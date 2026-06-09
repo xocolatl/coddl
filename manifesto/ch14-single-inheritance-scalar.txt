@@ -1,0 +1,2859 @@
+                                                     Chapter 14
+
+                 Single Inheritance with Scalar Types
+
+In this chapter, we elaborate on the first 20 of our IM Prescriptions, using the type hierarchy of Fig.
+12.1 as a basis for most examples. We remind you that until further notice we take the unqualified
+terms type, subtype, and supertype to mean scalar types, subtypes, and supertypes specifically and
+the unqualified terms value, variable, (read-only) operator, expression, and result to mean scalar
+values, variables, operators, expressions, and results specifically.1 In addition, we take the
+unqualified term inheritance to mean single inheritance specifically and the unqualified term
+constraint to mean a type constraint specifically. We assume that all of the types under
+consideration are members of some given set of types S (and all references to root or leaf types are
+to be understood in the context of that set S). Finally, we use the symbols T and T' to refer
+generically to a pair of types such that T' is a subtype of T—equivalently, such that T is a supertype
+of T'. As noted in Chapter 13, you might find it helpful to think of T and T' as ELLIPSE and
+CIRCLE, respectively, except where otherwise indicated.
+
+
+IM PRESCRIPTION 1: TYPES ARE SETS
+
+T and T' shall indeed both be types; i.e., each shall be a named set of values.
+
+                                                 ———  —
+
+IM Prescription 1 simply asserts that supertypes and subtypes are indeed types, in the full sense of
+that term as required by The Third Manifesto. One consequence is that subtypes can have lower-
+level subtypes of their own (and supertypes can have higher-level supertypes of their own), as we
+already know.
+
+
+IM PRESCRIPTION 2: SUBTYPES ARE SUBSETS
+
+Every value in T' shall be a value in T; i.e., the set of values constituting T' shall be a subset of the
+set of values constituting T (in other words, if a value is of type T', it shall also be of type T).
+Moreover, if T and T' are distinct (see IM Prescriptions 3 and 4), then there shall exist at least one
+value of type T that is not of type T'.
+
+                                             ———  ———
+
+
+1
+  To repeat from Chapter 12, however, formal statements—the IM Prescriptions themselves in particular—are
+deliberately worded in such a way as to allow, e.g., the term value to be taken to mean a scalar value or a tuple value or
+a relation value as the context demands. They are also deliberately worded in such a way as to apply to multiple
+inheritance as well as single, barring explicit statements to the contrary.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                           283
+Part IV / Subtyping and Inheritance                  Chapter 14 / Single Inheritance with Scalar Types
+
+
+In general, to say that value v is of type T does not preclude the possibility that v is also of type T'.
+For example, to say that e is an ellipse does not preclude the possibility that e is also a circle. In
+fact, to say that v is of type T means, precisely, that the most specific type of v (see IM Prescription
+8) is some subtype of T (see IM Prescriptions 3-5). It follows that if v is of type T', the operators
+that apply to v include (by definition) all of the operators that apply to values of type T', and those
+operators include (by definition) all of the operators that apply to values of type T. For example, if
+AREA is an operator that applies to values of type ELLIPSE, then AREA is also an operator that
+applies to values of type CIRCLE. In other words (loosely): Operators associated with type T
+are inherited by type T'.
+       Here in outline are some of the operators that (we will assume) apply to values of type
+ELLIPSE and hence to values of type CIRCLE also. Note: As we will see later, some of these
+operators might need to be reimplemented for type CIRCLE, implying that two implementation
+versions of the operator in question, an ELLIPSE version and a CIRCLE version, might exist under
+the covers (as it were). See IM Prescription 9 for further discussion.
+      OPERATOR THE_A ( E ELLIPSE ) RETURNS LENGTH ;
+          /* “the a semiaxis of” */ ... ;
+      END OPERATOR ;
+
+      OPERATOR THE_B ( E ELLIPSE ) RETURNS LENGTH ;
+          /* “the b semiaxis of” */ ... ;
+      END OPERATOR ;
+
+      OPERATOR THE_CTR ( E ELLIPSE ) RETURNS POINT ;
+          /* “the center of” */ ... ;
+      END OPERATOR ;
+
+      OPERATOR AREA ( E ELLIPSE ) RETURNS AREA ;
+          /* “area of”; note that AREA is both the name of the */
+          /* operator and the name of the type of the result    */
+          /* (meaning it is probably the name of the            */
+          /* corresponding selector too); such punning might or */
+          /* might not be valid in a real D (?)                 */
+          ... ;
+      END OPERATOR ;
+
+And here is an operator that applies to values of type CIRCLE but not to values of type ELLIPSE:
+      OPERATOR THE_R ( C CIRCLE ) RETURNS LENGTH ;
+          /* “the radius of” */ ... ;
+      END OPERATOR ;
+
+      Of course, the operators THE_A, THE_B, and THE_CTR (for type ELLIPSE) and THE_R
+and THE_CTR (for type CIRCLE) are in fact required by RM Prescription 5, and they are provided
+“automatically.” (As we saw in Chapter 3, “automatically” here might or might not mean
+automated, in the sense that the implementation is provided by the system.) In the case of
+THE_CTR for type CIRCLE in particular, it is precisely inheritance from type ELLIPSE that serves
+as the required “automatic” provision of that operator (though, to repeat, it is possible that the
+operator might need to be reimplemented for type CIRCLE). As for THE_A and THE_B for type
+CIRCLE, these operators are required, not by RM Prescription 5, but rather by the very notion of
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          284
+Part IV / Subtyping and Inheritance                   Chapter 14 / Single Inheritance with Scalar Types
+
+
+inheritance (though once again it is possible that they might need to be reimplemented for type
+CIRCLE).
+        It follows from all of the above that if v is of type T', then v must satisfy all of the constraints
+that apply to values of type T (as well as all of the constraints that apply to values of type T'
+specifically). To repeat an example from Chapter 12, if c is a circle (and hence an ellipse), and if
+ellipses are subject to the constraint that the length of their major semiaxis a must be greater than or
+equal to that of their minor semiaxis b, then that same constraint must be satisfied by c—as indeed it
+is, trivially, because in the case of a circle the semiaxes a and b coincide in the radius r. In other
+words (loosely): Constraints associated with type T are inherited by type T'.
+        Now, in Chapter 3 we said that if v is a scalar value, it can be thought of as carrying around
+with it a kind of flag that announces “I am an integer” or “I am a supplier number” or “I am a
+geometric point” (and so on). Now we see that, conceptually speaking, it might have to carry
+around several distinct flags—e.g., “I am an ellipse” and “I am a circle.” (Of course, a flag that
+announces just the most specific type is all that is logically required. See IM Prescription 8.)
+        We also said in Chapter 6 that distinct types are disjoint “except possibly if type inheritance is
+supported.” Now we see that two types are definitely not disjoint if one is a subtype of the other.
+We will encounter some further cases of nondisjointness in Chapters 15 and 16.
+        We now observe that our informal characterization of IM Prescription 2 (“subtypes are
+subsets”) can more accurately be stated as follows: Proper subtypes are proper subsets (see IM
+Prescription 4). This stronger characterization follows from the requirement that if T and T' are
+distinct, then there must exist at least one value of type T that is not of type T'—a requirement we
+now proceed to justify. Suppose it were not satisfied; i.e., suppose every value of type T were in
+fact a value of type T'. Then:
+
+ ■    Any operator that applied to values of type T' would apply to all values of type T.
+
+ ■    Any constraint that applied to values of type T' would apply to all values of type T.
+
+In other words, T' and T would effectively be identical except for their names, and there would be
+no logical reason to distinguish between them.
+      Incidentally, it follows immediately from the foregoing that the most specific type of a given
+value is not necessarily a leaf type. It also follows that type hierarchies cannot contain any
+cycles (i.e., they are indeed hierarchies). For suppose, contrariwise, that there existed some
+sequence of types T1, T2, T3, ..., Tn such that T1 was an immediate supertype of T2, T2 was an
+immediate supertype of T3, ..., and Tn was an immediate supertype of T1. Then every one of these
+types T1, T2, T3, ..., Tn would be a proper supertype, and hence a proper superset, of itself!
+      One last point: It is an obvious corollary of IM Prescription 2 that there cannot be more
+values of type T' than there are of type T. This apparently trivial observation can be very helpful in
+pinpointing errors and clearing up confusions. For example, it would be an error according to our
+model to define COLORED_CIRCLE as a subtype of type CIRCLE (a state of affairs that might
+come as a surprise, if you are familiar with object systems). Assuming circles were originally seen
+as “plain” or uncolored, then there are clearly more colored circles than there are just plain circles.
+Moreover, there is clearly no CIRCLE selector invocation that could possibly yield a value of type
+COLORED_CIRCLE. (We are assuming here that, e.g., a red circle and a blue circle of the same
+size and at the same location are different colored circles.) And so the proposed supertype/subtype
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            285
+Part IV / Subtyping and Inheritance                 Chapter 14 / Single Inheritance with Scalar Types
+
+
+relationship, as such, does not in fact exist. Note: We will have quite a lot more to say regarding
+this particular example in Appendix G.
+
+
+IM PRESCRIPTION 3: “SUBTYPE OF” IS REFLEXIVE
+
+T and T' shall not necessarily be distinct; i.e., every type shall be both a subtype and a supertype of
+itself.
+
+                                      ———  ———
+
+This prescription and the next five all have to do with matters of terminology (they elaborate on
+certain of the terms and concepts introduced in the section “The Running Example” in Chapter 12).
+The current prescription in particular recognizes that it is convenient to regard any given type T as
+both a subtype and a supertype of itself. This convention has the effect of simplifying the
+formulation of many of the prescriptions that we will be discussing later. Thus, for example,
+“ELLIPSE is a subtype of ELLIPSE” is a true statement, and so is “ELLIPSE is a supertype of
+ELLIPSE.”
+      Note: To say that a given dyadic logical operator Op is reflexive merely means that x Op x
+evaluates to TRUE for all x. Thus, e.g., “=” is reflexive, and so is “is a subtype of.” By contrast,
+“<” and “>” are not.
+
+
+IM PRESCRIPTION 4: PROPER SUBTYPES
+
+If and only if types T and T' are distinct, T' shall be a proper subtype of T, and T shall be a proper
+supertype of T'.
+
+                                      ———  ———
+
+This prescription introduces some terminology for talking about subtypes and supertypes when the
+types in question are distinct. In terms of our running example, we can say that, e.g., CIRCLE is a
+proper subtype of ELLIPSE. (By virtue of IM Prescription 5, q.v., it is also a proper subtype of
+PLANE_FIGURE.) It is also a subtype of CIRCLE, but not a proper one. Likewise,
+PLANE_FIGURE is a proper supertype of both ELLIPSE and CIRCLE; it is also a supertype of
+PLANE_FIGURE, but not a proper one.
+       We remind you from Chapter 12 that if T' is a proper subtype of T, there is no requirement
+that (a) physical representations of appearances of values of type T', and (b) physical representations
+of appearances of values of type T, be of the same form. Of course, there is no requirement that
+they be different, either.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         286
+Part IV / Subtyping and Inheritance                  Chapter 14 / Single Inheritance with Scalar Types
+
+
+IM PRESCRIPTION 5: “SUBTYPE OF” IS TRANSITIVE
+
+Every subtype of T' shall be a subtype of T. Every supertype of T shall be a supertype of T'.
+
+                                       ———  ———
+
+This prescription simply says that a subtype of a subtype is a subtype and a supertype of a supertype
+is a supertype. Thus, for example, RECTANGLE is a subtype of PLANE_FIGURE, and
+PLANE_FIGURE is a supertype of RECTANGLE.
+       Note: To say that a given dyadic logical operator Op is transitive merely means that, for all
+x, y, and z, if x Op y and y Op z both evaluate to TRUE, then so does x Op z. Thus, e.g., “=” is
+transitive, and so is “is a subtype of.” By contrast, “≠” and “is disjoint from” are not.
+
+
+IM PRESCRIPTION 6: IMMEDIATE SUBTYPES
+
+If and only if T' is a proper subtype of T and there is no type that is both a proper supertype of T'
+and a proper subtype of T, then T' shall be an immediate subtype of T, and T shall be an immediate
+supertype of T'. A type that is not an immediate subtype of any type shall be a root type. A type that
+is not an immediate supertype of any type shall be a leaf type.
+
+                                       ———  ———
+
+In terms of our running example, this prescription says that, e.g., CIRCLE is an immediate subtype
+of ELLIPSE, and ELLIPSE is an immediate supertype of CIRCLE. CIRCLE is also a subtype of
+PLANE_FIGURE, but not an immediate one; equivalently, PLANE_FIGURE is a supertype of
+CIRCLE, but not an immediate one. PLANE_FIGURE is a root type. CIRCLE and SQUARE are
+leaf types.
+
+
+IM PRESCRIPTION 7: ROOT TYPES DISJOINT
+
+If T1 and T2 are distinct root types, then they shall be disjoint; i.e., no value shall be of both type
+T1 and type T2.
+
+                                       ———  ———
+
+This prescription is in fact a logical consequence of IM Prescription 8. We state it explicitly for
+emphasis but defer detailed discussion to the next section.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                           287
+Part IV / Subtyping and Inheritance                            Chapter 14 / Single Inheritance with Scalar Types
+
+
+IM PRESCRIPTION 8: SCALAR VALUES WITH INHERITANCE
+
+Every set of types T1, T2, ..., Tn shall have a common subtype T' such that a given value is of each
+of the types T1, T2, ..., Tn if and only if it is of type T'.
+
+                                              ———  ———
+
+The definition of scalar value needs some extension if type inheritance is supported—basically
+because such a value can now be of more than one type. The present prescription addresses this
+issue, but in a rather roundabout way, as we now show.
+       First of all, we need to introduce the special scalar type omega. Type omega is empty,
+meaning it contains no values at all (no scalar values in particular). We will have more to say about
+omega under IM Prescription 20; for now, it is sufficient to observe that such a type does exist, at
+least conceptually, and it can be regarded as being a subtype of every scalar type1 (since the empty
+set is a subset of every set).
+       Observe next that the prescription refers to a common subtype T' of a set of n types T1, T2, ...,
+Tn. Consider the case n = 2, meaning we are dealing with precisely two types T1 and T2; moreover,
+we can assume that T1 and T2 are distinct (for otherwise we are dealing with the case n = 1). Now,
+if T1 and T2 have omega as their only common subtype, they are certainly disjoint; in fact, the only
+way T1 and T2 can have a nonempty common subtype—under our assumption of single
+inheritance—is if one is a (necessarily proper) subtype of the other. Assume without loss of
+generality that T2 is a proper subtype of T1. Then the requirements of IM Prescription 8 are
+satisfied with T' = T2.
+       It should be clear without going into detail that the foregoing argument can be extended to the
+case of arbitrary n > 2. So what about the remaining possibilities, n = 1 and n = 0? For n = 1, the
+requirements of IM Prescription 8 are satisfied trivially with T' = T1. For n = 0, they are satisfied
+even more trivially, as it were, since in this case there simply is no value that is “of each of the types
+T1, T2, ..., Tn,” and the requirements of IM Prescription 8 are satisfied trivially with T' = omega.
+       By the way, note carefully that we have said that type omega exists “at least conceptually.”
+What this means is that we do not require or expect it to be explicitly defined; indeed, we believe it
+would usually not be. (Note that if it is, it will necessarily be the only leaf type.) In what follows,
+we will assume it is not explicitly defined, barring explicit statements to the contrary.
+       An immediate logical consequence of IM Prescription 8 is the disjointness assumption
+(already discussed in Chapter 12 but repeated for convenience here):
+
+    ■   If types T1 and T2 are such that neither is a subtype of the other, then they are disjoint—i.e.,
+        no value is of both type T1 and type T2.
+
+
+
+
+1
+  It follows that we are moving here into the realm of multiple inheritance, albeit in a very limited kind of way.
+Nevertheless, we continue to assume throughout most of this chapter that it makes sense to talk in terms of single
+inheritance only. Note in particular that the fact that omega is a subtype of every scalar type does not in itself violate
+the disjointness assumption (!).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                             288
+Part IV / Subtyping and Inheritance                             Chapter 14 / Single Inheritance with Scalar Types
+
+
+      To repeat from Chapter 12, this assumption is valid as long as we limit our attention to single
+inheritance only.1 And it has a number of important implications, the following among them:
+
+    ■    Distinct root types are disjoint (IM Prescription 7).
+
+    ■    Distinct type hierarchies are disjoint. That is, if TH1 and TH2 are type hierarchies with
+         distinct root types RT1 and RT2, respectively, and if types T1 and T2 belong to TH1 and TH2,
+         respectively, then T1 and T2 are disjoint. For example, if we deleted type PLANE_FIGURE
+         (only) from Fig. 12.1, we would be left with two type hierarchies, one rooted at type
+         ELLIPSE and one at type POLYGON, that are necessarily disjoint (there is no value that is
+         both an ellipse and a polygon).
+
+    ■    Distinct immediate subtypes of the same supertype are disjoint.
+
+    ■    Distinct leaf types are disjoint.
+
+    ■    Every value has exactly one most specific type (and this is the real point of IM Prescription
+         8, in the context of single inheritance). For example, a given value might have types
+         PLANE_FIGURE, POLYGON, and RECTANGLE, but not SQUARE, in which case the
+         most specific type would be, precisely, RECTANGLE. In fact, as noted in Chapter 12, if
+         value v is of most specific type T, then the set of types possessed by v is, precisely, the set
+         consisting of all supertypes of T (a set that includes T itself, of course). In other words, v is of
+         every type that is a supertype of T and is of no other type.
+
+
+IM PRESCRIPTION 9: SCALAR VARIABLES WITH INHERITANCE
+
+Let scalar variable V be of declared type T. Because of value substitutability (see IM Prescription
+16), the value v assigned to V at any given time can have any subtype T' of type T as its most
+specific type. We can therefore model V as a named ordered triple of the form <DT,MST,v>,
+where:
+    a.     The name of the triple is the name of the variable, V.
+    b.     DT is the name of the declared type for variable V.
+    c.     MST is the name of the most specific type—also known as the current most specific type—
+           for, or of, variable V.
+    d.     v is a value of most specific type MST—the current value for, or of, variable V.
+We use the notation DT(V), MST(V), v(V) to refer to the DT, MST, v components, respectively, of
+this model of scalar variable V.
+      Now let X be a scalar expression. By definition, X specifies an invocation of some scalar
+operator Op (where the arguments, if any, to that invocation of Op are specified as expressions in
+turn). Thus, the notation DT(V), MST(V), v(V) just introduced can be extended in an obvious way
+
+1
+    It is also valid if we depart from single inheritance only in that we explicitly define type omega.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                 289
+Part IV / Subtyping and Inheritance                  Chapter 14 / Single Inheritance with Scalar Types
+
+
+to refer to the declared type DT(X), the current most specific type MST(X), and the current value
+v(X), respectively, of X—where DT(X) is DT(Op) and is known at compile time, and MST(X) and
+v(X) refer to the result of evaluating X and are therefore not known until run time (in general).
+                                       ———  ———
+
+Like the definition of scalar value, the definition of scalar variable also needs some extension if
+type inheritance is supported—basically because such a variable is permitted to have a value that is
+of any subtype of the declared type of the variable in question. For example, let scalar variable E be
+defined as follows:
+      VAR E ELLIPSE ;
+
+       At run time, then, the current value of variable E can have any subtype of ELLIPSE
+(including ELLIPSE itself in particular) as its most specific type. Thus, the current value might be a
+circle instead of “just an ellipse” (such a possibility is intuitively reasonable, of course, since a
+circle is an ellipse). If it is, then we can say that:
+
+ ■     DT(E) is ELLIPSE.
+
+ ■     MST(E) is CIRCLE.
+
+ ■     v(E) is whatever circle happens to be the current value of E.
+
+        Observe, therefore, that (as noted in Chapter 12) we must now be careful over the logical
+difference between the two important types that apply to any given variable: the declared type,
+which does not change over time, vs. the current most specific type, which does (in general). Of
+course, the second of these must always be some subtype—not necessarily a proper subtype—of the
+first; nevertheless, there is a logical difference between the two concepts.
+        Observe further that if type T is the current most specific type of variable V, then every proper
+supertype of type T is also a “current type” of variable V, in a sense. However, the term “current
+type” is usually used, informally, to refer to the most specific current type of the variable in
+question.
+        Note: By virtue of IM Prescription 8, MST(V) is in fact implied by v(V), and is thus logically
+unnecessary as a component of the model of V. We include it for reasons of convenience and
+explicitness. Also, by virtue of RM Prescription 11, DT(V) can never be omega. (Nor can MST(V),
+of course, since there is no value of type omega.)
+        Now, it should be clear that—as IM Prescription 9 in fact states—the foregoing definitions
+can readily be extended to apply to arbitrary scalar expressions instead of just to scalar variables
+specifically. Let X be such an expression, and let v(X) be the result of evaluating that expression.
+Then:
+
+ ■    X has a declared type, DT(X): namely, the declared type of the operator Op that is invoked at
+      the outermost level of X. DT(X) is known at compile time; in fact, it is determined by the
+      specification signature for Op, as we will see under IM Prescription 17. Note in particular
+      that Op might be a selector.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          290
+Part IV / Subtyping and Inheritance                  Chapter 14 / Single Inheritance with Scalar Types
+
+
+ ■    X also has a current most specific type, MST(X): namely, the type that is the most specific type
+      of v(X). MST(X) is not known until run time, in general.
+
+       We have now laid sufficient groundwork to be able to discuss an important concept that
+pervades the topic of type inheritance: polymorphism. (Of course, we have met this concept
+before, in Chapter 3 in particular, but there is a lot more to be said about it in the present context.)
+As we have seen, if T' is a subtype of T, then all operators that apply to values of type T apply to
+values of type T' as well. Thus (to repeat a by now familiar example), if AREA(e) is valid, where e
+is an ellipse, then AREA(c), where c is a circle, must be valid as well. It follows that the AREA
+operator is polymorphic: It can take arguments of different types on different invocations.
+       Recall now that ellipses and circles, at least as we defined them in Chapter 12, have different
+possreps:
+      TYPE ELLIPSE ... POSSREP { A ..., B ..., CTR ... } ;
+
+      TYPE CIRCLE      ... POSSREP { R ..., CTR ... } ... ;
+
+      It is conceivable, therefore, that two different versions of the AREA operator will exist under
+the covers, one that makes use of the ELLIPSE possrep and one that makes use of the CIRCLE
+possrep. To say it again, it is conceivable—but it is not absolutely necessary. So long as the code
+that implements AREA for type ELLIPSE is written in terms of the ELLIPSE possrep, that code
+will necessarily work for circles, because the ELLIPSE possrep is necessarily, albeit implicitly, a
+possrep for CIRCLE too (though, as explained in Chapter 12, not a declared one). To be more
+specific, the area of a general ellipse is ab, while that of a circle is r². Thus, the code that
+implements the ellipse version of AREA will presumably invoke THE_A and THE_B, and that
+code will certainly work for a circle.
+      Note further that the implementer might want to provide distinct versions of some operator at
+the supertype and subtype levels anyway, even when there is no logical need to do so. Consider
+polygons and rectangles, for example. The algorithm that computes the area of a general polygon
+will certainly work for a rectangle; for rectangles, however, a much more efficient algorithm—
+multiply the height by the width—is available. Thus, it might be desirable to have two
+implementation versions of the operator for reasons of efficiency, if for no other reason.
+      To return to ellipses and circles: Observe now, however, that the ellipse AREA code will
+definitely not work for circles if it is written in terms of a physical representation instead of a
+possible one, and physical representations for types ELLIPSE and CIRCLE differ. The practice of
+implementing operators in terms of physical representations is thus clearly contraindicated. Code
+defensively! In fact, we would strongly recommend the following discipline: Access to physical
+representations should be limited to the following operators and nothing else:
+
+ ■     Selector operators
+
+ ■     THE_ operators
+
+ ■     IS_T operators (see IM Prescription 15)
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         291
+Part IV / Subtyping and Inheritance                         Chapter 14 / Single Inheritance with Scalar Types
+
+
+We remind you that many of these operators (perhaps not all) will have system-provided
+implementations anyway.
+       Of course, it makes no logical difference to the user how many implementation versions of
+AREA exist under the covers; to the user there is just one AREA operator, which works for (say)
+ellipses and therefore works for circles too, by definition. To say it again, AREA is polymorphic.
+       Now, we have already seen many examples of polymorphic operators in earlier chapters: “=”,
+“:=”, “+”, “||”, SUM, and many others. But there is no inheritance, as such, involved in these
+examples—they are all instances of overloading polymorphism (also known as general
+polymorphism [137], ad hoc polymorphism [15], or just overloading for short). The kind of
+polymorphism exhibited by the AREA operator, by contrast, is known as inclusion polymorphism
+[15], on the grounds that the relationship between (e.g.) circles and ellipses is basically that of set
+inclusion.1 For obvious reasons, we take the unqualified term polymorphism throughout this part of
+the book to mean inclusion polymorphism specifically, barring explicit statements to the contrary.
+       Now, a helpful way to characterize the logical difference between inclusion and overloading
+polymorphism is as follows:
+
+    ■   Inclusion polymorphism means there is just one operator, with several distinct
+        implementation versions under the covers (but the user does not need to know that the
+        versions in question are in fact distinct—to the user, to repeat, there is just one operator).
+
+    ■   Overloading polymorphism, by contrast, means there are several distinct operators with the
+        same name (and the user does need to know that the operators in question are in fact distinct,
+        with distinct—though preferably similar—semantics). Note: “Preferably similar” might be
+        too strong here. For example, we use THE_A in this chapter to refer to an ellipse semiaxis,
+        but in the next chapter we will use it to refer to a parallelogram vertex—so THE_A is
+        definitely overloaded, and its meanings are quite different.
+
+       These matters are explained more fully later under IM Prescriptions 16-19, but we elaborate
+on them slightly here for purposes of reference (despite the fact that such elaboration might not
+make very much sense at this juncture). Briefly, for overloading polymorphism, each of the distinct
+operators will have its own distinct specification signature (because invocations of the operators in
+question would otherwise be ambiguous). For inclusion polymorphism, by contrast, the single
+operator will have just one specification signature, but each distinct under-the-covers
+implementation version of that operator will have its own distinct version signature. See IM
+Prescription 17 for further discussion.
+       The trouble is, as that further discussion will show, there can be no guarantee with inclusion
+polymorphism that the various versions under the covers do in fact all implement the same
+operator!—i.e., distinct versions might have distinct semantics. If they do, of course, we do not
+have true inclusion polymorphism any more, we have overloading polymorphism instead, and such
+a state of affairs is in violation of our model. But you should be aware that such violations are
+certainly possible in practice, and are even argued by some to be desirable. What is more, the
+situation is confused still further by the fact that, regrettably, much of the literature uses the term
+
+1
+  The operators “=”, “:=”, “+”, and so forth might become instances of inclusion polymorphism if inheritance is
+supported. For example, “=” might be inherited from type alpha (see IM Prescription 20).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                       292
+Part IV / Subtyping and Inheritance                          Chapter 14 / Single Inheritance with Scalar Types
+
+
+overloading to mean inclusion polymorphism anyway. Again, see IM Prescription 17 for further
+discussion.
+       Back to inclusion polymorphism specifically. What are the implications of this idea for the
+user? Consider the following example. Suppose we need to write a program to display some
+diagram, made up of squares, circles, ellipses, etc. Without polymorphism, the code for this task
+will look something like this:
+       FOR EACH x  DIAGRAM
+           CASE ;
+              WHEN IS_SQUARE ( x ) THEN CALL DISPLAY_SQUARE ... ;
+              WHEN IS_CIRCLE ( x ) THEN CALL DISPLAY_CIRCLE ... ;
+              .....
+           END CASE ;
+
+(See IM Prescription 15 for an explanation of the operators IS_SQUARE, IS_CIRCLE, etc.) With
+polymorphism, by contrast, the code is much simpler and much more succinct:
+       FOR EACH x  DIAGRAM CALL DISPLAY ( x ) ;
+
+Explanation: DISPLAY here is a polymorphic operator. The version of DISPLAY that works for
+values of a given type will be defined (if necessary) when that type is defined—or possibly at some
+subsequent time—and will be made known to the system at that time. At run time, then, when the
+system encounters the DISPLAY invocation with argument x, it will determine the version of
+DISPLAY that is appropriate to the type of x and invoke that version: a process known as run-time
+binding (because the invocation in question is being “bound” to the appropriate implementation
+code at run time).1 In other words, polymorphism effectively means that certain CASE expressions
+and CASE statements that would otherwise have had to appear in the user’s source code are moved
+under the covers—the system performs those CASE operations in the user’s behalf.
+       Note the implications of the foregoing for program maintenance in particular. For example,
+suppose that (a) a new type TRIANGLE is defined (another immediate subtype of POLYGON) and
+(b) a corresponding new version of DISPLAY is defined as well. Without polymorphism, we
+would have to examine every source-code CASE expression and CASE statement of the form
+shown previously to see whether it needs to be modified to include the following:
+       WHEN IS_TRIANGLE ( x ) THEN CALL DISPLAY_TRIANGLE ... ;
+
+With polymorphism, however, no such modifications are needed at all.
+      Because of examples like the foregoing, polymorphism is sometimes described, a little
+colorfully, as “old code invoking new code”; that is, a program P can effectively invoke some
+
+
+1
+  Two points. First, we will show under IM Prescription 17 that the system might in fact be able to do part or all of the
+binding at compile time instead of run time (an obvious performance benefit). Second, even if some run-time binding is
+required, it still might not involve as much overhead as you might think. As you probably noticed, we explained the
+run-time binding process in the example in terms of “the” type of x; well, we were being deliberately (and, we hope,
+uncharacteristically) vague here. Suppose types T1, T2, T3, T4, and T5 are such that T1, T2, T3, and T4 are immediate
+supertypes of T2, T3, T4, and T5, respectively; suppose operator Op has implementation versions for types T1 and T3
+(only); finally, suppose the most specific type of x is T5. Then there is no need for the system to determine this latter
+fact; all it needs to do is ascertain that x is certainly of type T3 and therefore invoke the T3 version of Op.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                         293
+Part IV / Subtyping and Inheritance                 Chapter 14 / Single Inheritance with Scalar Types
+
+
+version of an operator Op that did not even exist (the version, that is) at the time P was written.
+Thus, we have, at least potentially, what is called code reuse: The very same program P might be
+usable on data that is of a type that had not even been defined at the time P was written. (Certainly
+the code of program P is being reused here. The code that implements operator Op under the covers
+might or might not be; for example, the code that implements the AREA operator for ellipses might
+or might not be reusable for circles, as we saw earlier.)
+      We now consider another example in order to make another point. Specifically, we consider
+the operators THE_A (“the a semiaxis of”) and THE_R (“the radius of”). Assume first that ellipses
+and circles have the same physical representation and THE_A for type ELLIPSE is implemented in
+terms of that physical representation. Then that same implementation code can serve as the
+implementation of THE_A for type CIRCLE too, and THE_R can be implemented thus:
+      OPERATOR THE_R ( C CIRCLE ) RETURNS LENGTH ... ;
+         RETURN ( THE_A ( C ) ) ;
+      END OPERATOR ;
+
+Of course, it could also be implemented directly in terms of the physical representation if desired.
+      Now assume instead that ellipses and circles have different physical representations, but
+THE_A for type ELLIPSE is still implemented in terms of the ELLIPSE physical representation.
+Then THE_R might be implemented in terms of the CIRCLE physical representation, and THE_A
+for type CIRCLE could then be implemented thus:
+      OPERATOR THE_A ( C CIRCLE ) RETURNS LENGTH ... ;
+         RETURN ( THE_R ( C ) ) ;
+      END OPERATOR ;
+
+Of course, it could also be implemented directly in terms of the CIRCLE physical representation if
+desired.
+      The net of the foregoing example is just this: For type CIRCLE, either of THE_A or THE_R
+might be implemented in terms of the other, depending on circumstances (physical representations
+in particular). Either way, of course, it should make no logical difference so far as the user is
+concerned.
+      Recall now the concept of substitutability, which we said in Chapter 12 was “in many ways
+the whole point of inheritance.” Just to remind you, substitutability means that, e.g., wherever the
+system expects a value of type ELLIPSE, we can always substitute a value of type CIRCLE,
+because circles are ellipses. In particular:
+
+ ■    If some relation r has an attribute A of declared type ELLIPSE, some of the A values in r
+      might in fact be circles rather than “just ellipses.”
+
+ ■    If type T has a possrep with a component X of declared type ELLIPSE, then for some values v
+      of type T the operator invocation THE_X(v) might return a circle instead of “just an ellipse.”
+
+      More generally, wherever the system expects a value of type T, we can always substitute a
+value of type T'—The Principle of (Value) Substitutability (see IM Prescription 16). But it should
+be clear from our earlier discussions that substitutability is really just inclusion polymorphism in a
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         294
+Part IV / Subtyping and Inheritance                  Chapter 14 / Single Inheritance with Scalar Types
+
+
+different guise; we mention it here principally because it is widely recognized as the sine qua non of
+type inheritance, and no discussion of that topic would be complete without such a mention.
+      We close this section by pointing out that the notions of polymorphism and substitutability,
+important though they might be in practice, are both logically implied by the notion of type
+inheritance—they are not, logically speaking, completely separate concepts. In other words, if the
+system supports type inheritance, it must support polymorphism and substitutability as well (for if it
+did not, then it would not be supporting type inheritance, by definition).
+
+
+IM PRESCRIPTION 10: SPECIALIZATION BY CONSTRAINT
+
+Let T be a regular proper supertype (see IM Prescription 20), and let T' be an immediate subtype of
+T. Then the definition of T' shall specify a specialization constraint SC, formulated in terms of T,
+such that a value shall be of type T' if and only if it is of type T and it satisfies constraint SC. There
+shall exist at least one value of type T that does not satisfy constraint SC.
+
+                                       ———  ———
+
+Controversy has raged for years in the literature (especially the object literature) over the question
+of whether the system should be aware of the fact that, e.g., an ellipse whose semiaxes a and b are
+equal is really a circle. Clearly, if it is so aware, then updating a variable of declared type ELLIPSE
+could have the effect of changing the most specific type of that variable “down” from ELLIPSE to
+CIRCLE. We refer to such an effect as specialization by constraint, or S by C for short (though
+we should warn you that other writers use an almost identical term to mean something rather
+different, as we will see in Appendix F).
+       At first sight, it would seem obvious that a good model of inheritance must include S by C;
+“the more knowledge the system has, the better” is always a good general principle. After all, an
+ellipse with equal semiaxes certainly is a circle in the real world, and a model that does not
+understand this fact can hardly be said to be a good model of reality. However, we did not include
+S by C in the first version of our model [82]. Our reasons for adopting that position are not worth
+repeating here—well, not in detail, at any rate, but we should at least say that one of them was the
+fact that most other attempts at defining an inheritance model seemed to have done the same thing
+(see, e.g., reference [123]). Be that as it may, we did also say in reference [82] that we were
+“actively investigating the possibility of revising our model ... to include [S by C].” We are happy
+to be able to report that those investigations were successful, and our model—unlike just about
+every other proposal we have seen in this connection—does now include S by C, as we now
+proceed to explain. (In fact, it is our claim now that an inheritance model can be said to be good
+only if it does include S by C. See Appendix F for further discussion of this point.)
+       We begin by repeating from Chapter 12 the type definitions for types ELLIPSE and CIRCLE:
+      TYPE ELLIPSE
+           IS { PLANE_FIGURE
+                POSSREP { A LENGTH, B LENGTH, CTR POINT
+                          CONSTRAINT A  B } } ;
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                           295
+Part IV / Subtyping and Inheritance                         Chapter 14 / Single Inheritance with Scalar Types
+
+
+         TYPE CIRCLE
+              IS { ELLIPSE
+                   CONSTRAINT THE_A ( ELLIPSE ) = THE_B ( ELLIPSE )
+                   POSSREP { R   = THE_A   ( ELLIPSE ) ,
+                             CTR = THE_CTR ( ELLIPSE ) } } ;
+
+     Now we focus on the “IS definition”—the <is def>, in Tutorial D terms—for type CIRCLE,
+which specifies three things:
+
+    1.   The name of the immediate supertype (ELLIPSE)
+
+    2.   An additional constraint, to the effect that the semiaxes a and b must be equal for the ellipse
+          to be a circle
+
+    3.   A derived possrep (i.e., a possrep for circles that is derived from one for ellipses)
+
+      Items 1 and 2 together constitute the required specialization constraint for type CIRCLE.
+Note that (as required by IM Prescription 10) it is formulated in terms of type ELLIPSE; note
+further that it is, precisely, the type constraint for type CIRCLE. In other words, it can be
+interpreted as follows. In order for some value c to be of type CIRCLE, the following boolean
+expression must evaluate to TRUE:
+         IS_ELLIPSE ( c ) AND THE_A ( c ) = THE_B ( c )
+
+         By way of example, consider the following ELLIPSE selector invocation:
+         ELLIPSE ( LENGTH ( 5.0 ), LENGTH ( 5.0 ), POINT ( 0.0, 0.0 ) )
+
+This expression returns a value of most specific type CIRCLE, not ELLIPSE, because the value in
+question does indeed cause the boolean expression just shown to evaluate to TRUE; in other words,
+S by C occurs. In fact, the selector invocation in question, even though it names type ELLIPSE, is
+logically equivalent to a certain selector invocation for type CIRCLE1—viz.:
+         CIRCLE ( LENGTH ( 5.0 ), POINT ( 0.0, 0.0 ) )
+
+       Thus we see that S by C fundamentally implies that certain selector invocations will produce
+results whose most specific type is some proper subtype of the designated target type. Incidentally,
+it is worth pointing out explicitly that this fact does not constitute a violation of, or even an
+extension to, RM Prescription 4 as stated in Chapter 4.
+       Now suppose type CIRCLE has a proper subtype O_CIRCLE (where an “O-circle” is a circle
+with center the origin):
+         TYPE O_CIRCLE
+              IS { CIRCLE
+                   CONSTRAINT THE_CTR ( CIRCLE ) = POINT ( 0.0, 0.0 )
+                   POSSREP { R = THE_R ( CIRCLE ) } } ;
+
+
+1
+  Observe too that the system knows exactly which selector invocation for type CIRCLE it is equivalent to, thanks to
+the derived possrep specification.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                       296
+Part IV / Subtyping and Inheritance                        Chapter 14 / Single Inheritance with Scalar Types
+
+
+      Then the ELLIPSE selector invocation previously discussed now returns a value of most
+specific type O_CIRCLE, not CIRCLE, because the value in question satisfies the constraint for
+type O_CIRCLE as well. In other words, S by C implies that a given selector invocation will return
+a value that—in accordance with the specified constraints—is of the most specific type possible.
+      Recall now from Chapter 6 that, ultimately, the only way any expression can yield a value, of
+any type, is via some selector invocation. It follows that S by C can usefully be thought of as being
+implemented inside selector implementation code, using a procedure (“FIND_MST”) along the
+following lines:1
+        OPERATOR FIND_MST ( v value, t type ) RETURNS type ;
+           let t1, t2, ..., tn be all of the immediate subtypes of t
+           in some arbitrary order ;
+           let the corresponding specialization constraints be IC1, IC2, ..., ICn,
+           respectively ;
+           DO i := 1 TO n ;
+              IF v satisfies ICi THEN RETURN ( FIND_MST ( v, ti ) ) ; END IF ;
+           END DO ;
+           RETURN ( t ) ;
+        END OPERATOR ;
+
+    The procedure is initially invoked with the selected value and the selector declared type. For
+example, in the case of the ELLIPSE selector invocation discussed earlier—
+        ELLIPSE ( LENGTH ( 5.0 ), LENGTH ( 5.0 ), POINT ( 0.0, 0.0 ) )
+
+—the initial arguments are the indicated ellipse value and the type ELLIPSE.
+      So much for the basic idea of S by C. But there is much, much more to be said on this topic:
+so much, in fact, that it seemed better not to include it all in the body of the chapter—even though it
+does logically belong here—but instead to relegate most of it to Appendix F. (Note, however, that
+we do examine one particularly important aspect under IM Prescription 11 in the next section.) For
+the present, therefore, we content ourselves with a few miscellaneous observations:
+
+    ■   All nonroot types have an associated IS definition; no root type does (but note that all types
+        are root types in the absence of inheritance support).
+
+    ■   IM Prescription 10 states that “there shall exist at least one value of type T that does not
+        satisfy constraint SC.” This statement is just a more precise version of the requirement of IM
+        Prescription 2, as it applies to the case where T is a regular type (see IM Prescription 20), that
+        there shall exist at least one value that is of type T and not of type T'. As we said earlier,
+        proper subtypes are proper subsets.
+
+    ■   Finally, we show for interest an example involving a user-defined subtype
+        (EVEN_INTEGER) of a system-defined supertype (INTEGER):
+        TYPE EVEN_INTEGER ORDINAL IS { INTEGER CONSTRAINT MOD ( INTEGER, 2 ) = 0 } ;
+
+
+
+1
+  Note carefully that we say can be thought of here. In practice, we envisage a much more efficient implementation of
+S by C than this conceptual discussion might suggest (see Appendix F).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                      297
+Part IV / Subtyping and Inheritance                            Chapter 14 / Single Inheritance with Scalar Types
+
+
+         We are assuming the availability of an operator called MOD (“modulo”) that takes two
+         numeric arguments and returns the remainder that results after dividing the first by the second.
+         Since type INTEGER is a system-defined type with no declared possrep, type
+         EVEN_INTEGER has no declared possrep either. One consequence of this state of affairs is
+         that in order to assign the value 4 (say) to a variable EI of type EVEN_INTEGER, we will
+         have to use a statement of the form
+         EI := TREAT_AS_EVEN_INTEGER ( 4 ) ;
+
+         (See IM Prescription 14 for an explanation of TREAT.)
+
+
+IM PRESCRIPTION 11: ASSIGNMENT WITH INHERITANCE
+
+Consider the assignment
+         V := X
+
+(where V is a variable and X is an expression). DT(X) shall be a subtype of DT(V). The
+assignment shall set MST(V) equal to MST(X) and v(V) equal to v(X).
+
+                                               ———  ———
+
+The model of a scalar variable introduced in IM Prescription 9 is useful in pinning down the precise
+semantics of various operations, including assignment operations in particular. Consider the
+following example:
+         VAR E ELLIPSE ;
+         VAR C CIRCLE ;
+
+         C := CIRCLE ( ... ) ;
+         E := C ;
+
+       The first assignment here assigns some circle value to variable C (the expression on the right
+side of that assignment is a CIRCLE selector invocation). The second assignment then copies that
+circle value from variable C to variable E. (Of course, we could have simply assigned the result of
+the CIRCLE selector invocation to variable E directly, without involving variable C at all.) After
+that second assignment, then, the current most specific type of E will be CIRCLE, not ELLIPSE
+(the declared type, of course, will still be ELLIPSE). Thus, whereas assignment without
+inheritance1 requires the same type on both sides, assignment with inheritance means—thanks to
+substitutability—that:
+
+    ■    The declared type DT(X) of the expression on the right side can be any subtype of the
+         declared type DT(V) of the variable on the left side (this is a compile-time check).
+
+
+
+1
+    And, in accordance with our discussion of this topic in Chapter 3, without coercions.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                298
+Part IV / Subtyping and Inheritance                           Chapter 14 / Single Inheritance with Scalar Types
+
+
+    ■   The most specific type MST(X) of the value denoted by the expression on the right side can be
+        any subtype of the declared type DT(V) of the variable on the left side. (In fact, of course, it
+        must be some subtype of the declared type DT(X) of the expression on the right side, and so it
+        is necessarily some subtype of DT(V).)
+
+    ■   The variable V on the left side acquires its new most specific type, as well as its new value,
+        from the value denoted by the expression X on the right side. Note: As pointed out earlier in
+        this chapter, the most specific type of any value, and hence the most specific type of any
+        variable that currently contains that value, is in fact implied by the value in question. It
+        follows that the assignment must have the effect of setting MST(V) equal to MST(X), as well
+        as setting v(V) equal to v(X), and there is no need to say as much in so many words; we do so
+        only for explicitness.
+
+      Observe, therefore, that what does not happen is that the value of the expression on the right
+side gets “converted up” to the declared type of the variable on the left side. For if such a
+conversion did occur, the value would lose its most specific properties (loosely speaking). In the
+case at hand, for example, we would not be able to ask for the radius of E—more precisely, the
+radius of the circle that is now the current value of E—because the circle would have been
+converted to “just an ellipse,”1 and ellipses that are “just ellipses” do not have a radius.
+      By the way, you might possibly see a problem here, and indeed there is one. To be specific,
+the operator THE_R (“the radius of”) cannot validly be applied to a variable such as E whose
+declared type is only ELLIPSE, not CIRCLE. IM Prescription 14 addresses this issue.
+      Suppose we now continue the example as follows:
+        VAR A AREA ;
+
+        A := AREA ( E ) ;
+
+        What happens now is the following:
+
+    ■   First, the system performs a compile-time type check on the expression AREA(E), as required
+        by OO Prescription 1; the check succeeds, because E is of declared type ELLIPSE and the
+        single parameter to AREA is of declared type ELLIPSE also (see the outline definition of the
+        AREA operator as shown earlier under IM Prescription 2).
+
+
+
+
+1
+  In fact, IM Prescriptions 8 and 10 both imply that such a conversion is logically impossible. For if it were possible, it
+would mean that the very same value could have most specific type CIRCLE and most specific type ELLIPSE, thereby
+violating IM Prescription 8; it would also mean that, after the assignment, the target variable would contain an ellipse
+that could be “S by C’d” to a circle but has not been, thereby violating IM Prescription 10.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                            299
+Part IV / Subtyping and Inheritance                        Chapter 14 / Single Inheritance with Scalar Types
+
+
+    ■   Second, the system notes that—let us assume—a version of AREA exists that applies to
+        circles.1 (More generally, it will note all of the versions that apply to values of some proper
+        subtype of type ELLIPSE, but in our example only one such subtype exists.)
+
+    ■   Third, the system discovers at run time that the current value of E is of type CIRCLE. Since it
+        already knows that CIRCLE is the most specific subtype of type ELLIPSE for which a
+        distinct implementation version of AREA exists, it then invokes that version (i.e., it performs
+        the run-time binding process mentioned in our discussion of IM Prescription 9).
+
+        The fact that it is the circle version of AREA that is invoked might or might not be relevant to
+the user; it might be, if the declared type of the result of the operation varies depending on whether
+it is the circle version or the ellipse version that is invoked (it does not, in the case at hand). Note,
+however, that this state of affairs—i.e., the fact that the user might like to know which version of
+AREA is invoked—does not undermine our earlier claim to the effect that, so far as the user is
+concerned, there is really just one AREA operator. See IM Prescriptions 16 and 17 for further
+discussion of this issue.
+        We now consider another example in order to make another important point:
+        VAR E ELLIPSE ;
+
+        E := ELLIPSE ( LENGTH ( 6.0 ), LENGTH ( 5.0 ), POINT ( ... ) ) ;
+        THE_A ( E ) := LENGTH ( 5.0 ) ;
+
+     After the first assignment, MST(E) is ELLIPSE, of course. After the second, however, it is
+CIRCLE, thanks to S by C. To be more precise, the assignment to THE_A(E)—as we know from
+Chapter 6—is really shorthand for the following longer assignment:
+        E := ELLIPSE ( LENGTH ( 5.0 ), THE_B ( E ), THE_CTR ( E ) ) ;
+
+The selector invocation on the right side of this longer assignment returns a circle, because it yields
+a result with a = b = 5.0.
+      Now suppose we execute another assignment on E:
+        THE_A ( E ) := LENGTH ( 8.0 ) ;
+
+It should be clear that MST(E) is now ELLIPSE again (because THE_A(E) is now greater than
+THE_B(E)). We refer to this effect as generalization by constraint (G by C for short). Indeed, it
+should be obvious that support for S by C implies support for G by C as well. (What is more, the
+algorithm given under IM Prescription 10 for implementing S by C in fact implements G by C as
+well, as should also be obvious. Though we should perhaps add that, unlike S by C, which occurs
+on the invocation of some selector, G by C occurs on the execution of some assignment.)
+
+
+
+1
+  This step can be done at compile time or run time. Doing it at compile time means the run-time overhead of searching
+for versions is avoided, but programs might need to be recompiled when new implementation versions are defined.
+Doing it at run time means the possibly varying declared type of the result cannot be taken into account (and perhaps
+taken advantage of) at compile time.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                      300
+Part IV / Subtyping and Inheritance                          Chapter 14 / Single Inheritance with Scalar Types
+
+
+      We now observe that assignment, with S by C and G by C, is the key to the problem of
+changing the current most specific type of some variable V from T1 to T2 (say), where the declared
+type of V is some common supertype T of T1 and T2. For example, suppose we extend our running
+example to include another type NONCIRCLE (an immediate subtype of ELLIPSE, like CIRCLE),
+with the obvious semantics,1 and suppose once again that E is a variable of declared type ELLIPSE.
+Suppose further that MST(E) is NONCIRCLE (implying that THE_A(E) > THE_B(E); along with
+the fact that every noncircle is an ellipse, this condition is basically the type constraint for type
+NONCIRCLE). Let THE_A(E) and THE_B(E) be eight and five, respectively. Now consider the
+following assignment:
+        THE_A ( E ) := LENGTH ( 5.0 ) ;
+
+       After this assignment, E satisfies the condition THE_A(E) = THE_B(E), of course, and so
+MST(E) is now CIRCLE instead of NONCIRCLE. In other words, we have changed the most
+specific type of E “sideways,” as it were. Thus, S by C and G by C together take care of the
+problem of changing types not only “upward” and “downward,” as we already know, but also
+“sideways” (apologies for the sloppy manner of speaking here).
+       One last point: We have been assuming in accordance with our discussion of such matters in
+Chapter 3 that the assignment operator has not been overloaded in such a way as to permit DT(X)
+not to be a subtype of DT(V), thereby effectively requiring coercion of v(X) to the type, declared or
+current most specific, of V.2 Since IM Prescription 11 itself effectively assumes the same thing, it
+will clearly need some revision if that assumption is jettisoned.
+
+
+IM PRESCRIPTION 12: EQUALITY ETC. WITH INHERITANCE
+
+Consider the equality comparison
+        Y = X
+
+(where Y and X are expressions). DT(X) and DT(Y) shall have a nonempty common subtype. The
+comparison shall return TRUE if MST(Y) is equal to MST(X) and v(Y) is equal to v(X), FALSE
+otherwise.
+
+                                             ———  ———
+
+Consider the following example:
+
+
+
+
+1
+    ELLIPSE now becomes a union type, incidentally (see IM Prescription 20).
+2
+  Such overloading might permit, e.g., the assignment of a U.K. sterling value to a variable of declared type U.S.
+dollars, with implicit currency conversion from sterling to dollars. You might care to reflect on some of the
+complexities involved in such an overloading, bearing in mind in particular the fact that currency conversion rates vary
+over time.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                         301
+Part IV / Subtyping and Inheritance                           Chapter 14 / Single Inheritance with Scalar Types
+
+
+         VAR E ELLIPSE ;
+         VAR C CIRCLE ;
+
+         IF E = C THEN ... END IF ;
+
+      The comparison “E = C” here will evaluate to TRUE if and only if the current value of
+variable E (a) is a circle—i.e., is of type CIRCLE—and (b) is in fact the same circle as the current
+value of variable C. In general, the situation with respect to equality comparisons is analogous
+(though not identical) to that with respect to assignments. To be more specific, whereas equality
+comparison without inheritance1 requires the same type on both sides, equality comparison with
+inheritance means—thanks to substitutability again—that:
+
+    ■    The declared types DT(X) and DT(Y) of the expressions on the right and left side,
+         respectively, must have some common supertype (this is a compile-time check). Note that
+         this requirement is not explicitly stated in IM Prescription 12; however, we will show in the
+         next chapter that it is in fact implied by the requirement—which is stated—that DT(X) and
+         DT(Y) must have a nonempty common subtype.
+
+    ■    The comparison will definitely give FALSE if the current most specific types of the
+         comparands are different (a difference in type is certainly a logical difference), but will give
+         TRUE if those most specific types are the same and the values are the same too. Note: Again
+         we remind you that the most specific type of any value is implied by the value in question. It
+         follows that if v(Y) and v(X) are the same, then MST(Y) and MST(X) must be the same too, and
+         there is no need to say as much in so many words; we do so only for explicitness.
+
+    ■    Under the disjointness assumption—which is to say, in the context of single inheritance—it
+         should be clear that DT(X) and DT(Y) can have a nonempty common subtype only if one is a
+         subtype of the other. If this condition is not satisfied, the comparison will fail on a compile-
+         time type error. For example, if those declared types are ELLIPSE and RECTANGLE,
+         respectively, then the comparison is not valid.
+
+       The comparison Y ≠ X is equivalent to NOT (Y = X). The rules for “<“ etc., in the cases
+where those operators apply, follow the same general pattern, though it might not be necessary to
+insist in those cases that the most specific types of the comparands be the same in order for the
+comparison to give TRUE. To repeat an example from Chapter 3, let 8 and 5 be values of most
+specific type EVEN_INTEGER and ODD_INTEGER, respectively, where EVEN_INTEGER and
+ODD_INTEGER have INTEGER as a common supertype. Then the comparison 8 > 5 can surely
+(and reasonably) be defined in such a way as to give TRUE.
+       One last point: We have been assuming in accordance with our discussion of such matters in
+Chapter 3 that the equality comparison operator has not been overloaded in such a way as to permit
+the comparison to give TRUE even if the most specific types of X and Y are not the same (in effect
+requiring coercion of v(Y) to the type, declared or current most specific, of X or the other way
+
+
+
+1
+    And, in accordance with our discussion of this topic in Chapter 3 once again, without coercions.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                               302
+Part IV / Subtyping and Inheritance                        Chapter 14 / Single Inheritance with Scalar Types
+
+
+around).1 Since IM Prescription 12 itself effectively assumes the same thing, it will clearly need
+some revision if that assumption is jettisoned.
+
+
+IM PRESCRIPTION 13: JOIN ETC. WITH INHERITANCE
+
+Let rx and ry be relations with a common attribute A, and let the declared types of A in rx and ry be
+DTx(A) and DTy(A), respectively. Consider the join of rx and ry (necessarily over A, at least in
+part). DTx(A) and DTy(A) shall have a nonempty common subtype and hence shall also have a
+most specific common supertype, T say. Then the declared type of A in the result of the join shall
+be T.
+      Analogous remarks apply to union, intersection, and difference operators. That is, in each
+case:
+
+    a.   Corresponding attributes of the operands shall be such that their declared types have a
+          nonempty common subtype.
+
+    b.   The declared type of the corresponding attribute of the result shall be the corresponding most
+          specific common supertype.
+
+                                           ———  ———
+
+This prescription should be easy enough to understand as stated,2 but it is worth examining in detail
+because it might be felt to be slightly counterintuitive in one particular respect. Consider the
+relations RX and RY shown in Fig. 14.1; note that the sole attribute A in RX is of declared type
+ELLIPSE and its counterpart A in RY is of declared type CIRCLE. We adopt the convention that
+values in the figure of the form Ei are ellipses that are not circles and values of the form Ci are
+circles. Most specific types are shown in lowercase italics.
+╔═════════════════════════════════════════════════════════════════╗
+║     ┌────┬─────────┐     ┌────┬────────┐     ┌────┬─────────┐   ║
+║ RX │ A : ELLIPSE │ RY │ A : CIRCLE │ RJ │ A : ELLIPSE │         ║
+║     ├════╧═════════┤     ├════╧════════┤     ├════╧═════════┤   ║
+║     │ E1 : ellipse │     │ C2 : circle │     │ C2 : circle │    ║
+║     │ C2 : circle │      │ C3 : circle │     └──────────────┘   ║
+║     └──────────────┘     └─────────────┘                        ║
+╚═════════════════════════════════════════════════════════════════╝
+Fig. 14.1: Join with inheritance (example)
+
+
+
+
+1
+  Such overloading might permit, e.g., a comparison to be performed between a U.K. sterling amount and a U.S. dollar
+amount, with implicit currency conversion either way. Again, you might care to meditate on some of the complexities
+involved in such an overloading.
+2
+ Except perhaps for the fact that if DTx(A) and DTy(A) have a nonempty common subtype, they necessarily do have a
+most specific common supertype as well (see Chapter 15).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                     303
+Part IV / Subtyping and Inheritance                Chapter 14 / Single Inheritance with Scalar Types
+
+
+      Now consider the join of RX and RY, RJ say (again, see Fig. 14.1). Clearly, every A value in
+RJ will necessarily be of type CIRCLE (because any A value in RX whose most specific type is
+merely ELLIPSE cannot possibly “compare equal” to any A value in RY). Thus, it might be
+thought that the declared type of attribute A in RJ should be CIRCLE, not ELLIPSE. But consider
+the following:
+
+ ■    Since RX and RY each have A as their sole attribute, RX JOIN RY reduces to RX
+      INTERSECT RY, and so the rule regarding the declared type of the result attribute for JOIN
+      must reduce to the analogous rule for INTERSECT.
+
+ ■    RX INTERSECT RY in turn is logically equivalent to RX MINUS (RX MINUS RY). Let the
+      result of the second operand here—i.e., RX MINUS RY—be RZ. Then it is clear that:
+
+      ●   RZ will include some A values of most specific type ELLIPSE, in general, and so the
+          declared type of attribute A in RZ must be ELLIPSE.
+
+      ●   The original expression thus reduces to RX MINUS RZ, where the declared type of
+          attribute A in both RX and RZ is ELLIPSE, and hence yields a final result in which the
+          declared type of attribute A must obviously be ELLIPSE once again.
+
+ ■    It follows that the declared type of the result attribute for INTERSECT, and therefore for
+      JOIN too, must indeed be as stated.
+
+       The foregoing discussion takes care of RX MINUS RY, too. What about RY MINUS RX?
+Clearly, every A value in the result of this latter expression will be of type CIRCLE, and so again it
+might be thought that the declared type of A in that result should be CIRCLE, not ELLIPSE.
+However, noting that RX INTERSECT RY is also logically equivalent to RY MINUS (RY MINUS
+RX), we can quickly see that specifying the declared type of A in the result of RY MINUS RX to be
+CIRCLE would lead to a contradiction. It follows that the declared type of the result attribute for
+MINUS too must indeed be as stated.
+       Finally, consider RX UNION RY. Here it should be obvious that the result will include some
+A values of most specific type ELLIPSE, in general, and so the declared type of attribute A in that
+result must necessarily be ELLIPSE. Thus, the declared type of the result attribute for UNION too
+must be as stated (but in the case of UNION this situation can hardly be described as
+counterintuitive).
+
+Further Discussion
+
+As you might perhaps expect, IM Prescription 13 has been the subject of much discussion between
+the present authors; indeed, it has given rise to several comments and questions from readers of
+previous editions of this book. The following question captures the essence of the issue at hand:
+
+      Let RJ and RM be RX JOIN RY and RX MINUS (RX MINUS RY), respectively; also,
+      assume (merely to simplify the discussion) that both expressions denote relations of
+      cardinality one. Suppose that—IM Prescription 13 notwithstanding—the declared type of A
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        304
+Part IV / Subtyping and Inheritance                 Chapter 14 / Single Inheritance with Scalar Types
+
+
+      in RJ is CIRCLE, while that of A in RM is ELLIPSE (because, let us assume, the system is
+      unable to determine that RJ and RM are equivalent). What are the implications?
+
+       One is that RM is now not always substitutable for RJ. For example, if C is a variable of
+declared type CIRCLE, the assignment C := A FROM (TUPLE FROM RJ) is valid but the
+assignment C := A FROM (TUPLE FROM RM) is not. The consequences of such a state of affairs
+being unclear, we prefer to invoke The Principle of Cautious Design [46] and the mantra “Further
+research is needed.” That way, if it proves possible to weaken IM Prescription 13 at a later time,
+existing applications will still work even though certain of their TREAT invocations might have
+become redundant (see IM Prescription 14).
+       That further research, by the way, is likely to involve research into expression analysis (of the
+kind used by optimizers, for example), in which case restriction conditions would perhaps need to
+be taken into account also. For example, consider the logically equivalent expressions RX WHERE
+FALSE and RX MINUS RX. As we will see in Chapter 16, the most specific type of attribute A in
+the (empty) relation denoted by each of these expressions is omega—but is it reasonable to expect
+that attribute to have that type as its declared type? And what if (for example) we replace that
+FALSE by some less obvious contradiction, such as the very slightly less obvious one NOT (A =
+A)? Consider also that for all relations r, r WHERE FALSE is equivalent to r JOIN TABLE_DUM.
+       It is worth noting in passing that the SQL standard [99] is in agreement with IM Prescription
+13.
+
+
+IM PRESCRIPTION 14: TREAT
+
+Let X be an expression, let T be a type, and let DT(X) and T have a nonempty common subtype.
+Then an operator of the form
+      TREAT_AS_T ( X )
+
+(or logical equivalent thereof) shall be supported. We refer to such operators generically as
+“TREAT” or “TREAT AS” operators; their semantics are as follows. First, if MST(X) is not a
+subtype of T, then a type error shall occur. Otherwise:
+
+ a.   If the TREAT invocation appears in a “source” position (for example, on the right side of an
+      assignment), then the declared type of that invocation shall be T, and the invocation shall
+      yield a result, r say, with MST(r) equal to MST(X) and v(r) equal to v(X).
+
+ b.   If the TREAT invocation appears in a “target” position (for example, on the left side of an
+      assignment), then that invocation shall act as a pseudovariable reference, which means it
+      shall actually designate its argument X (more precisely, it shall designate a version of X for
+      which DT(X) is equal to T but MST(X) and v(X) are unchanged).
+
+                                      ———  ———
+
+Consider the following code fragment once again:
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        305
+Part IV / Subtyping and Inheritance                Chapter 14 / Single Inheritance with Scalar Types
+
+
+       VAR E ELLIPSE ;
+       VAR C CIRCLE ;
+
+       C := CIRCLE ( ... ) ;
+       E := C ;
+
+      As explained under IM Prescription 11, what does not happen here is that the circle value of C
+gets converted to “just type ELLIPSE,” because if such a conversion were to occur, then we would
+no longer be able to ask for the radius of the circle that is now the current value of E. Suppose now
+that we do want to ask for that radius. We might try:
+      VAR L LENGTH ;
+
+      L := THE_R ( E ) ;        /* invoke “the radius of” : TYPE ERROR! */
+
+      The expression on the right side of the assignment here gives a compile-time type error,
+because variable E is of declared type ELLIPSE and THE_R is defined in terms of a parameter of
+declared type CIRCLE (loosely, THE_R does not apply to ellipses). Note: If the compile-time type
+check were not done, we would get a run-time type error instead—which is worse—if the current
+value of E at run time were only an ellipse and not a circle. In the case at hand, of course, we do
+know that the value at run time will be a circle; the trouble is, we know this, but the compiler does
+not.
+      TREAT is intended to address such situations. The correct way to obtain the radius in the
+example is as follows:
+      L := THE_R ( TREAT_AS_CIRCLE ( E ) ) ;
+
+     The expression TREAT_AS_CIRCLE(E) is defined to have declared type CIRCLE, so the
+compile-time type checking now succeeds. Then, at run time:
+
+ ■    If the current value of E is indeed of type CIRCLE, then the overall expression does correctly
+      turn the radius of that circle. More precisely, the TREAT invocation yields a result, Z say,
+      with (a) MST(Z) equal to MST(E), which is CIRCLE in the example, and (b) v(Z) equal to
+      v(E); then (c) the expression “THE_R(Z)” is evaluated, to give the desired radius (which can
+      then be assigned to L).
+
+ ■    However, if the current value of E is only of type ELLIPSE, not CIRCLE, then the TREAT
+      fails on a run-time type error.
+
+    In other words, the expression TREAT_AS_CIRCLE(E) is logically equivalent to an IF-
+THEN-ELSE expression along the following lines:
+      IF IS_CIRCLE ( E )
+         THEN CIRCLE ( THE_A ( E ), THE_CTR ( E ) )
+         ELSE type error
+      END IF
+
+      The broad intent of IM Prescription 14 is to ensure that run-time type errors can occur only in
+the context of a TREAT invocation.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      306
+Part IV / Subtyping and Inheritance               Chapter 14 / Single Inheritance with Scalar Types
+
+
+      Suppose now, as in our discussion of IM Prescription 10, that CIRCLE in turn has a proper
+subtype, O_CIRCLE say, where an “O-circle” is a circle that is centered on the origin. Then the
+current value of variable E at some given time might be of most specific type O_CIRCLE instead of
+just CIRCLE. If it is, then the invocation
+      TREAT_AS_CIRCLE ( E )
+
+will succeed, and will yield a result, Z say, with MST(Z) equal to O_CIRCLE, because O_CIRCLE
+is the most specific type of E, and v(Z) equal to v(E). (The declared type is, of course, CIRCLE,
+because of the “..._AS_CIRCLE” specification.) In other words (loosely): TREAT always leaves
+the most specific type alone, it never “pushes it up” to make it less specific than it was before.
+       Here now is an example of the use of TREAT in a pseudovariable context. Let the current
+value of variable E, of declared type ELLIPSE, be of type CIRCLE (i.e., let MST(E) be some
+subtype of CIRCLE). Now consider the following assignment:
+      THE_R ( TREAT_AS_CIRCLE ( E ) ) := LENGTH ( 5.0 ) ;
+
+       Observe that the argument to THE_R on the left side is of declared type CIRCLE. Assume
+for the moment that MST(E) is exactly CIRCLE, not some proper subtype of CIRCLE. Then the
+assignment will set the value of E to be a circle with radius five (and with center unchanged, i.e.,
+equal to THE_CTR(E) as it was prior to the assignment). MST(E) will still be CIRCLE after the
+update.
+       Now assume again that CIRCLE has a proper subtype O_CIRCLE, and the current value of E
+is of most specific type O_CIRCLE instead of just CIRCLE. Then the assignment will set the value
+of E to be an O-circle with radius five (MST(E) will still be O_CIRCLE after the update).
+       Of course, we already know that THE_ pseudovariables are logically unnecessary. For
+example, the assignment shown above is logically equivalent to the following:
+      TREAT_AS_CIRCLE ( E ) := CIRCLE ( LENGTH ( 5.0 ), THE_CTR ( E ) ) ;
+
+And this assignment in turn is logically equivalent to the following (pseudocode):
+      E := IF IS_CIRCLE ( E )
+              THEN CIRCLE ( LENGTH ( 5.0 ), THE_CTR ( E ) )
+              ELSE type error
+           END IF ;
+
+    By way of another example, assume again that the current value of E is of most specific type
+O_CIRCLE, and consider the following assignment:
+      THE_CTR ( TREAT_AS_CIRCLE ( E ) ) := POINT ( 1.0, 0.0 ) ;
+
+This one is equivalent to:
+      TREAT_AS_CIRCLE ( E ) := CIRCLE ( THE_R ( TREAT_AS_CIRCLE ( E ) ),
+                                        POINT ( 1.0, 0.0 ) ) ;
+
+As a consequence, generalization by constraint occurs (see IM Prescription 11) and MST(E) ceases
+to be O_CIRCLE and becomes CIRCLE instead.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                     307
+Part IV / Subtyping and Inheritance                           Chapter 14 / Single Inheritance with Scalar Types
+
+
+TREAT and Single Inheritance
+
+Given the expression TREAT_AS_T(X), IM Prescription 14 requires only that T and DT(X) have a
+nonempty common subtype (this is a compile-time check). In all of our discussions thus far,
+however, T has actually been a proper subtype of DT(X)—in most cases, T has been CIRCLE and
+DT(X) has been ELLIPSE—and the nonempty common subtype in question has thus just been T
+itself (CIRCLE). And indeed T normally would be a proper subtype of DT(X) in practice; our
+discussions have been completely realistic in this respect. But there is no reason to insist on this
+state of affairs, and in fact it might be undesirable to do so if multiple inheritance is supported (see
+the next chapter). With single inheritance, however, to say that T and DT(X) have a nonempty
+common subtype is merely to say that one must be a nonempty subtype of the other (not necessarily
+a proper subtype, of course). In terms of our usual variables E and C, for example, the expression
+         TREAT_AS_CIRCLE ( E )
+
+is syntactically valid, as we already know (though it might fail at run time). More to the point, the
+expression
+         TREAT_AS_ELLIPSE ( C )
+
+is also syntactically valid (and it cannot possibly fail at run time).
+       Note: We do not mean to claim that an expression of the form TREAT_AS_ELLIPSE(C) is
+particularly useful; we permit it mainly because there seems little reason not to—also because
+general-purpose applications have a tendency to come up with surprising requirements of this
+nature.
+
+Syntactic Shorthands
+
+Support for the following slightly more general form of TREAT (both operator and pseudovariable
+versions) would also be desirable in practice:
+         TREAT_AS_SAME_TYPE_AS ( Y, X )
+
+     Here X and Y are scalar expressions such that DT(Y) and DT(X) have a nonempty common
+subtype, and the overall expression is equivalent to the expression
+         TREAT_AS_T ( X )
+
+where T is DT(Y). Note: Since DT(Y) is known at compile time, this more general form of TREAT
+is strictly unnecessary; we include it for reasons of user friendliness, convenience, and consistency
+with the tuple- and relation-type versions of TREAT to be discussed in Chapter 16.
+       Support for the following new relational operator1 would also be convenient in practice:
+         R TREAT_AS_T ( A )
+
+
+
+1
+    And a tuple operator analog, too, and corresponding tuple and relational pseudovariables.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                               308
+Part IV / Subtyping and Inheritance                   Chapter 14 / Single Inheritance with Scalar Types
+
+
+      Here R is a relational expression, A is an attribute of the relation denoted by that expression,
+and T is a type. The overall expression is defined to be equivalent to the following:
+      UPDATE R ( A := TREAT_AS_T ( A ) )
+
+The obvious generalized form should be supported too:
+      R TREAT_AS_SAME_TYPE_AS ( Y, A )
+
+
+IM PRESCRIPTION 15: TYPE TESTING
+
+Let X be an expression, let T be a type, and let DT(X) and T have a nonempty common subtype.
+Then a logical operator of the form
+      IS_T ( X )
+
+(or logical equivalent thereof) shall be supported. The operator shall return TRUE if v(X) is of
+type T, FALSE otherwise.
+
+                                        ———  ———
+
+The general intent here is simply that defining a given type should cause “automatic” provision of
+an operator for testing values to see whether they are of the type in question. Note that the declared
+type of the argument and the type in question must have a nonempty common subtype (this is a
+compile-time check). Thus, for example, if E is of declared type ELLIPSE, the expression
+      IS_SQUARE ( E )
+
+is invalid (it will fail on a compile-time type error).
+
+IS_T and Single Inheritance
+
+Given the expression IS_T(X), T would typically be a proper subtype of DT(X) in practice. But
+there is no reason to insist on this requirement, and in fact it might be undesirable to do so if
+multiple inheritance is supported (see the next chapter). With single inheritance, however, to say
+that T and DT(X) have a nonempty common subtype is merely to say that one must be a nonempty
+subtype of the other (not necessarily a proper subtype, of course). In terms of our usual variables E
+and C, for example, the expression
+      IS_CIRCLE ( E )
+
+is clearly valid (though it might give FALSE). More to the point, the expression
+      IS_ELLIPSE ( C )
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         309
+Part IV / Subtyping and Inheritance                  Chapter 14 / Single Inheritance with Scalar Types
+
+
+is also valid (and it cannot possibly give FALSE). Note: We do not mean to claim that an
+expression of the form IS_ELLIPSE(C) is particularly useful; we permit it for the same kinds of
+reasons we permit expressions like TREAT_AS_ELLIPSE(C).
+
+Syntactic Shorthands
+
+Support for the following slightly more general form of IS_T would be desirable in practice:
+      IS_SAME_TYPE_AS ( Y, X )
+
+     Here X and Y are scalar expressions such that DT(Y) and DT(X) have a nonempty common
+subtype, and the overall expression is equivalent to the expression
+      IS_T ( X )
+
+where T is DT(Y). Note: Since DT(Y) is known at compile time, this more general form of IS_T is
+strictly unnecessary; we include it for reasons of user friendliness, convenience, and consistency
+with the tuple- and relation-type versions of TREAT to be discussed in Chapter 16.
+       Support for the following new relational operator would also be convenient in practice:
+      R : IS_T ( A )
+
+      Here R is a relational expression and A is an attribute of the relation—r, say—denoted by that
+expression. T and the declared type DT(A) of A must have a nonempty common subtype. The
+value of the overall expression is a relation with:
+
+ a.   A heading the same as that of r, except that the declared type of attribute A in that heading is
+      T
+
+ b.   A body consisting of those tuples of r in which attribute A contains a value of type T, except
+      that the declared type of attribute A in each of those tuples is T
+
+    Consider the following example. Suppose relvar R includes an attribute A of declared type
+ELLIPSE. Then (assuming the obvious operator precedence) the expression
+      R : IS_CIRCLE ( A ) WHERE THE_R ( A ) > LENGTH ( 2.0 )
+
+returns those tuples of R in which the A value is a circle with radius greater than two—or, more
+precisely, it returns a relation with (a) a heading the same as that of R, except that the declared type
+of attribute A in that result is CIRCLE instead of ELLIPSE, and (b) a body consisting of just those
+tuples from R in which the A value is of type CIRCLE and the radius for the circle in question is
+greater than two. By contrast, the expression
+      R WHERE THE_R ( A ) > LENGTH ( 2.0 )
+
+is invalid—it fails on a compile-time type error—since THE_R is not defined for type ELLIPSE
+(ELLIPSE being the declared type of attribute A of relation R).
+      Note that the (valid) expression
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          310
+Part IV / Subtyping and Inheritance                 Chapter 14 / Single Inheritance with Scalar Types
+
+
+      R : IS_CIRCLE ( A ) WHERE THE_R ( A ) > LENGTH ( 2.0 )
+
+is almost but not quite equivalent to the following (also valid) expression:
+      R WHERE CASE
+                 WHEN IS_CIRCLE ( A ) THEN
+                    THE_R ( TREAT_AS_CIRCLE ( A ) ) > LENGTH ( 2.0 )
+                 WHEN NOT ( IS_CIRCLE ( A ) ) THEN FALSE
+              END CASE
+
+      The difference is that this latter expression yields a relation with the same heading as R, rather
+than one in which the declared type of attribute A is CIRCLE instead of ELLIPSE.
+      More generally, however, the expression
+      R : IS_T ( A )
+
+is equivalent to, and therefore shorthand for, the following expression:
+      ( R WHERE IS_T ( A ) ) TREAT_AS_T ( A )
+
+Moreover, this latter expression is itself shorthand for a longer one (see the previous section).
+      We observe that a slightly more general form of the “R:IS_T(A)” operator could also be
+useful:
+      R : IS_SAME_TYPE_AS ( Y, A )
+
+Here Y is an expression such that DT(A) and DT(Y) have a nonempty common subtype, and the
+overall expression is equivalent to the expression
+      R : IS_T ( A )
+
+where T is DT(Y). Note: Once again, since DT(Y) is known at compile time, this more general
+form of the operator is strictly unnecessary; we include it for reasons of user friendliness,
+convenience, and consistency with the tuple- and relation-type versions to be discussed in Chapter
+16.
+      Finally, we remark that “most specific type” counterparts to all of the foregoing operators
+could also be provided if desired. For example, we could define the operator
+      IS_MS_T ( X )
+
+to give TRUE if MST(X) is T, FALSE otherwise. (It might help to observe that, e.g., whereas the
+operator IS_ELLIPSE is perhaps best rendered into natural language as “is an ellipse,” the operator
+IS_MS_ELLIPSE is probably better rendered as “is most specifically an ellipse”). Other possible
+“most specific type” operators include the following (the semantics should be obvious in every
+case):
+ ■    IS_SAME_MS_TYPE_AS ( Y, X )
+
+ ■    R : IS_MS_T ( A )
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         311
+Part IV / Subtyping and Inheritance                            Chapter 14 / Single Inheritance with Scalar Types
+
+
+    ■    R : IS_SAME_MS_TYPE_AS ( Y, A )
+
+      However, we see no compelling need for any of these operators; in fact, it is easy to see that
+they are logically unnecessary (exercise for the reader).
+
+
+IM PRESCRIPTION 16: READ-ONLY OPERATOR INHERITANCE
+                    AND VALUE SUBSTITUTABILITY
+
+Let Op be a read-only operator, let P be a parameter to Op, and let T be the declared type of P.
+Then the declared type (and therefore, necessarily, the most specific type) of the argument A
+corresponding to P in an invocation of Op shall be allowed to be any subtype T' of T. In other
+words, the read-only operator Op applies to values of type T and therefore, necessarily, to values of
+type T'—The Principle of (Read-Only) Operator Inheritance. It follows that such operators are
+polymorphic, since they apply to values of several different types—The Principle of (Read-Only)
+Operator Polymorphism. It further follows that wherever a value of type T is permitted, a value
+of any subtype of T shall also be permitted—The Principle of (Value) Substitutability.
+
+                                               ———  ———
+
+As we have seen, subtyping implies that a reference to a variable of declared type T can in fact
+denote a value of any subtype of T. What we have not emphasized prior to this point is that it also
+implies that an invocation of a read-only operator with declared type T can likewise denote a value
+of any subtype of T.1 This latter fact is an immediate consequence of The Principle of Value
+Substitutability, as can be seen from the following rather trivial example:
+         OPERATOR EORC ( B BOOLEAN ) RETURNS ELLIPSE ;
+            RETURN ( IF B THEN ELLIPSE ( 5.0, 4.0, POINT ( 1.0, 2.0 ) )
+                          ELSE CIRCLE ( 5.0, POINT ( 1.0, 2.0 ) )
+                     END IF ) ;
+         END OPERATOR ;
+
+       Note that we are within our rights here when we specify in the ELSE portion of the IF ... END
+IF expression that a circle be returned instead of “just an ellipse,” thanks to value substitutability.
+Note too that the ELLIPSE selector invocation in the THEN portion does indeed return “just an
+ellipse” and not a circle. Thus, an invocation of the read-only operator EORC returns either a circle
+or just an ellipse, depending on the value of the argument corresponding to the BOOLEAN
+parameter B.
+       Here is a simpler example that illustrates much the same point:
+         OPERATOR COPY ( E ELLIPSE ) RETURNS ELLIPSE ;
+            RETURN ( E ) ;
+         END OPERATOR ;
+
+An invocation of COPY returns either a circle or just an ellipse, depending on the most specific type
+of the argument corresponding to its ELLIPSE parameter E.
+
+1
+    Though we do know that this property applies to selectors in particular, thanks to S by C (see IM Prescription 10).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                           312
+Part IV / Subtyping and Inheritance                             Chapter 14 / Single Inheritance with Scalar Types
+
+
+      Now, this property—that if Op is a read-only operator, then the most specific type of the
+value returned from an invocation of Op can be any subtype T' of the declared type T of Op—is
+sometimes referred to as result covariance, although we dislike this term for several reasons and do
+not use it much ourselves. One reason we dislike it is this: The term is presumably meant to reflect
+the fact that the type of the result “covaries” with the type of the argument (which is indeed what
+happens in the COPY example). But there seems to be a tacit assumption that there is exactly one
+argument! In the case of the operator MOVE, for example (see later in this section), the result type
+covaries with the type of the first argument but not that of the second. Moreover, the result type can
+“covary” even if the argument type remains fixed (see the EORC example), or even if there are no
+explicit arguments at all (imagine an operator that returns a circle on weekdays but just an ellipse at
+weekends).
+      Be that as it may, note carefully that the “result covariance” phenomenon can occur even if
+either of the following is true:
+
+    ■   No separate implementation versions of Op have been defined as described under IM
+        Prescription 17 (see EORC and COPY for examples)
+
+    ■   No argument has a most specific type that is a proper subtype of the declared type of the
+        corresponding parameter (see EORC for an example)
+
+       Now we can explain the remark we made under IM Prescription 11 earlier to the effect that
+(a) the fact that the user might like to know which implementation version of a given polymorphic
+operator Op is invoked does not undermine (b) our claim that the user’s perception is still that there
+is really just a single operator. The point is, the semantics of Op can—and should—be explained to
+the user in such a way as to take into account any variations in the most specific types of its
+arguments (if applicable). For example, the semantics of COPY are simply that it returns a copy of
+its argument; thus, if it is passed a circle, it returns a circle, and if it is passed “just an ellipse,” it
+returns “just an ellipse.” And the semantics of EORC are that it returns either a circle or “just an
+ellipse,” depending on the value (FALSE or TRUE, respectively) of the argument corresponding to
+the parameter B.
+       Next, there is another concept, argument contravariance, that is also described in the
+literature and seems to be vaguely related to the concept of result covariance. We do not include
+this concept in our own inheritance model, however, because we believe it stems from (at best) a
+confusion over the model vs. implementation distinction, and quite possibly from a flawed
+definition of the very concept of subtype as well.1 On the other hand, we do think it worth trying to
+explain what the concept is, in order to be able to explain exactly why we reject it. By way of
+example, then, suppose we have an operator MOVE with a specification signature (see IM
+Prescription 17) that looks like this:
+
+
+1
+   The definition in question is flawed because it is circular (not recursive!): “A type T' is a subtype of a type T if ... for
+each method M of T there is a corresponding method M' of T' such that ... the ith argument type of M is a subtype of the
+ith argument type of M' (rule of contravariance in arguments) ...” (paraphrased from reference [7], boldface added). In
+other words, the concept of some type being a subtype of another is defined in terms of the concept of some type being
+a subtype of another. Note too that the definition seems to be saying T' is a subtype of T if substitutability applies,
+whereas we say that substitutability applies if T' is a subtype of T.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                               313
+Part IV / Subtyping and Inheritance                         Chapter 14 / Single Inheritance with Scalar Types
+
+
+       MOVE ( ELLIPSE, SQUARE ) RETURNS ELLIPSE
+
+       The purpose of MOVE is, loosely, to “move” its first argument (an ellipse) so that it is
+centered on the center of the second (a square). More precisely, an invocation of MOVE returns a
+result that is just like its first argument except that it is “located somewhere else”—it is, to repeat,
+centered on the center of the second argument. The implementation code for (the most general
+version of) this operator might look like this:
+       OPERATOR MOVE ( E ELLIPSE, S SQUARE ) RETURNS ELLIPSE VERSION E_MOVE ;
+          RETURN ( ELLIPSE ( THE_A ( E ), THE_B ( E ), CTR ( S ) ) ) ;
+       END OPERATOR ;
+
+      We have assumed that an operator CTR has been defined that returns the center of its
+argument (a square). Also, the VERSION specification in the second line introduces a
+distinguishing name, E_MOVE, for this particular version of MOVE (implementation versions are
+discussed under IM Prescription 17).
+      Now let us assume that for some reason1 another version of MOVE, C_MOVE say, has been
+defined that moves circles in particular instead of ellipses in general (see IM Prescription 17 once
+again):
+       OPERATOR MOVE ( C CIRCLE, S SQUARE ) RETURNS CIRCLE VERSION C_MOVE ;
+          RETURN ( CIRCLE ( THE_R ( C ), CTR ( S ) ) ) ;
+       END OPERATOR ;
+
+      This version always returns a circle, whereas the previous version (E_MOVE) sometimes
+returns “just an ellipse.”
+      Now let variables E and S be of declared types ELLIPSE and SQUARE, respectively, but
+suppose the current value of E is of type CIRCLE. Consider the MOVE invocation
+       MOVE ( E, S )
+
+      The system performs a compile-time type check on this expression; that check succeeds, of
+course. Then, at run time, it discovers that argument E is of type CIRCLE and argument S is of
+type SQUARE, and it therefore invokes the version of MOVE that applies to circles and squares
+(namely, C_MOVE). But it would also invoke C_MOVE if the declared type of the parameter
+corresponding to argument S in C_MOVE were some proper supertype of SQUARE (a proper
+supertype, that is, for which the concept of having a center makes sense). It might, for example, be
+RECTANGLE, as here:2
+       OPERATOR MOVE ( C CIRCLE, R RECTANGLE ) RETURNS CIRCLE
+       VERSION C_MOVE ; /* revised */
+          RETURN ( CIRCLE ( THE_R ( C ), CTR ( R ) ) ) ;
+       END OPERATOR ;
+
+1
+  The exact reason is not important here—in fact, there might be no good reason at all. See IM Prescription 19 for
+further discussion.
+2
+  Note that the revised version of C_MOVE shown here would not be valid in our model, however, because the version
+signature is incompatible with the specification signature as previously defined (RECTANGLE is not a subtype of
+SQUARE!) Once again, see IM Prescription 17 for a detailed discussion of signatures.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                          314
+Part IV / Subtyping and Inheritance                 Chapter 14 / Single Inheritance with Scalar Types
+
+
+       This property—that if the declared type of one parameter to operator Op (in some version of
+Op) is further specialized, then the declared type of another parameter (in that same version of Op)
+can be further generalized—is the argument contravariance property. Again, however, we dislike
+this term for several reasons and do not use it much ourselves. One reason we dislike it is this: The
+term is presumably meant to reflect the fact that the type of one argument “contravaries” with that
+of another. But it is really parameters that “contravary,” not arguments, so at the very least the
+term ought to be parameter contravariance. And in any case there seems to be a tacit assumption
+that there are exactly two parameters! In the case of MOVE, there are indeed two parameters,
+which “contravary”; but what if there had been three?
+       Note further that “argument contravariance” differs from “result covariance” in that it must be
+made explicit (by explicitly defining appropriate implementation versions of the operator in
+question), because it refers to the declared types of parameters to such versions.
+       Anyway, regardless of whether or not we accept the term “argument contravariance,” we
+frankly do not find the concept very useful, nor very helpful. Rather, it seems clearer to us to talk in
+terms of argument-type combinations. Consider the MOVE operator once again. Presumably the
+person responsible for defining that operator will tell the user that it takes two arguments, of types
+ELLIPSE and RECTANGLE respectively—please notice that RECTANGLE, not SQUARE as
+previously—and returns a result of type ELLIPSE. (After all, to the user there is just one MOVE
+operator, regardless of how many implementation versions might exist under the covers.) Then,
+because of value substitutability, the user knows that:
+
+ ■    The arguments to any given MOVE invocation can be of any subtypes of ELLIPSE and
+      RECTANGLE, respectively.
+
+ ■    The result can be of any subtype of ELLIPSE.
+
+      However, the user also has to know that certain combinations of most specific argument types
+are not allowed. To be precise:
+
+ ■    The combination ELLIPSE-SQUARE (which corresponds to the implementation version
+      called E_MOVE and gives a result of most specific type ELLIPSE) is allowed.
+
+ ■    The combination CIRCLE-RECTANGLE (which corresponds to the version called C_MOVE
+      and gives a result of most specific type CIRCLE) is allowed.
+
+ ■    However, the combination ELLIPSE-RECTANGLE is not allowed.
+
+       So the obvious question arises: Why did the person who defined the operator impose such a
+strange restriction? Does it not constitute a violation of value substitutability? (After all, ELLIPSE
+is a subtype of ELLIPSE and RECTANGLE is a subtype of RECTANGLE, so we should surely be
+able to invoke the operator and pass it an ellipse per se and a rectangle per se.) In fact, the
+restriction might be regarded as a violation of orthogonality too, because there is an unpleasant—
+and unexplained—interdependence between the two arguments to any given invocation.
+       We believe there is no good reason for imposing such strange restrictions. Therefore, IM
+Prescription 16 requires simply that read-only operators be defined in such a way as to allow the
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         315
+Part IV / Subtyping and Inheritance                 Chapter 14 / Single Inheritance with Scalar Types
+
+
+most specific type of any given argument to any given invocation of any given operator to be the
+same as the declared type of the corresponding parameter. Indeed, it seems perverse to us to do
+otherwise! And if this discipline is followed, then we can forget about the “argument
+contravariance” concept entirely.
+      Note: The foregoing paragraph needs a tiny refinement to take care of the possibility that a
+parameter might be declared to be of some union type. A union type cannot be the most specific
+type of anything, by definition (see IM Prescription 20). Hence, if parameter P has declared type T
+and T is a union type, the most specific type of any argument corresponding to P is limited to being
+some subtype of T', where T' is the least specific subtype of T that is not a union type. See IM
+Prescription 20 for further explanation.
+
+
+IM PRESCRIPTION 17: OPERATOR SIGNATURES
+
+Any given operator Op shall have exactly one specification signature, a nonempty set of version
+signatures, and a nonempty set of invocation signatures. For definiteness, assume the parameters
+of Op and the arguments appearing in any given invocation of Op each constitute an ordered list of
+n elements (n  0), such that the ith argument corresponds to the ith parameter. Then:
+
+ a.   The specification signature shall denote Op as perceived by potential users. It shall consist of
+      the operator name Op, the declared types (in order) of the parameters to Op, and the
+      declared type of the result, if any, of executing Op. No two distinct operators shall have
+      specification signatures that differ only in the declared types of their results (if any).
+      Moreover, let S be a set of types with a nonempty common subtype. Then no two distinct
+      operators shall have specification signatures that differ only in that, for some i, j, ..., k, the
+      declared types of their ith parameters are distinct members of S, the declared types of their jth
+      parameters are distinct members of S, ..., and the declared types of their kth parameters are
+      distinct members of S.
+
+ b.   There shall be one version signature for each implementation version V of Op. Each such
+      signature shall consist of the operator name Op (and possibly the version name V), the
+      declared types (in order) of the parameters to V, and the declared type of the result, if any, of
+      executing V.
+
+ c.   There shall be one invocation signature for each possible combination of most specific
+      argument types to an invocation of Op. Each such signature shall consist of the operator
+      name Op and the pertinent combination of most specific argument types (in order). Note:
+      The invocation signatures for Op can easily be derived from the corresponding specification
+      signature, but the concepts are logically distinct.
+
+Every version of Op shall implement the same semantics.
+
+                                      ———  ———
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        316
+Part IV / Subtyping and Inheritance                         Chapter 14 / Single Inheritance with Scalar Types
+
+
+Although the point is not strictly part of our inheritance model per se, it is important to understand
+that if the code that implements a given operator needs access to some possible representation1 of
+some argument value v that is available only if v is of type T' and not just of type T, then—as
+explained under IM Prescription 9—two distinct versions of that code will probably have to exist
+under the covers. As also explained under IM Prescription 9, distinct implementation versions
+might also be desirable, even if logically unnecessary, if improved efficiency can be achieved by
+such means. Moreover, it is never logically wrong to implement additional versions, regardless of
+whether they are actually necessary. Note: If distinct versions are not provided, then (as mentioned
+under IM Prescription 9 once again) we have code reuse: The very same implementation code can
+operate upon arguments of different types. Observe, however, that here we are talking about reuse
+of “under the covers” code, not reuse of some program that invokes that “under the covers” code.
+       As a consequence of the foregoing, it should be clear that we need to distinguish carefully
+between any given operator Op as perceived by the user, on the one hand, and implementation
+versions under the covers of that operator Op on the other. It should also be clear that we need to
+distinguish carefully between the operator Op together with its implementation versions, on the one
+hand, and various possible invocations of Op on the other. The concept of signatures is intended to
+help make these distinctions.
+       We can define the term signature (or operator signature, to be more specific), a little loosely,
+as the combination of the name of the operator in question and the types of the operands and result
+(if any) for that operator. As you have probably come to expect by now, however, we need to be
+very careful once again over certain logical differences—namely, those between:
+
+    ■     Arguments and parameters
+
+    ■     Declared types and most specific types
+
+    ■   Operators as seen by the user and operators as seen by the system (meaning, in this latter case,
+        implementation versions of the operator under the covers)
+
+        In fact, we can distinguish three kinds of signatures that apply to any given operator Op:2
+
+    ■   First, there is exactly one specification signature, consisting of the operator name Op
+        together with the declared types, in order, of the parameters (and the declared type of the
+        result, if any), as perceived by potential Op users. For example, the specification signature for
+        the operator MOVE (see IM Prescription 16) might look like this:
+        MOVE ( ELLIPSE, RECTANGLE ) RETURNS ELLIPSE
+
+
+
+
+1
+    Or (worse) some physical representation.
+2
+  We should mention that different writers and different languages ascribe slightly different meanings to the term
+signature anyway; for example, it is sometimes taken to include operand names (we do not include such names
+ourselves because we are assuming for simplicity that argument/parameter matching is done on the basis of ordinal
+position, as in Tutorial D).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                          317
+Part IV / Subtyping and Inheritance                         Chapter 14 / Single Inheritance with Scalar Types
+
+
+        The specification signature thus corresponds to the user’s understanding of what the operator
+        looks like. More precisely, it is necessary but not sufficient for such an understanding; it is
+        not sufficient, because it fails to capture the “result covariance” property. Unfortunately,
+        none of the signatures is sufficient in this sense, as consideration of operator EORC will
+        easily show.
+             Note: It would be possible to capture more (though still not all) of the “result
+        covariance” property by including parameter names in the specification signature and then
+        allowing the RETURNS specification to refer to those names accordingly. Under such a
+        scheme, the specification signature for MOVE might look like this:
+        MOVE ( E ELLIPSE, R RECTANGLE ) RETURNS SAME_TYPE_AS ( E )
+
+        The intent here is that an invocation of MOVE returns a result of the same declared type as
+        that of the argument corresponding to its first (ellipse) parameter.1 However, it is easy to see
+        that such a scheme is still inadequate, in general; for example, consider an operator that
+        returns a square if invoked with a circle, but “just a rectangle” (not a square) if invoked with a
+        noncircular ellipse.
+
+    ■   Second, there is one version signature for each implementation version of Op, each
+        consisting of the operator name Op (and possibly a version name) together with the declared
+        types, in order, of the parameters (and the declared type of the result, if any) as defined for
+        that version. For example, the following version signatures might have been defined for
+        MOVE (note the version names):
+        MOVE ( ELLIPSE, RECTANGLE ) RETURNS ELLIPSE VERSION ER_MOVE
+
+        MOVE ( ELLIPSE, SQUARE ) RETURNS ELLIPSE VERSION ES_MOVE
+
+        MOVE ( CIRCLE, RECTANGLE ) RETURNS CIRCLE VERSION CR_MOVE
+
+        MOVE ( CIRCLE, SQUARE ) RETURNS CIRCLE VERSION CS_MOVE
+
+
+
+
+1
+  Suppose such syntax for specification signatures is in fact supported. Let variable C be of
+declared type CIRCLE. Then the user might be allowed to write, e.g.,
+        THE_R ( MOVE ( C, ... ) )
+
+
+instead of what would otherwise be required, viz.:
+        THE_R ( TREAT_AS_CIRCLE ( MOVE ( C, ... ) ) )
+
+Note that relaxing the rules (as it were) in this way would not depend on the existence of different implementation
+versions, because the SAME_TYPE_AS specification guarantees that the result is of the declared type of the indicated
+argument. Indeed, we would not consider the mere fact that different versions exist to be sufficient justification for
+allowing TREATs to be omitted in such a manner (we certainly do not want to expose the concept of implementation
+versions to the user). On the other hand, if it turns out that such TREATs cannot be omitted, then we might at least
+expect the implementation to optimize them away, since they will effectively be “no ops.”
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                        318
+Part IV / Subtyping and Inheritance               Chapter 14 / Single Inheritance with Scalar Types
+
+
+     The version signatures thus correspond to the various pieces of implementation code that
+     implement the operator under the covers. We remark that the availability of version names
+     implies among other things that it might be possible to destroy—i.e., drop—a specific version
+     without having to destroy the corresponding operator in its entirety.
+          By the way, we deliberately show a distinct version signature in the foregoing example
+     for each possible combination of most specific argument types (i.e., one version signature for
+     each possible invocation signature—see the next paragraph). In practice, however, it is
+     unlikely that there will always be such a one-to-one match between version and invocation
+     signatures. We will return to this point later in this section.
+          Note: If overloading is supported, it might be necessary for certain version signatures to
+     include a reference to the specification signature for the operator they implement—perhaps
+     like this:
+     MOVE ( CIRCLE, SQUARE ) RETURNS CIRCLE
+     VERSION CS_MOVE FOR MOVE ( ELLIPSE, RECTANGLE )
+
+     (Clearly there is no need to include the RETURNS portion of the specification signature,
+     however.)
+
+ ■   Third, there is one invocation signature for each possible combination of most specific
+     argument types to an invocation of Op, each consisting of the operator name Op together with
+     the corresponding combination of most specific argument types, in order (the result type, if
+     any, is obviously irrelevant here). These signatures correspond to various possible
+     invocations of Op. For example, the invocation signatures that apply to MOVE are basically
+     as follows:
+     MOVE ( ELLIPSE, RECTANGLE )
+
+     MOVE ( ELLIPSE, SQUARE )
+
+     MOVE ( CIRCLE, RECTANGLE )
+
+     MOVE ( CIRCLE, SQUARE )
+
+     Different invocation signatures involving the same operator thus correspond, at least
+     potentially, to different implementation versions under the covers of the operator in question.
+     Thus, if several versions of “the same” operator do in fact exist under the covers, then which
+     version is invoked on any given occasion will depend on which version signature is the best
+     match for the applicable invocation signature. The process of deciding that best match—i.e.,
+     the process of deciding which version to invoke—is known variously as run-time binding (our
+     own preferred term) or dynamic binding or dynamic dispatch or function resolution or subject
+     routine determination (this last is the SQL term).
+          Note: Actually, a certain amount of compile-time binding might be possible too, based
+     on argument declared types (certainly known to the compiler) and version signatures (at least
+     potentially known to the compiler). For example, if the user invokes MOVE with arguments
+     of declared types CIRCLE and SQUARE, the compiler—rather than the run-time system—
+     should be able to determine that the version CS_MOVE is the one to be invoked, since
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                     319
+Part IV / Subtyping and Inheritance                 Chapter 14 / Single Inheritance with Scalar Types
+
+
+      CIRCLE and SQUARE are both leaf types and no “lower” version of MOVE can possibly
+      exist.
+
+More on Run-Time Binding
+
+Let Op be a polymorphic operator and let OpI be some invocation of Op. As we have seen, the
+specific version of Op to be invoked for OpI will be determined on the basis of consideration of the
+most specific types of the arguments to that invocation OpI. We propose that every argument be
+able to participate equally in this process. In other words (and as in fact previously indicated under
+OO Very Strong Suggestion 2 in Chapter 11), we do not much care for the notion, supported by
+certain object systems, that an operator might have a special “distinguished” or “receiver” or
+“target” parameter, such that the corresponding argument plays some special role in the run-time
+binding process. To elaborate briefly: Treating one argument as special has the obvious advantage
+that it makes the run-time binding process simpler—simpler for the system, that is—because that
+process involves determining the most specific type of just that one argument. But it has certain
+obvious disadvantages too, not the least of which is that it can make it harder for the implementer to
+write the implementation code. For example:
+
+ ■    Suppose the first MOVE argument (i.e., the ellipse-or-circle argument) is chosen as the
+      special one. Then there could be at most two distinct implementation versions of MOVE, one
+      for moving a circle and one for moving just an ellipse; in effect, versions ER_MOVE and
+      ES_MOVE would be combined into a single version, E_MOVE say, and versions CR_MOVE
+      and CS_MOVE would be combined into a single version, C_MOVE say.
+
+ ■    So if the implementer wanted different implementation code depending on whether the
+      second argument is a square or just a rectangle, then he or she might have to include explicit
+      type testing and flow-of-control operations within both E_MOVE and C_MOVE, as well as
+      possibly having to include both the square and rectangle code within both of those versions.
+
+ ■    Alternatively, and probably preferably, E_MOVE and C_MOVE could both invoke a
+      rectangle-or-square subroutine, and that routine in turn could have two distinct
+      implementation versions, one for squares and one for nonsquare rectangles. But even with
+      this preferred approach, the fact remains that the MOVE implementer has to do a certain
+      amount of work that would and could be done much better by the system.
+
+       Incidentally, it follows from the foregoing that the question of whether operator definitions
+should be bundled in with type definitions (again, see OO Very Strong Suggestion 2) is not just a
+matter of syntax. As a matter of fact, there is another, more pragmatic, argument against bundling
+also. Bundling implies that adding a new operator will have to involve some kind of ALTER TYPE
+operation. But the person defining the new operator might not have the ability or the authority to
+alter an existing type (especially if the type in question is provided as part of some kind of off-the-
+shelf “type package” from some third party). As a consequence, there is likely to be a strong
+temptation to hack ... The hack in question consists in (a) defining a new subtype T' of the existing
+type T that specifies CONSTRAINT TRUE (not permitted in our model—see IM Prescription 10),
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        320
+Part IV / Subtyping and Inheritance                         Chapter 14 / Single Inheritance with Scalar Types
+
+
+so that every value of T is also a value of T', and then (b) bundling the new operator with that phony
+subtype T' instead of with the supertype T where it “belongs.”
+      To repeat, therefore, we propose that every argument should be able to participate equally in
+the run-time binding process. However, there is a well-known practical (though not unsolvable)
+problem here. By way of example, suppose (a) operator Op has a specification signature involving
+two parameters, both of declared type ELLIPSE; (b) implementation versions are defined for the
+most specific argument type combinations ELLIPSE-ELLIPSE, ELLIPSE-CIRCLE, and CIRCLE-
+ELLIPSE (only); and (c) Op is invoked with the most specific argument type combination
+CIRCLE-CIRCLE. The invocation signature here obviously does not exactly match any of the
+corresponding version signatures. Clearly, therefore, rules are needed in order to determine which
+particular version should be invoked—i.e., rules that define what the term best match (between
+version and invocation signatures) really means. But we stress the point that such rules are an
+implementation issue; they have nothing to do with the model as such.1
+
+Semantics Must Not Change
+
+The fact that it is always at least possible to define several implementation versions for the same
+operator has one very important consequence: It opens up the possibility of changing the semantics
+of the operator in question. For example, consider the following sequence of events:
+
+    1.   Type ELLIPSE and the corresponding operator AREA are defined, but type CIRCLE is not
+         defined yet. Variable E, of declared type ELLIPSE, is assigned an ellipse value for which a =
+         b. The operator AREA is invoked on E, giving a result area1, say.
+
+    2.   Type CIRCLE is now defined as a subtype of type ELLIPSE and a new version of AREA is
+         implemented for this new type. Variable E is assigned the same ellipse value as before, but S
+         by C now comes into play and MST(E) becomes CIRCLE. The operator AREA is invoked on
+         E, giving a result area2, say.
+
+      At this point we would surely like to be able to say that the comparison area1 = area2 must
+give TRUE. However, this would-be requirement is not enforceable! That is, there is little to stop
+AREA from being reimplemented for circles in such a way as to return, e.g., the circumference
+instead of the area. (Careful type design can alleviate this problem somewhat; for example, if
+operator AREA is defined to return a result of type AREA, obviously the implementation cannot
+return a result of type LENGTH instead. It can, however, still return the wrong area.)
+      Now, it has been claimed that “changing semantics” in the way just outlined can actually be
+desirable. The following is an example of a situation in which such a claim might be made:
+
+    1.   A type called HIGHWAY is defined, together with an operator called TRAVEL_TIME that
+         computes the time it takes to travel between two points a and b on a highway h using the
+         formula d/s, where d = distance between a and b and s = speed. The highway value h is
+
+
+1
+  Except inasmuch as (as we will see in the subsection immediately following) the model does require that all versions
+implement the same semantics; in particular, therefore, it requires that distinct versions whose signatures are equally
+good matches for a given invocation signature have the same result type.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                        321
+Part IV / Subtyping and Inheritance                 Chapter 14 / Single Inheritance with Scalar Types
+
+
+      assigned to a variable H of declared type HIGHWAY, and TRAVEL_TIME is invoked on H
+      (and points a and b on h) and returns a result, tt1 say.
+
+ 2.   Type TOLL_HIGHWAY is now defined as a subtype of type HIGHWAY and a new
+      implementation version of TRAVEL_TIME is defined for this new type using the formula
+      (d/s)+(n*t), where n = number of tollbooths, t = time spent at each tollbooth, and d and s are
+      as before.
+
+ 3.   Variable H is assigned the same highway value h as before. Assume for the moment that h is
+      not a toll highway. Then invoking TRAVEL_TIME on H with the same points a and b as
+      before gives the same result tt1 as before.
+
+ 4.   But suppose now that h is in fact a toll highway. Then S by C comes into play, MST(H)
+      becomes TOLL_HIGHWAY, and invoking TRAVEL_TIME on H with the same points a and
+      b as before gives a different result tt2.
+
+      Now, of course it is true that the presence or absence of tollbooths does affect travel time. An
+advocate of the idea that changing semantics can be desirable might therefore claim that the
+foregoing state of affairs (in particular, the fact that tt1 ≠ tt2) is reasonable. However, we disagree
+with this reasoning. We argue as follows:
+
+ ■    If TOLL_HIGHWAY truly is a subtype of HIGHWAY, it means by definition that every
+      individual toll highway is in fact a highway.
+
+ ■    Thus, some highways (i.e., some values of type HIGHWAY) are indeed toll highways—they
+      do indeed have tollbooths. So type HIGHWAY is not “highways without tollbooths,” it is
+      “highways with n tollbooths,” where n might be zero (and type TOLL_HIGHWAY is
+      “highways with n tollbooths” where n is greater than zero).
+
+ ■    So the operator TRAVEL_TIME for type HIGHWAY is not “compute the travel time for a
+      highway without tollbooths,” it is “compute the travel time for a highway ignoring tollbooths”
+      (another logical difference here).
+
+ ■    The operator TRAVEL_TIME for type TOLL_HIGHWAY, by contrast, is “compute the
+      travel time for a highway not ignoring tollbooths.” So we have found yet another logical
+      difference—the two TRAVEL_TIMEs are logically different operators. Confusion arises
+      because those two different operators have been given the same name (in fact, the example is
+      an example of overloading polymorphism, not inclusion polymorphism at all).
+
+      Thus, we reject the suggestion that changing operator semantics can ever be a good idea. We
+therefore define our model to say that if a change in semantics occurs, the implementation is in
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        322
+Part IV / Subtyping and Inheritance                          Chapter 14 / Single Inheritance with Scalar Types
+
+
+violation—i.e., it is not an implementation of the model, and the implications are unpredictable.1
+Indeed, it could be argued that the ability to change operator semantics (or, rather, the fact that some
+writers seem to regard that ability as a virtue) is—like the business of “argument contravariance”
+discussed earlier—a case of the implementation tail wagging the model dog.
+      Observe that our position here does mean that, regardless of how many implementation
+versions of operator Op are defined, the user perception remains the same: namely, that (a) there
+exists a read-only operator—a single read-only operator, that is—called Op, and (b) that operator
+Op applies to argument values of type T and hence, by definition, to argument values of any subtype
+of T.
+
+More on Compile-Time Binding
+
+We pointed out earlier that it might be possible to perform some binding at compile time. In fact,
+we now observe that it might be possible to perform all binding at compile time! Let T and T' be
+supertype and subtype, respectively (as usual), and let Op be an operator that applies to values of
+type T and therefore to values of type T' as well. Assume that Op does not apply to values of any
+proper supertype of T. Assume also that both of the following conditions are satisfied:
+
+    ■   Implementation versions of Op are provided for both type T and type T', but they implement
+        the same semantics (as indeed our model requires).
+
+    ■   Either (a) the implementation version for type T involves no access to the physical
+        representation of values that are “just of type T” or (b) the physical representation of values
+        that are “just of type T” is the same as that for values of type T'.
+
+      Then no logical harm is done if an invocation of Op on a value of type T' is bound—at
+compile time, potentially—to the version of Op that is defined for type T. (Performance might
+suffer, but performance is not a model consideration.)
+      Note: Of course, the foregoing argument does rely on an implementation version of Op being
+defined for type T. If T is a dummy type, however, such a version might not exist, even if the
+operator itself is indeed defined at the level of type T. In other words, the presence of dummy types
+implies that some binding, at least, will probably have to be done at run time after all. See IM
+Prescription 20 for further discussion.
+      We conclude this subsection, and this section, by remarking that many of the concepts we
+have been discussing at such length—inclusion polymorphism, value substitutability, result
+covariance, argument contravariance, code reuse, implementation versions, version signatures,
+invocation signatures, and run-time vs. compile-time binding—are not really features of the model,
+as such, at all (despite the fact that you do need to understand them somewhat in order to appreciate
+what inheritance and subtyping are really all about). The only thing that is truly relevant to the
+
+
+
+1
+  Of course, our model does not preclude support for genuine overloading polymorphism. In particular, if (a) T1 and
+T2 are distinct subtypes of some dummy type T, (b) neither is a subtype of the other, and (c) an operator is defined for
+T1 and another with the same name is defined for T2, then (d) there is no requirement, nor can there be, that those two
+operators implement the same semantics.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                          323
+Part IV / Subtyping and Inheritance                         Chapter 14 / Single Inheritance with Scalar Types
+
+
+model is this: “To say that T' is a subtype of T means, by definition, that operators that apply to
+values of type T apply to values of type T' also”—and the rest logically follows.
+
+
+IM PRESCRIPTION 18: READ-ONLY PARAMETERS TO UPDATE OPERATORS
+
+Let Op be an update operator and let P be a parameter to Op that is not subject to update. Then Op
+shall behave as a read-only operator as far as P is concerned, and all relevant aspects of IM
+Prescription 16 shall therefore apply, mutatis mutandis.
+
+                                            ———  ———
+
+This prescription does not seem to require any further explanation, except to say that the property of
+“result covariance” is obviously irrelevant (update operators do not return a result).
+
+
+IM PRESCRIPTION 19: UPDATE OPERATOR INHERITANCE AND VARIABLE
+                    SUBSTITUTABILITY
+
+Let Op be an update operator, let P be a parameter to Op that is subject to update, and let T be the
+declared type of P. Then it might or might not be the case that the declared type (and therefore,
+necessarily, the current most specific type) of the argument A corresponding to P in an invocation
+of Op shall be allowed to be a proper subtype of type T. It follows that for each such update
+operator Op and for each parameter P to Op that is subject to update, it shall be necessary to state
+explicitly for which proper subtypes of the declared type T of parameter P operator Op shall be
+inherited—The Principle of (Update) Operator Inheritance. (And if update operator Op is not
+inherited in this way by type T', it shall not be inherited by any proper subtype of type T' either.)
+Update operators shall thus be only conditionally polymorphic—The Principle of (Update)
+Operator Polymorphism. If Op is an update operator and P is a parameter to Op that is subject
+to update and T' is a proper subtype of the declared type T of P for which Op is inherited, then by
+definition it shall be possible to invoke Op with an argument corresponding to parameter P that is
+of declared type T'—The Principle of (Variable) Substitutability.
+
+                                            ———  ———
+
+First we explain why it does not make sense for update operators to be inherited unconditionally.1
+Let variables R and S have declared types RECTANGLE and SQUARE, respectively. Then—
+speaking very loosely!—it is possible to change the height of R without changing its width; more
+precisely, it is possible to update R so as to replace the current rectangle value r1 by a new rectangle
+value r2 that has the same width but a different height. However, it is certainly not possible to do
+the same thing to S, because squares must always have equal height and width. In other words, a
+
+
+
+1
+ Unlike read-only operators! In fact, the arguments presented under this prescription constitute an important reason
+why we continually stress the logical difference between read-only and update operators.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                       324
+Part IV / Subtyping and Inheritance                 Chapter 14 / Single Inheritance with Scalar Types
+
+
+certain update operator (“change height but not width”) is effectively defined for type
+RECTANGLE but not type SQUARE.
+      For a more probing example, we return to the operator MOVE from our discussion of IM
+Prescription 16. Now, we previously made a tacit assumption that MOVE was a read-only operator
+specifically. Here is the implementation code (ER_MOVE version):
+      OPERATOR MOVE ( E ELLIPSE, R RECTANGLE ) RETURNS ELLIPSE VERSION ER_MOVE ;
+         RETURN ( ELLIPSE ( THE_A ( E ), THE_B ( E ), CTR ( R ) ) ) ;
+      END OPERATOR ;
+
+       As an aside, we observe that if ER_MOVE is implemented as shown, then the versions
+ES_MOVE, CR_MOVE, and CS_MOVE are not needed—the ER_MOVE code works for those
+other cases too, thanks to specialization by constraint! And thanks to generalization by constraint, it
+would even work for O-circles too—where, just to remind you, an O-circle is a circle with center
+the origin. (We deliberately ignored these points in our previous discussions under IM Prescriptions
+16 and 17.)
+       Since it is a read-only operator, MOVE returns a result, by definition. But suppose we made
+it an update operator instead, thus:
+      OPERATOR MOVE ( E ELLIPSE, R RECTANGLE ) UPDATES { E } VERSION ER_MOVE ;
+         THE_CTR ( E ) := CTR ( R ) ;
+      END OPERATOR ;
+
+       Instead of “returning a result that is just like its first argument except that it is located
+somewhere else” (as we put it earlier), this revised operator actually updates its first argument. Of
+course, that argument must be specified as a variable specifically; but that variable can be of
+declared type CIRCLE or just declared type ELLIPSE. Like the read-only ER_MOVE code, in
+other words, this update code works for circles as well as ellipses. Note, however, that it does not
+work for O-circles, because updating a variable of declared type O_CIRCLE to change its center is
+clearly invalid (the center for such a variable must be the origin and cannot be changed). What is
+more, it is not just this particular code that does not work for O-circles; no code that attempts to
+update the center of a variable of declared type O_CIRCLE can possibly work (unless the update is
+in fact a “no op,” perhaps).
+       It follows from the foregoing that, as already stated, update operator inheritance has to be
+conditional (as indeed it is in our model). Essentially, what this means is that which update
+operators are inherited by which subtypes must be specified explicitly. For example, we might
+specify the following:
+
+ ■    The update operators that apply to variables of declared type ELLIPSE are:
+
+      ●     Assignment to THE_A, THE_B, THE_CTR
+
+      ●     MOVE (update form)
+
+ ■    The update operators that apply to variables of declared type CIRCLE are:
+
+      ●     Assignment to THE_CTR and THE_R
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        325
+Part IV / Subtyping and Inheritance                          Chapter 14 / Single Inheritance with Scalar Types
+
+
+         ●     MOVE (update form)
+
+         Observe in particular, therefore, that pseudovariables THE_A and THE_B do not apply to
+         variables of declared type CIRCLE. Note: In Tutorial D, in fact, we adopt the conservative
+         position that pseudovariable THE_X applies to variables of declared type T if and only if
+         either (a) T has a declared possrep with a component called X (this is the normal case)1 or,
+         possibly, (b) T is a dummy type and pseudovariable THE_X applies to variables of each of its
+         immediate subtypes (see the section on IM Prescription 20, subsection “Dummy Types,” later,
+         for an explanation of this latter possibility).
+
+    ■    The update operators that apply to variables of declared type O_CIRCLE are:
+
+         ●     Assignment to THE_R
+
+         MOVE (update form) and pseudovariable THE_CTR do not apply to variables of declared
+         type O_CIRCLE.
+
+      We now consider some of the consequences of the foregoing. Suppose we have variables E,
+C, and O declared as follows:
+         VAR E ELLIPSE ;
+         VAR C CIRCLE ;
+         VAR O O_CIRCLE ;
+
+         Let the variables be initialized as follows:
+         E := ELLIPSE ( LENGTH ( 6.0 ), LENGTH ( 5.0 ), POINT ( 4.0, 3.0 ) ) ,
+         C := CIRCLE   ( LENGTH ( 5.0 ), POINT ( 4.0, 3.0 ) ) ,
+         O := O_CIRCLE ( LENGTH ( 5.0 ) ) ;
+
+      Now consider the following updates (for simplicity we limit our attention to updates that are
+assignments to pseudovariables specifically; we have numbered them for ease of subsequent
+reference).
+
+    1.   THE_A ( E ) := LENGTH ( 5.0 ) ;
+
+         MST(E) is now CIRCLE, thanks to S by C. However, if we now try the following—
+
+    2.   THE_R ( E ) := LENGTH ( 4.0 ) ;
+
+         —we will get a compile-time type error, because assignment to THE_R does not apply to
+         variables of declared type ELLIPSE. (More precisely, the error occurs because no possrep for
+         type ELLIPSE has an R component, and hence no THE_R operator or pseudovariable is
+         defined for that type.) By contrast, the following will work:
+
+1
+  Thus, if we were to declare an {a,b,ctr} possrep for type CIRCLE, then pseudovariables THE_A and THE_B would
+be available for variables of declared type CIRCLE after all. However, any attempt to use them will fail if it violates
+the constraint a = b.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                         326
+Part IV / Subtyping and Inheritance                         Chapter 14 / Single Inheritance with Scalar Types
+
+
+    3.   THE_R ( TREAT_AS_CIRCLE ( E ) ) := LENGTH ( 4.0 ) ;
+
+         So will the following:
+
+    4.   THE_A ( E ) := LENGTH ( 6.0 ) ;
+
+         MST(E) is now ELLIPSE again, thanks to G by C.
+
+    5.   THE_CTR ( C ) := POINT ( 0.0, 0.0 ) ;
+
+         MST(C) is now O_CIRCLE. However, we can invoke the MOVE operator (update form) on
+         it; the effect will be to set MST(C) back to CIRCLE again, thanks to G by C. By contrast, if
+         we try to invoke the MOVE operator (update form) on the variable O, we will get a compile-
+         time type error (we cannot “G by C” a variable to some proper supertype of its declared type,
+         of course).
+
+       As these examples illustrate, if update operator Op does not apply to variables whose declared
+type is T, it certainly does not apply to variables whose declared type is any proper subtype of type
+T.
+       So much for the examples. For completeness, we now observe that (as noted under IM
+Prescription 18) the property of “result covariance” does not apply to update operators, since update
+operators do not return a result. The property of “argument contravariance” does apply, but we
+reject that concept anyway. The remarks regarding code reuse, implementation versions,
+signatures, and run-time binding under IM Prescriptions 16 and 17 apply to update operators also,
+mutatis mutandis.
+       We close this section by admitting that the question of update operator inheritance is one in
+which our thinking might be regarded as a little controversial (heretical, some might say). To be
+specific, some writers claim that update operators, like read-only operators, should be inherited
+unconditionally, whereas we want them to be inherited only where they make sense.1 But it seems
+to us that those who want such unconditional inheritance run into a variety of logical problems and
+other undesirable consequences that our scheme avoids. For example:
+
+    ■    They require update operators to return a value, thereby allowing retrieval operations to have
+         the side effect of updating the database (as noted under RM Prescription 3 in Chapter 6).
+
+    ■    Or they allow (e.g.) a value of type SQUARE to have sides of different lengths, thereby
+         violating its own “squareness,” undermining the database “as a model of reality,” and causing
+         programs to produce nonsensical results such as “nonsquare squares” or “noncircular circles.”
+
+    ■    Or they do not support S by C or G by C.
+
+1
+  Actually our position here is not as controversial as it might seem. Nobody wants “:=” to be inherited
+unconditionally; e.g., assignment of a value of most specific type ELLIPSE to a variable of declared type CIRCLE is
+never valid (at least, not in any scheme we are aware of). And assignment is the only update operator that is logically
+necessary! Thus, those who want update operators to be inherited unconditionally might be accused of a certain lack of
+consistency.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                        327
+Part IV / Subtyping and Inheritance                 Chapter 14 / Single Inheritance with Scalar Types
+
+
+ ■    Or they simply do not support type constraints at all (see Appendix F for a detailed discussion
+      of this particular—and important—issue).
+
+      The common thread running through all such thinking is, it seems to us, a failure to make a
+clear distinction between values and variables. To us, by contrast, that distinction is both crucial
+and fundamental; indeed, as explained in Chapter 1, we regard it as one of the great logical
+differences—one that underlies and buttresses our thinking throughout both The Third Manifesto
+and the inheritance model currently under discussion.
+
+
+IM PRESCRIPTION 20: UNION, DUMMY, AND MAXIMAL AND MINIMAL TYPES
+
+A union type is a type T such that there exists no value that is of type T and not of some immediate
+subtype of T (i.e., there is no value v such that MST(v) is T). A dummy type is a union type that
+has no declared possible representation (and hence no selector); a given union type shall be
+permitted to be a dummy type if and only if it is empty or it has no regular immediate supertype
+(where a regular type is a type that is not a dummy type). Moreover:
+
+ a.   Conceptually, there is a special scalar dummy type, alpha, that contains all scalar values.
+      Type alpha is the maximal type with respect to every scalar type; by definition, it has no
+      declared possible representation and no immediate supertypes.
+
+ b.   Conceptually, there is a special scalar dummy type, omega, that contains no values at all.
+      Type omega is the minimal type with respect to every scalar type; by definition, it has no
+      declared possible representation and no immediate subtypes.
+
+                                      ———  ———
+
+In our discussion of IM Prescription 11, we briefly considered the possibility of introducing an
+additional immediate subtype of type ELLIPSE called NONCIRCLE, with the obvious semantics.
+Let us examine that possibility a little more closely. Here first is the definition of NONCIRCLE:
+       TYPE NONCIRCLE
+            IS { ELLIPSE
+                 CONSTRAINT THE_A ( ELLIPSE ) > THE_B ( ELLIPSE )
+                 POSSREP { A   = THE_A   ( ELLIPSE ) ,
+                           B   = THE_B   ( ELLIPSE ) ,
+                           CTR = THE_CTR ( ELLIPSE ) } } ;
+
+      Type ELLIPSE now becomes a union type: Every ellipse is either a circle or a noncircle
+(there is no value of type ELLIPSE that is not also a value of some immediate subtype of that type),
+and so type ELLIPSE is the union—in fact, the disjoint union—of types CIRCLE and
+NONCIRCLE. Note: Union type is the traditional term for the concept we have in mind here [19].
+However, you should be aware that other terms are also found in the literature, including abstract
+types (we mentioned this one briefly in Chapter 3), noninstantiable types (on the grounds that the
+types in question have no “instances”), or sometimes just as interfaces. Types that are not union
+types are then referred to as concrete types, instantiable types, or just types, respectively. (We have
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         328
+Part IV / Subtyping and Inheritance                Chapter 14 / Single Inheritance with Scalar Types
+
+
+changed our own terminology slightly, too; in reference [82], we called union types dummy types
+and all other types regular types.)
+       A union type is not the most specific type of any value at all. Thus, such a type must have
+immediate subtypes—unless it is empty, a possibility we ignore until further notice—and every
+value of the type must be a value of one of those immediate subtypes; the specialization constraints
+for those immediate subtypes (see IM Prescription 10) must be such as to guarantee that this
+requirement is met. Note that union types make sense only in an inheritance context, because they
+rely on the existence of proper (in fact, immediate) subtypes. Note too that a union type must have
+at least two immediate subtypes, thanks to IM Prescription 2.
+       Why might it be desirable to define a union type? The major reason is that such a definition
+provides a way of specifying operators that apply to values and variables of several different types,
+all of them proper subtypes of the union type in question. Appropriate implementation versions of
+the operator in question can then be defined, if necessary, at each of the applicable subtype levels.
+For example:
+      TYPE ELLIPSE UNION
+           IS { PLANE_FIGURE
+                POSSREP { A LENGTH, B LENGTH, CTR POINT
+                          CONSTRAINT A  B } } ;
+
+      TYPE CIRCLE
+           IS { ELLIPSE
+                CONSTRAINT THE_A ( ELLIPSE ) = THE_B ( ELLIPSE )
+                POSSREP { R   = THE_A   ( ELLIPSE ) ,
+                          CTR = THE_CTR ( ELLIPSE ) } } ;
+
+      TYPE NONCIRCLE
+           IS { ELLIPSE
+                CONSTRAINT THE_A ( ELLIPSE ) > THE_B ( ELLIPSE )
+                POSSREP { A   = THE_A   ( ELLIPSE ) ,
+                          B   = THE_B   ( ELLIPSE ) ,
+                          CTR = THE_CTR ( ELLIPSE ) } } ;
+
+      OPERATOR AREA ( E ELLIPSE ) RETURNS AREA ;
+         /* declared type of parameter E is a union type, but the following */
+         /* implementation code works for both circles and noncircles:      */
+         RETURN ( 3.14159 * THE_A ( E ) * THE_B ( E ) ) ;
+      END OPERATOR ;
+
+      Observe that:
+
+ ■    We require union types to be explicitly declared as such—see the UNION specification in the
+      definition of type ELLIPSE. (In fact, PLANE_FIGURE, whose definition is deliberately not
+      shown above, is a union type too. We will return to this point in the next subsection.)
+
+ ■    Type ELLIPSE does have a declared possrep and hence a selector, but invoking that selector
+      will never return a value of most specific type ELLIPSE (because there are no values of most
+      specific type ELLIPSE).
+
+ ■    A variable of declared type ELLIPSE will always have most specific type some proper
+      subtype of ELLIPSE (because, again, there are no values of most specific type ELLIPSE).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       329
+Part IV / Subtyping and Inheritance                Chapter 14 / Single Inheritance with Scalar Types
+
+
+ ■    Operator AREA is defined at the ELLIPSE level, but it will never be invoked on a value that
+      is of most specific type ELLIPSE. (To say it one more time, no such value exists.)
+
+ ■    The fact that ELLIPSE is now a union type does not prevent operators from having declared
+      (result) type ELLIPSE. The specification signature for our MOVE operator, for example
+      (read-only version), will still specify a declared result type of ELLIPSE—but, of course, no
+      MOVE invocation will now return a result of most specific type ELLIPSE.
+
+ ■    We remark that the type constraint for type ELLIPSE in the example seems to be redundant.
+      Given that the purpose of defining the union type in the first place was to reduce redundancy,
+      in a sense, this state of affairs suggests that in practice we might not want to define too many
+      union types with possreps. (Dummy types, which are union types without possreps, are
+      another matter—see further discussion below.)
+
+      Now, a union type obviously cannot be a leaf type (again, unless it is empty, a possibility we
+continue to ignore until further notice). However, it would be possible to set up the type hierarchy
+in such a way that all types except leaf types are union types; in terms of our running example,
+introducing type NONCIRCLE as above, together with types NONRECTANGLE and
+NONSQUARE (as immediate subtypes of POLYGON and RECTANGLE, respectively) would
+have such an effect. “All most specific types must be leaf types” might thus be regarded as the
+extreme form of the idea of union types, and some writers have indeed advocated such a notion.
+Our model does not prohibit such an arrangement, but it does not insist on it, either; i.e., we allow
+values to exist whose most specific type is, e.g., ELLIPSE and not CIRCLE, as we already know.
+
+Dummy Types
+
+A dummy type is a union type that has no possrep (and therefore in particular no possrep constraint).
+A type that is not a dummy type is a regular type. By way of example, let us revise types
+ELLIPSE, CIRCLE, and NONCIRCLE from the preceding discussion to make ELLIPSE a dummy
+type, thus:
+      TYPE ELLIPSE UNION
+           IS { PLANE_FIGURE } ;
+      TYPE CIRCLE
+           IS { ELLIPSE
+                POSSREP { R LENGTH, CTR POINT } } ;
+      TYPE NONCIRCLE
+           IS { ELLIPSE
+                POSSREP { A LENGTH, B LENGTH, CTR POINT
+                          CONSTRAINT A > B } } ;
+      Observe that:
+
+ ■    Type ELLIPSE is indeed now a dummy type: It has no possrep (and no possrep constraint)
+      and no selector. Incidentally, it is worth pointing out explicitly that this fact does not
+      constitute a violation of, or even an extension to, RM Prescription 4 as stated in Chapter 4.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        330
+Part IV / Subtyping and Inheritance                      Chapter 14 / Single Inheritance with Scalar Types
+
+
+    ■   No “additional constraints”—see IM Prescription 10—have been specified for types CIRCLE
+        and NONCIRCLE (since type ELLIPSE has no possrep in terms of which such constraints
+        might be formulated). Thus, specialization by constraint now does not apply to those types;
+        i.e., circles and noncircles are no longer obtained from ellipses via S by C.
+
+    ■   Type CIRCLE does have a possrep (though, for simplicity, no possrep constraint) and a
+        selector. It also has certain THE_ operators (THE_R and THE_CTR). Note that THE_A and
+        THE_B now do not apply to type CIRCLE (nor to type ELLIPSE, of course).
+
+    ■   Type NONCIRCLE also has a possrep and a selector (unlike type CIRCLE, it also has a
+        possrep constraint). It also has certain THE_ operators (THE_A, THE_B, and THE_CTR).
+
+    ■   Operators THE_A, THE_B, and THE_R do not apply to variables of declared type ELLIPSE,
+        since that type has no possrep. (By contrast, THE_CTR might apply—see later.)
+
+    ■   The ELLIPSE-level implementation version of the AREA operator that we showed earlier
+        will no longer work (basically because of the lack of a possrep for type ELLIPSE).1 Instead,
+        we will—in effect—have to give just an appropriate specification signature at the ELLIPSE
+        level and then provide appropriate implementation versions at the CIRCLE and NONCIRCLE
+        levels, as follows:
+        OPERATOR AREA ( E ELLIPSE ) RETURNS AREA ;
+           /* declared type of parameter E is a dummy type; */
+           /* no implementation code provided at this level */
+        END OPERATOR ;
+
+        OPERATOR AREA ( E CIRCLE ) RETURNS AREA VERSION C_AREA ;
+           /* implementation version for type CIRCLE */
+           RETURN ( 3.14159 * THE_R ( E ) ** 2 ) ;
+        END OPERATOR ;
+
+        OPERATOR AREA ( E NONCIRCLE ) RETURNS AREA VERSION NC_AREA ;
+           /* implementation version for type NONCIRCLE */
+           RETURN ( 3.14159 * THE_A ( E ) * THE_B ( A ) ) ;
+        END OPERATOR ;
+
+      Now, the foregoing example is not very realistic, because we have already seen that if we
+make ELLIPSE a regular union type (i.e., one with a possrep) instead of a dummy type, then we can
+define an implementation version of AREA at the ELLIPSE level after all that will work for both
+circles and noncircles. But consider type PLANE_FIGURE. That type would almost certainly be a
+true dummy type—it is hard to think of a possrep that will work for an arbitrary plane figure!—and
+it might well make sense to give a specification signature for AREA at the PLANE_FIGURE level
+and implementation versions at (say) the ELLIPSE and POLYGON levels.
+      Despite the foregoing, let us stay with the example of ELLIPSE as a dummy type, for
+simplicity. Observe now that the operator THE_CTR applies to values of type CIRCLE and values
+
+1
+  These remarks should not be construed to mean that we can never specify implementation code at a dummy type
+level. See the discussion of the DOUBLE_AREA example later in this subsection.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                     331
+Part IV / Subtyping and Inheritance                         Chapter 14 / Single Inheritance with Scalar Types
+
+
+of type NONCIRCLE—i.e., values of every proper subtype of type ELLIPSE—and yet apparently
+not to values of type ELLIPSE itself! (We say “apparently,” because type ELLIPSE has no possrep
+from which such an operator can be derived.) But such a state of affairs is clearly absurd; to say
+that every ellipse is either a circle or a noncircle, and circles and noncircles both have a center but
+ellipses do not, is an affront to common sense. After all, compare the situation with areas: Every
+ellipse has an area, because every ellipse is either a circle or a noncircle and circles and noncircles
+both have an area, and so we do allow the operator AREA to be applied to variables of declared
+type ELLIPSE. By analogy, therefore, we should surely be allowed to do the same with the
+operator THE_CTR. (Indeed, if we did not do so, then THE_CTR would be a case of overloading
+rather than inclusion polymorphism.)
+       The foregoing anomaly is easily fixed, however: We simply allow the ELLIPSE type definer
+to assert that THE_CTR does apply at the ELLIPSE level after all (since implementation versions of
+that operator will certainly be provided at both the CIRCLE and NONCIRCLE levels).1 Thus, for
+example, the assignment
+       P := THE_CTR ( E ) ;
+
+(where P is of declared type POINT and E is of declared type ELLIPSE) is effectively shorthand for
+something like the following:
+        P := CASE
+                WHEN IS_CIRCLE ( E ) THEN THE_CTR ( TREAT_AS_CIRCLE ( E ) )
+                WHEN IS_NONCIRCLE ( E ) THEN THE_CTR ( TREAT_AS_NONCIRCLE ( E ) )
+             END CASE ;
+
+       Likewise, the assignment
+       THE_CTR ( E ) := P ;
+
+(where P and E are as before and THE_CTR is being used as a pseudovariable) is effectively
+shorthand for something like the following:
+        E := CASE
+                WHEN IS_CIRCLE ( E )
+                   THEN CIRCLE ( THE_R ( TREAT_AS_CIRCLE ( E ) ), P )
+                WHEN IS_NONCIRCLE ( E )
+                   THEN NONCIRCLE ( THE_A ( TREAT_AS_NONCIRCLE ( E ) ),
+                                     THE_B ( TREAT_AS_NONCIRCLE ( E ) ), P )
+             END CASE ;
+
+      By the way, we do not mean to suggest by everything we have said in this subsection so far
+that implementation code for operators defined at some dummy-type level must be provided at the
+
+
+1
+  Note that THE_CTR here is indeed a THE_ operator in the usual sense (i.e., it has prescribed semantics, and those
+semantics must not be overridden). In particular, it can be used as a pseudovariable—a fact that suggests that simply
+providing a specification signature at the ELLIPSE level might not quite be adequate as a mechanism for “asserting that
+THE_CTR does apply” (since other operators defined in such a fashion are generally not usable as pseudovariables).
+Note also that the provision of THE_ operators for a dummy type does not constitute a violation of, or even an
+extension to, RM Prescription 5 as stated in Chapter 4.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                        332
+Part IV / Subtyping and Inheritance                 Chapter 14 / Single Inheritance with Scalar Types
+
+
+level of the pertinent supertypes. By way of a simple counterexample, we might define an operator
+called DOUBLE_AREA, with the obvious semantics, at the ELLIPSE level or even (more
+strikingly) at the PLANE_FIGURE level, thus:
+      OPERATOR DOUBLE_AREA ( PF PLANE_FIGURE ) RETURNS AREA ;
+         RETURN ( 2 * AREA ( PF ) ) ;
+      END OPERATOR ;
+
+       We close this subsection with a few miscellaneous observations. First, note that it follows
+from IM Prescription 20 that if T is a nonempty dummy type, then all of its proper supertypes are
+nonempty dummy types too (because “a [nonempty] type shall be permitted to be a dummy type if
+and only if ... it has no regular immediate supertype”).
+       Second, recall from RM Prescription 4 that certain system-defined types—and, as we saw
+under IM Prescription 10, proper subtypes thereof—are allowed to have no possrep; type INTEGER
+is a case in point. Such a type is not a dummy type, however, because (a) values do exist, in
+general, whose most specific type is the type in question and (b) the type is still required to have at
+least one associated selector that permits the specification of literals of the type in question.
+       Last, we remark that some systems use dummy types as a way of providing type generator
+functionality. For example, RELATION might be a dummy type in such a system (with generic
+operators JOIN, SUMMARIZE, and so forth), and every specific relation type would then be a
+proper subtype of that dummy type. We do not adopt such an approach in the Manifesto, however,
+because we certainly do not want our support for type generators to rely on support for inheritance.
+We note too that the approach seems to imply that specific implementation code must be provided
+for each specific join, each specific summarize, and so forth (instead of reusing generic, optimized,
+system-provided code)—surely not a very desirable state of affairs! Finally, we observe also that
+the kind of “relation type inheritance” this approach to a RELATION type generator seems to entail
+is not the kind of relation type inheritance we think we need (in particular, it does not provide the
+kind of substitutability we think we need). See Chapter 16 for a detailed discussion of our own
+approach to relation type inheritance.
+
+Alpha and Omega
+
+We did not discuss the point in detail before, but it is an immediate consequence of IM Prescription
+7 that there can be any number of distinct type hierarchies. If there is more than one, however, we
+can always invent some kind of “system” type that is an immediate supertype for the root types for
+all of those hierarchies, thereby effectively tying all of those hierarchies together into one. In fact,
+some object systems come ready equipped with such a type, often called OBJECT (on the grounds
+that “everything is an object”).
+       In our model, we address this issue by introducing a special type that we call type alpha
+(mentioned in passing in a footnote under IM Prescription 9). Alpha is the maximal scalar type:
+It contains all scalar values and is a supertype of every scalar type; more precisely, it is a proper
+supertype of every scalar type except itself, and an immediate supertype of every scalar type that
+would otherwise be a root type.
+       Analogously, we introduce another type that we call type omega (previously discussed briefly
+under IM Prescription 8). Omega is the minimal scalar type: It contains no values at all and is a
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         333
+Part IV / Subtyping and Inheritance                        Chapter 14 / Single Inheritance with Scalar Types
+
+
+subtype of every scalar type; more precisely, it is a proper subtype of every scalar type except itself,
+and an immediate subtype of every scalar type that would otherwise be a leaf type.
+      Note: The remarks in the previous two paragraphs assume that types alpha and omega are
+explicitly defined and thus included in the type hierarchy (or type graph, rather, in the case of
+omega). In practice, however, we would not expect them to be explicitly defined. They are useful
+primarily from a conceptual point of view (though they do turn out to be important in connection
+with tuple and relation type inheritance—see Chapter 16). In what follows, we will assume they are
+not explicitly defined, barring explicit statements to the contrary.
+      Now for more specifics. First, type alpha:
+
+    ■   Alpha is indeed a dummy type—it has no possrep and hence no selector.
+
+    ■   The corresponding type constraint is just TRUE.1
+
+    ■   IS_alpha(X) always gives TRUE.
+
+    ■   TREAT_AS_alpha (...) always succeeds.
+
+     As for type omega (which, perhaps surprisingly, turns out to be more important than type
+alpha in certain respects, as we will see in the next two chapters):
+
+    ■   Omega is also a dummy type—it has no possrep and hence no selector. Note: Omega is truly
+        a union type, as all dummy types must be, because by definition there is no value of type
+        omega that is not of some immediate subtype of omega. (You might want to read that
+        sentence again.)
+
+    ■   The corresponding type constraint is just FALSE.
+    ■   IS_omega(X) always gives FALSE.
+
+    ■   TREAT_AS_omega (...) always fails.
+
+    ■   No variable, no operator, and in fact no expression can have either declared type or most
+        specific type omega.
+
+    ■   Type omega inherits all possible read-only operators, but vacuously so, since they can never
+        be invoked on any value of the type.
+
+      Finally, we repeat the point that since it is a subtype of every scalar type, the introduction of
+type omega takes us, by definition, into the realm of multiple inheritance. (This is one reason why
+we believe it makes little logical sense to consider single inheritance only—despite the fact that we
+have been doing exactly that for most of this chapter! But we were doing so for pedagogical
+
+
+
+1
+  Alpha and omega are exceptions to the general rule that dummy types, having no possrep, therefore have no type
+constraint.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                        334
+Part IV / Subtyping and Inheritance                 Chapter 14 / Single Inheritance with Scalar Types
+
+
+reasons, not logical ones.) Indeed, the introduction of omega into any given type “hierarchy” has
+the effect of converting that “hierarchy” into a lattice. See Chapter 15 for further discussion.
+
+
+EXERCISES
+
+14.1   A possrep constraint implies that certain selector invocations will fail. By contrast, a
+       specialization constraint implies that certain TREAT invocations will fail. Are these
+       statements true or false?
+
+14.2   Given your answer to Exercise 12.11—”Define an operator to rotate a specified rectangle
+       through 90° about its center”—define an implementation version of that operator for
+       squares.
+
+14.3   A conic section (conic for short) is a curve in (x,y)-space, defined by the equation ax² - 2px +
+       y² = 0. If a < 0, the conic is a hyperbola; if a = 0, it is a parabola; if a > 0, it is an ellipse
+       (and if a = 1, the ellipse is a circle). Define a corresponding set of types. Note: You will
+       need some additional knowledge regarding conic sections in order to answer this exercise.
+
+14.4   Write Tutorial D definitions for types HIGHWAY and TOLL_HIGHWAY (see IM
+       Prescription 17). Also write the code for the TRAVEL_TIME operator(s).
+
+14.5   If C is a variable of declared type CIRCLE, assignment to THE_A(C) and THE_B(C) is not
+       supported. What is the formal reason for this state of affairs?
+
+14.6   Let CHAR_n (n  0) be a family of types such that a value v is a value of type CHAR_n if
+       and only if it is a character string of no more than n significant characters (where a character
+       is significant if and only if it is not a trailing space). Do you agree that type CHAR_n' is a
+       subtype of type CHAR_n if and only if n'  n? Does value substitutability apply? Are there
+       any operators that apply to values of type CHAR_n' and not to values of type CHAR_n?
+       Does S by C apply? Is there a nonempty type that is a subtype of all possible types in the
+       family?
+
+14.7   Following on from the previous exercise, consider the character string literal 'ABC ' (note
+       the trailing space). What is the declared type of this literal? What is the most specific type?
+
+14.8   Let T' be a proper subtype of type T. It has been conjectured that if the only operators that
+       apply to values and variables that are of type T' and not of type T are those that are provided
+       “automatically”—THE_ operators, selectors, “=”, “:=”, TREAT_AS_T, and IS_T
+       operators—then type T' was probably not worth defining in the first place. Discuss.
+
+14.9   In the body of this chapter, we made repeated use of the polymorphic operator AREA. The
+       polymorphism in question was inclusion polymorphism, of course. However, we did also
+       suggest that AREA might be the name of a selector operator for type AREA, in which case
+       AREA becomes overloaded too. Write an appropriate set of specification signatures for all
+       of these various AREA operators.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         335
+Part IV / Subtyping and Inheritance                Chapter 14 / Single Inheritance with Scalar Types
+
+
+14.10 Can the implementation of TREAT_AS_T and IS_T be automated? Do these operators
+      apply to built-in types?
+
+14.11 Let T' be an existing type. What is involved in introducing a new proper supertype T of T'?
+      Does it make any difference if T' is built in, not user defined?
+
+14.12 The Tutorial D syntax for defining a proper subtype (under single inheritance) includes a
+      specification of the form IS {<scalar type name> ...}. Does it make sense for the specified
+      <scalar type name> to be the name of a generated type?
+
+14.13 As noted several times in the body of this chapter, we prohibit coercion. In fact, it has been
+      argued that coercion, if supported, would undermine substitutability; for example, if passing
+      a circle to some operator where an ellipse was expected were to cause that circle to be
+      coerced to type ELLIPSE, then it would become “just an ellipse” and would lose its circle-
+      specific properties (e.g., its radius). Discuss.
+
+14.14 Consider the following type definition. Can you see anything wrong with it?
+       TYPE BETA ... POSSREP { X alpha ... } ... ;
+
+       What about this one?
+       TYPE GAMMA ... POSSREP { X omega ... } ... ;
+
+14.15 No variable can have declared type omega; but what about an attribute (within some tuple or
+      relation type)?
+
+14.16 Let types T1 and T2 be defined as follows:
+       TYPE T1 POSSREP { CONSTRAINT FALSE } ;
+
+       TYPE T2 POSSREP { CONSTRAINT FALSE } ;
+
+       Clearly, these types are both empty; yet they have different names. In accordance with RM
+       Prescription 1, therefore, are they not different types? Discuss.
+             Incidentally, what would happen if we deleted the specification CONSTRAINT
+       FALSE from both of the foregoing type definitions?
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                     336

@@ -1,0 +1,2113 @@
+                                                       Chapter 2
+
+                      A Survey of the Relational Model
+
+Most of this book assumes you have a reasonably good understanding of the relational model. This
+chapter is meant to serve as a quick refresher course on that model; in effect, it summarizes much of
+what you will be expected to know in later chapters. A detailed tutorial on this material, and much
+more, can be found in reference [76]; if you are familiar with that reference, you probably do not
+need to read this chapter in detail. But if your knowledge of the relational model derives from other
+sources—especially ones based on SQL—then you probably do need to read this chapter fairly
+carefully, because it emphasizes numerous important topics that other sources typically do not.
+Such topics include:
+
+        Relations vs. types
+
+        Relation values vs. relation variables
+
+        Predicates and propositions
+
+        Relation-valued attributes
+
+        The crucial role of integrity constraints
+
+        Relational assignment and comparisons
+
+and many others.
+
+
+THE RUNNING EXAMPLE
+
+Examples in this book are based for the most part on the familiar suppliers-and-parts database (see
+Fig. 2.1 for a set of sample values). The semantics are as follows:
+
+       Relvar S represents suppliers (more accurately, suppliers under contract).1 Each supplier has
+        one supplier number (S#), unique to that supplier; one name (SNAME), not necessarily
+        unique (though the SNAME values in Fig. 2.1 do happen to be unique); one rating or status
+        value (STATUS); and one location (CITY).
+
+
+
+
+1
+  The term relvar is short for relation variable. It is explained in detail in the section “Relation Variables” later in this
+chapter. Also, note that throughout this book we favor the terms relation, attribute, and tuple──usually pronounced to
+rhyme with couple──over their less formal and less precise counterparts table, column, and row (except in SQL
+contexts).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                          page 16
+Part I / Preliminaries                                   Chapter 2 / A Survey of The Relational Model
+
+
+     Relvar P represents parts (more accurately, kinds of parts). Each kind of part has one part
+      number (P#), which is unique; one name (PNAME); one color (COLOR); one weight
+      (WEIGHT); and one location where parts of that kind are stored (CITY).
+
+     Relvar SP represents shipments (it shows which parts are supplied by which suppliers). Each
+      shipment has one supplier number (S#), one part number (P#), and one quantity (QTY); there
+      is at most one shipment at any given time for a given supplier and a given part. Notice that
+      the database of Fig. 2.1 includes one supplier, S5, with no shipments at all.
+      ╔═════════════════════════════════════════════════════════════════╗
+      ║     S                                          SP               ║
+      ║    ┌────┬───────┬────────┬────────┐           ┌────┬────┬─────┐ ║
+      ║    │ S# │ SNAME │ STATUS │ CITY   │           │ S# │ P# │ QTY │ ║
+      ║    ├════┼───────┼────────┼────────┤           ├════┼════┼─────┤ ║
+      ║    │ S1 │ Smith │     20 │ London │           │ S1 │ P1 │ 300 │ ║
+      ║    │ S2 │ Jones │     10 │ Paris │            │ S1 │ P2 │ 200 │ ║
+      ║    │ S3 │ Blake │     30 │ Paris │            │ S1 │ P3 │ 400 │ ║
+      ║    │ S4 │ Clark │     20 │ London │           │ S1 │ P4 │ 200 │ ║
+      ║    │ S5 │ Adams │     30 │ Athens │           │ S1 │ P5 │ 100 │ ║
+      ║    └────┴───────┴────────┴────────┘           │ S1 │ P6 │ 100 │ ║
+      ║     P                                         │ S2 │ P1 │ 300 │ ║
+      ║    ┌────┬───────┬───────┬────────┬────────┐   │ S2 │ P2 │ 400 │ ║
+      ║    │ P# │ PNAME │ COLOR │ WEIGHT │ CITY   │   │ S3 │ P2 │ 200 │ ║
+      ║    ├════┼───────┼───────┼────────┼────────┤   │ S4 │ P2 │ 200 │ ║
+      ║    │ P1 │ Nut   │ Red   │   12.0 │ London │   │ S4 │ P4 │ 300 │ ║
+      ║    │ P2 │ Bolt │ Green │    17.0 │ Paris │    │ S4 │ P5 │ 400 │ ║
+      ║    │ P3 │ Screw │ Blue │    17.0 │ Oslo   │   └────┴────┴─────┘ ║
+      ║    │ P4 │ Screw │ Red   │   14.0 │ London │                     ║
+      ║    │ P5 │ Cam   │ Blue │    12.0 │ Paris │                      ║
+      ║    │ P6 │ Cog   │ Red   │   19.0 │ London │                     ║
+      ║    └────┴───────┴───────┴────────┴────────┘                     ║
+      ╚═════════════════════════════════════════════════════════════════╝
+      Fig. 2.1: The suppliers-and-parts database—sample values
+
+      Here are Tutorial D definitions for these three relvars:
+      VAR S REAL RELATION
+        { S# S#, SNAME NAME, STATUS INTEGER, CITY CHAR }
+        KEY { S# } ;
+
+      VAR P REAL RELATION
+        { P# P#, PNAME NAME, COLOR COLOR, WEIGHT WEIGHT, CITY CHAR }
+        KEY { P# } ;
+
+      VAR SP REAL RELATION
+        { S# S#, P# P#, QTY QTY }
+        KEY { S#, P# } ;
+
+      Detailed discussion of the foregoing definitions can be found in Chapter 6, under RM
+Prescription 13. For present purposes, it is sufficient to observe that:
+
+     Each relvar has a set of attributes; for example, relvar S has four attributes, called S#,
+      SNAME, STATUS, and CITY.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         17
+Part I / Preliminaries                                               Chapter 2 / A Survey of The Relational Model
+
+
+        Each attribute has a type; for example, the types of the attributes of relvar S are called S#,
+         NAME, INTEGER, and CHAR, respectively.
+
+      In this chapter we will mostly take types for granted—we will discuss them in detail in the
+next chapter—but it is at least worth stating explicitly that attributes can be of any type whatsoever.1
+In particular, those types can be either system defined (built in) or user defined. In our running
+example, we will assume, where it makes any difference, that types INTEGER (integers) and
+CHAR (character strings of arbitrary length) are system defined and all others are user defined.
+
+
+TUPLES
+
+Since relations are built out of tuples, it is convenient to begin by defining the term tuple precisely.
+Given a collection of types Ti (i = 1, 2, ..., n, where n  0), not necessarily all distinct, a tuple value
+(tuple for short) over those types2—t, say—is a set of n ordered triples of the form <Ai,Ti,vi>, where
+Ai is an attribute name, Ti is a type name, and vi is a value of type Ti. Moreover:
+
+        The value n is the degree (or arity) of t.
+
+        The ordered triple <Ai,Ti,vi> is a component of t.
+
+        The ordered pair <Ai,Ti> is an attribute of t, and it is uniquely identified by the attribute
+         name Ai (attribute names Ai and Aj are the same only if i = j). The value vi is the attribute
+         value for attribute Ai of t. The type Ti is the corresponding attribute type. Note: There is,
+         of course, a logical difference between an attribute and its name; among other things, an
+         attribute is a pair but its name is a singleton. This fact notwithstanding, we often (as we just
+         did) use expressions such as “attribute Ai,” informally, to mean the attribute whose name is
+         Ai. Similar remarks apply to various other constructs, including types, variables, and
+         operators.
+
+        The complete set of attributes is the heading of t.
+
+        The tuple type of t is determined by the heading of t, and the heading and that tuple type both
+         have the same attributes (and hence the same attribute names and types) and the same degree
+         as t does. The tuple type name is, precisely, TUPLE H, where H is the heading. Thus, the
+         particular tuple type name under discussion can be expressed in Tutorial D as follows:
+             TUPLE { A1 T1, A2 T2, ..., An Tn }
+
+         The order in which the attributes are specified is immaterial, however; thus, for example,
+
+
+1
+  This remark is true in general, but there are exceptions, of which one of the most important is this: Attributes of
+relations in the database──as opposed to relations that are local to the application (see RM Prescription 14)──are not
+allowed to be of type pointer. See Chapter 9 for further explanation.
+2
+    We might also reasonably say the tuple is “over” its attributes, q.v.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                              18
+Part I / Preliminaries                                  Chapter 2 / A Survey of The Relational Model
+
+
+         TUPLE { A1 T1, A2 T2 }          and     TUPLE { A2 T2, A1 T1 }
+
+      both denote the same tuple type, in Tutorial D.
+Here is a sample tuple:
+      ┌────┬────┬───────┬──────┬────────┬─────────┬──────┬──────┐
+      │ S#   S# │ SNAME   NAME │ STATUS   INTEGER │ CITY   CHAR │
+      ├────┴────┼───────┴──────┼────────┴─────────┼──────┴──────┤
+      │ S1      │ Smith        │               20 │ London      │
+      └─────────┴──────────────┴──────────────────┴─────────────┘
+
+The attribute names here are S#, SNAME, STATUS, and CITY; the corresponding type names are,
+respectively, S#, NAME, INTEGER, and CHAR; and the corresponding values are, respectively,
+S#('S1'), NAME('Smith'), 20, and 'London'—though most of these expressions have been simplified
+somewhat in the picture (and we will make use of similar simplifications in such pictures
+throughout this book). The degree of this tuple is four. Its heading is:
+      ┌────┬────┬───────┬──────┬────────┬─────────┬──────┬──────┐
+      │ S#   S# │ SNAME   NAME │ STATUS   INTEGER │ CITY   CHAR │
+      └────┴────┴───────┴──────┴────────┴─────────┴──────┴──────┘
+
+Its type in Tutorial D terms is:
+      TUPLE { S# S#, SNAME NAME, STATUS INTEGER, CITY CHAR }
+
+       Now, it is common in informal contexts to omit the type names from a heading, showing just
+the attribute names. Informally, therefore, we might represent the foregoing tuple thus:
+      ┌────┬───────┬────────┬────────┐
+      │ S# │ SNAME │ STATUS │ CITY   │
+      ├────┼───────┼────────┼────────┤
+      │ S1 │ Smith │     20 │ London │
+      └────┴───────┴────────┴────────┘
+
+In Tutorial D, the following expression could be used to denote this tuple:
+      TUPLE { S# S#('S1'), SNAME NAME('Smith'), STATUS 20, CITY 'London' }
+
+This expression is an example of a tuple selector invocation. We will have more to say about such
+expressions in Chapter 3; here we just remark that—as you might have noticed—the keyword
+TUPLE does double duty in Tutorial D, being used in connection with both tuple selector
+invocations and tuple type names. An analogous remark applies to the keyword RELATION (see
+the next section, “Relations”).
+
+Properties of Tuples
+
+Tuples possess a number of important properties, all of them immediate consequences of the
+foregoing definitions. To be specific:
+
+     Every tuple contains exactly one value (of the appropriate type) for each of its attributes.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          19
+Part I / Preliminaries                                   Chapter 2 / A Survey of The Relational Model
+
+
+     Note carefully that, by definition, a tuple considered in its entirety is also a value. For
+      emphasis, we sometimes speak of “tuple values” explicitly, but we usually abbreviate that
+      term to just tuples (exactly as we usually abbreviate, e.g., “integer values” to just integers).
+
+     There is no left-to-right ordering to the components of a tuple. This property follows because
+      a tuple has a set of components, and sets in mathematics have no ordering to their elements.
+      (Our reason for including the redundant qualifier “left-to-right” in the foregoing sentence is
+      explained in the next section.)
+
+      Every subset of a tuple is a tuple and every subset of a heading is a heading. Given some
+       particular tuple, therefore—say the tuple
+       ┌────┬───────┬────────┬────────┐
+       │ S# │ SNAME │ STATUS │ CITY   │
+       ├────┼───────┼────────┼────────┤
+       │ S1 │ Smith │     20 │ London │
+       └────┴───────┴────────┴────────┘
+      —then what we might call “the {S#,CITY} value in this tuple” is itself a tuple:
+       ┌────┬────────┐
+       │ S# │ CITY   │
+       ├────┼────────┤
+       │ S1 │ London │
+       └────┴────────┘
+
+In like fashion, every subset of a heading is a heading.
+       As an aside, we note that this bullet item is the first place in the text to use the term subset.
+We therefore take the opportunity to say that, throughout this book, we take statements of the form
+“b is a subset of a” (equivalently, “a is a superset of b”), noncontroversially, to include the
+possibility that a and b might be equal; if we wish to exclude that possibility, we will talk explicitly
+in terms of proper subsets and supersets. Also, we take statements of the form “a is a set” (again
+noncontroversially) to include the possibility that a might be empty; if we wish to exclude that
+possibility, we will talk explicitly in terms of nonempty sets.
+
+Tuple Equality
+
+Two tuples are equal, obviously enough, if and only if they are in fact the very same tuple (just as,
+e.g., two integers are equal if and only if they are the very same integer). However, it is worth
+spelling out the semantics of tuple equality in detail, since so much in the relational model depends
+on it; for example, candidate keys, functional dependencies, and most of the operators of the
+relational algebra are all defined in terms of it. Here then is a precise definition:
+
+ ■    Tuples t1 and t2 are equal if and only if they have the same attributes A1, A2, ..., An and, for
+      all i (i = 1, 2, ..., n), the value of Ai in t1 is equal to the value of Ai in t2.
+
+      Furthermore (this might seem obvious but it needs to be said), if p1 and p2 are appearances of
+tuples t1 and t2, respectively, then p1 and p2 are duplicates of each other if and only if t1 and t2 are
+equal—i.e., if and only if t1 and t2 are the very same tuple. (See the section “Some Crucial Logical
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                              20
+Part I / Preliminaries                                   Chapter 2 / A Survey of The Relational Model
+
+
+Differences” in Chapter 1 if you need to refresh your memory regarding the meaning of the term
+appearance.)
+
+
+RELATIONS
+
+Now we can define the term relation. A relation value (relation for short), r say, consists of a
+heading and a body, where:
+
+     The heading of r is a heading as defined in the previous section. Relation r has the same
+      attributes (and hence the same attribute names and types) and the same degree as that heading
+      does.
+
+     The body of r is a set of tuples, all having that same heading (and the cardinality of that set is
+      the cardinality of r).
+
+The relation type of r is determined by the heading of r, and it has the same attributes (and hence
+the same attribute names and types) and degree as that heading does. The relation type name is,
+precisely, RELATION H, where H is the heading. In Tutorial D, therefore, we can express a
+relation type name as here:
+      RELATION { A1 T1, A2 T2, ..., An Tn }
+
+(The order in which the attributes are specified is immaterial, however.) Here is a sample relation:
+      ┌────┬────┬───────┬──────┬────────┬─────────┬──────┬──────┐
+      │ S#   S# │ SNAME   NAME │ STATUS   INTEGER │ CITY   CHAR │
+      ├────┴────┼───────┴──────┼────────┴─────────┼──────┴──────┤
+      │ S1      │ Smith        │               20 │ London      │
+      │ S2      │ Jones        │               10 │ Paris       │
+      │ S3      │ Blake        │               30 │ Paris       │
+      │ S4      │ Clark        │               20 │ London      │
+      │ S5      │ Adams        │               30 │ Athens      │
+      └─────────┬──────────────┴──────────────────┴─────────────┘
+
+Its type in Tutorial D is:
+      RELATION { S# S#, SNAME NAME, STATUS INTEGER, CITY CHAR }
+
+       As previously noted, it is common in informal contexts to omit the type names from a
+heading, showing just the attribute names. Informally, therefore, we might represent the foregoing
+relation thus (as we did in Fig. 2.1, in fact):
+      ┌────┬───────┬────────┬────────┐
+      │ S# │ SNAME │ STATUS │ CITY   │
+      ├════┼───────┼────────┼────────┤
+      │ S1 │ Smith │     20 │ London │
+      │ S2 │ Jones │     10 │ Paris │
+      │ S3 │ Blake │     30 │ Paris │
+      │ S4 │ Clark │     20 │ London │
+      │ S5 │ Adams │     30 │ Athens │
+      └────┴───────┴────────┴────────┘
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            21
+Part I / Preliminaries                                          Chapter 2 / A Survey of The Relational Model
+
+
+The following expression could be used in Tutorial D to denote this relation:
+        RELATION {
+            TUPLE { S# S#('S1'), SNAME NAME('Smith'),
+                    STATUS 20, CITY 'London' } ,
+            TUPLE { S# S#('S2'), SNAME NAME('Jones'),
+                    STATUS 10, CITY 'Paris' } ,
+            TUPLE { S# S#('S3'), SNAME NAME('Blake'),
+                    STATUS 30, CITY 'Paris' } ,
+            TUPLE { S# S#('S4'), SNAME NAME('Clark'),
+                    STATUS 20, CITY 'London' } ,
+            TUPLE { S# S#('S5'), SNAME NAME('Adams'),
+                    STATUS 30, CITY 'Athens' } }
+
+(This is an example of a relation selector invocation. See Chapter 3.)
+
+Properties of Relations
+
+       Note that, strictly speaking, a relation does not contain tuples—it contains a body, and that
+        body in turn contains tuples. Informally, however, it is convenient to talk as if relations
+        contained tuples directly, and we will follow this simplifying convention throughout this
+        book.
+
+       Every subset of a body is a body (loosely, every subset of a relation is a relation).
+
+       No relation ever contains two or more distinct appearances of the same tuple ( “duplicate
+        tuples”). This property follows because a body is a set of tuples, and sets in mathematics have
+        no duplicate elements. Now, you probably know that SQL tables are allowed to contain
+        duplicate rows, and SQL tables are thus not relations, in general. Please understand,
+        therefore, that in this book we always use the term “relation” to mean a relation—without
+        duplicate tuples, by definition—and not an SQL table. Please note further that relational
+        operations always produce a result without duplicate tuples, again by definition.
+
+       Relations have no top-to-bottom ordering to their tuples and no left-to-right ordering to their
+        attributes, pictures like Fig. 2.1 notwithstanding. (Actually, attributes have no ordering of any
+        kind, and it would be logically correct to drop that “left-to-right” qualifier. But to say merely
+        that attributes have no ordering could be misconstrued to mean that attribute values cannot be
+        ordered—top to bottom, as it were—and we therefore include the qualifier for emphasis.
+        Purely for consistency, therefore, we include the qualifier “top-to-bottom” in connection with
+        tuple ordering as well.)
+
+       Every tuple of every relation contains exactly one value for each attribute of that relation; i.e.,
+        relations are always normalized or, equivalently, in what has historically been called first
+        normal form, 1NF.1 Note: In connection with this point, it needs to be said that much of the
+        literature talks about—and SQL products support—the use of what are called nulls in attribute
+
+
+1
+  Our understanding of the term first normal form has changed somewhat over the years. See reference [74] for an
+exhaustive discussion of this issue.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                        22
+Part I / Preliminaries                                   Chapter 2 / A Survey of The Relational Model
+
+
+      positions to indicate that some value is missing for some reason. However, since (by
+      definition) nulls are not values, the notion of a “tuple” containing nulls is a contradiction in
+      terms. A “tuple” that contains nulls is not a tuple, and a “relation” that contains such a
+      “tuple” is not a relation. Thus, relations never contain nulls.
+
+     Like a tuple, a relation considered in its entirety is a value. Fig. 2.1, for example, shows three
+      such values. For emphasis, we sometimes speak of “relation values” explicitly, but we
+      usually abbreviate that term to just relations (exactly as we usually abbreviate “tuple values”
+      to just tuples). See the next section ( “Relation Variables”) for further discussion of this issue.
+
+Relation-Valued Attributes
+
+As noted near the end of the section “The Running Example” earlier in this chapter, attributes of
+relations can be of any type whatsoever (with certain exceptions that we can safely ignore here). It
+follows that such attributes can be of relation types in particular, since relation types are certainly
+types; in other words, attributes can be relation valued, meaning we can have relations with
+attributes whose values are relations in turn. An example of such a relation is shown in Fig. 2.2 (we
+will return to this example in our discussion of the GROUP and UNGROUP operators in the section
+“Relational Operators,” later in this chapter).
+╔════════════════════════════════════════════════════════════════╗
+║   ┌────┬──────────────┐                                        ║
+║   │ S# │ PQ           │           │    │ ┌────┬─────┐ │        ║
+║   ├════┼──────────────┤           │ S3 │ │ P# │ QTY │ │        ║
+║   │    │ ┌────┬─────┐ │           │    │ ├════┼─────┤ │        ║
+║   │ S1 │ │ P# │ QTY │ │           │    │ │ P2 │ 200 │ │        ║
+║   │    │ ├════┼─────┤ │           │    │ └────┴─────┘ │        ║
+║   │    │ │ P1 │ 300 │ │           │    │ ┌────┬─────┐ │        ║
+║   │    │ │ P2 │ 200 │ │           │ S4 │ │ P# │ QTY │ │        ║
+║   │    │ │ P3 │ 400 │ │           │    │ ├════┼─────┤ │        ║
+║   │    │ │ P4 │ 200 │ │           │    │ │ P2 │ 200 │ │        ║
+║   │    │ │ P5 │ 100 │ │           │    │ │ P4 │ 300 │ │        ║
+║   │    │ │ P6 │ 100 │ │           │    │ │ P5 │ 400 │ │        ║
+║   │    │ └────┴─────┘ │           │    │ └────┴─────┘ │        ║
+║   │    │ ┌────┬─────┐ │           │    │ ┌────┬─────┐ │        ║
+║   │ S2 │ │ P# │ QTY │ │           │ S5 │ │ P# │ QTY │ │        ║
+║   │    │ ├════┼─────┤ │           │    │ ├════┼─────┤ │        ║
+║   │    │ │ P1 │ 300 │ │           │    │ └────┴─────┘ │        ║
+║   │    │ │ P2 │ 400 │ │           └────┴──────────────┘        ║
+║   │    │ └────┴─────┘ │                                        ║
+╚════════════════════════════════════════════════════════════════╝
+
+RELATION VARIABLES
+
+Consider Fig. 2.1 once again. As noted in the previous section (at the end of the subsection
+“Properties of Relations”), that figure shows three relation values: namely, those that happen to
+appear in the database at some particular time. But, of course, if we were to look at the database at
+some different time, we would probably see three different relation values appearing in their place.
+In other words, S, P, and SP in that database are really variables: relation variables, to be precise,
+meaning variables whose permitted values are relation values (and the logical difference discussed
+in Chapter 1 between values and variables in general thus applies to relation values and relation
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                              23
+Part I / Preliminaries                                        Chapter 2 / A Survey of The Relational Model
+
+
+variables in particular). For example, suppose relation variable S currently has the value—the
+relation value—shown in Fig. 2.1, and suppose we delete the tuples (actually there is just one such)
+for suppliers in Athens:
+      DELETE S WHERE CITY = 'Athens' ;
+
+(Tutorial D syntax again). The result is shown in Fig. 2.3.
+╔════════════════════════════════════════════════════════════════╗
+║                ┌────┬───────┬────────┬────────┐                ║
+║             S │ S# │ SNAME │ STATUS │ CITY    │                ║
+║                ├════┼───────┼────────┼────────┤                ║
+║                │ S1 │ Smith │     20 │ London │                ║
+║                │ S2 │ Jones │     10 │ Paris │                 ║
+║                │ S3 │ Blake │     30 │ Paris │                 ║
+║                │ S4 │ Clark │     20 │ London │                ║
+║                └────┴───────┴────────┴────────┘                ║
+╚════════════════════════════════════════════════════════════════╝
+Fig. 2.3: Relation variable S (as shown in Fig. 1) after deleting suppliers in Athens
+      Conceptually, what has happened here is that the old relation value of S has been replaced en
+bloc by a new one. Of course, the old value (with five tuples) and the new one (with four) are
+somewhat similar to each other, but they certainly are different values. In fact, the DELETE just
+shown is logically equivalent to, and indeed shorthand for, the following relational assignment:
+      S := S WHERE NOT ( CITY = 'Athens' ) ;
+
+       As in all assignments, what is happening here is that (a) the source expression on the right
+side is evaluated, and then (b) the result of that evaluation is assigned to the target variable on the
+left side. As already stated, the net effect is thus to replace the “old” value of S by a “new” one, or
+in other words to update the variable S. Note that the left side of the assignment must identify a
+variable specifically; variables are updatable by definition, while values (also by definition) are not.
+In the final analysis, in fact, to say that V is a variable is to say, precisely, that V can serve as the
+target for an assignment operation, no more and no less.
+       In analogous fashion, of course, relational INSERT and UPDATE operators are also
+shorthand for certain relational assignments. Thus, while Tutorial D certainly does support the
+familiar INSERT, DELETE, and UPDATE operators on relation variables, as we will see in
+Chapters 5 and 6, it expressly recognizes that those operators are really just shorthands, albeit
+convenient ones, for certain relational assignments. (We follow convention throughout this book in
+using the generic term “update” to refer to the INSERT, DELETE, and UPDATE—and
+assignment—operators considered collectively; indeed, we have already been doing this, as you
+might have noticed. When we want to refer to the UPDATE operator specifically, we will set it in
+all uppercase as just shown.)
+       Back to relation variables. As you probably know, most of the literature in fact uses the term
+relation when what it really means is a relation variable (as well as when it means a relation per
+se—i.e., a relation value). Historically, however, this practice has certainly caused confusion. In
+this book, therefore, we distinguish very carefully between relation variables and relations per se.
+We also follow reference [35] in using the term relvar as a convenient shorthand for relation
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            24
+Part I / Preliminaries                                  Chapter 2 / A Survey of The Relational Model
+
+
+variable (as you already know). More to the point, we take care always to phrase our remarks in
+terms of relvars, not relations, when it really is relvars we mean, and in terms of relations, not
+relvars, when it really is relations we mean.
+      By way of example, here repeated from the section “The Running Example” is a Tutorial D
+definition for the suppliers relvar S:
+      VAR S REAL RELATION
+        { S# S#, SNAME NAME, STATUS INTEGER, CITY CHAR }
+        KEY { S# } ;
+
+The KEY specification here defines a candidate key for the relvar (see the subsection “Keys” later
+in this section). The REAL specification indicates that this is a real relvar as opposed to a virtual
+one—real and virtual relvars being the Manifesto counterparts to what SQL would call “base tables”
+and “views,” respectively (see the section “Virtual Relvars” later in this chapter).
+       Any given relvar is of some relation type, and all possible values of that relvar are of that
+same type. For relvar S, that type is explicitly specified in the relvar definition as:
+      RELATION { S# S#, SNAME NAME, STATUS INTEGER, CITY CHAR }
+
+      The terms heading, body, attribute, tuple, cardinality, and degree, defined in the previous
+section for relation values, can all be interpreted in the obvious way to apply to relvars as well. (In
+the case of body, tuple, and cardinality, they must be understood as applying to the specific relation
+that happens to be the current value of the relvar in question.)
+
+Some Remarks on Updating
+
+We return for a moment to the issue of updating relvars, because there is another point to be made
+in connection with that issue, viz.: Relational assignment, regardless of what syntax we use to
+express it, is really a set-level operator. UPDATE, for example, updates a set of tuples in the target
+relvar (loosely speaking!—see further discussion below). Informally, we often talk of, e.g.,
+updating some individual tuple, but it must be clearly understood that:
+
+     Such talk really means that the set of tuples we are updating just happens to have cardinality
+      one.
+
+     Sometimes, moreover, updating a set of tuples of cardinality one is impossible.
+
+      Suppose, for example, that the suppliers relvar S is subject to the constraint (see the section
+“Integrity Constraints,” later in this chapter) that suppliers S1 and S4 are always located in the same
+city. Then any “single-tuple” UPDATE on S that attempts to change the city for just one of those
+two suppliers must necessarily fail. Instead, both suppliers must be updated simultaneously,
+perhaps as here:
+      UPDATE S WHERE S# = S#('S1') OR S# = S#('S4')
+               ( CITY := some value ) ;
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            25
+Part I / Preliminaries                                   Chapter 2 / A Survey of The Relational Model
+
+
+       We now observe that to talk as we have just been doing of “updating a tuple” (or set of tuples,
+rather) is really somewhat imprecise—not to say sloppy—as well. If something is subject to update,
+then that something must be a variable, not a value; and tuples, like relations, are values and cannot
+be updated, by definition. Furthermore, we certainly do not mean, when we talk of “updating a
+tuple within some relvar,” that we are updating a tuple variable (for if we did mean that, then we
+would be talking about variables containing other variables, a concept to which we do not subscribe
+at all). Rather, what we really mean when we talk of, e.g., updating tuple t1 to t2 within some
+relvar is that we are replacing one tuple by another. And even that talk is still just shorthand; what
+we really mean is that we are replacing the original value of the relvar, r1 say, by another value r2,
+and r2 is equal to (r1 MINUS s1) UNION s2, where s1 and s2 are relations containing just t1 and
+t2, respectively.
+       Analogous remarks apply to phrases such as “updating attribute A” within some tuple. In this
+book, we will continue to talk from time to time in terms of updating tuples or attributes thereof—
+the practice is convenient—but it must be clearly understood that such talk is only shorthand, and
+rather sloppy shorthand at that.
+
+Keys
+
+Let K be a subset of the heading of relvar R. Then K is a candidate key (or just key for short) for R
+if and only if it possesses both of the following properties:
+
+      Uniqueness: No possible value for R contains two distinct tuples with the same value for K.
+
+      Irreducibility (also known as nonredundancy or minimality): No proper subset of K has the
+       uniqueness property.
+
+      Observe that the key concept applies to relvars specifically (an analogous notion can be
+defined for relation values as well, but relvars are the important case). For the suppliers-and-parts
+database, the sole keys are {S#} for relvar S, {P#} for relvar P, and {S#,P#} for relvar SP. Note the
+braces, by the way: Keys are sets of attributes, not attributes per se, even when the set in question
+involves just a single attribute as it does for relvars S and P. Note too that, by definition, key values
+are tuples!—and so we see that, as claimed earlier, the definition of “key” relies on the notion of
+tuple equality. For such reasons, we always enclose the pertinent attribute name(s) in braces, as in
+the examples at hand.
+      Any given relvar always has at least one key (why?). If it has two or more, the relational
+model has historically required—at least in the case of real relvars—that one be chosen as the
+primary key, and the others are then alternate keys. While this discipline (i.e., choosing a primary
+key) might be useful in practice, we do not insist on it, because we regard the idea of making one
+key somehow “more equal than others” as a psychological issue merely [52]. Of course, we do not
+prohibit it either, and indeed we tend to adopt it in our own examples. In particular, we assume—
+where it makes any difference—that {S#}, {P#}, and {S#,P#} are the primary keys for relvars S, P,
+and SP, respectively (as the double underlining in Fig. 2.1 suggests).
+      We also define the notion of a superkey. A superkey is a superset of a key; equivalently, a
+subset of the heading of relvar R is a superkey for R if it possesses the uniqueness property but not
+necessarily the irreducibility property. In the case of the suppliers relvar S, for example, every set
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            26
+Part I / Preliminaries                                           Chapter 2 / A Survey of The Relational Model
+
+
+of attributes that includes S#—the full heading in particular—is a superkey. Note that if the system
+is told that K is a key for relvar R, it can enforce the uniqueness property for K but not the
+irreducibility property; in other words, it can guarantee at best only that K is a superkey. (If we
+wished, however, we could at least impose a syntax rule to the effect that no two keys defined for
+the same relvar be such that one is a superset of the other.)
+       Another important concept, related to that of keys, is that of functional dependency. Let A
+and B be subsets of the heading of relvar R. Then the functional dependency A  B holds for R if
+and only if, in every possible value for R, whenever two tuples have the same value for A, they also
+have the same value for B.1 For example, suppose there were an integrity constraint on relvar S to
+the effect that if two suppliers are located in the same city, then they must also have the same status.
+Then the functional dependency
+       { CITY }  { STATUS }
+
+would hold for that relvar S.
+      We will have little to say regarding functional dependencies in this book, but it is interesting
+to note in passing that they provide the basis for an alternative definition of the notion of a
+superkey. To be specific, let X be a subset of the heading of relvar R; then X is a superkey for R if
+and only if the functional dependency X  Y holds for every subset Y of the heading of R.
+
+Foreign Keys
+
+Let R1 and R2 be relvars, not necessarily distinct. Let K and FK be subsets of the headings of R1
+and R2, respectively, such that (a) K is a key for R1 and (b) there exists a (very often empty)
+sequence of attribute renamings—see the section “Relational Operators” later in this chapter—that
+maps K into K' (say), such that K' and FK consist of exactly the same attributes. Then FK is a
+foreign key if and only if, for all time, every tuple in the current value of R2 has a value for FK that
+is equal to the value of K' obtained from some necessarily unique tuple in the current value of R1.
+In the case of suppliers and parts, for example, {S#} and {P#} in relvar SP are foreign keys, and
+they match—or reference—the sole candidate key (in fact, the primary key) in relvars S and P,
+respectively.
+      It follows immediately from the foregoing that no database is ever allowed to contain any
+unmatched foreign key values—where an “unmatched foreign key value” is a foreign key value in
+the current value of some referencing relvar R2 for which there does not exist a tuple with the
+applicable candidate key value in the current value of the applicable referenced relvar R1. This rule
+is known as the referential integrity rule. (In case it is not obvious, by “referencing relvar” we
+mean the relvar that includes the foreign key, and by “referenced relvar” we mean the relvar that
+includes the applicable candidate key. In the case of suppliers and parts, for example, SP is a
+referencing relvar and S and P are both referenced relvars.)
+      Note: We include this brief subsection because foreign keys are of considerable pragmatic
+importance, and also because they were part of the relational model as originally defined (see
+references [20-21], also reference [70]). However, we must emphasize that foreign keys are not
+
+1
+  Those A and B values are themselves tuples, so we see that the notion of functional dependency also relies on the
+notion of tuple equality.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                           27
+Part I / Preliminaries                                              Chapter 2 / A Survey of The Relational Model
+
+
+truly fundamental—they merely provide a convenient shorthand for certain integrity constraints that
+are commonly required in practice.1 For this reason, The Third Manifesto merely suggests, and
+does not prescribe, foreign key support (see Chapter 10).
+
+Relvars vs. Types
+
+We close this section by pointing out that there is an obvious logical difference between relvars and
+types: Relvars have types but are not types. Indeed, a relvar is a variable, and variables are not
+types. We mention this point explicitly because many people attempt to argue to this day (albeit not
+usually in these terms) that relvars are types: a mistake that we examine in detail, along with a
+related one, in Chapter 9.
+
+
+RELVARS, RELATIONS, AND PREDICATES
+
+Everything we have said about relvars and relations in this chapter so far is accurate, of course, but
+there is another way to think about these matters—not the way (we hasten to add) in which the
+database community usually does think about them, but we venture to suggest it should be. To be
+more specific, it is common to think of a relvar as if it were just a simple abstraction of a traditional
+computer file; but we think the ideas discussed in this section can lead to a deeper understanding of
+what relational databases are really all about.
+       Consider the suppliers-and-parts database once again. That database contains three relvars,
+and of course each of those relvars is supposed to represent some portion of reality in some way. In
+fact, we can make this statement more precise: Each of those relvars represents some predicate,
+and each of those predicates is, in essence, a generic statement about some portion of reality. Here
+is an example:
+
+         Supplier S# is under contract, is named SNAME, has status STATUS, and is located in city
+         CITY.
+
+This predicate is the intended interpretation—also known as the intension (note the spelling)—
+for the suppliers relvar S.
+        So what exactly is a predicate?2 In general, it is a function; like all functions, it takes a set of
+parameters and it returns a result when it is invoked. But a predicate in particular is a truth-valued
+function, meaning the result it returns when invoked is a truth value (TRUE or FALSE). In the case
+of the predicate just shown for relvar S, for example, the parameters are the attributes of the relvar
+heading—S#, SNAME, STATUS, and CITY—and they stand for values of the corresponding types
+(i.e., S#, NAME, INTEGER, and CHAR, respectively). When we invoke the function (or
+instantiate the predicate, as the logicians say), we substitute arguments for the parameters. Suppose
+we substitute the argument values S1, Smith, 20, and London, respectively. Then we obtain the
+following proposition:
+
+1
+    Similar remarks apply to candidate keys, but here the practical benefits of providing a shorthand are overwhelming.
+2
+  Actually there is a slight lack of consensus on this question in the literature; not all logicians would agree with every
+detail in our definition of the term. However, we believe they would agree with the essence of that definition.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                               28
+Part I / Preliminaries                                              Chapter 2 / A Survey of The Relational Model
+
+
+         Supplier S1 is under contract, is named Smith, has status 20, and is located in city London.
+
+       Now, a proposition in logic is, in general, a statement that is unconditionally either true or
+false; however, the particular propositions we are interested in here are supposed to be ones that
+evaluate to TRUE, a point we will return to in just a moment. In the example just shown, the
+proposition is indeed true—at least, so we believe—because a tuple corresponding to that
+proposition does currently appear in relvar S (see Fig. 2.1).
+       More generally, let relvar R represent predicate P; then P is the relvar predicate for relvar
+  1
+R. Moreover, let the current value of R be r; then each tuple t in r can be regarded as representing
+a certain proposition p, derived by invoking, or instantiating, P with the attribute values from t
+being substituted for the parameters of P. And (very important!) we assume by convention that
+each such proposition—each proposition, that is, that is represented by some tuple in r—evaluates
+to TRUE. Thus, given the sample value for relvar S shown in Fig. 2.1, we assume the following
+propositions all evaluate to TRUE:
+
+         Supplier S1 is under contract, is named Smith, has status 20, and is located in city London.
+
+         Supplier S2 is under contract, is named Jones, has status 10, and is located in city Paris.
+
+         Supplier S3 is under contract, is named Blake, has status 30, and is located in city Paris.
+
+And so on. Furthermore, we subscribe, noncontroversially, to the Closed World Assumption
+[121], which says that if a given tuple plausibly could appear in the relvar at some time but in fact
+does not, then the corresponding proposition is understood by convention to be one that evaluates to
+FALSE at the time in question. For example, the tuple
+         TUPLE { S# S#('S6'), SNAME NAME('Lopez'), STATUS 30, CITY 'Madrid' }
+
+is (let us agree) a plausible supplier tuple; however, it does not appear in the current value of relvar
+S as shown in Fig. 2.1, and so we are entitled to assume that the corresponding proposition—
+
+         Supplier S6 is under contract, is named Lopez, has status 30, and is located in city Madrid.
+
+—evaluates to FALSE at this time. In other words, the relvar contains, at any given time, all and
+only the tuples that represent true propositions at that time.
+      More terminology: Again, let P be the relvar predicate or intension for relvar R, and let the
+value of R at some given time be r. Then r—or the body of r, to be more precise—constitutes the
+extension of P at that given time. (Observe, therefore, that the extension varies over time but the
+intension does not.) Another way of saying the same thing is to say that relation r is “the current
+manifestation” of predicate P. Yet another way is to say that r contains exactly the tuples that make
+P evaluate to TRUE (at the time in question).
+
+
+
+
+1
+    In references [82, 83] and elsewhere we called relvar predicates external predicates.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                  29
+Part I / Preliminaries                                            Chapter 2 / A Survey of The Relational Model
+
+
+      Now, if we think of each relvar as containing the tuples that make its predicate evaluate to
+TRUE at the time in question, it follows that we can think in a similar way about arbitrary
+relational expressions. For example, consider the following expression:
+       S { S#, SNAME, STATUS }
+
+This expression denotes a projection—see the section “Relational Operators” later in this chapter—
+of the current value of relvar S on attributes S#, SNAME, and STATUS. The result of that
+projection contains all tuples of the form
+       TUPLE { S# s, SNAME n, STATUS t }
+
+such that a tuple of the form
+       TUPLE { S# s, SNAME n, STATUS t, CITY c }
+
+currently appears in relvar S for some CITY value c. Thus, that result represents the current
+extension of a predicate that looks like this:
+
+       There exists some city CITY such that supplier S# is under contract, is named SNAME, has
+       status STATUS, and is located in city CITY.
+
+       Observe that the result relation has three attributes and the corresponding predicate has three
+parameters; CITY is not a parameter to that predicate but a bound variable instead, thanks to the
+fact that it is quantified by the phrase there exists some city.1 Another, perhaps clearer, way of
+making the same point—i.e., that the predicate has three parameters, not four—is to observe that the
+predicate as just stated is logically equivalent to this one:
+
+       Supplier S# is under contract, is named SNAME, has status STATUS, and is located in some
+       city.
+
+This version of the predicate very clearly has just three parameters.
+      It follows from the foregoing that virtual relvars in particular represent certain predicates (see
+the section “Virtual Relvars” later in this chapter). For example, let virtual relvar SST be defined as
+follows:
+       VAR SST VIRTUAL ( S { S#, SNAME, STATUS } ) ;
+
+Then the relvar predicate for relvar SST is precisely:
+
+       Supplier S# is under contract, is named SNAME, has status STATUS, and is located in some
+       city.
+
+
+
+1
+  Bound variables are not variables in the usual programming sense, they are variables in the sense of predicate logic.
+See reference [78] or reference [112] if you need further explanation of quantifiers, bound variables, and related
+matters.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                               30
+Part I / Preliminaries                                   Chapter 2 / A Survey of The Relational Model
+
+
+       There are a few more points to be made regarding predicates and propositions. First, we have
+said that a predicate has a set of parameters. Of course, that set can be empty—and if it is, then the
+predicate in question degenerates to a proposition (certainly it is unconditionally either true or
+false). In other words, all propositions are predicates, but most predicates are not propositions.
+       Second, we have said that a predicate is “a generic statement about some portion of reality.”
+We can now see that it is precisely the fact that the statement is, in general, parameterized that
+makes it generic (and if the set of parameters is empty, then that “generic” statement becomes rather
+specific!).
+       Third, we have also said, in the case of a relvar predicate specifically, that the parameters
+correspond to the attributes of the relvar; thus, a relvar of degree n represents a predicate with n
+parameters, or what the logicians call an n-place predicate. However, no harm is done, logically
+speaking, if we think of that set of n parameters as constituting a single tuple parameter (and
+corresponding arguments, in some instantiation of the predicate, as constituting a single tuple
+value). Thus, we can simplify our discussions somewhat by considering relvar predicates always to
+be monadic, meaning they are defined in terms of just one (tuple) parameter. And we can then go
+on to think of a given tuple t (of the appropriate tuple type) as either satisfying or violating a given
+relvar predicate P. To be specific, tuple t satisfies predicate P if and only if the proposition
+obtained from P by substituting t for its (tuple) parameter evaluates to TRUE, and it violates it if
+and only if it does not satisfy it.
+       Fourth, a matter of notation: For clarity, we have deliberately used different symbols, R and
+P, for a relvar and its predicate. Sometimes, however, there are good reasons to conflate the two.
+Thus, we will occasionally write expressions of the form R(t)—meaning, specifically, that tuple t
+appears in relvar R and therefore satisfies the relvar predicate corresponding to R.
+
+Relations vs. Types
+
+It follows from everything we have said in this section so far that:
+
+      Types comprise the things we can talk about.
+
+      Relations comprise the truths we utter about those things.
+
+      In other words, types give us things we can talk about—in effect, they give us our
+vocabulary—and relations give us the ability to say things about the things we can talk about.
+(There is a nice analogy here that might help you remember and appreciate these important points:
+Types are to relations as nouns are to sentences.) In the case of suppliers, for example, the things
+we can talk about are supplier numbers, names, integers, and character strings, and the things we
+can say are things of the form “The supplier with the specified supplier number is under contract,
+has the specified name, has the status denoted by the specified integer, and is located in the city
+denoted by the specified character string.” Note the following important corollaries! In order (as
+we put it earlier) to “represent some portion of reality”:
+
+ 1.   Types and relations are both necessary—without types, we have nothing to talk about;
+      without relations, we cannot say anything.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            31
+Part I / Preliminaries                                     Chapter 2 / A Survey of The Relational Model
+
+
+    2.   Types and relations are sufficient, as well as necessary—we do not need anything else,
+         logically speaking. (Well, we need relvars too, in order to reflect the fact that reality changes
+         over time, but not to reflect any particular portion of reality.)
+
+    3.   Types and relations are not the same thing.
+
+       With regard to the last of these points, incidentally, we saw in the previous section that there
+is a logical difference between relvars and types—a relvar is a variable, and variables are not types.
+By the same token, we now see that there is a logical difference between relations and types as
+well—a relation is a value, and values are not types either.
+
+
+INTEGRITY CONSTRAINTS
+
+An integrity constraint (usually abbreviated to just constraint) can be thought of as a boolean
+expression—also known as a logical, conditional, or truth-valued expression—that is required to
+evaluate to TRUE.1 Constraints are so called because they constrain the values that can appear in
+some context. They fall into two broad categories, which we call type constraints and database
+constraints, respectively:
+
+        A type constraint defines the set of values that constitute a given type.
+
+        A database constraint limits the set of values a given database is permitted to assume. Note:
+         Local or private (nondatabase) data is subject to constraints too, but such matters are beyond
+         the scope of this book.
+
+Type Constraints
+
+In Tutorial D, type constraints are specified as part of the definition of the type to which they
+apply. For example:
+         TYPE S# POSSREP { C CHAR CONSTRAINT SUBSTR ( C, 1, 1 ) = 'S'
+                                    AND CHAR_LENGTH ( C )  2
+                                    AND CHAR_LENGTH ( C )  5 } ;
+
+This definition constrains supplier numbers to be such that they can “possibly be represented” by a
+character string C of from two to five characters, of which the first must be an “S”; we have
+assumed the existence of an operator called CHAR_LENGTH, which returns the length in
+characters of its character string argument. (In practice we might additionally want to specify that
+every character in C after the first is a decimal digit; we do not do so in the example for reasons of
+simplicity only.) Note: Possible representations and related matters are explained in detail in
+Chapter 3. Several further examples of type constraints can be found under RM Prescription 1 in
+Chapter 6.
+
+
+
+1
+    Formally, in fact, a constraint is a proposition.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                              32
+Part I / Preliminaries                                               Chapter 2 / A Survey of The Relational Model
+
+
+      Type constraints are checked during the execution of some selector operator for the type in
+question (see Chapter 3). For example, the expression S#('S1') is an invocation of a selector (also
+called S#) for type S#, and it returns the supplier number for supplier S1. As another example, the
+expression S#('X2') is also such an invocation; it fails on a type constraint violation, however,
+because the first character of the character string argument is not an “S”. See RM Prescription 23 in
+Chapter 6 for further discussion.
+
+Database Constraints
+
+Database constraints are specified in Tutorial D by means of an explicit CONSTRAINT statement
+(or by some shorthand that is effectively equivalent to some such CONSTRAINT statement). Here
+are some examples (note the constraint names DBC1-DBC5 and the appeals to the self-explanatory
+operators IS_EMPTY and COUNT):
+         CONSTRAINT DBC1 IS_EMPTY ( S WHERE STATUS < 1
+                                      OR    STATUS > 100 ) ;
+
+Meaning: Supplier status values must be in the range 1-100 inclusive. This constraint involves just
+a single attribute of a single relvar;1 note that it can be checked for a given supplier by examining
+just the pertinent supplier tuple in isolation. If relvar S already contains a supplier tuple that
+violates this constraint when the foregoing CONSTRAINT statement is executed, that execution
+will fail, of course. More generally, whenever the user attempts to define a new database constraint,
+the system will first check to see that the constraint in question is satisfied by the database at that
+time; if not, the constraint is rejected, otherwise it is accepted and enforced from that point forward.
+       CONSTRAINT DBC2 IS_EMPTY ( S WHERE CITY = 'London'
+                                    AND   STATUS ≠ 20 ) ;
+
+Meaning: Suppliers in London must have status 20. This constraint involves two distinct attributes
+(of the same relvar), but it is still the case that it can be checked for a given supplier by examining
+just the pertinent supplier tuple in isolation.
+       CONSTRAINT DBC3 COUNT ( S ) = COUNT ( S { S# } ) ;
+
+Meaning: {S#} is a superkey for relvar S. Like constraints DBC1 and DBC2, this constraint still
+involves just one relvar; however, it clearly cannot be checked for a given supplier by examining
+just the pertinent supplier tuple in isolation. Note: The Tutorial D syntax KEY {S#} might be
+regarded as shorthand for the foregoing more longwinded expression (ignoring the fact that keys are
+supposed to be irreducible as well as unique, and ignoring also the fact that the KEY syntax does
+not include a constraint name); in other words, if K is a key for R, then that fact is a database
+constraint. In like manner, if the functional dependency A  B holds for R, then that fact also is a
+database constraint.
+
+
+
+1
+  It is not, however, what references [82, 83] call an attribute constraint, which is simply a constraint to the effect that a
+specified attribute is of a specified type.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                                 33
+Part I / Preliminaries                                        Chapter 2 / A Survey of The Relational Model
+
+
+      CONSTRAINT DBC4 IS_EMPTY ( ( S JOIN SP ) WHERE STATUS < 20
+                                               AND   P# = P#('P6') ) ;
+
+      Meaning: No supplier with status less than 20 can supply part P6. Observe that this
+constraint involves—in fact, interrelates—two distinct relvars, S and SP. In general, of course, a
+database constraint might involve any number of distinct relvars.
+      CONSTRAINT DBC5 SP { S# }  S { S# } ;
+
+       Meaning: Every supplier number in the shipments relvar must also exist in the suppliers
+relvar. Notice that this constraint involves a relational comparison; to be specific, it requires that
+the body of the relation that is the projection on S# of the current value of relvar SP be a subset of
+the body of the relation that is the projection on S# of the current value of relvar S. Given that {S#}
+is a key—in fact, the key—for relvar S, of course, we can see that this constraint is basically just the
+foreign key constraint from shipments to suppliers; thus, foreign key constraints also are database
+constraints.
+       Database constraints are required to be satisfied—i.e., to evaluate to TRUE, given the values
+currently appearing in the database—at statement boundaries; in other words, such constraints are
+conceptually checked at the end of any statement that might cause them to be violated ( “immediate
+checking”). If any such check fails, the effects on the database of the statement in question are
+undone and an exception is raised.
+       As an aside, we remark that since statements are delimited by semicolons in Tutorial D, we
+might say, very informally, that database constraint checking is “done at semicolons.” Note: The
+term statement here basically means relational assignment; fundamentally, relational assignment is
+the only operator that can update the database. (We ignore here relvar definitions and other
+statements of a definitional nature, such as the CONSTRAINT statement itself, that cause updates
+to be made to the database catalog. In fact, of course, all such statements are really just relational
+assignments anyway; to be specific, they are relational assignments in which the target relvars
+happen to be relvars in the catalog.) Observe, therefore, that statements that update nothing in the
+database at all—including the statements BEGIN TRANSACTION, COMMIT, and ROLLBACK
+in particular—do not involve any database constraint checking. See Chapter 6 for further
+discussion.
+       Now let C1, C2, ..., Cn be all of the database constraints defined for some given database DB
+(but ignore the constraint names, for simplicity). Then the conjunction
+      ( C1 ) AND ( C2 ) AND ... AND ( Cn ) AND TRUE
+
+can be regarded as the total constraint for database DB. Note that final “AND TRUE,” by the way;
+the implication is that if no constraints are explicitly specified for a given database, then the default
+is just TRUE. The reason this observation is valid is that no Ci and Cj can contradict one another.1
+Why not? Because if Ci is declared first, then Cj will necessarily evaluate to FALSE when the
+CONSTRAINT statement that declares it is executed, and that execution will therefore certainly
+fail.
+
+1
+  A contradiction in logic is an expression such as C AND NOT C that always evaluates to FALSE. (By contrast, a
+tautology is an expression such as C OR NOT C that always evaluates to TRUE.)
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                       34
+Part I / Preliminaries                                            Chapter 2 / A Survey of The Relational Model
+
+
+       Let DB be a database, then, and let DBC be the total constraint for DB. Since we have said
+that all database constraint checking is immediate—i.e., “done at semicolons”—database DB is
+never allowed to violate that constraint DBC: a state of affairs that we refer to as The Golden Rule.
+Another way of saying the same thing is that no update on database DB can be accepted if it leads to
+a violation of the constraint DBC; thus, the constraint DBC constitutes the criterion for
+acceptability of updates on database DB.
+       One consequence of the foregoing is that no update on relvar R in database DB can be
+accepted if it leads to a violation of any portion of constraint DBC that involves that relvar R: a
+weaker form of The Golden Rule. More terminology: Any portion of DBC that involves relvar R
+is a relvar constraint for R, and the conjunction RC of all such portions is the total constraint for R
+(see Appendix E for further discussion).1 Hence, we can say that no update on relvar R can be
+accepted if it leads to a violation of constraint RC.
+
+
+RELATIONAL OPERATORS
+
+The relational model includes an open-ended set of generic operators known collectively as the
+relational algebra (the operators are generic because they apply to all possible relations, loosely
+speaking). Each operator takes at least one relation as input and produces another as output. In this
+section, we define a number of such operators; we also give a few examples, but only where we
+think the operators in question might be unfamiliar to you. Note: The fact that the output is always
+a relation is referred to as the relational closure property. It is that property that, among other
+things, allows us to write nested relational expressions.
+
+Rename
+
+Let a be a relation with an attribute X and no attribute Y. Then the expression
+       a RENAME ( X AS Y )
+
+yields a relation that differs from a only in that the name of the specified attribute is Y instead of X.
+      Tutorial D also supports a “multiple” form of RENAME—for example:
+       a RENAME ( X1 AS Y1 , X2 AS Y2 )
+
+is shorthand for
+       ( a RENAME ( X1 AS Y1 ) ) RENAME ( X2 AS Y2 )
+
+In other words, the individual renamings X1 AS Y1 and X2 AS Y2 are executed in sequence as
+written [changed to parallel execution in Tutorial D Version 2].
+      Tutorial D also supports “multiple” forms of EXTEND, SUMMARIZE, WRAP/UNWRAP,
+and GROUP/UNGROUP (see later), to all of which analogous remarks apply.
+
+1
+  In references [82, 83] and elsewhere we called total relvar constraints internal predicates──partly because the total
+relvar constraint for R can be characterized as an attempt to formalize what we called in those same references the
+external (i.e., relvar) predicate for R.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                               35
+Part I / Preliminaries                                               Chapter 2 / A Survey of The Relational Model
+
+
+Restrict
+
+Let a be a relation and let p be a predicate1 that is quantifier free (see the next paragraph) and takes
+just one parameter, a tuple with heading equal to that of a. Then the restriction of a according to
+p—
+        a WHERE p
+
+—is a relation with heading equal to that of a and with body consisting of all tuples t of a that
+satisfy p. For example, the expression
+        S WHERE STATUS > 10
+
+evaluates to a relation with heading equal to that of relvar S and body consisting of all tuples from
+the current value of S that satisfy the predicate STATUS > 10. (Note that “STATUS > 10” can
+indeed be regarded as a predicate with sole parameter a tuple with the same heading as S.)
+       We now explain the term quantifier free. A given monadic predicate is quantifier-free if we
+can determine whether a given tuple satisfies it by examining just that tuple in isolation. Such a
+predicate is also said to be a restriction predicate or a restriction condition (sometimes a simple
+restriction condition, for emphasis).
+       Now, Tutorial D provides no explicit support for quantifiers at all. However, it does support
+them implicitly (in effect), and for user convenience it allows the predicate p in the expression
+        a WHERE p
+
+not to be quantifier free (again, in effect). In other words, Tutorial D supports “WHERE
+predicates” of arbitrary complexity, loosely speaking.
+
+Project
+
+Let relation a have attributes X, Y, ..., Z (and possibly others). Then the projection of a on X, Y, ...,
+Z—
+        a { X, Y, ..., Z }
+
+—is a relation with:
+
+       A heading derived from the heading of a by removing all attributes not mentioned in the set {
+        X, Y, ..., Z }
+
+
+
+1
+  Predicate p here is not a relvar predicate in the sense of that term discussed earlier in this chapter; in particular, unlike
+those earlier predicates, it must be computable, meaning the system must be able to evaluate it (given an appropriate
+argument, of course). To elaborate: If tuple t appears in relvar R, the system can certainly “compute” the fact that t
+satisfies the relvar predicate P for R; P is computable in that sense. But if the user attempts to insert t into R, the system
+has no way to “compute” whether or not t satisfies P; all it can do is check to see whether inserting t into R will cause
+any integrity constraint to be violated.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                                  36
+Part I / Preliminaries                                    Chapter 2 / A Survey of The Relational Model
+
+
+      A body consisting of all tuples { X x, Y y, ..., Z z } such that a tuple appears in a with X value
+       x, Y value y, ..., and Z value z
+
+     Tutorial D also allows the foregoing projection to be expressed as a { ALL BUT U, V, ... W },
+where U, V, ..., W are all of the attributes of a apart from X, Y, ..., Z. An analogous remark applies to
+SUMMARIZE (BY form only), GROUP, and WRAP (see later).
+
+Join
+
+Let relations a and b have attributes
+       X1, X2, ..., Xm, Y1, Y2, ..., Yn
+
+and
+       Y1, Y2, ..., Yn, Z1, Z2, ..., Zp
+
+respectively; i.e., the Y attributes Y1, Y2, ..., Yn (only) are common to the input relations a and b, the
+X attributes X1, X2, ..., Xm are the other attributes of a, and the Z attributes Z1, Z2, ..., Zp are the
+other attributes of b. Observe that:
+
+      We can assume without loss of generality, thanks to the availability of RENAME, that no
+       attribute Xi (i = 1, 2, ..., m) has the same name as any attribute Zj (j = 1, 2, ..., p).
+
+      Every attribute Yk (k = 1, 2, ..., n) has the same type in both a and b (for otherwise it would
+       not be a common attribute, by definition).
+
+For brevity, let the X attributes all taken together be denoted just X, and similarly for Y and Z. Then
+the join of a and b—
+       a JOIN b
+
+—is a relation with heading the (set-theoretic) union of the headings of a and b and body consisting
+of the set of all tuples t such that t is the (set-theoretic) union of a tuple appearing in a and a tuple
+appearing in b. In other words, the heading is { X, Y, Z }, and the body consists of all tuples { X x, Y
+y, Z z } such that a tuple appears in a with X value x and Y value y and a tuple appears in b with Y
+value y and Z value z.
+       Some logical consequences of the foregoing definition:
+
+      If n = 0, join degenerates to (relational) cartesian product. Note: This operation differs from
+       conventional cartesian product in that it gives a result that is a relation (of degree m+p).
+       Conventional cartesian product, by contrast, gives a result that is a set of ordered pairs (of
+       tuples, one each from a and b). As a consequence, relational cartesian product, unlike its
+       conventional counterpart, is both commutative and associative. From this point forward, we
+       will take the term cartesian product (sometimes just product, unqualified) to refer to the
+       relational operator specifically, barring explicit statements to the contrary.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                              37
+Part I / Preliminaries                                   Chapter 2 / A Survey of The Relational Model
+
+
+     If m = p = 0, a JOIN b degenerates to a INTERSECT b—see later in this section. (Cartesian
+      product and intersection are thus both special cases of join. This fact notwithstanding, for
+      psychological reasons Tutorial D supports INTERSECT explicitly, though not cartesian
+      product.)
+
+     If p = 0, a JOIN b degenerates to a SEMIJOIN b, which is equivalent to (a JOIN b){X,Y} (in
+      other words, it is the join of a and b, projected back on the attributes of a). Likewise, if m =
+      0, a JOIN b degenerates to b SEMIJOIN a.
+
+Join is both commutative and associative. Tutorial D therefore supports an n-adic form of the
+operator, and it allows unnecessary parentheses to be omitted from an uninterrupted sequence of
+dyadic joins. For example, the expressions
+      a JOIN ( b JOIN c )
+
+and
+      ( a JOIN b ) JOIN c
+
+can both be unambiguously abbreviated to just
+      a JOIN b JOIN c
+
+They can also be written as JOIN {a,b,c} (and the order in which the operands are specified here is
+immaterial).
+       Furthermore, it turns out to be desirable to define both (1) joins of just a single relation and
+(2) joins of no relations at all. Let s be a set of relations. Then:
+
+ 1.   If s contains just one relation r, then the join of all relations in s—in Tutorial D, JOIN {r}—
+      is simply r.
+
+ 2.   If s contains no relations at all, then the join of all relations in s—in Tutorial D, JOIN {}—is
+      TABLE_DEE. Note: TABLE_DEE is the unique relation having degree zero and cardinality
+      one. See Chapter 6 for further explanation.
+
+Union, Intersect, and Difference
+
+Let a and b be relations of the same type. Then:
+
+     The union of those relations, a UNION b, is a relation of the same type, with body consisting
+      of all tuples t such that t appears in a or b or both. Note: Tutorial D also supports “disjoint
+      union” (D_UNION), which is a version of union that requires its operands to be disjoint (i.e.,
+      to have no tuples in common). As we will see in Chapter 6, D_UNION can be useful in
+      defining the semantics of INSERT, also in certain constraints.
+
+     The intersection of those relations, a INTERSECT b, is a relation of the same type, with
+      body consisting of all tuples t such that t appears in both a and b.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                              38
+Part I / Preliminaries                                             Chapter 2 / A Survey of The Relational Model
+
+
+        The difference between those relations, a MINUS b (in that order), is a relation of the same
+         type, with body consisting of all tuples t such that t appears in a and not b. Note: Tutorial D
+         also supports SEMIMINUS (semidifference); the expression a SEMIMINUS b is equivalent
+         to a MINUS (a SEMIJOIN b). Observe in particular that if a and b are of the same type, then
+         a SEMIMINUS b degenerates to a MINUS b. (This fact notwithstanding, Tutorial D
+         supports MINUS explicitly—though this support, like that for INTERSECT, is included
+         mainly for psychological reasons.)
+
+      Like join, union and intersection are each both commutative and associative. Tutorial D
+therefore supports an n-adic form of both, and it allows unnecessary parentheses to be omitted from
+an uninterrupted sequence of dyadic unions or intersections. For example, the expressions
+         a UNION ( b UNION c )
+
+and
+         ( a UNION b ) UNION c
+
+can both be unambiguously abbreviated to just
+         a UNION b UNION c
+
+They can also be written as UNION {a,b,c} (and the order in which the operands are specified here
+is immaterial).
+      Furthermore, it turns out to be desirable to define both (1) unions and intersections of just a
+single relation and (2) unions and intersections of no relations at all. Let s be a set of relations all of
+the same type RT. Then:
+
+    1.   If s contains just one relation r, then the union and intersection of all relations in s—in
+         Tutorial D, UNION {r} and INTERSECT {r}—are both simply r.
+
+    2.   If s contains no relations at all, then:
+
+         ●   The union of all relations in s—in Tutorial D, UNION h {}, where h is the heading of
+             RT—is the empty relation of type RT. Note the need to specify the result heading h in
+             this case, since there are no input relations from which that heading can be inferred.
+
+         ●   The intersection of all relations in s—in Tutorial D, INTERSECT h {}, where h is the
+             heading of RT—is the “universal” relation of type RT (i.e., that unique relation of type RT
+             that contains all possible tuples of type TUPLE h).1 We remark in passing that the term
+             universal relation is more frequently used in the literature with a rather different meaning
+             (see, e.g., reference [101]).
+
+
+1
+  You might see an apparent contradiction here: Given that INTERSECT is a special case of JOIN, you might have
+expected both operators to give the same result when applied to no relations at all, but they do not. See Exercise 2.33 at
+the end of the chapter.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                             39
+Part I / Preliminaries                                            Chapter 2 / A Survey of The Relational Model
+
+
+Extend
+
+Let a be a relation. Then the extension
+        EXTEND a ADD ( exp AS Z )
+
+is a relation with
+
+       A heading consisting of the heading of a extended with the attribute Z
+
+       A body consisting of all tuples t such that t is a tuple of a extended with a value for attribute Z
+        that is computed by evaluating exp on1 that tuple of a
+
+Relation a must not have an attribute called Z, and exp must not refer to Z. Observe that the result
+has cardinality equal to that of a and degree equal to one plus that of a. The type of Z in that result
+is the type of exp.
+
+        Here is a simple example of EXTEND:
+        EXTEND S ADD ( 3 * STATUS AS TRIPLE )
+
+The result of this operation, given our usual sample data values, is shown in Fig. 2.4.
+      By the way, do not make the mistake in this example of thinking that relvar S has been
+changed in the database. EXTEND is not an SQL-style “ALTER TABLE.” Rather, the result of
+the EXTEND expression is simply a derived relation, just as (e.g.) the result of the expression S
+JOIN SP is a derived relation. Analogous remarks apply to all of the other relational algebra
+operators, of course: in particular, to RENAME (see earlier).
+╔════════════════════════════════════════════════════════════════╗
+║            ┌────┬───────┬────────┬────────┬────────┐           ║
+║            │ S# │ SNAME │ STATUS │ CITY   │ TRIPLE │           ║
+║            ├════┼───────┼────────┼────────┼────────┤           ║
+║            │ S1 │ Smith │     20 │ London │     60 │           ║
+║            │ S2 │ Jones │     10 │ Paris │      30 │           ║
+║            │ S3 │ Blake │     30 │ Paris │      90 │           ║
+║            │ S4 │ Clark │     20 │ London │     60 │           ║
+║            │ S5 │ Adams │     30 │ Athens │     90 │           ║
+║            └────┴───────┴────────┴────────┴────────┘           ║
+╚════════════════════════════════════════════════════════════════╝
+Fig. 2.4: Extending S (as shown in Fig. 2.1) to add a “triple status” attribute
+
+Summarize
+
+Let a and b be relations. Then the summarization
+        SUMMARIZE a PER ( b ) ADD ( summary AS Z )
+
+1
+  To be more precise, evaluating exp “on” some tuple u of a means (a) substituting, for each appearance in exp of an
+attribute name A from a, the value of attribute A from that tuple u and then (b) evaluating the modified version of exp
+that results.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                               40
+Part I / Preliminaries                                            Chapter 2 / A Survey of The Relational Model
+
+
+is a relation defined as follows:
+
+        First, b must be of the same type as some projection of a; i.e., every attribute of b must be an
+         attribute of a. Let the attributes of that projection (equivalently, of b) be A1, A2, ..., An.
+
+        The heading of the result consists of the heading of b extended with the attribute Z.
+
+        The body of that result consists of all tuples t such that t is a tuple of b extended with a value
+         for attribute Z. That Z value is computed by evaluating summary over1 all tuples of a that
+         have the same value for attributes A1, A2, ..., An as tuple t does. (Of course, if no tuples of a
+         have the same value for A1, A2, ..., An as tuple t does, then summary is evaluated over an
+         empty set of tuples.)
+Relation b must not have an attribute called Z, and summary must not refer to Z. Observe that the
+result has cardinality equal to that of b and degree equal to one plus that of b. The type of Z in that
+result is whatever the type of summary is.
+         Here is a simple example of SUMMARIZE:
+         SUMMARIZE SP PER ( S { S# } ) ADD ( COUNT ( ) AS P_COUNT )
+The result of this operation, given our usual sample data values, is shown in Fig. 2.5. Observe in
+particular that the result includes a tuple for supplier S5. Note: If you happen to be familiar with
+SQL, it might help to point out that, by contrast, the SQL expression
+         SELECT S#, COUNT(*) AS P_COUNT
+         FROM   SP
+         GROUP BY S#
+
+yields a result containing no tuple for supplier S5, because relvar SP as shown in Fig. 2.1 contains
+no such tuple either. In other words, it might be thought that the expression just shown is an SQL
+analog of the SUMMARIZE expression earlier, but in fact it is not—not quite.
+╔════════════════════════════════════════════════════════════════╗
+║                        ┌────┬─────────┐                        ║
+║                        │ S# │ P_COUNT │                        ║
+║                        ├════┼─────────┤                        ║
+║                        │ S1 │       6 │                        ║
+║                        │ S2 │       2 │                        ║
+║                        │ S3 │       1 │                        ║
+║                        │ S4 │       3 │                        ║
+║                        │ S5 │       0 │                        ║
+║                        └────┴─────────┘                        ║
+╚════════════════════════════════════════════════════════════════╝
+Fig. 2.5: Summarizing SP (as shown in Fig. 2.1) to obtain “number of shipments per supplier”
+
+         Here is another example:
+         SUMMARIZE S PER ( S { CITY } ) ADD ( AVG ( STATUS ) AS AVG_STATUS )
+
+
+
+1
+    Remarks analogous to those in footnote 1 on the previous page apply here also.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                   41
+Part I / Preliminaries                                           Chapter 2 / A Survey of The Relational Model
+
+
+In this example, “relation b” is not just “of the same type as” some projection of “relation a,” it
+actually is such a projection. In such a case, Tutorial D allows the expression to be abbreviated
+slightly, thus:
+       SUMMARIZE S BY { CITY } ADD ( AVG ( STATUS ) AS AVG_STATUS )
+Either way, the result is as shown in Fig. 2.6.
+╔════════════════════════════════════════════════════════════════╗
+║                     ┌────────┬────────────┐                    ║
+║                     │ CITY   │ AVG_STATUS │                    ║
+║                     ├════════┼────────────┤                    ║
+║                     │ London │         20 │                    ║
+║                     │ Paris │          20 │                    ║
+║                     │ Athens │         30 │                    ║
+║                     └────────┴────────────┘                    ║
+╚════════════════════════════════════════════════════════════════╝
+Fig. 2.6: Summarizing S (as shown in Fig. 2.1) to obtain “average status per city”
+
+       Tutorial D also allows the PER or BY specification in SUMMARIZE to be omitted entirely,
+in which case the specification PER (TABLE_DEE) is implicit. Again, see Chapter 6 for further
+explanation of TABLE_DEE.
+       We assume you are familiar with the semantics of the various kinds of “summaries”
+(COUNT, SUM, AVG, and so forth) and omit further details here. However, we stress the point
+that a “summary” is not the same thing as an aggregate operator invocation (see below). An
+aggregate operator invocation is an expression1 and is allowed wherever a literal or, more generally,
+a selector invocation of the appropriate type would be allowed. A “summary,” by contrast, is
+merely an operand within a SUMMARIZE invocation; it is not an expression, it has no meaning
+outside the context of a SUMMARIZE invocation, and in fact it cannot appear outside that context.
+       So what then is an aggregate operator invocation? Well, an aggregate operator is, very
+loosely, an operator that derives a single value from the “aggregate” of such values appearing in
+some specified relation or in some specified attribute of some specified relation. As with the
+business of “summaries” earlier, we assume you are familiar with the semantics of such operators
+and do not give detailed definitions here. However, we do give a few examples and corresponding
+results (based on our usual sample data values). Note the difference between the two AVG
+examples in particular: The first—in which the comma and the second argument could be omitted
+if desired—returns the average of the three status values in the projection of S over STATUS, the
+second returns the average of the five status values in S.
+       COUNT ( S )                                                         /* result          5 */
+
+       COUNT ( S { CITY } )                                                /* result          3 */
+
+       AVG ( S { STATUS }, STATUS )                                        /* result         20 */
+
+       AVG ( S, STATUS )                                                   /* result         22 */
+
+
+1
+  Usually though not always a scalar expression specifically (see Chapter 5). For present purposes we take the term
+scalar expression to mean, simply, an expression that is neither tuple nor relation valued. The whole matter of
+“scalarness” is discussed in detail in Chapter 3; for now we just assume it is well understood.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                           42
+Part I / Preliminaries                                            Chapter 2 / A Survey of The Relational Model
+
+
+       MAX ( S, STATUS )                                                    /* result         30 */
+
+       SUM ( EXTEND S ADD
+              ( ( 2 * STATUS ) + 1 AS XYZ ) , XYZ )                         /* result        225 */
+
+       OR ( EXTEND S ADD
+             ( STATUS > 20 AS TEST ) , TEST )                               /* result TRUE */
+
+Group and Ungroup
+
+The fact that we can have relations with attributes that are relation valued leads to the need for
+operators for mapping between relations that contain such attributes and relations that do not. For
+example:
+       SP GROUP ( { P#, QTY } AS PQ )
+
+Given our usual sample data, this expression yields the result shown in Fig. 2.7.
+╔════════════════════════════════════════════════════════════════╗
+║   ┌────┬──────────────┐                                        ║
+║   │ S# │ PQ           │                                        ║
+║   ├════┼──────────────┤                                        ║
+║   │    │ ┌────┬─────┐ │           │    │ ┌────┬─────┐ │        ║
+║   │ S1 │ │ P# │ QTY │ │           │ S3 │ │ P# │ QTY │ │        ║
+║   │    │ ├════┼─────┤ │           │    │ ├════┼─────┤ │        ║
+║   │    │ │ P1 │ 300 │ │           │    │ │ P2 │ 200 │ │        ║
+║   │    │ │ P2 │ 200 │ │           │    │ └────┴─────┘ │        ║
+║   │    │ │ P3 │ 400 │ │           │    │ ┌────┬─────┐ │        ║
+║   │    │ │ P4 │ 200 │ │           │ S4 │ │ P# │ QTY │ │        ║
+║   │    │ │ P5 │ 100 │ │           │    │ ├════┼─────┤ │        ║
+║   │    │ │ P6 │ 100 │ │           │    │ │ P2 │ 200 │ │        ║
+║   │    │ └────┴─────┘ │           │    │ │ P4 │ 300 │ │        ║
+║   │    │ ┌────┬─────┐ │           │    │ │ P5 │ 400 │ │        ║
+║   │ S2 │ │ P# │ QTY │ │           │    │ └────┴─────┘ │        ║
+║   │    │ ├════┼─────┤ │           └────┴──────────────┘        ║
+║   │    │ │ P1 │ 300 │ │                                        ║
+║   │    │ │ P2 │ 400 │ │                                        ║
+║   │    │ └────┴─────┘ │                                        ║
+╚════════════════════════════════════════════════════════════════╝
+Fig. 2.7: Grouping SP over P# and QTY
+
+       Observe first that the original expression
+       SP GROUP ( { P#, QTY } AS PQ )
+
+—loosely, “group SP over P# and QTY”—might be read as “group SP by S#,” S# being the sole
+attribute of SP not mentioned in the GROUP specification.1 The result is a relation defined as
+
+
+1
+  If you happen to be familiar with SQL, it might help to point out that──very loosely speaking──GROUP in Tutorial
+D specifies the attributes that are to be grouped together, whereas GROUP BY in SQL specifies the other attributes (i.e.,
+the attributes that control the grouping). In other words, the expression SP GROUP ({P#,QTY} AS PQ) might be read
+as “group SP by S#,” S# being the sole attribute of SP not mentioned in the GROUP specification. Indeed, the
+“grouping” {P#,QTY} in the example can alternatively be specified as {ALL BUT S#}, in Tutorial D.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                           43
+Part I / Preliminaries                                   Chapter 2 / A Survey of The Relational Model
+
+
+follows. First, the heading looks like this:
+      { S# S#, PQ RELATION { P# P#, QTY QTY } }
+
+In other words, it consists of a relation-valued attribute PQ (where PQ values in turn have attributes
+P# and QTY), together with all of the other attributes of SP (of course, “all of the other attributes of
+SP” here just means attribute S#). Second, the body contains exactly one tuple for each distinct S#
+value in SP (and no other tuples). Each tuple in that body consists of the applicable S# value (s,
+say), together with a PQ value (pq, say) obtained as follows:
+
+ ■    Each SP tuple is replaced by a tuple (x, say) in which the P# and QTY components have been
+      “wrapped"—see later—into a tuple-valued component (y, say).
+
+ ■    The y components of all such tuples x in which the S# value is equal to s are then “grouped”
+      into a relation, pq, and a result tuple with S# value equal to s and PQ value equal to pq is
+      thereby obtained.
+
+The overall result is thus indeed as shown in Fig. 2.7. Note in particular that the result includes no
+tuple for supplier S5 (because relvar SP does not currently do so either).
+      Observe that the result of r GROUP ( { A1, A2, ..., An } AS B ) has degree equal to nr-n+1,
+where nr is the degree of r.
+      Now we turn to UNGROUP. Let SPQ be the relation shown in Fig. 2.7. Then the expression
+      SPQ UNGROUP ( PQ )
+
+(perhaps unsurprisingly) gives us back our usual SP relation. To be more precise, it yields a relation
+defined as follows. First, the heading looks like this:
+      { S# S#, P# P#, QTY QTY }
+
+In other words, the heading consists of attributes P# and QTY (derived from attribute PQ), together
+with all of the other attributes of SPQ (i.e., just attribute S#, in the example). Second, the body
+contains exactly one tuple for each combination of a tuple in SPQ and a tuple in the PQ value within
+that SPQ tuple (and no other tuples). Each tuple in that body consists of the applicable S# value (s,
+say), together with P# and QTY values (p and q, say) obtained as follows:
+
+     Each SPQ tuple is replaced by an “ungrouped” set of tuples, one such tuple (x, say) for each
+      tuple in the PQ value in that SPQ tuple.
+
+     Each such tuple x contains an S# component (s, say) equal to the S# component from the SPQ
+      tuple in question and a tuple-valued component (y, say) equal to some tuple from the PQ
+      component from the SPQ tuple in question.
+
+     The y components of each such tuple x in which the S# value is equal to s are then
+      “unwrapped”—see later—into separate P# and QTY components (p and q, say), and a result
+      tuple with S# value equal to s, P# value equal to p, and QTY value equal to q is thereby
+      obtained.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            44
+Part I / Preliminaries                                           Chapter 2 / A Survey of The Relational Model
+
+
+The overall result is thus, as claimed, our usual SP relation.
+       Note: It follows from the definition of UNGROUP that if SPQ had included a tuple for
+supplier S5, with PQ value an empty relation—if SPQ had the value shown in Fig. 2.2 in
+particular—then the result of evaluating SPQ UNGROUP ( PQ ) would still include no tuple for
+supplier S5.
+       Observe that the result of r UNGROUP ( B )—where the relations that are values of the
+relation-valued attribute B have heading { A1, A2, ..., An }—has degree equal to nr+n-1, where nr is
+the degree of r.
+
+Additional Operations
+
+Tutorial D supports a few additional operations over and above those described so far. For
+purposes of reference, we briefly summarize those additional operations in this subsection.
+
+Compose: Let a and b be as for JOIN. Then a COMPOSE b is equivalent to (a JOIN b){X,Z}.
+Note: If a and b have no attributes in common, then COMPOSE degenerates to JOIN (and that
+JOIN in turn degenerates to cartesian product).
+
+Semijoin and Semidifference: We have already mentioned the fact that Tutorial D supports these
+operators directly. However, it also supports more user-friendly syntax for both, according to which
+a SEMIJOIN b and a SEMIMINUS b can be expressed as
+       a MATCHING b            and       a NOT MATCHING b
+
+(respectively). For example, the query “Get suppliers who do not supply part P1” can be
+formulated thus:
+       S NOT MATCHING ( SP WHERE P# = P#('P1') )
+
+Substitute [dropped in Tutorial D Version 2, EXTEND being revised to support the same effect]:1
+We do not attempt to define this operator here in full generality (such a definition appears in
+Chapter 5), but content ourselves with a simple example. Consider the following expression:
+        UPDATE S WHERE CITY = 'Paris' :
+                 { STATUS := 2 * STATUS , CITY := 'Nice' }
+
+       The first point to note about this expression is that it is an expression, not a statement (there is
+no terminating semicolon), and it has no effect on relvar S. What it does do is yield a relation
+containing just those tuples from relvar S for which the city is Paris—except that, in those tuples,
+the status is doubled and the city is set to Nice. The overall expression is thus equivalent to the
+following:
+
+
+
+
+1
+  The name substitute here has nothing to do with the substitution of arguments for parameters, nor with the concept of
+substitutability as understood in the context of type inheritance (see Part IV).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                           45
+Part I / Preliminaries                                  Chapter 2 / A Survey of The Relational Model
+
+
+      WITH ( S WHERE CITY = 'Paris' ) AS T1 ,
+           ( EXTEND T1 ADD ( 2 * STATUS AS NEW_STATUS, 'Nice' AS NEW_CITY ) )
+                                                                     AS T2 ,
+           ( T2 { ALL BUT STATUS, CITY } ) AS T3 ,
+           ( T3 RENAME ( NEW_STATUS AS STATUS , NEW_CITY AS CITY ) AS T4 :
+      T4
+
+Notice the use of WITH here to introduce names for the results of certain subexpressions. We will
+be making heavy use of this construct in the chapters to come. See Chapter 5 for a formal
+explanation.
+       Now, in Chapter 3 we will see that operators in general fall into two disjoint categories, read-
+only vs. update operators; and (at the risk of confusing you) we need to stress the fact that the
+substitute operator UPDATE is not an update operator!—it is a read-only operator instead. We use
+the keyword UPDATE because the operator does closely resemble the familiar UPDATE statement
+in its effect. In fact, given support for the “substitute” operator UPDATE as sketched above, the
+effect of the UPDATE statement
+      UPDATE R WHERE p : { attribute updates } ) ;
+
+can neatly be defined as being equivalent to that of the following assignment:
+      R := ( R WHERE NOT ( p ) )
+              UNION
+            ( UPDATE R WHERE p : { attribute updates } ) ;
+
+Again, see Chapter 5 for a formal explanation. Note: For the remainder of this book, we will rely
+on context to make it clear whether the term “UPDATE operator” refers to the read-only or update
+operator of that name.
+
+Wrap and Unwrap: Consider the following relation types:
+      RELATION { S# S#, P# P#, QTY QTY }
+
+      RELATION { S#, PQ TUPLE { P# P#, QTY QTY } }
+
+Let us refer to these types as SPT3 and SPT2, respectively, and let SP3 and SP2 be relvars of types
+SPT3 and SPT2, respectively (where the 3 and 2 refer to the number of attributes in each case).
+Then:
+
+      The expression
+       SP3 WRAP ( { P#, QTY } AS PQ )
+
+       takes the relation that is the current value of SP3 and, for each tuple in that relation, “wraps”
+       the P# and QTY components of that tuple to yield a single tuple-valued PQ component. The
+       result of the expression is thus of type SPT2, and so (e.g.) the following assignment is valid:
+       SP2 := SP3 WRAP ( { P#, QTY } AS PQ ) ;
+
+      The expression
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                           46
+Part I / Preliminaries                                     Chapter 2 / A Survey of The Relational Model
+
+
+        SP2 UNWRAP ( PQ )
+
+        takes the relation that is the current value of SP2 and, for each tuple in that relation,
+        “unwraps” the (tuple-valued) PQ component of that value to yield two scalar components P#
+        and QTY. The result of the expression is thus of type SPT3, and so (e.g.) the following
+        assignment is valid:
+        SP3 := SP2 UNWRAP ( PQ ) ;
+
+Divide: We defer a detailed explanation of this operator to Chapter 6 (see RM Prescription 18).
+
+Tclose: “Tclose” stands for transitive closure. Let a be a binary relation with attributes X and Y,
+both of the same type T. Then the transitive closure of a, TCLOSE a, is a relation a+ with heading
+the same as that of a and body a superset of that of a, defined as follows: The tuple
+      { X x, Y y }
+
+appears in a+ if and only if it appears in a or there exists a sequence of values z1, z2, ..., zn, all of
+type T, such that the tuples
+      { X x, Y z1 }, { X z1, Y z2 }, ..., { X zn, Y y }
+
+all appear in a. See RM Prescription 19 in Chapter 6 for further explanation, also RM Very Strong
+Suggestion 6 in Chapter 10.
+
+Relational Operations on Relvars
+
+As we have seen, the operators of the relational algebra apply, by definition, to relation values
+specifically. In particular, of course, they apply to the values that happen to be the current values of
+relation variables. As a consequence, it clearly makes sense to talk about—for example—“the
+projection on attribute A of relvar R,” meaning the relation that results from taking the projection on
+that attribute A of the current value r of that relvar R.
+       Sometimes, however, it is convenient to use expressions like “the projection on attribute A of
+relvar R” in a slightly different sense. By way of example, suppose we define a virtual relvar, or
+view, of the suppliers relvar S, called SC, that consists of just the S# and CITY attributes of that
+relvar (see the next section). In Tutorial D, that definition might look like this:
+      VAR SC VIRTUAL ( S { S#, CITY } ) ;
+
+In this example, we might say, loosely but very conveniently, that relvar SC is “the projection on S#
+and CITY of relvar S”—meaning, more precisely, that the value of SC at all times is the projection
+on S# and CITY of the value of relvar S at the time in question. In a sense, therefore, we can talk in
+terms of projections of relvars per se, rather than just in terms of projections of current values of
+relvars. We hope this kind of dual usage on our part will not cause you any confusion.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                 47
+Part I / Preliminaries                                  Chapter 2 / A Survey of The Relational Model
+
+
+VIRTUAL RELVARS
+
+A virtual relvar or view V is a relvar whose value at time t is the result of evaluating a certain
+relational expression at that time t. The expression in question is specified when V is defined. To
+repeat an example from the previous section:
+      VAR SC VIRTUAL ( S { S#, CITY } ) ;
+
+The goal is to make virtual relvars look like real ones to the user (meaning, of course, the user who
+uses them, as opposed to the user who actually defines them). If this goal is achieved, several
+advantages accrue (see reference [76] for a detailed discussion); but can it be achieved? Well, the
+implication is that the user must be allowed to operate on the virtual relvar exactly as if were real,
+and such operations must be mapped by the system into certain “equivalent” operations on the real
+relvars in terms of which the virtual one is—possibly via many levels of indirection—ultimately
+defined.
+      Read-only operations are straightforward. For example, the expression
+      SC WHERE CITY = 'London'
+
+can be mapped very simply by the system into
+      ( S { S#, CITY } ) WHERE CITY = 'London'
+
+But what about update operations? As you are probably aware, the view update problem has been
+the subject of investigation for many years. When we wrote this book’s predecessor [83], we
+thought that problem was solved, but we realized subsequently that there were still some
+unanswered questions. For that reason we choose not to discuss the issue further here; instead, we
+refer you to Appendix E for a detailed examination of the topic.
+       We close this section by emphasizing that we do not, in this book, reserve the term relvar to
+mean a real relvar exclusively (SQL, by contrast, very commonly uses the term table to mean a
+“base table” exclusively). If we want to say that some relvar R is a real relvar specifically—or a
+virtual relvar specifically, come to that—then we will say as much explicitly.
+
+
+THE RELATIONAL MODEL
+
+For purposes of future reference, we close this chapter with a rather abstract definition of the
+relational model, based on one in reference [70]. Briefly, the relational model consists of the
+following five components:
+
+ 1.   An open-ended collection of scalar types, including in particular type BOOLEAN (truth
+      values)
+
+ 2.   A relation type generator and an intended interpretation for relations of types generated
+      thereby
+
+ 3.   Facilities for defining relation variables of such generated relation types
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            48
+Part I / Preliminaries                                  Chapter 2 / A Survey of The Relational Model
+
+
+ 4.   A relational assignment operator for assigning relation values to such relation variables
+
+ 5.   An relationally complete but otherwise open-ended collection of generic relational operators
+      for deriving relation values from other relation values
+
+      We offer the following additional comments on these five components:
+
+ 1.   The scalar types can be system or user defined, in general; thus, a means must be available for
+      users to define their own scalar types (this requirement is implied, partly, by the fact that the
+      set of such types is open ended). A means must therefore also be available for users to define
+      their own scalar operators, since types without operators are useless. The only required
+      system-defined scalar type is BOOLEAN (the most fundamental type of all), but a real system
+      will surely support other built-in scalar types (e.g., INTEGER) as well.
+
+ 2.   The relation type generator allows users to specify individual relation types as desired (see
+      Chapters 3-6 for further explanation). The intended interpretation for a given relation of a
+      given relation type is as a set of true propositions, all of them instantiations of some common
+      predicate.
+
+ 3.   Facilities for defining relation variables must be available (of course). Relation variables are
+      the only variables allowed in a relational database. Note: This latter observation is in
+      accordance with Codd’s Information Principle. Codd stated that principle in various forms
+      and in various places over the years (indeed, he was known to refer to it as the fundamental
+      principle underlying the relational model). One possible formulation is as follows:
+
+      The entire information content of the database is represented in one and only one way:
+      namely, as explicit values in attribute positions in tuples in relations.
+
+       (Reference [76] remarks that this principle might better be called The Principle of Uniform
+      Representation. The Principle of Uniformity of Representation might be better still; certainly
+      it is more accurate, though somewhat clumsy.)
+
+ 4.   Variables are updatable by definition; hence, every kind of variable is subject to assignment,
+      and relation variables are no exception. INSERT, DELETE, and UPDATE shorthands are
+      permitted and indeed useful, but strictly speaking they are only shorthands.
+
+ 5.   The generic relational operators are the operators that make up the relational algebra, and they
+      are therefore built in (though there is no inherent reason why users should not be able to
+      define additional operators of their own, if desired). They are used for the formulation of
+      relational expressions. Those expressions in turn serve many purposes; for example, they are
+      used in query formulation, in virtual relvar definition, and (very important!) in the
+      specification of constraints.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            49
+Part I / Preliminaries                                  Chapter 2 / A Survey of The Relational Model
+
+
+EXERCISES
+
+2.1    State The Information Principle.
+
+2.2    What is a relational assignment?
+
+2.3    Define the terms attribute, body, cardinality, degree, heading, relation, relvar, and tuple.
+
+2.4    State as precisely as you can what it means for two tuples to be equal.
+
+2.5    Which of the relational operators defined in this chapter have a definition that does not rely
+       on tuple equality?
+
+2.6    What is a relation-valued attribute (RVA)? Give an example of a relation with (a) one RVA,
+       (b) two RVAs. Also give two more relations that represent the same information as those
+       relations but do not involve RVAs. Also give an example of a relation with an RVA such
+       that there is no relation that represents precisely the same information but has no RVA.
+       Finally, assuming all of your example relations are in fact values of corresponding relvars,
+       give relvar predicates for those relvars.
+
+2.7    What is an aggregate operator?
+
+2.8    Define the operators extend, summarize, wrap, unwrap, group, and ungroup.
+
+2.9    Write Tutorial D tuple selector invocations for a typical tuple from (a) the parts relvar, (b)
+       the shipments relvar.
+
+2.10   Write a Tutorial D expression that returns TRUE if the current value of the parts relvar P is
+       empty and FALSE otherwise. Do not use the IS_EMPTY shorthand.
+
+2.11   Given the usual suppliers-and-parts database, what is the value of the expression S JOIN SP
+       JOIN P? What is the corresponding predicate? Warning: There is a trap here.
+
+2.12   Given sample values for the suppliers-and-parts database as shown in Fig. 2.1 in this
+       chapter, what values do the following expressions denote? In each case, also give an
+       informal interpretation of the expression in natural language.
+       a.      S SEMIJOIN ( SP WHERE P# = P#('P2') )
+
+       b.      P NOT MATCHING ( SP WHERE S# = S#('S2') )
+
+       c.      S { CITY } UNION P { CITY }
+
+       d.      S { CITY } MINUS P { CITY }
+
+       e.      S { CITY } D_UNION P { CITY }
+
+       f.      S { S#, CITY } COMPOSE P { P#, CITY }
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                             50
+Part I / Preliminaries                                  Chapter 2 / A Survey of The Relational Model
+
+
+       g.      JOIN { ( S RENAME ( CITY AS SC ) ) { SC } ,
+                      ( P RENAME ( CITY AS PC ) ) { PC } }
+
+       h.      WITH ( S WHERE NOT ( CITY = 'Athens' ) ) AS T1 ,
+                    ( T1 RENAME ( CITY AS SC ) ) AS T2 ,
+                    ( P WHERE NOT ( CITY = 'London' ) ) AS T3,
+                    ( T3 RENAME ( CITY AS PC ) ) AS T4 :
+               TCLOSE ( JOIN { T2 { SC } , T4 { PC } } )
+
+2.13   Write Tutorial D expressions for the following queries on the suppliers-and-parts database:
+
+       a.      Get all shipments.
+
+       b.      Get supplier numbers for suppliers who supply part P1.
+
+       c.      Get suppliers with status in the range 15-25 inclusive.
+
+       d.      Get part numbers for parts supplied by a supplier in London.
+
+       e.      Get part numbers for parts not supplied by any supplier in London.
+
+       f.      Get city names for cities in which at least two suppliers are located.
+
+       g.      Get all pairs of part numbers such that some supplier supplies both of the indicated
+               parts.
+
+       h.      Get the total number of parts supplied by supplier S1.
+
+       i.      Get supplier numbers for suppliers with a status lower than that of supplier S1.
+
+       j.      Get supplier numbers for suppliers whose city is first in the alphabetic list of such
+               cities.
+
+       k.      Get part numbers for parts supplied by all suppliers in London.
+
+       l.      Get supplier-number/part-number pairs such that the indicated supplier does not
+               supply the indicated part.
+
+       m.      Get all pairs of supplier numbers, Sx and Sy say, such that Sx and Sy supply exactly
+               the same set of parts each.
+
+2.14   Which if any of the following expressions are equivalent?
+       a.      SUMMARIZE r PER ( r { } ) ADD ( COUNT ( ) AS CT )
+
+       b.      SUMMARIZE r ADD ( COUNT ( ) AS CT )
+
+       c.      SUMMARIZE r BY { } ADD ( COUNT ( ) AS CT )
+
+       d.      EXTEND TABLE_DEE ADD ( COUNT ( r ) AS CT )
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            51
+Part I / Preliminaries                                 Chapter 2 / A Survey of The Relational Model
+
+
+2.15   What do you understand by the term first normal form?
+
+2.16   Let R be a relvar of degree n. What is the maximum number of candidate keys R might
+       possess?
+
+2.17   What do you understand by the terms proposition and predicate? Give examples.
+
+2.18   Explain the term relvar predicate. Give relvar predicates for the parts and shipments relvars
+       from the suppliers-and-parts database.
+
+2.19   Explain the Closed World Assumption.
+
+2.20   In the body of the chapter, we said any type whatsoever can be used as the basis for defining
+       attributes, in general. That qualifier “in general” was there for a reason, however. Can you
+       think of any exceptions to this general rule?
+
+2.21   Define the terms functional dependency, candidate key, and foreign key.
+
+2.22   Candidate keys are sets of attributes. What happens if the set in question is empty (i.e.,
+       contains no attributes)? Can you think of any uses for such an empty (or nullary) candidate
+       key?
+
+2.23   (This is essentially a repeat of Exercise 1.9, but you should be able to give a more
+       comprehensive answer now.) There are many logical differences between a relation and a
+       table. List as many as you can.
+
+2.24   What is the closure property of the relational algebra?
+
+2.25   Using Tutorial D, write integrity constraints for the suppliers-and-parts database to express
+       the following requirements:
+
+       a.      All London suppliers must have status 20.
+
+       b.      No two suppliers can be located in the same city.
+
+       c.      At most one supplier can be located in Athens at any one time.
+
+       d.      There must exist at least one London supplier.
+
+       e.      The average supplier status must be at least 10.
+
+       f.      Every London supplier must be capable of supplying part P2.
+
+       What operations can cause these constraints to be violated?
+
+2.26   Let r be a relation of degree n. How many different projections of r are there?
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        52
+Part I / Preliminaries                                  Chapter 2 / A Survey of The Relational Model
+
+
+2.27   Union, intersection, cartesian product, and join are all both commutative and associative.
+       Verify these claims. Also verify that semijoin is associative but not commutative.
+
+2.28   Consider the expression a JOIN b. If a and b have disjoint headings, this expression is
+       equivalent to a TIMES b (where TIMES denotes cartesian product); if they have the same
+       heading, it is equivalent to a INTERSECT b. Verify these claims. What is the expression
+       equivalent to if the heading of a is a proper subset of that of b?
+
+2.29   Show that MINUS can be regarded as a special case of SEMIMINUS.
+
+2.30   In ordinary arithmetic there are two special numbers, 1 and 0, with the properties that
+             x * 1       =   1 * x   =   x
+
+       and
+             x * 0       =   0 * x   =   0
+
+       for all numbers x. What relations if any play analogous roles in the relational algebra?
+       Investigate the effect of the algebraic operations discussed in this chapter on those relations.
+
+2.31   What do the following Tutorial D expressions denote?
+       a.      RELATION { S# S#, P# P#, QTY QTY } { }
+
+       b.      RELATION { TUPLE { S# S#('S1'), P# P#('P1'), QTY QTY(300) } }
+
+       c.      RELATION { TUPLE { } }
+
+       d.      RELATION { } { TUPLE { } }
+
+       e.      RELATION { } { }
+
+2.32   Closure is important in the relational model for the same kind of reason that numeric closure
+       is important in ordinary arithmetic. In arithmetic, however, there is one situation where the
+       closure property breaks down, in a sense—namely, division by zero. Is there any analogous
+       situation in the relational algebra?
+
+2.33   Given that intersect is a special case of join, why do not both operators give the same result
+       when applied to no relations at all?
+
+2.34   Let r be the relation denoted by the following expression:
+             SP GROUP ( { } AS X )
+
+       Show what r looks like, given our usual sample value for SP. Also show the result of
+             r UNGROUP ( X )
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                           53
+Part I / Preliminaries                                 Chapter 2 / A Survey of The Relational Model
+
+
+2.35   Let A and B be relvars. State the candidate key(s) for each of the following:
+       a.      A WHERE p
+
+       b.      A {...}
+
+       c.      A UNION B
+
+       d.      A INTERSECT B
+
+       e.      A MINUS B
+
+       f.      A JOIN B
+
+       g.      EXTEND A ADD ( exp AS Z )
+
+       h.      SUMMARIZE A PER ( B ) ADD ( exp AS Z )
+
+       Assume in each case that A and B meet the requirements for the operation in question (e.g.,
+       they are of the same type, in the case of UNION).
+
+2.36   Show that WRAP and UNWRAP are really just shorthand for certain combinations of other
+       operators.
+
+2.37   Consider this expression:
+             SUMMARIZE SP PER ( S { S# } ) ADD ( COUNT ( ) AS NP )
+
+       Give an expression involving EXTEND instead of SUMMARIZE that is logically
+       equivalent to this expression.
+
+2.38   Define virtual relvars for the following:
+       a.      Suppliers in London
+
+       b.      Supplier numbers for suppliers who supply every purple part
+
+       c.      Supplier-number/part-number pairs for suppliers and parts that are not in the same
+               city
+
+2.39   Consider the suppliers-and-parts database, but ignore the parts relvar for simplicity. Here in
+       outline are two possible designs for suppliers and shipments:
+       1.      S { S#, SNAME, STATUS, CITY }
+               SP { S#, P#, QTY }
+
+       2.      SSP { S#, SNAME, STATUS, CITY, P#, QTY }
+               XSS { S#, SNAME, STATUS, CITY }
+
+       Design 1 is as illustrated in Fig. 2.1. In Design 2, by contrast, relvar SSP contains a tuple
+       for every shipment, giving the applicable part number and quantity and full supplier details,
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          54
+Part I / Preliminaries                                   Chapter 2 / A Survey of The Relational Model
+
+
+       and relvar XSS contains supplier details for suppliers who supply no parts at all. Write
+       virtual relvar definitions to express Design 2 in terms of Design 1 and vice versa. Also,
+       show the applicable integrity constraints for each design. Does either design have any
+       obvious advantages over the other? If so, what are they?
+
+2.40   It is sometimes suggested that a relvar is really just a traditional computer file, with tuples
+       instead of records and attributes instead of fields. Discuss.
+
+2.41   We have seen that every relvar (and in fact every relation) corresponds to some predicate. Is
+       the converse true?
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                              55

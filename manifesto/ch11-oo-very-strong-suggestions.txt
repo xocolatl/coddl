@@ -1,0 +1,173 @@
+                                            Chapter 11
+
+                       OO Very Strong Suggestions
+
+OO VERY STRONG SUGGESTION 1: TYPE INHERITANCE
+
+Some level of type inheritance should be supported (in which case, see OO Prescription 2).
+
+                                      ———  ———
+
+As explained in the discussion of OO Prescription 2 in Chapter 8, we do not include inheritance
+support as a mandatory component of our Manifesto; we merely require that if inheritance is
+supported at all, then that support shall be based on the model described in Part IV of this book.
+Note, however, that we would very much like to include such support!—especially since (as we will
+argue in the next chapter) we see our inheritance model in large part as a logical consequence of our
+type theory. For that reason, we have tried not to prescribe, proscribe, or even strongly suggest
+anything now that might preclude our ability to include such support later.
+
+
+OO VERY STRONG SUGGESTION 2: TYPES AND OPERATORS UNBUNDLED
+
+Operator definitions should be logically distinct from the definitions of the types of their parameters
+and results, not “bundled in” with those latter definitions (though the operators required by RM
+Prescriptions 4, 5, 8, and 21 might be exceptions in this regard).
+
+                                      ———  ———
+
+In object systems, operators (“methods”) are typically bundled in with types (“classes”), meaning
+that the definition of any given operator is made part of the definition of some type. In the
+discussion of RM Prescription 3 in Chapter 6, for example, we might have included the definition of
+the read-only operator REFLECT—which, you will recall, takes a point with cartesian coordinates
+(x,y) and returns the “inverse” point with cartesian coordinates (-x,-y)—as part of the definition of
+the type POINT. But suppose we were to define an operator PERP_DIST that computes the
+perpendicular distance of some point from some line. Should PERP_DIST be bundled with type
+POINT or type LINE? Whichever it is, why? What are the implications?
+       As another example, consider the operator “*”, which might be used (among other things) to
+multiply a speed by a time to give a distance. Which type does “*” belong to? SPEED? TIME?
+Perhaps DISTANCE? Surely the only sensible answer is “None of the above.”
+       We see, therefore, that the idea of an operator being bundled in with some type works just fine
+so long as the operator in question takes exactly one operand, as REFLECT does. But as soon as it
+takes two or more, as PERP_DIST and “*” do, a degree of arbitrariness, artificiality, asymmetry,
+and awkwardness inevitably creeps in.
+       So let us step back for a moment. Why are operators bundled in with types anyway, in object
+systems? One answer to this question seems to be that those operators need (or might need)
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        255
+Chapter 11                                                                          OO Very Strong Suggestions
+
+
+privileged access: access, that is, to the physical representation of instances of the type in question.
+In other words, those operators need (or might need) to invoke what we called protected operators
+in Chapter 3. Note: We are using the fuzzy term “instances” here as a convenient shorthand for
+“values and/or variables.”
+       But we already have a mechanism for dealing with privileged access: viz., the security
+mechanism.1 Would it not be better, therefore, to unbundle operators from types, and instead use
+the security mechanism—whatever that mechanism might be—to control, directly or indirectly,
+which operators are allowed access to which types (more accurately, access to the physical
+representation of instances of those types)? We believe it would. To be specific, we believe this
+approach has the advantages that:
+
+    ■   Operators can be permitted access to the physical representations of instances of as many
+        types as desired, instead of being limited to just one.
+
+    ■   The arbitrariness, artificiality, asymmetry, and awkwardness inherent in the bundling scheme
+        are all eliminated.
+
+      Further advantages are discussed under IM Prescription 17 in Chapter 14. What is more,
+adopting this approach implies that:
+
+    ■   D does not need to support the concept, found in some object systems, that operators have a
+        distinguished or receiver or target operand. (In a typical object system, if operator Op is
+        bundled with type T, then Op is invoked by “sending a message” to a specific target operand:
+        namely, an instance of type T. That target operand is, typically, given special treatment, both
+        syntactic and semantic, a fact that can have a variety of undesirable consequences. But if the
+        present suggestion is implemented, all operands can be treated uniformly. Again, see Chapter
+        14 for further discussion.)
+
+    ■   D also does not need to support either the concept of protected instance variables or the
+        concept of friends. (See reference [90] for an explanation of these concepts. Basically, they
+        are both ad hoc techniques for getting around the limitation that one operator is permitted
+        privileged access to instances of only one type.)
+
+      To repeat, we believe the problem all such notions are intended to address is better solved by
+judicious application of the system’s security mechanism. As already noted, in fact, the problem in
+question degenerates to nothing more than that of deciding which operator definitions shall be
+allowed to make use of which protected operators. Note: We will go on in Chapter 14 to suggest
+that use of those protected operators should be limited to just a very small, well defined set of
+operators: selectors, THE_ operators, and one or two others. And even there we believe the
+operator definitions in question can be system generated in many cases, though not all.
+
+
+1
+  Of course, we are talking about database systems specifically here. Programming systems typically do not have a
+security mechanism, and this lack perhaps accounts for the approach typically taken by object systems. Of course, we
+do not actually prescribe a security mechanism for D either, for reasons explained in Chapters 1 and 3, but we do
+assume that any industrial strength D will include some security support.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                      256
+Chapter 11                                                                        OO Very Strong Suggestions
+
+
+OO VERY STRONG SUGGESTION 3: SINGLE-LEVEL STORE
+
+D should support the concept of single-level storage.
+
+                                          ———  ———
+
+The concept of a “single-level storage model” was proposed—under the name of direct reference—
+by one of the present authors as far back as 1976 [42], and it is supported by most object systems
+today (though not by the “object/relational” DBMSs that became available from several vendors in
+the 1990s, because those DBMSs are based on SQL). The general idea is simply that there should
+be no unnecessary differences between access to data in the database and access to data not in the
+database; all such access should look the same to the user. And in Tutorial D, of course, it does.
+For example, a Tutorial D scalar expression can reference an attribute value within some tuple
+within some relation, and it makes no difference whether the relation in question is in the database
+or “in main memory.” Note in particular, therefore, that there is no notion in Tutorial D of
+database data having to be “copied into main memory” before it can be processed. The net effect is
+that it makes no logical difference whether a given piece of data resides in main memory,1 online
+secondary storage, tertiary backup storage, etc. What is important is whether it is persistent or not.
+
+
+EXERCISES
+
+11.1    (For discussion) Under OO Very Strong Suggestion 1, we said the Manifesto tries not to
+        prescribe, proscribe, or even strongly suggest anything that might preclude its ability to
+        include inheritance support later. Do you think it succeeds in this respect?
+
+11.2    Under OO Very Strong Suggestion 2, we said that D does not need to support the concept,
+        found in some object systems, that operators have a distinguished or receiver or target
+        operand. Such operators are sometimes known as selfish methods, because they have to
+        access that special operand by means of a special parameter that is often called SELF. What
+        are the advantages and disadvantages of selfish methods?
+
+11.3    What are the advantages of a single-level store? What are the disadvantages?
+
+
+
+
+1
+  It is relevant to observe here that main-memory DBMSs have been commercially available for some time; indeed,
+they are becoming increasingly important, for a variety of pragmatic reasons.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                   257
+                                           Part IV:
+
+                   SUBTYPING AND INHERITANCE
+
+Essentially, this part of the book does for our model of subtyping and inheritance what Parts I-III do
+for The Third Manifesto. Thus, Chapter 12 corresponds to Part I (it contains an overall introduction
+to the topic); Chapter 13 corresponds to Part II (it contains formal definitions); and Chapters 14, 15,
+and 16 correspond to Part III (they contain extended but informal explanations and discussions of
+those formal definitions). More specifically:
+
+ ■    Chapter 14 discusses single inheritance and scalar types only.
+
+ ■    Chapter 15 elaborates on the ideas discussed in Chapter 14 to deal with multiple inheritance
+      as well.
+
+ ■    Finally, Chapter 16 goes on to take tuple and relation types into account too.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        258

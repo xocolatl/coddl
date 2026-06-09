@@ -1,0 +1,1233 @@
+                                              Chapter 16
+
+         Inheritance with Tuple and Relation Types
+
+In the previous two chapters we have presented, described, and illustrated a series of prescriptions
+for a model of subtyping and inheritance for scalar types. Now we turn our attention to the question
+of extending that model to take tuple and relation types into account as well—as indeed we really
+must, since we explicitly permit domains in the usual relational sense to be tuple or relation types in
+addition to the more traditional scalar types.
+      The style of presentation in what follows resembles that of Chapter 14; in other words, most
+of the sections consist of (a) a formal definition, followed by (b) an informal discussion (with
+examples) of the concepts involved in that definition. And once again we use the symbols T and T'
+generically to refer to a pair of types such that T' is a subtype of T (equivalently, such that T is a
+supertype of T')—but now, of course, those types might be tuple or relation types instead of just
+scalar types as previously.
+      One last introductory remark: It might have been thought better, at least from a pedagogic
+viewpoint, to treat tuple types exclusively first, and then to extend the treatment to include relation
+types subsequently. In practice, however, tuple and relation type inheritance are so intricately
+intertwined that it is virtually impossible to treat them separately. Indeed, it turns out that many of
+the concepts and definitions to be discussed:
+
+ ■    Come in pairs (a tuple version and a relation version), and
+
+ ■    Are both recursive (they refer to themselves) and mutually recursive (they refer to each other).
+
+Indeed, this state of affairs is not really surprising, given that tuples can contain relation- and tuple-
+valued attributes and relations can contain tuple- and relation-valued attributes.
+       A small point of nomenclature: In what follows, we occasionally find it convenient,
+especially in section titles, to use the term tuple/relation as an abbreviation for either tuple and
+relation or tuple or relation, as the sense demands, when such terms are used as a qualifier (as in,
+e.g., the phrase “tuple and relation types,” which we would thereby abbreviate to just tuple/relation
+types). The section title immediately following illustrates the point.
+
+
+IM PRESCRIPTION 21: TUPLE/RELATION SUBTYPES AND SUPERTYPES
+
+Let types T and T' be both tuple types or both relation types, with headings
+      { <A1,T1>,      <A2,T2>,     ..., <An,Tn>       }
+
+      { <A1,T1'>, <A2,T2'>, ..., <An,Tn'> }
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            358
+Part IV / Subtyping and Inheritance            Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+respectively. Then type T' is a subtype of type T (equivalently, type T is a supertype of type T') if
+and only if, for all i (i = 1, 2, ..., n), type Ti' is a subtype of type Ti (equivalently, type Ti is a
+supertype of type Ti').
+
+                                     ———  ———
+Consider the following variable definition:
+      VAR TV TUPLE { E ELLIPSE, R RECTANGLE } ;
+
+TV here is a tuple variable, with declared type
+      TUPLE { E ELLIPSE, R RECTANGLE }
+
+Values of this type are tuples with two attributes, one called E and ellipse valued, the other called R
+and rectangle valued.
+       Now, thanks to substitutability, a variable of declared type ELLIPSE can have a value that is a
+circle, because CIRCLE is a subtype of ELLIPSE; likewise, a variable of declared type
+RECTANGLE can have a value that is a square, because SQUARE is a subtype of RECTANGLE.
+In like fashion, the variable TV can have a value whose E value is a circle or whose R value is a
+square or both. What are the implications of this fact? Well, consider the following tuple types:
+      TUPLE { E ELLIPSE, R RECTANGLE }                        /* tuple type “ER” */
+
+      TUPLE { E CIRCLE,        R RECTANGLE }                  /* tuple type “CR” */
+
+      TUPLE { E ELLIPSE, R SQUARE              }              /* tuple type “ES” */
+
+      TUPLE { E CIRCLE,        R SQUARE        }              /* tuple type “CS” */
+
+      Let us refer to these types by the names ER, CR, ES, and CS, respectively, as the comments
+indicate. Note that they all have the same attribute names; clearly, then, tuples of any of these four
+types can all be values of the tuple variable TV. Note too that all four of these types are at least
+implicitly available, even though we have not explicitly defined any variables of types CR, ES, or
+CS. (Recall that, in Tutorial D at least, tuple types can simply be used—typically as part of the
+operation that defines a tuple variable, as in the case of tuple variable TV—without being separately
+defined. In fact, Tutorial D deliberately does not provide any kind of explicit “define tuple type”
+operator, for reasons explained, in part, in Chapter 3.)
+      Now let us concentrate for a moment on the two extreme cases, types ER and CS. Does it
+make sense to regard type CS as a “subtype” of “supertype” ER? Well, it should be clear that:
+
+ ■    Every type constraint that applies to values of type ER also applies to values of type CS,
+      while the converse is not true, in general. (We remind you that the only type constraints, as
+      such, that apply to tuple types in our model are constraints that are a logical consequence of
+      the ones that apply to the scalar types in terms of which those tuple types are ultimately
+      defined. Thus, there is no way tuple type ER could be subject to any type constraint that did
+      not also apply to tuple type CS.)
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                           359
+Part IV / Subtyping and Inheritance                   Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+    ■   Hence, every value of type CS is certainly a value of type ER, while the converse is not true,
+        in general.
+
+    ■   Every operator that applies to values of type ER also applies to values of type CS, while the
+        converse is not true, in general. The operators that apply to values of type ER (and therefore
+        to values of type CS) are (a) the built-in tuple operators of D (tuple comparisons, tuple
+        rename, tuple join, and so on), together with (b) those user-defined tuple operators, if any, that
+        have been defined for type ER. The operators that apply to values of type CS but not to
+        values of type ER are (a) “compound” operators such as THE_R(E FROM ...) that rely on
+        attribute E being of declared type CIRCLE or attribute R being of declared type SQUARE,
+        together with (b) those user-defined tuple operators, if any, that have been defined for type CS
+        specifically.
+
+      Now, all of these observations are in accord with our usual understanding of what it means for
+one type to be a subtype of another, so there does seem to be a prima facie case for regarding CS as
+a subtype of ER (equivalently, ER as a supertype of CS). But is it useful to do so? The answer, of
+course, is yes. In particular, the concept of value substitutability is applicable, meaning that
+wherever the system expects a tuple of type ER, we can always substitute a tuple of type CS
+instead. Among other things, therefore, we can assign a tuple of type CS to a variable of declared
+type ER, and we can test a variable of declared type CS and a variable of declared type ER for
+equality.
+      In a similar manner, we can say that types CR and ES are both subtypes of type ER and both
+supertypes of CS (note, however, that neither of CR and ES is a subtype of the other). And so CS is
+a subtype with two immediate supertypes, and we are dealing with multiple inheritance—which is
+one reason why we wanted to discuss multiple inheritance before considering tuple and relation
+type inheritance. It is also one reason1 why we believe support for multiple inheritance is a logical
+requirement (assuming inheritance is supported at all, that is).
+      With the foregoing example by way of motivation, let us now try to define exactly what it
+means for tuple type TT' to be a subtype of tuple type TT. First of all, of course, TT' and TT must
+certainly have the same attribute names (for otherwise there is no way a value of type TT' could be a
+value of type TT). Thus, we might attempt a definition along the following lines:
+
+    ■   Let tuple types TT and TT' have headings
+        { <A1,T1>,        <A2,T2>,       ..., <An,Tn>        }
+
+        { <A1,T1'>, <A2,T2'>, ..., <An,Tn'> }
+
+        respectively. Then tuple type TT' is a subtype of tuple type TT (equivalently, tuple type TT is
+        a supertype of tuple type TT') if and only if, for all i (i = 1, 2, ..., n), type Ti' is a subtype of
+        type Ti (equivalently, type Ti is a supertype of type Ti').
+
+
+
+
+1
+    The other has to do with type omega, as we saw in Chapter 14.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                              360
+Part IV / Subtyping and Inheritance              Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+      And this definition is perfectly acceptable, provided we understand that, for any given i, types
+Ti and Ti' might themselves be tuple or relation types in turn (because, of course, tuples can have
+tuple- and relation-valued attributes). In other words, our definition of what it means for one tuple
+type to be a subtype of another:
+
+ ■    Is recursive (a fact that should not cause any problems in itself, of course), but also
+
+ ■    Relies on a definition of what it means for one relation type to be a subtype of another—a
+      possibility we have not yet considered.
+
+      So let us now turn our attention to this latter possibility. Suppose we have a relation variable
+(relvar) RV, say, defined thus:
+      VAR RV ... RELATION { E ELLIPSE, R RECTANGLE } ... ;
+
+Then it should be clear that the current relation value of RV might include tuples of any mixture of
+the four tuple types ER, CR, ES, and CS discussed above. Thus, that current relation value might
+reasonably be of any of the following relation types:
+      RELATION { E ELLIPSE, R RECTANGLE }                    /* relation type “ER” */
+
+      RELATION { E CIRCLE,          R RECTANGLE }            /* relation type “CR” */
+
+      RELATION { E ELLIPSE, R SQUARE                 }       /* relation type “ES” */
+
+      RELATION { E CIRCLE,          R SQUARE         }       /* relation type “CS” */
+
+For example, if every tuple it contains is of tuple type CS, that relation will be of relation type CS.
+      Without going through the detailed analysis—it parallels that already given for the tuple case
+above—it should be clear that we can regard relation type CS as a subtype of relation type ER
+(equivalently, relation type ER as a supertype of relation type CS), and so on. Here then is a
+definition of what it means for relation type RT' to be a subtype of relation type RT:
+
+ ■    Let relation types RT and RT' have headings
+      { <A1,T1>,      <A2,T2>,      ..., <An,Tn>         }
+
+      { <A1,T1'>, <A2,T2'>, ..., <An,Tn'> }
+
+      respectively. Then relation type RT' is a subtype of relation type RT (equivalently, relation
+      type RT is a supertype of relation type RT') if and only if, for all i (i = 1, 2, ..., n), type Ti' is a
+      subtype of type Ti (equivalently, type Ti is a supertype of type Ti').
+
+      Again, however, it must be understood that, for any given i, types Ti and Ti' might themselves
+be tuple or relation types. In other words, our definition of what it means for one relation type to be
+a subtype of another:
+
+ ■    Is recursive, and also
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                               361
+Part IV / Subtyping and Inheritance                Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+ ■      Relies on a definition of what it means for one tuple type to be a subtype of another (but this
+        latter is a possibility we have already discussed).
+
+       To sum up, therefore: The definitions of tuple subtype and relation subtype are each both
+recursive (they refer to themselves) and mutually recursive (they refer to each other). Ultimately,
+however, they each rely on the notion of a scalar subtype, a notion that has already been defined in
+earlier chapters. And, of course—the point is obvious but is still worth stating explicitly—if
+tuple/relation type T' is a subtype of tuple/relation type T and v is a tuple or relation of type T', then
+v is also a tuple or relation of type T.
+       Given the foregoing definitions, it turns out that all of the IM Prescriptions discussed in
+Chapters 14 and 15 apply essentially unchanged to tuples and relations as well, just so long as we
+are careful to interpret, e.g., the term value as now meaning a tuple or relation value instead of a
+scalar value. However:
+
+ ■      Certain of those existing prescriptions (primarily IM Prescriptions 11-15) do merit further
+        attention.
+
+ ■      Four more prescriptions are also needed (IM Prescriptions 22-25), in addition to the one we
+        have been discussing (IM Prescription 21). Those additional prescriptions all have to do with
+        tuple and relation analogs of IM Prescriptions 8 and 9 (“scalar values and variables with
+        inheritance”).
+
+        These matters are discussed and explained in the sections that follow.
+
+
+IM PRESCRIPTION 22: TUPLE/RELATION VALUES WITH INHERITANCE
+
+Let H be a heading defined as follows:
+        { <A1,T1>, <A2,T2>, ..., <An,Tn> }
+
+Then:
+
+ a.     t is a tuple that conforms to heading H if and only if t is of the form
+        { <A1,T1',v1>, <A2,T2',v2>, ..., <An,Tn',vn> }
+
+        where, for all i (i = 1, 2, ..., n), type Ti' is a subtype of type Ti and vi is a value of type Ti'.
+
+ b.     r is a relation that conforms to heading H if and only if r consists of a heading and a body,
+          where:
+
+        ●    The heading of r is of the form
+                  { <A1,T1'>, <A2,T2'>, ..., <An,Tn'> }
+
+             where, for all i (i = 1, 2, ..., n), type Ti' is a subtype of type Ti.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                    362
+Part IV / Subtyping and Inheritance                   Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+        ●   The body of r is a set of tuples, all of which conform to the heading of r.
+
+                                             ———  ———
+
+You might have noticed in the previous section that, although we explained what it meant for
+tuple/relation type T' to be a subtype of tuple/relation type T, we did not really pin down just what it
+meant for a given value to be of a given tuple/relation type; in fact, we deliberately ducked the issue
+in that section, because it is not quite as straightforward as might at first be thought (especially in
+the relational case). Now we turn our attention to that issue.
+
+        First, tuples. Let tuple type T have heading
+        { <A1,T1>, <A2,T2>, ..., <An,Tn> }
+
+Then we define t to be a tuple that conforms to the heading of type T—equivalently, we say that t is
+of type T—if and only if it is of the form
+        { <A1,T1',v1>, <A2,T2',v2>, ..., <An,Tn',vn> }
+
+where, for all i (i = 1, 2, ..., n), type Ti' is a subtype of type Ti—equivalently, type Ti is a supertype
+of type Ti'—and vi is a value of type Ti'.1 And, of course, values of type T are precisely the tuples
+that are of type T.
+
+        Example: The tuple returned by the tuple selector invocation
+        TUPLE { E CIRCLE (...), R SQUARE (...) }
+
+(note the CIRCLE and SQUARE selector invocations nested inside this tuple selector invocation) is
+of all four of the tuple types ER, CR, ES, CS discussed in the previous section.
+       Once again, of course, type Ti' in the foregoing definition might be a tuple or relation type in
+turn. Hence, that definition:
+
+    ■   Is recursive again (it relies on a definition of what it means for a value to be of a given tuple
+        type), and also
+
+    ■   Relies on a definition of what it means for a value to be of a given relation type.
+
+        So let us now turn to this latter question. Let relation type T have heading
+        { <A1,T1>, <A2,T2>, ..., <An,Tn> }
+
+Then we define r to be a relation that conforms to the heading of type T—equivalently, we say that
+r is of type T—if and only if it consists of a heading and a body, where:
+
+
+1
+  This definition is a compatible extension to the definition in RM Prescription 9 of what it means for a given tuple to
+conform to a given heading or to be of a given type. An analogous remark applies to relations too (see later in this
+section).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                          363
+Part IV / Subtyping and Inheritance             Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+ ■   The heading is of the form
+     { <A1,T1'>, <A2,T2'>, ..., <An,Tn'> }
+
+     where, for all i (i = 1, 2, ..., n), type Ti' is a subtype of type Ti (equivalently, type Ti is a
+     supertype of type Ti').
+
+ ■   The body is a set of tuples, all of which conform to the heading of r.
+
+And, of course, values of type T are precisely the relations that are of type T.
+      Example: Consider the relation type RELATION { E ELLIPSE, R RECTANGLE }
+(“relation type ER”) once again.
+      Fig. 16.1 shows a few relations of this type.
+╔═════════════════════════════════════════════════════════════════╗
+║                ┌────┬─────────┬────┬───────────┐                ║
+║                │ E : ELLIPSE │ R : RECTANGLE │                  ║
+║                ├════╧═════════┼════╧═══════════┤                ║
+║                │ E1 : ellipse │ R1 : rectangle │                ║
+║                │ C2 : circle │ R2 : rectangle │                 ║
+║                │ E3 : ellipse │ S3 : square    │                ║
+║                │ C4 : circle │ S4 : square     │                ║
+║                └──────────────┴────────────────┘                ║
+║                ┌────┬─────────┬────┬───────────┐                ║
+║                │ E : ELLIPSE │ R : RECTANGLE │                  ║
+║                ├════╧═════════┼════╧═══════════┤                ║
+║                │ C4 : circle │ S4 : square     │                ║
+║                └──────────────┴────────────────┘                ║
+║                ┌────┬─────────┬────┬───────────┐                ║
+║                │ E : CIRCLE │ R : RECTANGLE │                   ║
+║                ├════╧═════════┼════╧═══════════┤                ║
+║                │ C2 : circle │ R2 : rectangle │                 ║
+║                │ C4 : circle │ S4 : square     │                ║
+║                └──────────────┴────────────────┘                ║
+║                ┌────┬─────────┬────┬───────────┐                ║
+║                │ E : ELLIPSE │ R : SQUARE      │                ║
+║                ├════╧═════════┼════╧═══════════┤                ║
+║                │ E3 : ellipse │ S3 : square    │                ║
+║                │ C4 : circle │ S4 : square     │                ║
+║                └──────────────┴────────────────┘                ║
+║                ┌────┬─────────┬────┬───────────┐                ║
+║                │ E : CIRCLE │ R : SQUARE       │                ║
+║                ├════╧═════════┼════╧═══════════┤                ║
+║                │ C4 : circle │ S4 : square     │                ║
+║                └──────────────┴────────────────┘                ║
+║                ┌────┬─────────┬────┬───────────┐                ║
+║                │ E : omega    │ R : omega      │                ║
+║                ├════╧═════════┼════╧═══════════┤                ║
+║                └──────────────┴────────────────┘                ║
+╚═════════════════════════════════════════════════════════════════╝
+Fig. 16.1: Some relations of type RELATION { E ELLIPSE, R RECTANGLE }
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                              364
+Part IV / Subtyping and Inheritance             Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+Note: We adopt the convention in Fig. 16.1 that values of the form Ei are ellipses that are not
+circles, values of the form Ri are rectangles that are not squares, values of the form Ci are circles,
+and values of the form Si are squares. The most specific types for all such values are shown in
+lowercase italics. (Perhaps we should elaborate briefly on the last example in particular. By
+definition, no scalar value is of type omega and no tuple value has an attribute of type omega.
+However, a relation value can have an attribute of type omega—though any such relation is
+necessarily empty.)
+
+      It follows from the foregoing definitions that:
+
+ ■    If tuple t is of type TT, it is also of all supertypes of TT.
+
+ ■    If relation r is of type RT, it is also of all supertypes of RT.
+
+
+IM PRESCRIPTION 23: MAXIMAL AND MINIMAL TUPLE/RELATION TYPES
+
+Let types T, T_alpha, and T_omega be all tuple types or all relation types, with headings
+      { <A1,T1>,             <A2,T2>,             ..., <An,Tn>             }
+
+      { <A1,T1_alpha>, <A2,T2_alpha>, ..., <An,Tn_alpha> }
+
+      { <A1,T1_omega>, <A2,T2_omega>, ..., <An,Tn_omega> }
+
+respectively. Then types T_alpha and T_omega are the maximal type with respect to type T and
+the minimal type with respect to type T, respectively, if and only if, for all i (i = 1, 2, ..., n), type
+Ti_alpha is the maximal type with respect to type Ti and type Ti_omega is the minimal type with
+respect to type Ti.
+
+                                        ———  ———
+
+IM Prescription 20 introduced the special scalar—in fact, dummy—types alpha and omega. Just to
+review briefly:
+
+ ■    Alpha is the maximal scalar type; it contains all scalar values (but no nonscalar values) and is
+      a supertype of all scalar types. More precisely, it is a proper supertype of every scalar type
+      except itself, and an immediate supertype of every scalar type except itself that would
+      otherwise be a root type.
+
+ ■    Omega is the minimal scalar type; it contains no scalar values at all (and no nonscalar values
+      either!) and is a subtype of all scalar types. More precisely, it is a proper subtype of every
+      scalar type except itself, and an immediate subtype of every scalar type except itself that
+      would otherwise be a leaf type.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                             365
+Part IV / Subtyping and Inheritance             Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+      Note: We can and do refer to alpha and omega, a trifle more formally, as the maximal and
+minimal type, respectively, with respect to any given scalar type. This tiny matter of terminology
+will become significant in just a moment.
+      Now, analogs of alpha and omega do exist in connection with tuple and relation types, as you
+would surely expect, but the situation is a little more complicated than it is with scalar types, as you
+would probably also expect. We begin by considering the issue of maximal types. Here is a
+definition:
+
+ ■    Let tuple types TT and TT_alpha have headings
+      { <A1,T1>,            <A2,T2>,             ..., <An,Tn>             }
+
+      { <A1,T1_alpha>, <A2,T2_alpha>, ..., <An,Tn_alpha> }
+
+      respectively. Then tuple type TT_alpha is the maximal type with respect to type TT if and
+      only if, for all i (i = 1, 2, ..., n), type Ti_alpha is the maximal type with respect to type Ti.
+
+      Once again, of course, type Ti in the foregoing definition might be a tuple or relation type in
+turn. Hence, that definition:
+
+ ■    Is recursive again, and also
+
+ ■    Relies on a definition of what it means for a relation type to be a maximal type.
+
+      Let us therefore now turn to this latter question.
+
+ ■    Let relation types RT and RT_alpha have headings
+      { <A1,T1>,            <A2,T2>,             ..., <An,Tn>             }
+      { <A1,T1_alpha>, <A2,T2_alpha>, ..., <An,Tn_alpha> }
+
+      respectively. Then relation type RT_alpha is the maximal type with respect to type RT if
+      and only, if for all i (i = 1, 2, ..., n), type Ti_alpha is the maximal type with respect to type Ti.
+
+      Examples: The maximal type with respect to the tuple type
+      TUPLE { E ELLIPSE, R RECTANGLE }
+
+is TUPLE { E alpha, R alpha }. Likewise, the maximal type with respect to the relation type
+      RELATION { E ELLIPSE, R RECTANGLE }
+
+is RELATION { E alpha, R alpha }. Observe, therefore, that whereas with scalar types there is just
+one maximal type that applies to all possible scalar types, the same is not true for tuple and relation
+types. Rather, there is one tuple maximal type for each possible tuple type (loosely speaking), and
+one relation maximal type for each possible relation type (again, loosely speaking). More precisely,
+if and only if tuple types TT1 and TT2 have no common supertype, then the corresponding tuple
+maximal types are distinct (and analogously for relation types).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            366
+Part IV / Subtyping and Inheritance            Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+      Another precise statement is the following: Tuple type TT_alpha contains all possible tuples
+whose type is some subtype or some supertype of tuple type TT, and no other tuples (and
+analogously for relation type RT_alpha).
+      The definitions for minimal types parallel the foregoing definitions for maximal types, of
+course. To be specific:
+
+ ■    Let tuple types TT and TT_omega have headings
+      { <A1,T1>,            <A2,T2>,            ..., <An,Tn>              }
+      { <A1,T1_omega>, <A2,T2_omega>, ..., <An,Tn_omega> }
+
+      respectively. Then tuple type TT_omega is the minimal type with respect to type TT if and
+      only if, for all i (i = 1, 2, ..., n), type Ti_omega is the minimal type with respect to type Ti.
+
+ ■    Let relation types RT and RT_omega have headings
+      { <A1,T1>,            <A2,T2>,            ..., <An,Tn>              }
+      { <A1,T1_omega>, <A2,T2_omega>, ..., <An,Tn_omega> }
+
+      respectively. Then relation type RT_omega is the minimal type with respect to type RT if
+      and only if, for all i (i = 1, 2, ..., n), type Ti_omega is the minimal type with respect to type Ti.
+
+      Examples: The minimal type with respect to the tuple type
+      TUPLE { E ELLIPSE, R RECTANGLE }
+
+is TUPLE { E omega, R omega }. Likewise, the minimal type with respect to the relation type
+      RELATION { E ELLIPSE, R RECTANGLE }
+
+is RELATION { E omega, R omega }. In general, the situation with respect to minimal types is
+analogous to that for maximal types; to be specific, there is one tuple minimal type for each possible
+tuple type (loosely speaking), and one relation minimal type for each possible relation type (again,
+loosely speaking). More precisely, if and only if tuple types TT1 and TT2 have no common
+subtype, then the corresponding tuple minimal types are distinct (and analogously for relation
+types). Also:
+
+ ■    Unlike the scalar minimal type omega, the tuple minimal type TT_omega is not necessarily
+      empty. The particular example shown earlier—TUPLE { E omega, R omega }—is empty, of
+      course (there are no tuples of this type). A conceptually important counterexample is as
+      follows: Let TT be TUPLE{}. Then TT_omega is equal to TT (i.e., TT is its own minimal
+      type), and it contains exactly one value: namely, the 0-tuple (i.e., the tuple with the empty set
+      of attributes).
+
+ ■    Moreover, the relation minimal type RT_omega is definitely not empty; as noted in Chapter 6,
+      in fact, there is no such thing as an empty relation type (the very phrase is a contradiction in
+      terms). The example shown earlier—RELATION { E omega, R omega }—contains exactly
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            367
+Part IV / Subtyping and Inheritance               Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+        one value: namely, the empty relation of that type (which was illustrated in Fig. 16.1).
+        Another conceptually important case is as follows: Let RT be RELATION{}. Then
+        RT_omega is equal to RT (i.e., RT is its own minimal type), and it contains two values,
+        TABLE_DEE and TABLE_DUM.
+
+
+IM PRESCRIPTION 24: TUPLE/RELATION MOST SPECIFIC TYPES
+
+Let H be a heading defined as follows:
+        { <A1,T1>, <A2,T2>, ..., <An,Tn> }
+
+Then:
+
+ a.     If t is a tuple that conforms to H—meaning t is of the form
+        { <A1,T1',v1>, <A2,T2',v2>, ..., <An,Tn',vn> }
+
+        where, for all i (i = 1, 2, ..., n), type Ti' is a subtype of type Ti and vi is a value of type Ti'—
+        then the most specific type of t is
+        TUPLE { <A1,MST1>, <A2,MST2>, ..., <An,MSTn> }
+
+        where, for all i (i = 1, 2, ..., n), type MSTi is the most specific type of value vi.
+
+ b.     If r is a relation that conforms to H—meaning the body of r is a set of tuples, each of which
+        has as its most specific type a type that is a subtype of the type TUPLE H, and meaning
+        further that each such tuple can be regarded without loss of generality as being of the form
+        { <A1,T1',v1>, <A2,T2',v2>, ..., <An,Tn',vn> }
+
+        where, for all i (i = 1, 2, ..., n), type Ti' is a subtype of type Ti and is the most specific type of
+        value vi (note that distinct tuples in the body of r will be of distinct most specific types, in
+        general; thus, type Ti' varies over the tuples in the body of r)—then the most specific type of r
+        is
+        RELATION { <A1,MST1>, <A2,MST2>, ..., <An,MSTn> }
+
+        where, for all i (i = 1, 2, ..., n), type MSTi is the most specific common supertype of those
+        most specific types Ti', taken over all tuples in the body of r.
+
+                                          ———  ———
+
+The concept of most specific type does apply to tuples and relations, though the situation is
+considerably more complicated than it is for scalars (at least in the case of relations, where the
+terminology of “most” specific type is arguably a trifle misleading; the tuple case is comparatively
+straightforward). As usual, it turns out that the definitions are both recursive and mutually
+recursive.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                               368
+Part IV / Subtyping and Inheritance                    Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+       First of all, then, let t be a tuple of the form
+       { <A1,T1,v1>, <A2,T2,v2>, ..., <An,Tn,vn> }
+
+Then we define the most specific type of t to be that unique tuple type with heading
+       { <A1,MST1>, <A2,MST2>, ..., <An,MSTn> }
+
+where, for all i (i = 1, 2, ..., n), type MSTi is the most specific type of value vi.
+     Example: Let t be the tuple
+       TUPLE { E EX, R RX }
+
+and let the most specific types of EX and RX be CIRCLE and SQUARE, respectively. Then the
+most specific type of t is
+       TUPLE { E CIRCLE, R SQUARE }
+
+(“tuple type CS”).
+      Now let r be a relation with heading
+       { <A1,T1>, <A2,T2>, ..., <An,Tn> }
+
+Then the body of r is a set of tuples, each of which has as its most specific type a type that is a
+subtype of the tuple type with the same heading as r. In other words, each such tuple can be
+regarded without loss of generality as being of the form
+       { <A1,T1',v1>, <A2,T2',v2>, ..., <An,Tn',vn> }
+
+where, for all i (i = 1, 2, ..., n), type Ti' is a subtype of type Ti, and is in fact the most specific type
+of value vi. Note that distinct tuples in the body of r will be of distinct most specific types, in
+general; thus, type Ti' varies over the tuples in the body of r. Then we define the most specific type
+of r to be that unique relation type with heading
+       { <A1,MST1>, <A2,MST2>, ..., <An,MSTn> }
+
+where, for all i (i = 1, 2, ..., n), type MSTi is the most specific common supertype (note that
+“supertype”!) of the types Ti', taken over all tuples in the body of r. See the explanation of “most
+specific common supertype” (for a set of types) immediately following.
+
+Definition of most specific common supertype:1 First, let T and T' be two scalar types. Then the
+most specific common supertype of T and T' is as defined in Chapter 15.
+       Second, let T1, T2, ..., Tn and T1', T2', ..., Tn' be two sets of types, where, for all i (i = 1, 2, ...,
+n), Ti and Ti' (a) are both scalar types or both tuple types or both relation types, and moreover (b)
+have a common supertype. Now:
+
+1
+  The definitions that follow are a generalization of the definition given for scalar types in Chapter 15. Note that in
+these definitions we break for once with our convention that type T' is always a subtype of type T.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                               369
+Part IV / Subtyping and Inheritance                   Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+    ■   Consider tuple types T and T', with headings
+        { <A1,T1>,       <A2,T2>,       ..., <An,Tn>         }
+
+        { <A1,T1'>, <A2,T2'>, ..., <An,Tn'> }
+
+        respectively. Then we define the most specific common supertype of types T and T' to be the
+        unique tuple type with heading
+        { <A1,MSC1>, <A2,MSC2>, ..., <An,MSCn> }
+
+        where, for all i (i = 1, 2, ..., n), MSCi is the most specific common supertype of Ti and Ti'.
+
+    ■   Consider relation types T and T', with headings
+        { <A1,T1>,       <A2,T2>,       ..., <An,Tn>         }
+        { <A1,T1'>, <A2,T2'>, ..., <An,Tn'> }
+
+        respectively. Then we define the most specific common supertype of types T and T' to be the
+        unique relation type with heading
+        { <A1,MSC1>, <A2,MSC2>, ..., <An,MSCn> }
+
+        where, for all i (i = 1, 2, ..., n), MSCi is the most specific common supertype of Ti and Ti'.
+
+      The definition of most specific common supertype for a set of N types for N > 2, where the
+types are all scalar types or all tuple types or all relation types and all have a common supertype,
+follows by pairwise application of the foregoing definition to the set in question. But what about N
+< 2?
+
+    ■   The case N = 1 is straightforward—the set of types contains just one type, T say, and we can
+        define the “most specific common supertype” for that set to be simply T itself.
+
+    ■   However, we also need to address the case N = 0. To be specific, what is the most specific
+        common supertype for the (empty) set of types corresponding to the (empty) set of values of
+        some attribute within an empty relation? You will probably not be surprised to learn that the
+        answer to this question is the applicable minimal type. That is, if the declared type of the
+        attribute in question is some scalar type, then the most specific common supertype is just
+        omega;1 if it is some tuple or relation type T, then the most specific common supertype is
+        T_omega. Note: As an aside, we remark that the least specific common subtype of an empty
+        set of types is, of course, the applicable maximal type.
+
+
+
+1
+  This definition marks the first point in this book where we have encountered a practical use—a crucial practical use,
+in fact—for type omega (our previous discussions have all been primarily conceptual in nature). In an earlier paper
+[29], we said we were unable to find a use for the concept of an empty type; we are thus delighted to have found one
+here.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                         370
+Part IV / Subtyping and Inheritance           Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+      Here then are some “most specific common supertype” examples. First, scalar types. The
+most specific common supertype of the set of types {POLYGON, RECTANGLE, SQUARE} is
+POLYGON; likewise, the most specific common supertype of the set of types {PLANE_FIGURE,
+RECTANGLE} is PLANE_FIGURE, and the most specific common supertype of the set of types
+{CIRCLE, SQUARE} is again PLANE_FIGURE. All of these examples are based on the type
+hierarchy of Fig. 12.1. Switching now to the type graph of Fig. 15.1, the most specific common
+supertype of the set of types {RECTANGLE, RHOMBUS} is PARALLELOGRAM; and the most
+specific common supertype of {}, where {} denotes the empty subset of the set of scalar types
+{RECTANGLE, RHOMBUS}, is simply omega.
+      Second, consider once again the tuple types
+      TUPLE { E ELLIPSE, R RECTANGLE }                      /* tuple type “ER” */
+
+      TUPLE { E CIRCLE,       R RECTANGLE }                 /* tuple type “CR” */
+
+      TUPLE { E ELLIPSE, R SQUARE            }              /* tuple type “ES” */
+
+      TUPLE { E CIRCLE,       R SQUARE       }              /* tuple type “CS” */
+
+Then the most specific common supertype of CR and CS is CR; the most specific common
+supertype of ES and CS is ES; the most specific common supertype of CR and ES is ER; and the
+most specific common supertype of all four types is again ER.
+       Of course, we have only to replace these four tuple types by four analogous relation types to
+obtain a set of relation “most specific common supertype” examples.
+       Now we return to the real point of this section and consider the question of the most specific
+type of a given value. The scalar case has already been dealt with in Chapters 14 and 15, of course,
+and the tuple case is an obvious generalization of the scalar case—but the relation case is a little
+more complicated, as we now explain.
+       We begin by considering some examples. Take another look at the relations in Fig. 16.1. The
+most specific types of those relations are (from top to bottom) relation types ER, CS, CR, ES, CS
+again, and ER_omega, respectively (where by ER_omega we mean the type RELATION { E
+omega, R omega }, of course). Note further that, e.g., the top relation in that figure would still have
+relation type ER as its most specific type even if we deleted the only tuple—viz., the E1-R1 tuple—
+that is in fact of tuple type ER. (If we deleted the C2-R2 tuple as well, however, that relation would
+then have relation type ES as its most specific type.)
+       Now, you might feel something counterintuitive is going on here, and so it is, in a way. For
+example, look again at the top relation in Fig. 16.1 (call it TopRel). For relation TopRel, it almost
+seems as if we have defined the most specific type of that relation (viz., relation type ER) to be the
+least specific type of the tuples it contains!—and indeed so we have, in this particular example.
+Why then did we not define the most specific type of TopRel to be relation type CS (the other
+“extreme” type) instead? The answer is as follows:
+
+ ■    Suppose we had defined that most specific type to be CS instead of ER. Then certain of the
+      attributes in certain of the tuples in TopRel would contain values that were not of the “right”
+      type. The E1-R1 tuple, for example, contains a value of type ELLIPSE (not CIRCLE) and a
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        371
+Part IV / Subtyping and Inheritance            Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+      value of type RECTANGLE (not SQUARE), and thus certainly is not of tuple type CS (in
+      fact, it is of tuple type ER).
+
+ ■    But allowing a relation of relation type CS to contain a tuple of tuple type ER would be a
+      contradiction in terms—it would mean, for example, that attribute E of that relation, of type
+      CIRCLE, is allowed to include values that are “just ellipses” and not circles. Indeed, such a
+      state of affairs would be just as bad as allowing a variable of declared type CIRCLE to have a
+      value that is “just an ellipse.”
+
+       It follows that we must define the most specific type for relation r in the way we have done:
+namely, in such a way that the type corresponding to attribute A is the most specific common
+supertype—and not, as might have been expected, the least specific common subtype—of the most
+specific types of all of the A values in r. As noted earlier, the terminology is perhaps a little
+misleading in the relational case.
+       In an attempt to help you understand better exactly what is going on here, we show in Fig.
+16.2 another set of relations, based on the type graph of Fig. 15.1. The most specific types of these
+relations (from top to bottom) are as follows:
+ ■    RELATION { PX PARALLELOGRAM, PY RECTANGLE }
+
+ ■    RELATION { PX RHOMBUS,                PY RECTANGLE }
+
+ ■    RELATION { PX RECTANGLE,              PY SQUARE        }
+
+ ■    RELATION { PX SQUARE,                 PY SQUARE        }
+
+ ■    RELATION { PX omega,                  PY omega         }
+
+       By the way, you might find the last of these most specific types a little surprising (though it is
+in full accordance with all of our foregoing discussions). To be specific, you might have expected
+that type to be RELATION { PX alpha, PY alpha }. If it were, however, we would be faced with
+the unpalatable consequence that the relation in question could not be assigned to a relvar of type,
+say, RELATION { PX PARALLELOGRAM, PY PARALLELOGRAM }.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          372
+Part IV / Subtyping and Inheritance          Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+╔═════════════════════════════════════════════════════════════════╗
+║           ┌────┬───────────────┬────┬───────────────┐           ║
+║           │ PX : PARALLELOGRAM │ PY : PARALLELOGRAM │           ║
+║           ├════╧═══════════════┼════╧═══════════════┤           ║
+║           │ X1 : rectangle     │ Y1 : rectangle     │           ║
+║           │ X2 : rhombus       │ Y2 : rectangle     │           ║
+║           │ X3 : rectangle     │ Y3 : square        │           ║
+║           │ X4 : square        │ Y4 : square        │           ║
+║           └────────────────────┴────────────────────┘           ║
+║           ┌────┬───────────────┬────┬───────────────┐           ║
+║           │ PX : PARALLELOGRAM │ PY : PARALLELOGRAM │           ║
+║           ├════╧═══════════════┼════╧═══════════════┤           ║
+║           │ X2 : rhombus       │ Y2 : rectangle     │           ║
+║           │ X4 : square        │ Y4 : square        │           ║
+║           └────────────────────┴────────────────────┘           ║
+║           ┌────┬───────────────┬────┬───────────────┐           ║
+║           │ PX : PARALLELOGRAM │ PY : PARALLELOGRAM │           ║
+║           ├════╧═══════════════┼════╧═══════════════┤           ║
+║           │ X3 : rectangle     │ Y3 : square        │           ║
+║           │ X4 : square        │ Y4 : square        │           ║
+║           └────────────────────┴────────────────────┘           ║
+║           ┌────┬───────────────┬────┬───────────────┐           ║
+║           │ PX : PARALLELOGRAM │ PY : PARALLELOGRAM │           ║
+║           ├════╧═══════════════┼════╧═══════════════┤           ║
+║           │ X4 : square        │ Y4 : square        │           ║
+║           └────────────────────┴────────────────────┘           ║
+║           ┌────┬───────────────┬────┬───────────────┐           ║
+║           │ PX : PARALLELOGRAM │ PY : PARALLELOGRAM │           ║
+║           ├════╧═══════════════┼════╧═══════════════┤           ║
+║           └────────────────────┴────────────────────┘           ║
+╚═════════════════════════════════════════════════════════════════╝
+Fig. 16.2: Some relations of type RELATION { PX PARALLELOGRAM, PY PARALLELOGRAM }
+
+       One further remark to close this section: Given the foregoing definition of the most specific
+type MST(r) of a relation r, we observe that computation of MST(r) might be too time consuming to
+be a practical proposition unless r is of low cardinality. One implication is that the implementer of
+an operator that has a parameter of some relation type might well want to avoid having special
+implementation versions of that operator to deal with proper subtypes of that relation type. For
+example, suppose we have an operator called AVG_AREA that computes the average area for the
+ellipses appearing in some attribute A of some relation r. Suppose further that two implementation
+versions of that operator exist, one for when MST(A) is ELLIPSE and one for when it is CIRCLE.
+Suppose finally that r contains a billion tuples, not one of which contains “just an ellipse” ...
+Clearly, then, the implementation will have to examine all billion tuples in order to perform the run-
+time binding process.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       373
+Part IV / Subtyping and Inheritance           Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+IM PRESCRIPTION 25: TUPLE/RELATION VARIABLES WITH INHERITANCE
+
+Let tuple or relation variable V be of declared type T, and let the heading of T have attributes A1,
+A2, ..., An. Then we can model V as a named set of named ordered triples of the form
+<DTi,MSTi,vi>, where:
+
+ a.   The name of the set is the name of the variable (V in the example).
+
+ b.   The name of each triple is the name of the corresponding attribute.
+
+ c.   DTi is the name of the declared type of attribute Ai.
+
+ d.   MSTi is the name of the most specific type—also known as the current most specific type—
+      for, or of, attribute Ai. (If V is a relation variable, then the most specific type of Ai is the
+      most specific common supertype of the most specific types of the m values in vi—see the
+      explanation of vi below.
+
+ e.   If V is a tuple variable, vi is a value of most specific type MSTi—the current value for, or of,
+      attribute Ai. If V is a relation variable, then let the body of the current value of V consist of
+      m tuples; label those tuples (in some arbitrary sequence) “tuple 1,” “tuple 2,” ..., “tuple m”;
+      then vi is a sequence of m values (not necessarily all distinct), being the Ai values from tuple
+      1, tuple 2, ..., tuple m (in that order); note that all of those values are of type MSTi.
+
+We use the notation DT(Ai), MST(Ai), v(Ai) to refer to the DTi, MSTi, vi components,
+respectively, of attribute Ai of this model of tuple or relation variable V. We also use the notation
+DT(V), MST(V), v(V) to refer to the overall declared type, overall current most specific type, and
+overall current value, respectively, of this model of tuple or relation variable V.
+       Now let X be a tuple or relation expression. By definition, X specifies an invocation of some
+tuple or relation operator Op (where the arguments, if any, to that invocation of Op are specified as
+expressions in turn). Thus, the notation DTi(V), MSTi(V), vi(V) just introduced can be extended in
+an obvious way to refer to the declared type DTi(X), the current most specific type MSTi(X), and
+the current value vi(X), respectively, of the DTi, MSTi, vi components, respectively, of attribute Ai
+of tuple or relation expression X—where DTi(X) is known at compile time, and MSTi(X) and vi(X)
+refer to the result of evaluating X and are therefore not known until run time (in general).
+
+                                      ———  ———
+
+Now (at last!) we are in a position to give the necessary extended definitions for tuple variable and
+relation variable (or relvar). Yet again, it turns out that the definitions are both recursive and
+mutually recursive.
+      Basically, of course, a tuple variable of declared type TT is a variable whose permitted
+values are tuples of type TT, and a relation variable (relvar) of declared type RT is a variable
+whose permitted values are relations of type RT. (In fact, these definitions are essentially the same
+as in Chapter 4—see RM Prescriptions 12 and 13—but the concept of a tuple or relation value being
+of a given type is now being given a considerably extended interpretation.)
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         374
+Part IV / Subtyping and Inheritance              Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+      We need to be a little more specific, however. In fact, what we really need is a model for
+tuple and relation variables, analogous to the model already described for scalar variables in
+Chapter 14. So let us examine this question. As usual, we consider tuples first.
+      Let tuple variable V be of declared type T, and let the heading of T have attributes A1, A2, ...,
+An. Then we can model V as a named set of named ordered triples of the form <DTi,MSTi,vi>,
+where:
+
+ ■    The name of the set is the name of the variable (V in the example).
+
+ ■    The name of each triple is the name of the corresponding attribute.
+
+ ■    DTi is the name of the declared type of attribute Ai.
+
+ ■    MSTi is the name of the most specific type—also known as the current most specific type—
+      for, or of, attribute Ai.
+
+ ■    vi is a value of most specific type MSTi—the current value for, or of, attribute Ai.
+
+       We use the notation DT(Ai), MST(Ai), v(Ai) to refer to the DTi, MSTi, vi components,
+respectively, of attribute Ai of this model of tuple variable V. Of course, it must always be the case
+that MST(Ai) is some subtype—not necessarily a proper subtype—of DT(Ai). Note also that
+MST(Ai) and v(Ai) change with time, in general; in other words, the phrase “most specific type of
+attribute Ai” refers to the most specific type of the value of Ai within the current value of tuple
+variable V, not to the most specific type that such Ai values are ever permitted to have. Note finally
+that MST(Ai) is in fact implied by vi.
+       We also use the notation DT(V), MST(V), v(V) to refer to the overall declared type, overall
+current most specific type, and overall current value (respectively), of tuple variable V. In other
+words (using Tutorial D notation):
+ ■    DT(V)     ≡       TUPLE { A1    DT1, A2    DT2, ..., An     DTn }
+
+ ■    MST(V)    ≡       TUPLE { A1 MST1, A2 MST2, ..., An MSTn }
+
+ ■     v(V)         ≡    TUPLE { A1     v1, A2      v2, ..., An      vn }
+
+DT(V)—and MST(V) and, for all i, DTi and MSTi—must not be empty.
+      Turning now to relation variables (i.e., relvars): Let relvar V be of declared type T, and let the
+heading of T have attributes A1, A2, ..., An. Let the body of the current value of V consist of m
+tuples; label those tuples (in some arbitrary sequence) “tuple 1,” “tuple 2,” ..., “tuple m.” Then we
+can model V as a named set of named ordered triples of the form <DTi,MSTi,vi>, where:
+
+ ■    The name of the set is the name of the relvar (V in the example).
+
+ ■    The name of each triple is the name of the corresponding attribute.
+
+ ■    DTi is the name of the declared type of attribute Ai.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         375
+Part IV / Subtyping and Inheritance              Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+ ■    MSTi is the name of the most specific type—also known as the current most specific type—
+      for, or of, attribute Ai (it is in fact the most specific common supertype of the most specific
+      types of the m values in vi—see below).
+
+ ■    vi is a sequence of m values (not necessarily all distinct), being the Ai values from tuple 1,
+      tuple 2, ..., tuple m (in that order); all of those values are of type MSTi.
+
+      We use the notation DT(Ai), MST(Ai), v(Ai) to refer to the DTi, MSTi, vi components,
+respectively, of attribute Ai of this model of relvar V. Of course, it must always be the case that
+MST(Ai) is some subtype—not necessarily a proper subtype—of DT(Ai). Note also that MST(Ai)
+and v(Ai) change with time, in general; in other words, the phrase “most specific type of attribute
+Ai” refers to the most specific common supertype of the most specific types of all of the Ai values
+within the current value of the relvar V, not to the most specific type that such Ai values are ever
+permitted to have. Note finally that MST(Ai) is in fact implied by vi.
+      We also use the notation DT(V), MST(V), v(V) to refer to the overall declared type, overall
+current most specific type, and overall current value (respectively), of relvar V. In other words
+(using Tutorial D notation):
+ ■      DT(V)      ≡   RELATION { A1       DT1, A2      DT2, ..., An       DTn }
+
+ ■      MST(V)     ≡   RELATION { A1 MST1, A2 MST2, ..., An MSTn }
+
+ ■      v(V)       ≡   RELATION { TUPLE { A1 v11, A2 v12, ..., An                     v1n },
+                                  TUPLE { A1 v21, A2 v22, ..., An                     v2n },
+                                  .................................
+                                  TUPLE { A1 vm1, A2 vm2, ..., An                      vmn } }
+
+Here, of course, the symbol vij denotes the value of attribute Aj in tuple i (i = 1, 2, ..., m; j = 1, 2, ...,
+n).
+
+
+SOME IMPLICATIONS OF IM PRESCRIPTIONS 21-25
+
+As noted earlier in this chapter, the definitions in the four sections immediately preceding this one
+together constitute the tuple and relation analogs of IM Prescriptions 8 and 9 (“Scalar Values and
+Variables with Inheritance”). Now we turn to some important implications of those definitions.
+
+Specialization by Constraint
+
+IM Prescription 10 (“Specialization by Constraint”) was formulated in Chapter 14 in terms of scalar
+types specifically—in part because tuple and relation types are not explicitly defined (at least in
+Tutorial D). If specialization by constraint is performed as prescribed for scalar types, however, it
+will happen “automatically” for tuple and relation types too, and nothing further needs to be said on
+the matter.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                               376
+Part IV / Subtyping and Inheritance           Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+Union and Dummy Types
+
+Remarks analogous to those in the preceding subsection apply to IM Prescription 20 (“Union,
+Dummy, and Maximal and Minimal Types”) also, and effectively dispose of that issue as well.
+However, it is worth pointing out explicitly that a tuple type that includes an attribute of some union
+type will itself necessarily be a union type also (and likewise for dummy types, mutatis mutandis).
+By contrast, RELATION {A omega}, for example, is not a union type—why not?—even though its
+sole attribute is of a union, and in fact dummy, type.
+
+Assignment
+
+IM Prescription 11 (“Assignment with Inheritance”) as discussed in Chapter 14 is sufficient to
+cover tuple and relation assignment too, provided we take the terms variable and expression in that
+prescription to refer to tuple or relation variables and expressions, as appropriate. Here is an
+example to illustrate tuple assignment:
+      VAR V1 TUPLE { P POINT, ER TUPLE { E ELLIPSE, R RECTANGLE } } ;
+      VAR V2 TUPLE { P POINT, ER TUPLE { E CIRCLE, R SQUARE     } } ;
+
+      V2 := TUPLE { P POINT (...),
+                    ER TUPLE { E CIRCLE (...), R SQUARE (...) } } ;
+      V1 := V2 ;
+
+      After this latter assignment:
+
+ ■    DT(V1) is unchanged (it is the tuple type specified in the definition of V1, of course).
+
+ ■    MST(V1) is the same as MST(V2) (it is in fact the tuple type specified in the definition of V2,
+      but only because that type happens to be the most specific type of the current value of V2).
+
+ ■    v(V1) is the same as v(V2).
+
+      Suppose now that V2 had been defined slightly differently:
+VAR V2 TUPLE { Q POINT, ER TUPLE { E CIRCLE, R SQUARE } } ;
+
+(the difference is that the point-valued attribute is now called Q instead of P). The assignment of
+V2 to V1 will now fail, because the declared type of V2 is no longer a subtype of that of V1 (this is
+a compile-time check). However, the following assignment is valid:
+      V1 := V2 RENAME ( Q AS P ) ;
+
+       It is only fair to point out a minor oddity here. Given scalar variables E and C of declared
+types ELLIPSE and CIRCLE, respectively, we can assign C to E. Yet if ET and CT are tuple
+variables, of tuple types TUPLE { E ELLIPSE } and TUPLE { C CIRCLE }, respectively, we
+cannot assign CT to ET; we have to assign CT RENAME (C AS E) to ET instead. The reason for
+this seeming anomaly is, of course, that tuple types have attributes, and the attribute names are part
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        377
+Part IV / Subtyping and Inheritance           Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+of the type; scalar types, by contrast, have no attributes, and so the question of the names of such
+attributes being somehow part of the type does not arise.
+       It should be clear that relational assignments obey the same general rules. We leave the
+provision of examples as an exercise for the reader.
+
+Equality Comparisons
+
+IM Prescription 12 (“Equality etc. with Inheritance”) as discussed in Chapters 14 and 15 is
+sufficient to cover tuple and relation equality too, provided we take the term expressions to refer to
+tuple or relation expressions, as appropriate. Here is an example to illustrate tuple comparison:
+      VAR V1 TUPLE { E ELLIPSE, R SQUARE } ;   /* tuple type “ES” */
+      VAR V2 TUPLE { E CIRCLE, R RECTANGLE } ; /* tuple type “CR” */
+
+      IF V1 = V2 THEN ... END IF ;
+
+       The comparison here is valid because tuple types ES and CR have a nonempty common
+subtype (tuple type CS). Further, it will give TRUE if (a) the current values of tuple variables V1
+and V2 are of tuple type CS and (b) those current values are equal.
+       Relation comparison is analogous, of course. Further elaboration seems unnecessary, except
+to note that the rules regarding comparison operators other than equality (“is a subset of,” etc.) can
+be derived in an obvious way from the rules for equality—though it is perhaps worth pointing out
+explicitly that relation ry can be a subset of relation rx only if MST(ry) is a subtype of MST(rx).
+       As for IM Prescription 13 (“Join etc. with Inheritance”), that prescription applies to tuple and
+relation types essentially unchanged. For example, if the declared type of attribute A in relation rx
+is tuple type ES and the declared type of attribute A in relation ry is tuple type CR, then the declared
+type of attribute A in the join of rx and ry is tuple type ER.
+
+TREAT
+
+IM Prescription 14 (“TREAT”) as previously defined is sufficient to cover tuple and relation
+TREAT too, provided we replace the reference in that prescription to an operator of the form
+      TREAT_AS_T ( X )
+
+by a reference to one of the more general form
+      TREAT_AS_SAME_TYPE_AS ( Y, X )
+(where X and Y are tuple or relation expressions, as applicable, and DT(Y) is T), and provided also
+that we interpret terms such as expression appropriately, of course. Consider the following
+example:
+      VAR V1 TUPLE { E ELLIPSE, R RECTANGLE } ;
+      VAR V2 TUPLE { E CIRCLE, R SQUARE     } ;
+
+      V2 := TUPLE { E CIRCLE (...), R SQUARE (...) } ;
+      V1 := V2 ;
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         378
+Part IV / Subtyping and Inheritance           Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+       After the latter assignment, the current value of V1 consists of a circle and a square, not an
+ellipse and a rectangle (speaking very loosely!). Suppose now that we want to assign that value
+back to V2. Then the following assignment will not work:
+      V2 := V1 ;                             /* COMPILE-TIME TYPE ERROR !!! */
+
+(it fails because the declared type of V1 is not a subtype of the declared type of V2). By contrast,
+the following will work:
+      V2 := TREAT_AS_SAME_TYPE_AS ( V2, V1 ) ;
+
+      The expression on the right side here is defined to have declared type the same as that of
+variable V2, so the compile-time type checking now succeeds. Then, at run time:
+
+ ■    If the current value of V1 is indeed of that type, then the expression yields a result, Z say,
+      with (a) MST(Z) equal to MST(V1), which is the same as DT(V2) in the example, and (b) v(Z)
+      equal to v(V1).
+
+ ■    However, if the current value of V1 is only of the (declared) type of V1, not of V2, then the
+      expression fails on a run-time type error.
+
+      In other words, the TREAT_AS_SAME_TYPE_AS operator as just discussed is indeed a
+tuple analog of TREAT as previously understood. (Note that we have to use the slightly more
+general “SAME TYPE AS” format because our tuple-type naming conventions do not lend
+themselves to the simpler format available in the scalar case.) Note: It is interesting to observe in
+passing that the particular TREAT invocation in the foregoing example is logically equivalent to the
+following tuple selector invocation:
+      TUPLE { TREAT_AS_CIRCLE ( E FROM V1 ) , TREAT_AS_SQUARE ( R FROM V1 ) }
+
+      Without going into further specifics, we hope it is clear that we can also support:
+
+ ■    A relation version of TREAT_AS_SAME_TYPE_AS
+
+ ■    Tuple/relation TREAT_AS_SAME_TYPE_AS pseudovariables
+
+ ■    Tuple/relation operators of the form
+      X TREAT_AS_SAME_TYPE_AS ( Y, A )
+
+      (where X is a tuple expression or a relational expression, A is a tuple- or relation-valued
+      attribute of the tuple or relation denoted by X, and Y is an expression such that DT(Y) is some
+      proper subtype of DT(A)).
+
+       Together, these operators constitute a complete set of tuple/relation counterparts to the scalar
+facilities discussed under IM Prescription 14 in Chapter 14.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         379
+Part IV / Subtyping and Inheritance            Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+Type Testing
+IM Prescription 15 (“Type Testing”) as discussed in Chapters 14 and 15 is sufficient to cover tuple
+and relation type testing too, provided we replace the reference in that prescription to an operator of
+the form
+       IS_T ( X )
+
+by a reference to one of the more general form
+       IS_SAME_TYPE_AS ( Y, X )
+
+(where X and Y are tuple or relation expressions, as applicable, and DT(Y) is T). Without going into
+further specifics, we hope it is clear that we can also support:
+
+ ■     Relation operators of the form
+       X : IS_SAME_TYPE_AS ( Y, A )
+
+       where X is a relation expression, A is an attribute of the relation denoted by X, and Y is an
+       expression such that DT(Y) is some subtype of DT(A)
+
+ ■     Type testing operators of the form
+       IS_SAME_MS_TYPE_AS ( Y, X )
+
+       (if desired)
+
+ ■     Relation operators of the form
+       X : IS_SAME_MS_TYPE_AS ( Y, A )
+
+       (if desired)
+
+       Together, these operators constitute a complete set of tuple/relation counterparts to the scalar
+facilities discussed under IM Prescription 15 in Chapters 14 and 15.
+
+
+EXERCISES
+
+16.1    How can a type be empty? List as many ways as you can think of.
+
+16.2    Give an example, different from the one given in the body of the chapter, of a tuple type TT
+        for which the corresponding minimal type TT_omega is nonempty.
+
+16.3    Let r be a relation. Explain the most specific type of r in your own words. Give some
+        examples.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            380
+Part IV / Subtyping and Inheritance           Chapter 16 / Inheritance with Tuple and Relation Types
+
+
+16.4   Devise some examples to illustrate the general rules arising from IM Prescription 11 that
+       govern relational assignment.
+
+16.5   Our inheritance model as it applies to tuple and relation types has been criticized on the
+       grounds that we cannot define, e.g., relation type RT2 to be an explicitly constrained subtype
+       of relation type RT1 (i.e., all tuple and relation subtyping is implicit, being based as it is on
+       the types of the pertinent attributes). Discuss.
+
+16.6   (Repeated from the body of the chapter) Why is RELATION {A omega} not a union type?
+
+16.7   As the final exercise in the body of the book, go through the prescriptions and proscriptions
+       of The Third Manifesto and demonstrate that the inheritance model as described in the past
+       few chapters is fully consistent with them. Note: You might want to pay special attention to
+       RM Prescriptions 1-5.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         381
+                                    APPENDIXES
+
+The appendixes that follow cover a mixed bag of topics:
+
+ ■   Appendix A presents an “almost minimal” relational algebra that we call A.
+
+ ■   Appendix B discusses a design issue or “dilemma” (?) that some have suggested might arise
+     in a system that conforms to the prescriptions—especially the type prescriptions—laid down
+     in The Third Manifesto.
+
+ ■   Appendix C presents some preliminary proposals for dealing with units (e.g., inches vs.
+     centimeters or degrees Celsius vs. degrees Fahrenheit).
+
+ ■   Appendix D takes a closer look at the question of what exactly a database is.
+
+ ■   Appendix E investigates the problem of view updating.
+
+ ■   Appendix F goes into more detail on one extremely important aspect of our inheritance
+     model, specialization by constraint.
+
+ ■   Appendix G elaborates on the question of structural inheritance and what is sometimes called
+     “the EXTENDS relationship.”
+
+ ■   Appendix H presents a detailed comparison of the SQL standard with the ideas of the
+     Manifesto.
+
+ ■   Appendix I presents a Tutorial D syntax summary.
+
+ ■   Finally, Appendix K provides an annotated list of references and suggestions for further
+     reading.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                     382

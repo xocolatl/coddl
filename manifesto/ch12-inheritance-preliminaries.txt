@@ -1,0 +1,818 @@
+                                             Chapter 12
+
+                                       Preliminaries
+
+As noted under OO Prescription 2 in Chapter 8, there is currently no consensus (at least in the data
+management literature) on a formal, rigorous, and abstract type inheritance model, and we have
+therefore been more or less forced to develop such a model of our own. In this part of the book, we
+describe that model in depth.
+       We should say immediately that we would like this effort on our part not to be seen as just an
+academic exercise. Rather, we would like our proposal to be considered by the community at large
+as a serious contender for filling the gap alluded to above (i.e., as a candidate for the role that is
+“formal, rigorous, and abstract” and can be generally agreed upon by that “community at large”).
+We offer it here in that spirit.
+       We begin by raising the question of why this topic might be worth investigating in the first
+place. There are at least two possible answers to this question:
+
+ ■    First, the ideas of subtyping and inheritance do seem to arise naturally in the real world. That
+      is, it is not at all unusual to encounter situations in which (more or less by definition) all
+      values of a given type have certain properties in common, while some of those values have
+      additional properties of their own. For example, all ellipses have an area, while some
+      ellipses—namely, those that happen to be circles—have a radius as well; thus, we might say
+      that type ELLIPSE has a subtype CIRCLE, and further that the subtype inherits the property
+      of having an area from its supertype ELLIPSE (but circles also have certain properties of their
+      own that ellipses in general do not). Thus, subtyping and inheritance look as if they might be
+      useful tools for “modeling reality.”
+
+ ■    Second, if we can recognize such general patterns—patterns of subtyping and inheritance, that
+      is—and build intelligence regarding them into our application and system software, we might
+      be able to achieve certain practical economies. For example, a program that works for
+      ellipses might work for circles too, even if it was originally written with no thought for circles
+      at all (perhaps type CIRCLE had not even been defined at the time the program was written).
+
+       We remark that much of the existing literature seems to be concerned more with the second of
+these points than it is with the first—that is, it seems to be principally interested in inheritance as a
+mechanism for designing, building, and using (and reusing) programs. Our own focus, by contrast,
+is more on the first point than the second; we are interested in inheritance more as a conceptual tool
+for designing, building, and using (and reusing) data structures. In other words, we are seeking an
+inheritance model that can be used to “model reality” (or, at least, certain aspects of reality), in the
+same kind of way that the relational model can be used to model certain aspects of reality. To put it
+yet another way, we are interested as always in the possibility of constructing an abstract model,
+not in matters of implementation merely. (As in earlier chapters, however, the discussions and
+explanations in what follows do sometimes touch on implementation matters for purposes of
+clarification.)
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          259
+Part IV / Subtyping and Inheritance                                                    Chapter 12 / Preliminaries
+
+
+       Caveat: Before going any further, we should warn you that this whole topic is considerably
+more complex than you might expect. The trouble is, although “the basic idea of inheritance is
+quite simple” [131], the devil is in the details: You have to study the topic in its entirety (and, we
+might add, extremely closely and carefully) in order to come properly to grips with it—in particular,
+to appreciate the fact that it is not at all as straightforward as it might seem at first sight. All of
+which goes some way, perhaps, to justify the possibly rather surprising length of this part of the
+book (especially Chapter 14).
+       There is another point we need to warn you of, too. The fact is, there is not even consensus in
+the literature on the meaning of such basic terms as subtype and inheritance, let alone on an entire
+inheritance model. Here also, therefore, we have been more or less forced to introduce our own
+definitions; and while we have naturally done our best to define terms and concepts in a manner that
+makes sense to us, you need to be aware that different definitions can be found elsewhere.1 We
+defend our definitions—and our entire model, come to that—on the grounds that, among other
+things, they are mostly just a logical consequence of our type theory as described in earlier parts of
+this book. In other words, we think it would be inconsistent to agree with the Manifesto’s approach
+to types in general but not to agree with the proposed inheritance model. But you must be the judge
+of this claim, of course.
+       One last introductory point: The subject of type inheritance has a lot to do with data in
+general, of course, but not much to do with persistent or database data in particular (there is little or
+nothing about inheritance that applies to persistent data only). For simplicity, therefore—and
+despite our remarks in Chapter 1 regarding the general focus in this book on database management
+specifically—most of the examples in this part of the book are expressed in terms of local data
+instead of database data.
+
+
+TOWARD A TYPE INHERITANCE MODEL
+
+To repeat, we use the term inheritance to refer to that phenomenon according to which we can
+sensibly say, for example, that every circle is an ellipse, and hence that all properties that apply to
+ellipses in general apply to—i.e., are inherited by—circles in particular. For example, every ellipse
+has an area, and therefore every circle has an area too. More formally, we say we have two types,
+ELLIPSE and CIRCLE, such that ELLIPSE is a supertype of CIRCLE and CIRCLE is a subtype
+of ELLIPSE; we also say, somewhat loosely, that all properties that apply to the supertype
+necessarily apply to the subtype as well. Of course, the converse is not true: The subtype will have
+properties of its own that do not apply to the supertype (again speaking somewhat loosely). For
+example, circles have a radius, but ellipses in general do not.
+       Incidentally, a point arises here that beginners sometimes find a little confusing: namely, that
+a subtype has a subset of the values but a superset of the properties. For example, the subtype
+CIRCLE contains a subset of the values of the supertype ELLIPSE, but an individual circle has all
+of the properties of an ellipse and more besides. Note: For exactly such reasons, some writers
+prefer to avoid the “sub and super” terminology and talk of descendants and ancestors instead (see,
+
+1
+  In fact, it has been suggested—see references [2], [19], [118], and [137], among others—that there are many kinds of
+inheritance, and hence many sets of concepts and many definitions of terms, that are all distinct from one another and
+yet overlap in various ways.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                       260
+Part IV / Subtyping and Inheritance                                            Chapter 12 / Preliminaries
+
+
+e.g, reference [100]); however, we think this latter nomenclature has problems of its own, and
+therefore choose to stay (mostly) with the “sub and super” terminology.
+       By the way, it should be understood that constraints are properties too, of a kind, and are
+therefore inherited too—where by constraints we mean type constraints specifically, a convention
+we will adhere to throughout this part of the book (barring explicit statements to the contrary).
+Thus, e.g., any constraint that applies to ellipses in general also applies, necessarily, to circles in
+particular (for if it did not, then some circles would not be ellipses). For example, if ellipses are
+subject to the constraint that the length of their major semiaxis a is greater than or equal to that of
+their minor semiaxis b, then this same constraint must be satisfied by circles also. (For circles, of
+course, a and b coincide in the radius r, and this particular constraint is therefore satisfied trivially.)
+       Now, it is important in this context—as in all others!—to distinguish very carefully between
+values and variables. When we say that every circle is an ellipse, what we mean, more precisely, is
+that every circle value is an ellipse value. We certainly do not mean that every circle variable is an
+ellipse variable: i.e., that a variable of declared type CIRCLE is a variable of declared type
+ELLIPSE, and hence can contain a value that is an ellipse and not a circle. In other words, and
+speaking somewhat loosely once again, inheritance applies to values, not variables (although
+naturally there are implications for variables too, as will be seen). We conjecture that much of the
+confusion we observe in this field—and there is a lot of it—is due precisely to a failure to
+distinguish properly between values and variables.
+
+
+SINGLE VS. MULTIPLE INHERITANCE
+
+As explained in Chapter 8, there are two broad “flavors” of type inheritance, single and multiple.
+Loosely speaking, single inheritance means each subtype has just one supertype and inherits
+properties from just that one type, while multiple inheritance means a subtype can have any number
+of supertypes and inherits properties from all of them. Obviously, the former is a special case of the
+latter.
+        Now, we do believe that support for multiple inheritance is desirable; in fact, as noted under
+OO Prescription 2 in Chapter 8, we believe that if inheritance is supported at all, it must be multiple.
+Despite this fact, our strategy in investigating this topic has been (a) to construct a sound model of
+single inheritance first, and then (b) to extend that model to incorporate multiple inheritance
+subsequently. Our reason for adopting this perhaps rather conservative approach is that even single
+inheritance raises numerous tricky questions; it therefore seemed reasonable to try to find good
+answers to those questions first, before having to concern ourselves too much about the additional
+complexities of multiple inheritance. Of course, we did try not to build anything into our model for
+single inheritance that might have precluded later extensions to deal with multiple inheritance, and
+it is a measure of our cautious optimism regarding our single-inheritance model that it does seem (at
+least to us) to extend gracefully to the multiple-inheritance case.
+        Be that as it may, the structure of Chapters 14 and 15 reflects this history:
+
+ ■    Chapter 14 discusses and illustrates a series of detailed prescriptions (“IM Prescriptions”)
+      that together constitute a basis for the kind of robust inheritance model we are seeking, at least
+      for the case of single inheritance only.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            261
+Part IV / Subtyping and Inheritance                                                        Chapter 12 / Preliminaries
+
+
+    ■    Chapter 15 then goes on to extend the model discussed in Chapter 14 to incorporate multiple
+         inheritance as well.
+
+
+SCALARS, TUPLES, AND RELATIONS
+
+We said earlier that inheritance applies to values, not variables. We were, however, making a tacit
+assumption at that point that the term values meant scalar values specifically. As explained under
+RM Prescription 1 in Chapter 6, of course, such values can have an arbitrarily complex internal
+structure or physical representation, but that internal structure is part of the implementation, not the
+model, and it is hidden from the user. Thus, for example, ellipses and circles can have a
+complicated internal structure and yet still be regarded as scalar values (as we already know). More
+to the point, inheritance has implications for nonscalar values—in particular, tuple and relation
+values—too, since such nonscalar values are ultimately built out of scalar values. But we obviously
+cannot even begin to talk sensibly about those implications until we have pinned down what
+subtyping and inheritance mean for scalar values specifically.
+       Throughout Chapters 14 and 15, therefore, we take the unqualified term value to mean
+a scalar value specifically. By the same token, throughout those two chapters we take the
+unqualified terms type, subtype, and supertype to mean scalar types, subtypes, and supertypes
+specifically, and we take the unqualified terms variable, operator, expression, and result to mean
+scalar variables, operators, expressions, and results specifically.1 Note, however, that formal
+statements in those chapters—the IM Prescriptions themselves in particular—are deliberately
+worded in such a way as to allow, e.g., the term value to be taken to mean a scalar value or a tuple
+value or a relation value, as the context demands. They are also deliberately worded in such a way
+as to be applicable to multiple inheritance as well as single, barring explicit statements to the
+contrary.
+       To repeat, scalar values have no user-visible structure. But they do have associated operators,
+of course, and it follows that when we talk as we did earlier of inheritance of “properties,” what we
+mean, primarily, is inheritance of operators. (More precisely, we mean inheritance of read-only
+operators specifically, thanks to our recognition of the fact that inheritance applies to values, not
+variables—though once again, of course, there are implications for variables too.) For example,
+when we say that every circle has an area because every ellipse has an area, what we mean is that
+subtype CIRCLE inherits a (read-only) operator, AREA say, from supertype ELLIPSE. In other
+words, we are interested in what is sometimes called behavioral inheritance.
+       Note: Much of the literature contrasts behavioral inheritance with structural inheritance.
+This latter term refers to inheritance of physical representations;2 as such, it is properly an
+implementation matter, not part of the model. Of course, we certainly do not preclude such
+inheritance, but, to repeat, it is not part of the model. We observe, however, that much of the
+
+1
+    By operators here we really mean read-only operators, since update operators have no type.
+2
+  There are those who would dispute this claim (see the brief explanation of “the EXTENDS relationship” in the section
+“Concluding Remarks” at the end of the chapter). We stand by it, however, so long as the types under discussion are
+scalar types specifically. The true state of affairs is too complicated to deal with adequately here (part of the problem is
+precisely that the literature does not always distinguish properly between scalar and nonscalar types). See Appendix G
+for further discussion.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                            262
+Part IV / Subtyping and Inheritance                                                     Chapter 12 / Preliminaries
+
+
+literature, especially in the object world, does tend to assume that inheritance means—or at least
+includes—inheritance of physical representations; it further tends to assume that some operators, at
+least, depend on those physical representations. We regard this state of affairs as evidence of
+confusion over the distinction between model and implementation, and choose not to discuss it
+further here.
+       Turning now to tuple and relation types: As noted earlier, the notions of scalar subtyping and
+inheritance do have implications for tuples and relations, because tuples and relations are ultimately
+constructed out of scalar components. For example, a relation with an attribute of type ELLIPSE
+might include some tuples in which the value corresponding to that attribute is specifically a circle,
+not “just an ellipse.” In Chapter 16, we consider the question of what is involved in extending our
+inheritance model for scalar types (for both single and multiple inheritance, as discussed in Chapters
+14 and 15) to take tuple and relation types into account as well.
+
+
+THE RUNNING EXAMPLE
+
+We now introduce a running example that will serve as a basis for much of the discussion in
+subsequent chapters (and in Appendixes F and G as well). The example deliberately involves scalar
+types only and single inheritance only; as already indicated, our model does include support for
+nonscalar types and multiple inheritance, but we feel that scalar types and single inheritance suffice
+to illustrate most of the points we need to make at this stage. If we do need to say something that
+either (a) applies to scalar and not nonscalar types (or the other way around), or (b) applies to single
+and not multiple inheritance (or the other way around), we will clearly indicate that such is the case.
+       The running example is based on a collection of geometric types: PLANE_FIGURE,
+ELLIPSE, POLYGON, and so on (refer to Fig. 12.1). In accordance with RM Prescription 1, each
+of those types is a named set of values; for example, there is a set of values named ELLIPSE, and
+every value in that set is some specific ellipse.1 The types are arranged into what is called a type
+hierarchy.
+╔═════════════════════════════════════════════════════════════════╗
+║                         ┌──────────────┐                        ║
+║                         │ PLANE_FIGURE │                        ║
+║                         └──────┬───────┘                        ║
+║                 ───────────────┴───────────────                 ║
+║          ┌─────────────┐               ┌─────────────┐          ║
+║          │   ELLIPSE   │               │   POLYGON   │          ║
+║          └─────────────┘               └─────────────┘          ║
+║          ┌─────────────┐               ┌─────────────┐          ║
+║          │   CIRCLE    │               │ RECTANGLE │            ║
+║          └─────────────┘               └─────────────┘          ║
+║                                        ┌─────────────┐          ║
+║                                        │   SQUARE    │          ║
+║                                        └─────────────┘          ║
+╚═════════════════════════════════════════════════════════════════╝
+Fig. 12.1: Example of a type hierarchy
+
+1
+  More precisely, it is an ellipse at some specific position in two-dimensional euclidean space. We assume for the sake
+of the example that geometric figures that occupy different positions in that space but are otherwise identical are
+distinct.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                        263
+Part IV / Subtyping and Inheritance                                                     Chapter 12 / Preliminaries
+
+
+      We should say immediately that our choice of a slightly academic example is deliberate.
+While it might be objected that geometric figures are not the kind of thing we expect to find in a
+typical database, in fact there are several advantages to such an example, the main one being that
+the semantics of the various types involved are or should be crystal clear to everyone. We can
+therefore avoid the kind of unproductive debates that tend to arise when “fuzzier” examples are
+chosen. For instance, suppose we had chosen an example involving a type BOOK. Are two copies
+of the same book two instances of that type or only one? What if the two copies are of different
+editions? What if one is a translation of the other? Is a journal a book? Is a magazine? And so on.
+      We also observe that type hierarchies as such will certainly be inadequate when we get to
+multiple inheritance (when we will have to replace them by more general type graphs). However,
+they are sufficient for the purposes of the present chapter.
+      To revert to Fig. 12.1: The type hierarchy in that figure should be more or less self-
+explanatory, of course; it shows, for example, that type RECTANGLE is a subtype of supertype
+POLYGON, which means that all rectangles are polygons, but the converse is not true (some
+polygons are not rectangles). As a consequence, all properties that apply to polygons in general
+apply to—i.e., are inherited by—rectangles in particular, but the converse is not true (rectangles
+have properties of their own that do not apply to polygons in general). Note: Recall that
+“properties” here essentially means operators and constraints; thus, operators and constraints that
+apply to polygons apply to rectangles too (because a rectangle is a polygon), but some operators and
+constraints that apply to rectangles do not apply to mere polygons.
+      Now, Tutorial D as defined in Chapter 5 did not include any support for inheritance.
+However, we do need a way of telling the system which types are subtypes of which (in other
+words, a way of defining type hierarchies). So let us extend Tutorial D to support a new syntactic
+category, <user scalar nonroot type def>, as an alternative form of <user scalar type def> (the
+existing form, as you will recall from Chapter 5, being <user scalar root type def>). A <user
+scalar nonroot type def> in turn includes an <is def> (“IS definition”), thereby enabling us to write
+type definitions like these:
+       TYPE ELLIPSE
+            IS { PLANE_FIGURE POSSREP { A LENGTH, B LENGTH, CTR POINT
+                                        CONSTRAINT A  B } } ;
+
+       TYPE CIRCLE
+            IS { ELLIPSE CONSTRAINT THE_A ( ELLIPSE ) = THE_B ( ELLIPSE )
+            POSSREP { R = THE_A ( ELLIPSE ) , CTR = THE_CTR ( ELLIPSE ) } } ;
+
+       Now the system knows that CIRCLE is a subtype of ELLIPSE (loosely, every circle “is a”
+ellipse), and hence that operators and constraints that apply to ellipses in general apply to circles in
+particular.
+       Let us take a closer look at these type definitions. First of all, we assume as we did in Chapter
+6 that ellipses are always oriented such that their major axis is horizontal and their minor axis
+vertical. Thus, ellipses might indeed have a possrep1 consisting of their semiaxes a and b (and their
+
+
+
+1
+  We remind you that we take the unqualified term possible representation, or the abbreviated form possrep, to refer to
+a declared possrep specifically, barring explicit statements to the contrary.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                        264
+Part IV / Subtyping and Inheritance                                           Chapter 12 / Preliminaries
+
+
+center). By contrast, circles might have a possrep consisting of their radius r (and their center).
+Observe now that:
+
+ ■    For type ELLIPSE, we have specified that every ellipse “is a” plane figure. We have also
+      specified the {a,b,ctr} possrep in the usual way, with what in Chapter 5 we called a <possrep
+      constraint> to the effect that a  b (as in Chapter 6).
+
+ ■    For type CIRCLE, by contrast, we have specified that every circle “is a” ellipse. We have
+      also specified an additional constraint to the effect that a = b. (That constraint is not,
+      however, a possrep constraint; in fact, type CIRCLE has no possrep constraint.) Along with
+      that constraint, moreover, we have specified the {r,ctr} possrep for circles, and we have
+      indicated how that possrep is derived from that for ellipses. Observe the use of the supertype
+      name ELLIPSE within the constraint—also within the derived possrep definition—to denote
+      an arbitrary value of the supertype in question (i.e., an arbitrary ellipse).
+
+       Note, therefore, that the type constraint for a given type is specified by means of either a
+<possrep def> or an <is def>, depending on which is included in the type definition. (Note too that
+the first of these alternatives is the only one available in the absence of inheritance support.)
+
+A Note on Possible Representations
+
+It should be clear that every possrep for ellipses is necessarily, albeit implicitly, a possrep for circles
+as well, because circles are ellipses. (Of course, the converse is not true—a possrep for circles is
+not necessarily a possrep for ellipses.) Thus, we might regard possreps as further “properties” that
+are inherited by subtypes from supertypes. However, we do not regard that inherited possrep as a
+declared one in the sense of RM Prescription 4, because to do so would lead to a contradiction
+between IM Prescription 19, q.v., and RM Prescription 5. Thus, to say that type CIRCLE inherits a
+possrep from type ELLIPSE is only a façon de parler—it does not carry any formal weight.
+       To pursue the point a moment longer: Let type T' be a subtype of type T. Then it will often
+be the case in practice that T' does have a possrep—a declared possrep, that is—that is similar
+(possibly identical) to some possrep for T. This fact suggests that it might be convenient in practice
+to have some syntactic shorthand for declaring a possrep for T', perhaps along the lines of “same as
+possrep PR for T but subtracting component(s) x and adding component(s) y.” However, we see
+this issue as a purely syntactic one and secondary to our main purpose.
+       By the way, it is certainly possible for T and T' to have possreps that differ from each other
+quite markedly. For example, let T and T' be PENTAGON and REGULAR_PENTAGON,
+respectively. Then T could have a possrep consisting of five points (the five vertices), while T' has
+one consisting of just two points (the center and one vertex). However, it is always the case—in
+fact, it must always be the case—that each possrep for the subtype is expressible in terms of, and
+thus derivable from, each possrep for the supertype.
+
+Terminology
+
+We now introduce a number of further terms and concepts, most of them fairly self-explanatory (in
+any case, they are all amplified in later chapters):
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            265
+Part IV / Subtyping and Inheritance                                          Chapter 12 / Preliminaries
+
+
+ ■    A supertype of a supertype is itself a supertype (e.g., POLYGON is a supertype of SQUARE).
+
+ ■    Every type is a supertype of itself (e.g., ELLIPSE is a supertype of ELLIPSE).
+
+ ■    If T is a supertype of T' and T and T' are distinct, then T is a proper supertype of T' (e.g.,
+      POLYGON is a proper supertype of SQUARE).
+
+Analogous remarks apply to subtypes, of course. Thus:
+ ■    A subtype of a subtype is itself a subtype (e.g., SQUARE is a subtype of POLYGON).
+
+ ■    Every type is a subtype of itself (e.g., ELLIPSE is a subtype of ELLIPSE).
+
+ ■    If T' is a subtype of T and T' and T are distinct, then T' is a proper subtype of T (e.g.,
+      SQUARE is a proper subtype of POLYGON).
+
+Moreover:
+
+ ■    If T is a proper supertype of T' and there is no type that is both a proper subtype of T and a
+      proper supertype of T', then T is an immediate supertype of T' and T' is an immediate
+      subtype of T (e.g., RECTANGLE is an immediate supertype of SQUARE, and SQUARE is
+      an immediate subtype of RECTANGLE).
+
+ ■    A root type is a type with no proper supertype (e.g., PLANE_FIGURE is a root type); a leaf
+      type is a type with no proper subtype (e.g., SQUARE is a leaf type). Note: Strictly speaking,
+      a given type can be said to be a root or leaf type only in the context of some specific type
+      hierarchy or type graph. For example, type RECTANGLE is a leaf type in the hierarchy that
+      results from by deleting type SQUARE from the hierarchy of Fig. 12.1. Informally, however,
+      we usually take the context as understood.
+
+      Incidentally, we can now give a precise characterization of single inheritance: Single
+inheritance means, precisely, that every proper subtype has exactly one immediate supertype.
+
+The Disjointness Assumption
+
+It is convenient for tutorial purposes to adopt the following simplifying assumption:
+
+ ■    If types T1 and T2 are such that neither is a subtype of the other, then they are disjoint—i.e.,
+      no value is of both type T1 and type T2. For example, no value is both an ellipse and a
+      polygon.
+
+      Now, this assumption, which we call the disjointness assumption, is certainly valid as long as
+we limit our attention to single inheritance only; in that context, in fact, it is implied (perhaps not
+very obviously) by IM Prescription 8, q.v. It will cease to be valid when we get to multiple
+inheritance; as already noted, however, we are emphasizing single inheritance in this preliminary
+chapter, and so we will take it as valid until further notice. Here are some immediate consequences
+of the assumption:
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            266
+Part IV / Subtyping and Inheritance                                                  Chapter 12 / Preliminaries
+
+
+    ■   Distinct root types are disjoint, and hence distinct type hierarchies are disjoint also (no value
+        is of two distinct types T1 and T2 such that T1 and T2 are part of two distinct type
+        hierarchies).
+
+    ■   Distinct subtypes of the same supertype are disjoint unless one is a subtype of the other. In
+        particular, distinct leaf types are disjoint.
+
+    ■   (Important!) Every value has exactly one most specific type. For example, a given value
+        might be “just an ellipse” and not a circle, meaning its most specific type is ELLIPSE (in the
+        real world, some ellipses are not circles).
+
+    ■   In fact, following on from the previous point, if value v is of most specific type T, then the set
+        of types possessed by v is, precisely, the set consisting of all supertypes of T (a set that
+        includes T itself, of course). In other words, v is of every type that is a supertype of T and is
+        of no other type.
+
+       One reason the disjointness assumption is desirable is that it avoids certain ambiguities that
+might otherwise occur. For suppose, contrariwise, that some value v could be of two distinct types
+T1 and T2, neither of which was a subtype of the other. Suppose further that an operator named Op
+has been defined for type T1 and another operator with the same name Op has been defined for type
+T2.1 Then an invocation of Op with argument v would be ambiguous.
+       We note in passing that analogous ambiguities do not arise over constraints. For if type T1 is
+subject to constraint C1 and type T2 is subject to constraint C2, and if constraints C1 and C2
+conflict, then it simply means that types T1 and T2 are disjoint (because no value v can possibly
+satisfy both C1 and C2). Loosely speaking, in fact, it is necessary and sufficient that C1 and C2
+conflict in order for T1 and T2 to be disjoint.
+       Finally, we have said that the disjointness assumption applies to single inheritance only;
+however, there are situations even with multiple inheritance in which certain types are required to
+be disjoint. Unfortunately, it is always possible that the type designer could make a mistake and
+specify types that are supposed to be disjoint but in fact are not. For example, the designer might
+specify types RECTANGLE and RHOMBUS as subtypes of type PARALLELOGRAM and forget
+that some parallelograms are both a rectangle and a rhombus. The consequences of such violations
+will be unpredictable, in general. Although this fact need not concern us from the point of view of
+the model—a violation is simply a violation, and there is no need within the model to spell out what
+the consequences might be—in practice, we would hope that some kind of mechanical aid would be
+available to help the designer avoid such errors.
+
+Substitutability
+
+By definition, if T' is a subtype of T, then all operators that apply to values of type T apply to values
+of type T' too. For example, if AREA(e) is valid, where e is an ellipse, then AREA(c), where c is a
+
+
+1
+  In other words, Op is polymorphic. What is more, the kind of polymorphism involved could be either overloading or
+inclusion polymorphism. See IM Prescription 9 in Chapter 14 for further explanation.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                    267
+Part IV / Subtyping and Inheritance                                         Chapter 12 / Preliminaries
+
+
+circle, must be valid too. In other words, wherever the system expects a value of type ELLIPSE, we
+can always substitute a value of type CIRCLE (because, to say it again, circles are ellipses).
+       Now, this matter of substitutability is in many ways the whole point of inheritance. We
+claimed earlier that one reason for wanting to support inheritance in the first place is that (for
+example) a program that works for ellipses might work for circles too, even if it was originally
+written with no thought for circles. Well, it should be clear now that it is substitutability that makes
+such an objective attainable.
+       Observe, incidentally, that there is another logical difference here that we need to be very
+careful over: viz., that between the parameters in terms of which an operator is defined, with their
+declared types, and the corresponding arguments to some invocation of that operator, with their
+actual—i.e., most specific—types. In the AREA example, for instance, the operator is presumably
+defined in terms of a parameter of declared type ELLIPSE, but the most specific type of the
+argument c in the invocation AREA(c) is CIRCLE. (Indeed, the declared type of the expression
+denoting that argument might be CIRCLE too.)
+
+A Note on Physical Representations
+
+Although we are primarily concerned with a model of inheritance, not with implementation issues,
+there are certain implementation issues that do need to be understood if the overall concept of
+inheritance is to be properly understood in turn—and now we come to one such (which will turn out
+to be important at several points in subsequent chapters):
+
+ ■    The fact that T' is a proper subtype of T does not imply that the physical representation of T'
+      values is the same as that of T values.
+
+      For example, ellipses and circles might be physically represented by their center and semiaxes
+and their center and radius, respectively (though we know from Chapter 3 that there is no need, in
+general, for a physical representation to be the same as any declared possrep). As another example,
+it might be that the built-in type INTEGER is a proper subtype of the built-in type RATIONAL, but
+they are implemented internally in 32-bit two’s-complement notation and IEEE 64-bit floating-point
+notation, respectively. Note: In fact, we already know from Chapters 1 and 6 that there is no
+logical reason why all values of the same type need have the same physical representation. For
+example, some points might be physically represented in cartesian coordinates and others in polar;
+some temperatures might be physically represented in Celsius and others in Fahrenheit; some
+integers might be physically represented in decimal and others in binary; and so on.
+
+More on Type Hierarchies
+
+Here now is a precise definition of the term type hierarchy. Basically, a type hierarchy TH is a
+special kind of graph. The graph consists of a finite set N of nodes and a finite set DA of directed
+arcs and satisfies the following properties:
+
+ a.   TH is empty if N is empty (in which case DA is necessarily empty too), otherwise it is
+      nonempty.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         268
+Part IV / Subtyping and Inheritance                                           Chapter 12 / Preliminaries
+
+
+ b.   Each node is given the name of a type. No two nodes have the same name.
+
+ c.   Each arc connects exactly two distinct nodes and represents a directed path from one of those
+      two nodes (the parent) to the other (the child). There is a directed arc from parent T to child
+      T' if and only if type T is an immediate supertype of type T'.
+
+ d.   Each parent is connected to one or more children. Each child is connected to exactly one
+      parent.
+
+ e.   Node Y is a descendant of node X if it is a child of X or a child of a descendant of X. No node
+      is a descendant of itself. (Also, node X is an ancestor of node Y if and only if node Y is a
+      descendant of node X. No node is an ancestor of itself.)
+
+ f.   A node connected to no parent is a root node. Types corresponding to root nodes are called
+      root types. Note: If TH is nonempty, it has exactly one root node, otherwise it has no root
+      node at all.
+
+ g.   A node connected to no children is a leaf node. Types corresponding to leaf nodes are called
+      leaf types.
+
+       We remark that type hierarchies per se are not part of our inheritance model as such—they are
+merely an intuitively convenient way of depicting supertype/subtype relationships, which are.
+Indeed, type hierarchies play a role in our inheritance model analogous to that played by tables in
+the relational model: Tables per se are not part of the relational model as such, they are merely an
+intuitively convenient way of depicting relations, which are.
+       We also remark that type hierarchies are known by a variety of different names, the following
+among them:
+
+ ■    Class hierarchies (on the grounds that types are sometimes called classes, especially in the
+      object world)
+
+ ■    Generalization hierarchies (on the grounds that, e.g., an ellipse is a generalization of a circle)
+
+ ■    Specialization hierarchies (on the grounds that, e.g., a circle is a specialization of an ellipse)
+
+ ■    Inheritance hierarchies (on the grounds that, e.g., circles inherit properties from ellipses)
+
+ ■    Is-a hierarchies (on the grounds that, e.g., every circle “is a” ellipse)
+
+and so on (this is not an exhaustive list).
+
+Syntax
+
+Here for purposes of reference is a summary (covering both single and multiple inheritance) of our
+proposal for extending the Tutorial D syntax for <user scalar type def>. Detailed explanations are
+given in Chapters 14 and 15. Note: The syntax of <is def>, q.v., has changed slightly from that
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                           269
+Part IV / Subtyping and Inheritance                                       Chapter 12 / Preliminaries
+
+
+given in reference [83]; to be specific, everything following the keyword IS is now enclosed in
+braces.
+       <user scalar type def>
+            ::=   <user scalar root type def>
+                | <user scalar nonroot type def>
+
+       <user scalar root type def>
+            ::=   TYPE <user scalar type name>
+                  [ ORDINAL ] [ UNION ] <possrep def list>
+
+     UNION must be specified if and only if the root type being defined is a union type. The
+<possrep def list> must be empty if and only if the root type being defined is a dummy type. Note:
+Every dummy type is necessarily a union type. A type that is not a dummy type is a regular type.
+      <user scalar nonroot type def>
+           ::=   TYPE <user scalar type name> [ ORDINAL ] [ UNION ] <is def>
+
+      UNION must be specified if and only if the nonroot type being defined is a union type.
+      <is def>
+           ::=     <single inheritance is def>
+                 | <multiple inheritance is def>
+      <single inheritance is def>
+           ::=   IS { <scalar type name> <possrep or specialization details> }
+      <possrep or specialization details>
+           ::=   <possrep def list>
+               | <additional constraint def> [ <derived possrep def list> ]
+
+      Let the immediate supertype of the nonroot type being defined be IST. The <possrep def
+list> must be specified if IST is a dummy type; however, it must be empty if (and only if) the
+nonroot type being defined is a dummy type. The <additional constraint def> must be specified if
+IST is not a dummy type. The <derived possrep def list> must be specified (and must not be
+empty) unless IST is either a dummy type or a system-defined type without a possrep.
+      <additional constraint def>
+           ::=   CONSTRAINT <bool exp>
+
+      The <bool exp> must not mention any variables, but the name of the immediate supertype of
+the nonroot type being defined can (and in fact must) be used to denote an arbitrary value of the
+supertype in question.
+      <derived possrep def>
+           ::=   POSSREP [ <possrep name> ]
+                 { <derived possrep component def commalist> }
+      <derived possrep component def>
+           ::=   <possrep component name> = <exp>
+      The <exp> must not mention any variables, but the name of an immediate supertype of the
+nonroot type being defined can (and in fact must) be used to denote an arbitrary value of the
+supertype in question.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       270
+Part IV / Subtyping and Inheritance                                             Chapter 12 / Preliminaries
+
+
+      <multiple inheritance is def>
+           ::=   IS { <scalar type name commalist> <derived possrep def list> }
+
+      The <scalar type name commalist> must contain at least two <scalar type name>s. The
+<derived possrep def list> must be empty if and only if the nonroot type being defined is a dummy
+type.
+
+Recursively Defined Types and Headings
+
+We noted in Chapter 6 that (a) the concept of a recursively defined type and (b) the concept of a
+recursively defined heading both require some extension if type inheritance is supported. Just to
+remind you, Chapter 6 said:
+
+ ■    Scalar type T is recursively defined if there exists some n (n > 0) such that T is a member of a
+      certain set S(n), where sets S(1), S(2), etc., form a certain sequence of sets of types.
+
+ ■    Likewise, heading H is recursively defined if there exists some n (n > 0) such that TUPLE H
+      or RELATION H is a member of a certain set S(n), where again sets S(1), S(2), etc., form a
+      certain sequence of sets of types.
+
+      The required extension is as follows: In the first bullet item, replace “such that T is a
+member” by “such that some subtype or supertype of T is a member”; in the second, replace “such
+that TUPLE H or RELATION H is a member” by “such that some subtype or supertype of
+TUPLE H or RELATION H is a member” (see Chapter 16). For the purposes of the present book,
+however, we continue to follow The Principle of Cautious Design [46] and assume, where it makes
+any difference, that recursively defined types and headings are not permitted.
+
+Practical Problems
+
+In closing this section, it would be remiss of us not to point out that type inheritance does give rise
+to some thorny practical problems. Given the type hierarchy of Fig. 12.1, for example, what should
+happen if we try to drop type ELLIPSE? Should there be a way to “alter” or rename type ELLIPSE
+without dropping it? Should we be able to introduce a new type as an immediate supertype of an
+existing type? What if that existing type is system defined? And so on. Such questions must
+clearly be answered in any real implementation, but we do not regard them as issues that affect the
+model per se, and we have little to say about them in this book.
+
+CONCLUDING REMARKS
+
+We have presented an introduction to some of the basic ideas of our inheritance model. As noted
+earlier in this chapter, however, many other approaches to inheritance are discussed in the literature.
+We briefly mention two significant ones here:
+
+ ■    Reference [17] among others discusses what it calls the EXTENDS relationship, which it
+      defines as “a single inheritance relationship between two classes whereby the subordinate
+      class inherits all of the [structure, also called state] and all of the behavior of the class that it
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                              271
+Part IV / Subtyping and Inheritance                                          Chapter 12 / Preliminaries
+
+
+       extends.” It gives an example in which class EmployeePerson extends class Person by adding
+       “attributes” hireDate and payRate to the ones (name and birthDate) it inherits from class
+       Person. Appendix G discusses this idea in more detail. Note: C++ [90], Java [94], and the
+       SQL standard [99] all support the EXTENDS relationship.
+
+ ■     Reference [129] among others advocates support for subtables and supertables (not by that
+       name, however). This concept might be thought of as an application of “the EXTENDS
+       relationship” to tables specifically. (We do not say relations or relvars here because the
+       tables in question do not have to be properly relational.) Reference [129] gives an example in
+       which a STUDENT table inherits all of the columns of a PERSON table but adds a GPA
+       column (“grade point average”). Appendix G discusses this idea in more detail as well. Note:
+       The SQL standard [99] supports this one, too.
+
+       Finally, for purposes of reference, and also to give some idea of the scope of our inheritance
+model, we close this chapter by giving below a mnemonic list of the 25 IM Prescriptions. Note that
+the first 20 take care of scalar types; the last five are needed to take care of tuple and relation types
+as well.
+
+ 1. Types are sets                                      16. Read-only operator inheritance and value
+ 2. Subtypes are subsets                                substitutability
+ 3. “Subtype of” is reflexive                           17. Operator signatures
+ 4. Proper subtypes                                     18. Read-only parameters to update operators
+ 5. “Subtype of” is transitive                          19. Update operator inheritance and variable
+ 6. Immediate subtypes                                  substitutability
+ 7. Root types disjoint                                 20. Union, dummy, and maximal and minimal
+ 8. Scalar values with inheritance                      types
+ 9. Scalar variables with inheritance                   21. Tuple/relation subtypes and supertypes
+10. Specialization by constraint                        22. Tuple/relation values with inheritance
+11. Assignment with inheritance                         23. Maximal and minimal tuple/relation types
+12. Equality etc. with inheritance                      24. Tuple/relation most specific types
+13. Join etc. with inheritance                          25. Tuple/relation variables with inheritance
+14. TREAT
+15. Type testing
+
+
+EXERCISES
+
+12.1    Explain the concepts of type inheritance and subtype in your own words.
+
+12.2    Distinguish between immediate and proper subtypes.
+
+12.3    What do you understand by the term most specific type?
+
+12.4    What do you understand by the term substitutability?
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          272
+Part IV / Subtyping and Inheritance                                        Chapter 12 / Preliminaries
+
+
+12.5   With reference to the type hierarchy of Fig. 12.1, consider a value e of type ELLIPSE. The
+       most specific type of e is either ELLIPSE or CIRCLE. What is the least specific type of e?
+
+12.6   Define the terms root type and leaf type.
+
+12.7   State the disjointness assumption. What are some of the implications of that assumption?
+       What do you think should replace that assumption if multiple inheritance is supported?
+       Note: The latter question was not answered in the body of the chapter; the point of the
+       question is simply to get you thinking about the issue, should you feel so inclined, before we
+       get to the detailed discussions in Chapter 15.
+
+12.8   Give as precise a definition as you can of the term type hierarchy. (You might like to try
+       giving a recursive definition, different from the nonrecursive one given in the body of the
+       chapter.) Why are type hierarchies strictly not part of the inheritance model?
+
+12.9   Are possreps inherited? If not, why not?
+
+12.10 Use the syntax sketched in this chapter to give definitions for types RECTANGLE and
+      SQUARE from Fig. 12.1. Assume for simplicity that all rectangles are centered on the
+      origin, but do not assume that all sides are either vertical or horizontal. What about types
+      POLYGON and PLANE_FIGURE?
+
+12.11 Given your answer to Exercise 12.10, define an operator to rotate a specified rectangle
+      through 90° about its center.
+
+12.12 (This exercise will probably take longer to read than to answer!) Let TH be a type
+      hierarchy. Then:
+
+       ■    Any graph G derived from TH by choosing the node corresponding to some type T and
+            deleting (a) all nodes not corresponding to some subtype T' of T, and (b) all arcs
+            emanating from those nodes, is also a type hierarchy, with T as its root.
+
+       ■    Any graph derived by deleting a node from the graph G just defined is also a type
+            hierarchy (again with T as its root, unless node T was the one deleted), provided that
+            deletion of a node is always accompanied by deletion of (a) the arc entering into that
+            node and (b) each corresponding immediate subtype node.
+
+       ■    TH itself is also regarded as a type hierarchy derived from TH.
+
+       By contrast, if (a) TH is a type hierarchy with root T, and (b) type T is an immediate
+       supertype of type T' and type T' is an immediate supertype of type T'' (and we assume for
+       simplicity that type T' is an immediate supertype of no types other than type T''), and (c) G is
+       the graph derived from TH by deleting node T' and coalescing the arc connecting nodes T
+       and T' and the arc connecting nodes T' and T'' into a single arc connecting nodes T and T'',
+       then (d) G is not a type hierarchy (at least, not one that can be derived from TH), because it
+       causes T'' to lose some of its inheritance (as it were). For example, the graph that contains
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        273
+Part IV / Subtyping and Inheritance                                        Chapter 12 / Preliminaries
+
+
+       just nodes POLYGON and SQUARE from Fig. 12.1 (with a single connecting arc) is not a
+       type hierarchy that can be derived from the one in that figure.
+             Given the foregoing definitions, how many distinct type hierarchies can be derived
+       from that of Fig. 12.1?
+
+12.13 In the body of the chapter we said that if inheritance is supported at all, it must be multiple.
+      Why do you think this is? Note: As with the second question in Exercise 12.7, this question
+      was not answered in this chapter; again, the point of the question is simply to get you
+      thinking about the issue.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       274

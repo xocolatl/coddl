@@ -1,0 +1,1009 @@
+                                                        Appendix F
+
+        A Closer Look at Specialization by Constraint
+
+Our inheritance model requires support for specialization by constraint (S by C). You might recall,
+however, that after we had explained the basic idea of S by C in Chapter 14, we said this:
+
+         But there is much, much more to be said on this topic: so much, in fact, that it seemed better
+         not to include it all in the body of the chapter [but] instead to relegate most of it to [this
+         appendix].
+
+      We also said the topic was controversial; in fact, we excluded it from our original model [82],
+basically because everyone else seemed to have done the same thing (not a very good reason!).
+Why, then, is there this broad sentiment against S by C? The answer seems to do with performance;
+there seems to be a widespread belief that S by C is difficult to implement efficiently and must
+perform badly. Now, performance by definition is not a model concern—we would always rather
+get the model right first and worry about the implementation afterward—but we do have some
+thoughts on the performance issue, which we will discuss in the section “Implementation
+Considerations” later in this appendix. First, however, we would like to take a closer look at S by C
+from the perspective of the model, and that is the primary purpose of this appendix.
+      The discussion is structured as follows. The two sections immediately following this
+introductory material offer a brief historical review. The following sections then summarize the
+benefits of S by C and suggest that the reason it has typically not been supported in the past is
+because most work on inheritance has been done in an object setting. The final section offers some
+thoughts on implementation and performance. Note: To keep the appendix shorter than it might be,
+we assume—where it makes any difference (actually in very few places)—that we are dealing with
+single inheritance only and scalar types only.
+
+
+THE 3 OUT OF 4 “RULE”
+
+It is instructive to begin by taking a look at a historical issue that is directly related to the S by C
+controversy. The issue in question is known as “the 3 out of 4 rule,”1 and it turns out that S by C—
+or, rather, generalization by constraint (G by C), which is part of the same overall phenomenon, of
+course—is the key to resolving it.
+        We have said that S by C is controversial. Just to remind you, S by C means the system
+should be aware that, e.g., if an ellipse has equal semiaxes, it is really a circle. Now, we have
+assumed throughout this book, tacitly, that the inverse notion—i.e., that the system should be aware
+that, e.g., if an ellipse is really a circle, its semiaxes must be equal—is not controversial at all; in
+fact, of course, it is just a type constraint on circles, and we have tacitly assumed that type
+
+
+
+1
+    We call your attention to the deliberately different positioning of the quotation marks in the title to this section.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                                 469
+Appendixes                                        Appendix F / A Closer Look at Specialization by Constraint
+
+
+constraints are obviously desirable. Indeed, without type constraints we do not even have a way of
+specifying the values that go to make up a given type.
+      Not everyone agrees with us on this point, however (in other words, our position on type
+constraints is controversial as well). Consider the following extract from reference [137]:
+      We can list four features of a subtyping mechanism that all seem to be desirable, yet ... it is not possible to
+      combine them in a single type system. The four features are:
+
+      ● Substitutability
+      ● Static type checking
+      ● Mutability
+      ● Type constraints
+
+      [We break in at this point in order to explain a couple of matters. First, “mutability” just means updatability; as
+      mentioned in Chapter 6, mutator is the object term for what we call an update operator (the object term for a
+      read-only operator, you will recall, being observer). Second, reference [137] identifies the last feature in the list
+      not as type constraints but rather as specialization via constraints. But it does not mean by that term quite what
+      we mean by S by C. Rather, it refers to the more fundamental notion—of which S by C is a logical
+      consequence—that type T' might be defined as a “constrained” form of type T; in other words, it really is talking
+      about type constraints. To continue:]
+
+      All four of these properties seem to be desirable ... We submit, however, that it is impossible to have all four of
+      them in the same type system. This conflict can be illustrated with the following example. [We have replaced
+      the example given in reference [137] by one that is essentially similar but conforms to our own notation and our
+      own running example. Also, for consistency with the body of the present book, we use LENGTH as a selector,
+      despite the fact that we have argued in Appendix C that, e.g., LENGTH_IN_INCHES would be preferable.]
+
+      VAR E ELLIPSE ;
+      VAR C CIRCLE ;
+
+      C := CIRCLE ( LENGTH ( 3.0 ), ... ) ;
+      E := C ;
+      THE_A ( E ) := LENGTH ( 4.0 ) ;
+
+      [The first assignment initializes C to a circle of radius three.] The [second] assignment must be allowed ... if we
+      have substitutability and mutability ... The [third assignment] would type-check at compile time ... Of course,
+      [that assignment] ... will fail [at run time] even though the compile-time check determined that it was all right.
+
+      [And the extract concludes:]
+
+      We observe that any three of the four features seem to work just fine. No one of them is obviously the one that
+      must be discarded, but in any type system, at least one of them must be sacrificed to achieve consistency with the
+      others.
+
+      Now, perhaps you can see right away what is wrong with this argument. To be specific, in
+our model, G by C would occur on the third assignment, MST(E) would become ELLIPSE again,
+and everything would indeed “work just fine.” However, reference [137] does not consider the
+possibility of G by C, so let us agree to ignore that possibility ourselves for a while and see where
+the argument takes us. We begin by taking a closer look at the four features and seeing how each
+relates to the example at hand:
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                             470
+Appendixes                              Appendix F / A Closer Look at Specialization by Constraint
+
+
+ ■   Substitutability: As explained in Chapter 14, type inheritance implies substitutability (value
+     substitutability, at any rate), so this feature cannot possibly be discarded. The second
+     assignment in the example appeals to value substitutability.
+
+ ■   Static type checking: Reference [137] defines static type checking to mean that “there is no
+     need to insert expensive run-time [type] checks [into the compiled] code, and also the coder
+     can be assured that [run-time type] errors can never occur.” In our inheritance model, by
+     contrast, run-time type errors certainly can occur in the context of TREAT (though nowhere
+     else), even if static type checking is performed. So perhaps it can be claimed that static type
+     checking—full static type checking, that is, in the sense of reference [137]—is the feature we
+     have discarded.
+            However, we would argue that to insist that everything be fully type-checkable at
+     compile time is to throw the baby out with the bathwater. For example, consider the
+     following code fragment:
+     VAR L LENGTH ;
+
+     E := C ;
+     L := THE_R ( E ) ;
+
+     The expression THE_R(E) will fail on a compile-time type check, of course. So now we have
+     no way to obtain the radius of the circle that is the current value of E (we cannot use TREAT,
+     because TREAT intrinsically cannot be fully type-checked at compile time). So there is
+     really no point in saying that the current value of E is of type CIRCLE; we might as well have
+     converted that circle to make it “just an ellipse” when we assigned C to E. So we have lost
+     substitutability!—and therefore the whole idea of type inheritance, in fact.
+
+ ■   Mutability: As noted earlier, mutability just means updatability. Updatability in turn implies
+     support for variables and assignment (and the example does involve variables and assignment,
+     obviously). Now, we did say in Chapter 1 that a functional-style language would not need
+     variables or assignment as such, so we might be persuaded that mutability could be discarded
+     (though we doubt whether this interpretation is what the authors of reference [137] had in
+     mind). And even if the language is imperative in style, as Tutorial D is, and therefore does
+     require variables and assignment, we could certainly be persuaded—indeed, it is obvious—
+     that assignment is the only update operator (or mutator) that is logically necessary. But that
+     still leaves us with mutability as a sine qua non.
+           Note: It is possible that what reference [137] means by the term mutability is not
+     assignment as such, but rather the idea that certain mutators work in such a way as to assign to
+     some component of their target while leaving other components unchanged (as in the
+     assignment to THE_A(E) in the example). If so, then we have already argued under RM
+     Prescription 5 in Chapter 6 that such operators are very desirable in practice, despite the fact
+     that in the final analysis they are also logically unnecessary.
+
+ ■   Type constraints: As already indicated, reference [137] does not consider the possibility of G
+     by C. As a consequence, it observes that if type constraint checking is done, then the
+     assignment to THE_A(E) will fail at run time. To be more specific, it fails because the most
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      471
+Appendixes                                         Appendix F / A Closer Look at Specialization by Constraint
+
+
+        specific type of the target is CIRCLE, and assignment to THE_A for a circle will, in general,
+        violate the constraint on circles that a = b.1 It follows that, if we want the assignment not to
+        fail at run time, the system must not be informed of the constraint. But this conclusion is
+        surely unacceptable; surely, the more constraints the system is aware of and can enforce, the
+        better (we surely want our data to be as correct as possible at all times).
+
+       Now, in reference [111], Mattos and DeMichiel examine the foregoing claims and conclude
+that type constraint checking (and enforcement) is indeed the feature that must be discarded. Their
+analysis goes somewhat as follows:
+
+       Can we discard substitutability? Well, no: As we have already seen, substitutability—value
+        substitutability, that is—cannot possibly be thrown away without undermining the whole idea
+        (and point) of type inheritance.
+
+       Can we discard static type checking? Well, no: Discarding static type checking is highly
+        undesirable, of course, and in any case it solves nothing—in the example, the assignment to
+        THE_A(E) will still fail at run time.
+
+       Can we discard mutability? Well, no: We must have assignment, at least (assuming the
+        language is imperative in style), and component-level update operators are highly desirable
+        too in practice. (We note in passing that in fact reference [111] does assume that the term
+        mutability refers specifically to the idea of component-level updating, not just to assignment
+        in general.)
+
+      Reference [111] thus concludes that “the most appropriate [solution] is to not permit
+specialization via constraints” (meaning, to say it again, that they advocate not enforcing, or even
+declaring, type constraints). They claim that to do otherwise would mean “[forcing] the
+overloading of all [operators] defined on supertypes.” We should immediately explain that by
+“overloading” here, they really mean defining new implementation versions, to use the terminology
+of Chapter 14;2 in terms of our example, that is, they are claiming that assignment to THE_A would
+have to be “overloaded” for a circle in such a way as to have the side effect of assignment to
+THE_B too, so that the circle still satisfies the constraint a = b after the update. And they go on to
+say:
+
+        This option [i.e., of forcing “overloading”] seems to be unacceptable because we believe that ... users are not
+        likely to define type hierarchies themselves, but to buy them as class libraries from third-party vendors. It is an
+        important requirement that users be able to define ... subtypes of these type hierarchies [sic] ... If we force all
+        operators to be overloaded, users will have to redefine every [operator] provided by the class libraries whenever
+        they need to [define such a subtype].
+
+
+
+1
+  We do not agree with this argument, of course—we are just doing our best to explain the point of view of reference
+[137].
+2
+  Note in particular, therefore, that they are not using the term overloading as we did in Chapters 6 and 14 to mean
+something that is properly part of the model; rather, they are using it to mean something that is of concern to the
+implementation merely.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                            472
+Appendixes                                         Appendix F / A Closer Look at Specialization by Constraint
+
+
+       We agree that forcing such “overloading” is unacceptable. In fact, we would argue that the
+semantics of assignment to THE_A in particular are (for good reasons) prescribed by our model and
+must not be “overloaded” in the manner suggested. And even if those semantics were not
+prescribed by the model, we would still argue that (a) changing the semantics of an operator in
+arbitrary ways is a bad idea in general, and (b) changing the semantics of an operator in such a way
+as to cause arbitrary side effects is an even worse one; it is a good general principle to insist that
+operators have exactly the requested effect, no more and no less.1 Furthermore, we observe that the
+option of changing the semantics in the manner suggested is not always available, anyway. For
+example, let type ELLIPSE have another immediate subtype NONCIRCLE, with the obvious
+semantics; let the constraint a > b apply to noncircles; and consider an assignment to THE_A for a
+noncircle that, if accepted, would set a equal to b. What would be an appropriate “overloading” for
+that assignment? Exactly what side effect would be appropriate?
+       On the face of it, then, the conclusion of reference [111] that type constraints should be
+rejected does seem inescapable. But observe the following implications of adopting that position:
+
+    ■    As already explained, assignment to THE_A is not reimplemented (“overloaded”) for circles.
+
+    ■    The fact that the current value of E in the example is a circle does not cause the assignment to
+         THE_A to fail.
+
+    ■    The result is thus that after that assignment, variable E contains a “noncircular circle”—that
+         is, it contains a value of type CIRCLE for which a > b. (The type is still CIRCLE because,
+         according to reference [111], we have done nothing to change it.)
+
+    ■    Even worse, the fact that assignment to THE_A is supported (without any type checking) for
+         a variable of declared type ELLIPSE but current most specific type CIRCLE strongly
+         suggests that assignment to THE_A should be supported (again without any type checking)
+         for a variable of declared type CIRCLE.
+
+    ■    So let C be such a variable. After such an assignment, then, variable C will (in general)
+         contain a “noncircular circle”—that is, a value of type CIRCLE for which a > b.
+
+    ■    So the constraint a = b is not being enforced for type CIRCLE, and there is therefore no point
+         in even stating it.
+
+    ■    More generally, type constraints cannot be enforced—and therefore are not worth even
+         stating—even if inheritance is currently not supported at all, just in case such support
+         might be added at some future time.
+
+      To us, these implications, the last one in particular, seem even more unacceptable than the
+option of “forcing overloading.” (We note in passing, however, that SQL behaves in exactly the
+manner just outlined! See Appendix H.)
+
+
+
+1
+    In fact it might be regarded as a strong form of The Assignment Principle.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                             473
+Appendixes                               Appendix F / A Closer Look at Specialization by Constraint
+
+
+      So what is to be done? Well, let us step back a moment and take stock. It seems to us that the
+system should indeed support all of the four features (substitutability, static type checking,
+mutability, and type constraints). More precisely, it seems to us that:
+
+ ■   The system should support The Principle of Value Substitutability 100 percent.
+
+ ■   The system should support static type checking to the maximum extent possible (the only
+     place where run-time type checking is needed is in the context of TREAT).
+
+ ■   The system should support mutability—meaning not only that it should support assignment
+     per se, but also that it should support component-level update operators as a shorthand.
+
+ ■   The system should support type constraints—meaning it should be aware of the fact that
+     circles are subject to the constraint that a = b, and meaning further that assignment to
+     THE_A(C) fails at compile time if the declared type of C is CIRCLE.
+
+ ■   But the system should additionally support S by C and G by C! In particular, if the declared
+     type of E is ELLIPSE, then it should always permit assignment to THE_A(E), and it should
+     be prepared for MST(E) to change on such an assignment, either “down” from ELLIPSE to
+     CIRCLE (“S by C”) or “up” from CIRCLE to ELLIPSE (“G by C”), as and when appropriate.
+
+     In other words, S by C and G by C are the solution to “the 3 out of 4 problem.” In fact, we
+now see that the 3 out of 4 “rule” is not really a rule at all, so long as S by C and G by C are
+supported—as we claim they should be.
+
+
+WHAT DOES INHERITANCE REALLY MEAN?
+
+We are now in a position to take care of a piece of business that we tacitly (but of course
+deliberately) left unfinished in Chapter 14. Recall IM Prescription 19 (“Update Operator
+Inheritance and Variable Substitutability”), which states among other things that update operators
+are inherited only conditionally; thus, for example, assignment to THE_A is not inherited by type
+CIRCLE, as we saw at the end of the previous section. But this position raises a major issue—
+namely, what does inheritance really mean? Does a sensible model even exist? If assignment to
+THE_A does not apply to variables of type CIRCLE, is it reasonable to regard type CIRCLE as a
+subtype of type ELLIPSE? After all, to say that type CIRCLE is a subtype of type ELLIPSE means
+that all operators that apply to type ELLIPSE apply to type CIRCLE too, does it not?
+       Well, no, it does not. To repeat from Chapter 12:
+
+     [It] is important in this context—as in all others!—to distinguish very carefully between
+     values and variables. When we say that every circle is an ellipse, what we mean, more
+     precisely, is that every circle value is an ellipse value. We certainly do not mean that every
+     circle variable is an ellipse variable: i.e., that a variable of declared type CIRCLE is a
+     variable of declared type ELLIPSE, and hence can contain a value that is an ellipse and not a
+     circle. In other words ... inheritance applies to values, not variables.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                     474
+Appendixes                                 Appendix F / A Closer Look at Specialization by Constraint
+
+
+      Thus, it seems to us that the key to the problem is to recognize
+
+ ■    The logical difference between values and variables, and hence
+
+ ■    The logical difference between read-only and update operators, and hence
+
+ ■    The logical difference between The Principle of Value Substitutability and The Principle of
+      Variable Substitutability
+
+(and, of course, to act appropriately upon such recognition).
+       It further seems to us that the positions argued in references [111] and [137] (and a host of
+similar writings) stem from a failure to make these crucial distinctions. And it seems still further
+that such failures are at least partly responsible for the lack of consensus, noted several times earlier
+in this book, on a formal, rigorous, and abstract inheritance model. For example:
+
+ ■    Reference [2] states that “[there] are at least four types of inheritance: substitution inheritance,
+      inclusion inheritance, constraint inheritance, and specialization inheritance ... Various degrees
+      of these four types of inheritance are provided by existing systems and prototypes, and we do
+      not prescribe a specific style of inheritance.”
+
+ ■    Reference [19] states that “[inheritance can be] based on [a variety of] different criteria and
+      there is no commonly accepted standard definition”—and proceeds to give eight (!) possible
+      interpretations. (Reference [118] gives twelve.)
+
+ ■    Reference [4] states that “[a given language merely] provides a set of [inheritance]
+      mechanisms. While these mechanisms certainly restrict what one can do in that language and
+      what views of inheritance can be implemented [in that language], they do not by themselves
+      validate some view of inheritance or other. [Types,] specializations, generalizations, and
+      inheritance are only concepts, and ... they do not have a universal objective meaning ... This
+      [fact] implies that how inheritance is to be incorporated into a specific system is up to the
+      designers of [that] system, and it constitutes a policy decision that must be implemented with
+      the available mechanisms.” In other words, there simply is no model.
+           It is, however, relevant to mention that the authors of reference [4] draw their conclusion
+      after analysis of an example that is essentially isomorphic to the example discussed in the
+      previous section of assignment to THE_A for a variable of declared type ELLIPSE but
+      current most specific type CIRCLE—and their analysis is essentially isomorphic to that of
+      reference [111], too. For such reasons, we reject their conclusion.
+
+       Our own position, by contrast, is as follows: We do believe there is such a thing as a good
+inheritance model; we believe further that any such model must pay careful attention to the logical
+differences (values vs. variables and the rest) articulated in this book; and we believe still further
+that any such model must support S by C and G by C. And yes, we do believe a circle is an
+ellipse!—see the section immediately following.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          475
+Appendixes                                      Appendix F / A Closer Look at Specialization by Constraint
+
+
+BENEFITS OF S BY C
+
+We have seen that one advantage of S by C and G by C is that they solve the 3 out of 4 “problem.”
+But there are, of course, many other advantages that accrue from S by C and G by C, and those
+advantages are the principal subject of this section.
+      First, however, we should see whether there are any disadvantages. The obvious one is as
+follows. Recall from Chapter 14 that S by C has the fundamental consequence that—at least as far
+as the model is concerned—a selector invocation might return a value of some proper subtype of the
+designated target type; for example, the selector invocation
+         ELLIPSE ( LENGTH (...), LENGTH (...), POINT (...) )
+
+will return a value of type CIRCLE, not ELLIPSE, if the two LENGTH invocations happen to
+return the same value. As explained in Chapter 14, it follows that—at least conceptually—S by C
+must be implemented inside selector implementation code. Note carefully, however, that we say “at
+least conceptually.” In fact, we will argue in the section “Implementation Considerations,” later in
+this appendix, that it is not actually necessary to compute the most specific type of the result of a
+selector invocation—at least, not at the time of that invocation. For the record, however, we
+consider in the paragraph immediately following what would be involved if S by C did indeed have
+to be implemented inside selector implementation code.
+       Assume for the moment, therefore, that the implementation does have to determine the most
+specific type of the result of a selector invocation as soon as that result is computed. Every time we
+define a new proper subtype T', then, the selector(s) for the immediate supertype(s) T of T' will need
+to be reimplemented, or at least revised, because they might now return values of that new type T'
+as their most specific type. But those revisions can clearly be automated! In the case of ellipses
+and circles, for example, the system knows exactly when an ellipse is in fact a circle, and
+furthermore it knows exactly which circle the ellipse in question is. (Note in particular, therefore,
+that what we do not have to do—contrary to the claim, noted two sections back, in reference
+[111]—is “redefine every [operator] provided by the class libraries whenever [we] need to [define a
+subtype].”) In other words, the possible need to revise certain selectors (which, we stress, is the
+only disadvantage to the S by C idea as far as we can see) is perhaps a minor burden on the system,
+but it is no burden at all on any human user.1
+       Now we turn to the advantages. We have numbered the points that follow for convenience.
+
+    1.   The first is simply the overriding point that S by C obviously means the model is a better
+         model of reality. As we put it in Chapter 14, “the more knowledge the system has, the better”
+         is always a good general principle.
+
+    2.   It is a direct consequence of S by C that values of most specific type ELLIPSE correspond to
+         ellipses that are definitely not circles in the real world. In other models—including the
+         original version of our own [82]—values of most specific type ELLIPSE can have a = b and
+         can thus correspond to circles in the real world. Hence, defining CIRCLE as a subtype of
+
+1
+  Not even a performance burden, in our opinion. Again, see the section “Implementation Considerations,” later in this
+appendix.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                       476
+Appendixes                                Appendix F / A Closer Look at Specialization by Constraint
+
+
+      ELLIPSE in such a model partitions the set of ellipses, not into circles vs. noncircles, but
+      rather into circles vs. “maybe-circles”—intuitively not a very satisfactory state of affairs.
+
+ 3.   It is also a direct consequence of S by C that values of most specific type CIRCLE correspond
+      to ellipses that are definitely circles in the real world. In other words, “noncircular circles”
+      and similar nonsenses cannot occur. (Nor could they in our previous model, but for a
+      different reason. More to the point, perhaps, they can occur in SQL, as already noted, since
+      SQL does not support type constraints. See Appendix H.)
+
+ 4.   More compile-time type checking can be done and fewer run-time type errors can occur; in
+      fact, run-time type errors can occur solely on an attempt to TREAT a value as being of a type
+      it does not possess. (In our original model, by contrast, additional run-time type errors could
+      occur—for example, on an attempt to assign to THE_A of a variable of declared type
+      ELLIPSE but current most specific type CIRCLE.)
+
+ 5.   Assignments are logically simpler (especially assignments to THE_ pseudovariables, which in
+      our original model involved a complicated CASE expression on the right side in their
+      expansion). In particular, changing types “up” or “down” is easy. That is, given variable E of
+      declared type ELLIPSE, in order to change the most specific type of E from ELLIPSE to
+      CIRCLE or the other way around, it is sufficient just to update E appropriately.
+
+ 6.   Changing types “sideways” is also easy. That is, given (say) types ELLIPSE, CIRCLE, and
+      NONCIRCLE, in order to change the most specific type of variable E (of declared type
+      ELLIPSE) from CIRCLE to NONCIRCLE or the other way around, it is sufficient just to
+      update E appropriately. (In our original model, by contrast, changing types “sideways” in
+      such a manner was a considerably more complex process, involving a “TREAT UP”
+      operation on E—see Points 7 and 8 below—to force it to be “just an ellipse” first, followed by
+      an assignment with a complicated CASE expression on its right side second. What is more,
+      the overall process did not work properly anyway if ELLIPSE was a union type, as in fact it is
+      in the example. All of these complications go away with S by C.)
+
+ 7.   Equality comparisons are easy. For example, given our usual variables E and C of declared
+      types ELLIPSE and CIRCLE, respectively, we can test them for equality as follows:
+      E = C
+
+      In our original model, by contrast, we would have had to have written something like this:
+      TREAT_UP_AS_ELLIPSE ( E ) = TREAT_UP_AS_ELLIPSE ( C )
+
+      (This expression can be read as “treat both comparands as just ellipses and then compare the
+      two ellipses.”)
+
+ 8.   In fact, the TREAT UP operator, which as we have seen was included in our original model
+      for a variety of reasons, is completely unnecessary with S by C and G by C, and so can be
+      dropped. (Actually it was only shorthand anyway, but any simplification is generally to be
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                           477
+Appendixes                                 Appendix F / A Closer Look at Specialization by Constraint
+
+
+      desired.) Note: Perhaps we should point out that our model does still support “treating up” as
+      well as “treating down,” but only in a harmless kind of way. Given our usual variable C, for
+      example, the expression TREAT_AS_ELLIPSE(C) is valid, but it can never fail; in fact, it is a
+      “no op.”
+
+ 9.   With S by C and G by C, the rules regarding conditional inheritance of update operators apply
+      to declared types. In our original model, by contrast, they applied to most specific types
+      instead, a fact that made them harder to understand and harder to implement and led to more
+      run-time type checking and more run-time type errors.
+
+10.   More code reuse is achievable, and programs are more immune to the introduction of new
+      subtypes. For example, a program that assigns to THE_A(E) will still work after type
+      CIRCLE is introduced (as it might not have done under our original model).
+
+11.   There is never any logical need to CAST—i.e., convert—a value of type ELLIPSE to type
+      CIRCLE, because an ellipse that can be “converted to” type CIRCLE will in fact be of type
+      CIRCLE already, under S by C. The operator itself thus becomes unnecessary (as it was not,
+      under our previous model).
+
+12.   S by C can also have the effect of making certain implementation versions of certain operators
+      logically unnecessary. For example, the update version of MOVE discussed in Chapter 14 for
+      ellipses and rectangles will work for any combination of most specific argument types—
+      ELLIPSE or CIRCLE for the first argument and RECTANGLE or SQUARE for the second
+      argument—whereas such was not the case with our original model.
+
+      In fact, we would now like to go further and argue that S by C is the only conceptually valid
+way of defining subtypes!—so long as the supertype is a regular type, at any rate (S by C from a
+dummy type makes no sense). We justify this strong claim as follows. Let type T' be a subtype of
+(regular) type T. Then:
+
+ ■    T and T' are both sets (sets of values), and T' is a subset of T.
+
+ ■    Therefore T and T' both have membership predicates—predicates, that is, such that a given
+      value is of the type in question if and only if it satisfies the corresponding predicate. Let those
+      predicates be P and P', respectively.
+
+ ■    Since we are dealing with finite sets only, we can for simplicity regard predicates P and P' as
+      effectively just enumerating the values of types T and T', respectively.
+
+ ■    Note in particular that since every value of type T' is also a value of type T, predicate P' can
+      be formulated in terms of values of type T (not T') only.
+
+ ■    And that predicate P', formulated in terms of values of type T, is precisely the constraint that
+      values of type T have to satisfy in order to be values of type T'. In other words, a value of
+      type T is specialized to type T' precisely if it satisfies the constraint P'. Note: P' is what IM
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         478
+Appendixes                                          Appendix F / A Closer Look at Specialization by Constraint
+
+
+         Prescription 10 calls the specialization constraint for T'. In Tutorial D, it is specified by
+         means of an <is def> on the definition of that type T'.
+
+Thus, to repeat, we see S by C as the only conceptually valid way of defining subtypes. In
+particular, therefore (see reference [71] for a detailed discussion of this particular issue), our answer
+to the notorious question “Is a circle an ellipse?” is a very firm yes.
+
+WHAT ABOUT OBJECTS?
+
+We have now laid sufficient groundwork to be able to explain a claim we made in Chapter 9, in our
+discussion of OO Proscription 2 (“No Object IDs”). The claim in question was basically this:
+Object IDs undermine inheritance. (What we actually said was that “pointers ... can lead to a
+serious problem if type inheritance is also supported.”) In this section, we take a closer look at this
+issue.
+       First of all, we remind you that (unlike D) object languages make heavy use of object IDs, or
+in other words pointers, and variables in such languages typically contain such pointers instead of
+regular nonpointer values. Thus, for example, the analog of our usual variables E and C in such a
+language would typically be variables—call them XE and XC—that contain pointers to ellipses and
+circles instead of ellipses and circles as such. Furthermore, when we say pointers to ellipses and
+circles, we really mean pointers to ellipse and circle variables,1 because by definition it is variables,
+not values, that have addresses.
+       Next, we remind you from Chapter 9 that languages that support pointers also typically
+support two operators called referencing and dereferencing, respectively:
+
+    ■    Referencing: Given a variable V, the referencing operator applied to V returns a pointer to V.
+
+    ■    Dereferencing: Given a variable P of type pointer, the dereferencing operator applied to P
+         returns the variable that P currently points to.
+
+     Note: Referencing and dereferencing operations are often implicit in practice. However, we
+show them explicitly in the examples that follow, because we have found that implicitness in this
+context can unnecessarily obscure some of the points we want to make.
+     With these preliminaries out of the way, we now present our first code fragment:
+         VAR E ELLIPSE ;
+         VAR XE PTR_TO_ELLIPSE ;
+
+         E := CIRCLE ( LENGTH ( 5.0 ), POINT ( 0.0, 0.0 ) ) ;
+         XE := PTR_TO ( E ) ;
+
+         Explanation: We are making use of two hypothetical extensions to Tutorial D:
+
+
+
+
+1
+    Object languages would say they are pointers to ellipse and circle objects.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                              479
+Appendixes                                        Appendix F / A Closer Look at Specialization by Constraint
+
+
+    ■   First, if T is a type, then PTR_TO_T is a type too, and its values are pointers to, or object IDs
+        of, variables of type T. In other words, PTR_TO_ is a type generator (a scalar type generator,
+        in fact).
+
+    ■   Second, if V is a variable of type T, then the operator invocation PTR_TO (V) returns a
+        pointer to V. In other words, PTR_TO is the referencing operator mentioned above.
+
+     The effect of the code fragment is thus (a) to set the variable E to contain a circle of radius
+five—note the appeal to substitutability—and (b) to set the variable XE to contain a pointer to E.
+     Now we introduce another variable:
+        VAR XC PTR_TO_CIRCLE ;
+
+       We assume that—as is in fact typically the case in object languages—type PTR_TO_CIRCLE
+is a proper subtype of type PTR_TO_ELLIPSE. Thus, we can legitimately perform the following
+assignment:
+        XC := TREAT_AS_PTR_TO_CIRCLE ( XE ) ;
+
+        Now XC also contains a pointer to E—in fact, it contains the same pointer value as XE does.
+        Finally, we attempt the following assignment (let us call it Assignment Z):
+        THE_A ( DEREF ( XE ) ) := LENGTH ( 6.0 ) ;
+
+      Explanation: We are assuming the existence of a dereferencing operator, DEREF, which
+takes a variable of some pointer type and returns the variable that pointer variable currently points
+to. (In the example, we are actually using DEREF as a pseudovariable,1 since it appears on the left
+side of the assignment.) Thus, the intent of Assignment Z is, loosely speaking, to update the length
+of the a semiaxis of the ellipse variable that XE currently points to, setting it to six. So what
+happens?
+      Well, it seems there are three possibilities, all of them bad. We consider each in turn.
+
+    ■   Case 1: Assignment Z fails on a run-time type error, because MST(E) is CIRCLE and
+        assignment to THE_A is not supported for type CIRCLE. In this case, the model is bad
+        because (a) it leads to run-time type errors in a context other than TREAT, and (b) more
+        important, it does not support G by C, and so is not “a good model of reality.”
+
+    ■   Case 2: Assignment Z “succeeds” (i.e., there is no run-time type error and the update is
+        done), but G by C does not occur. In this case, the model is bad because (a) it fails to
+        support G by C (and so is not “a good model of reality”); (b) variable XC now points to a
+        “noncircular circle”; (c) more generally, type constraints cannot be supported. (As pointed
+        out earlier, this case corresponds to the way SQL works.)
+
+1
+  This observation is not strictly accurate, because the overall assignment is not just shorthand for something else. In
+other words, support for pointers implies that we need to extend our definition (both syntactic and semantic) of the
+assignment operator. We omit the details here, since the whole aim of the discussion is to bolster the argument that
+pointers should not be supported in the first place.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                           480
+Appendixes                                 Appendix F / A Closer Look at Specialization by Constraint
+
+
+ ■    Case 3: Assignment Z “succeeds” (i.e., there is no run-time type error and the update is
+      done), and G by C does occur. In this case, the model is bad because (a) variable XC, of
+      declared type PTR_TO_CIRCLE, now points to a variable of current most specific type
+      ELLIPSE, and hence (b) type constraints cannot be supported. Note: In practice, this option
+      is probably a nonstarter, precisely because of point (a); thus, G by C probably does not occur,
+      and we are back with Case 2.
+
+       Conclusion: Whichever option we choose, the model is bad. And the culprit (in this
+particular example) is the concept of “shared variables”: Pointer variables XE and XC “share” the
+ellipse variable E. Furthermore, it is pointers (i.e., object IDs) that permit that sharing in the first
+place. It follows that object IDs—at least if they permit shared variables—and a good model of
+inheritance are incompatible.
+       As a matter of fact, we do not even need to invoke the concept of shared variables in order to
+illustrate the problem. Consider the following simpler version of the example:
+      VAR E ELLIPSE ;
+      VAR XC PTR_TO_CIRCLE ;
+
+      E := CIRCLE ( LENGTH ( 5.0 ), POINT ( 0.0, 0.0 ) ) ;
+      XC := TREAT_AS_PTR_TO_CIRCLE ( PTR_TO ( E ) ) ;
+      THE_A ( E ) := LENGTH ( 6.0 ) ;
+
+       Explanation: The first assignment sets E to contain a circle of radius five. The second sets
+XC to point to E. The third (“Assignment Z”) attempts to update the length of the a semiaxis of the
+ellipse variable E to six. What happens? Without going into details, it should be clear that there are
+the same three possibilities as before, again all bad, and the overall conclusion is the same as before
+as well: Object IDs and a good model of inheritance are incompatible.
+       For a third and final example, we consider the following still simpler code fragment:
+      VAR C CIRCLE ;
+      VAR XE PTR_TO_ELLIPSE ;
+
+      C := CIRCLE ( LENGTH ( 5.0 ), POINT ( 0.0, 0.0 ) ) ;
+      XE := PTR_TO ( C ) ;
+      THE_A ( DEREF ( XE ) ) := LENGTH ( 6.0 ) ;
+
+       Here S by C and G by C have no part to play (variable C can never have most specific type
+ELLIPSE), but the final assignment still either raises a run-time type error or produces a noncircular
+circle. Once again, therefore, we conclude that object IDs and a good model of inheritance are
+incompatible.
+       We conjecture that the foregoing conclusion goes some way toward explaining why (so far as
+we know) there have been no good inheritance models in the past. To be specific, all of the prior
+work on inheritance that we are aware of has been done in an object setting specifically, and the
+object world generally seems to take it as a sine qua non that object IDs must be supported. As we
+have now seen, however, object IDs imply that the model must be bad. In other words, (a) objects
+imply object IDs; (b) object IDs and a good model of inheritance are incompatible; (c) hence,
+objects per se and a good model of inheritance are incompatible!
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          481
+Appendixes                                 Appendix F / A Closer Look at Specialization by Constraint
+
+
+      What is more, since it is clearly an assumption underlying the claims of reference [137]
+regarding “the 3 out of 4 rule” that object support is a desideratum, it is tempting to suggest that we
+should really have been talking all along about “a 4 out of 5 rule” instead, where the fifth element—
+and clearly the one to be discarded—was objects themselves.
+      One last point on this topic: Nothing we have said in this section has anything to do with
+databases specifically. In other words, the problems we have been discussing apply equally well to
+the use of pointers or object IDs for purely local data as well as for database data per se. (This
+observation does not necessarily mean there should be no pointer support in the nondatabase
+portions of D, but it does mean that such support, if it exists, should be treated with all due caution.)
+
+Why the Problems Do Not Arise with Foreign Keys
+
+It is interesting to observe that problems analogous to those we have been discussing do not arise
+with foreign keys (which are sometimes claimed to be the relational world’s counterpart to pointers
+or object IDs). By way of illustration, consider this example once again (the second of those
+previously discussed):
+      VAR E ELLIPSE ;
+      VAR XC PTR_TO_CIRCLE ;
+
+      E := CIRCLE ( LENGTH ( 5.0 ), POINT ( 0.0, 0.0 ) ) ;
+      XC := TREAT_AS_PTR_TO_CIRCLE ( PTR_TO ( E ) ) ;
+      THE_A ( E ) := LENGTH ( 6.0 ) ;
+
+     Ignoring irrelevancies, a relational analog of this example might involve relvars looking
+something like this:
+      VAR R1 ... RELATION { K ELLIPSE ... } KEY { K } ;
+
+      VAR R2 ... RELATION { K CIRCLE ... } FOREIGN KEY { K } REFERENCES R1 ;
+
+       For simplicity, we assume no referential actions—cascade update, etc.—are specified (this
+simplifying assumption does not materially affect the argument in any way). Both relvars are
+initially empty.
+       Observe now that every value of K in relvar R1 that “matches” some value of K in relvar R2
+must be of type CIRCLE, not just of type ELLIPSE. So let us insert a tuple into each of the two
+relvars:
+      INSERT R1 ... TUPLE { K CIRCLE ( LENGTH ( 5.0 ), POINT ( 0.0, 0.0 ) ) } ... ;
+
+      INSERT R2 ... TUPLE { K CIRCLE ( LENGTH ( 5.0 ), POINT ( 0.0, 0.0 ) ) } ... ;
+
+      Finally, let us try to “update the tuple” in R1:
+      UPDATE R1 WHERE K = CIRCLE ( LENGTH ( 5.0 ), POINT ( 0.0, 0.0 ) )
+              ( THE_A ( K ) := LENGTH ( 6.0 ) ) ;
+
+      This UPDATE attempts to “G by C” the circle in the single tuple in R1 to type ELLIPSE.
+That attempt fails, however (and the overall UPDATE fails), on a referential integrity violation. So
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          482
+Appendixes                                          Appendix F / A Closer Look at Specialization by Constraint
+
+
+we do get a run-time error. But the error in question is a run-time integrity violation, not a run-time
+type error (run-time integrity violations are always possible, of course). What we do not get is a
+noncircular circle, nor a failure of G by C. Overall, in fact, we have a system in which noncircular
+circles cannot occur, type constraints can be supported, and in particular S by C and G by C are
+supported too.
+
+
+IMPLEMENTATION CONSIDERATIONS
+
+As we have seen, S by C (including G by C) is an area in which our inheritance model differs
+significantly from that usually found in object languages. The following quote from a paper by
+Rumbaugh [123] illustrates the point:
+
+        Is SQUARE a subclass of RECTANGLE? ... Stretching the x-dimension of a rectangle is a perfectly reasonable
+        thing to do. But if you do it to a square, then the object is no longer a square. This is not necessarily a bad thing
+        conceptually. When you stretch a square you do get a rectangle ... But ... most object-oriented languages do not
+        want objects to change class ... [This] suggests [a] design principle for classification systems: A subclass should
+        not be defined by constraining a superclass.
+
+        Observe that Rumbaugh’s conclusion—i.e., his “design principle for classification
+systems”—is the diametric opposite of our own, which is that S by C is the only conceptually valid
+way of defining a subclass (or subtype, in our terms). Note too, however, that Rumbaugh takes the
+position he does, at least in part, because “[object] languages do not want objects to change class.”
+Our own model, by contrast, was deliberately not constrained by existing languages or
+implementations;1 we wanted to define the abstract model first and leave implementation concerns
+till later. In particular, as explained earlier in this appendix, we included S by C in that model
+because we think it is useful. But we would certainly remove it if it turned out to be impossible to
+implement or impossible to implement efficiently.
+        So can S by C be implemented efficiently? Well, it is relevant to observe that Rumbaugh
+buttresses his conclusion with the following claim:
+
+        It would be computationally infeasible to support a rule-based, intensional definition of class membership,
+        because you would have to check the rules after each operation that affects an object.
+
+(The phrase “rule-based, intensional definition of class membership” refers to S by C and G by C; it
+means, for example, that a given ellipse is a member of the class of circles if it satisfies the rule that
+a = b.)
+      However, we reject the foregoing claim; we believe the computational aspects of S by C can
+be handled both simply and efficiently. To be more specific, we reject both (a) the suggestion that
+S by C is “computationally infeasible” (i.e., that it imposes intolerable computational overhead) and
+(b) the suggestion that the most specific type has to be (re)computed “after each operation that
+affects an object.” We now proceed to elaborate on these points.
+      Let X be an expression. Then the first and most important point is that it is never necessary to
+compute the current most specific type MST(X), as such, of that expression X; it is necessary only to
+
+1
+    Though the original version was!
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                             483
+Appendixes                                Appendix F / A Closer Look at Specialization by Constraint
+
+
+determine in certain contexts whether the current value v(X) of X is of some particular type—to be
+more precise, whether it is of some specific proper subtype of the declared type DT(X) of X. By
+way of example, consider the simple type graph shown in Fig. F.1 (a repeat of Fig. 15.1). Let
+DT(X) and MST(X) be PARALLELOGRAM and SQUARE, respectively, and consider the
+expression TREAT_AS_RECTANGLE(X). In order to evaluate that expression, we clearly do not
+need to compute MST(X)—all we need to do is ascertain whether X is indeed of type
+RECTANGLE.
+╔═════════════════════════════════════════════════════════════════╗
+║                        ┌───────────────┐                        ║
+║                        │ PARALLELOGRAM │                        ║
+║                        └───────┬───────┘                        ║
+║                 ┌──────────────┴──────────────┐                 ║
+║          ┌─────────────┐                ┌─────────────┐         ║
+║          │ RECTANGLE │                  │   RHOMBUS   │         ║
+║          └──────┬──────┘                └──────┬──────┘         ║
+║                 └──────────────┬──────────────┘                 ║
+║                         ┌─────────────┐                         ║
+║                         │   SQUARE    │                         ║
+║                         └─────────────┘                         ║
+╚═════════════════════════════════════════════════════════════════╝
+Fig. F.1: A simple type graph
+
+     Next, we observe that the remarks of the foregoing paragraph apply if X is a selector
+invocation in particular. To revert for a moment to our usual example of ellipses and circles: As
+we know, the selector invocation
+      ELLIPSE ( LENGTH ( 5.0 ), LENGTH ( 5.0 ), POINT ( 0.0, 0.0 ) )
+
+is defined by the model to return a value of most specific type CIRCLE, not ELLIPSE (“in other
+words, S by C occurs,” as we put it in Chapter 14 when we first discussed this example). But there
+is no need for the implementation to perform S by C as such at this time; to repeat, all it has to do is
+be able to ascertain subsequently that the value in question is indeed a circle, if and when some
+operation—e.g., TREAT_AS_CIRCLE(X)—is executed that depends in some way on that fact.
+       As the basis for a more searching discussion, we return to the type graph of Fig. F.1. Suppose
+again that DT(X) is PARALLELOGRAM and we need to determine whether v(X) is of type
+SQUARE. Now, there are two paths in the graph from PARALLELOGRAM to SQUARE, via
+RECTANGLE and RHOMBUS respectively, and the system needs to choose one in order to make
+that determination. Suppose it chooses the one via RHOMBUS. If v(X) fails to satisfy the
+constraint for RHOMBUS, then it is certainly not of type SQUARE; but if it does satisfy the
+constraint for RHOMBUS, then it needs to be tested against the constraint for SQUARE. On the
+face of it, therefore, it seems that no more than two nodes of the graph need be visited in order to
+discover whether v(X) is a square: two if it is a rhombus, otherwise just one.
+       Recall from Chapter 15, however, that the type constraint for type SQUARE takes the form:
+      IS { RECTANGLE, RHOMBUS }
+
+(we omit the POSSREP specification for simplicity). Thus, it looks as if it might be necessary to
+traverse the path from PARALLELOGRAM to RECTANGLE as well as the one from
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         484
+Appendixes                                       Appendix F / A Closer Look at Specialization by Constraint
+
+
+PARALLELOGRAM to RHOMBUS, in order to determine whether v(X) is of type RECTANGLE
+as well as of type RHOMBUS. However, we can avoid this apparent need to visit additional nodes
+by labeling the arc from RHOMBUS to SQUARE with the constraint that determines whether a
+given parallelogram is a rectangle.1 Then, if the implementation discovers that v(X) is a rhombus, it
+can immediately check to see whether it is a rectangle (and hence a square) too, without having to
+visit any additional nodes.
+       Here then is an algorithm (“TEST_T”), embodying the foregoing ideas, for determining
+whether some specified value v of some known type t is of some specified type s:
+        OPERATOR TEST_T ( v value, t type, s type ) RETURNS BOOLEAN ;
+            IF t = s
+                THEN RETURN TRUE ;
+                ELSE
+                    BEGIN ;
+                        let t' be some immediate subtype of t
+                             that is also a supertype of s ;
+                        let IC be the specialization constraint
+                             on the arc from t to t' ;
+                        IF v satisfies IC
+                            THEN RETURN ( TEST_T ( v, t', s ) ) ;
+                            ELSE RETURN FALSE ;
+                        END IF ;
+                    END ;
+            END IF ;
+        END OPERATOR ;
+
+      It should be clear that this algorithm of itself is certainly “computationally feasible” and does
+not impose intolerable overhead. Of course, we do need to consider how often it needs to be
+invoked; in particular, we need to consider whether it is invoked so frequently that those
+invocations do constitute an excessive performance burden. We will return to these matters at the
+end of this section. First, however, we need to pin down the contexts in which TEST_T needs to be
+invoked. Careful consideration of the inheritance model described in this book reveals that there
+are precisely three such contexts:
+
+    ■   TREAT: The expression TREAT_AS_T(X), where T is a proper subtype of DT(X), is
+        evaluated by raising an exception if TEST_T(X,DT(X),T) returns FALSE.
+
+    ■   Type testing: The expression IS_T(X), where T is a proper subtype of DT(X), is logically
+        equivalent to TEST_T(X,DT(X),T).
+
+    ■   Operator version selection (“binding”): As explained under IM Prescription 17, operators
+        are allowed to have several implementation versions, each with a different version signature;
+        moreover, the system is generally expected to “bind” a given invocation, somehow, to the
+        version whose signature best matches the corresponding invocation signature—though as
+        noted in Chapter 14 there is actually no requirement in the model per se that it do so. Let Op
+
+1
+  If there were any intervening nodes between PARALLELOGRAM and RECTANGLE, the constraint in question
+would have to be the conjunction of all constraints on the path from PARALLELOGRAM to RECTANGLE. And if
+there were more than one such path, the system would have to choose one, just as it had to choose whether to follow the
+RECTANGLE or RHOMBUS path to SQUARE in our earlier discussion.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                       485
+Appendixes                                       Appendix F / A Closer Look at Specialization by Constraint
+
+
+       be an operator, then, and let OpI be some invocation of Op. If the most specific types of all
+       arguments to OpI are known, then the binding problem reduces to one that has already been
+       solved in existing languages. However, determining those most specific types under S by C
+       clearly does involve overhead, so let us concentrate for the moment on the argument declared
+       types instead (which are certainly known). If any of those types is a proper subtype of its
+       corresponding parameter, and an implementation version for that proper subtype is available,
+       then at least part of the binding process can be done at compile time. At run time, the system
+       will need to know which implementation versions are available to suit the declared types of
+       the arguments. If there are several such, and at least one has a parameter whose declared type
+       is a proper subtype of that of the corresponding argument, then the system does have some
+       type testing to do (i.e., it does need to invoke TEST_T at run time). We will have a little more
+       to say in connection with this point in the very last sentence of this appendix.
+
+       We claim there is nothing else in our inheritance model that requires TEST_T to be invoked at
+run time.1 In particular, equality comparisons do not require it. To be more specific, it is sufficient
+in order to evaluate the comparison X = Y (a) to determine the most specific common supertype of
+DT(X) and DT(Y) (which can be done at compile time) and then (b) to invoke the “=“ operator for
+that common supertype. (Actually, any common supertype that is not a dummy type can be chosen
+for this purpose.)
+       We offer one further argument to justify our claim that S by C does not entail excessive
+overhead: Whenever the assignment X := Y is executed, either explicitly or implicitly, the system
+knows the declared type of Y and can thus flag X internally as being of that type. Such a flag could
+allow subsequent invocations of TEST_T on X to be performed on a smaller portion of the type
+graph, or even to be eliminated entirely in some cases. In the same kind of way, whenever X is
+specified as an argument to some operator invocation that requires run-time examination of the
+types of its arguments, the system can take the opportunity to “remember” any types it discovers.
+       We turn now to the suggestion that the most specific type has to be (re)computed “after each
+operation that affects an object.” In fact, of course, we have already seen that there is no need to
+compute the most specific type, as such, at all. In particular, if variable V is updated by some
+invocation of some update operator, there is no need to determine MST(V) after that invocation (at
+least, not at the time of the invocation). All we need is to be able to determine subsequently
+whether V is of some specified type—and we have already discussed that requirement at length.
+       Finally, we return as promised to the issue of how often TEST_T needs to be invoked and
+consider whether those invocations might constitute a serious performance burden. Suppose the
+system did not support inheritance and S by C at all, and suppose we have a user-defined type
+POLYGON. Then there are two possibilities—(a) we might want, on certain occasions, to execute
+different code depending on whether a given polygon is in fact a rectangle or “just a polygon,” or
+(b) we might not. For example, suppose we want to implement an AREA operator for polygons.
+
+
+1
+  Observe in particular that—unlike SQL (see Appendix H)—our model prescribes no operator for testing whether a
+given expression is of a given most specific type (see the remarks on this issue at the end of IM Prescription 15 in
+Chapter 14). If such an operator were supported nonetheless, the algorithm FIND_MST given in Chapter 14 could be
+used to implement it. In this connection, it is worth pointing out that FIND_MST does not necessarily entail visiting
+every node between the declared type and most specific type of its operand.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                        486
+Appendixes                               Appendix F / A Closer Look at Specialization by Constraint
+
+
+Then we might or might not want to check whether the argument to a given AREA invocation is in
+fact a rectangle (and use the simple “height times width” formula when it is):
+
+ ■   Suppose we do want to perform such a check. In effect, then, we will have to include our
+     own implementation of the IS_RECTANGLE operator—in effect, of TEST_RECTANGLE—
+     inside the AREA code. Clearly, support for inheritance with S by C would make our task a
+     little easier in this case, because there would be no need for us to provide that implementation
+     after all. Moreover, the effect on overall system performance is more or less the same either
+     way; the main difference is just that the type checking is done by the system instead of the
+     application, if S by C is supported.
+
+ ■   By contrast, suppose we do not want to perform such a check. In this case, support for S by C
+     (and TEST_T) would clearly impose no overhead at all, because the type checking would
+     simply not be done.
+
+      Analogous remarks apply to TREAT operations and the binding process (these being the other
+areas requiring invocation of TEST_T, if S by C is supported). We consider the binding process
+briefly. To continue with the AREA example, the question is: Would we include code in the
+AREA implementation, not only to check whether the argument to a given AREA invocation is a
+rectangle, but also to use the simple “height times width” formula when it is?
+
+ ■   Suppose we would include such code. In effect, then, we will be providing two separate
+     versions of the AREA operator bundled together within the AREA implementation, as well as
+     code to perform the run-time binding process. Again, direct support for inheritance with S by
+     C would surely make our task a little easier, and the effect on overall system performance will
+     be more or less the same either way.
+
+ ■   By contrast, suppose we would not include such code. In that case, support for S by C clearly
+     imposes no overhead at all.
+
+      In conclusion, it is worth pointing out that (as the foregoing discussion suggests) what
+overhead S by C does impose is a function of the number of different implementation versions
+provided, not a function of the number of subtypes and constraints involved.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      487

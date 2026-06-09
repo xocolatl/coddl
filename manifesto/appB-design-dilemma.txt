@@ -1,0 +1,237 @@
+                                            Appendix B
+
+                                 A Design Dilemma?
+
+It is sometimes suggested that to consider relational domains as fully fledged data types, as The
+Third Manifesto does, is to introduce a design dilemma. For example, suppose we need to deal with
+employees, where every employee has an employee number (EMP#), a name (ENAME), a
+department number (DEPT#), and a salary (SALARY). Consider the following Tutorial D
+definitions (constraints deliberately omitted until further notice, for simplicity):
+       TYPE EMP                                                /* “Design T” */
+       POSSREP { EMP#       CHAR, ENAME      CHAR, DEPT# CHAR, SALARY MONEY ... } ;
+       VAR EMP REAL                                            /* “Design R” */
+       RELATION { EMP#       CHAR, ENAME      CHAR, DEPT# CHAR, SALARY MONEY } ... ;
+
+      Clearly, we could define an EMP type (“Design T”) or an EMP relvar (“Design R”). The
+question we address in this appendix is: Which approach is better? In other words, are there any
+grounds for choosing one over the other?
+
+
+ENCAPSULATION
+
+One immediate difference between Design T and Design R is that the EMP type is encapsulated,
+while the EMP relvar is not. Now, encapsulation is a term much used in the object world, and you
+might already be familiar with it. However, you might also have noticed that we have not used it at
+all in this book prior to this point—mainly because we do not find much need for it; in fact, we
+believe it is the source of some confusion [64]. Be that as it may, we now explain it.
+        Briefly, to say some object is encapsulated is simply to say the object in question has no user-
+visible components, no matter how complex its physical representation—i.e., its internal encoding—
+might be. (We are using the term object here in its generic sense, not its special object-oriented
+sense.) Observe immediately, therefore, that all scalar values and variables are encapsulated by
+definition. Tuple and relation values and variables, by contrast, are not encapsulated in this sense,
+because they involve a set of user-visible attributes. In fact, an object is encapsulated if and only
+if it is scalar; that is, encapsulated and scalar mean exactly the same thing. And this fact explains
+why we find little use for the term: After all, it really just means users do not need to worry about
+what they should not need to worry about: namely, internal encodings. Indeed, the idea that scalar
+values and variables must be encapsulated is a logical consequence of the distinctions we draw
+between model and implementation in general, and between type and representation in particular.
+        Getting back to the example, the fact that the EMP type in Design T is encapsulated means
+that values and variables of type EMP are scalar (they have no internal structure so far as the user is
+concerned). Of course, we do have a set of operators available to us—THE_EMP#,
+THE_SALARY, etc., in Tutorial D—that allow us to “get and set” certain employee properties, but
+the availability of those operators says nothing about any internal structure employees might
+possess, as we have explained at several places in the body of this book already.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        401
+Appendixes                                                                       Appendix B / A Design Dilemma
+
+
+      By contrast, the EMP relvar in Design R is definitely not encapsulated; that is, the user
+definitely does know with Design R that employees have a component that is the EMP# attribute, a
+component that is the SALARY attribute, and so on. Furthermore, of course, access to those
+components is not by means of “THE_ operators” or anything of that nature but is more direct (or
+what might be thought of as more direct, at any rate).
+
+
+DISCUSSION
+
+We now proceed to argue that, at least in the particular case under discussion, the “choice” is really
+no choice at all. Observe first that Design T gives us no way to hire and fire!—thus, that design is
+clearly insufficient as it stands. The reason is that type EMP is the set of all possible employees,1
+and there is simply no way to insert new employees into that set or delete existing ones. To put it
+another way, the set in question contains all possible values of the form EMP(e#,en,d#,sal), where
+e#, en, d#, and sal are values of types CHAR, CHAR, CHAR, and MONEY, respectively,
+regardless of whether any employee actually exists with the indicated properties. In other words
+(loosely): Types are static. Again, if you are having difficulty with this idea, consider the simpler
+example of type INTEGER. This type is the set of all possible integers, and it is clearly not
+possible to insert new ones or delete existing ones. (Indeed, to pursue the point a moment longer,
+suppose it were possible to “insert a new integer.” Where would that “new integer” come from?)
+      It follows from the foregoing that Design T additionally requires an accompanying relvar,
+perhaps looking like this:
+       VAR EMP1 REAL RELATION { EMP EMP } KEY { EMP } ;
+
+Relvar EMP1—“1” because it has just one attribute—contains a tuple for every employee currently
+of interest (meaning, presumably, every employee who currently works for the company), and now
+of course we do have a way to hire new employees and fire existing ones. Note carefully, however,
+that relvar EMP1 does indeed have just one attribute, not four, thanks to encapsulation. Note too
+that the KEY specification is almost a “no op”; in particular, it does not say that employee numbers
+are unique.
+       One implication of the Design T approach is thus that it tends to suggest that the database will
+wind up containing a large number of single-attribute relvars: a fact that should perhaps give us
+some pause (see further discussion in just a moment).
+       Anyway, note that now not only can we “hire and fire employees,” we can also perform
+operations analogous—though not identical—to the usual relational operations that we would have
+performed on the relvar EMP if we had opted for Design R. Here are a couple of examples:
+
+“Restriction”: Get employees with salary greater than $50,000.
+       EMP1 WHERE THE_SALARY ( EMP ) > MONEY ( 50000 )
+
+
+
+1
+  More accurately, the set of all possible employee surrogates or representatives. The type EMP does not contain
+actual employees, of course, but rather symbols—symbols that can be used as surrogates or representatives (inside a
+database, for example) that stand for employees per se.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                       402
+Appendixes                                                                          Appendix B / A Design Dilemma
+
+
+“Projection”: Get all employee-name/employee-salary pairs.
+         ( EXTEND EMP1 ADD ( THE_ENAME ( EMP ) AS ENAME,
+                             THE_SALARY ( EMP ) AS SALARY ) )
+         { ENAME, SALARY }
+
+      As you can see, however, the result in this second example has two attributes, not one! Thus,
+it should be clear that:
+
+    ■    Given the single-attribute relvar EMP1 required by Design T, we can create the four-attribute
+         relvar EMP required by Design R (as a view, perhaps).
+
+    ■    Furthermore, we would probably want to do exactly that in practice, because—for a variety of
+         reasons—the four-attribute relvar is considerably more convenient than the single-attribute
+         one.
+
+Here to spell it out is a definition for that four-attribute view (let us call it EMP4):
+         VAR EMP4 VIRTUAL ( ( EXTEND EMP1 ADD ( THE_EMP#   ( EMP ) AS EMP#,
+                                                THE_ENAME ( EMP ) AS ENAME,
+                                                THE_DEPT# ( EMP ) AS DEPT#,
+                                                THE_SALARY ( EMP ) AS SALARY ) )
+         { EMP#, ENAME, DEPT#, SALARY } ) KEY { EMP# } ;
+
+      Note in particular that the KEY specification for EMP4 does state that employee numbers are
+unique. In other words, we can start off with Design T, the type design, if we like, which means we
+also need an associated single-attribute relvar—but we quickly find that, in effect, we have created
+Design R (the relvar design) as well. So Design T implies that we wind up with everything in
+Design R, plus the type EMP, plus the single-attribute relvar EMP1 as well. So what was the point
+of opting for Design T in the first place? And what purpose is served, exactly, in Design T by the
+type EMP and the single-attribute relvar EMP1?
+
+
+FURTHER CONSIDERATIONS
+
+What then is the criterion for making something a type and not a relvar? (We must have some
+types, of course, if only for the obvious reason that relvars cannot be defined without them.) In our
+opinion, this question is still somewhat open. However, we offer the following points for
+consideration:
+
+    ■    In conventional design terms, types correspond—loosely speaking—to properties and relvars
+         to entities (or sets of properties and sets of entities, rather). Hence, if something is “only” a
+         property, it should map to a type and not a relvar.
+              The trouble with this idea, of course, is that “one person’s property is another person’s
+         entity.” For example, consider colors. We would usually tend to think of (say) the color red
+         as a property,1 not an entity, and we would therefore usually tend to map colors into a type.
+
+1
+    As a property of some entity, that is. The concept of a property in isolation makes no sense.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                  403
+Appendixes                                                                          Appendix B / A Design Dilemma
+
+
+        But some users might be very interested in the color red as an entity, with further properties of
+        its own (shade, for example, or intensity)—in which case we might want to map colors into a
+        relvar. Perhaps this is an example of a situation where we need both a type and a relvar.
+
+    ■   Another important general point is that if “hire and fire” (or something analogous to “hire and
+        fire”) is a requirement, then we are definitely talking about entities rather than properties, and
+        we should definitely be aiming for a relvar design.
+              Given this state of affairs, incidentally, it is odd that so many articles and presentations
+        on object systems use employees, departments, and so forth as examples of object classes. An
+        object class is a type, of course, and so those presentations are typically forced to go on to
+        define a “collection” for those employees, a “collection” for those departments, and so on.
+        What is more, those “collections” are collections of encapsulated objects, and they therefore
+        effectively omit the all-important user-visible attribute names. As a consequence, they do not
+        lend themselves very well to the formulation of ad hoc queries, declarative integrity
+        constraints, and so forth—a fact that advocates of the approach themselves often admit,
+        apparently without being aware that it is precisely the lack of user-visible attribute names (in
+        effect, the encapsulation) that causes the difficulties.1 As a trivial example, consider the class
+        (i.e., type) INTEGER and some corresponding collection of “currently interesting” integers.
+        Does that collection have a name for its sole attribute? Probably not. And if not, we cannot
+        (e.g.) join it to any other collection.
+
+    ■   The following conjecture (previously articulated in the exercises in Chapter 14) is relevant to
+        the issue too: If the only operators that apply to some given type are the ones that are
+        provided “automatically”—THE_ operators, selectors, “=”, “:=”, and so on—then the type
+        was probably not worth defining in the first place.
+
+       Overall, we believe the most appropriate design will emerge if careful consideration is given
+to the distinction between (a) declarative sentences in natural language, on the one hand, and (b) the
+vocabulary used in the construction of such sentences on the other. As we showed in Chapter 2 (but
+simplifying slightly here), it is unencapsulated tuples in relations that stand for those sentences, and
+it is encapsulated domain values in attributes in those tuples that stand for particular elements—
+typically nouns—in that vocabulary. To say it slightly differently (and to repeat what we said in
+Chapter 2, albeit in different words): Domains, or types, give us values that represent things we
+might wish to make statements about; relations give us ways of making those statements.
+       Consider once again the EMP relvar of Design R. Suppose that relvar includes the tuple
+        TUPLE { EMP# 'E7',            ENAME 'Amy', DEPT# 'D5', SALARY MONEY ( 60000 ) }
+
+     The existence of this tuple in the relvar means, by definition, that the database includes
+something that asserts that the following declarative sentence (statement) is true:
+
+
+1
+   In fact, object systems typically support ad hoc queries, etc., by breaking encapsulation and exposing physical
+representations! To quote reference [107]: “All object DBMS products currently require that [object components]
+referenced in ... queries be public [i.e., visible to the user].” Likewise, reference [7] says: “Query management ... is one
+situation where violating encapsulation is almost obligatory.”
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                            404
+Appendixes                                                            Appendix B / A Design Dilemma
+
+
+      Employee E7, named Amy, is assigned to department D5 and earns a salary of $60,000.
+
+       By contrast, consider the EMP type of Design T. Where the relvar of Design R allowed us to
+insert the tuple just shown (loosely speaking), with the interpretation just explained, the type of
+Design T allows us instead to execute the following selector invocation:
+      EMP ( 'E7', 'Amy', 'D5', MONEY ( 60000 ) )
+
+       This invocation does not of itself assert or deny the truth of anything at all. Rather, it
+constitutes nothing more than a certain rather heavy-duty noun, something like “an E7-numbered,
+Amy-named, D5-assigned, $60,000-earning employee.” Now, we can if we like form a 1-tuple
+containing just that noun—i.e., that EMP value—and then effectively insert that 1-tuple into the
+single-attribute relvar EMP1 that Design T additionally requires; to do so, however, is effectively
+just to place a “There exists” in front of that noun, to make a declarative sentence, the truth of which
+is thereby asserted.
+       Of course, the “true fact” asserted by the 4-tuple in Design R is exactly the same as the “true
+fact” asserted in different words (as it were) by the 1-tuple in Design T. However, designers might
+profitably reflect on which of the two ways of asserting that fact is the more economical, the more
+communicative, and the more tractable to further reasoning.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         405

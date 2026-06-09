@@ -1,0 +1,123 @@
+                                                   Appendix D
+
+                                    What Is a Database?
+
+This book’s predecessor, reference [83], included text along the following lines:
+
+      The first version of the Manifesto drew a distinction between database values and database variables, analogous
+      to that between relation values and relation variables. It also introduced the term dbvar as shorthand for
+      database variable. While we still believe this distinction to be a valid one, we found it had little direct relevance
+      to other aspects of the Manifesto. We therefore decided, in the interests of familiarity, to revert to more
+      traditional terminology.
+
+      And we have continued to use the term database in the traditional way in the present book, of
+course. However, reference [85] quotes the foregoing text and then adds:
+
+      Now this bad decision has come home to roost! With hindsight, it would have been much better to “bite the
+      bullet” and adopt the more logically correct terms database value and database variable (or dbvar), despite their
+      lack of familiarity.
+
+      That same reference gives arguments in support of this position, but those arguments need not
+concern us here; the simple fact is, a database is a variable (its value changes over time), regardless
+of whether we call it a “dbvar” or just a database. As William Shakespeare would agree,
+differences in terminology (only) are not logical differences.
+
+
+UPDATING THE DATABASE
+
+It follows from the foregoing that when we update a database relvar, what we are really doing is
+updating the dbvar that contains that relvar (for clarity, we adopt the term dbvar for the remainder
+of this discussion). For example, the Tutorial D statement
+      DELETE SP WHERE QTY < QTY(150) ;
+
+updates the shipments relvar SP and thus “really” updates the entire suppliers-and-parts dbvar (the
+“new” database value for that dbvar being the same as the “old” one except that certain shipment
+tuples have been removed).
+      Recall now, however, that in Chapter 6 (under RM Prescription 13) we said this:
+
+      Do not make the mistake of thinking that a relation variable is a set of tuple variables. A
+      relation variable is a variable whose permitted values are relation values; updating a relation
+      variable replaces the current relation value of that variable by another such value. There is no
+      notion, nor can there be any notion, that “updating a relation variable” really means updating
+      some tuple variable(s) within the relation variable in question.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                           413
+Appendixes                                                                Appendix D / What Is a Database?
+
+
+      This idea—i.e., that it makes no sense to regard, e.g., a relation variable as a collection of
+tuple variables—is considered at more length in reference [79]. But if it makes no sense to regard a
+relvar as a collection of tuple variables or “tuplevars,” how can it make sense to regard a dbvar as a
+collection of relvars? Are we not being inconsistent here?
+      A point of clarification: Before we try to answer these questions, we need to make it clear
+that when we say the database is a variable, we are speaking conceptually. The Manifesto includes
+no prescription regarding the ability to define such variables or the ability to operate on them (other
+than indirectly, via database relvars); it does not even have anything to say regarding the names of
+such variables. And Tutorial D has nothing to say about such matters either. To quote Chapter 5:
+
+         [Neither] databases nor catalogs are explicitly mentioned anywhere in the syntax of Tutorial
+         D.
+
+
+THE DATABASE IS A TUPLE
+
+We now claim there is no inconsistency in our position after all. (Were you surprised?) While we
+might say, informally, that a dbvar is a variable that contains other variables (viz., relvars), we stress
+the fact that such a characterization is indeed only informal. We claim further that there is a more
+formal and more accurate way to describe the situation—viz.:
+
+                                                  A dbvar is a tuplevar
+
+       The tuplevar in question has one attribute for each real relvar1 in the database (and no other
+attributes), and each of those attributes is relation valued. In the case of suppliers and parts, for
+example, we can think of the entire dbvar as a tuplevar of the following tuple type:
+         TUPLE { S      RELATION { S# S#, SNAME NAME, STATUS INTEGER, CITY CHAR },
+                 P      RELATION { P# P#, PNAME NAME, COLOR COLOR, WEIGHT WEIGHT,
+                                   CITY CHAR },
+                     SP RELATION { S# S#, P# P#, QTY QTY } }
+
+      Suppose we call the tuplevar in question SPDB. Then the DELETE example from the
+previous section might be regarded as shorthand for the following <tuple update>:
+         UPDATE SPDB ( SP := SP WHERE NOT ( QTY < QTY(150) ) ) ;
+
+         And this <tuple update> in turn is shorthand for the following <tuple assign>:
+         SPDB := UPDATE SPDB ( SP := SP WHERE NOT ( QTY < QTY(150) ) ) ;
+
+         This <tuple assign> expands to:
+         SPDB := ( ( EXTEND SPDB ADD ( SP WHERE NOT ( QTY < QTY(150) ) AS NEWSP ) )
+                   { ALL BUT SP } ) RENAME ( NEWSP AS SP ) ;
+
+
+
+1
+    We ignore virtual relvars in this appendix, for simplicity.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                           414
+Appendixes                                                        Appendix D / What Is a Database?
+
+
+      Or equivalently to:
+      SPDB := TUPLE { S (    S FROM SPDB ), P ( P FROM SPDB ),
+                      SP ( ( SP FROM SPDB ) WHERE NOT ( QTY < QTY(150) ) ) } ;
+
+      In sum: A dbvar is a tuplevar, and a database (i.e., the value of some given dbvar at some
+given time) is a tuple. What is more, given a <relation assign> of the form
+      R := r
+
+(where R is a <relation target> and r is a <relation exp>), we can say that the expression R
+appearing on the left side is really a pseudovariable reference!—the <relation assign> is shorthand
+for an assignment that “zaps” one component of the corresponding dbvar (or tuplevar).
+      We close this section, and this appendix, by noting that Exercise 1.1 (see Chapter 1) asked for
+a precise definition of the term database. This appendix provides such a definition—one that is
+possibly rather different from what you might have expected.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        415

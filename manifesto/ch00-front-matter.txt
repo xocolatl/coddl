@@ -1,0 +1,524 @@
+Third Edition
+with minor revisions for this online copy (see next page)
+
+
+
+
+                                                              The Third Manifesto
+
+
+A detailed study of the impact of type theory
+on the relational model of data,
+including a comprehensive model of type inheritance
+
+                                                                                    C. J. Date
+                                                                                               and
+
+                                                                              Hugh Darwen
+
+
+
+
+Many of the designations used by manufacturers and sellers to distinguish their products are
+claimed as trademarks. Where those designations appear in this book, and we were aware of a
+trademark claim, the designations have been printed in caps or initial caps.
+                              All logical differences are big differences
+
+                                                                              —Ludwig Wittgenstein
+
+
+                                     ————  ———
+
+
+
+                                   Again I must remind you that
+                                 A Dog’s a Dog──A CAT’S A CAT
+
+                                                                     —T. S. Eliot, demonstrating that
+                                                                          logical differences are not
+                                                                         everything, and nor is logic
+
+
+                                   ————  ————
+
+
+                               We would like to dedicate this book to
+                                philosophers and poets everywhere
+
+
+———————
+
+This book is a major revision of an earlier book that was published under the title Foundation for
+Future Database Systems: The Third Manifesto (ISBN 0-201-70928-7) published by Addison-
+Wesley in 2000. That in turn was a revision of Foundation for Object/Relational Database
+Systems: The Third Manifesto (ISBN 0-201-30978-5) published by Addison-Wesley in 1998.
+
+In this PDF copy, provided at www.thethirdmanifesto.com, text marked in blue is either material
+that does not appear in the book as published in 2007, or material in that book that was later revised,
+or material in a Tutorial D example affected a by subsequent change to that language. In the latter
+two cases the revisions in question can be seen in other documents at the same web site. A few
+minor errors in the book have been silently corrected and a few pieces of text not appropriate to this
+online version have been silently excluded.
+Disclaimer: It proved difficult to faithfully reproduce the formatting of the printed book.
+Typographical errors might have been introduced in the editing process. Please report any problems
+to Hugh Darwen (hd@thethirdmanifesto.com).
+———————
+                                        Contents
+                                    ———  ———
+
+             Preface     x
+
+                                PART I      PRELIMINARIES
+
+Chapter 1    Background and Overview          2
+
+             The Third Manifesto       3
+             Back to the relational future 8
+             Some guiding principles 10
+             Some crucial logical differences      11
+             Concluding remarks       13
+             Exercises 15
+
+Chapter 2    A Survey of the Relational Model           16
+
+             The running example       16
+             Tuples 18
+             Relations     21
+             Relation variables 23
+             Relvars, relations, and predicates    28
+             Integrity constraints    32
+             Relational operators 35
+             Virtual relvars 48
+             The relational model      48
+             Exercises 50
+
+Chapter 3    Toward a Theory of Types         56
+
+             Values are typed 58
+             Types vs. representations  61
+             Scalar vs. nonscalar types  62
+             Possible representations 62
+             Selectors and THE_ operators 64
+             System-defined types 70
+             Operators 71
+             Type generators 75
+             Concluding remarks 77
+             Exercises 78
+                                    ———  ———
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                  iii
+                                          Contents
+
+
+                          PART II     FORMAL SPECIFICATIONS
+
+Chapter 4    The Third Manifesto     82
+
+             RM Prescriptions    82
+             RM Proscriptions 90
+             OO Prescriptions   91
+             OO Proscriptions 92
+             RM Very Strong Suggestions  92
+             OO Very Strong Suggestions 93
+             Recent Manifesto changes 93
+
+Chapter 5    Tutorial D     96
+
+             Common constructs 99
+             Scalar definitions    102
+             Tuple definitions 104
+             Relational definitions 104
+             Scalar operations    106
+             Tuple operations     110
+             Relational operations 114
+             Relations and arrays 122
+             Statements 124
+             Recent language changes 125
+             A remark on syntax 127
+             Exercises 129
+
+                                    ———  ———
+
+             PART III     INFORMAL DISCUSSIONS AND EXPLANATIONS
+
+Chapter 6    RM Prescriptions       133
+
+             RM Prescription 1: Scalar types 133
+             RM Prescription 2: Scalar values are typed 137
+             RM Prescription 3: Read-only vs. update operators 137
+             RM Prescription 4: Physical vs. possible representations 144
+             RM Prescription 5: Expose possible representations 149
+             RM Prescription 6: Type generator TUPLE 153
+             RM Prescription 7: Type generator RELATION          159
+             RM Prescription 8: Equality     163
+             RM Prescription 9: Tuples 164
+             RM Prescription 10: Relations    165
+             RM Prescription 11: Scalar variables 167
+             RM Prescription 12: Tuple variables 168
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                 iv
+                                          Contents
+
+
+             RM Prescription 13: Relation variables (relvars) 169
+             RM Prescription 14: Kinds of relvars 170
+             RM Prescription 15: Candidate keys 174
+             RM Prescription 16: Databases 174
+             RM Prescription 17: Transactions 176
+             RM Prescription 18: Relational algebra 176
+             RM Prescription 19: Relvar names, relation selectors, and recursion 181
+             RM Prescription 20: User-defined tuple and relational operators 185
+             RM Prescription 21: Assignments 186
+             RM Prescription 22: Comparisons 189
+             RM Prescription 23: Integrity constraints 190
+             RM Prescription 24: Total database constraints 197
+             RM Prescription 25: Catalog 197
+             RM Prescription 26: Language design 198
+             Exercises 198
+
+Chapter 7    RM Proscriptions     202
+
+             RM Proscription 1: No attribute ordering 202
+             RM Proscription 2: No tuple ordering    204
+             RM Proscription 3: No duplicate tuples 204
+             RM Proscription 4: No nulls    205
+             RM Proscription 5: No nullological mistakes 205
+             RM Proscription 6: No internal-level constructs 206
+             RM Proscription 7: No tuple-level operations   207
+             RM Proscription 8: No composite attributes 208
+             RM Proscription 9: No domain check override 208
+             RM Proscription 10: Not SQL      208
+             Exercises 209
+
+Chapter 8    OO Prescriptions     210
+
+             OO Prescription 1: Compile-time type checking 210
+             OO Prescription 2: Type inheritance (conditional) 210
+             OO Prescription 3: Computational completeness 212
+             OO Prescription 4: Explicit transaction boundaries 213
+             OO Prescription 5: Nested transactions     214
+             OO Prescription 6: Aggregate operators and empty sets 214
+             Exercises 216
+
+Chapter 9    OO Proscriptions     217
+
+             OO Proscription 1: Relvars are not domains   217
+             OO Proscription 2: No object IDs 222
+             Exercises 225
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                            v
+                                          Contents
+
+
+Chapter 10   RM Very Strong Suggestions         227
+
+             RM Very Strong Suggestion 1: System keys 227
+             RM Very Strong Suggestion 2: Foreign keys 230
+             RM Very Strong Suggestion 3: Candidate key inference 232
+             RM Very Strong Suggestion 4: Transition constraints 233
+             RM Very Strong Suggestion 5: Quota queries 234
+             RM Very Strong Suggestion 6: Generalized transitive closure 236
+             RM Very Strong Suggestion 7: User-defined generic operators 240
+             RM Very Strong Suggestion 8: SQL migration 241
+             Exercises 253
+
+Chapter 11   OO Very Strong Suggestions         255
+
+             OO Very Strong Suggestion 1: Type inheritance 255
+             OO Very Strong Suggestion 2: Types and operators unbundled   255
+             OO Very Strong Suggestion 3: Single-level store 257
+             Exercises 257
+
+                                    ———  ———
+
+                     PART IV        SUBTYPING AND INHERITANCE
+
+Chapter 12   Preliminaries    259
+
+             Toward a type inheritance model    260
+             Single vs. multiple inheritance 261
+             Scalars, tuples, and relations 262
+             The running example         263
+             Concluding remarks         271
+             Exercises 272
+
+Chapter 13   The Inheritance Model     275
+
+             IM Prescriptions 275
+             Recent inheritance model changes     281
+
+Chapter 14   Single Inheritance with Scalar Types       283
+
+             IM Prescription 1: Types are sets    283
+             IM Prescription 2: Subtypes are subsets 283
+             IM Prescription 3: “Subtype of” is reflexive  286
+             IM Prescription 4: Proper subtypes 286
+             IM Prescription 5: “Subtype of” is transitive 287
+             IM Prescription 6: Immediate subtypes 287
+             IM Prescription 7: Root types disjoint 287
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                     vi
+                                           Contents
+
+
+             IM Prescription 8: Scalar values with inheritance 288
+             IM Prescription 9: Scalar variables with inheritance 289
+             IM Prescription 10: Specialization by constraint 295
+             IM Prescription 11: Assignment with inheritance     298
+             IM Prescription 12: Equality etc. with inheritance 301
+             IM Prescription 13: Join etc. with inheritance 303
+             IM Prescription 14: TREAT 305
+             IM Prescription 15: Type testing 309
+             IM Prescription 16: Read-only operator inheritance and value substitutability 312
+             IM Prescription 17: Operator signatures      316
+             IM Prescription 18: Read-only parameters to update operators 324
+             IM Prescription 19: Update operator inheritance and variable substitutability 324
+             IM Prescription 20: Union, dummy, and maximal and minimal types 328
+             Exercises 335
+
+Chapter 15   Multiple Inheritance with Scalar Types      337
+
+             An introductory example     337
+             Type graphs 343
+             Least specific types unique  345
+             Most specific types unique 347
+             Remarks on operator inheritance 354
+             Exercises 356
+
+Chapter 16   Inheritance with Tuple and Relation Types         358
+
+             IM Prescription 21: Tuple/relation subtypes and supertypes 358
+             IM Prescription 22: Tuple/relation values with inheritance 362
+             IM Prescription 23: Maximal and minimal tuple/relation types 365
+             IM Prescription 24: Tuple/relation most specific types 368
+             IM Prescription 25: Tuple/relation variables with inheritance 374
+             Some implications of RM Prescriptions 21-25 376
+             Exercises 380
+
+                                  ———  ———
+
+                                       APPENDIXES
+
+Appendix A A New Relational Algebra         383
+
+             Motivation and justification   384
+             ◄REMOVE►, ◄RENAME►, and ◄COMPOSE►                        387
+             Treating operators as relations 389
+             Formal definitions 392
+             How Tutorial D builds on A      394
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      vii
+                                              Contents
+
+
+Appendix B A Design Dilemma?            401
+
+             Encapsulation 401
+             Discussion    402
+             Further considerations     403
+
+Appendix C Types and Units        406
+
+             Type definition  406
+             Selectors 407
+             THE_ operators 408
+             Computational operators      409
+             Display operators 411
+             Type constraints 411
+             A more complex example           412
+
+Appendix D What Is a Database?          413
+
+             Updating the database      413
+             The database is a tuple    414
+
+Appendix E View Updating         416
+
+             Date’s appoach 416
+             Assumptions and notation       417
+             A closer look at relational assignment 418
+             A model of updating      421
+             A closer look at constraints 423
+             Updating restrictions     427
+             Updating intersections      429
+             Updating unions      432
+             Updating differences 434
+             Nested updates 437
+             Updating extensions      442
+             Updating joins     443
+             Updating projections      449
+             Some remarks on orthogonality 454
+             A remark on multiple assignment 456
+             Summary 457
+             Darwen’s approach 459
+
+Appendix F A Closer Look at Specialization by Constraint   469
+
+             The 3 out of 4 “rule” 469
+             What does inheritance really mean?      474
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                      viii
+                                          Contents
+
+
+             Benefits of S by C  476
+             What about objects?   479
+             Implementation considerations      483
+
+Appendix G A Closer Look at Structural Inheritance         488
+
+             An introductory example 488
+             Tuple types, values, and variables 490
+             Subtables and supertables 494
+             Scalar types revisited 499
+             Structural inheritance with fewer tears 501
+
+Appendix H A Comparison with SQL          506
+
+             RM Prescriptions  507
+             RM Proscriptions 518
+             OO Prescriptions  520
+             OO Proscriptions 521
+             RM Very Strong Suggestions       521
+             OO Very Strong Suggestions       522
+             IM Prescriptions  523
+
+Appendix I   Tutorial D Syntax    528
+
+Appendix J   The Next 25 Years of The Relational Model?          541
+
+             Remarks on republication 541
+             Introduction 541
+             Background 543
+             The Third Manifesto and SQL 547
+             Technical content 547
+             More on SQL      552
+             Miscellaneous questions 554
+
+Appendix K References and Bibliography          559
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                            ix
+                                              Preface
+
+This is a textbook on database management. It is based on our earlier book Foundation for Future
+Database Systems: The Third Manifesto (Addison-Wesley, 2000), but it has been thoroughly
+revised—indeed, completely rewritten—from start to finish. Part of our reason for wanting to
+revise it was to make it more suitable as a textbook (the earlier book, by contrast, was quite terse
+and formal and not very easy to read); in particular, most chapters now include a set of exercises,
+answers to which can be found on the website www.thethirdmanifesto.com. (Much other relevant
+material can be found on that website also, including in particular information regarding prototype
+implementations of Tutorial D, q.v.). However, we have naturally taken the opportunity to
+incorporate many other changes as well, including numerous clarifications, a certain amount of
+restructuring, many more examples, and—we regret to have to say—quite a few corrections also.
+      Like its predecessor, the book is organized around the ideas of The Third Manifesto. As
+Chapter 1 explains in more detail, The Third Manifesto—the Manifesto for short—is a proposal for
+a foundation for data and database management systems (DBMSs); it can be seen as an abstract
+blueprint for the design of a DBMS and the language interface to such a DBMS. In particular, it
+serves as a basis for a model of type inheritance, also discussed in this book. The overall structure
+of the book is thus as follows. First of all, it is divided into four major parts:
+
+  I.   Preliminaries
+ II.   Formal Specifications
+III.   Informal Discussions and Explanations
+IV.    Subtyping and Inheritance
+
+       To elaborate briefly:
+
+ ■     Part I (three chapters) sets the scene by explaining in general terms what the Manifesto is all
+       about and why we wrote it. It also contains an informal overview of both the relational model
+       and a theory of types. We recommend that you read these chapters fairly carefully before
+       moving on to later parts of the book.
+
+ ■     Part II (two chapters) is the most formal part. It contains the Manifesto proper and a grammar
+       for a language based on Manifesto principles called Tutorial D. Note: This part of the book
+       is provided mainly for reference purposes; it is not necessary, and probably not even a good
+       idea, to study it exhaustively, at least not on a first reading. Tutorial D in particular is
+       intended to be largely self-explanatory. Even though examples throughout the book are based
+       on it, therefore, it should not be necessary to study the Tutorial D grammar in depth in order
+       to understand those examples.
+
+ ■     Part III is the real heart of the book. It consists of six chapters, one for each of the six sections
+       of the Manifesto as defined in Part II. Each chapter discusses the relevant section of the
+       Manifesto in detail, with examples, and thereby explains the motivations and rationale behind
+       the formal proposals of Part II.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                               x
+                                               Preface
+
+
+ ■    Finally, Part IV (five chapters) does for type inheritance what Parts I-III do for the Manifesto
+      proper.
+
+      In addition to the foregoing, there are eleven appendixes, including one in particular
+(Appendix K) that gives an annotated and consolidated list of references for the entire book. Note:
+References throughout the book take the form of numbers in square brackets. For example, the
+reference “[3]” refers to the third item in the list in Appendix K: viz., a paper by Malcolm P.
+Atkinson and O. Peter Buneman entitled “Types and Persistence in Database Programming
+Languages,” published in ACM Computing Surveys, Volume 19, No. 2, in June 1987.
+      We defer discussion of exactly who the book is aimed at and what readers are expected to
+know to Chapter 1.
+
+
+ACKNOWLEDGMENTS
+
+The number of people who have supported us over the years in our work on the Manifesto in
+general and this book in particular has now grown so large that it is no longer feasible to list them
+all here. With apologies to other supporters, therefore, we would just like to mention the following:
+Shai Berger, Peter Elderon, Maurice Gittens, Jonathan Leffler, David McGoveran, Åke Persson,
+Bryn Rhodes, and Andrew Sieber. All of these have helped in one way or another to ensure that
+this book finally saw the light of day in its present form. We would also like to thank Doug Inkster,
+David McGoveran, Jeremy Peel, Sudha Ram of the University of Arizona, Greg Baylor of Baylor
+University, Junping Sun of Nove Southeastern University, Vassilis Tsotrasof UC Riverside, and
+especially Jonathan Leffler again, for their careful and constructive comments on earlier versions of
+the manuscript. Finally, we would like to thank once again our wives, Lindy Date and Lindsay
+Darwen, for their support throughout this project, and to acknowledge our copyeditor, Elisabeth
+Beller, for her assistance and high standards of professionalism.
+       We are also grateful to Addison-Wesley for returning the rights on this book to us, allowing
+us to provide this online copy.
+
+                                                                   C. J. Date, Healdsburg, California
+                                                                   Hugh Darwen, Shrewley, England
+                                                                                      2005 and 2014
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          xi
+                                            Part I:
+
+                                  PRELIMINARIES
+
+This first part of the book consists of three introductory chapters. Chapter 1 contains background
+information, including in particular brief explanations of certain fundamental ideas—e.g., the
+distinction between model and implementation—that pervade and underlie the entire book; Chapter
+2 consists of a review of the relational model; and Chapter 3 provides a detailed introduction to our
+theory of types. Everything else in the book builds on the material of these three chapters.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         1

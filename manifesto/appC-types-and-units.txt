@@ -1,0 +1,356 @@
+                                           Appendix C
+
+                                   Types and Units
+
+We mentioned the fact a few times in earlier chapters (especially Chapter 6) that certain types—
+WEIGHT, LENGTH, ANGLE, TEMPERATURE, and many others—raise the question of how we
+ought to deal with units (e.g., inches vs. centimeters, in the case of lengths). In this appendix we
+examine this question more carefully. For definiteness, we focus for the most part on type
+LENGTH specifically.
+      Now, values of type LENGTH are lengths, of course—but what exactly does this statement
+mean? What exactly is a length? Clearly, it is a measure: a measure that has to be understood as
+being expressed in certain units in order for it to have a sensible interpretation. For example, we
+cannot meaningfully say that a certain length is “24” (say); rather, we have to say that it is,
+specifically, “24 inches” (say). Furthermore, of course, we could equally well say that the length in
+question is not “24 inches” but rather “2 feet” or “60.96 centimeters”; all three of these expressions
+denote the same value.
+      How can we deal with such matters in a formal computer system? What follows is one
+proposal, perhaps not very ambitious.
+
+
+TYPE DEFINITION
+
+The basic idea underlying our proposal is that there should be one declared possrep for each
+relevant unit of measure for the type in question (note the importance, therefore, of being able to
+declare two or more possreps for the same type). Consider type LENGTH, for example. In Chapter
+6, we defined this type as follows:
+      TYPE LENGTH ORDINAL POSSREP { M RATIONAL CONSTRAINT M  0.0 } ;
+
+(“M” here stands for measure, as you will recall.) Now, however, we propose defining the type like
+this:
+      TYPE LENGTH ORDINAL
+      POSSREP LENGTH_IN_INCHES { NO_OF_INCHES RATIONAL
+                                 CONSTRAINT NO_OF_INCHES  0.0 }
+      POSSREP LENGTH_IN_FEET   { NO_OF_FEET   RATIONAL
+                                 CONSTRAINT NO_OF_FEET    0.0 }
+      POSSREP LENGTH_IN_CM     { NO_OF_CM     RATIONAL
+                                 CONSTRAINT NO_OF_CM      0.0 } ;
+
+      The possrep LENGTH_IN_INCHES, for example, corresponds to lengths measured in inches,
+and the single component of that possrep, which is called NO_OF_INCHES, denotes the
+corresponding measure (i.e., the applicable number of inches). Hence, e.g., the following code
+fragment will have the effect of setting the variable L to contain the length “six inches”:
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       406
+Appendixes                                                              Appendix C / Types and Units
+
+
+      VAR L LENGTH ;
+      L := LENGTH_IN_INCHES ( 6.0 ) ;
+
+       Note: We deliberately give each possrep a distinct and explicit name in the foregoing
+example, instead of relying on the Tutorial D system of defaults as described in Chapters 3 and 5.
+It is our experience that using the default system can make it harder to see what is really going on
+(in the context under discussion, at any rate). Thus, for example, observe in the assignment to L
+that the selector invoked on the right side is specifically called LENGTH_IN_INCHES, not just
+LENGTH. (It might be more user friendly in practice to give each possrep the same name as its
+sole component, but we deliberately do not do so here.)
+
+
+SELECTORS
+
+Suppose the physical representation of lengths is indeed in terms of inches (though as usual there is
+no need for the physical representation to be the same as any of the declared possreps, in general).
+Let the “highly protected operators not part of D” that provide access to physical representations be
+denoted by italic pseudocode, as in Chapter 3. Here then is the implementation code for the
+LENGTH_IN_INCHES selector:
+      OPERATOR LENGTH_IN_INCHES ( N RATIONAL ) RETURNS LENGTH ;
+         BEGIN ;
+            VAR L LENGTH ;
+            I component of physical representation of L := N ;
+            RETURN ( L ) ;
+         END ;
+      END OPERATOR ;
+
+      We are assuming that the physical representation of a length involves a single component, of
+type RATIONAL, called I (for inches).
+      The LENGTH_IN_FEET and LENGTH_IN_CM selectors could and probably should be
+implemented analogously, as follows:
+      OPERATOR LENGTH_IN_FEET ( N RATIONAL ) RETURNS LENGTH ;
+         BEGIN ;
+            VAR L LENGTH ;
+            I component of physical representation of L := N * 12 ;
+            RETURN ( L ) ;
+         END ;
+      END OPERATOR ;
+      OPERATOR LENGTH_IN_CM ( N RATIONAL ) RETURNS LENGTH ;
+         BEGIN ;
+            VAR L LENGTH ;
+            I component of physical representation of L := N / 2.54 ;
+            RETURN ( L ) ;
+         END ;
+      END OPERATOR ;
+
+      Alternatively, they could be implemented in terms of the LENGTH_IN_INCHES selector, as
+follows (and what follows is genuine Tutorial D code, not pseudocode):
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       407
+Appendixes                                                          Appendix C / Types and Units
+
+
+     OPERATOR LENGTH_IN_FEET ( N RATIONAL ) RETURNS LENGTH ;
+        RETURN ( LENGTH_IN_INCHES ( N * 12 ) ) ;
+     END OPERATOR ;
+     OPERATOR LENGTH_IN_CM ( N RATIONAL ) RETURNS LENGTH ;
+        RETURN ( LENGTH_IN_INCHES ( N / 2.54 ) ) ;
+     END OPERATOR ;
+
+     Here is a code fragment showing some sample invocations of these selectors:
+     VAR L LENGTH ;
+     L := LENGTH_IN_INCHES ( 6.0 ) ;
+     L := LENGTH_IN_FEET   ( 0.5 ) ;
+     L := LENGTH_IN_CM     ( 15.24 ) ;
+
+     These three assignments all have the same effect.
+
+
+THE_ OPERATORS
+
+The operator THE_NO_OF_INCHES could be implemented as follows (pseudocode again):
+     OPERATOR THE_NO_OF_INCHES ( L LENGTH ) RETURNS RATIONAL ;
+         RETURN ( I component of physical representation of L ) ;
+     END OPERATOR ;
+     The operators THE_NO_OF_FEET and THE_NO_OF_CM could be implemented
+analogously:
+     OPERATOR THE_NO_OF_FEET ( L LENGTH ) RETURNS RATIONAL ;
+        RETURN ( ( I component of physical representation of L ) / 12 ) ;
+     END OPERATOR ;
+     OPERATOR THE_NO_OF_CM ( L LENGTH ) RETURNS RATIONAL ;
+        RETURN ( ( I component of physical representation of L ) * 2.54 ) ;
+     END OPERATOR ;
+
+     Or they could be implemented in terms of THE_NO_OF_INCHES, as here (and this is valid
+Tutorial D code again):
+     OPERATOR THE_NO_OF_FEET ( L LENGTH ) RETURNS RATIONAL ;
+       RETURN ( THE_NO_OF_INCHES ( L ) / 12 ) ;
+     END OPERATOR ;
+     OPERATOR THE_NO_OF_CM ( L LENGTH ) RETURNS RATIONAL ;
+        RETURN ( THE_NO_OF_INCHES ( L ) * 2.54 ) ;
+     END OPERATOR ;
+
+     Here is a code fragment showing some sample invocations of these THE_ operators:
+     VAR N RATIONAL ;
+     N := THE_NO_OF_INCHES ( L ) ;
+     N := THE_NO_OF_FEET ( L ) ;
+     N := THE_NO_OF_CM ( L ) ;
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                408
+Appendixes                                                               Appendix C / Types and Units
+
+
+If the current value of L is “six inches,” these three assignments have the effect of setting N to 6.0,
+0.5, and 15.24, respectively. And here are examples of the use of the same three THE_ operators as
+pseudovariables:
+      THE_NO_OF_INCHES ( L ) := 6.0 ;
+      THE_NO_OF_FEET ( L )   := 0.5 ;
+      THE_NO_OF_CM ( L )     := 15.24 ;
+
+Again these three assignments all have the same effect; in fact, they are logically equivalent to—
+i.e., shorthand for—the three assignments shown at the end of the previous section (the ones with L
+on the left side and selector invocations on the right side).
+
+
+COMPUTATIONAL OPERATORS
+
+We clearly need to be able to perform various kinds of computations involving lengths. Here first is
+an operator that allows two lengths to be added to yield another:
+       OPERATOR ADD_LENGTHS ( L1 LENGTH, L2 LENGTH ) RETURNS LENGTH ;
+          RETURN ( LENGTH_IN_INCHES ( THE_NO_OF_INCHES ( L1 ) +
+                   THE_NO_OF_INCHES ( L2 ) ) ) ;
+       END OPERATOR ;
+
+      Points to note:
+
+ ■    The ADD_LENGTHS implementation makes use of the “+” operator for rational numbers. It
+      would be nice to be able to use the same syntax—in other words, to overload the “+”
+      operator—for invoking ADD_LENGTHS, thereby writing (e.g.) L1+L2 instead of
+      ADD_LENGTHS (L1,L2). For simplicity, therefore, we will assume for the rest of this
+      appendix that the usual infix notation “+” can indeed be used for lengths. We omit the details
+      of how that infix notation might be specified in practice, since it is basically just a syntax
+      issue (but see the next bullet item). Note: We could have implemented “+” for lengths in
+      terms of feet or centimeters instead of inches without making any logical difference, just so
+      long as we are careful to use the same units throughout the code. (For efficiency, however,
+      we might want the possrep involved to be the same as, or close to, the physical
+      representation.)
+
+ ■    Of course, the foregoing implementation of “+” for lengths effectively just says: “Addition
+      for lengths is done by invoking the regular addition operator on a certain component of a
+      certain possrep for lengths.” In other words, we are talking about a mechanism known as
+      operator delegation—the responsibility for implementing “+” for type LENGTH is
+      “delegated” to the type, RATIONAL, of a certain component of one of its possreps. Note:
+      We will have more to say about delegation in Appendix G. In practice it might be desirable to
+      provide some shorthand syntax for it, instead of requiring operator definitions to be written
+      out in longhand as in our example.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        409
+Appendixes                                                                         Appendix C / Types and Units
+
+
+    ■   As you can see, units are definitely a consideration in the implementation of the “+” operator
+        for lengths. However, they are not a consideration in the use of that operator. For example,
+        given variables L1 and L2 as follows—
+        VAR L1 LENGTH ;
+        VAR L2 LENGTH ;
+
+        —we can write an expression such as L1+L2 without having to worry about whether the
+        lengths are measured in inches or centimeters or whatever.
+
+    ■   In practice, it would be desirable to be able to inform the system (e.g., for optimization
+        purposes) that “+” for lengths is commutative—i.e., L1+L2 = L2+L1 for all possible lengths
+        L1 and L2. Analogously, it would be desirable to be able to inform the system that the
+        operator is also associative—i.e., L1+(L2+L3) = (L1+L2)+L3 for all possible lengths L1, L2,
+        and L3. We have no concrete suggestions to offer in this connection, however, other than to
+        note that the shorthand syntax for delegation mentioned under the second bullet item above
+        might be sufficient to take care of the issue.
+
+     Here are some other computational operators that we would probably want for type LENGTH
+(we omit the implementation code for brevity):
+
+    ■   An operator to subtract one length from another to return a length. We will use the infix
+        notation “-” for this operator.
+
+    ■   An operator to multiply a length by an integer or a rational to return a length. We will use the
+        infix notation “*” for this operator. In practice, we would like to be able to let the system
+        know that the operator is both commutative and associative (again, the shorthand delegation
+        syntax might suffice).
+
+    ■   An operator to multiply two lengths to return an area (i.e., we assume the existence of another
+        type, AREA, to which analogous units considerations also apply). We will use the infix
+        notation “*” for this operator too, thereby overloading it even further. We would like to be
+        able to tell the system that this new operator is commutative and associative, too.1
+
+    ■   An operator to allow a length to be divided by a rational or an integer to return a length. We
+        will use the infix notation “/” for this operator.
+
+And so on.
+     Here are some examples to illustrate the use of some of these computational operators:
+
+
+
+
+1
+  In connection with associativity, however, note that while the expression L1*L2*L3 (where L1, L2, and L3 are all
+lengths) is certainly valid, the value denoted by that expression is a volume, not an area.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                      410
+Appendixes                                                                        Appendix C / Types and Units
+
+
+      VAR L LENGTH ;
+      VAR L1 LENGTH ;
+      VAR L2 LENGTH ;
+      VAR A AREA ;
+      L := L1 + L2 ;
+      L := 2.0 * ( L1 - L2 ) ;
+      A := 2 * L1 * L2 ;
+
+      Note that (to repeat) units are not a consideration in any of these examples.
+
+
+DISPLAY OPERATORS
+
+Assume the existence of a DISPLAY operator that returns a character string representation of its
+argument value, which we take for present purposes to be a length specifically. Now, it could
+certainly be argued that displaying a length without some indication of the corresponding units
+makes little sense. Thus, for example, the following assignment might be prohibited:
+      N := DISPLAY ( L ) ;                                                /* invalid ??? */
+
+Instead, we might have to say something like this:
+      N := DISPLAY ( THE_NO_OF_INCHES ( L ) ) ;
+
+      In other words, the DISPLAY operator is perhaps best defined to take a parameter of type
+RATIONAL, not one of type LENGTH. Alternatively, we might define a version of DISPLAY that
+does take a parameter of type LENGTH and returns a character string such as, say, '6.00 inches', in
+which certain default units are made explicit.
+
+
+TYPE CONSTRAINTS
+
+The definition for type LENGTH shown earlier in this appendix constrained lengths (not
+unreasonably) to be nonnegative. In practice, however, we would probably want to constrain them
+to be less than some maximum, too. Suppose for the sake of the example that the maximum length
+we ever want to deal with is one mile. Then the type definition might look like this:1
+        TYPE LENGTH ORDINAL
+             POSSREP LENGTH_IN_INCHES { NO_OF_INCHES RATIONAL
+                                        CONSTRAINT NO_OF_INCHES  0.0
+                                                   AND NO_OF_INCHES  63360.0 }
+             POSSREP LENGTH_IN_FEET   { NO_OF_FEET   RATIONAL
+                                        CONSTRAINT NO_OF_FEET    0.0
+                                                   AND NO_OF_FEET  5280.00 }
+             POSSREP LENGTH_IN_CM     { NO_OF_CM     RATIONAL
+                                        CONSTRAINT NO_OF_CM      0.0
+                                                   AND NO_OF_CM  160934.40 } ;
+
+1
+  The various CONSTRAINT specifications in this example are all equivalent (as indeed they must be, as noted in the
+discussion of type POINT under RM Prescription 23 in Chapter 6), and thus clearly involve some redundancy—a fact
+that raises the question of whether there might be some better way of stating them. Further study is required.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                     411
+Appendixes                                                            Appendix C / Types and Units
+
+
+      Observe that, given the foregoing constraints, an attempt to add one length to—or subtract
+one length from—another might lead to a type constraint violation. (We mention this possibility in
+connection with ADD_LENGTHS specifically because ADD_LENGTHS was the one operator we
+gave a definition for in the section “Computational Operators.” However, a similar remark is likely
+to apply to other operators as well. In the case of ADD_LENGTHS specifically, the type constraint
+violation will occur if the argument to the LENGTH_IN_INCHES selector invocation is out of
+range.)
+
+
+A MORE COMPLEX EXAMPLE
+
+We conclude this appendix with a slightly more complicated example, in order to show how some
+of the ideas we have been discussing might fit together in practice. Suppose we have the following
+types (the semantics are meant to be obvious):
+       TYPE DURATION ORDINAL
+            POSSREP MILLISECONDS { NO_OF_MSECS RATIONAL ... }
+            POSSREP SECONDS      { NO_OF_SECS RATIONAL ... }
+            POSSREP MINUTES      { NO_OF_MINS RATIONAL ... } ;
+       TYPE SPEED ORDINAL
+            POSSREP FEET_PER_SEC { NO_OF_FPS RATIONAL ... } ;
+
+       TYPE ACCELERATION ORDINAL
+            POSSREP FEET_PER_SEC_SQD { NO_OF_FPS_SQD RATIONAL ... } ;
+
+      Here then is a possible implementation of the well-known formula s = ut + ½ft² (s = distance,
+u = initial speed, t = time, f = acceleration):
+     OPERATOR S ( U SPEED, T DURATION, F ACCELERATION ) RETURNS LENGTH ;
+        RETURN ( LENGTH_IN_FEET ( THE_NO_OF_FPS ( U ) * THE_NO_OF_SECS ( T ) +
+                                  0.5 * THE_NO_OF_FPS_SQD ( F ) *
+                                  ( THE_NO_OF_SECS ( T ) ** 2 ) ) ) ;
+     END OPERATOR ;
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                     412

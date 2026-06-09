@@ -1,0 +1,966 @@
+                                           Appendix G
+
+           A Closer Look at Structural Inheritance
+
+The inheritance model described in Part IV of this book is concerned with behavioral inheritance, so
+called because what is inherited is “operational behavior.” But there is another kind of inheritance,
+structural inheritance, where what is inherited is physical representations—at least, so we claimed in
+Chapter 12, though we did also say there were those who would dispute that claim, and we
+suggested there might be a connection with what is sometimes called “the EXTENDS relationship.”
+In this appendix, we investigate these matters further.
+       The structure of the appendix is as follows. The section immediately following discusses a
+simple example, with a view to exposing the real issues underlying the concept of structural
+inheritance. The next section considers what might be involved in supporting that concept. The
+next two sections then respectively (a) examine a particular version of the concept (“subtables and
+supertables”) in some depth and (b) offer some thoughts on examples of a certain common kind, of
+which “COLORED_CIRCLE is a subtype of CIRCLE” is a typical illustration. The final section
+shows how it might be possible to achieve the benefits of structural inheritance without departing
+from the prescriptions of our own inheritance model as laid down in the body of the book.
+
+
+AN INTRODUCTORY EXAMPLE
+
+The following example is typical of those commonly used to introduce the notion of structural
+inheritance. Consider entity types EMP (“employees”) and PGMR (“programmers”). Assume that
+every programmer is an employee but some employees are not programmers. Clearly, this example
+parallels our familiar ellipses-and-circles example, where every circle is an ellipse but some ellipses
+are not circles, and it thus seems entirely reasonable from an intuitive point of view to say that
+“programmers are a subtype of employees.” But does this point of view stand up to closer
+inspection?
+       Well, let us focus for a moment on employees alone and ignore programmers. Suppose every
+employee has an employee number (EMP#), a name (ENAME), a department number (DEPT#),
+and a salary (SALARY). Now, we saw in Appendix B that there are two ways we could represent
+this state of affairs: We could have an EMP type (scalar by definition) or an EMP relvar (nonscalar
+by definition). Suppose we choose the former. Then
+
+ ■    The EMP type will be “encapsulated” (scalar), meaning it has no user-visible structure. Note:
+      We deliberately use the object term encapsulated here because most of the work on structural
+      inheritance has been done in an object context.
+
+ ■    That type will have a possrep with components EMP#, ENAME, DEPT#, and SALARY, and
+      THE_ operators to access each of those components.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        488
+Appendixes                                               Appendix G / A Closer Look at Structural Inheritance
+
+
+       Now we can go on to define a scalar type PGMR as a proper subtype of the scalar type EMP,
+just as earlier in this book we defined type CIRCLE as a proper subtype of type ELLIPSE. The
+PGMR type will inherit all operators (all read-only operators, at least) that apply to employees, and
+will additionally have operators of its own—in particular, operators to access the particular
+language skill (LANG) for a given programmer.1 Note: For simplicity, we assume each
+programmer has just one language in which he or she is proficient. This assumption is not very
+realistic, of course, but the point is not important for present purposes.
+       Given the foregoing design, it really would be the case that PGMR is a subtype of EMP in the
+sense of our inheritance model. However, the kind of inheritance involved here is, by definition,
+behavioral, not structural, and that kind of design is thus not what we want to talk about in the
+present appendix. Indeed, following the discussions in Appendix B, we would be more likely to
+represent employees and programmers not as types anyway but as relvars, perhaps as follows (in
+outline only, for simplicity):
+       EMP    { EMP#, ENAME, DEPT#, SALARY KEY { EMP# }
+
+       PGMR { EMP#, ENAME, DEPT#, SALARY, LANG } KEY { EMP# }
+
+       CONSTRAINT E_P_DISJOINT IS_EMPTY ( EMP { EMP# } JOIN PGMR )
+
+       Note the constraint—employee e is represented in relvar PGMR if and only if e is a
+programmer, and in relvar EMP if and only if e is not a programmer.
+       Now, this design clearly involves two relation types, neither of which is a subtype of the other
+as far as our model is concerned (recall from Chapter 16 that relation type RT' can be a subtype of
+relation type RT in our model only if RT' and RT involve exactly the same attributes). Under
+structural inheritance, however, we might say that type PGMR inherits the structure of type EMP
+but “extends” that structure to include an additional attribute—and we might then to go on to say,
+under this very different notion of inheritance, that type PGMR is indeed a subtype of supertype
+EMP after all.
+       Now, in Chapter 12 we said we do not preclude such inheritance; however, we also said it had
+nothing to do with the model. Now we can elaborate on these remarks. With regard to whether it
+has anything to do with the model, then (we deliberately consider the second remark first): It is
+clear that if we limit our attention to scalar types, any structural inheritance that might apply is
+definitely an implementation issue,2 because scalars have no (user-visible, model-level) structure to
+inherit. In the case of object systems, therefore, it follows that an object, if it is properly
+encapsulated, ought not to be subject to structural inheritance at all, at the model level. But the
+picture is muddied by the fact that—as mentioned in Appendix B—even “encapsulated” objects
+often do expose their structure to the user in object systems, in the form of what are called instance
+variables. For example, an EMP object might have user-visible instance variables EMP#, ENAME,
+
+1
+   Observe, however, that the possrep for type EMP would have to include a LANG component, even though
+nonprogrammers have no such property. The specialization constraint for PGMR, required by IM Prescription 10,
+might then reasonably take the form LANG =/ '' (say). But of course the simple fact that the LANG possrep component
+is effectively required even for nonprogrammers is enough to show that this approach is very unrealistic.
+2
+  Unless the structure being inherited is only a possible representation, not a physical one. We briefly consider the
+question of inheriting possreps in the section “Scalar Types Revisited,” later in this appendix.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                             489
+Appendixes                                      Appendix G / A Closer Look at Structural Inheritance
+
+
+DEPT#, and SALARY; as you can see, therefore, user-visible instance variables in object systems
+are analogous, somewhat, to tuple attributes in a relational system or record fields in a traditional
+file system. We think the only way to make sense of this state of affairs is to regard the user-visible
+structure of those “encapsulated” objects as the physical structure, and hence to regard the model
+and the implementation as (to say the least) inadequately distinguished. We further think that to say
+that structural inheritance applies to such objects is to mean that it is physical representations that
+are inherited, which is why we claim it has nothing to do with the model. (It is also why we prefer
+to explain our own ideas in terms of constructs like tuples that are carefully and precisely defined.
+See the paragraph immediately following.)
+       Turning now to the question of precluding support: On the face of it, our model cannot
+handle the kind of inheritance illustrated by the example of employees and programmers (relvar
+version). Do we want it to? If we do, do we have to revise our model in some way, or can it
+somehow handle that kind of inheritance after all? We consider these questions in what follows.
+First, however, we spell out the obvious point that if we want to examine the possibility of
+inheriting user-visible structure, then by definition we are talking about tuple and/or relation types,
+because (by definition) those are the types that possess such structure. To be absolutely precise,
+therefore, the principal question we will be examining is this: Can we make sense of the idea of
+structural inheritance for tuple or relation types?
+       One final point to close this section: As we have said, it does seem intuitively reasonable to
+say, at least informally, that every programmer is an employee. But there is a better way to
+characterize the situation—a way, that is, that points up the logical difference between examples
+like employees and programmers vs. examples like ellipses and circles—and that is to say that a
+programmer is an employee who has a language skill. In other words, the crucial issue here is not
+the is-a relationship (a programmer “is a” employee) but, rather, the has-a relationship (a
+programmer “has a” language skill). Contrast the situation with ellipses and circles: Although we
+might say a circle “has a” property (the radius) that ellipses in general do not have, that property is
+really just a degenerate form of a property (a semiaxis) that ellipses in general do have. The
+situation is different with employees and programmers: A programmer’s language skill does not
+correspond to any property of nonprogrammer employees.
+       We will have quite a lot more to say regarding the distinction between is-a and has-a in later
+sections of this appendix.
+
+
+TUPLE TYPES, VALUES, AND VARIABLES
+
+Until further notice, we limit our attention (for simplicity) to tuple types only. So the question we
+want to look at becomes: Can we make sense of structural inheritance for tuple types? Well,
+suppose we want to say that tuple type TT' “extends” tuple type TT by adding further attributes. For
+example (to invent some syntax on the fly):
+      TYPE EMP_TT     TUPLE { EMP#      CHAR, ENAME      CHAR, DEPT# CHAR, SALARY MONEY } ;
+
+      TYPE PGMR_TT TUPLE EXTEND EMP_TT ADD { LANG CHAR } ;
+
+     Observe that we immediately run into a syntax problem! In our Manifesto, tuple types are
+“unnamed”—meaning, more precisely, that they have no name other than the one of the form
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        490
+Appendixes                                              Appendix G / A Closer Look at Structural Inheritance
+
+
+TUPLE{...} that is required by RM Prescription 6, and there is no separate “define tuple type”
+operator. There are good reasons for these rules, too, but we will have to overlook them for present
+purposes and assume that the foregoing syntax is valid after all.
+      Now we can define tuple variables (hereinafter tuplevars) of these types.1 For example:
+        VAR EMP_VAR EMP_TT ;
+        VAR PGMR_VAR PGMR_TT ;
+
+      Values of variable EMP_VAR are tuples of four components (EMP#, ENAME, DEPT#, and
+SALARY); values of variable PGMR_VAR are tuples of five components (the same four, plus
+LANG). In other words, the set of values constituting type PGMR_TT is the join (in fact the
+cartesian product) of the set of all possible tuples of type
+        TUPLE { EMP# CHAR, ENAME CHAR, DEPT# CHAR, SALARY MONEY }
+
+and the set of all possible tuples of type
+        TUPLE { LANG CHAR }
+
+These Subtypes Are Not Subsets
+
+In our usual ellipses-and-circles example:
+
+    ■    Every circle is an ellipse.
+
+    ■   Hence, the set of all possible circles (i.e., type CIRCLE) is a subset of the set of all possible
+        ellipses (i.e., type ELLIPSE).
+
+    ■   Moreover, the set of all current circles is a subset of the set of all current ellipses—where by
+        the set of all current circles we mean, precisely, the set of values of just those variables whose
+        current most specific type is some subtype of CIRCLE, and similarly for ellipses.
+
+        The situation is very different with our tuple types EMP_TT and PGMR_TT, however:
+
+    ■   No value of type PGMR_TT is a value of type EMP_TT. Conversely, no value of type
+        EMP_TT is a value of type PGMR_TT, either.
+
+    ■   It follows that the set of all possible values of type PGMR_TT is not a subset of the set of all
+        possible values of type EMP_TT. Conversely, the set of all possible values of type EMP_TT
+        is not a subset of the set of all possible values of type PGMR_TT, either.
+
+    ■   It also follows that the set of all current values of type PGMR_TT is not a subset of the set of
+        all current values of type EMP_TT. Conversely, the set of all current values of type EMP_TT
+        is not a subset of the set of all current values of type PGMR_TT, either.
+
+1
+   We cannot include such variables in a relational database, of course, but as we know from Chapter 12 inheritance has
+little to do with database data as such anyway.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                        491
+Appendixes                                               Appendix G / A Closer Look at Structural Inheritance
+
+
+       Now, in the inheritance model described in Part IV of this book, to say that type T' is a
+subtype of type T is to say that T' is a subset of type T (IM Prescription 2). It follows that we cannot
+say that PGMR_TT is a subtype of type EMP_TT without doing considerable violence to the
+commonsense notion of subtype, and indeed to our inheritance model in general. Let us agree,
+therefore, not to use the terminology of subtyping in this connection; let us agree to say, rather, that
+(e.g.) PGMR_TT is an extension of EMP_TT—and let us agree to say analogously that EMP_TT is
+a projection of PGMR_TT, since it is obtained from PGMR_TT by projecting away an attribute.
+Then we can at least say that the set of projections of all possible PGMR_TT tuples, over all but
+LANG, is a subset of—is in fact equal to—the set of all possible EMP_TT tuples.1
+       To pursue the point just a moment longer: Despite the foregoing, those who advocate the idea
+of structural inheritance normally do refer to EMP_TT and PGMR_TT as supertype and subtype,
+respectively (see the subsection immediately following). But we now observe that the terminology
+is really bad—because the “subtuples” (i.e., tuples of the “subtype”) have a superset of the attributes
+of the “supertuples” (i.e., tuples of the “supertype”)! A programmer tuple, for example, has all of
+the attributes of an employee tuple, plus one more (LANG).
+
+Substitutability
+
+Recall now that the whole point of inheritance is substitutability; for example, a program that works
+for ellipses can work for circles too, because we can always substitute a circle wherever the system
+expects an ellipse. So what about employees and programmers? Does substitutability apply?
+       Well, we have seen that no tuple of type PGMR_TT is a tuple of type EMP_TT (and vice
+versa). Thus, if Op is an operator that takes a parameter of type EMP_TT, it cannot validly be
+invoked with an argument of type PGMR_TT instead. In other words, inclusion polymorphism
+does not apply, and there is no value substitutability either. (Of course, we can validly invoke Op
+with an argument that is the projection over all but LANG of some tuple of type PGMR_TT. By
+definition, however, that argument is of type EMP_TT, and it hardly seems appropriate to dignify
+this rather trivial possibility with the grand name of substitutability.)
+       So what can we do? There would be little point in supporting structural inheritance in the first
+place if it turned out to provide no substitutability. How can we rescue the situation?
+       Well, one thing we could do is expand our notion of what it means for variable V to be of type
+T, such that the value of V at any time could be of any subtype of T or any extension of T (or any
+extension of any subtype of T, perhaps). Then it would be possible for variable EMP_VAR, of
+declared type EMP_TT, to contain a value of most specific type PGMR_TT, for example. It would
+also be possible to assign a value of most specific type PGMR_TT to a variable of declared type
+EMP_TT (and so on—all the things we expect to be able to do with behavioral inheritance would
+now be possible, in fact). Indeed, if we did not expand our notion (of what it means to declare
+something to be of a certain type) in such a way, we could not have, e.g., a relation r with an
+attribute A of declared type EMP_TT, such that some tuples in r contain an A value of type
+
+
+1
+  It is still not the case, however, that the set of projections of all current PGMR_TT tuples over all but LANG is a
+subset of the set of all current EMP_TT tuples; for that to be so, we would need a certain integrity constraint to be
+enforced. However, such considerations take us into the realm of structural inheritance as it applies to relvars, not
+tuplevars. See the section “Subtables and Supertables,” later in this appendix.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                             492
+Appendixes                                              Appendix G / A Closer Look at Structural Inheritance
+
+
+PGMR_TT instead of EMP_TT. So it looks as if at least part of the solution to the problem of
+rescuing substitutability is going to have to involve the foregoing scheme.
+       However, one objection to that scheme is the pragmatic one that the implementation would
+not be able to tell ahead of time, in general, how much storage to allocate for any given variable.
+As a result, we might have to move to an implementation in which variables contain pointers to
+their corresponding allocated storage, instead of actual values as in our model. If so, then there is a
+possibility that this feature of the implementation will show through at the model level (as indeed it
+does in object systems)—and that consequence, if it is a consequence, is something we are
+adamantly opposed to, for reasons explained in Appendix F and elsewhere.
+       Another way we might attempt to rescue substitutability is to use overloading polymorphism.
+As a simple example, suppose we want to conduct a “what if” experiment to determine the total cost
+to the company of raising certain salaries by 10 percent; so we want an operator to compute the
+hypothetical new salary for a given employee, regardless of whether that employee is a programmer
+or “just an employee.” Then we might define two distinct operators, both called RAISE,1 as
+follows:
+       OPERATOR RAISE ( E EMP_TT ) RETURNS MONEY VERSION E_RAISE ;
+          RETURN ( ( SALARY FROM E ) * 1.1 ) ;
+       END OPERATOR ;
+
+       OPERATOR RAISE ( P PGMR_TT ) RETURNS MONEY VERSION P_RAISE ;
+          RETURN ( ( SALARY FROM P ) * 1.1 ) ;
+       END OPERATOR ;
+
+       Now, e.g., the expression RAISE (EMP_VAR) will cause the version of RAISE called
+E_RAISE to be invoked, while the expression RAISE (PGMR_VAR) will cause the version of
+RAISE called P_RAISE to be invoked instead. (We remark in passing on a slight awkwardness
+here, arising from the fact that tuple types are “named”—viz., the operators have to be defined in
+terms of an attribute, SALARY, that is not immediately visible as an attribute of the pertinent
+parameter.)
+       Of course, once we start down the overloading path, there is nothing to stop different versions
+of “the same” operator from implementing different semantics (and we remind you from Chapter 14
+that some might even argue that this state of affairs is a good thing). For example, suppose the
+salary increase for a given employee is supposed to be 25 percent if the employee is a programmer
+but only 10 percent otherwise:
+       OPERATOR RAISE ( E EMP_TT ) RETURNS MONEY VERSION E_RAISE ;
+          RETURN ( ( SALARY FROM E ) * 1.1 ) ;
+       END OPERATOR ;
+
+       OPERATOR RAISE ( P PGMR_TT ) RETURNS MONEY VERSION P_RAISE ;
+          RETURN ( ( SALARY FROM P ) * 1.25 ) ;
+       END OPERATOR ;
+
+
+
+1
+  Recall that overloading really means overloading operator names (to say that Op is overloaded really means there are
+two or more distinct operators with the same name Op). We note in passing that the particular kind of overloading
+polymorphism under discussion here is also referred to in the literature as extension polymorphism [137], for obvious
+reasons.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                       493
+Appendixes                                              Appendix G / A Closer Look at Structural Inheritance
+
+
+      Now the two RAISE operators are indeed different operators, not just different
+implementation versions of “the same” operator.
+      We modify the foregoing example in order to illustrate another point (the modified example is
+very contrived but is sufficient for our purpose). Suppose the intent of the operator is to compute
+the hypothetical new salary by increasing the original salary by 10 percent and then (for
+programmers only) doubling the result:
+       OPERATOR RAISE ( E EMP_TT ) RETURNS MONEY VERSION E_RAISE ;
+          RETURN ( ( SALARY FROM E ) * 1.1 ) ;
+       END OPERATOR ;
+
+       OPERATOR RAISE ( P PGMR_TT ) RETURNS MONEY VERSION P_RAISE ;
+          RETURN ( 2 * RAISE ( TREAT_AS_EMP_TT ( T ) ) ) ;
+       END OPERATOR ;
+
+       Version E_RAISE here is straightforward. Version P_RAISE, however, involves an
+invocation of TREAT, which, for the purposes of this discussion, we are assuming has been given
+somewhat revised semantics. To be specific, we assume that the expression TREAT_AS_EMP_TT
+(T) means “treat the argument T—which is actually of type PGMR_TT—as if it were of type
+EMP_TT instead.” Thus, version P_RAISE computes its result by (a) invoking version E_RAISE
+to increase the salary by 10 percent and then (b) doubling that increased salary. In other words, we
+are talking here about the mechanism called operator delegation (see Appendix C)—the function
+of increasing the salary by 10 percent is not implemented explicitly for type PGMR_TT but is
+“delegated” to type EMP_TT instead.
+       Observe that delegation is not the same as inheritance; we cannot say the operator “increase
+salary by 10 percent” is inherited by programmers from employees, because PGMR_TT is not a
+subtype of EMP_TT. It is true that, like inheritance, delegation might imply a certain amount of
+code reuse; unlike inheritance, however, we regard delegation more as an implementation issue (and
+perhaps an optimization issue) than it is a model issue. We note, however, that whereas the is-a
+relationship leads naturally to inclusion polymorphism (as we know from Part IV of this book), it
+seems that the has-a relationship—which, we remind you, is the fundamental issue here—seems to
+lead naturally to overloading polymorphism instead, which in turn seems to lead to delegation. We
+remark too that the automatic provision, discussed in Chapter 6, of implementation code for, say,
+the “<“ operator for type QTY might be regarded as a form of delegation.
+       As an exercise, you might like to ponder the implications of the ideas discussed in this
+subsection for assignments and equality comparisons in particular.
+
+SUBTABLES AND SUPERTABLES
+
+In Part IV of this book, we proposed a detailed model for what in relational terms might be called
+domain inheritance. When approached regarding the possibility of inheritance in a relational
+context, however, many people—perhaps most—immediately jump to the conclusion that it is some
+kind of table inheritance that is the subject under discussion.1 For example, we mentioned the fact
+
+1
+  We deliberately use the “fuzzy” terms table, row, and column in this section instead of our preferred terms relation,
+relvar, tuple, and attribute, because our examples and discussion are based on SQL, at least in part (though we have not
+hesitated to omit or simplify many SQL details that are irrelevant to our purpose).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                         494
+Appendixes                                               Appendix G / A Closer Look at Structural Inheritance
+
+
+in Chapter 12 that the SQL standard [99] includes something it calls “subtables and supertables,”
+according to which some table B might inherit all of the columns of some other table A and then add
+some more of its own. An example is shown in Fig. G.1.
+╔═════════════════════════════════════════════════════════════════╗
+║       ┌──────┬───────┬───────┬────────┐                         ║
+║ EMP │ EMP# │ ENAME │ DEPT# │ SALARY │               supertable ║
+║       └══════┴───────┴───────┴────────┘                         ║
+║                                                                 ║
+║              inherited from EMP                                 ║
+║       ┌─ ─ ─ ┬ ─ ─ ─ ┬ ─ ─ ─ ┬ ─ ─ ─ ─┬──────┐                  ║
+║ PGMR │ EMP# │ ENAME │ DEPT# │ SALARY │ LANG │         subtable ║
+║       └═ ═ ═ ┴ ─ ─ ─ ┴ ─ ─ ─ ┴ ─ ─ ─ ─┴──────┘                  ║
+╚═════════════════════════════════════════════════════════════════╝
+Fig. G.1: Subtable/supertable example
+
+       Here are the SQL definitions:
+       CREATE TYPE EMP_RT
+         AS ( EMP# CHAR, ENAME CHAR, DEPT# CHAR, SALARY MONEY ) ... ;
+
+       CREATE TYPE PGMR_RT UNDER EMP_RT AS ( LANG ... ) ;
+
+       CREATE TABLE EMP OF EMP_RT ... PRIMARY KEY ( EMP# ) ... ;
+
+       CREATE TABLE PGMR OF PGMR_RT UNDER EMP ;
+
+      Explanation: EMP_RT and PGMR_RT are what SQL calls structured types—for present
+purposes, you can think of them as relation or table types—and PGMR_RT is a “subtype” of
+“supertype” EMP_RT. (We prefer the terms extension type and projection type, however, for
+reasons explained in the previous section.) Tables EMP and PGMR are of types EMP_RT and
+PGMR_RT, respectively; EMP has four columns and PGMR only one (but it “inherits” the four
+columns of EMP as well). Nonprogrammers have a row in EMP only, while programmers have a
+row in both tables—so every row in PGMR has a counterpart in EMP, but the converse is not true.1
+However, the properties EMP#, ENAME, DEPT#, and SALARY are not recorded twice for
+programmers; rather, the PGMR table “inherits” those properties from the EMP table, as already
+indicated.
+      It should be clear already that subtables and supertables are basically just another example of
+structural inheritance (or “the EXTENDS relationship”), as it applies to the case of tables
+specifically. It follows that much of the discussion in the previous section applies more or less
+unchanged, and we will not bother to make the same points all over again. However, there are a
+few additional points arising that are worth calling out explicitly, and that is the purpose of the
+present section.
+      First, then, here are the implications of the design of Fig. G.1 on the usual SQL retrieval and
+update operations. Note: We caution you that different systems and different writers interpret the
+
+1
+  It follows that the set of projections of all current programmer rows (speaking a little loosely) over all but LANG is a
+subset of the set of all current employee rows; in effect, there is an automatically enforced referential constraint from
+table PGMR to table EMP.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                           495
+Appendixes                                     Appendix G / A Closer Look at Structural Inheritance
+
+
+idea of subtables and supertable in different ways—see, e.g., the annotation to reference [124] in
+Appendix K. What follows is the way the SQL standard works, more or less.
+
+ ■    SELECT: Retrieval from EMP behaves normally. Retrieval from PGMR behaves as if
+      PGMR actually contained the columns EMP#, ENAME, DEPT#, and SALARY (as well as
+      LANG, of course).
+
+ ■    INSERT: INSERT into EMP behaves normally. INSERT into PGMR effectively causes new
+      rows to appear in both EMP and PGMR.
+
+ ■    DELETE: DELETE from EMP causes rows to disappear from EMP and (if the rows in
+      question happen to correspond to programmers) from PGMR too. DELETE from PGMR
+      causes rows to disappear from both EMP and PGMR.
+
+ ■    UPDATE: Updating EMP# or ENAME or DEPT# or SALARY in EMP applies the same
+      updates to any corresponding rows in PGMR. Updating those columns in PGMR applies the
+      same updates to the corresponding rows in EMP. Updating LANG in PGMR updates PGMR
+      only.
+
+      Note, incidentally, that the INSERT/DELETE behavior sketched above means we are not
+dealing with a conventional foreign-key-to-candidate-key relationship from PGMR to EMP, with
+conventional referential actions—for if we were, then, e.g., deleting a row from PGMR could not
+possibly cause deletion of a row from EMP. Note too that we have overlooked a couple of
+complicating factors in our brief explanations. For example:
+
+ ■    Suppose an existing nonprogrammer becomes a programmer. If we simply try to insert an
+      appropriate row into PGMR, the system will attempt to insert a corresponding row into EMP
+      as well—an attempt that will fail on a key uniqueness violation. Thus, it looks as if we will
+      need an additional form of INSERT (“INSERT ONLY”?) that will let us insert a row into the
+      subtable only.
+
+ ■    Conversely, suppose an existing programmer becomes a nonprogrammer. If we simply try to
+      delete the appropriate row from PGMR, the system will delete the corresponding row from
+      EMP as well—a side effect that will presumably not be desired. Thus, it looks as if we will
+      need an additional form of DELETE (“DELETE ONLY”?) that will let us delete a row from
+      the subtable only.
+
+We remark in passing that SQL does not include support for any such INSERT ONLY and
+DELETE ONLY operators.
+      The obvious question now is: What if anything do the foregoing ideas have to do with
+inheritance? Well, it should be immediately clear that they have nothing to do with the
+prescriptions for relation types discussed in Chapter 16. According to those prescriptions, just to
+remind you, if RT' and RT are relation types such that RT' is a subtype of supertype RT, there is no
+notion that RT' somehow “inherits columns” from RT; rather, RT' and RT have the same columns,
+loosely speaking. So far as we are concerned, in fact, the subtype/supertype relationship is actually
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       496
+Appendixes                                       Appendix G / A Closer Look at Structural Inheritance
+
+
+implied, in part, by the fact that types RT' and RT have the same columns (recall once again that we
+have no way of explicitly defining tuple and relation types outside of the statements that make use
+of them, and hence no way of explicitly stating that one such type is a subtype of another). To
+repeat, then: What do subtables and supertables have to do with inheritance?
+       Well, the fact that our model deals exclusively with type inheritance does not of itself rule out
+the possibility of some kind of table inheritance, of course. Indeed, it should be the case that our
+model provides a framework for understanding whether some sense might be made of such a
+notion; after all, that model is quite general and does necessarily address the implications of
+inheritance for values and variables in general—including relation values and variables in
+particular—and of course “tables” in the present context are really just relation variables (relvars),
+at least to a first approximation.
+       But herein lies a crucial point. “Tables” are indeed variables; thus, to talk of “subtables and
+supertables” is to talk of what might be called “subvariables and supervariables” ... whatever that
+might mean! (How can two distinct variables possibly be such that one is a “subvariable” of the
+other?) This observation immediately suggests that:
+
+ ■    First, whatever “subtables and supertables” might be all about, the one thing they are
+      definitely not about is type inheritance; the tables in question are variables, and variables are
+      not types.
+
+ ■    Second, the idea seems a little suspect right away. We explained in Part IV of this book that
+      inheritance applies to values, not variables. (To paraphrase a remark from Chapter 12: “To
+      say a circle is an ellipse is to say that every circle value is an ellipse value, not that every
+      circle variable is an ellipse variable.”) What then can it mean to say that relation variable
+      PGMR is a “sub”-anything of relation variable EMP?
+
+      Thus, it might be possible to make some kind of sense out of “subtables and supertables,” but
+(as we will show) it is a completely different phenomenon, one that has essentially nothing to do
+with type inheritance as such.
+      Next, when we talk of PGMR being a “subtable” of EMP (and inheriting columns from
+EMP), what we really mean is that each PGMR row inherits certain properties from the
+corresponding EMP row. In other words, we should really be talking about “subrows and
+superrows,” not “subtables and supertables” at all. (And we pointed out in the previous section, in
+effect, that this latter terminology is very bad, because each “subrow” is a superset of the
+corresponding “superrow.”)
+      Next, it follows that, whatever else they might be, “subtables and supertables” are not an
+application of our inheritance ideas in which the variables are relvars specifically. Nor are they an
+application of our inheritance ideas in which the variables are tuplevars (or “rowvars”) specifically,
+because the only tuplevars we deal with in our model are “free-standing” ones—there is not, nor can
+there be, any notion of a tuplevar somehow being embedded within a relvar, as we have observed at
+several points in this book previously.
+      So why might subtables and supertables be a good idea? What are the advantages? Well, the
+only advantage we can see (and it is a pretty minor one) is this:
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         497
+Appendixes                                               Appendix G / A Closer Look at Structural Inheritance
+
+
+         Informing the system that, e.g., PGMR is a subtable of supertable EMP is shorthand for
+         stating certain new kinds of referential actions declaratively.
+
+    To be specific, it allows:
+
+    ■    Insertion of a row into PGMR to cause automatic insertion of the corresponding row into
+         EMP
+
+    ■    Deletion of a row from PGMR to cause automatic deletion of the corresponding row from
+         EMP
+
+      But there is no need to pretend that certain columns are “inherited” by PGMR from EMP in
+order to achieve these effects! In fact, we could achieve these effects very simply by:1
+
+    a.   Defining two base tables as follows (in outline):
+         EMP      ( EMP# ..., ENAME ..., DEPT# ..., SALARY ... )
+         EMP_LANG ( EMP# ..., LANG ... )
+
+    b.   Defining PGMR as a view of these two base tables, thus:
+         PGMR = EMP JOIN EMP_LANG
+
+       This approach, which is described in detail in reference [76], provides all of the functionality
+described earlier for the subtable/supertable design; it also gets around the INSERT ONLY and
+DELETE ONLY problem (trivially so, in fact—the operators are simply no longer needed). What
+is more, the approach could serve as a basis for implementing subtables and supertables (if they are
+regarded as worth implementing at all, that is). Note: Actually, we suspect the whole idea derives
+from a confusion over model vs. implementation once again. To be more specific, we suspect that
+if table B and table A are a subtable and corresponding supertable, respectively, then the intent is
+that tables B and A should be physically implemented—for performance reasons—as one “stored
+table” on the disk, with nulls in the B-only columns in “stored rows” corresponding to A rows and
+not to B rows. But such implementation concerns should never show through to the model level!
+The relational model quite deliberately has nothing to say regarding physical storage matters.
+       In sum, it looks as if the whole business of a subtable inheriting columns from a supertable is
+nothing but a syntactic shorthand—not that there is anything wrong with syntactic shorthands in
+general, of course, but this particular shorthand does not seem very useful, and in any case it is
+already more than adequately supported by the conventional view mechanism.
+       One final point to close this section: It is worth noting that the terminology of subtables and
+supertables might more reasonably be applied “the other way around,” as it were. Consider our
+usual suppliers-and-parts database, and suppose some parts have no color. Instead of using a null to
+represent the color of such a part—a notion we reject anyway—the following design might make
+more sense:
+
+
+
+1
+    Thanks to Spencer Olson of State Street Bank, Boston, Massachusetts, for these observations.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                             498
+Appendixes                                                 Appendix G / A Closer Look at Structural Inheritance
+
+
+         P     { P#, PNAME, COLOR, WEIGHT, CITY }                              /* “supertable */
+
+         NCP { P#, PNAME, WEIGHT, CITY }                                       /* “subtable”          */
+
+      Here parts with no color are represented in NCP and other parts are represented in P. See
+reference [33] for further discussion.
+
+
+SCALAR TYPES REVISITED
+
+In the present section we offer a few further thoughts regarding structural inheritance in connection
+with scalar types. First of all, we saw earlier in this book that if T' is a subtype of T, then every
+possrep for T is necessarily, albeit implicitly, a possrep for T' as well; for example, every possrep
+for ellipses is necessarily a possrep for circles as well, because circles are ellipses. As noted in
+Chapter 12, therefore, we might regard possreps as further “properties” that are inherited, albeit
+silently, by subtypes from supertypes. And we might go further and regard such inheritance as
+structural inheritance, of a kind. Note, however, that the possrep that is inherited in this way by
+type T' is identical to the corresponding possrep for type T; there is no notion, as there is with
+structural inheritance as usually understood, of the subtype “structure” having additional
+components, over and above those in the “structure” for the supertype.
+       Also, if T' is a subtype of T, then every declared possrep for T' is derived from some possrep
+      1
+for T, and we might regard the derivation process as structural inheritance, of a kind. Here,
+however, the derived possrep not only has no additional components over and above those in the
+possrep for the supertype, it typically has fewer (think of ellipses and circles, for example). Again,
+therefore, this kind of inheritance is not structural inheritance as usually understood. Indeed,
+subtypes and supertypes as we have defined them make little sense as examples of structural
+inheritance as usually understood. For example, suppose we were to represent ellipses and circles
+not by scalar types as usual but by tuple types instead, thus:
+         TYPE ELLIPSE TUPLE { A LENGTH, B LENGTH, CTR POINT } ;
+
+         TYPE CIRCLE         TUPLE EXTEND ELLIPSE ADD { R LENGTH } ;
+
+       Now every circle will have three attributes (A, B, and R) whose values are always equal!—
+not a very sensible design, it might be thought (especially if those three attributes map directly to
+three physical “attributes” in storage).
+       We have now laid the groundwork for discussing another outstanding issue. Under IM
+Prescription 2 in Chapter 14, we said that examples along the following lines are often found in the
+literature: “Let type COLORED_CIRCLE be a subtype of type CIRCLE.” And we said we would
+return to this particular example in the present appendix. Now read on ...
+       The example clearly suggests that colored circles are a special case of circles in general. But
+are they? We think not. By definition, surely, “colored circles” are images (on a display screen
+perhaps), whereas circles in general are not images but geometric figures in two-dimensional space.
+Thus, it seems to us more reasonable to regard COLORED_CIRCLE not as a subtype of CIRCLE
+
+
+1
+    We assume here for simplicity that (a) we are dealing with single inheritance and (b) T is a regular type.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                      499
+Appendixes                                      Appendix G / A Closer Look at Structural Inheritance
+
+
+but rather as a completely separate type. Now, that separate type might well have a possrep in
+which one component is of type CIRCLE and another is of type COLOR, thus—
+      TYPE COLORED_CIRCLE POSSREP { CIR CIRCLE, COL COLOR ... } ;
+
+—but it is not, to repeat, a subtype of type CIRCLE, any more than it is a subtype of type COLOR.
+       Note: Another way of saying the same thing is to say that every colored circle has a circle
+property but is not a circle (just as it has a color property but is not a color). As with employees and
+programmers, therefore, what we are really talking about here is the has-a relationship, not the is-a
+relationship that characterizes inheritance and subtyping as such.
+       We now proceed to present a series of arguments to bolster the foregoing conclusion. (Well,
+we say “a series of arguments,” but perhaps we should admit up front that the arguments in question
+are really all just the same argument in different guises, as will soon be seen.)
+       We begin by reminding you of the following remark from Chapter 14:
+
+      It is an obvious corollary of IM Prescription 2 that there cannot be more values of type T' than
+      there are of type T. This apparently trivial observation can be very helpful in pinpointing
+      errors and clearing up confusions.
+
+       In the case at hand, it is surely obvious—as in fact we pointed out in Chapter 14—that there
+are more colored circles than there are just plain circles. (We assume, reasonably enough, that two
+circles that differ in color but are otherwise identical are the same circle but different colored
+circles.) Thus, this simple test should be sufficient to show right away that type
+COLORED_CIRCLE is indeed not a subtype of type CIRCLE.
+       Second, recall RM Prescription 4, which says in part that if S is a selector for type T, then
+every value of type T must be produced by some invocation of S. But no invocation of the CIRCLE
+selector can possibly produce a value of type COLORED_CIRCLE, since the CIRCLE selector has
+no color parameter; hence, a value of type COLORED_CIRCLE is not a value of type CIRCLE,
+and type COLORED_CIRCLE is not a subtype of type CIRCLE.
+       Third, we pointed out earlier in this section that, informally, we might regard possreps as
+further “properties” that are inherited by subtypes from supertypes. Yet our CIRCLE possrep, with
+its radius and center components, is not a possrep for colored circles, because it has no color
+component. Once again, therefore, type COLORED_CIRCLE cannot be a subtype of type
+CIRCLE.
+       Last, we offer the important observation that there is no way to obtain a colored circle from a
+circle via S by C. That is, there is no constraint we can write for type COLORED_CIRCLE that, if
+satisfied by a given value of type CIRCLE, means the circle in question is really a colored circle.
+And the reason is, of course, again basically that the CIRCLE possrep has no color component.
+       It should be clear, then, that CIRCLE and COLORED_CIRCLE are completely different
+types. As suggested earlier, however, it is probably true that type COLORED_CIRCLE has a
+possrep in which one component is of type CIRCLE. And it is probably also true that we would
+like to be able to say that, e.g., the operator CTR which returns the center of a given colored circle
+is basically just the THE_CTR operator that applies to the CIRCLE component CIR of the possrep
+for that colored circle. Once again, then, we are talking about the mechanism of delegation—the
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         500
+Appendixes                                     Appendix G / A Closer Look at Structural Inheritance
+
+
+responsibility for implementing CTR for type COLORED_CIRCLE is delegated to the type,
+CIRCLE, of a certain component of (one of) its possrep(s).
+
+
+STRUCTURAL INHERITANCE WITH FEWER TEARS
+
+We have said that we do not preclude direct support for structural inheritance. However, we have
+now seen that such support might well be problematic for various reasons. In this section, therefore,
+we show how our own model can be used to achieve the effect of structural inheritance without
+having to support that concept directly.
+     It is convenient to begin by repeating something we said in Chapter 14. In our discussion of
+IM Prescription 17 in that chapter, we said this:
+
+      [We] are still not convinced that changing operator semantics is ... a good idea. We therefore
+      define our model to say that if a change in semantics occurs, then the implementation is in
+      violation—i.e., it is not an implementation of the model, and the implications are
+      unpredictable.
+
+     We are not without our critics on this issue, of course. The typical counterargument goes
+something like this:
+
+      One significant advantage that is often claimed for object orientation is code reuse. The idea
+      is that some existing class might be “almost right” for a new application, and that much of it
+      can be reused by a subclass that introduces some additions and changes. For example,
+      suppose a company has a class called EMPLOYEE, with various operators, including a
+      PAYROLL operator that (among other things) computes the net pay for a given employee.
+      Suppose the company now introduces a new kind of employee who is paid in a different way,
+      perhaps at an hourly rate instead of monthly. The company might be able to reuse most of the
+      PAYROLL code by creating a subclass, HOURLY_EMPLOYEE, with its own PAYROLL
+      operator. The new subclass might not find the representation of the original class to be
+      sufficient, so it will probably need to add new instance variables, such as
+      HOURS_WORKED. Overloading the PAYROLL operator makes it possible to process a
+      column of employees, some of whom are paid by the hour, without putting logic into the
+      application to branch on employee type, using the principle called polymorphism. However,
+      this example of code reuse and polymorphism will clearly not work under the constraint that
+      the semantics of the PAYROLL operator must not change as we go from class EMPLOYEE
+      to class HOURLY_EMPLOYEE. So a refusal to allow changes in semantics forfeits the
+      advantage of code reuse, one of the principal advantages claimed for object orientation.
+
+       (The foregoing is based on one specific criticism [1], but we have revised the original
+considerably. In particular, we have replaced the example by one of our own. Of course, we have
+tried not to change the essential nature of the argument.)
+       So what is wrong with this criticism? The overriding point, it seems to us, is that examples
+like the one described are not examples of subtyping. If we say that employees have a monthly
+salary, and hourly employees are employees, then it follows as the night the day that hourly
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      501
+Appendixes                                      Appendix G / A Closer Look at Structural Inheritance
+
+
+employees have a monthly salary!—for otherwise they are not employees in the first place. To put
+it another way, to say that hourly employees are somewhat like regular employees is not the same as
+saying that hourly employees are a special case of regular employees. A mechanism that allows us
+to say that hourly employees are “somewhat like” regular employees might possibly be useful—it
+might even allow a certain amount of code reuse—but, to repeat, that mechanism is not type
+inheritance as such. After all, if to say that type B is a subtype of type A just means that type B is
+“somewhat like” type A except that certain properties are added and/or dropped and/or altered, then
+absolutely any type whatever could be regarded as a subtype of absolutely any type whatever!
+       In fact, it seems to us that, once again, what we are really talking about here is a has-a
+relationship, not an is-a relationship at all: Hourly employees “have a” certain property that
+employees in general do not have, and likewise for monthly employees. Note in particular that,
+once again, S by C does not apply (at least, not directly).
+
+A Possible Solution
+
+Despite the foregoing analysis, it turns out that we can convert the monthly vs. hourly employees
+example into an application of true subtyping and inheritance if we want to. The key is to recognize
+that monthly and hourly employees can both be regarded as special cases of the abstract concept
+“employees in general.” We proceed as follows.
+      First of all, in accordance with the arguments presented in Appendix B, we would probably
+have three real relvars looking something like this:
+      VAR EMP REAL RELATION                              /* employees in general */
+        { EMP# ... ,
+          DEPT# ... }
+          KEY { EMP# } ;
+
+      VAR MONTHLY_EMP REAL RELATION           /* monthly employees */
+        { EMP# ... ,
+          MONTHLY_RATE ... }
+          KEY { EMP# }
+          FOREIGN KEY { EMP# } REFERENCES EMP ;
+
+      VAR HOURLY_EMP REAL RELATION            /* hourly employees */
+        { EMP# ... ,
+          HOURS_WORKED ... ,
+          HOURLY_RATE ... }
+          KEY { EMP# }
+          FOREIGN KEY { EMP# } REFERENCES EMP ;
+
+     Next, we introduce some constraints to ensure that every employee is either monthly or hourly
+and not both:
+      CONSTRAINT MONTHLY_AND_HOURLY_DISJOINT
+         IS_EMPTY ( MONTHLY_EMP { EMP# } INTERSECT HOURLY_EMP { EMP# } ) ;
+
+      CONSTRAINT MONTHLY_AND_HOURLY_SPAN
+         ( MONTHLY_EMP { EMP# } UNION HOURLY_EMP { EMP# } ) = EMP { EMP# } ;
+
+      We also define a couple of useful views (virtual relvars):
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       502
+Appendixes                                    Appendix G / A Closer Look at Structural Inheritance
+
+
+     VAR MONTHLY_EMP_ALL_INFO VIRTUAL ( EMP JOIN MONTHLY_EMP )
+         KEY { EMP# } ;
+
+     VAR HOURLY_EMP_ALL_INFO VIRTUAL ( EMP JOIN HOURLY_EMP )
+         KEY { EMP# } ;
+
+       Now, the object of the exercise is to be able to “[overload] the PAYROLL operator [and thus
+make] it possible to process a column of employees, some of whom are paid by the hour, without
+putting logic into the application to branch on employee type.” It follows that we are going to need
+a relvar that includes an attribute of some scalar “employee type,” some of whose values
+correspond to monthly employees and some to hourly employees. (Note: The attribute cannot be of
+a tuple type, because the tuple types corresponding to EMP, MONTHLY_EMP, and
+HOURLY_EMP tuples are all different, and no two of them have a common supertype; hence, if
+the attribute in question were of any of those three types, it obviously could not take on values of
+either of the other two.) So let us define three scalar types, S_EMP, S_MONTHLY_EMP, and
+S_HOURLY_EMP (S_ for scalar), thus:
+     TYPE S_EMP UNION ;
+
+     TYPE S_MONTHLY_EMP IS { S_EMP POSSREP { EMP# ... , DEPT# ... ,
+                             MONTHLY_RATE ... } } ;
+
+     TYPE S_HOURLY_EMP IS { S_EMP POSSREP { EMP# ... , DEPT# ... ,
+                            HOURS_WORKED ... , HOURLY_RATE ... } } ;
+
+      Every value of type S_EMP is in fact a value of type S_MONTHLY_EMP or type
+S_HOURLY_EMP—there are no values of most specific type S_EMP. However, there is no “S by
+C” from S_EMP to S_MONTHLY_EMP or S_HOURLY_EMP, because S_EMP is a dummy type.
+(Despite this fact, we would still expect THE_EMP# and THE_DEPT# operators and
+pseudovariables to be defined at the S_EMP level. Compare the analogous example in Chapter 14,
+under IM Prescription 20, in which THE_CTR is defined as applying at the ELLIPSE level even
+when ELLIPSE is a dummy type.)
+      Now we can define the PAYROLL operator. To be more precise, we can define two
+PAYROLL operators, one at the S_MONTHLY_EMP (“monthly employees”) level and one at the
+S_HOURLY_EMP (“hourly employees”) level. Note very carefully that those two PAYROLL
+operators really are different operators (though they might be able to share some implementation
+code):
+     OPERATOR PAYROLL ( E S_MONTHLY_EMP ) RETURNS MONEY ;
+        /* compute on basis of monthly rate */
+        ... ;
+     END OPERATOR ;
+
+     OPERATOR PAYROLL ( E S_HOURLY_EMP ) RETURNS MONEY ;
+        /* compute on basis of hours worked and hourly rate */
+        ... ;
+     END OPERATOR ;
+
+     We also need a PAYROLL specification signature at the S_EMP level:
+     OPERATOR PAYROLL ( E S_EMP ) RETURNS MONEY ;
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                     503
+Appendixes                                      Appendix G / A Closer Look at Structural Inheritance
+
+
+         /* specification signature only */
+      END OPERATOR ;
+
+      Now we define a view that contains the desired attribute, EMP, of type S_EMP. Note the use
+of S_MONTHLY_EMP and S_HOURLY_EMP selectors and the appeal to IM Prescription 13
+here!
+      VAR REQD_VIEW VIRTUAL
+      ( ( EXTEND MONTHLY_EMP_ALL_INFO
+                 ADD ( S_MONTHLY_EMP ( EMP#, DEPT#, MONTHLY_RATE )
+                           AS EMP ) ) { EMP }
+           UNION
+        ( EXTEND HOURLY_EMP_ALL_INFO
+                   ADD ( S_HOURLY_EMP ( EMP#, DEPT#,
+                                              HOURS_WORKED, HOURLY_RATE )
+                            AS EMP ) ) { EMP } ) ;
+
+This view contains just one attribute, EMP, of declared type S_EMP.
+      Finally, “to process [the] column of employees, some of whom are paid by the hour, without
+putting logic into the application to branch on employee type”:
+      EXTEND REQD_VIEW ADD ( PAYROLL ( EMP ) AS PAY )
+
+Attribute PAY in the relation that results from this expression contains exactly what is required.
+
+Another Example
+
+In this subsection we sketch a similar (but different) solution to a similar (but different) problem.
+This problem involves multiple instead of single inheritance and inclusion instead of overloading
+polymorphism. However, the “objects” that participate in the inheritance relationships are again,
+for reasons explained in Appendix B, better represented—at least initially—by means of relvars, not
+types. The “objects” in question are again employees. This time, however, some employees are
+part-time and some are managers (and some are both), and the assumption is that we want to be able
+to treat part-time managers differently in some way from the way we treat full-time managers and
+part-time nonmanagers.
+       Our approach to this problem goes something like this. First of all, here is the relational
+design:
+      VAR EMP REAL RELATION { EMP# ... , DEPT# ... } KEY { EMP# } ;
+
+      VAR PART_TIME_EMP REAL RELATION { EMP# ... , DAY_OFF ... } KEY { EMP# }
+          FOREIGN KEY { EMP# } REFERENCES EMP ;
+
+      VAR MANAGER_EMP REAL RELATION { EMP# ... , BUDGET ... }
+          FOREIGN KEY { EMP# } REFERENCES EMP ;
+
+      VAR PART_TIME_MANAGER_EMP REAL RELATION { EMP# ... , SOMETHING_ELSE ... }
+          FOREIGN KEY { EMP# } REFERENCES PART_TIME_EMP
+          FOREIGN KEY { EMP# } REFERENCES MANAGER_EMP ;
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          504
+Appendixes                                     Appendix G / A Closer Look at Structural Inheritance
+
+
+      From the foregoing relational design, we can, in a manner similar to that sketched in the
+previous section, define the following scalar types (shown here in outline only; the details are
+tedious but straightforward). Note in particular that type EMP includes two BOOLEAN
+components, PART_TIME and MANAGER, to indicate whether a given employee is part- or full-
+time and whether he or she is a manager.
+      TYPE EMP POSSREP { EMP# ... ,      DEPT# ... ,
+                         PART_TIME ... , DAY_OFF ... ,
+                         MANAGER ... ,   BUDGET ... ,
+                         SOMETHING_ELSE ... } ;
+
+      /* If NOT ( THE_PART_TIME (e) ), then THE_DAY_OFF (e) and    */
+      /* THE_SOMETHING_ELSE (e) are both special “missing” values; */
+      /* if NOT ( THE_MANAGER (e) ), then THE_BUDGET (e) and       */
+      /* THE_SOMETHING_ELSE (e) are both special “missing” values. */
+      /* These constraints need to be stated formally, of course; */
+      /* we omit the details here.                                 */
+
+      /* This is not a GOOD design!—but it’s a possible one.                     */
+
+      /* Note in particular that type EMP is a regular type (it    */
+      /* might or might not be a union type), and so subtyping     */
+      /* (e.g., to PART_TIME_EMP) can and must be done via S by C, */
+      /* as here:                                                  */
+
+      TYPE PART_TIME_EMP IS { EMP CONSTRAINT THE_PART_TIME ( EMP )
+           POSSREP { EMP#           = THE_EMP# ( EMP ),
+                     DEPT#          = THE_DEPT# ( EMP ),
+                     DAY_OFF        = THE_DAY_OFF ( EMP ),
+                     MANAGER        = THE_MANAGER ( EMP ),
+                     BUDGET         = THE_BUDGET ( EMP ),
+                     SOMETHING_ELSE = THE_SOMETHING_ELSE ( EMP ) } } ;
+
+      /* Type MANAGER_EMP is very similar ... As for type                         */
+      /* PART_TIME_MANAGER_EMP, it looks something like this:                     */
+
+      TYPE PART_TIME_MANAGER_EMP
+           IS { PART_TIME_EMP, MANAGER_EMP
+                POSSREP { EMP# = ... /* etc., etc. */ } } ;
+
+      Now we can define operators that apply (for example) only at the
+PART_TIME_MANAGER_EMP level, define relvars with attributes of type EMP that contain
+values of any of the four types, and so on and so forth.
+      As the comments above suggest, the foregoing is perhaps not a very elegant solution to the
+problem, but at least it gets the job done, and it abides 100 percent by the prescriptions of the
+Manifesto (including the inheritance prescriptions in particular).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                     505

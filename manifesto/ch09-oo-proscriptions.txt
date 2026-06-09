@@ -1,0 +1,524 @@
+                                             Chapter 9
+
+                                   OO Proscriptions
+
+OO PROSCRIPTION 1: RELVARS ARE NOT DOMAINS
+
+Relvars are not domains.
+
+                                      ———  ———
+
+We first made this point in Chapter 2, in the subsection “Relvars vs. Types” at the end of the section
+on relation variables. Briefly, a relvar is a variable; a domain is a type; variables are not types (and
+types are not variables). In other words, we categorically reject the equation “relvar = class”
+advocated in, e.g., references [102-103] (recall that types are often called classes in object systems).
+But why might anyone advocate such an equation, anyway? It is instructive to consider this
+question in detail. (The discussion that follows is based on one that previously appeared in
+reference [76].)
+      Consider the following simple “class” definition, expressed in a hypothetical object language:
+      CREATE OBJECT CLASS EMP
+           ( EMP#      CHAR(5),
+             ENAME     CHAR(20),
+             SAL       NUMERIC,
+             HOBBY     CHAR(20),
+             WORKS_FOR CHAR(20) ) ;
+
+And now consider the following SQL “base table” definition:
+      CREATE TABLE EMP
+           ( EMP#      CHAR(5),
+             ENAME     CHAR(20),
+             SAL       NUMERIC,
+             HOBBY     CHAR(20),
+             WORKS_FOR CHAR(20) ) ;
+
+      These two definitions certainly look very similar, and the idea of equating them thus looks
+very tempting. And indeed some of the “object/relational” systems that appeared in the 1990s,
+including some commercial products, effectively did just that. So let us take a closer look. More
+precisely, let us take the CREATE TABLE statement just shown and consider a series of possible
+extensions to it that, some have argued, serve to make it more “object like.” (The discussion that
+follows is based on a specific product; in fact, it is based on an example in the vendor’s own
+product documentation. We do not identify that product here, however, since it is not our intent in
+this book to criticize or praise specific products. Rather, the criticisms we will be making apply,
+mutatis mutandis, to any system that espouses the “relvar = class” equation.)
+      The first extension is to permit composite attributes (i.e., attributes that are tuple valued).
+More specifically, we allow attribute values within a given relvar to be tuples from some other
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         217
+Part III / Informal Discussions and Explanations                       Chapter 9 / OO Proscriptions
+
+
+relvar, or possibly from the same relvar (?). This first extension is thus roughly analogous to
+allowing objects to contain other objects, thereby supporting the containment hierarchy concept
+[76]. In the example, we might replace the original CREATE TABLE statement by the following
+collection of statements (refer to Fig. 9.1):
+     CREATE TABLE EMP
+          ( EMP#      CHAR(5),
+            ENAME     CHAR(20),
+            SAL       NUMERIC,
+            HOBBY     ACTIVITY,
+            WORKS_FOR COMPANY ) ;
+
+     CREATE TABLE ACTIVITY
+          ( NAME      CHAR(20),
+            TEAM      INTEGER ) ;
+
+     CREATE TABLE COMPANY
+          ( NAME      CHAR(20),
+            LOCATION CITYSTATE ) ;
+
+     CREATE TABLE CITYSTATE
+          ( CITY      CHAR(20),
+            STATE     CHAR(2) ) ;
+
+     ╔════════════════════════════════════════════════════════════════╗
+     ║ EMP                                                            ║
+     ║┌──────┬───────┬─────┬───────────────┬─────────────────────────┐║
+     ║│ EMP# │ ENAME │ SAL │ HOBBY tuple   │ WORKS_FOR tuple         │║
+     ║│      │       │     ├───────────────┼─────────────────────────┤║
+     ║│      │       │     │┌──────┬──────┐│┌──────┬────────────────┐│║
+     ║│      │       │     ││ NAME │ TEAM │││ NAME │ LOCATION tuple ││║
+     ║│      │       │     │└──────┴──────┘││      ├────────────────┤│║
+     ║│      │       │     │               ││      │┌──────┬───────┐││║
+     ║│      │       │     │               ││      ││ CITY │ STATE │││║
+     ║│      │       │     │               ││      │└──────┴───────┘││║
+     ║│      │       │     │               │└──────┴────────────────┘│║
+     ║└══════┴───────┴─────┴───────────────┴─────────────────────────┘║
+     ╚════════════════════════════════════════════════════════════════╝
+     Fig. 9.1: Attributes containing (pointers to) tuples—deprecated
+      Explanation: Attribute HOBBY in relvar EMP is declared to be of type ACTIVITY.
+ACTIVITY in turn is a relvar of two attributes, NAME and TEAM, where TEAM gives the number
+of players in a team corresponding to NAME (e.g., if NAME = 'Soccer' then TEAM = 11). Each
+HOBBY value is thus actually a tuple with two components, a NAME component and a TEAM
+component (more precisely, it is a tuple that currently appears in relvar ACTIVITY). Observe,
+therefore, that we have already violated OO Proscription 1—the “domain” for attribute HOBBY is
+defined to be the relvar ACTIVITY. We will come back to this point later.
+      Similarly, attribute WORKS_FOR in relvar EMP is declared to be of type COMPANY, and
+COMPANY is also a relvar of two attributes, one of which is defined to be of type CITYSTATE,
+which is another two-attribute relvar, and so on. In other words, relvars ACTIVITY, COMPANY,
+and CITYSTATE are all considered to be types (domains) as well as relvars. The same is true for
+relvar EMP itself, of course.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                   218
+Part III / Informal Discussions and Explanations                                Chapter 9 / OO Proscriptions
+
+
+       As an aside, we remark that we have characterized this first extension as attributes containing
+tuples because that is the way advocates of the “relvar = class” equation themselves characterize it.
+It would be more accurate, however, to characterize it as “attributes containing pointers to tuples”—
+an issue we will examine more closely in a few moments, and more closely still in the next section.
+(In Fig. 9.1, therefore, we should really replace each of the three occurrences of the term tuple by
+the term pointer to tuple.)
+       Remarks analogous to those of the previous paragraph apply to the second extension also,
+which is to allow relation-valued attributes; that is, attribute values within a given relvar are
+allowed to be, not just single tuples, but sets of tuples from some other relvar, or possibly from the
+same relvar (?). This second extension is thus roughly analogous to allowing objects to contain
+“collection” objects [76]—a more complex version of the containment hierarchy. (We remark in
+passing that in the particular product on which our example is based, those collection objects can be
+sequences or bags as well as sets per se.) For example, suppose employees can have an arbitrary
+number of hobbies, instead of just one (refer to Fig. 9.2):
+      CREATE TABLE EMP
+           ( EMP#      CHAR(5),
+             ENAME     CHAR(20),
+             SAL       NUMERIC,
+             HOBBIES   SET OF ( ACTIVITY ),
+             WORKS_FOR COMPANY ) ;
+
+      ╔═══════════════════════════════════════════════════════════════════╗
+      ║ EMP                                                               ║
+      ║┌──────┬───────┬─────┬──────────────────┬─────────────────────────┐║
+      ║│ EMP# │ ENAME │ SAL │ HOBBIES relation │ WORKS_FOR tuple         │║
+      ║│      │       │     ├──────────────────┼─────────────────────────┤║
+      ║│      │       │     │ ┌──────┬──────┐ │┌──────┬────────────────┐│║
+      ║│      │       │     │ │ NAME │ TEAM │ ││ NAME │ LOCATION tuple ││║
+      ║│      │       │     │ └══════┴──────┘ ││       ├────────────────┤│║
+      ║│      │       │     │                  ││      │┌──────┬───────┐││║
+      ║│      │       │     │                  ││      ││ CITY │ STATE │││║
+      ║│      │       │     │                  ││      │└──────┴───────┘││║
+      ║│      │       │     │                  │└──────┴────────────────┘│║
+      ║└══════┴───────┴─────┴──────────────────┴─────────────────────────┘║
+      ╚═══════════════════════════════════════════════════════════════════╝
+      Fig. 9.2: Attributes containing sets of (pointers to) tuples—deprecated
+     Explanation: The HOBBIES value within any given tuple of relvar EMP is now,
+conceptually, a set of zero or more tuples from relvar ACTIVITY.
+     The third extension is to permit relvars to have associated methods (i.e., operators). For
+example:
+      CREATE TABLE EMP
+           ( EMP#      CHAR(5),
+             ENAME     CHAR(20),
+             SAL       NUMERIC,
+             HOBBIES   SET OF ( ACTIVITY ),
+             WORKS_FOR COMPANY )
+      METHOD RETIREMENT_BENEFITS ( ) : NUMERIC ;
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            219
+Part III / Informal Discussions and Explanations                                  Chapter 9 / OO Proscriptions
+
+
+     Explanation: RETIREMENT_BENEFITS is a method that takes a given EMP tuple as its
+argument and produces a result of type NUMERIC.
+       So much for a quick overview of how the “relvar = class” equation might be realized in
+practice.1 So what is wrong with it? Well, observe immediately that, as noted earlier, a relvar is a
+variable and a class is a type; so how can they possibly be the same? This first observation should
+be logically sufficient to stop the “relvar = class” idea dead in its tracks. However, there is more
+that can usefully be said, so let us continue for a while.
+       Observe next, then, that there is a difference in kind—a logical difference, in fact—between
+the attribute definitions (e.g.) SAL NUMERIC and WORKS_FOR COMPANY. NUMERIC is a
+true data type; it places a time-independent constraint on the values that can legally appear in
+attribute SAL. By contrast, COMPANY is not a true data type; the constraint it places on the values
+that can appear in attribute WORKS_FOR is time dependent (it depends, obviously, on the current
+value of relvar COMPANY). In fact, as pointed out earlier, the relvar vs. domain distinction has
+been muddied here.
+       Next, we have seen that tuple “objects” are apparently allowed to contain other such
+“objects”; for example, EMP “objects” apparently contain COMPANY “objects.” But they do
+not—not really; instead, they contain pointers to those “contained objects,” and users must be
+absolutely clear on this fact. For example, suppose the user updates some particular COMPANY
+tuple in some way (refer back to Fig. 9.1). Then that update will immediately be visible in all EMP
+tuples that “contain” that COMPANY tuple. (Please understand that we are not saying this effect is
+undesirable, only that it has to be explained to the user. But explaining it to the user amounts to
+telling the user that the “model” shown in Fig. 9.1 is incorrect—EMP tuples do not contain
+COMPANY tuples, they contain pointers to COMPANY tuples instead, as already stated.)
+       Here are some further implications and questions arising from this same point:
+
+    ■   Can we insert an EMP tuple and specify a value for the “contained” COMPANY tuple that
+        does not currently exist in the COMPANY relvar? If the answer is yes, the fact that attribute
+        WORKS_FOR is defined as being of type COMPANY does not mean very much, since it
+        does not significantly constrain the INSERT operation in any way. If the answer is no, the
+        INSERT operation becomes unnecessarily complex—the user has to specify, not just an
+        existing company name (i.e., a foreign key value) as would be required in the analogous
+        relational situation, but an entire existing COMPANY tuple. Moreover, specifying an entire
+        COMPANY tuple means, at best, telling the system something it already knows; at worst, it
+        means that if the user makes a mistake, the INSERT will fail when it could perfectly well
+        have succeeded.
+
+    ■   Suppose we want an ON DELETE RESTRICT rule for companies (i.e., an attempt to delete a
+        company must fail if the company has any employees). Presumably this rule must be
+        enforced by procedural code, say by some method M (note that relvar EMP has no foreign key
+        to which a declarative version of the rule might be attached). Furthermore, regular DELETE
+
+
+1
+  The product on which our example is based goes a lot further than we have suggested—for example, it also supports
+“subtables and supertables” (see Appendix G)—but the extensions we have discussed so far are sufficient for present
+purposes.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                     220
+Part III / Informal Discussions and Explanations                         Chapter 9 / OO Proscriptions
+
+
+      operations must now not be performed on relvar COMPANY other than within the code that
+      implements that method M. How is this requirement enforced? Analogous remarks and
+      questions apply to other foreign key rules, of course, such as ON DELETE CASCADE.
+
+ ■    Note too that deleting an EMP tuple presumably will not cascade to delete the corresponding
+      COMPANY tuple, despite the pretense that the EMP tuple contains that COMPANY tuple.
+
+       Next, suppose we define view V to be the projection of EMP over (say) just the attribute
+HOBBIES. V is a relvar too, of course, but a virtual relvar instead of a real one. So if “relvar =
+class” is a correct equation, V is also a class. What class is it? Also, classes have methods; what
+methods apply to V?
+       Well, “class” EMP has just one method, RETIREMENT_BENEFITS, and that method clearly
+does not apply to “class” V. In fact, it hardly seems reasonable that any methods that apply to
+“class” EMP would apply to “class” V—and there certainly are no others. So it looks as if (in
+general) no methods at all apply to the result of a projection; i.e., the result, whatever it is, is not
+really a class after all. In fact, it is clear that when people equate relvars and classes, it is
+specifically real relvars they have in mind—they are forgetting about the virtual ones. (Certainly
+the pointers discussed above are pointers to tuples in real relvars, not derived ones.) But to
+distinguish between real and virtual relvars in this way is a serious mistake, because the question as
+to which relvars are real and which virtual is (as we have explained elsewhere) to some
+considerable degree arbitrary.
+       Finally, what domains are supported? Those who advocate the “relvar = class” equation
+never seem to have much to say about domains, presumably because they cannot see how domains
+as such fit into their overall scheme—and yet domains are essential, as we know. What is more, the
+“relvar = class” equation merely gives us an alternative way of doing things we can already do with
+regular relvars; it does not provide support for user-defined types in general (consider, for example,
+how the scheme sketched above might be used to implement QTY, POINT, and all of the other
+examples of user-defined types discussed in Chapter 6 under RM Prescription 1).
+       You might also like to consider the following question: If the tuples of a certain relvar
+represent “objects” of some “class”—meaning in particular that the content of that “class” varies
+over time—what term is used for the set of all possible “objects” that might ever appear in that
+“class” (i.e., at any time)?
+       It follows from all of the above that we are not talking about the relational model any more.
+In particular, the fundamental data construct is no longer a relation containing values, it is a
+“relation”—actually not a proper relation at all, so far as the relational model is concerned—
+containing values and pointers. In other words, we have undermined the conceptual integrity of
+the relational model (see Chapter 1).
+       As a kind of footnote to the foregoing discussion, it is interesting to speculate on what would
+have happened if Codd had not originally used the term domain instead of data type, and the object
+community had not then introduced the term object class for the same concept. When the
+requirement arose for users to be able to define their own data types, the only possible term that
+could have been used to refer to those types would surely have been user-defined data types—and
+any proposal to support such things in a manner that suggested they were not data types would thus
+surely have been open to well-founded criticism.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         221
+Part III / Informal Discussions and Explanations                                      Chapter 9 / OO Proscriptions
+
+
+OO PROSCRIPTION 2: NO OBJECT IDS
+
+No database relvar shall include an attribute of type pointer.
+
+                                             ———  ———
+
+As we saw in the previous section, a system that violates OO Proscription 1 will almost certainly
+violate OO Proscription 2 as well. However, it is possible—and, sadly, not at all unusual in
+practice—to violate OO Prescription 2 without violating OO Proscription 1, so it is worth
+discussing OO Proscription 2 in its own right.
+       We begin by taking an informal look at the idea, mentioned a couple of times in the previous
+section, that some relvar R2 might have an attribute whose values are pointers to tuples in some
+relvar R1. Why might anyone want to do such a thing? The answer seems to be bound up with
+performance; the argument, such as it is, is that it is quicker to follow a pointer than to do a join. Of
+course, to argue thus is to confuse model and implementation issues once again; nevertheless, it is
+an argument that is frequently heard.
+       Observe now, however, that—by definition!—pointers point to variables, not values (because
+variables have addresses and values do not). By definition, therefore, if some relvar is allowed to
+have an attribute whose values are “pointers to tuples,” then those pointers point to tuple variables,
+not to tuple values. But there is no notion of a tuple variable in the relational model. The
+relational model deals with relation values, which are (loosely speaking) sets of tuple values, which
+are in turn (again loosely speaking) sets of scalar values. It also deals with relation variables, which
+are variables whose values are relations. However, it does not deal with tuple variables (which are
+variables whose values are tuples) or scalar variables (which are variables whose values are
+scalars).1 The only kind of variable included in the relational model—and the only kind of variable
+permitted in a relational database—is, very specifically, the relation variable. It follows that a
+violation of OO Proscription 2 constitutes a major departure from the relational model, introducing
+as it does an entirely new kind of variable (thereby violating The Information Principle, in fact). As
+noted in the previous section, in fact, we would argue that it seriously undermines the conceptual
+integrity of the relational model.
+       The foregoing argument has many implications, far too many to elaborate on here; more detail
+can be found in reference [59] if you are interested. We content ourselves in the remainder of this
+section with a slightly more formal look at OO Proscription 2 per se.
+       First of all, then, we need to be clear about the distinction between pointers and names.
+Following reference [125], we can distinguish these concepts as follows:
+
+    ■   A name is a character string.2 Names are labels or identifiers that are attached to program
+        objects (typically variables) and are used to identify those objects symbolically.
+
+
+
+1
+  And it certainly does not deal with tuple variables that are somehow “contained in” some relation variable, since (as
+noted at the end of the section on RM Prescription 13 in Chapter 6) this latter is a notion that makes no sense.
+2
+  We do not mean to suggest that a name is a value of type CHAR; more particularly, we do not mean to suggest that a
+name can be denoted by some expression of type CHAR in the language D.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                         222
+Part III / Informal Discussions and Explanations                                    Chapter 9 / OO Proscriptions
+
+
+    ■   A pointer is an address. Like names, pointers are used to identify program objects (typically
+        variables), but they do so, not symbolically as names do, but by the location of those objects.
+
+      So we see that names and pointers are both used to refer to or reference variables (among
+other things); the intuitive difference between them is that names are externally visible, while
+pointers are not—the latter are, to repeat, addresses. Of course, we are speaking here purely from a
+conceptual point of view—the addresses in question are not necessarily direct hardware addresses;
+the point is, however, they can always be thought of as direct hardware addresses.
+      Now, the source of the pointer notion is, of course, the fact that the concept of a variable is
+really an abstraction of the concept of an area of storage, implying that variables do indeed have
+addresses. Programming languages thus often support address or pointer values and variables (in
+other words, they support an address or pointer type). Hence, to repeat, a pointer value is an
+address, and a pointer variable is a variable whose permitted values are addresses.
+      The address or pointer type has two fundamental operations associated with it, usually called
+referencing and dereferencing, respectively:1
+
+    ■   Referencing: Given a variable V, the referencing operator applied to V returns the address of
+        V. Note that—even though the operator is read-only!—the argument V must be specified as a
+        variable reference specifically, not as a literal or more general expression (probably not even
+        as a pseudovariable reference). The reason is, of course, that values do not have addresses,
+        variables do (recall from Chapter 1 that values have no location in time or space, while
+        variables do).
+
+    ■   Dereferencing: Given a variable A of type address, the dereferencing operator applied to A
+        returns the variable whose address is currently contained in A. Note carefully that the
+        operator returns a variable, not a value. The reason is, again, that values do not have
+        addresses, variables do. (Of course, if the dereferencing operator invocation occurs in a
+        source position instead of a target position—in particular, if it occurs on the right side of an
+        assignment—it can be regarded, harmlessly, as returning the value of the variable in question
+        instead of returning that variable per se.)
+
+       Now, object systems rely heavily on the concept of object IDs, and object IDs are essentially
+pointers as just described. OO Proscription 2 thus means that we reject the notion of object IDs, at
+least insofar as such IDs might be permitted within databases.2 As a consequence, we also reject
+both:
+
+    ■   The notion that certain database objects might make use of such IDs in order to reference—
+        and, in particular, to share—other such objects
+
+
+1
+  SQL is unusual in that it has a dereferencing operator—it might even be said to have two different dereferencing
+operators—but no referencing operator. Furthermore, those dereferencing operators are unusual too, in that they return
+values, not variables. See references [59] and [76] for further explanation.
+2
+  As noted under RM Proscription 1 in Chapter 7, we also reject the concept of hidden “tuple IDs” (some writers seem
+to equate that concept with object IDs—see, e.g., the annotation to reference [130]).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                       223
+Part III / Informal Discussions and Explanations                         Chapter 9 / OO Proscriptions
+
+
+ ■    The notion that users might have to dereference such IDs, either explicitly or implicitly, in
+      order to access such objects
+
+      In fact, we reject the notion of objects (in the special sense in which that term is understood in
+object systems, as opposed to its normal natural language sense) entirely.
+      Perhaps we should stress the point that OO Proscription 2 does not prohibit support for
+pointers in the nondatabase portions of D. We do note, however, that pointers, even if limited to the
+nondatabase portions of D, can lead to a serious problem if type inheritance is also supported (see
+Appendix F).
+      We should also stress the fact that OO Proscription 2 does not prevent database relvars from
+having attributes whose values are names (in particular, names of variables) instead of addresses.
+For example, a database relvar might reasonably have an attribute whose values are (say) “operating
+system file names” or “database relvar names.” Indeed, relvars with attributes whose values are
+database relvar names will certainly be needed in the catalog. To what extent D should provide any
+corresponding dereferencing operators is a question that requires further study, however; in
+Tutorial D we adopt the conservative position that no such operators are provided at all. The
+following observations are pertinent:
+
+ ■    First of all, a type whose values are names of variables does logically resemble, somewhat, a
+      type whose values are pointers. If we permit such types, therefore, we run the risk of
+      backsliding into the kind of pointer free-for-all found in prerelational systems—with its
+      attendant looping, and pointer-chasing, and lack of proper end user access, and so on and so
+      forth—and that state of affairs is definitely something we want to avoid.
+
+ ■    On the other hand, we cannot prevent users from defining a type whose values are variable
+      names. And perhaps there is no need to. For consider:
+
+      ●   The only variables D allows within the database are, very specifically, database relvars.
+          Hence, the only “pointers” to database data that might be allowed in D are, very
+          specifically, database relvar names.
+
+      ●   As far as data in the database is concerned, therefore, the only kind of dereferencing D
+          might possibly need is an operation that would allow a database relvar to be specified, not
+          directly by means of its name, but indirectly by means of a variable whose value is that
+          name. In SQL terms, for example, such a facility might mean that, in place of the
+          familiar SELECT * FROM T, the user would be able to say SELECT * FROM V, where
+          V is a program variable whose value is the required name T.
+
+      ●   As far as data in the database is concerned, therefore, support in D for “pointers” and
+          dereferencing would not constitute a return to the kind of pointer free-for-all mentioned
+          (and objected to) above.
+
+ ■    The foregoing remarks notwithstanding, we do not (to repeat) prescribe any such explicit
+      dereferencing operator for D. Indeed, we observe that if D were to support a mechanism akin
+      to the PREPARE and EXECUTE capabilities of “dynamic SQL” or (perhaps better) the
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                           224
+Part III / Informal Discussions and Explanations                                     Chapter 9 / OO Proscriptions
+
+
+      analogous Prepare and Execute capabilities of the SQL Call-Level Interface [41,99], explicit
+      dereferencing as such would be unnecessary anyway. (For the benefit of readers who might
+      not be familiar with these SQL features, we should explain that PREPARE or Prepare allows
+      a source language statement—possibly a dynamically constructed source language
+      statement—to be compiled at run time, and EXECUTE or Execute then allows the compiled
+      version of such a statement to be executed. We remark that, as hinted in Chapter 1, an
+      industrial strength D would certainly require some such mechanism in order to allow the
+      construction of applications that support ad hoc interactions on the part of the end user.)
+
+       We observe in conclusion that the heavy reliance of object systems on object IDs lends weight
+to our belief that such systems are designed primarily by programmers for programmers. The
+relational model, by contrast, explicitly recognizes that the primary purpose of databases is to serve
+end users rather than application programmers (though this objective does not rule out the
+possibility of their serving application programmers too, of course). For this very reason, Codd
+deliberately excluded pointers from the relational model when he first defined it. Here is his stated
+rationale for doing so [23]:
+      It is safe to assume that all kinds of users [including end users in particular] understand the act of comparing
+      values, but that relatively few understand the complexities of pointers [including the complexities of referencing
+      and dereferencing in particular]. The relational model is based on this fundamental principle ... [The]
+      manipulation of pointers is more bug-prone than is the act of comparing values, even if the user happens to
+      understand the complexities of pointers.
+
+        It is thus sad to see that the SQL standard now permits—in fact, encourages—the use of
+pointers within “relations” (“relations” in quotes because those “relations” are in fact not relations
+at all, in the sense of the relational model). And the pointers in question are, of course, not mere
+database relvar names as above but genuine “object ID”-style pointers. This is backsliding with a
+vengeance.
+
+
+EXERCISES
+
+9.1    Distinguish as carefully as you can between names and pointers.
+
+9.2    Explain the referencing and dereferencing operators. In what respects are these operators
+       rather unusual?
+
+9.3    If you are familiar with SQL, repeat Exercise 9.2 for the SQL versions of the operators in
+       question.
+
+9.4    Explain the concept of object IDs in your own words. Compare and contrast them with (a)
+       the concept of surrogate keys, (b) the concept of “row IDs” or “tuple IDs.”
+
+9.5    What are the reasons typically given in practice for violating OO Proscription 1? What
+       about OO Proscription 2?
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                         225
+Part III / Informal Discussions and Explanations                       Chapter 9 / OO Proscriptions
+
+
+9.6    Why does a violation of OO Proscription 1 seem to lead inevitably to a violation of OO
+       Proscription 2?
+
+9.7    What do you understand by the term “containment hierarchy”? What if anything is the
+       analog of that concept in the relational world?
+
+9.8    What do you understand by the term “collection object”? What if anything is the analog of
+       that concept in the relational world?
+
+9.9    Why does a violation of OO Proscription 2 constitute a violation of The Information
+       Principle? What are the consequences of such violation?
+
+9.10   What do you understand by the SQL terms Prepare and Execute? Why are such features
+       desirable?
+
+9.11   Why do you think OO Proscriptions 1 and 2 are not included in Chapter 7? Are they not
+       both logical consequences of the relational model and thus in fact RM Proscriptions?
+
+9.12   Attempt to implement user-defined types POINT and ELLIPSE (from Chapter 6) in the style
+       of the “data types” ACTIVITY and COMPANY of the HOBBY and WORKS_FOR
+       attributes shown in Fig. 9.1. Given that implementation, describe how you think the effect
+       of the following Tutorial D assignment might be obtained:
+       THE_X ( THE_CTR ( E ) ) := 5.0 ;
+
+       (where E is a variable of declared type ELLIPSE).
+
+9.13   The term data type was in widespread use in the computer programming world of 1970.
+       Why do you think Codd chose the term domain for that concept in his relational model of
+       data? What, if any, adverse consequences have arisen from that choice of term? Why are
+       object classes called object classes and not (data) types? What, if any, adverse
+       consequences have arisen from that choice of term?
+
+9.14   “Types are to nouns as relations are to ...”: Complete this sentence.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                     226

@@ -1,0 +1,1114 @@
+                                                  Chapter 15
+
+             Multiple Inheritance with Scalar Types
+
+In this chapter we consider what happens to our inheritance model when we take multiple
+inheritance into account. It will turn out that none of the 20 IM Prescriptions discussed in the
+previous chapter needs any extension or reformulation; however, a couple of them, IM Prescriptions
+7 and (especially) 8, do merit a much closer look. But first things first.
+       To review briefly, multiple inheritance is the phenomenon according to which a given subtype
+can have more than one immediate supertype and can therefore inherit operators and constraints
+from more than one such supertype (a simple example is given in the section immediately
+following). As noted in Chapter 12 and elsewhere, it is our position that multiple inheritance
+support is not only desirable but logically required. As reference [131] says:
+
+      Most modern ... systems allow [multiple inheritance] ... A generally accepted view is that a modern ... language
+      should support [multiple inheritance], despite the fact that [it] introduces many conceptual and technical
+      intricacies.
+
+       We will be examining some of those “conceptual and technical intricacies” in this chapter.
+Note: For simplicity, we continue to follow the convention that the unqualified terms type, subtype,
+and supertype refer to scalar types, subtypes, and supertypes specifically; the unqualified terms
+value, variable, (read-only) operator, expression, and result refer to scalar values, variables,
+operators, expressions, and results specifically; and the unqualified term constraint refers to a type
+constraint specifically. We also continue to assume that all of the types under discussion are
+members of some given set of types S and that the root and leaf type concepts in particular are to be
+understood in terms of that set S. Finally, we continue to use the symbols T and T' to refer
+generically to a pair of types such that T' is a subtype of T—equivalently, such that T is a supertype
+of T'.
+
+
+AN INTRODUCTORY EXAMPLE
+
+In order to introduce some of the basic concepts of multiple inheritance, we use a simple variation
+on our geometric example from Chapters 12 and 14, involving parallelograms, rectangles, rhombi,
+and squares. (Just to remind you, a rhombus is a parallelogram whose sides are all the same length.)
+Fig. 15.1 shows a graph—a directed acyclic graph, to be precise—of the subtype/supertype
+relationships in this example. Observe that type PARALLELOGRAM is a root type, type
+SQUARE is a leaf type, and type SQUARE has two immediate supertypes, RECTANGLE and
+RHOMBUS.
+       To see that the subtype/supertype relationships in the figure are indeed reasonable, consider
+the following:
+
+ ■    Every parallelogram has a “long” diagonal of length ld and a “short” one of length sd, where
+      ld  sd.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                        337
+Part IV / Subtyping and Inheritance              Chapter 15 / Multiple Inheritance with Scalar Types
+
+
+╔═════════════════════════════════════════════════════════════════╗
+║                        ┌───────────────┐                        ║
+║                        │ PARALLELOGRAM │                        ║
+║                        └──────┬────────┘                        ║
+║                       ┌───────┴─────────┐                       ║
+║                                                                 ║
+║                ┌───────────┐        ┌─────────┐                 ║
+║                │ RECTANGLE │        │ RHOMBUS │                 ║
+║                └──────┬────┘        └────┬────┘                 ║
+║                       └───────┬─────────┘                       ║
+║                                                                 ║
+║                          ┌────────┐                             ║
+║                          │ SQUARE │                             ║
+║                          └────────┘                             ║
+╚═════════════════════════════════════════════════════════════════╝
+Fig. 15.1: A simple type graph
+
+ ■    Every parallelogram also has two “long” sides of length ls and two “short” ones of length ss,
+      where ls  ss.
+
+ ■    A rectangle is a parallelogram for which ld = sd. Unlike parallelograms in general, every
+      rectangle has a unique circumscribed circle (i.e., a circle that passes through each of the
+      rectangle’s four vertices); hence, every rectangle has a property, unique to rectangles alone
+      among parallelograms, that is exactly that circumscribed circle.
+
+ ■    A rhombus is a parallelogram for which ls = ss. Unlike parallelograms in general, every
+      rhombus has a unique inscribed circle (i.e., a circle that touches each of the rhombus’s four
+      sides); hence, every rhombus has a property, unique to rhombi alone among parallelograms,
+      that is exactly that inscribed circle. (We remark in passing that a parallelogram that is not a
+      rhombus is sometimes called a rhomboid.)
+
+ ■    A square is a parallelogram that is both a rectangle and a rhombus. Unlike rectangles and
+      rhombi in general, every square has a unique associated annulus that is defined by the
+      difference between the corresponding circumscribed and inscribed circles; hence, every
+      square has a property, unique to squares alone among rectangles and rhombi, that is exactly
+      that annulus. Moreover, every square has both (a) a unique side, which rectangles in general
+      do not have, and (b) a unique diagonal, which rhombi in general do not have.
+
+Possible Representations
+
+It is instructive to consider the question of what possreps we might specify in this example. (You
+might want to sketch a parallelogram of your own in order to help you appreciate the points to be
+made in what follows.) Let p be a parallelogram with vertices (in clockwise sequence) A, B, C, D
+and center E. Then it should be clear that there are many different ways of “possibly representing”
+p. Here are some of them:
+
+ ■    We could use the four vertices A, B, C, and D. Of course, it is not the case that every set of
+      four points defines a parallelogram; we would therefore have to impose an appropriate
+      constraint on the points A, B, C, D. There are several different ways to state that constraint,
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        338
+Part IV / Subtyping and Inheritance                      Chapter 15 / Multiple Inheritance with Scalar Types
+
+
+        too. For example, we could require that line segments AB and DC be parallel and line
+        segments BC and AD be parallel also; or we could require that line segments AB and DC be
+        of equal length and line segments BC and AD be of equal length also; or possibly other ways
+        besides. Note too that A, B, C, and D must all be distinct!—and no three of them can be
+        collinear.
+
+    ■   We could use any three of the vertices (A, B, and C, say). Here the only constraint we would
+        have to impose is that the three points are not collinear (but note again that there are several
+        different ways to state such a constraint). Of course, there are four possible choices for the set
+        of three vertices.
+
+    ■   We could use any two adjacent vertices (A and B, say) and the center E. Here again the only
+        constraint we would have to impose is that the three points are not collinear. There are four
+        possible choices for the pair of adjacent vertices.
+
+    ■   We could use any two adjacent sides—AB and BC, say. Here we would have to impose the
+        constraint that the line segments AB and BC do in fact meet at B (and A, B, and C are not
+        collinear). There are four possible choices for the pair of adjacent sides.
+
+    ■   We could use a pair of opposite sides—AB and DC, say—with the constraint that those two
+        sides are parallel and of equal length. There are two choices here.
+
+    ■   We could use the diagonals AC and BD, with the constraint that they bisect each other at E.
+
+    ■   We could use a pair of adjacent half-diagonals—EA and EB, say—with the constraint that the
+        line segments do in fact meet at E (and E, A, and B are not collinear). Four choices here.
+
+    ■   We could use one vertex, an angle, and two lengths (for example, the point A, the angle DAB,
+        and the lengths of the sides AB and AD). The angle must not be 180°. Four choices.
+
+And so on, probably.
+
+Type Definitions
+
+Let us agree, somewhat arbitrarily, to specify just one possrep for type PARALLELOGRAM: viz.,
+the one involving the four vertex points A, B, C, D.1 Let us also agree to use that same possrep for
+each of the other three types as well. Of course, we already know that three vertices would suffice
+(in fact, just two—which two?—would suffice in the case of type SQUARE). We have chosen to
+specify all four, despite the redundancy, for reasons of symmetry; i.e., there does not seem to be any
+good argument in favor of any particular three over any other. Perhaps more study is required.
+Note in particular that our choice does mean that the components of the possrep are not mutually
+independent (see the discussion of such matters under RM Prescription 5 in Chapter 6). One
+
+
+1
+  Some convention, left unspecified here, would be needed in practice to establish which point corresponds to which
+vertex, in order to ensure that references to (e.g.) angle DAB are unambiguous.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                       339
+Part IV / Subtyping and Inheritance               Chapter 15 / Multiple Inheritance with Scalar Types
+
+
+possibly undesirable consequence of this state of affairs is discussed at the end of the present
+subsection.
+      Here then is a possible definition for the root type PARALLELOGRAM:
+      TYPE PARALLELOGRAM
+           POSSREP { A POINT, B POINT, C POINT, D POINT
+                     CONSTRAINT DISTINCT ( A, B, C, D )
+                                AND NOT ( COLLINEAR ( A, B, C ) )
+                                AND NOT ( COLLINEAR ( B, C, D ) )
+                                AND NOT ( COLLINEAR ( C, D, A ) )
+                                AND NOT ( COLLINEAR ( D, A, B ) )
+                                AND DIST ( A, B ) = DIST ( C, D )
+                                AND DIST ( B, C ) = DIST ( D, A ) } ;
+
+We are appealing here to:
+
+ ■    A presumably built-in operator called DISTINCT, which returns TRUE if and only if its
+      arguments are all distinct
+
+ ■    An operator called COLLINEAR (code not given), which returns TRUE if and only if its
+      three POINT arguments lie on a straight line
+
+ ■    The operator DIST from Chapter 3, which takes two points and returns the distance between
+      them as a value of type LENGTH
+
+      Here next is a possible definition for type RECTANGLE:
+      TYPE RECTANGLE
+           IS { PARALLELOGRAM CONSTRAINT
+                                 LD ( PARALLELOGRAM ) = SD ( PARALLELOGRAM )
+                              POSSREP { A = THE_A ( PARALLELOGRAM ) ,
+                                         B = THE_B ( PARALLELOGRAM ) ,
+                                         C = THE_C ( PARALLELOGRAM ) ,
+                                         D = THE_D ( PARALLELOGRAM ) } } ;
+
+      We have assumed the availability of two operators LD and SD (see the subsection
+“Operators” later), which return the length of the “long” and the “short” diagonal, respectively, of a
+given parallelogram. Incidentally, the POSSREP specification here lends weight to the suggestion
+from Chapter 12 that it might be convenient to have some syntactic shorthand for defining a subtype
+possrep that is similar or identical to some corresponding supertype possrep.
+      Next, type RHOMBUS:
+      TYPE RHOMBUS
+           IS { PARALLELOGRAM CONSTRAINT
+                                 LS ( PARALLELOGRAM ) = SS ( PARALLELOGRAM )
+                              POSSREP { A = THE_A ( PARALLELOGRAM ) ,
+                                         B = THE_B ( PARALLELOGRAM ) ,
+                                         C = THE_C ( PARALLELOGRAM ) ,
+                                         D = THE_D ( PARALLELOGRAM ) } } ;
+      We have assumed the availability of two operators LS and SS (again, see the subsection
+“Operators” later), which return the length of the “long” and the “short” side, respectively, of a
+given parallelogram.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          340
+Part IV / Subtyping and Inheritance                Chapter 15 / Multiple Inheritance with Scalar Types
+
+
+      Finally, type SQUARE:
+      TYPE SQUARE
+           IS { RECTANGLE, RHOMBUS
+                POSSREP { A = THE_A ( RECTANGLE ) ,
+                          B = THE_B ( RECTANGLE ) ,
+                          C = THE_C ( RECTANGLE ) ,
+                          D = THE_D ( RECTANGLE ) } } ;
+
+      The specialization constraint here states precisely that a given value s is of type SQUARE if
+and only if IS_RECTANGLE(s) and IS_RHOMBUS(s) both evaluate to TRUE. No additional
+CONSTRAINT specification is stated, or indeed permitted. In general, in fact, such an additional
+constraint is required if and only if (a) the subtype being defined has exactly one immediate
+supertype and (b) that supertype is regular. (Just to remind you, a type is regular if it is not a
+dummy type; in other words, a regular type is a type with at least one possrep and hence at least one
+selector.)
+      A few further points arise in connection with the foregoing definitions:
+
+ ■    It seems we have to make an arbitrary decision in the POSSREP specification for type
+      SQUARE. To be specific, we have to decide whether to define that possrep in terms of type
+      RECTANGLE or in terms of type RHOMBUS. Purely for definiteness, we have defined it in
+      terms of RECTANGLE, but we could equally well have defined it in terms of RHOMBUS
+      instead (or even, perhaps, a mixture of the two!)—a situation that might be regarded as a little
+      unsatisfactory. Note: The discussions in the section “Remarks on Operator Inheritance,” later
+      in this chapter, might have some bearing on this issue.
+
+ ■    As we have already seen, there are many distinct but logically equivalent candidate possreps
+      that could have been used in this example. It follows that there are many distinct but logically
+      equivalent ways of formulating the corresponding specialization constraints (at least for types
+      RECTANGLE and RHOMBUS, though not for type SQUARE, of course).
+
+ ■    Our choice of possrep for type PARALLELOGRAM does have the advantage that operators
+      THE_A, THE_B, THE_C, and THE_D are all available for parallelograms (and hence for
+      rectangles, rhombi, and squares as well). What is more, corresponding pseudovariables are
+      available for all four types too, by definition. However, any attempt to use those
+      pseudovariables will fail if it violates some applicable constraint; in fact, any attempt to
+      update just one vertex in isolation will necessarily fail (this state of affairs is a consequence of
+      our decision to include some redundancy in the possreps). For example, consider what is
+      involved in doubling the height of a rectangle (more precisely, updating a variable V of
+      declared type RECTANGLE such that the values returned by AD(V) and BC(V)—see the
+      operator definitions in the next subsection—are twice what they were before the update).
+
+Operators
+
+In this subsection we show definitions—the final few just in outline—for a set of operators that
+would surely prove useful in practice in connection with the foregoing example. (We will not
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                           341
+Part IV / Subtyping and Inheritance             Chapter 15 / Multiple Inheritance with Scalar Types
+
+
+actually be using these operators in the rest of the chapter; we show them here merely by way of
+illustration.)
+       OPERATOR AB ( P PARALLELOGRAM ) RETURNS LENGTH SYNONYMS { BA, CD, DC } ;
+          /* “length of side AB”; note the SYNONYMS specification, which     */
+          /* defines additional names for the same operator                  */
+          RETURN ( DIST ( THE_A ( P ), THE_B ( P ) ) ) ;
+       END OPERATOR ;
+
+       OPERATOR BC ( P PARALLELOGRAM ) RETURNS LENGTH SYNONYMS { CB, AD, DA } ;
+          /* “length of side BC”; note the SYNONYMS specification, which     */
+          /* defines additional names for the same operator                  */
+          RETURN ( DIST ( THE_B ( P ), THE_C ( P ) ) ) ;
+       END OPERATOR ;
+
+       OPERATOR AC ( P PARALLELOGRAM ) RETURNS LENGTH SYNONYMS { CA } ;
+          /* “length of diagonal AC” */
+          RETURN ( DIST ( THE_A ( P ), THE_C ( P ) ) ) ;
+       END OPERATOR ;
+
+       OPERATOR BD ( P PARALLELOGRAM ) RETURNS LENGTH SYNONYMS { DB } ;
+          /* “length of diagonal BD” */
+          RETURN ( DIST ( THE_B ( P ), THE_D ( P ) ) ) ;
+       END OPERATOR ;
+
+       OPERATOR DAB ( P PARALLELOGRAM ) RETURNS ANGLE SYNONYMS { BAD, BCD, DCB } ;
+          /* “included angle at vertex A” */
+          RETURN ( ARCCOS ( ( AB ( P ) ** 2 + AD ( P ) ** 2 - DB ( P ) ** 2 )
+                            / ( 2 * AB ( P ) * AD ( P ) ) ) ) ;
+       END OPERATOR ;
+
+       OPERATOR ABC ( P PARALLELOGRAM ) RETURNS ANGLE SYNONYMS { CBA, ADC, CDA } ;
+          /* “included angle at vertex B” */
+          RETURN ( ARCCOS ( ( BA ( P ) ** 2 + BC ( P ) ** 2 - AC ( P ) ** 2 )
+                            / ( 2 * BA ( P ) * BC ( P ) ) ) ) ;
+       END OPERATOR ;
+
+       OPERATOR LS ( P PARALLELOGRAM ) RETURNS LENGTH ;
+          /* “length of long side of” */
+          RETURN ( MAX { AB ( P ), BC ( P ) } ) ;
+       END OPERATOR ;
+
+       OPERATOR SS ( P PARALLELOGRAM ) RETURNS LENGTH ;
+          /* “length of short side of” */
+          RETURN ( MIN { AB ( P ), BC ( P ) } ) ;
+       END OPERATOR ;
+
+       OPERATOR LD ( P PARALLELOGRAM ) RETURNS LENGTH ;
+          /* “length of long diagonal of” */
+          RETURN ( MAX { AC ( P ), BD ( P ) } ) ;
+       END OPERATOR ;
+
+       OPERATOR SD ( P PARALLELOGRAM ) RETURNS LENGTH ;
+          /* “length of short diagonal of” */
+          RETURN ( MIN { AC ( P ), BD ( P ) } ) ;
+       END OPERATOR ;
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        342
+Part IV / Subtyping and Inheritance            Chapter 15 / Multiple Inheritance with Scalar Types
+
+
+       OPERATOR AREA ( P PARALLELOGRAM ) RETURNS AREA ;
+          /* “area of” */
+          ... ;
+       END OPERATOR ;
+
+       OPERATOR CTR ( P PARALLELOGRAM ) RETURNS POINT ;
+          /* “center of” */
+          ... ;
+       END OPERATOR ;
+
+      All of the foregoing operators apply to parallelograms, and hence to rectangles and rhombi,
+and hence to squares as well. Note in particular that type SQUARE inherits these operators from
+both of its immediate supertypes RECTANGLE and RHOMBUS, a point we will return to in the
+section “Remarks on Operator Inheritance.”
+      The following operators, by contrast, do not apply to parallelograms in general:
+     OPERATOR CIR_CIRCLE ( RE RECTANGLE ) RETURNS CIRCLE ;
+        /* “circumscribed circle of” */
+        ... ;
+     END OPERATOR ;
+
+     OPERATOR IN_CIRCLE ( RH RHOMBUS ) RETURNS CIRCLE ;
+        /* “inscribed circle of” */
+        ... ;
+     END OPERATOR ;
+
+     OPERATOR ANNULUS ( S SQUARE ) RETURNS ANNULUS ;
+        /* “annulus of” */
+        ... ;
+     END OPERATOR ;
+
+     OPERATOR SIDE ( S SQUARE ) RETURNS LENGTH ;
+        /* “side of” */
+        ... ;
+     END OPERATOR ;
+
+     OPERATOR DIAG ( S SQUARE ) RETURNS LENGTH ;
+        /* “diagonal of” */
+        ... ;
+     END OPERATOR ;
+
+
+TYPE GRAPHS
+
+As we saw in Chapter 12, single inheritance can be characterized as follows: Every proper subtype
+has exactly one immediate supertype. Multiple inheritance means, by contrast, that every proper
+subtype has at least one immediate supertype. In Fig. 15.1, for example, the proper subtypes
+RECTANGLE and RHOMBUS each have one immediate supertype, PARALLELOGRAM, and the
+proper subtype SQUARE has two, RECTANGLE and RHOMBUS. The obvious question arises:
+Could we additionally define PARALLELOGRAM as an immediate supertype of SQUARE? In
+terms of Fig. 15.1, such a definition would involve an additional directed arc from type
+PARALLELOGRAM to type SQUARE. Could we add such an arc?
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                   343
+Part IV / Subtyping and Inheritance              Chapter 15 / Multiple Inheritance with Scalar Types
+
+
+      Well, observe first of all that PARALLELOGRAM is not an immediate supertype of
+SQUARE as defined by IM Prescription 6, because there does exist a type that is both a proper
+supertype of SQUARE and a proper subtype of PARALLELOGRAM. (In fact, of course, there are
+two such types, RECTANGLE and RHOMBUS.) At the very least, therefore, we would have to
+revise IM Prescription 6 if we wished to permit the additional arc. So do we wish to permit it?
+      We answer this question in the negative. It seems to us that permitting such an additional arc
+does not lead to any useful additional functionality; to be specific, all of the operators and
+constraints that type SQUARE would then inherit “immediately” from type PARALLELOGRAM it
+already inherits anyway, transitively, via the intermediate types RECTANGLE and RHOMBUS.
+Furthermore, permitting such an extension to our understanding of the term immediate supertype
+certainly has the potential to complicate some of our later concepts and definitions unduly. We
+therefore reject such an extension. As already indicated, we do not need to change our model in any
+way to achieve this effect—IM Prescription 6 already takes care of matters for us.
+      Now, multiple inheritance clearly implies that we can no longer talk about type hierarchies as
+such; instead, we need to introduce the more general concept of a type graph. Here is a precise
+definition of this concept. A type graph is a directed acyclic graph of nodes and directed arcs from
+one node to another that satisfies the following properties:
+
+ a.   Each node is given the name of a type. No two nodes have the same name.
+
+ b.   There is a directed arc from node T to node T' if and only if type T is an immediate supertype
+      of type T'.
+
+ c.   If there is a directed arc from node T to node T', then node T' is not reachable from node T via
+      any other path. Note: A path from node T to node T' is a sequence of n directed arcs A1
+      (from T to T1, say), A2 (from T1 to T2, say), ..., An (from T(n-1), say, to T'), where n  0, and
+      n = 0 implies T = T' (i.e., there is always a path from node T to itself). A node T' is reachable
+      from a node T if and only if there is a path from node T to node T'.
+
+ d.   If the graph includes any nodes at all, then—because it is directed and acyclic—it necessarily
+      contains at least one node that has no immediate supertype node. Such a node is called a root
+      node, and the type corresponding to that node is called a root type.
+
+ e.   If the graph includes any nodes at all, then—because it is directed and acyclic—it necessarily
+      contains at least one node that has no immediate subtype node. Such a node is called a leaf
+      node, and the type corresponding to that node is called a leaf type.
+
+ f.   If nodes T1 and T2 are distinct root nodes, then no node other than node omega (if such a
+      node exists) is reachable from both T1 and T2.
+
+ g.   If nodes T1, T2, T', and T'' are such that there exist paths from both T1 and T2 to both T' and
+      T'', then there must exist a node T that is common to all of those paths.
+
+      Explanation:
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        344
+Part IV / Subtyping and Inheritance                Chapter 15 / Multiple Inheritance with Scalar Types
+
+
+ ■    Points a. and b. are self-explanatory.
+
+ ■    Point c. simply reflects the fact that (as discussed earlier in this section) no type T can be both
+      an immediate and a nonimmediate supertype of the same type T'.
+
+ ■    Points d. and e. are obvious generalizations of the corresponding portions of the “type
+      hierarchy” definition for the single inheritance case. Note that a root can be regarded as an
+      entry point into the overall type graph. As the definition indicates, we do not assume that
+      there is exactly one root type; if there are two or more, however, we can always introduce
+      some kind of “system” type—perhaps type alpha—that is an immediate supertype for all of
+      them, and so there is no loss of generality in assuming just one.
+
+ ■    Point f. is discussed in the next section. As for point g., see Exercise 15.7 at the end of the
+      chapter.
+
+     Of course, type graphs, like type hierarchies before them, are not really part of our model per
+se—they are just a convenient way of depicting subtype/supertype relationships, which are.
+
+
+LEAST SPECIFIC TYPES UNIQUE
+
+As noted earlier in this chapter, we do need to take a closer look at IM Prescriptions 7 and
+(especially) 8. We discuss IM Prescription 7 in this section and IM Prescription 8 in the next. We
+begin by repeating IM Prescription 7 (“root types disjoint”) from the previous chapter:
+
+ 7.   If T1 and T2 are distinct root types, then they shall be disjoint; i.e., no value shall be of both
+      type T1 and type T2.
+
+       Now, with single inheritance, this prescription was tightly connected to the disjointness
+assumption (“If types T1 and T2 are such that neither is a subtype of the other, then they are
+disjoint”). With multiple inheritance, of course, that assumption no longer applies. For example,
+types RECTANGLE and RHOMBUS in Fig. 15.1 are certainly not disjoint, yet neither is a subtype
+of the other (because some rectangles are not rhombi and some rhombi are not rectangles). Of
+course, those values that are both rectangles and rhombi are, precisely, squares; note, however, that
+until such time as we actually introduce type SQUARE as a subtype of both type RECTANGLE
+and type RHOMBUS, we still do not have multiple inheritance as such. Thus, in order to support
+multiple inheritance, it is necessary but not sufficient that we relax the disjointness assumption.
+(More precisely, if we relax it for leaf types only, we do not have multiple inheritance; if we relax it
+for nonleaf types, we do.)
+       We do not have to relax that assumption completely, however, nor do we wish to. Rather, we
+proceed as follows. First, we introduce the concept of least specific type: If value v is of type T
+and not of any proper supertype of T, then we say that T is the least specific type of v (obviously T
+here must be a root type). Then we go on to insist that the least specific type of any value must be
+unique—which is what IM Prescription 7 says (at least, it is logically equivalent to what IM
+Prescription 7 says). As a consequence, a graph like the one shown in Fig. 15.2 is not a valid type
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          345
+Part IV / Subtyping and Inheritance                 Chapter 15 / Multiple Inheritance with Scalar Types
+
+
+graph, because it shows a proper subtype, SQUARE, with two distinct proper supertypes,
+RECTANGLE and RHOMBUS, that are both root types. Note: Our reasons for insisting on the
+uniqueness of least specific types will become clear in the next section.
+╔═════════════════════════════════════════════════════════════════╗
+║                ┌───────────┐        ┌─────────┐                 ║
+║                │ RECTANGLE │        │ RHOMBUS │                 ║
+║                └──────┬────┘        └────┬────┘                 ║
+║                       └───────┬─────────┘                       ║
+║                                                                 ║
+║                          ┌────────┐                             ║
+║                          │ SQUARE │                             ║
+║                          └────────┘                             ║
+╚═════════════════════════════════════════════════════════════════╝
+Fig. 15.2: A graph that is not a valid type graph
+
+     It follows from the foregoing that any given type graph can be divided into a set of partitions,
+one per root, such that:
+
+ ■    Within any given partition, every node is connected to every other. Explanation: When we
+      say some node T0 is connected to some node Tn, we mean that either (a) T0 = Tn (by
+      definition, every node is connected to itself) or (b) there exists a sequence of n directed arcs
+      A0, A1, ... A(n-1), say (where n  1), such that A0 is from T0 to T1 or vice versa, A1 is from
+      T1 to T2 or vice versa, ..., and An is from T(n-1) to Tn or vice versa.
+
+ ■    No node in any given partition is connected to any node in any other partition (in other words,
+      the partitions are disjoint)—unless the graph includes a node for type omega; by definition,
+      such a node would be common to every partition. In this latter case, the omega node would
+      be connected to every node, and those “partitions” would no longer truly be partitions as such.
+      (But even then it would still be the case that no value is a value of two distinct types T1 and
+      T2 such that T1 and T2 belong to distinct partitions.)
+
+       Observe that any given partition is always fully connected, in the sense that every node in that
+partition is connected to every other node in that partition. What is more, if we introduce type
+omega into the type graph, each of those partitions becomes (by definition) a lattice [8]; and if we
+introduce type alpha as well, the entire graph becomes a single partition (and a single lattice).
+       To close this discussion, here again is point f. from the definition of type graph in the
+previous section:
+
+ f.   If nodes T1 and T2 are distinct root nodes, then no node other than node omega (if such a
+      node exists) is reachable from both T1 and T2.
+
+It should be obvious from the foregoing discussion that this point is an immediate consequence of
+IM Prescription 7.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         346
+Part IV / Subtyping and Inheritance                 Chapter 15 / Multiple Inheritance with Scalar Types
+
+
+MOST SPECIFIC TYPES UNIQUE
+
+Now we turn to IM Prescription 8 (“scalar values with inheritance”):
+
+ 8.   Every set of types T1, T2, ..., Tn shall have a common subtype T' such that a given value is of
+      each of the types T1, T2, ..., Tn if and only if it is of type T'.
+
+      As we know from Chapter 14, with single inheritance this prescription leads to the important
+consequence that every value has a unique most specific type. Is the same true for multiple
+inheritance? In order to investigate this question, it is convenient to start from the other end, as it
+were. To be specific, we will begin with a simplified version of the prescription that is tailored for
+single inheritance as such:
+
+      Let value v be of type T. If and only if no proper subtype T' of type T exists such that v is also
+      of type T', then T is the most specific type for (or of) v.
+
+(This definition is indeed equivalent to the original in the absence of multiple inheritance, as you
+might like to confirm for yourself.) Now we consider the question of what needs to be added to this
+simplified definition—which, to avoid confusion, we will refer to henceforth as IM Prescription 8S
+(“S” for single)—in order to ensure that every value does still have exactly one most specific type.
+       Before we go any further, we should explain why we want this property to hold. In fact, the
+reason is easy to see. Suppose it did not hold; suppose that (e.g.) a given value v could be both a
+rectangle and a rhombus, and suppose further that type SQUARE has not yet been defined. Clearly,
+then, the expression “the most specific type of v” would be ambiguous. To repeat a point already
+made in Chapter 12, one undesirable consequence would be that if an operator named Op had been
+defined for rectangles and another operator with the same name Op had been defined for rhombi, an
+invocation of Op with argument v would be ambiguous. The (partial) solution to this problem is, of
+course, to insist that type SQUARE be defined after all. (The other part of the solution is discussed
+in the section “Remarks on Operator Inheritance,” q.v.)
+       With the foregoing example as motivation, let us now consider the following possible
+replacement for IM Prescription 8S:
+
+      If two types T1 and T2 overlap, then they shall have a common subtype T' such that a given
+      value is of both types (i.e., T1 and T2) if and only if it is of type T'.
+
+      Note: Two types overlap if and only if they are not disjoint. Moreover, to say that value v is
+of types T1 and T2 if and only if it is of type T' is to say, precisely, that the set of values constituting
+type T' is the intersection of the sets of values constituting types T1 and T2. We can therefore refer
+to type T', informally, as an intersection type (or intersection subtype).
+      Now, the point is perhaps not immediately obvious, but this revised version of IM
+Prescription 8S does in fact guarantee that most specific types are unique, as required. Before we
+can show that this is so, however, we need to dispose of a few degenerate cases:
+
+ ■    Case 1: T1 = T2.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                             347
+Part IV / Subtyping and Inheritance                  Chapter 15 / Multiple Inheritance with Scalar Types
+
+
+      If types T1 and T2 are in fact the same type T, then T itself clearly serves as the required
+      intersection subtype.
+
+ ■    Case 2: T1 is a proper supertype of T2.
+
+      In this case, T2 is the required intersection subtype.
+
+ ■    Case 3: T1 and T2 are disjoint.
+
+      The revised IM Prescription 8S can even take care of this case, if we include type omega in
+      the type graph (type omega itself is the required intersection subtype in this case, of course).
+      In other words, we can simplify IM Prescription 8S still further, thus:
+
+      Any two types T1 and T2 shall have a common subtype T' such that a given value is of both
+      type T1 and type T2 if and only if it is of type T'.
+
+       Having taken care of these three special cases, we assume for the remainder of this section
+(barring explicit statements to the contrary) that (a) T1 and T2 are distinct, (b) they overlap (i.e.,
+they do have at least one value in common), and (c) neither is a subtype of the other. This
+combination is the most general and interesting case, of course.
+       By way of example, consider the type graph shown in Fig. 15.3 (type EQUILATERAL in that
+figure consists of polygons whose sides are all the same length). Note that, e.g., types
+QUADRILATERAL and EQUILATERAL satisfy the foregoing conditions: They are distinct, they
+overlap, and neither is a subtype of the other. But they do have a common subtype, RHOMBUS,
+such that it is indeed the case that a polygon that is both quadrilateral and equilateral must be,
+precisely, a rhombus. Thus, RHOMBUS is the intersection subtype for types QUADRILATERAL
+and EQUILATERAL.
+       Note: Just how our model allows the very same value to be of type QUADRILATERAL and
+type EQUILATERAL “at the same time,” as it were, is explained in the discussion of the third
+“important logical consequence” in the subsection immediately following. Note too that SQUARE
+is also a common subtype for types QUADRILATERAL and EQUILATERAL, but it is not the
+intersection subtype per se (see the discussion of the fourth “important logical consequence” in the
+subsection immediately following).
+       For completeness, we give the intersection subtype for every pair of types in Fig. 15.3 that
+satisfy the pertinent conditions:
+      QUADRILATERAL      and    EQUILATERAL      :     RHOMBUS
+      PARALLELOGRAM      and    EQUILATERAL      :     RHOMBUS
+      RECTANGLE          and    EQUILATERAL      :     SQUARE
+      RECTANGLE          and    RHOMBUS          :     SQUARE
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          348
+Part IV / Subtyping and Inheritance                Chapter 15 / Multiple Inheritance with Scalar Types
+
+
+╔═════════════════════════════════════════════════════════════════╗
+║                        ┌───────────────┐                        ║
+║                        │     POLYGON   │                        ║
+║                        └───────┬───────┘                        ║
+║                   ┌────────────┴───────────────┐                ║
+║                                                                 ║
+║            ┌───────────────┐           ┌───────────────┐        ║
+║            │ QUADRILATERAL │           │ EQUILATERAL │          ║
+║            └──────┬────────┘           └───────────┬───┘        ║
+║                                                     │           ║
+║            ┌───────────────┐                        │           ║
+║            │ PARALLELOGRAM │                        │           ║
+║            └──────┬───┬────┘                        │           ║
+║           ┌───────┘   └────────────────────────┐    │           ║
+║                                                                 ║
+║     ┌───────────┐                      ┌───────────────┐        ║
+║     │ RECTANGLE │                      │    RHOMBUS    │        ║
+║     └──────┬────┘                      └───────┬───────┘        ║
+║            └──────────────────┬────────────────┘                ║
+║                                                                 ║
+║                          ┌────────┐                             ║
+║                          │ SQUARE │                             ║
+║                          └────────┘                             ║
+╚═════════════════════════════════════════════════════════════════╝
+Fig. 15.3: Overlapping types must have an intersection subtype
+
+
+Some Important Logical Consequences
+
+Our revised version of IM Prescription 8S has several very important consequences, which we now
+proceed to explain.
+
+Most specific types unique: The first point is that, as desired, it is indeed still the case that every
+value has a well-defined, unique, most specific type. For suppose, contrariwise, that there exists
+some value v that is of two distinct most specific types, T1 and T2 say, “at the same time.” Observe
+that, by definition, neither of T1 and T2 is a subtype of the other (since they are both “most
+specific”). By our revised IM Prescription 8S, then, v must also be of some type T' that is a
+common subtype of T1 and T2. Furthermore, T' must be a proper subtype of T1 and T2, since
+neither of these latter two types is a subtype of the other. But to say that v is of some proper
+subtype of (e.g.) T1 is to contradict the hypothesis that T1 was a most specific type for v in the first
+place.
+       Of course, it is still the case, as it was with single inheritance, that not every value has to have
+a leaf type as its most specific type. For example, values can exist whose most specific type is
+RECTANGLE and not SQUARE.
+
+Leaf types disjoint: It is also still the case that leaf types are disjoint. For suppose, contrariwise,
+that types T1 and T2 are distinct but overlapping leaf types. By our revised IM Prescription 8S,
+then, T1 and T2 must have a common subtype T'. Moreover, since T1 and T2 are distinct and are
+leaf types, neither is a subtype of the other, and hence T' must be a proper subtype of both. But if
+they have a proper subtype, then they are not leaf types after all.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            349
+Part IV / Subtyping and Inheritance                   Chapter 15 / Multiple Inheritance with Scalar Types
+
+
+Model of a scalar variable: It follows from the foregoing that our model of a scalar variable as
+defined in IM Prescription 9—i.e., as a named ordered triple of the form <DT,MST,v>—is still
+valid. It follows further that the FIND_MST algorithm we gave in our discussion of IM Prescription
+10 (“specialization by constraint”) in Chapter 14 for computing the most specific type of a given
+value still works. For example, suppose we are given a parallelogram p with AC = BD (so p is in
+fact a rectangle) and AB = BC (so p is a rhombus also). First, the algorithm will examine the type
+constraint for (say) type RECTANGLE, since RECTANGLE is a proper subtype of
+PARALLELOGRAM; it will discover that p satisfies that constraint, and so p is certainly of type
+RECTANGLE. Next, it will examine the type constraint for type SQUARE, since SQUARE is a
+proper subtype of RECTANGLE; it will then discover that p also satisfies the type constraint for
+type RHOMBUS, and hence the type constraint for type SQUARE as well. Hence, p is of all four
+types PARALLELOGRAM, RECTANGLE, RHOMBUS, and SQUARE, and MST(p) is SQUARE.
+
+Least specific common subtypes unique: Next, observe that the intersection subtype T' required
+by our revised IM Prescription 8S must be unique. That is, given overlapping types T1 and T2,
+there cannot exist two different types T' and T'', both of which are common subtypes of T1 and T2
+and both of which satisfy the conditions of our revised IM Prescription 8S. For if they both satisfy
+those conditions, they are both, precisely, the intersection of T1 and T2; hence they are identical. In
+other words, if T1 and T2 overlap, they have precisely one least specific common subtype (viz.,
+the applicable intersection subtype)—and so, e.g., the situation shown in Fig. 15.4 makes no sense.
+(The arcs in that figure are broken in order to indicate that, e.g., T' and T'' are not necessarily
+immediate subtypes of T1 and T2.)
+╔═════════════════════════════════════════════════════════════════╗
+║                          ┌───────────┐                          ║
+║                          │     T     │                          ║
+║                          └─────┬─────┘                          ║
+║                 ┌────── ─ ─────┴─── ─ ─ ──────┐                 ║
+║          ┌────────────┐                ┌────────────┐           ║
+║          │     T1     │                │     T2     │           ║
+║          └───┬────┬───┘                └───┬────┬───┘           ║
+║              │    └── ─ ─ ────┐            │    │               ║
+║              :    ┌── ─ ─ ────┼──── ─ ─ ───┘    :               ║
+║                               └──── ─ ─ ───┐                    ║
+║          ┌────────────┐                ┌────────────┐           ║
+║          │     T'     │                │     T''    │           ║
+║          └────────────┘                └────────────┘           ║
+╚═════════════════════════════════════════════════════════════════╝
+Fig. 15.4: Another graph that is not a valid type graph
+
+       Incidentally, note that “if and only if” in our revised IM Prescription 8S. In other words,
+loosely speaking, not only must two overlapping types have a nonempty common subtype, but if
+two types have a nonempty common subtype, then they must overlap. See Fig. 15.3 for several
+illustrations of this point.
+
+Any number of overlapping types: Next, our revised IM Prescription 8S needs very little by way
+of extension in order to cater for the case where n types all overlap each other for some n > 2. For
+example, let types T1, T2, and T3 be such that they overlap pairwise, and let the intersection
+subtypes required by IM Prescription 8S be Ta (for T2 and T3), Tb (for T3 and T1), and Tc (for T1
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         350
+Part IV / Subtyping and Inheritance                        Chapter 15 / Multiple Inheritance with Scalar Types
+
+
+and T2). Then types Ta, Tb, and Tc also overlap pairwise, in general; however, the three
+intersection subtypes required for these types Ta, Tb, and Tc taken pairwise are in fact all the same
+type, T' say. Proof of this fact and development of a concrete example to illustrate it are left as
+exercises for the reader.
+      Following on from the foregoing discussion, however, we must now point out that type T' is
+thus the intersection subtype for three immediate supertypes, viz., Ta, Tb, and Tc! We will return to
+this point near the end of the present section.
+
+Most specific common supertypes unique: Next, observe that not only do any given pair of
+overlapping types T1 and T2 have exactly one least specific common subtype (as already
+explained), they also have exactly one most specific common supertype, as we now show. (You
+might want to draw some diagrams as you work through the following explanation.) First of all, T1
+and T2 certainly have at least one common supertype: viz., the (unique) applicable root type. Now
+suppose they have two distinct common supertypes Ta and Tb, say, neither of which is a subtype of
+the other. Note that Ta and Tb also overlap, since they have a common subtype (actually at least
+two common subtypes, T1 and T2). Suppose further that Ta and Tb do not have a common proper
+subtype T that is a common proper supertype of T1 and T2 (i.e., Ta and Tb are both “most specific”
+common supertypes of T1 and T2, loosely speaking). Now rename the types as follows: Rename
+T1 and T2 as T' and T'', respectively; rename Ta and Tb as T1 and T2, respectively. Then we have
+exactly the invalid situation (excluding the root type T) previously shown in Fig. 15.4! It follows
+that the original supertypes Ta and Tb cannot be distinct after all—they must in fact be the same
+type. Hence, as stated, T1 and T2 have precisely one most specific common supertype.1
+
+Overlapping regular types have a regular most specific common supertype: Suppose types T1
+and T2 overlap and are regular types. Then their most specific common supertype, T say, must be a
+regular type also. For suppose not. Let T1 and T2 have possible representations PR1 and PR2,
+respectively. Then, in general, each of PR1 and PR2 will be quite independent of the other (since
+there is no common source for them to be derived from, because T is a dummy type). Thus, for
+example, PR1 might have a component C1 not present in PR2, and PR2 might have a component
+C2 not present in PR1.
+       Now let T' be the (required) least specific common subtype for types T1 and T2 (T' is required
+because T1 and T2 overlap). Then there is no way, in general, for an invocation of the selector
+corresponding to PR1 to return a value of type T' (equivalently, of type T2), because that selector
+has no argument corresponding to C2. (To put it another way, if that selector invocation returns the
+value v, the expression THE_C2(v) is undefined.) Equivalently, specialization by constraint from
+type T1 to type T' does not work—and likewise for S by C from type T2 to type T', of course. In
+other words, allowing T to be a dummy type leads to a violation of IM Prescription 10.
+       Here is an example to illustrate the foregoing discussion. Consider the type graph of Fig. 15.1
+once again. While type PARALLELOGRAM could possibly have a dummy type—say
+
+1
+  It might help to point out that while the least specific common subtype of T1 and T2 is certainly the intersection of T1
+and T2 (loosely speaking), the most specific common supertype of T1 and T2 is not necessarily the union of T1 and T2;
+for example, some parallelograms are neither rectangles nor rhombi. It might also help to point out that the very same
+type can be both an intersection type and a union type; such would be the case with type SQUARE, for example, if
+every square was either a SMALL_SQUARE or a LARGE_SQUARE.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                          351
+Part IV / Subtyping and Inheritance             Chapter 15 / Multiple Inheritance with Scalar Types
+
+
+PLANE_FIGURE (not shown in Fig. 15.1)—as a proper supertype, type PARALLELOGRAM
+itself must be a regular type, because types RECTANGLE and RHOMBUS are overlapping regular
+types.
+
+Equality comparisons: Recall from IM Prescription 12 that the comparison X = Y requires the
+declared types of X and Y to have a nonempty common supertype. Thus, for example, the following
+code fragment is valid:
+     VAR RE RECTANGLE ;
+     VAR RH RHOMBUS ;
+
+     IF RE = RH THEN ... END IF ;
+
+       The comparison RE = RH here is valid because types RECTANGLE and RHOMBUS do
+have a nonempty common subtype (viz., type SQUARE); moreover, it will give TRUE if and only
+if the two variables both contain the same value (viz., a value of that common subtype).
+
+TREAT: Recall from IM Prescription 14 that the TREAT invocation TREAT_AS_T(X) requires T
+and the declared type of X to have a nonempty common subtype. Thus, for example, the following
+code fragment is valid:
+     VAR RE RECTANGLE ;
+     VAR RH RHOMBUS ;
+
+     RH := TREAT_AS_RHOMBUS ( RE ) ;
+
+      The TREAT invocation here is valid because types RECTANGLE and RHOMBUS do have a
+nonempty common subtype; moreover, it will succeed if and only if the current value of variable
+RE is of type SQUARE (i.e., if and only if RE currently contains a value of that common subtype).
+In other words, the assignment shown is logically equivalent to—and could equally well have been
+expressed as—the following:
+     RH := TREAT_AS_SQUARE ( RE ) ;
+
+Type testing: Recall from IM Prescription 15 that the type test IS_T(X) requires T and the declared
+type of X to have a nonempty common subtype. Thus, for example, the following code fragment is
+valid:
+     VAR RE RECTANGLE ;
+     IF IS_RHOMBUS ( RE ) THEN ... END IF ;
+
+      The type test here is valid because types RECTANGLE and RHOMBUS do have a nonempty
+common subtype; moreover, it will give TRUE if and only if the current value of variable RE is of
+type SQUARE (i.e., if and only if RE currently contains a value of that common subtype). In other
+words, the IF statement shown is logically equivalent to—and could equally well have been
+expressed as—the following:
+     IF IS_SQUARE ( RE ) THEN ... END IF ;
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                    352
+Part IV / Subtyping and Inheritance                 Chapter 15 / Multiple Inheritance with Scalar Types
+
+
+An Extended Example
+
+It is our experience that the full implications of all of the foregoing points are far from obvious. We
+therefore present another example, rather more complicated than the one given in Fig. 15.3, that
+repays careful study. Refer to Fig. 15.5.
+╔═════════════════════════════════════════════════════════════════╗
+║                          ┌───────────────┐                      ║
+║                          │ QUADRILATERAL │                      ║
+║                          └───────┬───────┘                      ║
+║              ──────────────────┴───────────────────             ║
+║        ┌───────────┐        ┌──────────┐     ┌───────────────┐  ║
+║        │ TRAPEZOID ├──┐ │       KITE   ├──┐ │     CYCLIC      │ ║
+║        └─────┬─────┘ │ └──┬───────┘ │ │ QUADRILATERAL │         ║
+║              │         │       │           │ └┬────────┬─────┘  ║
+║              │         └─────│──────────│───│───┐      │        ║
+║      ┌───────────────┐         │    ┌─────┼───┘┌───────────┐    ║
+║      │ PARALLELOGRAM │ ┌────│────│─────│────┤ ISOSCELES │       ║
+║      └───────┬───┬───┘ │       │    │      │   │ TRAPEZOID │    ║
+║              │   │       │     │    │      │   └───────────┘    ║
+║              │   └─────│────│────│─────│──────────┐             ║
+║       ┌─────────────┐ │ ┌──────────┐ │        ┌─────────────┐   ║
+║       │ RECTANGLE │──┘ │ RIGHT         │ └───│    RHOMBUS   │   ║
+║       └──────┬──────┘       │ KITE     │      └──────┬──────┘   ║
+║              │              └─────┬────┘             │          ║
+║              └──────────────      │   ───────────────┘          ║
+║                           ┌─────────────┐                       ║
+║                           │    SQUARE    │                      ║
+║                           └─────────────┘                       ║
+╚═════════════════════════════════════════════════════════════════╝
+Fig. 15.5: Overlapping types must have a common subtype (a more complicated example)
+
+Note: We briefly remind you of the definitions of some of the possibly less familiar geometric
+terms mentioned in that figure:
+
+ ■    A trapezoid is a quadrilateral with at least one pair of opposite sides parallel. By the way, you
+      might or might not be interested to learn that in researching this example we discovered that a
+      quadrilateral with two parallel sides is called a trapezoid in the U.S. and a trapezium in the
+      U.K., while a quadrilateral with no parallel sides is called a trapezium in the U.S. and a
+      trapezoid in the U.K. But we digress.
+
+ ■    A kite is a quadrilateral with mirror symmetry about a diagonal, none of whose included
+      angles is greater than 180° (if this latter condition is not satisfied, the quadrilateral is not a kite
+      but a dart). If ABCD is a kite that is symmetric about diagonal AC, then AB = AD and CB =
+      CD.
+
+ ■    A cyclic quadrilateral is a quadrilateral whose vertices lie on a circle. A quadrilateral is cyclic
+      if and only if its opposite angles add up to 180°.
+
+ ■    An isosceles trapezoid is a trapezoid with mirror symmetry about the line that connects the
+      midpoints of its parallel sides. If ABCD is an isosceles trapezoid with AB parallel to CD,
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                             353
+Part IV / Subtyping and Inheritance               Chapter 15 / Multiple Inheritance with Scalar Types
+
+
+      then BC = AD and the included angles at A and B are equal, as are the included angles at C
+      and D.
+
+ ■    A right kite is a kite in which the angles subtended by the diagonal of symmetry are right
+      angles (if ABCD is a kite that is symmetric about diagonal AC, then the angles at B and D are
+      right angles).
+
+“IM Prescription 8S” Revisited
+
+We can now take care of a piece of unfinished business. In the subsection “Some Important Logical
+Consequences,” we said that our revised IM Prescription 8S required very little extension to cater
+for the case of n mutually overlapping types where n > 2. However, our discussion of the issue
+quickly led to the need for a type T' that was the intersection subtype for three immediate
+supertypes Ta, Tb, and Tc, and so some extension is definitely needed. In fact, it should be clear,
+without having to go through a lot of detailed analysis, that all of the ideas we have been discussing
+do extend very straightforwardly to the case n > 2. Thus, we arrive at the following as the final and
+most general version of IM Prescription 8S:
+
+      Every set of types T1, T2, ..., Tn shall have a common subtype T' such that a given value is of
+      each of the types T1, T2, ..., Tn if and only if it is of type T'.
+
+        The value n here is an arbitrary nonnegative integer. Type T' is the unique intersection
+subtype—also known as the least specific common subtype—for types T1, T2, ..., Tn. Analogously,
+of course, types T1, T2, ..., Tn also have a unique most specific common supertype T (and T must be
+a regular type if T1, T2, ..., Tn are regular types and T' is nonempty).
+        Observe now that the formulation of “IM Prescription 8S” just given is in fact identical to the
+formulation we originally gave for IM Prescription 8 in Chapter 14! So we can drop our references
+to “IM Prescription 8S” as such from this point forward, and we will.
+        By way of an example to illustrate the foregoing, consider what happens if we delete types
+PARALLELOGRAM, ISOSCELES TRAPEZOID, RECTANGLE, RIGHT KITE, and RHOMBUS
+from the type graph of Fig. 15.5 (thus leaving QUADRILATERAL with three immediate subtypes,
+each of which is an immediate supertype of SQUARE).
+        One final point to close this section (repeated from Chapter 12): It should be clear that, sadly,
+it is always possible to make mistakes in setting up the type graph. For example, we might define
+the overlapping types RECTANGLE and RHOMBUS and forget to define the necessary
+intersection subtype SQUARE. The consequences of such mistakes will be unpredictable, in
+general; it is to be hoped that some kind of mechanical aid would be available in practice to help the
+person designing the type graph to avoid them.
+
+
+REMARKS ON OPERATOR INHERITANCE
+
+In this, the final section of the chapter, we turn our attention to two remaining issues. First,
+consider types RECTANGLE and RHOMBUS once again. Both of these types inherit the read-
+only operator AREA from type PARALLELOGRAM, and hence—as noted earlier in this chapter—
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          354
+Part IV / Subtyping and Inheritance                Chapter 15 / Multiple Inheritance with Scalar Types
+
+
+type SQUARE inherits that operator from both of its immediate supertypes. What are the
+implications of this fact?
+      Well, if AREA is reimplemented for type SQUARE, there is no problem: An invocation
+AREA(s), where s is of most specific type SQUARE, will unambiguously refer to the version of
+AREA that has been defined for type SQUARE. But, of course, we would like to avoid such
+reimplementation as much as we reasonably can. Suppose, therefore, that AREA is not
+reimplemented for type SQUARE. Now there are two possibilities:
+
+ ■   If the semantics of the RECTANGLE and RHOMBUS versions of the AREA operator are the
+     same—i.e., if the expression AREA(s) gives the same result, no matter whether the
+     RECTANGLE version or the RHOMBUS version of AREA is invoked—then again there is
+     no problem. (No problem so far as the model is concerned, that is. There will still have to be
+     a way of telling the system which of the two versions is to be invoked. But this fact is of no
+     concern to someone who is merely making use of type SQUARE; it is an implementation
+     issue, not a model issue.)
+
+ ■   However, if the semantics of the RECTANGLE and RHOMBUS versions of the AREA
+     operator differ, then it matters very much which version is inherited by type SQUARE. But
+     now we face a logical absurdity! To say that SQUARE is a subtype of both RECTANGLE
+     and RHOMBUS is to say that any given square is both a rectangle and a rhombus. But to go
+     on and say that the area of that square depends on whether we think of it as a rectangle or as a
+     rhombus is surely nonsense.
+          As with our discussion of the TRAVEL_TIME operator in Chapter 14, therefore, we will
+     set a stake in the ground here—as IM Prescription 17 in fact requires us to do—and insist that
+     the semantics of the RECTANGLE and RHOMBUS versions of the AREA operator must not
+     differ. (If they do, then the implementation is in violation; i.e., it is not an implementation of
+     the model, and the implications are unpredictable.)
+
+      Now we turn to the second issue. Suppose some operator Op has been defined for rectangles
+and another operator with the same name Op has been defined for rhombi; suppose further that
+these operators are not inherited from parallelograms—i.e., there is no operator Op for type
+PARALLELOGRAM. Suppose also for simplicity that each of these operators takes just one
+parameter (of type RECTANGLE and type RHOMBUS, respectively). Suppose still further that the
+two operators named Op are really different operators (i.e., Op is overloaded). What do we do
+about the inheritance of Op by type SQUARE?
+      On the face of it, there is a problem here: By the very notion of type inheritance, both
+operators must indeed be inherited by type SQUARE, and an invocation Op(s), where s is of type
+SQUARE, would thus be ambiguous. Clearly, therefore, we must prohibit such a situation from
+arising in the first place. But that is exactly what the following rule (part of IM Prescription 17)
+does:
+
+     Let S be a set of types with a nonempty common subtype. Then no two distinct operators
+     shall have specification signatures that differ only in that, for some i, j, ..., k, the declared
+     types of their ith parameters are distinct members of S, the declared types of their jth
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                              355
+Part IV / Subtyping and Inheritance                 Chapter 15 / Multiple Inheritance with Scalar Types
+
+
+       parameters are distinct members of S, ..., and the declared types of their kth parameters are
+       distinct members of S.
+
+Note: We do not expect this rule to cause significant hardship in practice, because the system
+should be able to detect violations as soon as they occur (i.e., at “operator definition time”).
+
+
+EXERCISES
+
+15.1    Repeat Exercise 12.11—”Define an operator to rotate a specified rectangle through 90°
+        about its center”—using the definition given for type RECTANGLE in this chapter.
+
+15.2    Provide Tutorial D code for the operators AREA, CTR, CIR_CIRCLE, IN_CIRCLE, and
+        ANNULUS from the section “An Introductory Example” (subsection “Operators”) in the
+        body of this chapter.
+
+15.3    Identify all of the intersection types in Fig. 15.5.
+
+15.4    Is type QUADRILATERAL in Fig. 15.5 a union type? If it is, do you think it should be a
+        dummy type? Justify your answers.
+
+15.5    How many possreps can you think of for type RIGHT KITE from Fig. 15.5? Write a
+        Tutorial D definition for that type.
+
+15.6    Give a concrete example of distinct types A, B, C, D, E such that A and B have C as a
+        subtype and C has D and E as subtypes. Note: One such example was mentioned in passing
+        in the body of the chapter (where?); you can give that example as your answer if you like,
+        but we would prefer you to invent one of your own.
+
+15.7    The definition of type graph in the body of the chapter includes the following: If nodes T1,
+        T2, T', and T'' are such that there exist paths from both T1 and T2 to both T' and T'', then
+        there must exist a node T that is common to all of those paths. Show that this point is a
+        logical consequence of IM Prescription 8.
+
+15.8    (Paraphrased from the body of the chapter) Let types T1, T2, and T3 overlap pairwise, and
+        let the corresponding intersection subtypes be Ta (for T2 and T3), Tb (for T3 and T1), and Tc
+        (for T1 and T2). Show that:
+
+        ●    Types Ta, Tb, and Tc also overlap pairwise, in general.
+
+        ●    The three intersection subtypes required for these types Ta, Tb, and Tc taken pairwise
+             are in fact all the same type.
+
+        (Drawing a Venn diagram will help you visualize this situation and might suggest a proof.)
+        Also give a concrete example to illustrate the foregoing possibility.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            356
+Part IV / Subtyping and Inheritance             Chapter 15 / Multiple Inheritance with Scalar Types
+
+
+15.9   Let RATIONAL_p_q (p  1, q  0) be a family of types such that a value v is a value of type
+       RATIONAL_p_q if and only if it is a number whose decimal representation takes the form
+       int.frac, where:
+
+       ●   int and frac are both sequences of decimal digits.
+
+       ●   int involves no more than p-q digits (leading zeros are insignificant and can be
+           dropped).
+
+       ●   frac involves no more than q digits (trailing zeros are insignificant and can be dropped).
+
+       Do you agree that type RATIONAL_p'_q' is a subtype of type RATIONAL_p_q if and only
+       if p'  p and q'  q? Do you agree that we have a case of multiple inheritance on our hands?
+       What are the corresponding root types? Are those root types dummy types? Does value
+       substitutability apply? Are there any operators that apply to values of type
+       RATIONAL_p'_q' and not to values of type RATIONAL_p_q? Does S by C apply? Is
+       there a nonempty type that is a subtype of all possible types in the family?
+
+15.10 Following on from the previous exercise, consider the literal 0012.30. What is the declared
+      type of this literal? What is the most specific type? What is the least specific type?
+
+15.11 Again following on from Exercise 15.9, what is the relationship of type INTEGER to the
+      RATIONAL_p_q family?
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      357

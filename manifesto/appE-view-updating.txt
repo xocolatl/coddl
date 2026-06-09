@@ -1,0 +1,2747 @@
+                                            Appendix E
+
+                                     View Updating
+
+Every scientific discipline has its share of unsolved problems. In mathematics, for example, nobody
+has succeeded in over 100 years in either proving or disproving the Riemann Hypothesis; in
+computer science, the “P = NP” question is still open after some 35 years; in physics and
+cosmology, the long search for a “theory of everything” remains just that, a search (some might
+dispute this last claim). Thus, no book that addresses the frontiers of some field of scientific
+endeavor can claim to have all the answers, as it were. In this appendix, we examine an aspect of
+the database field, view updating, where there are certainly still some unresolved issues. Of course,
+we do not mean to suggest that the problem of view updating is in the same league as the Riemann
+Hypothesis or the “P = NP” issue or some hypothetical “theory of everything”—but we do believe it
+merits attention as a matter of considerable practical and theoretical interest, and we continue to
+work on it. This appendix is a progress report on that activity.
+
+                                      ———  ———
+
+In the interests of full disclosure, we must now explain that view updating is an area where—
+unusually!—the authors of this book are not yet in full agreement. Given the importance of the
+subject matter, however, we decided to go ahead and set our thoughts down in writing anyway, with
+the hope of at least getting some debate going among those who are interested in such matters. We
+also decided to present Date’s opinions first and Darwen’s, as an alternative perspective, second.
+For obvious reasons, we also decided, again unusually, to write in the first person singular where
+appropriate.
+      All opinions expressed in what follows, up to the section “Darwen’s Approach,” are thus
+Date’s specifically.
+
+
+DATE’S APPROACH
+
+I claim that constraints—specifically, database constraints—are the key to the view updating
+problem, and I therefore propose to take a closer look at such constraints in this appendix. In fact, I
+need to cover quite a lot of preliminary material before I can get to view updating as such. I should
+say too that I have been down numerous blind alleys in this investigation! It would be much too
+tedious to document all of those blind alleys here, but it would be dishonest not to admit that my
+previous writings on this topic have suffered from a good deal of error and confusion. And there
+are still, to repeat, some unresolved issues (appropriately flagged in what follows). But I feel
+enough issues have been resolved to make me cautiously optimistic about the remainder. Despite
+its incompleteness, therefore, I explicitly regard what follows as superseding all of my previous
+writings on this subject.
+       Of course, a great deal of work has been done on view updating by other researchers. I do not
+claim to be familiar with all of that prior work, but I have not seen a treatment in the literature that
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         416
+Appendixes                                                                 Appendix E / View Updating
+
+
+is the same as, or even close to, the one that follows—with the exception of that by David
+McGoveran and myself in reference [88], which as I have already indicated I see the treatment that
+follows as superseding (or extending and superseding, rather). Note: McGoveran’s proposals in his
+patent application [114] are broadly consistent with what follows, but some of the details seem to be
+different, and I will certainly be going into more specifics than reference [114] does.
+
+
+ASSUMPTIONS AND NOTATION
+
+For simplicity I adopt a number of assumptions and notational abbreviations in what follows. To be
+specific:
+
+ ■    As you might have noticed already, I (usually) use the term view instead of the Manifesto term
+      virtual relvar—though I retain the Manifesto term real relvar for a relvar that is not a view,
+      and I continue to use the generic term relvar to mean a real relvar or a view or both, as the
+      context demands.
+
+ ■    I use uppercase italic letters for generic relvar names (among other things) and corresponding
+      lowercase italic letters for corresponding relvar values. Thus, for example, relvar R has
+      current value r.
+
+ ■    I take the unqualified term constraint to mean, specifically, what Chapter 2 called a total
+      relvar constraint, barring explicit statements to the contrary.
+
+ ■    I use RC to denote the constraint for relvar R. I also use RX and RY to denote what I will be
+      calling the X constraint for R and the Y constraint for R, respectively (see the section “A
+      Closer Look at Constraints” later in this appendix for an explanation of these latter terms).
+
+ ■    I use the symbol “≡” to mean “is equivalent to” or “is defined as” or “be defined as” or “can
+      be defined as” or just “defined as,” as the context demands.
+
+      I also abbreviate several Tutorial D keywords and syntactic constructs:
+
+ ■    I use the symbols “”, “”, and “-” to denote INTERSECT, UNION, and MINUS,
+      respectively.
+
+ ■    I usually, though not exclusively, use the symbols “&”, “|”, and “¬” to denote AND, OR, and
+      NOT, respectively.
+
+ ■    I use the symbol “ø” to denote an empty relation.
+
+ ■    I use the symbol “” to denote logical implication, thereby writing, e.g., “p  q” instead of
+      “IF p THEN q END IF” (the Tutorial D analog).
+
+ ■    I use dot qualification to denote the operation of extracting an attribute value from a tuple,
+      thereby writing, e.g., “t.A” instead of “A FROM t” (the Tutorial D analog).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            417
+Appendixes                                                                              Appendix E / View Updating
+
+
+    ■   As elsewhere in this book, I use a simplified syntax for tuples—more precisely, tuple selector
+        invocations—thereby writing, e.g., <S1,P1,300> instead of
+        TUPLE { S# S#('S1'), P# P#('P1'), QTY QTY(300) }
+
+        (the Tutorial D analog).
+
+    ■   I use a syntax for constraints that is directly based on that of predicate logic, instead of the
+        more algebraic style used in the body of the book. I also introduce some shorthands. To be
+        specific, I use the expression
+        FORALL t  R ( p )
+
+        (“all tuples t in R are such that p”) as shorthand for
+        FORALL t ( ( t  R )  ( p ) )
+
+        Analogously, I use the expression
+        EXISTS t  R ( p )
+
+        (“there exists a tuple in R such that p”) as shorthand for
+        EXISTS t ( ( t  R ) & ( p ) )
+
+        Note: The expressions FORALL t  R and EXISTS t  R in these shorthands are examples of
+        what reference [22] calls range-coupled quantifiers.
+
+
+A CLOSER LOOK AT RELATIONAL ASSIGNMENT
+
+Note: This section is based on ideas first suggested by David McGoveran.
+      To say that V is a variable is to say that V is assignable to (i.e., updatable).1 As stated in
+Chapter 3, moreover, after assignment of value v to variable V, the comparison v = V is required to
+evaluate to TRUE (The Assignment Principle), otherwise the assignment fails (“is undone”) and V
+retains its previous value.
+      Now, the foregoing remarks are true of variables in general and therefore of relvars in
+particular. That is, the way we update a relvar R is precisely by means of a relational assignment in
+which the target is R:
+        R := exp
+
+     R here is a relvar reference (denoting relvar R, of course) and exp is an expression that
+denotes some relation x that is to be assigned to that relvar R. After the assignment, R = x must
+
+1
+   In this connection, I remind you that, as noted in Chapter 6, if some relvar (in particular, some view) turns out to be
+intrinsically nonupdatable—as opposed to being nonupdatable simply because of, e.g., some constraint violation—then
+it is hardly appropriate to call it a “relvar” (i.e., a variable) in the first place.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                           418
+Appendixes                                                                   Appendix E / View Updating
+
+
+evaluate to TRUE; also, the constraint RC must be satisfied (The Golden Rule). If either of these
+requirements is violated, the update is undone and R retains its previous value. Note: Strictly
+speaking, The Golden Rule applies to the database in its entirety. Here I am appealing to what
+Chapter 2 called a weaker form of that rule (a logical consequence of the more general version),
+which states that no assignment statement can ever leave any relvar in a state that violates its own
+constraint.
+      From this point forward, I take the term assignment to mean a relational assignment
+specifically.
+      Next I remind you that INSERT, DELETE, and UPDATE are really just shorthands for
+certain assignments. Again consider the assignment:
+      R := exp
+
+      It is intuitively obvious that the expression exp is logically equivalent to, and can therefore be
+replaced by, an expression of the form
+      r - d  i
+
+where:
+
+ ■    r is the value of R before the assignment, d is a set of tuples to be deleted from R, and i is a set
+      of tuples to be inserted into R after that deletion has been done. (More precisely, d and i, like
+      r, are really relations, and the “sets of tuples” I am talking about are really the bodies of those
+      relations. I will ignore this detail in what follows.)
+
+ ■    d is a subset of r (i.e., d-r = ø), because deleting a tuple that was not there in the first place has
+      no logical effect; in other words, there is no point in making d any bigger than it need be.
+
+ ■    r and i are disjoint (i.e., ri = ø), because inserting a tuple that was already there has no
+      logical effect; in other words, there is no point in making i any bigger than it need be.
+
+ ■    d and i are disjoint (i.e., di = ø), because there is no point in deleting a tuple and then
+      inserting it again all as part of the same assignment.
+
+     I now show that, for a given assignment R := r-di and a given initial value r of R, d and i are
+unique. Suppose, contrariwise, that
+      r - d1  i1 = r - d2  i2
+
+for some d1 ≠ d2 and/or some i1 ≠ i2, where (in accordance with the conditions spelled out above),
+d1-r = d2-r = ri1 = ri2 = d1i1 = d2i2 = ø. Then:
+
+ ■    Let t  d1-d2. Since d1-r = ø, t  r-d2 and t  r-d1. Hence t  r-d2i2; therefore t  r-d1i1.
+      Since t  r-d1, t  i1. But then d1i1 ≠ ø, which is a contradiction; hence no such t exists and
+      d1-d2 = ø (i.e., d1 is a subset of d2). A similar argument shows that d2 is a subset of d1.
+      Hence d1 = d2.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            419
+Appendixes                                                                  Appendix E / View Updating
+
+
+ ■    We thus have r-d1 = r-d2 = z, say. Then zi1 = zi2. But ri1 = ø, so (r-d1)i1 = ø, so
+      zi1 = ø. A similar argument shows that zi2 = ø. Hence, since zi1 = zi2, i1 = i2.
+
+       It follows from the foregoing that if x is the relation to be assigned to R, then x can be
+expressed as either r-di or ri-d (i.e., it makes no difference whether we do the delete first or the
+insert). It further follows that, given r and x, we have:
+      d    =   r - x
+      i    =   x - r
+
+      I can now define the operations INSERT and DELETE: An INSERT is an assignment for
+which d = ø, a DELETE is an assignment for which i = ø (and an UPDATE is a DELETE followed
+by an INSERT). In other words:
+ ■        INSERT i INTO R     ≡       R := R  i   /* syntax */
+                              ≡       R := r  i   /* semantics */
+
+ ■        DELETE d FROM R     ≡       R := R - d   /* syntax */
+                              ≡       R := r - d   /* semantics */
+
+where ir = d-r = ø. Moreover:
+
+ ■    After INSERT, the comparison R = ri and the constraint RC must both evaluate to TRUE.
+
+ ■    After DELETE, the comparison R = r-d and the constraint RC must both evaluate to TRUE.
+
+       Note: I deliberately do not use Tutorial D INSERT and DELETE syntax here. Also, note
+that in Chapter 6 we did not legislate on whether it was an error to try to insert a tuple that was
+already present or delete one that was not, but here I do (because I require that ir = d-r = ø). In the
+case of DELETE, however, I observe that in practice the operation will usually be expressed in the
+form DELETE R WHERE p, in which case d is necessarily a subset of r, and we have:
+ ■        DELETE R WHERE p        ≡   R := R WHERE ¬ ( p )      /* syntax */
+                                  ≡   R := r WHERE ¬ ( p )      /* semantics */
+
+       It follows from all of the above that it would be sufficient to investigate INSERT and
+DELETE operations specifically rather than general assignment, and for a long time I tried to do
+exactly that (I felt it was a good idea because INSERT and DELETE are, at least arguably,
+intuitively easier to understand than assignment in general). But this idea turned out to be one of
+the blind alleys I mentioned in the introduction to this appendix. One reason it was a blind alley
+had to do with “nested updates”; I will be discussing that topic in detail in a later section, but the
+point should be intuitively understandable even without that detailed discussion (though no harm is
+done if not). Consider an update of the form INSERT i INTO R, where R ≡ AB. It should be clear
+that this update might involve the “insertion” of a tuple t into A (say) that in fact already exists in A,
+thereby violating the precondition for INSERT. Likewise, a request of the form DELETE d FROM
+R where R ≡ AB might involve the “deletion” of a tuple t from B (say) that in fact does not exist in
+B, thereby violating the precondition for DELETE. In other words, it turned out to be useful to talk
+in terms of both:
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                           420
+Appendixes                                                                           Appendix E / View Updating
+
+
+    ■    INSERT-type assignments of the form R := ri where ir is not necessarily equal to ø1
+
+    ■    DELETE-type assignments of the form R := r-d where d-r is not necessarily equal to ø
+
+      In what follows, therefore, I will talk mostly in terms of INSERT- and DELETE-type
+assignments instead of INSERTs and DELETEs as such (note that I do still find it helpful to
+consider the two cases separately). In other words, I will be discussing view updating in terms of
+assignment after all. Observe, however, that the assignments in question will be multiple
+assignments, in general; for example, updating R ≡ AB will usually involve updating both A and B
+(a double assignment). Observe too that UPDATE in particular can be thought of as a double
+assignment—to be specific, an UPDATE on R can be thought of as an assignment of the form R :=
+R-d, R := Ri. (Though this double assignment in fact reduces to the single assignment R := WITH
+R-d AS R: Ri, as explained in Chapter 6.)
+
+A MODEL OF UPDATING
+
+Consider the assignment
+         R := x
+
+where R is a real relvar. Clearly, the semantics of this assignment can be explained in terms of the
+following conceptual algorithm:
+
+    1.    Assign x to R.
+
+    2.   (Check The Assignment Principle.) If R = x evaluates to FALSE, undo the assignment.
+
+    3.   (Check The Golden Rule.) If RC evaluates to FALSE, undo the assignment.
+
+      I remark in passing that conceptual algorithms along the foregoing lines appear at several
+points in what follows. In some cases, some of the steps can safely be omitted (for example, it
+might sometimes be impossible for The Assignment Principle to be violated); however, I will
+usually show all steps for explicitness.
+      Now recall The Principle of Interchangeability, which was mentioned briefly under RM
+Prescription 14 in Chapter 6: There must be no arbitrary and unnecessary distinctions between
+views and real relvars (emphasis on arbitrary and unnecessary). It follows that updates on views in
+particular must behave as far as possible as if those views were real relvars. By way of example, let
+R ≡ AB, and consider the update INSERT i INTO R. R is supposed to “look and feel” as far as
+
+
+
+
+1
+  Footnote 1 on page 161 raises the possibility of supporting two distinct “insert” operators—INSERT, which does not
+treat an attempt to insert an existing tuple as an error, and D_INSERT, which does. If this suggestion is adopted, all
+references to INSERT and INSERT-type assignment in my portions of this appendix could be replaced by references to
+D_INSERT and INSERT, respectively.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                       421
+Appendixes                                                                            Appendix E / View Updating
+
+
+possible just like a real relvar, and so it follows that the semantics of the INSERT must be as
+defined by the following conceptual algorithm:1
+
+    1. (Materialize R.) Create a temporary real relvar R' with initial value r (= ab, where a and b are
+         the current values of A and B, respectively).
+
+    2. (Update R'.) INSERT i INTO R'.
+
+    3. (Recompute R.) Given the new value ri of R', assign the new values a' = (a-b)(ri) and b' =
+         (b-a)(ri) to A and B, respectively, and thereby obtain the new value a'b' for R.
+
+    4. Check The Assignment Principle for R (a'b' should be equal to ri = (ab)i).
+
+    5. Check The Golden Rule for A and B (a' and b' should satisfy constraints AC and BC,
+        respectively). Note that if a' and b' do satisfy AC and BC, respectively, then r' = a'b' will
+        necessarily satisfy RC. Note: I assume here and throughout this paper that any constraints
+        expressed directly in terms of a view R are replaced, at least conceptually, by equivalent
+        constraints expressed in terms of the relvar(s) in terms of which R is defined; in effect,
+        therefore, I assume that constraints refer to real relvars only. This simplifying assumption
+        does not prevent us from talking in terms of “the constraint RC for a view R” when we need to
+        do so, of course.
+
+    6. Discard R'.
+
+      The algorithm for DELETE d FROM R is analogous.
+      Algorithms such as those outlined above constitute a model for how updating is supposed to
+work, and that model at least implicitly underpins everything I have to say in the rest of this
+appendix. Of course, I do not mean the DBMS actually has to execute those algorithms as such;
+rather, it is free to perform updates in whatever way it likes, just so long as whatever it does do is
+guaranteed to give the result prescribed by the model. Indeed, in what follows I usually give what
+might be seen as implementation algorithms (albeit ones that are far from optimal) instead of
+relying on the conceptual algorithms of the model as such. For example, the DBMS might—and
+often will, as I will show in the next section—be able to tell “ahead of time” that some tuple
+presented for insertion would cause the target relvar to violate its own constraint; thus, it (the
+DBMS) might be able to “undo” the update by simply not performing it in the first place. These
+remarks apply to both real relvars and views.
+
+
+
+
+1
+  Note that the definitional trick used in this algorithm—that of introducing a temporary target—could be used as the
+basis for an alternative definition of multiple assignment, one that might be simpler than that given in Chapter 4.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                        422
+Appendixes                                                                              Appendix E / View Updating
+
+
+A CLOSER LOOK AT CONSTRAINTS
+
+Now I turn to the promised closer look at constraints. I begin with some definitions. Let DBC be
+the total database constraint for some database DB. Without loss of generality, we can assume DBC
+takes the following form
+         ( DBC1 ) & ( DBC2 ) & ... & ( DBCn ) & TRUE
+
+where (a) each DBCi (i = 1, 2, ..., n) in turn takes the form1
+         ( Pi1 ) | ( Pi2 ) | ... | ( Pim )
+
+and (b) each Pij (j = 1, 2, ..., m) is a nonnegated proposition of one of the following forms:
+         FORALL t  R ( RQij )
+
+or
+         EXISTS t  R ( RQij )
+
+      Here R is some relvar R in database DB and RQij is a predicate with sole parameter t (and I
+rely on the fact that leading NOTs can be eliminated, thanks to the equivalence ¬(EXISTS x(p)) ≡
+FORALL x(¬(p))). Note: As previously stated, I assume for simplicity that every DBCi is
+formulated in terms of real relvars only; in fact, I assume until further notice that all relvars are real
+ones.
+      Now set to TRUE each DBCi in DBC for which none of the constituent propositions Pij
+mentions relvar R at any level of nesting. Next, for each DBCi in DBC, set to FALSE each Pij in
+DBCi that fails to mention relvar R at any level of nesting. What results is the total relvar
+constraint, RC, for relvar R.
+      I now conjecture2 that, in general, RC is logically equivalent to an expression of the form
+(RZ)&(RY), where:
+
+    ■    RZ is either simply TRUE or it takes the form
+         FORALL t  R ( RX )
+
+         where RX is quantifier-free and thus has the property that, given any tuple t with the same
+         heading as R, it can be evaluated for that tuple t by examining just that tuple t in isolation.
+
+    ■    RY (which also might be simply TRUE) has the property that, given any relation r assignable
+         to R, it can be evaluated for that relation r, albeit not without examining other relvars
+         referenced in RY.
+
+
+1
+  It might help to think of each DBCi, informally, as being a database constraint as explicitly declared in concrete
+syntax (loosely, the total database constraint is the AND of all such explicitly declared constraints).
+2
+    Throughout this appendix I use the term conjecture in connection with issues that might need further investigation.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                            423
+Appendixes                                                                                Appendix E / View Updating
+
+
+       I assume that if R is a real relvar, then RX and RY are known (I will consider the case of a
+virtual relvar later), and I will refer to them in what follows as “the X and Y constraints” for R.
+Note: In practice it would probably be desirable for RY to include no nontrivial “subconstraint,” as
+it were, with the same properties as RZ—in other words, it would be desirable for RZ to be the
+maximal subconstraint of RC to possess the properties in question—but I do not rely on RZ being
+maximal in this (or any other) sense. But no harm is done, logically speaking, if we replace RZ by
+TRUE and RY by RC throughout; my aim in splitting RC into RX and RY is merely (a) to make
+certain explanations intuitively easier to understand, (b) to provide a basis for certain simple
+optimizations, and (c) to mirror, in certain respects, the way we define constraints in practice.1
+       I now illustrate these ideas with a series of examples. For simplicity I assume in each case
+that the particular constraint under discussion is the total relvar constraint, barring explicit
+statements to the contrary.
+
+    1.   Supplier status is greater than zero. Formal expression:
+         FORALL t  S ( t.STATUS > 0 )
+
+         For this example, the X and Y constraints SX and SY are t.STATUS > 0 and TRUE,
+         respectively. Overall, the constraint says: If we insert some tuple into S, then after that
+         INSERT every tuple in S must have status greater than zero; likewise, if we delete some tuple
+         from S, then after that DELETE every tuple in S must have status greater than zero. Two
+         obvious optimizations are possible:
+
+         ●   If we attempt to insert some tuple t, the DBMS can reject the attempt “ahead of time”
+             (i.e., before doing the INSERT) if that tuple violates the X constraint for S—i.e., if
+             t.STATUS  0.
+
+         ●   If we attempt to delete some tuple t, the DBMS need not check the constraint at all, since
+             DELETE cannot possibly cause it to be violated.
+
+    2.   Suppliers in London have status 20:
+         FORALL t  S ( t.CITY = 'London'  t.STATUS = 20 )
+
+         Here SX is t.CITY = 'London'  t.STATUS = 20 and SY is TRUE. Thus, if we attempt to
+         insert the tuple <S8,Finzi,30,London>, the DBMS does not need to perform the actual
+         insertion because it can tell ahead of time that it will fail.
+
+    3.   Supplier numbers are unique:
+         FORALL t  S ( FORALL u  S ( u.S# = t.S#  u = t ) )
+
+
+
+
+1
+  In fact, we could if we liked simply regard the total database constraint DBC as the relvar constraint for each and
+every individual relvar; after all, subconstraints within DBC that fail to mention relvar R are simply irrelevant so far as
+R is concerned.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                             424
+Appendixes                                                                              Appendix E / View Updating
+
+
+         In this example, SX is just TRUE and SY is the whole of SC—and indeed it is intuitively
+         obvious that if a tuple is presented for insertion into S, we cannot tell ahead of time whether
+         that tuple causes the uniqueness constraint to be violated without examining other tuples, in
+         general. Note: Another obvious shorthand would allow the foregoing expression to be
+         simplified to just:
+         FORALL t,u  S ( u.S# = t.S#  u = t )
+
+         I will make use of this further shorthand from time to time in what follows.
+
+    4.   No supplier with status less than 20 can supply part P6:
+         FORALL t  S ( t.STATUS < 20 
+             FORALL u  SP ( u.S# = t.S#  u.P# ≠ P#('P6') ) )
+
+         Again SX is just TRUE and SY is the whole of SC;1 but the interesting point about this
+         example is that it mentions relvar SP as well as relvar S. The constraint is thus a constraint on
+         SP as well, as the following alternative but equivalent formulation makes clear:
+         FORALL u  SP ( u.P# = P#('P6') 
+             FORALL t  S ( t.S# = u.S#  t.STATUS  20 ) ) )
+
+         Here we can say SPX ≡ TRUE and SPY ≡ SPC.
+
+    5.   Every shipment involves an existing supplier:
+
+         FORALL t  SP ( EXISTS u  S ( u.S# = t.S# ) )
+
+
+         Again this constraint is a constraint for both S and SP. We have SX ≡ SPX ≡ TRUE, SY ≡
+         SPY ≡ SC ≡ SPC. Note that inserting a tuple into S or deleting one from SP cannot possibly
+         violate the constraint.
+
+    6.   Let relvar SPJ, with heading {S#,P#,J#}, be subject to the join dependency2
+          { SP, PJ, JS }
+
+         where SP denotes the projection of SPJ on attributes S# and P#, and similarly for PJ and JS.
+         This join dependency is logically equivalent to the following:
+         FORALL x,y,z  SPJ ( x.S# = y.S# & y.P# = z.P# & z.J# = x.J#
+                               EXISTS u  SPJ ( u.S# = x.S# & u.P# = y.P# &
+                                                 u.J# = z.J# ) )
+
+
+
+1
+    Though at least we know that an attempt to insert a supplier tuple with STATUS  20 cannot violate the constraint.
+2
+  See reference [76] for some background to this example. It might help to explain that the intended interpretation (i.e.,
+the relvar predicate) for SPJ is: Supplier S# supplies part P# to project J#. The join dependency means, loosely, that if
+(a) supplier S# supplies part P# and (b) part P# is supplied to project J# and (c) project J# is supplied by supplier S#,
+then (d) supplier S# supplies part P# to project J#.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                          425
+Appendixes                                                                     Appendix E / View Updating
+
+
+      We have SPJX ≡ TRUE, SPJY ≡ SPJC. If we attempt to insert or delete some tuple into or
+      from relvar SPJ, constraint SPJY will be evaluated after that insertion or deletion has
+      (tentatively) taken place.
+
+ 7.   There must always be at least one supplier:
+      EXISTS t  S ( TRUE )
+
+      Once again we have SX ≡ TRUE, SY ≡ SC. Inserting a tuple cannot violate this constraint, but
+      deleting a tuple might.
+
+ 8.   All parts are either blue or green and there exists at least one part:
+      FORALL t  P ( t.COLOR = 'Blue' OR t.COLOR = 'Green' ) AND
+      EXISTS t  P ( TRUE )
+
+      Here PX ≡ t.COLOR = 'Blue' OR t.COLOR = 'Green'; PY ≡ EXISTS t  P (TRUE).
+
+ 9.   All parts are either blue or green, or there exists at least one red part:
+      FORALL t  P ( t.COLOR = 'Blue' OR t.COLOR = 'Green' ) OR
+      EXISTS t  P ( t.COLOR = 'Red' )
+
+      Here PX ≡ TRUE, PY ≡ PC.
+
+      Now I turn my attention to views. Let view R be defined, possibly via several levels of
+indirection, in terms of real relvars R1, R2, ..., Rn. Then we can say that view R has a relvar
+constraint RC, which we define to be satisfied by R if and only if R1C, R2C, ..., RnC are satisfied by
+R1, R2, ..., Rn, respectively. Furthermore, I conjecture that, in general, RC is logically equivalent to
+an expression of the form
+      ( FORALL t  R ( RX ) ) & ( RY )
+
+(as previously), where RX in turn can easily be defined in terms of R1X, R2X, ..., RnX. By way of
+example, let view R be defined as a restriction of relvar A:
+      R ≡ A WHERE p
+
+      Recall from Chapter 2 that p here is a quantifier-free predicate. Then RC ≡ (AZ)&(p), and we
+define RX ≡ (AX)&(p) and RY ≡ AY. For example, let R ≡ S WHERE STATUS > 20 and let SY be
+      FORALL t  S ( FORALL u  S ( u.S# = t.S#  u = t ) )
+
+(“supplier numbers are unique”). Then RC is:
+      FORALL t  R ( ( SX ) & ( t.STATUS > 20 ) ) &
+      FORALL t  S ( FORALL u  S ( u.S# = t.S#  u = t ) )
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          426
+Appendixes                                                                             Appendix E / View Updating
+
+
+      So we can define RX as (SX) & (t.STATUS > 20) and RY as SY. Note that RY is basically a
+constraint on S, not R.
+      As another simple example, let R ≡ A RENAME (F AS G). Then RC, RX, and RY are
+identical to AC, AX, and AY, respectively, except that all references to F are replaced by references
+to G.
+      I conclude this section with a refined version of the conceptual update algorithm from the end
+of the section “A Model of Updating,” earlier in this appendix. Consider the assignment
+         R := r  i - d
+
+where R is a relvar, possibly virtual. The semantics are as follows:
+
+    1.   Every tuple in i must satisfy RX, otherwise the assignment fails.
+
+    2.   Create a temporary real relvar R' with initial value ri-d.
+
+    3.   From R', compute the new values for all real relvars R1, R2, ..., Rn involved in the definition
+         of R and assign those values to those relvars, and thereby obtain the new value for R. (Details
+         of this step are spelled out, at least implicitly, in subsequent sections.)
+
+    4.   If The Assignment Principle is violated for R, the assignment fails.
+
+    5.   If The Golden Rule is violated for any of R1, R2, ..., Rn, the assignment fails.
+
+    6.   Discard R'.
+
+      Note that RX (a) can be used to check ahead of time that INSERTs are valid and (b) cannot be
+violated by DELETEs; RX can be thought of, informally, as “the tuple-level constraint” for R. RY
+cannot be checked until after the update has (tentatively) been done; in general, it can be violated by
+both INSERTs and DELETEs.
+
+
+UPDATING RESTRICTIONS
+
+In this section I investigate the question of updating restriction views specifically. I treat
+restrictions first because in a sense they are “the easy case,” and also because several later sections
+rely on the discussions in this section. I will present the rules first, then show some examples.
+       Let R ≡ A WHERE p; then RC, RX, and RY are as given in the previous section (in particular,
+RX ≡ (AX)&(p)). Consider the INSERT-type assignment:
+         R := R  i
+
+Every tuple in i must satisfy RX. The given assignment expands1 into:
+         A := A  i
+
+
+1
+    “Expands” is perhaps not the mot juste in this simple case but becomes so in more complex cases.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                  427
+Appendixes                                                                Appendix E / View Updating
+
+
+After this assignment, R must have the value ri and ai must satisfy AY (where, to remind you, r
+and a are the original values of R and A, respectively), otherwise the update is undone.
+      Consider now the DELETE-type assignment:
+      R := R - d
+
+This assignment expands into:
+      A := A - d
+
+After this assignment, R must have the value r-d and a-d must satisfy AY, otherwise the update is
+undone.
+      By way of example, consider the usual suppliers relvar S, with its usual sample value
+(repeated in Fig. E.1 for convenience). Let the constraint SC for suppliers be such that SX is just
+TRUE and SY is just “supplier numbers are unique.” Let R ≡ S WHERE STATUS > 20; then RX ≡
+TRUE & t.STATUS > 20 (which reduces to just t.STATUS > 20, of course) and RY ≡ SY. Now
+consider the following updates on R:
+╔═════════════════════════════════════════════════════════════════╗
+║                ┌────┬───────┬────────┬────────┐                 ║
+║             S │ S# │ SNAME │ STATUS │ CITY    │                 ║
+║                ├════┼───────┼────────┼────────┤                 ║
+║                │ S1 │ Smith │     20 │ London │                 ║
+║                │ S2 │ Jones │     10 │ Paris │                  ║
+║                │ S3 │ Blake │     30 │ Paris │                  ║
+║                │ S4 │ Clark │     20 │ London │                 ║
+║                │ S5 │ Adams │     30 │ Athens │                 ║
+║                └────┴───────┴────────┴────────┘                 ║
+╚═════════════════════════════════════════════════════════════════╝
+Fig. E.1: The suppliers relvar S—sample value
+
+ 1.   INSERT <S6,Lopez,30,Madrid> INTO R: The specified tuple satisfies RX, so it is tentatively
+      inserted into S (and therefore appears in R, so The Assignment Principle is satisfied for R).
+      After that insertion, SY is satisfied, and so the update succeeds.
+
+ 2.   INSERT <S6,Lopez,20,Madrid> INTO R: The specified tuple violates RX, so the update
+      fails.
+
+ 3.   INSERT <S1,Lopez,30,Madrid> INTO R: The specified tuple satisfies RX, so it is tentatively
+      inserted into S (and therefore appears in R, so The Assignment Principle is satisfied for R).
+      After that insertion, however, SY is violated, and so the update is undone.
+
+ 4.   DELETE <S5,Adams,30,Athens> FROM R: The specified tuple is tentatively deleted from S
+      (and therefore no longer appears in R, so The Assignment Principle is satisfied for R). After
+      that deletion, SY is satisfied, and so the update succeeds.
+
+      As a basis for certain future examples, I now define a series of additional restriction views
+over relvar S:
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                           428
+Appendixes                                                               Appendix E / View Updating
+
+
+ ■    RI ≡ S WHERE ( STATUS > 20 ) & ( CITY = 'Paris' )
+
+ ■    RU ≡ S WHERE ( STATUS > 20 ) | ( CITY = 'Paris' )
+
+ ■    RD ≡ S WHERE ( STATUS > 20 ) & ( ¬ ( CITY = 'Paris' ) )
+
+ ■    RQ ≡ S WHERE ( STATUS > 20 & ( ¬ ( ( STATUS > 20 ) &
+                                       ( ¬ ( CITY = 'Paris' ) ) ) )
+
+      Assume again that SX is just TRUE and SY is just “supplier numbers are unique.” Then, using
+p and q to denote the expressions (t.STATUS > 20) and (t.CITY = 'Paris'), respectively, we have X
+constraints as follows:
+ ■    RIX ≡ p&q
+
+ ■    RUX ≡ p|q
+
+ ■    RDX ≡ p&(¬q)
+ ■    RQX ≡ p&(¬(p&(¬q))) ≡ p&q ≡ RIX
+
+
+UPDATING INTERSECTIONS
+
+In this section and the next two, I consider what is involved in updating intersection, union, and
+difference views, respectively. First of all, then, let R ≡ AB (so r = ab); then RC ≡ (AC)&(BC),
+and in particular RX ≡ (AX)&(BX). Now consider the INSERT-type assignment:
+      R := R  i
+
+Every tuple in i must satisfy RX. The given assignment expands into:
+      A := A  i , B := B  i
+
+After these assignments, (a) R must have the value ri and (b) ai must satisfy AY and bi must
+satisfy BY, otherwise the update is undone.
+       Consider now the DELETE-type assignment:
+      R := R - d
+
+This assignment expands into:
+      A := A - d , B := B - d
+
+After these assignments, (a) R must have the value r-d and (b) a-d must satisfy AY and b-d must
+satisfy BY, otherwise the update is undone. Discussion: The specified assignment means “The
+tuples of d are to be deleted from AB”; so every tuple of d must clearly be deleted from at least one
+of A and B. However, there is no good reason for deleting from A and not B or vice versa;
+moreover, if we did delete from just one, it is likely that deleting d from AB and deleting d from
+BA would have different effects. Symmetry therefore strongly suggests that we delete from both.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       429
+Appendixes                                                                 Appendix E / View Updating
+
+
+Moreover, deleting from both has the advantage that the rule is not just symmetric in itself, it is
+symmetric with the insert rule also.
+
+Examples
+
+Let real relvars A and B have just one attribute each, of type nonnegative integer, and let their
+constraints and initial values be as follows:
+      A : AX ≡ n  7 : initial value a = 0 4 5 7
+          AY ≡ TRUE
+
+      B : BX ≡ n  2 : initial value b = 3 4 6 7 8
+          BY ≡ TRUE
+
+Points arising:
+
+ ■    As the form in which I have stated these constraints and initial values suggests, I talk for
+      simplicity as if A and B contained sets of nonnegative integers as such, instead of (as would
+      be more correct) tuples containing such integers.
+
+ ■    For clarity I show sets of integers as simple lists with adjacent integers separated by a blank,
+      thereby writing, e.g., 0 4 5 7 instead of the more conventional {0,4,5,7}.
+
+ ■    I assume the same initial values for each example.
+
+ ■    The examples all involve attempts to insert or delete sets of integers of cardinality one, and so
+      we can speak, loosely, of inserting or deleting individual integers per se.
+
+ ■    I have already explained that, e.g., an INSERT-type assignment is not the same thing as an
+      INSERT as such; in the examples in this section, however (also in the next two), I will ensure
+      that the preconditions for INSERT and DELETE are always satisfied (barring explicit
+      statements to the contrary), and I will therefore feel free to use the more user-friendly terms
+      INSERT and DELETE per se in those examples.
+
+      Now consider the following updates on R ≡ AB:
+      INSERT 2         INSERT 5        DELETE 7
+
+      Observe that:
+ ■    RX ≡ (AX)&(BX) ≡ (n  7) & (n  2).
+
+ ■    2 appears in neither a nor b.
+
+ ■    5 appears in a but not b.
+
+ ■    7 appears in both a and b.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                           430
+Appendixes                                                                Appendix E / View Updating
+
+
+     Here now are the results of the three updates. Note: I use the symbol “::” from this point
+forward to mean “gives” or “yields” or “produces.”
+      INSERT 2 :: A = 0 2 4 5 7
+                  B = 2 3 4 6 7 8
+      INSERT 5 :: A unchanged
+                  B = 3 4 5 6 7 8
+      DELETE 7 :: A = 0 4 5
+                  B = 3 4 6 8
+
+      For each of these examples, let us also consider what happens if we immediately follow the
+specified operation by its inverse:
+      INSERT 2 / DELETE 2 :: A and B both unchanged
+      INSERT 5 / DELETE 5 :: A = 0 4 7, B unchanged
+      DELETE 7 / INSERT 7 :: A and B both unchanged
+
+        As you can see, the sequence INSERT 5 / DELETE 5 fails to preserve the status quo, and the
+INSERT and DELETE in question are thus not really inverses after all. I will revisit this issue—
+i.e., the question of whether INSERT and DELETE should be inverses—in the section “Some
+Remarks on Orthogonality,” later in this appendix.
+        Now I return to the usual suppliers relvar S. Let RI be defined as follows:
+      RI ≡ ( S WHERE STATUS > 20 )  ( S WHERE CITY = 'Paris' )
+
+Observe that this view is semantically identical to the view of the same name from the previous
+section. Its X constraint RIX is
+      ( t.STATUS > 20 ) & ( t.CITY = 'Paris' )
+
+which is clearly identical to the constraint of the same name from the previous section. Now
+consider the following updates on RI:
+
+ 1.   INSERT <S7,Jones,25,Paris> INTO RI: Let i be the relation containing just the specified
+      tuple. Then the expansion is
+      A := A  i , B := B  i
+
+      where A ≡ S WHERE STATUS > 20 and B ≡ S WHERE CITY = 'Paris', respectively. The
+      rules for updating through a restriction thus come into play, and the foregoing expansion
+      expands again, into:
+      S := S  i , S := S  i
+
+      As explained in Chapter 6, this latter multiple assignment in turn is equivalent to the
+      following:
+      S := WITH S  i AS S : S  i
+
+      If we think of this expansion as a sequence of assignments
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       431
+Appendixes                                                                             Appendix E / View Updating
+
+
+         S := S  i ;
+         S := S  i ;
+
+         then it should be clear that the second has no effect. But that is not the point; rather, the point
+         is the collection of the two assignments into one,1 which guarantees that just one assignment
+         to S is actually performed. Thus, the net effect is that the new tuple is successfully inserted
+         into S, and hence into both A and B, and hence into RI. The Assignment Principle is thus
+         satisfied, and so is The Golden Rule.
+
+    2.   INSERT <S6,Lopez,30,Madrid> INTO RI: Here the tuple presented for insertion satisfies the
+         constraint AX but not the constraint BX (where A and B are as in the previous example). The
+         update therefore fails.
+
+       It should be clear from these examples that, at least as far as INSERTs are concerned, the
+intersection view RI exhibits behavior identical to that of the restriction view RI from the section
+“Updating Restrictions,” earlier in this appendix. An analogous remark applies to DELETEs also
+(exercise for the reader). This state of affairs is highly gratifying, of course, given that the view
+definitions are semantically equivalent; indeed, reference [76] asserts it as a principle, or at least an
+objective, that “view updatability is a semantic issue, not a syntactic one—i.e., it must not depend
+on the particular syntactic form in which the view definition in question happens to be stated.” Part
+of my aim in this appendix is to see whether this objective can be achieved.
+       Suppose now that A (“suppliers with status greater than 20”) and B (“suppliers in Paris”) are
+two distinct real relvars, and we attempt the same two INSERTs on RI ≡ AB. The second
+INSERT still fails. The first, however, has the effect of inserting the new tuple into both of those
+real relvars, as you will easily see for yourself if you work through the expansions. I will revisit this
+example also in the section “Some Remarks on Orthogonality,” later in this appendix.
+       I close this section by remarking that (as is well known) intersection is a special case of join.
+It follows that the rules for updating intersections must be a special case of those for updating joins,
+and so indeed they are. However, I defer detailed discussion of the question of updating joins to a
+later section.
+
+
+UPDATING UNIONS
+
+Let R ≡ AB (so r = ab); then RC ≡ (AC)|(BC), and we can define RX as (AX)|(BX).2 Now
+consider the INSERT-type assignment:
+         R := R  i
+
+
+
+
+1
+ Note, however, that the second assignment in the example violates the preconditions for INSERT. This is one reason
+why I need to talk in terms of INSERT- and DELETE-type assignments instead of INSERTs and DELETEs per se.
+Other reasons will emerge as we proceed.
+2
+  Defining RX as (AX)|(BX) guarantees that if RX is not satisfied, then certainly RC is not satisfied—though if RX is
+satisfied, it does not follow that RC is satisfied.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                         432
+Appendixes                                                                    Appendix E / View Updating
+
+
+Let ia be the tuples of i that satisfy AX and let ib be the tuples of i that satisfy BX, respectively.
+Then the given assignment expands into the double assignment:
+      A := A  ia , B := B  ib
+
+After these assignments, (a) R must have the value ri and (b) aia must satisfy AY and bib must
+satisfy BY, otherwise the update is undone. Discussion: The given assignment means “The tuples
+of i are to be inserted into AB”; so every tuple of i must clearly be inserted into A or B or both.
+But how do we decide which ones go where? The intuitively obvious (and symmetric) answer is:
+For each tuple t of i, insert t into A if and only if it satisfies AX and into B if and only if it satisfies
+BX. Note clearly, however, that the overall operation will still fail if either AY or BY is violated
+after those insertions have been done; as usual, therefore, those insertions are only tentative, in a
+sense.
+       Consider now the DELETE-type assignment:
+      R := R - d
+
+This assignment expands into:
+      A := A - d , B := B - d
+
+After these assignments, (a) R must have the value r-d and (b) a-d must satisfy AY and b-d must
+satisfy BY, otherwise the update is undone.
+
+Examples
+
+First let me return to the “nonnegative integer” relvars A and B from the examples in the previous
+section:
+        A : AX ≡ n  7 : initial value a = 0 4 5 7
+            AY ≡ TRUE
+
+        B : BX ≡ n  2 : initial value b = 3 4 6 7 8
+            BY ≡ TRUE
+
+Now consider the following updates on R ≡ AB:
+      INSERT 1          INSERT 2         DELETE 0          DELETE 3          DELETE 4
+
+Observe that:
+ ■      RX ≡ (AX)|(BX) ≡ (n  7) | (n  2).
+
+ ■      1 appears in neither a nor b and satisfies AX but not BX.
+
+ ■      2 appears in neither a nor b and satisfies both AX and BX.
+
+ ■      0 appears in a but not b.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                              433
+Appendixes                                                              Appendix E / View Updating
+
+
+ ■     3 appears in b but not a.
+
+ ■     4 appears in both a and b.
+
+      Here now are the results of the five updates:
+      INSERT 1 :: A = 0 1 4 5 7
+                  B unchanged
+      INSERT 2 :: A = 0 2 4 5 7
+                  B = 2 3 4 6 7 8
+      DELETE 0 :: A = 4 5 7
+                  B unchanged
+      DELETE 3 :: A unchanged
+                  B = 4 6 7 8
+      DELETE 4 :: A = 0 5 7
+                  B = 3 6 7 8
+
+      Let us also consider in each case what happens if we immediately follow the specified
+operation by its inverse:
+      INSERT 1 / DELETE 1 :: A and B both unchanged
+      INSERT 2 / DELETE 2 :: A and B both unchanged
+      DELETE 0 / INSERT 0 :: A and B both unchanged
+      DELETE 3 / INSERT 3 :: B unchanged, A = 0 3 4 5 7
+      DELETE 4 / INSERT 4 :: A and B both unchanged
+
+     As you can see, the only sequence that fails to preserve the status quo is DELETE 3 / INSERT
+3. Again, I will revisit this issue in the section “Some Remarks on Orthogonality.”
+     Now let us switch to the suppliers example. Let RU be defined as follows:
+      RU ≡ ( S WHERE STATUS > 20 )  ( S WHERE CITY = 'Paris' )
+
+Observe that this view is semantically identical to the view of the same name from the section
+“Updating Restrictions.” Its X constraint RUX is
+      ( t.STATUS > 20 ) | ( t.CITY = 'Paris' )
+
+which is clearly identical to the constraint of the same name from the section “Updating
+Restrictions.” I leave it as an exercise to show that view RU exhibits the same behavior with
+respect to INSERTs and DELETEs, regardless of which way it is defined.
+
+
+UPDATING DIFFERENCES
+
+Let R ≡ A-B (so r = a-b); then RC ≡ (AC) & (FORALL t  R (t / B)), and we can define RX as
+simply AX. Consider the INSERT-type assignment:
+      R := R  i
+
+Every tuple in i must satisfy RX. The given assignment expands into:
+      A := A  i
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      434
+Appendixes                                                              Appendix E / View Updating
+
+
+After this assignment, (a) R must have the value ri and (b) ai must satisfy AY, otherwise the
+update is undone.
+      Consider now the DELETE-type assignment:
+      R := R - d
+
+This assignment expands into:
+      A := A - d
+
+After this assignment, (a) R must have the value r-d and (b) a-d must satisfy AY, otherwise the
+update is undone. Exercise: What happens if we try to delete a tuple from (or insert a tuple into)
+the view R ≡ A-A?
+
+Examples
+
+Again I return to the “nonnegative integer” relvars A and B:
+       A : AX ≡ n  7 : initial value a = 0 4 5 7
+           AY ≡ TRUE
+
+       B : BX ≡ n  2 : initial value b = 3 4 6 7 8
+           BY ≡ TRUE
+
+      Consider the following updates on R ≡ A-B:
+      INSERT 1        DELETE 0
+
+      I leave it to you to figure out why I choose exactly these examples; however, I note that RX ≡
+n  7. Results:
+      INSERT 1 :: A = 0 1 4 5 7
+                  B unchanged
+      DELETE 0 :: A = 4 5 7
+                  B unchanged
+
+      Let us also consider in each case what happens if we immediately follow the specified
+operation by its inverse:
+      INSERT 1 / DELETE 1 :: A and B both unchanged
+      DELETE 0 / INSERT 0 :: A and B both unchanged
+
+      Now consider the suppliers example once again. Let RD be defined as follows:
+      RD ≡ ( S WHERE STATUS > 20 ) - ( S WHERE CITY = 'Paris' )
+
+Observe that this view is semantically identical to the view of the same name from the section
+“Updating Restrictions.” Its X constraint RDX is
+      t.STATUS > 20
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       435
+Appendixes                                                                               Appendix E / View Updating
+
+
+which is not identical to the constraint of the same name from the section “Updating Restrictions.”
+It is nevertheless still the case that view RD exhibits the same behavior with respect to INSERTs
+and DELETEs, regardless of which way it is defined (another exercise for the reader).
+       I close this section by remarking that difference is in fact a special case of semidifference (to
+use Tutorial D syntax, A SEMIMINUS B—equivalently, A NOT MATCHING B—reduces to A
+MINUS B if A and B are of the same type).1 It follows that the rules for updating differences must
+be a special case of those for updating semidifferences, and so they are. For purposes of reference,
+let me explicitly state the rules for semidifference here. Let R ≡ A NOT MATCHING B (so r = a
+NOT MATCHING b). Then RC is:
+         FORALL t  R ( ( AX ) & ¬ ( EXISTS u ( BX ( u  t ) ) ) ) & ( AY )
+
+where u is a tuple whose heading consists of the attributes of B that are not also attributes of A; I use
+the notation BX(ut) to stress the point that it is the (tuple) union of u and t that is required to satisfy
+BX. Thus, RX ≡ AX. Consider the INSERT-type assignment:
+         R := R  i
+
+Every tuple in i must satisfy RX. The given assignment expands into:
+         A := A  i
+
+After this assignment, (a) R must have the value ri and (b) ai must satisfy AY, otherwise the
+update is undone.
+      Consider now the DELETE-type assignment:
+         R := R - d
+
+This assignment expands into:
+         A := A - d
+
+After this assignment, (a) R must have the value r-d and (b) a-d must satisfy AY, otherwise the
+update is undone.
+      By way of example, let R ≡ S NOT MATCHING SP, and let relvars S and SP have their usual
+sample values and be subject to the usual constraints (in particular, the usual key and foreign key
+constraints). Then:
+ 1. INSERT <S7,Jones,25,Paris> INTO R: Succeeds.
+
+    2.   INSERT <S1,Lopez,30,Madrid> INTO R: Fails on a violation of constraint SY (supplier
+         number not unique).
+
+    3.   DELETE <S5,Adams,30,Athens> FROM R: Succeeds.
+
+
+
+1
+ By contrast, join is not a special case of semijoin—in fact, the opposite is at least partly true. To be specific, A
+SEMIJOIN B (equivalently, A MATCHING B) reduces to A JOIN B if the heading of B is a subset of that of A.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                             436
+Appendixes                                                                Appendix E / View Updating
+
+
+ 4.   DELETE <S4,Clark,20,London> FROM R: Fails on a violation of constraint SY (referential
+      integrity violation).
+
+
+NESTED UPDATES
+
+Before going on to consider the rules for updating through other relational operators, I need to
+elaborate somewhat on the issue of nested updates (e.g., updating R ≡ AB where A and B are not
+just simple relvar references but more general relational expressions). Of course, I did touch on this
+issue in the last three sections when I discussed the views RI, RU, and RD, all of which were
+defined (in one of their incarnations) in terms of restrictions; however, now I can take a closer look.
+       Once again I use “nonnegative integer” relvars as a basis for my examples. Assume we have
+three such relvars A, B, and C, with constraints AC, BC, CC all just TRUE, for simplicity, and initial
+values as follows:
+      A : initial value a = 0 4 5 7 10
+      B : initial value b = 3 4 6 7 8 11
+      C : initial value c = 0 1 2 7 8 9 12
+
+      Again I assume the same initial values for each example, barring explicit statements to the
+contrary. I also assume the set of integers we want to insert is i = 1 2 3 9 (again, the same for each
+example; for reasons I will get to in a little while, the examples all involve INSERT-type
+assignments specifically).
+
+Example 1
+
+Let R ≡ A(BC), and consider the INSERT-type assignment R := Ri. We can represent this
+operation by means of the following tree structure. Note: I have taken a slight syntactic liberty in
+that tree by including assignments at some of the nodes in which the target is not a simple variable
+reference but, rather, a more general operational expression—a pseudovariable reference, in fact.
+(As noted in Chapter 5, Tutorial D does not currently support such pseudovariables.)
+                      0. A(BC) := A  (BC)  i
+                                   │
+                          ┌——─────┴——──────┐
+                          │                  │
+                1. A := A  i            2. BC := (BC)  i
+                   A := a' say              BC := x say
+                                     ┌───────┴───────┐
+                                     │               │
+                            3. B := B  i         4. C := C  i
+                               B := b' say           C := c' say
+
+      Explanation: The root of the tree (Node 0) represents the original update. We apply the rule
+for updating through union to obtain updates to A and BC, respectively (Nodes 1 and 2); a' and x
+are the values denoted by the assignment sources at Nodes 1 and 2, respectively. Observe that a'
+and x are immediately computable from a, b, c, and i. Next, we apply the rule for updating through
+intersection to obtain updates to B and C, respectively (Nodes 3 and 4); b' and c' are the values
+denoted by the assignment sources at Nodes 3 and 4, respectively. Observe that b' and c' are
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        437
+Appendixes                                                                             Appendix E / View Updating
+
+
+immediately computable from b, c, and i (x is not directly needed; effectively, x is just the value of
+some temporary variable that is used internally during the execution of the overall update but is
+never exposed to the user).
+      Given the specified values for a, b, c, and i, we obtain:
+        a' = ai = 0 1 2 3 4 5 7 9 10
+        b' = bi = 1 2 3 4 6 7 8 9 11
+        c' = ci = 0 1 2 3 7 8 9 12
+
+        We also have:
+        x   = (bc)i = 1 2 3 7 8 9 = b'c'
+
+        Observe that:
+
+    ■   The initial value of A(BC) = a(bc) = 0 4 5 7 8 10 and the final value = a'(b'c') = 0 1 2
+        3 4 5 7 8 9 10, and the overall update thus satisfies The Assignment Principle.
+
+    ■   Nodes 3 and 4 considered together also satisfy The Assignment Principle, because b'c' = x.
+        So do Nodes 1 and 2, of course, as we effectively saw in the previous bullet item.
+
+    ■   Nodes 3 and 4 both involve an assignment of the form R := Ri in which i and r are not
+        disjoint (and the assignment is thus not a valid INSERT, though it is “INSERT-type”).
+
+       Now, immediately following the INSERT-type assignment of the foregoing example by the
+DELETE-type assignment R := R-i does not preserve the status quo (though it does work
+satisfactorily in other respects); yet again, I refer you to the section “Some Remarks on
+Orthogonality” for further discussion. Apart from such considerations, it should be intuitively clear
+from this example that updates via an arbitrarily complex relational expression will certainly work1
+if both of the following conditions are satisfied:
+
+    ■   Condition 1: The expression involves intersections and unions only—because INSERT-type
+        assignments via such an expression ultimately expand to an INSERT-type assignment on
+        every real relvar involved and DELETE-type assignments via such an expression ultimately
+        expand to a DELETE-type assignment on every real relvar involved. (This is why I do not
+        bother to show any examples in this section involving DELETE-type assignments.)
+    ■   Condition 2: The expansion does not involve two or more assignments to the same real
+        relvar.
+
+      Examples 2-6 therefore examine the question of what happens if these conditions are violated.
+To be specific, Examples 2 and 6 consider the effect of violating Condition 1 only; Example 3
+considers the effect of violating Condition 2 only; and Examples 4 and 5 consider the effect of
+violating both.
+
+
+1
+  The term work here (and in similar contexts elsewhere) is intended to include the case in which the update fails on a
+violation of either The Assignment Principle or The Golden Rule.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                         438
+Appendixes                                                                 Appendix E / View Updating
+
+
+Example 2
+
+Let R ≡ A(B-C), and consider R := Ri. Here is the tree:
+                    0. A(B-C) := A(B-C)  i
+                                │
+                        ┌───────┴───────┐
+                        │               │
+                1. A := A  i      2. B-C := (B-C)  i
+                   A := a' say        B-C := x say
+                                        │
+                                        │
+                                   3. B := B  i
+                                      B := b' say
+
+      Now, no integer in B-C can appear in C, by definition. Given the specified values for c and i,
+therefore, the foregoing update will necessarily fail on a violation of The Assignment Principle—so
+let me change the initial value c to just 0 12. Then we obtain:
+      a' = ai    = 0 1 2 3 4 5 7 9 10
+      b' = bi    = 1 2 3 4 6 7 8 9 11
+      c' = c      = 0 12 (C is not updated at all)
+      x = (b-c)i = 1 2 3 4 6 7 8 9 11 = b'-c'
+
+      Observe that the initial value of A(B-C) = a(b-c) = 4 7 and the final value = a'(b'-c') = 1 2
+3 4 7 9, and the update thus satisfies The Assignment Principle.
+      Without going into further details, it should be intuitively clear that updates via an expression
+involving any combination of intersections, unions, and differences will work satisfactorily so long
+as Condition 2 is satisfied. So what happens if we violate Condition 2?
+
+Example 3
+
+Let R ≡ A(AB), and consider R := Ri (this example is effectively the same as Example 1, except
+that I have replaced C by A). Here is the tree:
+                            0. A(AB) := A(AB)  i
+                                        │
+                                  ┌─────┴─────┐
+                                  │            │
+                        1. A := A  i     2. AB := (AB)  i
+                           A := a' say       AB := x say
+                                       ┌──────┴───────┐
+                                       │               │
+                               3. A := A  i        4. B := B  i
+                                  A := a'' say         B := b' say
+
+       The significant thing about this tree is that it includes two distinct assignments (at Nodes 1
+and 3) to the same target A; in other words, Condition 2 has been violated. As a consequence, it
+might seem that the order in which individual assignments are performed could affect the overall
+result. Let us take a closer look.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         439
+Appendixes                                                               Appendix E / View Updating
+
+
+      It should be clear that, although trees are (of course) constructed from the top down, they need
+to be processed from the bottom up. Thus, the tree in the example can be regarded as representing
+the following multiple assignment:
+      A := A  i , B := B  i , A := A  i
+
+(corresponding to Nodes 3, 4, and 1, in that order). The two assignments to A are then collected
+together, yielding:
+      B := B  i , A := WITH A  i AS A : A  i
+
+Evaluating, we obtain:
+      b' = bi    = 1 2 3 4 6 7 8 9 11
+      a' = ai    = 0 1 2 3 4 5 7 9 10 = a''
+      x = (ab)i = 1 2 3 4 7 9 = a'b'
+
+      Once again, then, the overall update works (the final value of R is 0 1 2 3 4 5 7 9 10 =
+a'(a'b')). But the example is weak, in a way, precisely because a'' = a' (the order in which we
+execute the assignments to A thus clearly makes no difference in this particular example). Now, the
+reason why a'' = a' is that the constraints AC and BC are both just TRUE. Even if this were not the
+case, however, it would still be the case that the order in which we execute those assignments to A
+would make no difference to the overall result. Why? Because (as we have already seen) those
+assignments will be either all INSERT-type assignments or all DELETE-type assignments, not a
+mixture, and the assignments
+      A := WITH A  j AS A : A  k
+
+and
+      A := WITH A  k AS A : A  j
+
+are logically equivalent, as are the assignments
+      A := WITH A - j AS A : A - k
+
+and
+      A := WITH A - k AS A : A - j
+
+      The foregoing example raises another issue, however. As we have seen, the example involves
+assignment of a new value b' to relvar B. But why does it? Given that A(AB) is identically
+equal to A, why does B get updated at all? Why is updating A(AB) not equivalent to updating
+just A? I will return to this question in the section “Some Remarks on Orthogonality”; for now, I
+simply note that this example does appear to violate the principle, articulated earlier, that view
+updating is or should be a matter of semantics, not syntax.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        440
+Appendixes                                                               Appendix E / View Updating
+
+
+Example 4
+
+Let R ≡ A-(A-A), and consider R := Ri. The tree in this case is very simple:
+                      0. A-(A-A) := A-(A-A)  i
+                                 │
+                                 │
+                                 │
+                           1. A := A  i
+                              A := a' say
+
+Further discussion seems superfluous.
+
+Example 5
+
+Let R ≡ (AB)-(AB), and consider R := Ri. Here is the tree:
+                        0. (AB)-(AB) := (AB)-(AB)  i
+                                       │
+                                       │
+                                       │
+                                1. AB := (AB)  i
+                                   AB := x say
+                              ┌────────┴────────┐
+                              │                 │
+                      2. A := A  i          3. B := B  i
+                         A := a' say            B := b' say
+
+       This update necessarily fails, because (thanks to the semantics of “-”) no integer appearing in
+(AB)-(AB) is allowed to appear in AB, a state of affairs that is logically impossible unless ab =
+i = ø. (In fact, (AB)-(AB) is equivalent to (A-B)(B-A)—the “symmetric difference” of A and
+B—and it is intuitively obvious that inserting anything into the view is impossible.)
+
+Example 6
+
+For the final example in this section, I return to suppliers once again. Let RQ be defined as follows:
+       RQ ≡ ( S WHERE STATUS > 20 ) -
+            ( ( S WHERE STATUS > 20 ) - ( S WHERE CITY = 'Paris' ) )
+
+Observe that this view is semantically identical to the view of the same name from the section
+“Updating Restrictions.” Its X constraint RQX is
+      t.STATUS > 20
+
+which is not identical to the constraint of the same name from the section “Updating Restrictions.”
+It is nevertheless still the case that view RQ exhibits the same behavior with respect to INSERTs
+and DELETEs, regardless of which way it is defined (another exercise for the reader).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       441
+Appendixes                                                                 Appendix E / View Updating
+
+
+UPDATING EXTENSIONS
+
+I now turn my attention to some of the other relational operators. This section deals with EXTEND;
+the next two deal with joins and projections, respectively.
+      Let R ≡ EXTEND A ADD (z AS Z); then RC ≡ (AC) & (FORALL t  R (t.Z = z)), and we can
+define RX as
+        ( AX(u) ) & ( t.Z = z )
+
+      Here u ≡ t{ALL BUT Z}; I use the notation AX(u) to stress the point that it is u, not t, that is
+required to satisfy AX. Now consider the INSERT-type assignment:
+        R := R  i
+
+Every tuple in i must satisfy RX. The given assignment expands into:
+        A := A  ( i { ALL BUT Z } )
+
+After this assignment, (a) R must have the value ri and (b) the new value of A must satisfy AY,
+otherwise the update is undone.
+      Consider now the DELETE-type assignment:
+        R := R - d
+
+This assignment expands into:
+        A := A - ( d { ALL BUT Z } )
+
+After this assignment, (a) R must have the value r-d and (b) the new value of A must satisfy AY,
+otherwise the update is undone.
+       Note: Every EXTEND invocation is equivalent to a certain join invocation, and the update
+rules just outlined are consistent with this fact.
+       By way of example, let R be defined thus:
+        R ≡ EXTEND P ADD ( WEIGHT * 454 AS GMWT )
+
+Then:
+
+ 1.     INSERT <P7,Cog,Red,12,Paris,5448.0> INTO R: Succeeds (the projection of this tuple over
+        all but GMWT is inserted into P).
+
+ 2.     INSERT <P7,Cog,Red,12,Paris,5449.0> INTO R: Fails.
+
+ 3.     DELETE <P1,Nut,Red,12,London,5448.0> FROM R: Succeeds (the tuple for part P1 is
+        deleted from P).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         442
+Appendixes                                                                   Appendix E / View Updating
+
+
+UPDATING JOINS
+
+To what extent join views might or might not be updatable has been the subject of controversy for
+many years. Partly for that reason, I proceed a little differently in this section—instead of simply
+stating a set of rules and then showing examples to illustrate them, I want to consider a series of
+examples first and use those examples as a basis from which to extrapolate a suitable set of rules.
+The examples are all based on the usual suppliers-and-parts database (with its usual constraints) and
+the usual sample values (see Fig. E.2).
+╔═════════════════════════════════════════════════════════════════╗
+║    ┌────┬───────┬────────┬────────┐           ┌────┬────┬─────┐ ║
+║ S │ S# │ SNAME │ STATUS │ CITY    │       SP │ S# │ P# │ QTY │ ║
+║    ├════┼───────┼────────┼────────┤           ├════┼════┼─────┤ ║
+║    │ S1 │ Smith │     20 │ London │           │ S1 │ P1 │ 300 │ ║
+║    │ S2 │ Jones │     10 │ Paris │            │ S1 │ P2 │ 200 │ ║
+║    │ S3 │ Blake │     30 │ Paris │            │ S1 │ P3 │ 400 │ ║
+║    │ S4 │ Clark │     20 │ London │           │ S1 │ P4 │ 200 │ ║
+║    │ S5 │ Adams │     30 │ Athens │           │ S1 │ P5 │ 100 │ ║
+║    └────┴───────┴────────┴────────┘           │ S1 │ P6 │ 100 │ ║
+║                                               │ S2 │ P1 │ 300 │ ║
+║    ┌────┬───────┬───────┬────────┬────────┐   │ S2 │ P2 │ 400 │ ║
+║ P │ P# │ PNAME │ COLOR │ WEIGHT │ CITY    │   │ S3 │ P2 │ 200 │ ║
+║    ├════┼───────┼───────┼────────┼────────┤   │ S4 │ P2 │ 200 │ ║
+║    │ P1 │ Nut   │ Red   │   12.0 │ London │   │ S4 │ P4 │ 300 │ ║
+║    │ P2 │ Bolt │ Green │    17.0 │ Paris │    │ S4 │ P5 │ 400 │ ║
+║    │ P3 │ Screw │ Blue │    17.0 │ Oslo   │   └────┴────┴─────┘ ║
+║    │ P4 │ Screw │ Red   │   14.0 │ London │                     ║
+║    │ P5 │ Cam   │ Blue │    12.0 │ Paris │                      ║
+║    │ P6 │ Cog   │ Red   │   19.0 │ London │                     ║
+║    └────┴───────┴───────┴────────┴────────┘                     ║
+╚═════════════════════════════════════════════════════════════════╝
+Fig. E.2: The suppliers-and-parts database—sample values
+
+      First of all, let R ≡ A JOIN B (so r = a JOIN b); then RC ≡ (AC)&(BC), and in particular RX
+is:
+      ( AX(a) ) & ( BX(b) )
+
+       Here a and b are the projections of t on the attributes of A and B, respectively (t being the
+tuple that is supposed to satisfy RX, of course); I use the notation AX(a) to stress the point that it is
+a, not t, that is required to satisfy AX, and similarly for BX(b). Note: If A and B are of the same
+type, A JOIN B degenerates to A INTERSECT B, and the constraint degenerates to that for
+intersection; if A and B have no common attribute names, A JOIN B degenerates to the cartesian
+product of A and B, and the constraint degenerates to that for cartesian product.
+       The usual requirements regarding The Assignment Principle and The Golden Rule apply. I
+omit further details (or most of them, at any rate) in the discussions that follow.
+
+Example 1
+
+For my first example, I consider suppliers only. In Fig. E.2, suppliers are represented by a single
+real relvar that looks like this:
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            443
+Appendixes                                                                            Appendix E / View Updating
+
+
+       S { S#, STATUS, CITY }
+
+(I ignore supplier names for simplicity.) Thus, we might define projection views as follows:
+       ST ≡ S { S#, STATUS
+       SC ≡ S { S#, CITY }
+
+      In accordance with The Principle of Interchangeability, however, we could come up with a
+different design in which ST and SC are real and S is a join view, thus:
+       S ≡ ST JOIN SC
+
+      This join is key to key and therefore one to one. Moreover, every S# value appearing in ST
+also appears in SC and vice versa—i.e., this constraint is effectively part of the relvar constraint for
+each of S and ST and SC (and S in particular is not in sixth normal form, 6NF,1 regardless of
+whether it is real or virtual)—for otherwise the two designs would not be equivalent.
+
+       For this revised design, it is obvious that
+       INSERT i INTO S
+
+expands into
+       INSERT i { S#, STATUS } INTO ST
+       INSERT i { S#, CITY }   INTO SC
+
+and
+       DELETE d FROM S
+
+expands into
+       DELETE d { S#, STATUS } FROM ST
+       DELETE d { S#, CITY }   FROM SC
+
+      As this first example suggests, therefore, updating a one-to-one join is straightforward. Also,
+I noted earlier that intersection is a special case of join; more precisely, it is a special case of one-to-
+one join specifically, and the update rules just outlined are consistent with this fact.
+      Note: For clarity, I abbreviate the terms “INSERT-type assignment” and “DELETE-type
+assignment,” both in this section and the next, to just INSERT and DELETE, respectively (and I
+show expansions in terms of INSERT and DELETE specifically). These simplifications are
+legitimate, for the most part, because I will usually make no attempt either to insert a tuple that is
+already present or to delete one that is not. When the expansions do violate either of these
+preconditions, I will note the fact explicitly. Observe in particular that the expansions shown in
+connection with the foregoing example do not violate them.
+
+1
+  Loosely, a relvar is in 6NF if and only if it cannot be nonloss decomposed into two or more projections. See
+reference [76] for an explanation of nonloss decomposition and a tutorial on all the normal forms mentioned in this
+appendix.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                           444
+Appendixes                                                                Appendix E / View Updating
+
+
+      Now let me revise the foregoing example slightly. To be specific, suppose some suppliers
+have a status but no city and vice versa (in other words, ST and SC are real relvars and some
+suppliers are represented in just one of the two). Then deleting a tuple from ST JOIN SC could be
+implemented by deleting a tuple from just one of ST and SC without violating either The
+Assignment Principle or The Golden Rule. But deleting from both has the advantage of
+symmetry—see the discussion of updating intersections, earlier in this appendix—as well as the
+advantage that we have just one rule, universally applied. Of course, we can avoid deleting from
+both, if we want to, by not deleting from S in the first place: in particular, by not giving the user
+DELETE rights over that view.
+
+Example 2
+
+For my next example, I consider both suppliers and parts. In Fig. E.2, suppliers and parts are
+represented by two real relvars that look like this:
+      S { S#, CITY }
+      P { P#, CITY }
+
+(I ignore other attributes for simplicity.) Thus, we might define a join view as follows:
+      SCP ≡ S JOIN P
+
+      In accordance with The Principle of Interchangeability, however, we could come up with a
+different design in which SCP is real and S and P are projection views, thus:
+      S ≡ SCP { S#, CITY
+      P ≡ SCP { P#, CITY }
+
+       Again we have SCP ≡ S JOIN P, of course—and the join is many to many, regardless of
+whether SCP is real or virtual. What is more, if tuples <s,c,p> and <s',c,p'> appear in SCP, then
+tuples <s',c,p> and <s,c,p'> must appear in SCP also—i.e., this constraint is effectively part of the
+relvar constraint for each of S and P and SCP (and SCP in particular is not in fourth normal form,
+4NF, regardless of whether it is real or virtual)—for otherwise the designs would not be equivalent.
+It follows that even if SCP is real, the updates
+      INSERT <S9,London,P8> INTO SCP
+
+and
+      DELETE <S1,London,P1> FROM SCP
+
+both fail, because they violate that constraint. The following INSERT, by contrast, succeeds—
+      INSERT i INTO SCP
+
+—if i contains exactly the tuples
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        445
+Appendixes                                                                  Appendix E / View Updating
+
+
+       <S9,London,P1>      <S9,London,P8>
+       <S9,London,P4>      <S1,London,P8>
+       <S9,London,P6>      <S4,London,P8>
+
+    Observe in particular that this INSERT has the effect of inserting <S9,London> into S ≡
+SCP{S#,CITY} and <P8,London> into P ≡ SCP{P#,CITY}.
+    In similar fashion, the following DELETE also succeeds—
+       DELETE d FROM SCP
+
+—if d contains exactly the tuples
+       <S1,London,P1>      <S4,London,P1>
+       <S1,London,P4>      <S4,London,P4>
+       <S1,London,P6>      <S4,London,P6>
+
+    This DELETE has the effect of deleting <S1,London> and <S4,London> from S ≡
+SCP{S#,CITY} and <P1,London>, <P4,London>, and <P6,London> from P ≡ SCP{P#,CITY}.
+    So if SCP is in fact a join view, it should be clear that
+       INSERT i INTO SCP
+
+expands into
+       INSERT i { S#, CITY } INTO S ,
+       INSERT i { P#, CITY } INTO P
+
+and
+       DELETE d FROM SCP
+
+into
+       DELETE d { S#, CITY } FROM S
+
+       DELETE d { P#, CITY } FROM P
+
+       As this example suggests, updating a many-to-many join is also straightforward; in fact, the
+expansions are the same as for the one-to-one case, though specific INSERTs and DELETEs are
+more likely to fail in the many-to-many case on violations of The Golden Rule. Also, I noted
+earlier that cartesian product is a special case of join; more precisely, it is a special case of many-to-
+many join specifically, and the update rules just outlined are consistent with this fact—in other
+words, they apply directly to updating cartesian products.
+
+Example 3
+
+For my last example, I consider suppliers and shipments. In Fig. E.2, suppliers and shipments are
+represented by two real relvars that look like this:
+       S { S#, CITY
+       SP { S#, P#, QTY }
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                           446
+Appendixes                                                                            Appendix E / View Updating
+
+
+(I ignore other attributes for simplicity.) Thus, we might define a join view as follows:
+        SSP ≡ S JOIN SP
+
+      In accordance with The Principle of Interchangeability, however, we could come up with a
+different design in which SSP is real and S and SP are projection views, thus:
+        S ≡ SSP { S#, CITY
+        SP ≡ SSP { S#, P#, QTY }
+
+       Again we have SSP ≡ S JOIN SP, of course—and the join is a key-to-matching-foreign-key
+    1
+join and therefore one to many, regardless of whether SSP is real or virtual. What is more, if tuples
+<s,c,p,q> and <s,c',p',q'> both appear in SSP, then c = c'—i.e., this constraint is effectively part of
+the relvar constraint for each of S and SP and SSP (and SSP in particular is not in third normal
+form, 3NF, regardless of whether it is real or virtual)—for otherwise the designs would not be
+equivalent. It follows that even if SSP is real, the update
+        INSERT <S4,Athens,P1,100> INTO SSP
+
+fails, because it violates that constraint. The following updates, by contrast, both succeed:
+        INSERT <S4,London,P1,100> INTO SSP
+
+        INSERT <S9,London,P1,100> INTO SSP
+
+       The first has the effect of inserting <S4,P1,100> into SP ≡ SSP{S#,P#,QTY} (only, because
+the tuple <S4,London> is already present in S ≡ SSP{S#,CITY}); the second has the effect of
+inserting <S9,London> into S ≡ SSP{S#,CITY} and <S9,P1,100> into SP ≡ SSP{S#,P#,QTY}.
+       So if SSP is in fact a join view, it should be clear that
+        INSERT i INTO SSP
+
+expands into
+        INSERT i { S#, CITY }               INTO S
+
+        INSERT i { S#, P#, QTY } INTO SP
+
+(though the “INSERT” into S, at least, is really an “INSERT-type assignment,” since it might be
+“inserting” some tuples that already exist). This expansion is as for the one-to-one and many-to-
+many cases.
+      What about DELETE? On the face of it, there seems to be a problem here. The “obvious”
+expansion for
+        DELETE d FROM SSP
+
+
+
+1
+  Even if S and SP are both views!—that is, the fact that every S# value appearing in view SP also appears in view S
+constitutes a foreign key constraint from one view to another.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                       447
+Appendixes                                                                Appendix E / View Updating
+
+
+is
+      DELETE d { S#, CITY } FROM S , DELETE d { S#, P#, QTY } FROM SP
+
+     This expansion is as for the one-to-one and many-to-many cases and is symmetric with the
+expansion for INSERT. But consider the following example:
+      DELETE <S1,London,P1,300> FROM SSP
+
+      If SSP is a real relvar, this DELETE succeeds; but if it is a join view, it fails (given the
+foregoing expansion) on a referential integrity violation, because it leaves some tuples for supplier
+S1 in SP but no such tuple in S, and we have therefore violated both The Golden Rule and The
+Principle of Interchangeability. Note: Reference [76] would allow triggered actions such as
+cascade delete to occur at this point, the effect of which is not to violate The Golden Rule after all
+but to violate The Assignment Principle instead. I do not pursue this possibility here for obvious
+reasons.
+      Precisely because of the state of affairs just explained, many writers have suggested that
+DELETE on a one-to-many join view should delete from the “many” side only—that is, the
+expansion for
+      DELETE d FROM SSP
+
+should be just
+      DELETE d { S#, P#, QTY } FROM SP
+
+      This approach means the example previously discussed—
+      DELETE <S1,London,P1,300> FROM SSP
+
+—has the effect of deleting <S1,P1,300> from SP (only); thus, the DELETE succeeds, and The
+Principle of Interchangeability, The Assignment Principle, and The Golden Rule are all preserved.
+However, the approach has its disadvantages too:
+
+ ■     The INSERT and DELETE rules are asymmetric.
+
+ ■     INSERT and DELETE are not necessarily inverse operations.
+
+ ■    The DELETE rule (unlike the INSERT rule) for one-to-many joins is different from that for
+      one-to-one and many-to-many joins.
+
+       On the third hand ... To continue to talk in terms of the SSP example specifically for
+definiteness, the INSERT rule can be characterized, informally, as “insert S tuples if they do not
+exist, plus insert matching SP tuples.” Thus, we might consider extending the DELETE rule
+accordingly, along the lines of “delete SP tuples if they exist, plus delete S tuples if they now have
+no matching SP tuples.” We might even make the argument that the DELETE rule in the one-to-
+one and many-to-many cases behaves in essentially the same way, implying that this revised
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         448
+Appendixes                                                                                Appendix E / View Updating
+
+
+approach overcomes all three of the objections identified above. In fact, I do make this
+argument!—that is, I do argue that the DELETE rule is really the same in all three cases. My
+argument is based on an appeal to first principles1 (see the section “A Model of Updating” earlier in
+this appendix). To be specific, the semantics of the update
+         DELETE <S1,London,P1,300> FROM SSP
+
+are given by the following algorithm:
+
+    1.   Materialize SSP; call the result T.
+
+    2.   DELETE <S1,London,P1,300> FROM T.
+
+    3.   S := S - SSP { S#, CITY }       T { S#, CITY },
+         SP := SP - SSP { S#, P#, QTY }  T { S#, P#, QTY }.
+
+    4.   Check The Assignment Principle for SSP ≡ S JOIN SP.
+
+    5.   Check The Golden Rule for S and SP (though the particular constraint that every S# value
+         appearing in SP also appears in S will necessarily be satisfied).
+
+    6.   Discard T.
+
+      Note that the foregoing algorithm works even if SSP is real (except that in that case we would
+need to check The Golden Rule for SSP instead of S and SP). And if SSP is a view, the algorithm
+has the effect of deleting the specified tuple from SP and, if and only if that tuple is the sole tuple
+for supplier S1 in SSP, deleting the tuple for supplier S1 from S as well.
+
+
+UPDATING PROJECTIONS
+
+The structure of this section resembles, somewhat, that of the previous section on updating joins:
+Again I proceed by considering a series of examples and extrapolating a suitable set of rules from
+them.
+      First of all, let R ≡ A{ALL BUT Z} (so r = a{ALL BUT Z}); then RC is:
+         FORALL t  R ( EXISTS u ( ( t = u { ALL BUT Z } ) & ( AC ( u ) ) ) )
+
+      We can define RX as follows. Recall first that X constraints are quantifier free; without loss
+of generality, therefore, we can assume that AX is in conjunctive normal form. Now replace every
+conjunct in AX that mentions Z by TRUE. What results is RX.
+      In the previous section, I showed three examples. In this section, I show essentially the same
+three examples, but I look at them from the opposite point of view, as it were—i.e., I assume the
+joins are real relvars and the projections are views. Note in particular, therefore, that the projections
+
+
+1
+    Of course, all previous discussions were based on those principles as well, but implicitly so.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                     449
+Appendixes                                                                 Appendix E / View Updating
+
+
+I will be discussing in connection with those three examples are all the result of some nonloss
+decomposition.
+       The usual requirements regarding The Assignment Principle and The Golden Rule apply; I
+omit the details (mostly) in the discussions that follow.
+
+Example 1
+
+Let S{S#,STATUS,CITY} be a real relvar. Define projection views ST and SC thus:
+      ST ≡ S { S#, STATUS }
+      SC ≡ S { S#, CITY }
+
+      These views satisfy the constraint that every S# value appearing in ST also appears in SC and
+vice versa; following The Principle of Interchangeability, therefore, the same would have to be true
+if ST and SC were real relvars and S was a join view. This fact strongly suggests that ST and SC
+will often have to be updated “simultaneously,” via some user-visible multiple assignment (by
+which I mean the multiple assignment in question must be explicitly specified as such by the user).
+For example, if ST and SC were real relvars, the following would clearly be a valid update:
+      INSERT <S9,20> INTO ST , INSERT <S9,London> INTO SC
+
+     It follows that the same must be true if ST and SC are views. In order to explain the
+semantics of this update in the view case, I again appeal to first principles. Here is the algorithm:
+
+ 1.   Materialize ST and SC; call the results ST' and SC', respectively.
+
+ 2.   INSERT <S9,20> INTO ST', INSERT <S9,London> INTO SC'.
+
+ 3.   S := ST' JOIN SC'.
+
+ 4.   Check The Assignment Principle for ST ≡ S{S#,STATUS} and SC ≡ S{S#,CITY}.
+
+ 5.   Check The Golden Rule for S.
+
+ 6.   Discard ST' and SC'.
+
+       The foregoing algorithm also works if ST and SC are real, not views (except that in that case
+we would need to check The Golden Rule for ST and SC instead of S).
+       Of course, to repeat a point from the section “A Model of Updating,” there is no requirement
+that the foregoing sequence of steps actually be executed in order to achieve the desired result. To
+be more specific, we have seen that, e.g., inserting the tuple <S9,20> into ST requires a
+complementary tuple <S9,c> to be inserted into SC for some CITY value c; but there is nothing to
+prevent the DBMS from treating some specified CITY value c as a default and performing that
+complementary INSERT automatically. In other words, I have no objection to the possibility of
+building some kind of default scheme—so long as it is systematic—on top of what I am proposing
+here. What I do not want to do, however, is to make any such scheme an integral part of my
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         450
+Appendixes                                                                                Appendix E / View Updating
+
+
+proposal, because existing default schemes, at least, are notoriously ad hoc and suffer from
+numerous well-known problems. I ignore defaults for the rest of this appendix.1
+     Now consider the following “simpler” INSERT example:
+         INSERT <S9,20> INTO ST
+
+      Here is the conceptual algorithm (with apologies for the mixture of tuple- and relation-level
+notation in Step 2):
+
+    1.   Materialize ST and SC; call the results ST' and SC', respectively.
+
+    2.   INSERT <S9,20> INTO ST', INSERT ø INTO SC'.
+
+    3.   S := ST' JOIN SC'.
+
+    4.   Check The Assignment Principle for ST ≡ S{S#,STATUS} and SC ≡ S{S#,CITY}.
+
+    5.   Check The Golden Rule for S.
+
+    6.   Discard ST' and SC'.
+
+         It follows that:
+
+    ■    If ST and SC are views (as I am assuming), the INSERT violates The Assignment Principle,
+         because the tuple for S9 disappears when S, and therefore ST, is recomputed.
+
+    ■    If they are real—in which case Step 5 applies to ST and SC instead of to S—it violates The
+         Golden Rule instead, because it causes a tuple for S9 to appear in ST and not SC.2
+
+      Either way, therefore, if user U “sees” just ST and not SC, then user U should not be given
+INSERT rights over ST, because such INSERTs will always fail (unless they are “no ops”—or
+unless as previously suggested the DBMS has some mechanism for automatically performing the
+necessary complementary INSERT into SC; I will not mention this latter possibility again).
+      Turning now to DELETE, the update
+         DELETE <S1,20> FROM ST , DELETE <S1,London> FROM SC
+
+succeeds regardless of whether ST and SC are real or virtual. By contrast, the update
+
+1
+  Except to observe that the idea of an attribute having just one default to be used in all contexts is certainly too rigid.
+For example, consider a view defined as the projection over all but STATUS of S WHERE STATUS = 20, for which a
+default STATUS value of 20 clearly makes sense, vs. a view defined as the projection over all but STATUS of S
+WHERE STATUS ≠ 20, for which a default STATUS value of 20 clearly does not. Consider also the fact that the
+projection over all but Z of EXTEND A ADD (z AS Z) is identically equal to A. Further investigation is obviously
+needed.
+2
+   Incidentally, note the implication that if user-visible relvars are always in 6NF, user-visible multiple assignments are
+likely to be quite common.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                             451
+Appendixes                                                                 Appendix E / View Updating
+
+
+      DELETE <S1,20> FROM ST
+
+fails—if ST and SC are views, it violates The Assignment Principle for SC; if they are real, it
+violates The Golden Rule, because it causes a tuple for S1 to appear in SC and not ST. Either way,
+therefore, if user U “sees” just ST and not SC, then user U should not be given DELETE rights over
+ST, because such DELETEs will always fail (unless they are “no ops”).
+      A remark on UPDATE: An UPDATE is basically just a DELETE followed by an INSERT,
+and for that reason I have had little to say about UPDATE as such in this appendix. However, there
+is one point worth making in connection with UPDATE specifically in the present context.
+Consider an attempt to replace the tuple <S1,20> in ST by the tuple <S1,25> (“update the status for
+supplier S1 from 20 to 25”). This UPDATE is shorthand for the multiple assignment:
+      DELETE <S1,20> FROM ST , INSERT <S1,25> INTO ST
+
+      This multiple assignment in turn is shorthand for the following:
+
+ 1.   Materialize ST and SC; call the results ST' and SC', respectively.
+
+ 2.   DELETE <S1,20> FROM ST', DELETE ø FROM SC',
+      INSERT <S1,25> INTO ST', INSERT ø INTO SC'.
+
+ 3.   S := ST' JOIN SC'.
+
+ 4.   Check The Assignment Principle.
+
+ 5.   Check The Golden Rule.
+
+ 6.   Discard ST' and SC'.
+
+       And this algorithm produces exactly the desired effect, regardless of whether ST and SC are
+real relvars or views. Approaches that rely on default values, by contrast, have to treat UPDATE as
+a special case in order that (e.g.) updating the status for supplier S1 does not have the side effect of
+setting the city for supplier S1 to some default value, instead of leaving it unchanged.
+
+Example 2
+
+Let SCP{S#,CITY,P#} be a real relvar. Define projection views S and P thus:
+      S ≡ SCP { S#, CITY }
+      P ≡ SCP { P#, CITY }
+
+       These views satisfy the constraint that every CITY value appearing in S also appears in P and
+vice versa. Analysis similar to that under Example 1 thus shows—in general, and without going
+into too much detail—that inserting into or deleting from just one of the two views will always fail
+(unless the INSERT or DELETE is a “no op”), while inserting into or deleting from both at the
+same time will sometimes succeed.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         452
+Appendixes                                                               Appendix E / View Updating
+
+
+Example 3
+
+Let SSP{S#,CITY,P#,QTY} be a real relvar. Define projection views S and SP thus:
+      S ≡ SSP { S#, CITY }
+      SP ≡ SSP { S#, P#, QTY }
+
+      These views satisfy the constraint that every S# value appearing in S also appears in SP and
+vice versa. Again, therefore, analysis similar to that under Example 1 thus shows—in general, and
+without going into too much detail—that:
+
+ ■    Inserting into or deleting from just S fails (unless the INSERT or DELETE is a “no op”).
+
+ ■    Inserting into just SP succeeds so long as the specified S# values already appear in SP (the
+      “INSERT” into S in the expansion is really an “INSERT-type assignment” in this case, since
+      it is “inserting” some tuples that already exist).
+
+ ■    Deleting from just SP succeeds so long as the specified S# values still appear in SP.
+
+ ■    Inserting into or deleting from both S and SP at the same time sometimes succeeds.
+
+Example 4
+
+So far all of the projections I have considered have been the result of some nonloss decomposition.
+What happens otherwise? For example, let V ≡ SP{S#,QTY}. Then INSERTs on V clearly fail, in
+general, because (appealing once again to the conceptual implementation algorithm) there is no way
+to compute SP from V; that is, inserting the tuple <s,q> into V is virtually certain to violate either
+The Assignment Principle or The Golden Rule. As for DELETEs, it might be argued that deleting
+a tuple of the form <s,q> from V could be supported by deleting all tuples of the form <s,p,q> from
+SP, but even there violations of The Assignment Principle would be likely in practice.
+      Note: Given that in principle V could be a real relvar (in which case it would presumably be
+updatable), it might be thought that the foregoing state of affairs constitutes a violation of The
+Principle of Interchangeability. It does not, however, because such a real relvar V and the view V
+discussed above are not interchangeable; in particular, they have different constraints. To be
+specific, the constraint for the real relvar is—let us agree for the sake of the example—just:
+      FORALL t  V ( TRUE )
+
+But the constraint for the view is
+      FORALL t  V ( EXISTS p ( ( SPX(u) ) & ( SPY ) )
+
+where u ≡ EXTEND t ADD (p AS QTY).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       453
+Appendixes                                                                              Appendix E / View Updating
+
+
+SOME REMARKS ON ORTHOGONALITY
+
+In earlier sections, I identified three possible problems with the view updating approach I espouse.
+To review briefly, the problems in question are as follows:
+
+    a.   INSERT can sometimes have the effect of inserting into two or more distinct real relvars.
+         Likewise, DELETE can sometimes have the effect of deleting from two or more distinct real
+         relvars.
+
+    b.   INSERT and DELETE are sometimes not inverses of each other.
+
+    c.   Updating A(AB) (for example) is sometimes not equivalent to updating just A.
+
+      In this section, I want to show how The Principle of Orthogonal Design (also known as the
+orthogonality principle, or just orthogonality for short) can help in avoiding such problems. This
+principle was first documented in a paper by McGoveran and myself titled “A New Database
+Design Principle” (the first of the papers listed under reference [87]). Like the principles of further
+normalization, it is concerned with reducing data redundancy in database designs. And the simplest
+version of the principle, which is all I want to consider here, is quite straightforward and can be
+stated informally as follows:1
+
+         Let A and B be distinct relvars. Then the constraints for A and B should not be such as to
+         require the same tuple to appear in both.
+
+       Now, certainly no tuple can be required to appear in both A and B if no tuple can satisfy both
+of the associated X constraints AX and BX; enforcing this latter condition thus has the effect of
+enforcing what might be regarded as a strong form of orthogonality. In what follows, I limit my
+attention to this strong form.
+       By way of illustration, consider once again the “nonnegative integer” relvars A and B from the
+earlier examples of updating intersections, unions, and differences, with constraints and initial
+values as follows:
+         A : AX ≡ n  7 : initial value a = 0 4 5 7
+             AY ≡ TRUE
+
+         B : BX ≡ n  2 : initial value b = 3 4 6 7 8
+             BY ≡ TRUE
+
+      Here it is clearly possible for the very same integer n to satisfy both AX and BX (take n = 4,
+for example). And we know from our earlier discussions that (a) some updates (e.g., INSERTs on
+AB) will affect both A and B—possibly causing the very same integer (or tuple, rather) to be
+inserted into both relvars—and (b) INSERTs and DELETEs will sometimes not be inverses of each
+other. So let us examine an example that is similar to the foregoing, except that it is impossible for
+
+1
+  It would be more accurate to refer to this “simplest version” as a logical consequence of the principle in its general
+form. Indeed, there is much more to be said about orthogonality in general, but this appendix is not the place; a detailed
+discussion can be found in the papers listed under reference [87].
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                          454
+Appendixes                                                               Appendix E / View Updating
+
+
+the same integer to satisfy both AX and BX. To be specific, let A and B be relvars with constraints
+and initial values as follows:
+      A : AX ≡ n  4 : initial value a = 0 3 4
+      AY ≡ TRUE
+
+      B : BX ≡ n  5 : initial value b = 5 6 8 9
+      BY ≡ TRUE
+
+      Observe that:
+      ab = ø                                 /* necessarily empty          */
+      ab = 0 3 4 5 6 8 9                     /* necessarily disjoint union */
+      a-b = 0 3 4                             /* necessarily equal to a     */
+
+      Then, ignoring “no ops” for simplicity, it is easy to see that:
+
+ ■    Intersection: INSERT n INTO AB always fails. DELETE n FROM AB always fails.
+      Thus, both INSERT n INTO AB followed by DELETE n FROM AB and DELETE n
+      FROM AB followed by INSERT n INTO AB always preserve the status quo, albeit
+      trivially.
+
+ ■    Union: INSERT n INTO AB never affects both A and B. DELETE n FROM AB never
+      affects both A and B. INSERT n INTO AB followed by DELETE n FROM AB always
+      preserves the status quo (recall that we must have n / ab for the INSERT to be valid).
+      DELETE n FROM AB followed by INSERT n INTO AB always preserves the status quo
+      (recall that we must have n  ab for the DELETE to be valid).
+
+ ■    Difference: Both INSERT n INTO A-B followed by DELETE n FROM A-B and DELETE n
+      FROM A-B followed by INSERT n INTO A-B always preserve the status quo (recall that we
+      must have n / a for the INSERT to be valid and n  a for the DELETE to be valid).
+
+I leave examples to illustrate the foregoing as an exercise, if you feel they are necessary.
+       Recall now Example 1 from the section “Nested Updates” earlier in this appendix. Just to
+remind you, we had R ≡ A(BC), and we considered the INSERT-type assignment R := Ri. The
+initial values were:
+      a = 0 4 5 7 10
+      b = 3 4 6 7 8 11
+      c = 0 1 2 7 8 9 12
+
+      i = 1 2 3 9
+
+      And the values after the update were:
+      A = 0 1 2 3 4 5 7 9 10
+      B = 1 2 3 4 6 7 8 9 11
+      C = 0 1 2 3 7 8 9 12
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      455
+Appendixes                                                               Appendix E / View Updating
+
+
+      And I pointed out that following this INSERT-type assignment with the DELETE-type
+assignment R := R-i would not restore the status quo. But the problem, again, is the fact that the
+very same integer (e.g., 7) can appear in any two or even all three of A, B, C (recall that the
+constraints AC, BC, CC are all just TRUE). So let us consider an example that is similar to the
+previous one but does not permit the same integer to appear in more than one of A, B, C:
+      AX ≡ 0  n  4 : initial value a = 0 3 4
+      AY ≡ TRUE
+
+      BX = 9  n         : initial value b = 10 11 12
+      BY ≡ TRUE
+
+      CX ≡ 5  n  8 : initial value c = 6 7 8
+      CY ≡ TRUE
+
+       Then the X constraint RX for R ≡ A(BC) is (AX)|((BX)&(CX)), which reduces to
+AX|FALSE, or in other words to just AX. Now take i to be the set of integers 1 2. Then it is easy to
+see that R := Ri gives A = 0 1 2 3 4 and leaves B and C unchanged. Moreover, deleting i from the
+result now clearly does restore the status quo.
+       Consider also the case of updating R ≡ A(AB) (Example 3 from the section “Nested
+Updates”). Recall that previously we had the result that inserting into R could affect the value of B,
+even though A(AB) is (or should be?) identically equal to A. However, if AX and BX are such
+that no value can satisfy them both, then the constraint RX ≡ (AX)|((AX)&(BX)), which again
+reduces to just AX. In the update R := Ri, then, no value in i can satisfy BX, the overall update
+reduces to just A := Ai, and B remains unchanged—and the principle that view updating is a matter
+of semantics, not syntax, is upheld.
+       One consequence of all of the above is the following. Let x be a relational expression. If x
+appears in a “read-only” position, then the implementation is free to transform it (typically for
+optimization purposes) into any logically equivalent expression. But if x appears in an “update”
+position, the implementation is not free to perform such a transformation unless it can be sure it is
+safe to do so. Adherence to the strong form of orthogonality discussed in this section is a sufficient
+condition for ensuring such safety.
+
+
+A REMARK ON MULTIPLE ASSIGNMENT
+
+Note: Thanks to Hugh Darwen for alerting me to the issue addressed in this section.
+      Consider the following example (a modified version of one from the previous section). Let
+the “nonnegative integer” relvars A and B have constraints and initial values as follows:
+
+      A : AX ≡ n < 5 : initial value a = 0 3
+          AY ≡ TRUE
+
+      B : BX ≡ n > 5 : initial value b = 6 8 9
+          BY ≡ TRUE
+
+      Now let R ≡ AB and consider the following multiple assignment
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          456
+Appendixes                                                                 Appendix E / View Updating
+
+
+      INSERT 5 INTO R , UPDATE R WHERE n = 5 ( n := 7 ) ;
+
+       It should be clear that if we expand the constituent assignments separately, the overall
+operation will fail; more precisely, the INSERT will fail, because the value 5 does not satisfy the
+constraint RX ≡ (n < 5)|(n > 5). Yet the overall operation would clearly succeed if R were real, not
+virtual. What is to be done about this situation? One possible solution would be to add another step
+to the multiple assignment algorithm—see RM Prescription 21—according to which distinct
+assignments to the same virtual relvar are “collected” before Step a. (the syntactic expansion step) is
+performed; in the example, this approach would cause the two assignments to be collapsed into one,
+and the final result would be A unchanged, B = 6 7 8 9, and R = 0 3 6 7 8 9. But note the
+implication that we still might not have the semantics of multiple assignment quite right ... More
+study is required.
+
+
+SUMMARY
+
+In the foregoing sections, I have identified or at least touched on a number of principles, or
+objectives, that I believe any systematic approach to the view updating problem needs to satisfy. I
+summarize those principles here for purposes of future reference. (The summary that follows is
+based on a similar but less extensive one given in reference [76], but differs from that earlier one in
+several details.)
+
+ 1.   Relations only: I am interested in a relational mechanism specifically; in particular, I have no
+      interest in trying to extend my view-updating scheme to support “relations” that contain either
+      nulls or duplicate tuples. In fact, I would resist any attempt to do so, if it meant
+      compromising on any of the other objectives.
+
+ 2.   The Assignment Principle: After assignment of x to relvar R, the comparison R = x must
+      evaluate to TRUE, otherwise the assignment fails.
+
+ 3.   The Golden Rule: After assignment of x to relvar R, R must satisfy its constraint RC,
+      otherwise the assignment fails. (If R is virtual, it is sufficient, in order to ensure that R
+      satisfies RC, to ensure that the relvars R1, R2, ..., Rn in terms of which R is defined satisfy
+      their constraints R1C, R2C, ..., RnC, respectively.)
+
+ 4.   INSERT- and DELETE-type assignments only: Any relational assignment can be expressed in
+      the form R := R-di; thus, all such assignments can be expressed as a suitable combination of
+      INSERT- and DELETE-type assignments. UPDATE in particular is shorthand for an
+      assignment of the form R := WITH R-d AS R: Ri.
+
+ 5.   Relvar constraints (this one is a conjecture on my part, but it is easy to see that the conjecture
+      is at least trivially true): Relvar constraints can always be expressed in the form (FORALL t 
+      R (RX)) & (RY), where RX is a quantifier-free predicate with at most one parameter—namely,
+      t—and RY is a proposition, in general not quantifier free.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                             457
+Appendixes                                                                 Appendix E / View Updating
+
+
+ 6.   Semantics not syntax: The semantics of view updating should not depend on the particular
+      syntactic form in which the view definition in question happens to be stated.
+
+ 7.   The Principle of Interchangeability: The rules must work for real relvars too.
+
+ 8.   Symmetry: Operands to symmetric operations should be treated symmetrically. (This
+      principle fundamentally applies to unions and joins; the other symmetric operators, intersect
+      and cartesian product, are just special cases of join.)
+
+ 9.   All updates supported: Every relvar should support all three of INSERT / DELETE /
+      UPDATE.
+
+10.   Inverse operations: INSERT and DELETE should be inverses of each other.
+
+11.   Recursion: The rules must be capable of recursive application (i.e., “nested updates” should
+      work satisfactorily).
+
+12.   Database design: The rules cannot assume the database is well designed (though they might
+      occasionally produce results that some might find counterintuitive if it is not).
+
+       I have presented an approach to view updating that, I believe, goes a long way toward
+meeting the foregoing objectives. The approach in question is based on ideas originally articulated
+in references [88] and [114], but I have found it necessary to dot a lot of i’s and cross a lot of t’s in
+order to get it into the shape described herein—which, let me be the first to say, doubtless still needs
+a considerable amount of polishing in order to make it anywhere close to watertight. As noted
+earlier, however, I feel cautiously optimistic about the approach, for the following reasons among
+others:
+
+ ■    No views are inherently nonupdatable (though certain specific updates will fail on violations
+      of either The Assignment Principle or The Golden Rule).
+
+ ■    Join views in particular are always updatable (again, modulo violations of The Assignment
+      Principle or The Golden Rule); it is not a matter of whether the join in question is one to one,
+      one to many, or many to many.
+
+ ■    The approach gives a predictable result in every case.
+
+ ■    Moreover, it gives the intuitively expected and useful result in most cases (possibly not all).
+
+ ■    If The Principle of Orthogonal Design is followed, the number of cases (it is tempting to call
+      them pathological) in which the result might be “unexpected” is further reduced.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          458
+Appendixes                                                                  Appendix E / View Updating
+
+
+DARWEN’s APPROACH
+
+This final section describes Darwen’s objections to Date’s approach and sketches one that he might
+support—one that is more conservative in some respects and more ambitious in others. For the
+remainder of this appendix, therefore, the first person singular refers to Darwen.
+
+                                       ———  ———
+
+My objection to Date’s approach is simply that the rules for inserting through union and deleting
+through join require the system sometimes to make an arbitrary interpretation of an ambiguous
+request. I maintain instead that ambiguous requests should be rejected.
+      As a basis for the discussions to follow, I now introduce some notation, of my own personal
+preference (the notation in question was mentioned in Chapter 2 but not much used elsewhere in
+this book). Let R be a relvar. Then I define the expression R(t) to be equivalent to the truth-valued
+expression t  R. The notation appeals to my perception of a relvar as representing a time-varying
+truth-valued function—the extension of the relvar predicate varies over time (though the intension
+of course does not). Thus, the expression R(t) can be thought of as denoting an invocation of that
+function.
+
+Objections to Date’s Proposals for Updating Unions and Joins
+
+In order to illustrate my objections here, I consider the simplest database imaginable that is
+sufficient for the purpose at hand: one consisting of just two relvars, both of degree zero. (I
+deliberately violate the strong form of The Principle of Orthogonal Design here. That strong form
+is a principle I certainly do not hold with at all, a point I will return to later.) To give my example a
+semblance of realism, imagine the enterprise to be a shop. At all times the shop is either open for
+business or closed. The shop is equipped with a burglar alarm. At all times the alarm is either set
+or not set. The purpose of the database is to record (a) whether or not the shop is open and (b)
+whether or not the alarm is set. Assume until further notice that the two variables are not subject to
+any constraint, even though it might seem a little peculiar to allow the alarm to be set while the shop
+is open. Here is the Tutorial D definition:
+      VAR THE_SHOP_IS_OPEN REAL RELATION { } KEY { } ;
+
+      VAR THE_ALARM_IS_SET REAL RELATION { } KEY { } ;
+      Either of the following statements will suffice to record the fact that the shop is open:
+      THE_SHOP_IS_OPEN := TABLE_DEE ;
+
+      INSERT THE_SHOP_IS_OPEN TABLE_DEE ;
+
+Likewise, either of the following will suffice to record the fact that the alarm is not set:
+      THE_ALARM_IS_SET := TABLE_DUM ;
+
+      DELETE THE_ALARM_IS_SET ;
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          459
+Appendixes                                                                 Appendix E / View Updating
+
+
+Just to remind you, TABLE_DEE is shorthand for RELATION{TUPLE{}}, the relation with no
+attributes and just one tuple (the 0-tuple), and TABLE_DUM is shorthand for RELATION{}{}, the
+relation with no attributes and no tuples at all.
+       Observe now that, using my R(t) notation, the expression
+      THE_SHOP_IS_OPEN ( TUPLE { } )
+
+is a formal assertion of the truth of the proposition “The shop is open.” I will abbreviate it from this
+point forward to just
+      THE_SHOP_IS_OPEN ( )
+
+And I will define the expression
+      THE_ALARM_IS_SET ( )
+
+(“The alarm is set”) analogously.
+       In accordance with certain ideas previously articulated in reference [85], I would also like to
+introduce some new notation for updating the database. In The Third Manifesto, we regard
+relational assignment as the fundamental update operator, and of course I have no problem with that
+position. For present purposes, however (and possibly others), I prefer to think of expressing belief
+in a single “atomic” proposition as being even more fundamental than relational assignment. To
+“insert a tuple” into a relvar is to express belief in the truth of the proposition represented by the
+appearance of that tuple in that relvar; to “delete a tuple” from a relvar is to express the
+corresponding disbelief (i.e., belief in the truth of the negation of that proposition). In keeping with
+that perception, I will use imperatives of the following deliberately verbose form
+      IT IS [ NOT ] THE CASE THAT R ( [ t ] ) ;
+
+where the 0-tuple is implicit if t is omitted. So IT IS THE CASE THAT R(t) is equivalent to R := R
+UNION RELATION{t} and also to INSERT R RELATION{t}; likewise, IT IS NOT THE CASE
+THAT R(t) is equivalent to R := R MINUS RELATION{t} and also to some DELETE statement.
+Thus, for example, to record the opening of the shop for business and the simultaneous turning off
+of the alarm, I can write
+      IT IS THE CASE THAT THE_SHOP_IS_OPEN ( ) ,
+      IT IS NOT THE CASE THAT THE_ALARM_IS_SET ( ) ;
+
+(a multiple assignment).
+
+      Now let me introduce a couple of views:
+      VAR THE_SHOP_IS_OPEN_OR_THE_ALARM_IS_SET VIRTUAL
+        ( THE_SHOP_IS_OPEN UNION THE_ALARM_IS_SET ) ;
+
+      VAR THE_SHOP_IS_OPEN_AND_THE_ALARM_IS_SET VIRTUAL
+        ( THE_SHOP_IS_OPEN JOIN THE_ALARM_IS_SET ) ;
+
+      Under Date’s proposals the following updates would both be legal:
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         460
+Appendixes                                                               Appendix E / View Updating
+
+
+      IT IS THE CASE THAT THE_SHOP_IS_OPEN_OR_THE_ALARM_IS_SET ( ) ;
+
+      IT IS NOT THE CASE THAT THE_SHOP_IS_OPEN_AND_THE_ALARM_IS_SET ( ) ;
+
+       Under the semantics of UNION and JOIN, those two update statements both mean exactly
+what they say, and therefore they are both ambiguous—indeterminate—as far as the required effect
+on the database is concerned. The first can be implemented by assigning TABLE_DEE to either
+THE_SHOP_IS_OPEN or THE_ALARM_IS_SET, or both. Date proposes that the DBMS be
+required to choose the third possibility, advancing an observation regarding symmetry as
+justification. Similarly, the second can be implemented by assigning TABLE_DUM to either
+THE_SHOP_IS_OPEN or THE_ALARM_IS_SET, or both, and again Date’s proposal requires the
+DBMS to choose the third possibility and again the observation regarding symmetry is advanced as
+justification. I remark that this justification could also be used to allow an expression of the form
+x+y (or a name standing for that expression, to make the analogy with views a little closer) to be the
+target of an assignment: If z is the value to be assigned, just assign z/2 to both x and y.
+       In my opinion, however, both updates should be rejected. The reader who thinks that position
+harsh should perhaps consider what advantages database users might gain from the proposals that I
+am rejecting. The ability to insert through union? Well, if I, the designer of
+THE_SHOP_IS_OPEN and THE_ALARM_IS_SET, really want my users to be able to insert into
+their union, I would resort to the following artifice in the view definition:
+      VAR THE_SHOP_IS_OPEN_OR_THE_ALARM_IS_SET VIRTUAL
+        ( WITH RELATION { TUPLE { STATUS 'open'    } } AS OPEN,
+               RELATION { TUPLE { STATUS 'alarmed' } } AS ALARMED :
+      ( THE_SHOP_IS_OPEN JOIN OPEN ) UNION ( THE_ALARM_IS_SET JOIN ALARMED ) ) ;
+
+      Here it is clear that the operands of the UNION are disjoint. Now, for example, the opening
+of the shop can be expressed as:
+      IT IS THE CASE THAT THE_SHOP_IS_OPEN_OR_THE_ALARM_IS_SET
+                            ( TUPLE { STATUS 'open' } ) ;
+
+      Similarly, the turning off of the alarm can be expressed as:
+      IT IS NOT THE CASE THAT THE_SHOP_IS_OPEN_OR_THE_ALARM_IS_SET
+                                ( TUPLE { STATUS 'alarmed' } ) ;
+
+       I assume here that the two joins and the union mentioned in the view definition would indeed
+be updatable, under both Date’s proposal and the proper subset of that proposal that I believe I
+would not object to. (I use JOIN rather than EXTEND in the view definition just to float the idea
+that a dyadic operator invocation might be updatable even if only one of its operands is a variable.)
+       Now let me get back to the original view definitions:
+      VAR THE_SHOP_IS_OPEN_OR_THE_ALARM_IS_SET VIRTUAL
+        ( THE_SHOP_IS_OPEN UNION THE_ALARM_IS_SET ) ;
+
+      VAR THE_SHOP_IS_OPEN_AND_THE_ALARM_IS_SET VIRTUAL
+        ( THE_SHOP_IS_OPEN JOIN THE_ALARM_IS_SET ) ;
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       461
+Appendixes                                                                  Appendix E / View Updating
+
+
+       I note in passing, incidentally, that if these two views are the only relvars ever used as targets
+of update operations, then under Date’s approach they will always be equal in value in spite of the
+stark logical difference (OR vs. AND) in the predicates they represent. Be that as it may, here again
+are the two updates previously discussed on the foregoing views:
+      IT IS THE CASE THAT THE_SHOP_IS_OPEN_OR_THE_ALARM_IS_SET ( ) ;
+
+      IT IS NOT THE CASE THAT THE_SHOP_IS_OPEN_AND_THE_ALARM_IS_SET ( ) ;
+
+      I have shown that these updates are indeterminate. However, I agree that if those
+indeterminacies can be resolved by the existence of an appropriate constraint, then the update in
+question might be permitted. For example, suppose the shop sensibly decides that it is not a good
+idea ever to set the alarm when it is open for business:
+      CONSTRAINT NOT_ALARMED_WHEN_OPEN
+         IS_EMPTY ( THE_SHOP_IS_OPEN JOIN THE_ALARM_IS_SET ) ;
+
+       But this particular constraint does not resolve the indeterminacies. For the first update, the
+DBMS knows that just one of the two underlying real relvars is to be assigned TABLE_DEE, but it
+does not know which. For the second, all three possibilities satisfy the constraint.
+       Date also advances, in connection with his position on insert through union, a certain “strong
+form” of The Principle of Orthogonal Design, observing that results such as the one I object to are
+avoided if that strong form of the principle is followed. (I remark that there does not seem to be a
+counterpart to this observation that could apply to delete through join, except in the special case
+where the join degenerates to intersection.) I do not hold with this strong form of the principle at
+all. I see no advantage, ever—and sometimes positive disadvantage—in choosing a design that
+adheres to it over one that does not, as I now explain.
+
+Objections to Invoking “the Strong Form of Orthogonality”
+
+Date gives the following informal definition of (a certain logical consequence of) The Principle of
+Orthogonal Design:
+
+      Let A and B be distinct relvars. Then the constraints for A and B should not be such as to
+      require the same tuple to appear in both.
+
+      I cannot dispute that any violation of this principle, as far as it goes, would lead to
+redundancy, but I remark that it does not go very far. There are many ways in which redundancy
+can occur without the same tuple appearing in two relvars. For example, let relvars A and B have
+the same heading except that one attribute of B has a different name (say Y instead of X) from its
+counterpart in A. Further, let there be a constraint in effect that requires A to be equal at all times to
+B RENAME (Y AS X). This case is perhaps the simplest of the many that are not covered by the
+principle as stated. (Date does not disagree with this observation; in fact, he and I have worked
+together on the more general definition of the principle, as given in the last of the papers listed
+under reference [87].)
+      But Date continues:
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                           462
+Appendixes                                                                 Appendix E / View Updating
+
+
+      Now, certainly no tuple can be required to appear in both A and B if no tuple can satisfy both
+      of the associated X constraints AX and BX; enforcing this latter condition thus has the effect of
+      enforcing what might be regarded as a strong form of orthogonality. In what follows, I limit
+      my attention to this strong form.
+
+And he goes on to show that adherence to this “strong form” will avoid the undesired effects that
+sometimes arise in his approach to the updating of unions and joins.
+      I perceive a tacit suggestion here that adherence to the strong form of orthogonality is a good
+database design principle to follow, especially if undesired effects of update operations are to be
+avoided. I disagree on two counts:
+
+ 1.   I disagree with the tacit suggestion, because (a) as I have already explained, even the weak
+      form given in Date’s informal definition only scratches the surface of redundancy, and (b) the
+      strong form does not appear to address any cases of redundancy that the weak form misses
+      and, worse, rules out many designs that do not entail redundancy at all.
+
+ 2.   I disagree with the idea that a database should be designed “correctly” or “appropriately” in
+      order to ensure that operators never have undesired effects—in particular, effects that
+      represent unsafe conclusions from the premises that are represented by invocations of update
+      operators (under our agreed interpretation).
+
+As applied to 2-tuples, for example, the strong form of orthogonality seems to be saying that the
+database should not permit the same two things to be related to each other in two or more different
+ways—or, at least, should not permit such facts to be represented in the most obvious way (by
+allowing the same 2-tuple to appear in several relvars). This state of affairs strikes me as being a
+violation of orthogonality! (in a possibly different sense of that term). Moreover, my
+characterization is not entirely accurate either (hence “seems”), because for two 2-tuples to be
+identical their headings need to consist of the same set of attributes (and hence involve the same set
+of attribute names in particular). Therefore, if I want to be able to record, for example, that a pair of
+cousins happen also to be a married couple, I can do so without violating the strong form of the
+principle by choosing different attribute names for the two relvars: MARRIED{A,B} and
+COUSINS{A,C}, for example. But to place a restriction on my freedom of choice of attribute
+names strikes me also as a violation of orthogonality.
+       As applied to 1-tuples, the strong form of orthogonality is effectively saying that the database
+should not permit the same thing to have more than one “property” (a term used by some logicians
+to characterize monadic predicates). Consider, for example, the predicates “Employee E is on
+vacation” and “Employee E is awaiting phone number allocation.” What more natural way is there
+of representing those than defining two unary relvars with those very predicates? What problems
+are solved by adopting a different approach? (I see none of any significance.) What problems arise
+in that different approach? (For the different approaches I find myself able to imagine, apart from
+the simple one of choosing different attribute names for those two E’s, I see significant problems
+arising.)
+       I turn now to Date’s claim that orthogonal design “is concerned with reducing data
+redundancy.” I have already mentioned that his informal definition does not really go very far
+toward addressing the redundancy question. This issue is dealt with in the papers (excluding the
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          463
+Appendixes                                                              Appendix E / View Updating
+
+
+first such) listed under reference [87]. However, those papers also question whether redundancy
+really can or must always be avoided; they even show that there might be cases where redundancy
+is positively desirable (though in such cases it should at least be properly controlled).
+       So we have:
+
+ 1.   A desire, arising frequently but possibly not always, to avoid redundancy in database designs
+
+ 2.   A design principle, The Principle of Orthogonal Design, adherence to which goes some way
+      toward avoiding redundancy
+
+ 3.   One stated consequence of that principle, covering just the special case where redundancy
+      involves having more than one appearance of the very same tuple
+
+ 4.   A “strong form” of that consequence whereby the cases covered by it can be addressed
+      without knowledge of the declared constraints, by avoiding altogether the possibility of
+      having more than one appearance of the very same tuple, regardless of whether such
+      appearances would represent redundancy
+
+ 5.   An observation that adherence to that strong form eliminates the undesired effects that can
+      otherwise result from certain update operations
+
+I accept Points 1 and 2. I see no real value in mentioning Point 3 in connection with the issue of
+redundancy. It follows that I see no real value in Point 4, in spite of the slight relief from burden
+offered to the database designer who would like to be sure of adhering to Point 3 regardless of what
+constraints are declared. Besides, to compensate for the burden it avoids, it introduces a new
+burden to which I strongly object. It further follows, from my rejection of Point 4 and from the fact
+noted in point 1 that we do not always want to avoid redundancy, that Point 5 does nothing to
+address my objections to Date’s proposals for updating views.
+       That concludes my objections to Date’s proposals. The question now arises, to what extent do
+I think views might be updatable? And what general principles underlie my position? I address the
+second question first.
+
+Principles
+
+I accept The Golden Rule without question.
+       I accept The Assignment Principle without question but not without comment. Of course, any
+update operator invocation is equivalent to some assignment (possibly multiple). What assignment
+it is equivalent to depends on the definition of the operator being invoked. For example, we have
+given what we think are reasonable, useful, and intuitive definitions for the familiar INSERT,
+DELETE, and UPDATE operators in terms of relational assignment. It follows that every INSERT,
+DELETE, or UPDATE invocation should have the same effect on its target relvar as the assignment
+to which it is equivalent; for if not, The Assignment Principle is violated. My comment is that it
+might be possible to subvert the intent of The Assignment Principle by defining perverse update
+operators (a possibility I actually consider in my notes on UPDATE through extension and
+UPDATE through JOIN).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         464
+Appendixes                                                                 Appendix E / View Updating
+
+
+      As already noted, I reject the strong form of The Principle of Orthogonal Design.
+      I propose the following two additional principles:
+
+ ■    The Principle of No Ambiguity: If relation r is to be assigned to view R, then there must exist
+      exactly one corresponding set of assignments to the real relvars on which R is defined such
+      that The Golden Rule and The Assignment Principle are adhered to; otherwise, the
+      assignment is rejected.
+
+ ■    The Principle of View and Pseudovariable Equivalence: Every permitted assignment to view
+      R is also permitted, with exactly the same effect, to the expression x on which R is defined.
+      (That expression x, when appearing as a target, is therefore acting as a pseudovariable.)
+
+      Note: I state the second of these principles only because Date does not do so explicitly
+himself. We are not in disagreement here. Indeed, we mentioned the possibility of using relational
+expressions as pseudovariables in Chapter 5, and Date referred to it also in the section of this
+appendix titled “Nested Updates.”
+      In the remaining subsections, I provide some notes on each operator of the relational algebra
+through which I see some reasonable opportunity for updatability. I have put these notes together
+with more haste than usual, as a result of the lateness of our decision to include this appendix. The
+serious student should scrutinize them carefully and perhaps with a certain amount of suspicion.
+
+Rename
+
+If view V is defined on some invocation of RENAME on relvar R1, then all update operations on V
+are permitted and are effected by transforming them into operations on R1 merely by replacing
+references to attributes of V by references to the corresponding attributes of R1.
+
+Projection
+
+If view V is defined on some projection of relvar R1, then deletions from V are permitted but
+insertions, in general, are not.
+       The relvar predicate, P say, for V is
+      EXISTS x ( R1 ( x  y ) )
+
+where x is a tuple whose heading consists of the attributes of R1 that are excluded by the projection
+and y is a tuple consisting of the remaining attributes of R1.
+       To delete tuple y from V is to deny that there exists such an x (i.e., to assert that NOT P). The
+only way of achieving that effect is to delete all tuples of the form xy from R1.
+       To insert tuple y into V is to assert that there does exist such an x. In general, there are many
+equally reasonable ways of achieving that effect and to choose one of those ways would be
+arbitrary. Now, some writers have proposed to treat as special the case where all of the attributes of
+the heading of x have default values defined for them. My objection to that proposal is that we
+cannot safely conclude, given that there exists at least one x that makes R1(xy) evaluate to TRUE,
+that there exists exactly one such x; hence, to insert exactly one tuple into R1 would be arbitrary.
+However, it has been proposed (and this proposal has been implemented in more than one product)
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         465
+Appendixes                                                                  Appendix E / View Updating
+
+
+to make a special case of projections whose attributes include a key of R1, simply because of the
+existence of an explicit constraint to the effect that there cannot now exist more than one such x, so
+to insert a single tuple is not arbitrary after all.
+      A further thought: It might be possible to allow V to appear as the target of an UPDATE
+without the foregoing INSERT limitation (to the effect that the attributes of V must include a key of
+R1). For example, if V is defined as EMP {SALARY}, we could give everybody a 10% salary
+increase as follows:
+       UPDATE V ( SALARY := SALARY * 1.1 )
+
+     Is it really so important for UPDATE to be shorthand for DELETE followed by INSERT? I
+suppose we can keep it that way with a bit of sleight of hand, by defining it as DELETE-but-
+remember-the-deleted-tuples, then apply the updates to the remembered tuples, then INSERT. For
+UPDATE through projection we would have to propagate those three steps to the underlying relvar.
+
+Restriction
+
+If V is defined on some conjunction R1 AND p and p is quantifier free, then V is either a restriction
+or an extension of R1. If it is a restriction, then all update operations are permitted on V and are
+effected by transforming them into operations on R1. An attempt to insert tuple t is rejected if p(t)
+is false (because “p(t) false” contradicts V(t)). To delete t from V is to deny R1(t), because the truth
+of p(t) is not subject to change, so the deletion can safely be effected by deleting t from R1.
+
+Extension
+
+Following on from the previous subsection, if V is an extension of R1, then all deletions are
+permitted, and are effected by transforming them into deletions from R1 in an obvious manner (the
+details are tedious but straightforward). The justification for permitting deletions is analogous to
+the justification already given in connection with restrictions. Insertions are permitted with a
+proviso analogous to that already given in connection with restrictions.
+       UPDATE through extension is a case where The Assignment Principle might be seen as an
+annoyance. Intuitively it seems not unreasonable (and possibly desirable) to permit UPDATE
+invocations that affect only those attributes of V that are inherited from R1, with the additional
+attributes of V being recomputed. This treatment might be acceptable if some agreeable extension
+to the definition of UPDATE can be formulated such that The Assignment Principle is not violated
+under it.
+
+Join
+
+If V is defined on some conjunction R1 AND R2, then V is the join of R1 and R2 (with R1
+INTERSECT R2 and, if the heading of R2 is a subset of that of R1, R1 MATCHING R2 as
+degenerate but not special cases). Insertions into V are permitted; for IT IS THE CASE THAT V(t)
+is equivalent to R1(u) AND R2(v), where u is the projection of t over the attributes of R1 and v is
+the projection of t over the attributes of R2. (I assume that inserting a tuple that already exists in the
+target relvar is a “no op.”) However, deletions from V are not permitted, in general, for IT IS NOT
+THE CASE THAT V(t) can be effected by any of the following logically distinct invocations:
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                           466
+Appendixes                                                               Appendix E / View Updating
+
+
+ 1.   IT IS NOT THE CASE THAT R1(u) ;
+
+ 2.   IT IS NOT THE CASE THAT R2(v) ;
+
+ 3.   IT IS NOT THE CASE THAT R1(u) , IT IS NOT THE CASE THAT R2(v) ;
+
+(No. 3 is a multiple assignment.) Because R1 and R2 are both subject to change, it is not possible to
+identify exactly one of these invocations to effect deletion of t from V.
+       Note: I would relax the foregoing general prohibition in cases where exactly one of the
+choices satisfies both The Golden Rule and The Assignment Principle. I would also consider
+relaxing the prohibition in the specific case where the common attributes of R1 and R2 include a
+key of R2. Some people advocate supporting deletion (and therefore UPDATE) in such cases by
+propagating the operation to R1 only. The justification for this position is that each tuple being
+deleted from V has exactly one matching tuple in R1, as a consequence of which The Assignment
+Principle is guaranteed to hold. In the case where the matching tuple in R2 is matched by no other
+tuples in R1, The Assignment Principle also holds if that matching tuple is deleted from R2, but it
+seems reasonable to resolve the ambiguity by applying the same treatment as in the more general
+case. Unfortunately, this relaxation for many-to-one joins would appear to have to permit deletion
+from both operands in the one-to-one case where the common attributes include a key of R1 as well
+as a key of R2. If you think this treatment of DELETE seems a bit suspect (as it does to me, at
+least), I remark that it does seem utterly reasonable to permit UPDATE in these cases, noting that if
+common attributes are affected then we would have a possible violation of The Assignment
+Principle on our hands (and again I very tentatively wonder about the possibility of extending the
+definition of UPDATE to avoid such violation).
+
+Union
+
+If V is defined on some disjunction R1 OR p, then we are talking about R1 UNION R2 (because
+other kinds of disjunction where R1 is one of the disjuncts are not permitted). The situation is the
+inverse of what applies in the conjunction cases. Inserting into V is prohibited, because IT IS THE
+CASE THAT V(t) can be effected by any of the following logically distinct invocations:
+
+ 1.   IT IS THE CASE THAT R1(u) ;
+
+ 2.   IT IS THE CASE THAT R2(v) ;
+
+ 3.   IT IS THE CASE THAT R1(u) , IT IS THE CASE THAT R2(v) ;
+
+(where, as it happens, u = v = t). There is no justification for choosing exactly one of these three
+possibilities over the other two. However, all deletions are permitted. Deleting t from V is effected
+by deleting u from R1 and v from R2 (i.e., deleting t from both R1 and R2).
+      The prohibition on insertion might be relaxed when there is a constraint to the effect that R1
+and R2 be at all times disjoint, provided that the constraint in question can be used to determine to
+which unique operand a given tuple, proffered for insertion, must belong. For example, the
+constraint NOT_ALARMED_WHEN_OPEN given in the subsection “Objection to The Principle of
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      467
+Appendixes                                                               Appendix E / View Updating
+
+
+Orthogonal Design” cannot be used for the purpose at hand. However, a constraint such as the
+following (expressed for convenience in logic notation)
+      FORALL t ( R1(t)  t.A > 5 & R2(t)  t.A  5 )
+
+could perhaps be used. For any given tuple t the system needs only to evaluate the expression
+t.A > 5 to determine whether t is to be inserted into R1 or R2 (not both). A common shorthand for
+constraints such as these allows one to write something like CHECK A > 5 inside the relvar
+definition; use of such syntax might make it comparatively easy for the system to determine at
+compile time whether the constraint can be used to disambiguate inserts into unions.
+
+Semidifference
+
+If V is defined on R1 AND NOT (p), then either p is not subject to change, in which case the rules
+for restriction apply, or we are talking about R1 NOT MATCHING R2 (with R1 MINUS R2 as a
+degenerate but I hope not special case).
+       Insertion into V might be permitted. IT IS THE CASE THAT V(t) is equivalent to
+      IT IS THAT CASE THAT R1(u) , IT IS NOT THE CASE THAT EXISTS w (R2(v  w)) ;
+
+(where u = t, v is the projection of t over the common attributes, and w is a tuple whose heading
+consists of the remaining attributes of R2). One approach would be to adopt the same rules as for
+restriction (i.e., treating R2 as immutable via inserts into V). Another approach would be to effect
+the insertion of t into V by inserting u into R1 and deleting v from the projection of R2 over the
+common attributes.
+       Deletion might also be permitted, for the only reasonable way in general of effecting the
+deletion of t from V is to delete it from R1 and do nothing to R2. However, I remark that in the
+special case of R1 MINUS R2, inserting t into R2 appears to have just as much merit as deleting it
+from R1—and I have already said I do not want to treat R1 MINUS R2 as a special case.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       468

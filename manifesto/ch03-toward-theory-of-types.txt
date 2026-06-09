@@ -1,0 +1,1339 @@
+                                                    Chapter 3
+
+                             Toward a Theory of Types
+
+This chapter resembles the previous one in that a detailed tutorial on the material to be discussed
+can be found in reference [76]; if you are familiar with that reference, therefore, you might not need
+to study this chapter in depth. Unfortunately, however, the material in question is, arguably,
+supported even less widely and less well by current products than the relational model is. As a
+result, most readers will probably need to read the chapter fairly carefully.
+       Our subject is data types (types for short). As we saw in Chapter 1, types are fundamental; in
+particular, every value is of some type, so is every attribute of every tuple and every relation, and so
+is every variable. So what is a type? Essentially, it is a named, finite set of values.1 Examples
+include:
+
+    ■   Type INTEGER (the set of all integers)
+
+    ■   Type CHAR (the set of all character strings)
+
+    ■   Type S# (the set of all supplier numbers)
+
+And when we say that (e.g.) some relation has an attribute STATUS of type INTEGER, what we
+mean is that values of that attribute are integers, and nothing but integers. Points arising:
+
+    ■   First, types are also called domains, especially in relational contexts; and in object contexts
+        they are sometimes called object classes, or just classes for short. We remark as an aside that
+        SQL also uses the term domain, but not in the relational sense. A domain in SQL might be
+        regarded, loosely, as a kind of syntactic template that can be used as a basis for defining
+        attributes (or columns, rather).
+
+    ■   Second, a caveat: We are trying to be reasonably precise in this book. Therefore, instead of
+        saying that, e.g., type INTEGER is the set of all integers, we ought really to say that it is the
+        set of all integers that are capable of representation in the computer system under
+        consideration; there will always be some integers that are beyond the representational
+        capability of any given computer system (which is why we say in our model that types are
+        always finite). Analogous remarks apply to many subsequent statements and examples, as
+        you might expect; we will not bother to spell the point out explicitly every time, however,
+        letting this one caveat do duty for all.
+
+    ■   Third, we remind you that types are not limited to simple things like integers. Indeed, we saw
+        in Chapter 1 that values and variables can be arbitrarily complex—and that is so precisely
+
+
+1
+  Possibly an empty set of values (in which case we have an empty type). This possibility will be touched on from time
+to time in the next few chapters but will not become really important until we get to Part IV.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                   page 56
+Part I / Preliminaries                                                       Chapter 3 / Toward a Theory of Types
+
+
+        because the types of those values and variables can be arbitrarily complex. Thus, to
+        paraphrase a remark from that chapter, a type might consist of geometric points, or polygons,
+        or X rays, or XML documents, or fingerprints, or arrays, or stacks, or lists, or relations (and
+        on and on). Note the case of XML documents in particular! As mentioned in Chapter 1, a
+        battle raged in the 1990s over the claim that object technology would replace relational
+        technology. That battle is won, but we now find ourselves with another on our hands—there
+        are now those who claim that XML technology will replace relational technology. We reject
+        this claim; instead, we regard “XML documents” as just another data type that can be handled
+        perfectly well in a proper relational framework. Indeed, you might have noticed in the BIRD
+        example (Fig. 1.1) in Chapter 1 that we showed attribute DESCR as being of just such a type.
+
+    ■   Fourth, we have said a type is a set of values (more precisely, a named set of values), but it
+        would be more correct to say it is the set of all values that satisfy a certain type constraint.
+        In Tutorial D, such constraints can be defined as suggested by the following example
+        (repeated from Chapter 2):
+        TYPE S# POSSREP { C CHAR CONSTRAINT SUBSTR ( C, 1, 1 ) = 'S'
+                                            AND CHAR_LENGTH ( C )  2
+                                            AND CHAR_LENGTH ( C )  5 } ;
+
+        This statement constrains type S# (supplier numbers) to consist of all values that can possibly
+        be represented by a character string C of from two to five characters, of which the first must
+        be an “S” (for further discussion of POSSREP definitions, see the section “Possible
+        Representations” later in this chapter). Note: The CONSTRAINT portion of the POSSREP
+        definition is optional; omitting it is equivalent to specifying CONSTRAINT TRUE.
+
+    ■   Fifth, the fact that types are named is important. Types with different names are different
+        types (even if they have essentially the same POSSREP definition).
+      As noted in Chapter 2, any given type is either system defined (i.e., built in) or user defined,
+and we will assume as we did in that chapter that, of the three types mentioned earlier, INTEGER
+and CHAR are system defined and S# is user defined. (We remark in passing that the terminology
+of system- vs. user-defined types is sanctioned by usage but is not very good. After all, to a user
+who merely makes use of some user-defined type—as opposed to the user who is actually
+responsible for defining that type—the type in question behaves in all major respects just like a
+system-defined one; indeed, that is really the whole point. In other words, the distinction being
+sought is not so much one of users vs. the system but, rather, one of users playing different roles in
+different contexts.)
+      Any given type has an associated set of operators that can be applied to values and variables
+of the type in question; i.e., values and variables of a given type can be operated upon solely by
+means of the operators defined for that type.1 For example, in the case of the system-defined type
+INTEGER:
+
+
+
+1
+  Actually this observation is tautologous. See the discussion of strong typing in the section “Operators,” later in this
+chapter.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                        page 57
+Part I / Preliminaries                                             Chapter 3 / Toward a Theory of Types
+
+
+    ■    The system provides an assignment operator “:=” for assigning integer values to integer
+         variables.
+
+    ■    It also provides operators “=”, “<”, and so on, for comparing integers.
+
+    ■    It also provides operators “+”, “*”, and so on, for performing arithmetic on integers.
+
+    ■    It does not provide operators “||” (concatenate), SUBSTR (substring), and so on, for
+         performing string operations on integers; in other words, string operations on integers are not
+         supported.
+
+By contrast, in the case of the user-defined type S#, we would certainly define assignment and
+comparison operators (“:=”, “=”, “≠”, and so on); however, we would probably not define operators
+“+”, “*”, and so on, which would mean that arithmetic on supplier numbers would not be supported
+(why would we ever want to add or multiply two supplier numbers?).
+       We now proceed to explore the foregoing ideas, and some of their many implications, in
+detail.
+
+
+VALUES ARE TYPED
+
+Every value has, or is of, some type. In other words, if v is a value, then v can be thought of as
+carrying around with it a kind of flag that announces “I am an integer” or “I am a supplier number”
+or “I am a geometric point” (and so on). Note that, by definition, any given value always has
+exactly one type,1 which never changes. It follows that distinct types are disjoint, meaning they
+have no values in common. It also follows that everything that denotes or returns a value can be
+thought of as having a type as well. To be specific:
+    ■    Every variable is explicitly declared to be of some type, meaning that every possible value of
+         the variable in question is a value of the type in question (the declared type of that variable).
+         For example:
+         VAR N INTEGER ;
+
+    ■    Every attribute is explicitly or implicitly declared to be of some type, meaning that every
+         possible value of the attribute in question is a value of the type in question (the declared type
+         of that attribute). Here are some examples:
+         VAR S REAL RELATION { ... STATUS INTEGER, ... } ... ;
+
+         VAR SC VIRTUAL ( S { S#, CITY } ) ;
+
+         EXTEND S ADD ( CHAR_LENGTH ( CITY ) AS CN_LENGTH )
+
+         In the first example, attribute STATUS is explicitly declared to be of type INTEGER; in the
+
+
+1
+    Except possibly if type inheritance is supported.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         page 58
+Part I / Preliminaries                                          Chapter 3 / Toward a Theory of Types
+
+
+      second example, attributes S# and CITY are implicitly declared to be of types S# and CHAR,
+      respectively (see the discussion of relation type inference at the very end of the section
+      “Selectors and THE_ Operators,” later in this chapter); in the third example, attribute
+      CN_LENGTH is implicitly declared to be of type INTEGER (since INTEGER is the declared
+      type of the CHAR_LENGTH operator—see the bullet item immediately following).
+
+ ■    Every operator that returns a result is explicitly declared to be of some type, meaning that
+      every possible result that can be returned by an invocation of the operator in question is a
+      value of the type in question (the declared type of that operator). For example:
+      OPERATOR ABS ( I INTEGER ) RETURNS INTEGER ;
+         RETURN ( IF I  0 THEN +I ELSE -I END IF ) ;
+      END OPERATOR ;
+
+      The specification RETURNS INTEGER means that operator ABS (“absolute value”) is of
+      declared type INTEGER—it returns an integer when it is invoked. Note: The RETURN
+      statement in this example constitutes the implementation code for operator ABS. Some
+      languages, especially ones that support type inheritance, allow that code to be omitted from
+      the operator definition and provided “later” (i.e., separately), thereby allowing several distinct
+      implementations to be provided for the same operator. See Part IV for further discussion.
+
+ ■    Every parameter of every operator is explicitly declared to be of some type, meaning that
+      every possible argument that can be substituted for the parameter in question is a value of the
+      type in question (the declared type of that parameter). Operator ABS, for example, has just
+      one parameter, I, of declared type INTEGER, and so the following expressions are valid
+      invocations of that operator:
+      ABS ( N )
+
+      ABS ( ( 3 + N1 ) * N2 )
+
+      (In the first example here, we are assuming that N is a variable of type INTEGER; in the
+      second, we are assuming that N1 and N2 are also variables of type INTEGER.)
+           Note: Actually, the foregoing paragraph is not quite precise enough. Operators in
+      general fall into two disjoint categories, read-only vs. update operators. When a read-only
+      operator—ABS is an example—is invoked, it returns a result and does not update anything,
+      except possibly for local variables. By contrast, when an update operator is invoked, it does
+      update at least one nonlocal variable and it does not return a result; also, of course, anything
+      that is to be updated must be a variable, not a value (and if that variable is specified as an
+      argument, then it must be of the same type as the corresponding parameter). Here by way of
+      example is an update version of ABS:
+      OPERATOR ABS ( I INTEGER ) UPDATES { I } ;
+         I := ( IF I  0 THEN +I ELSE -I END IF ) ;
+      END OPERATOR ;
+
+      As you can see, this definition includes an UPDATES specification instead of a RETURNS
+      specification; that UPDATES specification indicates that parameter I is subject to update,
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      page 59
+Part I / Preliminaries                                           Chapter 3 / Toward a Theory of Types
+
+
+      meaning among other things that arguments corresponding to that parameter must be
+      variables specifically. Note that the operator itself is now not typed, since it returns no value,
+      and an ABS invocation is thus no longer a valid expression. See the section “Operators” for
+      further discussion.
+
+ ■    More generally, every expression is at least implicitly declared to be of some type (the
+      declared type of that expression): namely, the type declared for the outermost operator
+      involved, where by outermost operator we mean the operator executed last in evaluation of
+      the expression in question. For example, the declared type of the expression
+      N1 * ( 3 + N2 )
+
+      is the declared type of the operator “*” (multiply).
+
+       Note: The reason we keep using the phrase declared type when the term type, unqualified,
+might seem sufficient is that in Part IV of this book we will meet another type, called the most
+specific type. Of course, we can and do adopt the convention prior to Part IV that the unqualified
+term type means the declared type specifically, barring explicit statements to the contrary; but we
+still often use the explicit qualifier declared, for emphasis.
+
+Polymorphic Operators
+
+The foregoing remarks on operator and parameter types need some refinement if the operator in
+question is polymorphic. A polymorphic operator is one for which the arguments can be of
+different types on different invocations. For example, we might be able to use “||” (concatenate) on
+both character strings and bit strings, in which case “||” would be polymorphic. Two obvious and
+important examples of polymorphic operators are:
+
+ ■    Equality comparison (“=”): Clearly, we can test any two values v1 and v2 for equality, just
+      so long as v1 and v2 are of the same type. Thus, “=” is polymorphic—it applies to integers,
+      and to character strings, and to supplier numbers, and in fact to values of every possible type.
+
+ ■    Assignment (“:=”): We can also assign any value v to any variable V, just so long as v and V
+      are of the same type. Thus, “:=” is polymorphic also, and it applies to values and variables of
+      every type.
+
+      While we are on the subject, there are several more important points to be made in connection
+with these two operators:
+
+ 1.   To repeat, the Manifesto requires both of them to apply to every type (though SQL does not).
+      What is more, it requires them to have the obvious semantics, too (see points 2 and 6 below),
+      though again SQL does not.
+
+ 2.   The “=” operator might alternatively be called identity, since the comparison v1 = v2
+      evaluates to TRUE if and only if v1 and v2 are in fact the very same value.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      page 60
+Part I / Preliminaries                                                        Chapter 3 / Toward a Theory of Types
+
+
+    3.   Equality comparison is of declared type BOOLEAN (it returns a truth value). Assignment,
+         being an update operator, has no type.
+
+    4.   For the benefit of readers who might be familiar with object systems, we stress the point that
+         assigning value v to variable V really does have the effect in our model of placing (an
+         appearance of) that value v in that variable V. In other words, we do not embrace the
+         semantics found in some object languages according to which (a) declaring a variable to be of
+         type T really means the variable contains the address of some object of type T, and (b)
+         “assigning v to V” really means assigning the address of v to V. (In fact, the phrase “the
+         address of v” is a contradiction in terms; v, being a value, has no location in time and space
+         and thus has no address.)
+
+    5.   Logically speaking, assignment is the only update operator we need—all others are just
+         shorthand for certain assignments (we made this point explicitly in the case of relational
+         assignment in the previous chapter, but in fact it is true for assignment in general). We have
+         argued elsewhere, however (see reference [84]), that the assignment operator we need must be
+         what we call a multiple assignment, not the more conventional “single” form. See RM
+         Prescription 21 for further explanation.
+
+    6.   The assignment operator is required to satisfy The Assignment Principle, which can be stated
+         thus: Following assignment of v to V, the comparison v = V evaluates to TRUE.1
+
+
+TYPES VS. REPRESENTATIONS
+
+As we saw in Chapter 1, there is a logical difference between (a) a value as such, on the one hand,
+and (b) the physical encoding or representation of such a value inside the system, on the other. In
+fact, of course, this logical difference is really a consequence of a more fundamental one: namely,
+the difference between a type and its physical representation. Types are a model issue, physical
+representations are an implementation issue. For example, supplier numbers might be physically
+represented as character strings, but it does not follow that we can perform string operations on
+supplier numbers; rather, we can perform such operations only if corresponding operators have been
+defined for the type. And the operators we define for a given type will depend on the intended
+meaning of the type in question, not on the way values of that type happen to be physically
+represented—indeed, those physical representations should be hidden from the user. In other
+words, the distinction we draw between type and physical representation is one important aspect of
+data independence [76].
+       We note in passing that data types, especially user-defined ones, are sometimes called
+abstract data types (ADTs) in the literature, to stress the foregoing point (the point, that is, that
+types must be distinguished from their physical representation). We do not use this term ourselves,
+however, because it suggests there might be some types that are not abstract in this sense, and we
+
+
+1
+  Note that this principle applies to relational assignment in particular, though we did not call that fact out explicitly in
+the previous chapter. Note too that triggered procedures (especially “INSTEAD OF triggers,” which are supported by
+some SQL products, though not at the time of writing by the SQL standard) have the potential to violate the principle.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                          page 61
+Part I / Preliminaries                                          Chapter 3 / Toward a Theory of Types
+
+
+believe a distinction should always be drawn between a type and its physical representation. Also,
+the term abstract type is sometimes used (though not by us) to mean something quite different:
+namely, a type such that every value of the type in question must also be a value of some proper
+subtype of that type (and a type that is not abstract in this sense is then called a concrete type).
+Such matters are discussed and explained further in Part IV of this book.
+
+
+SCALAR VS. NONSCALAR TYPES
+
+The scalar notion is well established in the languages world. Loosely, we say a type is scalar if it
+has no user-visible components, and nonscalar if it is not scalar. We also say that values, variables,
+attributes, operators, parameters, and expressions of some type T are scalar or nonscalar according
+as that type T itself is scalar or nonscalar. For example:
+
+ ■    Type INTEGER is a scalar type; hence, values and variables (and so on) of type INTEGER
+      are also all scalar, meaning they have no user-visible components. Similar remarks apply to
+      (e.g.) the user-defined type S#.
+
+ ■    Tuple and relation types are nonscalar—the pertinent user-visible components being, of
+      course, the corresponding attributes—and hence tuple and relation values and variables (and
+      so on) are also all nonscalar.
+
+       That said, we now have to say too that these notions are quite informal. The truth is, it seems
+to be very difficult to come up with a definition of the term scalar that is both precise and useful;
+indeed, reference [74] shows that the concept of atomicity—which is just the concept of
+“scalarness” by another name—has no absolute meaning. For example, consider the string 'New
+York' (a value of type CHAR). If this string is considered to be a single value, then it seems
+reasonable to think of it as scalar; but if it is considered to be composite (consisting as it does of a
+sequence of either words or letters), then it seems reasonable to think of it as nonscalar.
+       For such reasons, we nowhere rely formally in this book on the notion of scalarness.
+However, we do make heavy use of the notion informally. To be more specific (and barring explicit
+statements to the contrary), we use the term scalar type to mean a type that is neither a tuple type
+nor a relation type, and we use the term nonscalar type to mean a type that is either a tuple type or a
+relation type. We also use the terms scalar value, nonscalar value, scalar operator, nonscalar
+operator, etc., analogously. (By operator here, we mean a read-only operator, of course, since
+update operators have no type. We might try saying an update operator is scalar if it updates a
+scalar argument—but then we would presumably also have to say an operator that updates both a
+scalar and a nonscalar argument is both scalar and nonscalar simultaneously.)
+
+
+POSSIBLE REPRESENTATIONS
+
+For simplicity, we now assume until further notice that all types are both scalar and user defined,
+barring explicit statements to the contrary. Let T be such a type. As we have seen, then, the
+physical representation of values of type T is hidden from the user; in fact, such representations can
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                     page 62
+Part I / Preliminaries                                                      Chapter 3 / Toward a Theory of Types
+
+
+be arbitrarily complex—in particular, they can have components—but, to repeat, those components
+will be hidden from the user. However, we do require that values of type T have at least one
+declared possible representation,1 and such possible representations are not hidden from the user;
+in particular, they do have user-visible components. Understand, however, that the components in
+question are not components of the type, they are components of the possible representation; the
+type as such is still scalar in the sense previously explained.
+      By way of example, consider the user-defined type QTY (“quantity”), whose definition in
+Tutorial D might look like this:
+       TYPE QTY POSSREP { I INTEGER } ;
+
+This type definition says, in effect, that quantities can “possibly be represented” by values of the
+system-defined type INTEGER (for simplicity, we ignore the fact that, in practice, we would
+probably want to constrain those integers to be greater than zero). In this example, therefore, the
+possible representation (which henceforth we abbreviate to just possrep) certainly does have user-
+visible components2—in fact, it has exactly one such, called I, of type INTEGER—but quantities
+per se do not.
+      Here is a slightly more complex example:
+       TYPE POINT     /* geometric points in two-dimensional space */
+            POSSREP CARTESIAN { X RATIONAL, Y RATIONAL }
+            POSSREP POLAR { R RATIONAL, THETA RATIONAL } ;
+
+       This definition includes declarations of two distinct possreps, CARTESIAN and POLAR,
+reflecting the fact that points in two-dimensional space can indeed “possibly be represented” by
+either cartesian or polar coordinates. Each of those possreps in turn has two components, both of
+which are of type RATIONAL3 and both of which are user visible. Like type QTY, however, type
+POINT is still scalar—the type as such has no user-visible components.
+       Despite the message of the previous paragraph, we must now say that it is often convenient,
+informally, to refer to the components of a given possrep as if they were in fact components of the
+type. For example, we might refer, informally, to the x and y coordinates of some point (instead of
+what we should be doing, which is referring to the x and y coordinates of the cartesian possible
+representation of that point). Please note immediately that this usage is more than a little sloppy—
+but, to repeat, it is convenient, and we will adopt it from time to time in what follows.
+
+
+1
+  We assume here that T is not a dummy type. Dummy types have to do with our inheritance model and are discussed
+in Part IV of this book; we ignore them until further notice.
+2
+  As we have had occasion to remark before (in connection with the terminology of user-defined types), the term user is
+always a little vague, and you might be wondering just what we mean when we say that possrep components are “user
+visible.” Essentially, what we mean is that any user who needs to invoke a selector or THE_ operator effectively needs
+to be aware of the corresponding possrep components, since (as we will see later, in the section “Selectors and THE_
+Operators”) selectors and THE_ operators are defined in terms of those components. Furthermore, in the case of
+selectors in particular, the user will need to be aware of the corresponding type constraint, and type constraints also are
+defined in terms of possrep components.
+3
+  Throughout this book we use the more accurate RATIONAL in place of the more usual REAL (and we assume it is a
+built-in type).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                       page 63
+Part I / Preliminaries                                          Chapter 3 / Toward a Theory of Types
+
+
+       A note on syntax: First of all, if possrep PR is declared as part of the definition of type T, we
+say, loosely, that “PR is a possrep for type T” (instead of, as would be more logically correct, “PR is
+a possrep for values of type T”). In Tutorial D, moreover, if type T has a possrep with no explicit
+name, then that possrep is named T by default. Thus, the definition already given for type QTY—
+      TYPE QTY POSSREP { I INTEGER } ;
+
+—can be regarded as shorthand for the following longer one:
+      TYPE QTY POSSREP QTY { I INTEGER } ;
+
+      Further discussion of possreps—in particular, an explanation of our motivation for
+introducing the concept—can be found under RM Prescriptions 4 and 5 in Chapter 6. See also
+Appendix C.
+
+
+SELECTORS AND THE_ OPERATORS
+
+Let PR be a possrep for type T. Then the declaration of PR causes automatic definition of the
+following more or less self-explanatory operators:
+
+ ■    A selector operator, which allows the user to specify or select a value of type T by supplying
+      a value for each component of PR
+
+ ■    A set of THE_ operators (one such operator for each component of PR), which allow the user
+      to access the PR components corresponding to a specified value of type T
+
+      Note: When we say declaration of PR causes “automatic definition” of these operators, what
+we mean is that whoever is responsible for defining type T, and therefore for declaring PR, is also
+responsible for defining the operators. Observe, therefore, that automatic does not necessarily mean
+automated. (To be a little more precise, we do not necessarily expect the implementation code for
+selectors and THE_ operators to be provided automatically; however, we do expect it to be provided
+automatically for certain other required operators, including “=” and “:=” in particular.)
+      By way of example, here are some sample selector and THE_ operator invocations for type
+POINT:
+      CARTESIAN ( 5.0, 2.5 )
+      /* selects the point with x = 5.0, y = 2.5 */
+
+      CARTESIAN ( X1, Y1 )
+      /* selects the point with x = X1, y = Y1, where */
+      /* X1 and Y1 are variables of type RATIONAL     */
+
+      POLAR ( 2.7, 1.0 )
+      /* selects the point with r = 2.7,  = 1.0 */
+
+      THE_X ( P )
+      /* denotes the x coordinate of the point in */
+      /* P, where P is a variable of type POINT   */
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                     page 64
+Part I / Preliminaries                                                     Chapter 3 / Toward a Theory of Types
+
+
+       THE_R ( P )
+       /* denotes the r coordinate of the point in P */
+
+       THE_Y ( exp )
+       /* denotes the y coordinate of the point denoted */
+       /* by the expression exp (which is of type POINT) */
+
+       Note that (a) selectors have the same name as the corresponding possrep; (b) THE_ operators
+have names of the form THE_C, where C is the name of the corresponding component of the
+corresponding possrep; (c) the syntax of selector and THE_ operator invocations is self-explanatory.
+Note too that selector invocations are a generalization of the familiar concept of a literal. (All
+literals are selector invocations, but not all selector invocations are literals; in fact, a selector
+invocation is a literal if and only if all of its arguments are literals in turn.)
+       A note regarding the term “literal”: The concept might be familiar, but it seems to be very
+hard to find a good definition for it in the literature! Here is our own preferred definition: A literal
+is a symbol that denotes a value that is fixed and determined by the particular symbol in question
+(and the type of that value is therefore also fixed and determined by the symbol in question).
+Loosely, we can say that a literal is self-defining. Here are some Tutorial D examples:
+       4                                            /* a literal of type INTEGER                 */
+       2.7                                          /* a literal of type RATIONAL */
+       'ABC'                                        /* a literal of type CHAR                    */
+       FALSE                                        /* a literal of type BOOLEAN                 */
+       S#('S1')                                     /* a literal of type S#                      */
+       CARTESIAN ( 5.0, 2.5 )                       /* a literal of type POINT                   */
+
+      We remark in passing that our model explicitly requires every value of every type, be it scalar
+or nonscalar, to be denotable by means of some literal (see RM Prescription 4).
+      Back to selectors and THE_ operators. To see how these ideas might work in practice,
+suppose the physical representation of points is in fact cartesian coordinates (though there is no
+need, in general, for a physical representation to be identical to any of the corresponding possreps).
+Then the system will provide certain highly protected operators,1 denoted in what follows by italic
+pseudocode, that effectively expose that physical representation, and the type implementer can then
+use those operators to implement the necessary CARTESIAN and POLAR selectors. (Obviously
+the type implementer is—in fact, must be—an exception to the general rule that users are not aware
+of physical representations.) For example:
+
+
+
+
+1
+  Just what is involved in protecting those operators, thereby making them unavailable to most users, is essentially a
+security matter and beyond the purview of the Manifesto as such. For our purposes, we simply assume that excluding
+them from Tutorial D is sufficient to provide the necessary protection.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                     page 65
+Part I / Preliminaries                                     Chapter 3 / Toward a Theory of Types
+
+
+      OPERATOR CARTESIAN ( X RATIONAL, Y RATIONAL ) RETURNS POINT ;
+          BEGIN ;
+              VAR P POINT ; /* P is a variable of type POINT */
+              X component of physical representation of P := X ;
+              Y component of physical representation of P := Y ;
+              RETURN ( P ) ;
+          END ;
+      END OPERATOR ;
+      OPERATOR POLAR ( R RATIONAL, THETA RATIONAL ) RETURNS POINT ;
+          RETURN ( CARTESIAN ( R * COS ( THETA ),
+                              R * SIN ( THETA ) ) ) ;
+      END OPERATOR ;
+
+     Observe that the POLAR definition makes use of the CARTESIAN selector, as well as the
+presumably built-in operators SIN and COS. Alternatively, the POLAR definition might be
+expressed directly in terms of the protected operators, thus:
+      OPERATOR POLAR ( R RATIONAL, THETA RATIONAL ) RETURNS POINT ;
+          BEGIN ;
+              VAR P POINT ;
+              X component of physical representation of P := R * COS ( THETA ) ;
+              Y component of physical representation of P := R * SIN ( THETA ) ;
+              RETURN ( P ) ;
+          END ;
+      END OPERATOR ;
+
+    The type implementer can also use those protected operators to implement the necessary
+THE_ operators, thus:
+      OPERATOR THE_X ( P POINT ) RETURNS RATIONAL ;
+          RETURN ( X component of physical representation of P ) ;
+      END OPERATOR ;
+
+      OPERATOR THE_Y ( P POINT ) RETURNS RATIONAL ;
+          RETURN ( Y component of physical representation of P ) ;
+      END OPERATOR ;
+
+      OPERATOR THE_R ( P POINT ) RETURNS RATIONAL ;
+          RETURN ( SQRT ( THE_X ( P ) ** 2 + THE_Y ( P ) ** 2 ) ) ;
+      END OPERATOR ;
+
+      OPERATOR THE_THETA ( P POINT ) RETURNS RATIONAL ;
+          RETURN ( ARCTAN ( THE_Y ( P ) / THE_X ( P ) ) ) ;
+      END OPERATOR ;
+
+      Observe that the definitions of THE_R and THE_THETA make use of THE_X and THE_Y,
+as well as the operators SQRT and ARCTAN (which, we assume, are built in and have the obvious
+semantics). Alternatively, THE_R and THE_THETA might be defined directly in terms of the
+protected operators (details left as an exercise).
+      So much for the POINT example. However, it is important to understand that all of the
+concepts we have discussed in connection with that example apply to simpler types as well (type
+QTY, for example). Here are some sample selector invocations for that type:
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                              page 66
+Part I / Preliminaries                                            Chapter 3 / Toward a Theory of Types
+
+
+      QTY ( 100 )
+      QTY ( N )
+      QTY ( N1 + N2 )
+
+And here are some sample THE_ operator invocations:
+      THE_I ( Q )
+
+      THE_I ( Q1 + Q2 )
+
+We are assuming in these examples that (a) N, N1, and N2 are variables of type INTEGER; (b) Q,
+Q1, and Q2 are variables of type QTY; and (c) “+” is a polymorphic operator—it applies to both
+integers and quantities.
+      By the way, observe that since values are always typed, it is strictly incorrect to say that, e.g.,
+“the quantity for a certain shipment is 100.” A quantity is a value of type QTY, not a value of type
+INTEGER! In the example, therefore, we should more properly say the quantity is QTY(100), not
+100 as such. In informal contexts, however, we usually do not bother to be quite so precise, thus
+using, e.g., 100 as a convenient shorthand for QTY(100). In particular, we typically use such
+shorthands when we draw pictures of relations as tables (e.g., on paper), as we saw in several
+examples in Chapters 1 and 2.
+      We give one further example of a type definition:
+      TYPE LINESEG POSSREP { BEGIN POINT, END POINT } ;
+
+Type LINESEG denotes line segments, and it has associated THE_ operators THE_BEGIN and
+THE_END (each of which is type POINT). This example thus illustrates the fact that a given
+possrep can be declared in terms of user-defined types, not just system-defined types as in all of our
+previous examples (in other words, a user-defined type is indeed a type and can be used in all of the
+ways that types in general can be used).
+      For simplicity, we assume throughout this book from this point forward that all operators with
+names of the form THE_C (for some C) are indeed THE_ operators of the kind we have been
+discussing.
+
+THE_ Pseudovariables
+
+Consider the following example:
+      VAR P POINT ;
+      P := CARTESIAN ( 5.0, 2.5 ) ;
+      THE_X ( P ) := 2.0 ;
+
+Explanation: Variable P is declared to be of type POINT, and the first assignment assigns to that
+variable P the point with x coordinate 5.0 and y coordinate 2.5. The second assignment then “zaps”
+the x coordinate of P, setting it to 2.0, so that P now contains the point with x coordinate 2.0 and y
+coordinate 2.5 (unchanged).
+       The expression THE_X(P) on the left side of the second assignment in the foregoing example
+is a pseudovariable reference: a THE_ pseudovariable reference, to be precise (other kinds are
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       page 67
+Part I / Preliminaries                                                       Chapter 3 / Toward a Theory of Types
+
+
+possible).1 In general, a pseudovariable reference is an operational expression that appears in some
+target position (e.g., on the left side of an assignment); thus, a THE_ pseudovariable reference in
+particular is a THE_ operator invocation appearing in such a target position. Such an invocation
+actually designates—instead of just returning the value of—the specified component of its
+argument. (More precisely, it designates the specified component of the applicable possible
+representation of that argument.) Thus, the assignment
+         THE_X ( P ) := 2.0 ;
+
+actually assigns the value 2.0 to the X component of the argument variable P.
+      Pseudovariable references can be nested, as in this example:
+         VAR LS LINESEG ;
+         THE_X ( THE_BEGIN ( LS ) ) := 6.5 ;
+
+      More generally, in fact, a pseudovariable reference can appear wherever a variable reference
+of the same type can appear. In other words, pseudovariables are variables (loosely speaking).
+      We now observe that pseudovariables in general, including THE_ pseudovariables in
+particular, are in fact logically unnecessary, because any assignment in which the target is a
+pseudovariable is logically equivalent to another in which it is not. Consider the following example
+once again:
+         THE_X ( P ) := 2.0 ;
+
+This assignment is logically equivalent to the following one:
+         P := CARTESIAN ( 2.0, THE_Y ( P ) ) ;
+
+Similarly, the assignment
+         THE_X ( THE_BEGIN ( LS ) ) := 6.5 ;
+
+is logically equivalent to this one:
+         LS := LINESEG ( CARTESIAN ( 6.5, THE_Y ( THE_BEGIN ( LS ) ) ),
+                                          THE_END ( LS ) ) ;
+
+       In other words, THE_ pseudovariables per se are not strictly necessary in order to support the
+kind of component-level updating we have been discussing. However, assignment to a THE_
+pseudovariable does seem intuitively more attractive than the alternative (for which it can be
+regarded as a shorthand); also, using THE_ pseudovariables provides a higher degree of
+imperviousness to changes in the syntax of the corresponding selector. Moreover, assignment to a
+pseudovariable is likely to be easier to implement efficiently than the alternative for which it is a
+shorthand (though of course performance issues are never a primary consideration in our model, nor
+in the design of the language D).
+
+
+1
+    The term pseudovariable is taken from PL/I; virtual variable might be a little more apt.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                              page 68
+Part I / Preliminaries                                                      Chapter 3 / Toward a Theory of Types
+
+
+Nonscalar Types
+
+We now turn briefly to tuple and relation types.1 We focus first on tuple types specifically. Here
+repeated from Chapter 2 is an example of such a type:
+       TUPLE { S# S#, SNAME NAME, STATUS INTEGER, CITY CHAR }
+
+       Now, tuple types do not have possreps as such; nor do they really need them, because the type
+itself can be regarded as playing a kind of “possrep” role. In other words, just as we can behave as
+if values of type QTY (say) were physically represented by integers, so in the case at hand we can
+behave as if values of the tuple type shown were physically represented by tuples of that type. For
+example, here is a selector invocation for that tuple type (also repeated from Chapter 2):
+       TUPLE { S# S#('S1'), SNAME NAME('Smith'), STATUS 20, CITY 'London' }
+
+       Observe how the syntax of this selector supports the idea that the tuple type serves as its own
+possrep (as it were), because it relies on the fact that the components of that type—i.e., the
+attributes—are indeed user visible.
+       As for “THE_ operators,” tuple types neither have nor need them; instead, their functionality
+is provided by what Tutorial D calls attribute extractors. For example, if tx is an expression of the
+tuple type under discussion, then the expression
+       STATUS FROM tx
+
+returns the corresponding STATUS value, just as a hypothetical “THE_STATUS” operator would.
+Note: It would be possible to use attribute extractors as pseudovariables, too, but Tutorial D does
+not; instead, it provides analogous functionality by means of statements of the form illustrated here:
+       UPDATE tv ( STATUS := 15 ) ;
+
+      This statement has the effect of setting the STATUS component of the tuple variable tv
+(which we assume to be of the tuple type under discussion, of course) to the value 15. It is
+shorthand for the following:
+       tv := TUPLE { S# S# FROM tv , SNAME SNAME FROM tv ,
+                     STATUS 15 , CITY CITY FROM tv } ;
+
+       A note on tuple type inference: One important advantage of the tuple type naming scheme
+prescribed in the Manifesto—viz., that such names be of the form TUPLE{...}—is that it facilitates
+the task of determining the type of the result of an arbitrary tuple expression. For example, consider
+the following tuple expression (actually a tuple projection):
+       tx { S#, CITY }
+
+where tx is as above. This particular expression evaluates to a tuple that is derived from the current
+
+1
+  Such types are in fact generated types. See the section “Type Generators,” later in this chapter, for further
+explanation of this point.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                       page 69
+Part I / Preliminaries                                                       Chapter 3 / Toward a Theory of Types
+
+
+value of tx by “projecting away” attributes SNAME and STATUS, and the tuple type of that derived
+tuple is, precisely,
+        TUPLE { S# S#, CITY CHAR }
+
+Similar remarks apply to all possible tuple expressions.
+      Finally, everything in this subsection regarding tuple types applies equally well to relation
+types also, mutatis mutandis.1 Thus, each relation type serves as its own possrep (as it were); the
+corresponding selector relies on the fact that components of the type are user visible; and operators
+are available that provide read-only and update access to any attribute of any tuple in any relation of
+the type in question (speaking rather loosely!). We omit further discussion here—except to point
+out that, with regard to the question of relation type inference specifically, we have already
+indicated what is involved in our explanation of the relational operators in Chapter 2. For example,
+the type of the result of the expression a UNION b is the same as that of both a and b.
+
+
+SYSTEM-DEFINED TYPES
+
+We assumed for the most part in the previous two sections that the scalar types we were dealing
+with were all user defined. But what about built-in types? Well, almost certainly there will be
+some built-in types that comply with everything we said in those sections. For example, we might
+have a built-in type called DATE, representing dates on the Gregorian calendar. Then:
+
+    ■   An obvious possrep for dates is:
+        POSSREP { YEAR INTEGER, MONTH INTEGER, DAY INTEGER CONSTRAINT ... }
+
+        (Details of the CONSTRAINT specification, which would be needed in practice to ensure that
+        dates conform to the rules of the Gregorian calendar, are tedious but straightforward and are
+        therefore omitted here.)
+
+    ■   The corresponding selector would take the form
+        DATE ( y, m, d )
+
+        where y, m, and d are integer expressions.
+
+    ■   The corresponding THE_ operators might look like this (though for historical reasons they
+        will probably use some different syntax):
+
+
+
+
+1
+  In case you are not familiar with this useful expression, we offer a brief explanation here. Essentially, it means with
+all necessary changes having been made (and it can save a good deal of writing). In the case at hand, for example, the
+“necessary changes” involve such things as replacing appearances of the term tuple by the term relation, replacing tuple
+selector invocations by relation selector invocations, replacing references to tuple variables by references to relvars, and
+so on.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                        page 70
+Part I / Preliminaries                                          Chapter 3 / Toward a Theory of Types
+
+
+      THE_YEAR ( d )
+      THE_MONTH ( d )
+      THE_DAY ( d )
+
+      where d is an expression (or a variable, if the THE_ operator invocation is being used as a
+      pseudovariable reference) of type DATE.
+
+       We remark in passing that type DATE is an example of a built-in type that might have several
+distinct possreps. For example, a possrep involving month names instead of numbers might be
+desirable from a human factors point of view. (And the physical representation is likely to be
+different again; it might, for example, consist of “day number since the beginning of time.”)
+       What about a simpler built-in type such as INTEGER? Well, clearly the system has to specify
+a format for writing integer literals—probably as an optionally signed sequence of decimal digits, as
+in Tutorial D. By definition, then, that format can be regarded as a “possrep for integers,” in a
+sense. However, we take the position that the possrep in question is not a declared one. Everything
+we have said about possreps in this chapter so far applies specifically to ones that are explicitly
+declared; in particular, our earlier remarks regarding selectors and THE_ operators apply
+specifically to possreps that are explicitly declared, but not to ones that are not. In our example,
+then, type INTEGER has no declared possrep, and therefore no THE_ operators. It does have a
+selector, but invocations of that selector are always simple integer literals, nothing more general.
+       Incidentally, just as type DATE might well have several distinct possreps, so type INTEGER
+might have several distinct literal formats (in other words, several distinct selectors). For example,
+15, X'F', and B'1111' might be distinct integer literals, all denoting the value fifteen.
+       From this point forward, we will take the unqualified term possible representation, or the
+abbreviated form possrep, to refer to a declared possrep specifically (barring explicit statements to
+the contrary).
+
+
+OPERATORS
+
+We have already seen several examples of operator definitions in this chapter, but it is time to take a
+closer look. We begin by repeating the two versions of ABS (“absolute value”) from the section
+“Values Are Typed” earlier in the chapter. For clarity, however, we now rename them R_ABS and
+U_ABS, respectively:
+      OPERATOR R_ABS ( I INTEGER ) RETURNS INTEGER ;
+          RETURN ( IF I  0 THEN +I ELSE -I END IF ) ;
+      END OPERATOR ;
+
+      OPERATOR U_ABS ( I INTEGER ) UPDATES { I } ;
+          I := ( IF I  0 THEN +I ELSE -I END IF ) ;
+      END OPERATOR ;
+
+      An invocation of R_ABS—e.g., R_ABS(N1+N2)—is an expression of type INTEGER, and it
+can appear wherever an integer literal would be allowed; in particular, it can be nested inside other
+expressions. An invocation of U_ABS, by contrast, is not an expression at all (not of type
+INTEGER and not of any other type), and it cannot be nested inside other expressions; instead, such
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                    page 71
+Part I / Preliminaries                                            Chapter 3 / Toward a Theory of Types
+
+
+an invocation takes the form of an explicit CALL statement, or something logically equivalent to
+such a statement. For example:
+      CALL U_ABS ( N ) ;
+
+N here must be a variable specifically (of type INTEGER), not some more general expression.
+      Why do we distinguish between read-only and update operators? Without getting into too
+much detail—further elaboration can be found in Chapter 6, also Chapter 14—the answer has to do
+with avoiding side effects. For example, if an expression such as N1+U_ABS(N2) were valid, it
+would not only return some integer value but would also have the side effect of updating the
+variable N2.
+      Here is another example, DIST (“distance between”). This read-only operator takes two
+parameters of one user-defined type (POINT) and returns a result of another (LENGTH):
+      OPERATOR DIST ( P1 POINT, P2 POINT ) RETURNS LENGTH ;
+         RETURN ( WITH THE_X ( P1 ) AS X1 ,
+                       THE_X ( P2 ) AS X2 ,
+                       THE_Y ( P1 ) AS Y1 ,
+                       THE_Y ( P2 ) AS Y2 :
+                LENGTH ( SQRT ( ( X1 - X2 ) ** 2 + ( Y1 - Y2 ) ** 2 ) ) ) ;
+      END OPERATOR ;
+
+       We are assuming that the LENGTH selector takes an argument of type RATIONAL. Also,
+recall from the previous chapter that the purpose of WITH is to simplify the formulation of
+expressions by allowing names to be introduced to refer to the results of subexpressions. See
+Chapter 5 for further details.
+       Our next example is the required “=” operator for type POINT:
+      OPERATOR EQ ( P1 POINT, P2 POINT ) RETURNS BOOLEAN ;
+         RETURN ( THE_X ( P1 ) = THE_X ( P2 ) AND THE_Y ( P1 ) = THE_Y ( P2 ) ) ;
+      END OPERATOR ;
+
+      Observe that the expression in the RETURN statement here makes use of the built-in “=”
+operator for type RATIONAL. For simplicity, we will assume from this point forward that the
+usual infix notation “=” can be used for the equality operator (for all types, that is, not just type
+POINT); we omit consideration of how such an infix notation might be specified, since it is
+basically just a matter of syntax. Note: In practice, we would expect the code for “=” to be
+provided by the system (again, for all types, not just for type POINT); we show an explicit
+definition above for type POINT only for pedagogic reasons.
+      Here now is the required “<” operator for type QTY:
+      OPERATOR LT ( Q1 QTY, Q2 QTY ) RETURNS BOOLEAN ;
+          RETURN ( THE_I ( Q1 ) < THE_I ( Q2 ) ) ;
+      END OPERATOR ;
+
+      We are assuming here, reasonably enough, that QTY has been defined as an ordinal type—
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       page 72
+Part I / Preliminaries                                                     Chapter 3 / Toward a Theory of Types
+
+
+an ordinal type being, precisely, a type for which the operator “<” is defined.1 Note that the
+expression in the RETURN statement makes use of the built-in “<” operator for type INTEGER.
+Again, we will assume from this point forward that the usual infix notation can be used for this
+operator (for all ordinal types, that is, not just type QTY). Note: There is quite a lot more that
+would be need to be said and done in connection with ordinal types in any real implementation. In
+particular, an argument could be made that some types for which “<” is supported are not really
+usable for typical ordinal purposes (type CHAR might be a case in point). Such considerations are
+beyond the scope of the present book, however; see reference [85] for further discussion.
+
+Type Conversions
+
+Consider the following definition for type S# (a simplified version of the definition shown earlier in
+the chapter):
+       TYPE S# POSSREP { C CHAR } ;
+
+By default, the specified possrep has the name S#, and hence the corresponding selector operator
+does, too. The following is thus a valid selector invocation:
+       S#('S1')
+
+(it returns a certain supplier number). Observe, therefore, that the S# selector might be regarded,
+loosely, as a type conversion operator that converts character strings to supplier numbers.
+Analogously, the P# selector might be regarded as a conversion operator that converts character
+strings to part numbers; the QTY selector might be regarded as a conversion operator that converts
+integers to quantities; and so on.
+       Incidentally, we follow convention in using the term type conversion here, but it is not a good
+term. After all, to say a character string is being “converted” to a supplier number suggests the
+character string is being changed somehow, but such is not the case (of course not!—the character
+string is a value and cannot be changed in any way, by definition). Indeed, to suggest that two
+values are really the same in all respects except that they happen to be of different types is to appeal
+to some concept that is certainly not part of our model. Rather, what is really going on with “type
+conversion” is that a mapping is being applied, a mapping from values of one type to values of
+another. Given a particular character string, for example, the mapping in question identifies the
+unique supplier number that corresponds to that string.
+       Back to selectors in particular. Of course, we can think, loosely, of the S# selector as being a
+“type conversion” operator only because the corresponding possrep happens to involve exactly one
+component. In that special case, however, we can also think (again loosely) of the corresponding
+THE_ operator as an operator that performs type conversion in the opposite direction. For example,
+if SID is a variable of type S#, then the expression
+       THE_C ( SID )
+
+
+1
+  Tutorial D requires ordinal types to be explicitly declared as such, via the specification ORDINAL in the type
+definition. We omit such specifications from our examples in this chapter for simplicity. Of course, not all types are
+ordinal; type POINT, for example, is not, and neither are tuple or relation types.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                     page 73
+Part I / Preliminaries                                                     Chapter 3 / Toward a Theory of Types
+
+
+effectively converts the supplier number denoted by SID to a character string.
+        Now, in the section “Values Are Typed” earlier in the chapter, we said that (a) the source and
+target in an assignment must be of the same type, and (b) the comparands in an equality comparison
+must also be of the same type. In some systems, however, these rules are not directly enforced; that
+is, it might be possible in such a system to request, e.g., a comparison between a supplier number
+and a character string, perhaps as here:
+       ... WHERE S# = 'S2'
+
+Here the left comparand is of type S# and the right comparand is of type CHAR. On the face of it,
+therefore, the comparison should fail on a type error (a compile-time type error, in fact).
+Conceptually, however, it would be possible for the system to realize that it can use the S#
+“conversion operator"—i.e., the S# selector—to convert the CHAR comparand to type S#, thereby
+effectively rewriting the comparison as follows:
+       ... WHERE S# = S#('S2')
+
+Alternatively, it could use the THE_C “conversion operator” instead to rewrite the comparison thus:
+       ... WHERE THE_C ( S# ) = 'S2'
+
+Either way, the comparison will now be valid.
+      Invoking a conversion operator implicitly as in the foregoing examples is known as coercion.
+However, it is well known that coercion can lead to errors. In this book, therefore, we follow The
+Principle of Cautious design [46] and adopt the position that coercions are not permitted—operands
+must always be of the appropriate types, not merely coercible to those types. Of course, we do
+allow explicit type conversion operators (or CAST operators, as they are usually known) to be
+defined and invoked when necessary. For example:
+       CAST_AS_CHAR ( 530 )
+
+As we have already pointed out, selectors—at least, those that take just one argument—can also be
+thought of as explicit type conversion operators, of a kind, and a similar remark applies to the
+corresponding THE_ operators.
+      Now, you might have realized that what we are talking about here is what is known in
+language circles as strong typing. Different writers have slightly different definitions for this term
+[125]; as we use it, however, it means, among other things, that (a) every value has a type, and (b)
+whenever we try to perform an operation, the system checks—preferably at compile time, otherwise
+at run time—that the operands are of the right types for the operation in question.1 For example,
+consider the following expressions:
+       WEIGHT + QTY         /* part weight plus shipment quantity                      */
+
+       WEIGHT * QTY         /* part weight times shipment quantity */
+
+
+1
+  In fact, OO Prescription 1 requires D to be such that all type checking can be done at compile time, except possibly if
+type inheritance is supported.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                      page 74
+Part I / Preliminaries                                             Chapter 3 / Toward a Theory of Types
+
+
+The first expression makes no sense, and the system should reject it. The second, on the other hand,
+does make sense—it denotes the total weight for all parts involved in the shipment. So the
+operators we would define for weights and quantities in combination would presumably include “*”
+but not “+”.
+      Here are a couple more examples, involving comparison operations this time:
+      WEIGHT > QTY
+
+      EVEN > ODD
+
+Again the first expression does not make sense, but the second does. (We are assuming in the
+second example that EVEN is of type EVEN_INTEGER and ODD is of type ODD_INTEGER,
+with the obvious semantics.) So the operators we would define for weights and quantities in
+combination presumably would not include “>“, but those for even and odd integers presumably
+would. Note: In practice EVEN_INTEGER and ODD_INTEGER might both be subtypes of type
+INTEGER, in which case the “>“ operator would probably be inherited from this latter type (see
+Part IV).
+
+Some Implications
+
+Complete support for operators along the lines sketched in the present section has a number of
+significant implications, which we now briefly summarize:
+
+ ■    First, and most important, it means the system will know (a) exactly which expressions are
+      valid, and (b) the type of the result for every valid expression.
+
+ ■    It also means that the total collection of types known to the system will be a closed set; that
+      is, the type of the result of every valid expression will be a type that is known to the system.
+      Observe in particular that this closed set of types must include the type BOOLEAN, if
+      comparisons are to be valid expressions [77].
+
+ ■    In particular, the fact that the system knows the type of the result of every valid expression
+      means it knows which assignments are valid, and also which comparisons.
+
+
+TYPE GENERATORS
+
+We turn now to types that are obtained by invoking some type generator. Abstractly, a type
+generator is just a special kind of operator; it is special because (a) it returns a type instead of, e.g.,
+a scalar value, and (b) the invocation occurs at compile time instead of run time. For example, we
+might write
+      VAR SALES ARRAY QTY (12) ;
+
+to define a variable called SALES whose permitted values are one-dimensional arrays of 12
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         page 75
+Part I / Preliminaries                                                     Chapter 3 / Toward a Theory of Types
+
+
+quantities.1 In this example, the expression ARRAY QTY (12) can be regarded as an invocation of
+the ARRAY type generator, and it returns a specific array type. That specific array type is a
+generated type (a nonscalar generated type, as it happens, though scalar generated types are
+possible too). Points arising:
+    1.   Type generators are known by many different names in the literature: type constructors,
+         parameterized types, polymorphic types, type templates, generic types, possibly others too.
+
+    2.   Generated types are indeed types, and can be used wherever ordinary (nongenerated) types
+         can be used. For example, we might define some relvar to have some attribute of type
+         ARRAY QTY (12). By contrast, type generators as such are not types.
+
+    3.   Like types, type generators can be either system or user defined, in general. In other words,
+         the system might allow users to define their own type generators (though we do not require D
+         to support such functionality, and Tutorial D in particular does not do so).
+
+    4.   A generated type is system or user defined according as the corresponding type generator is
+         system or user defined.
+
+      In general, generated types have possreps—or, at least, can be thought of as having
+possreps—that are derived in a fairly obvious way from (a) a generic possrep that applies to the
+type generator in question and (b) the user-visible component(s) of the specific generated type in
+question. In the case of ARRAY QTY (12), for example:
+
+    ■    There will be some generic possrep defined for one-dimensional arrays in general: probably
+         as a sequence of array elements that can be identified by subscripts in the range from lower to
+         upper, where lower and upper are the applicable bounds (1 and 12, in our example).
+
+    ■    The user-visible components are precisely the 12 array elements just mentioned.
+
+      In like manner, there will be operators that provide the required selector and THE_ operator
+functionality. For example, the expression (actually an array literal)
+         ARRAY QTY ( QTY( 2), QTY( 5), QTY( 9), QTY( 9),
+               QTY(15), QTY(27), QTY(33), QTY(32),
+               QTY(25), QTY(19), QTY( 5), QTY( 1) )
+
+might be used to specify a particular value of type ARRAY QTY (12) (“selector functionality”).
+Likewise, the expression
+         SALES (3)
+
+might be used to access the third component (i.e., the third array element) of the array value that
+
+
+1
+  The examples in this section are not formulated in terms of pure Tutorial D because Tutorial D does not support
+general-purpose arrays—but arrays are such a familiar construct that it seemed a good idea to use them as a basis for
+this discussion.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                     page 76
+Part I / Preliminaries                                                     Chapter 3 / Toward a Theory of Types
+
+
+happens to be the current value of the array variable SALES (“THE_ operator functionality”). It
+might also be used as a pseudovariable reference, as here:
+         SALES (3) := QTY(17) ;
+
+     Assignment and equality comparison operators also apply to values and variables of the
+generated type. For example, here is a valid assignment:
+         SALES := ARRAY QTY ( QTY( 2), QTY( 5), QTY( 9), QTY( 9),
+                        QTY(15), QTY(27), QTY(33), QTY(32),
+                        QTY(25), QTY(19), QTY( 5), QTY( 1) ) ;
+
+And here is a valid equality comparison:
+         SALES = ARRAY QTY ( QTY( 2), QTY( 5), QTY( 9), QTY( 9),
+                             QTY(15), QTY(27), QTY(33), QTY(32),
+                             QTY(25), QTY(19), QTY( 5), QTY( 1) )
+
+      Note: Any given type generator will also have a set of generic constraints and generic
+operators associated with it (generic in the sense that the constraints and operators in question will
+apply to every specific type obtained via invocation of the type generator in question). For
+example, in the case of the ARRAY type generator:
+
+    ■    There might be a generic constraint to the effect that the lower bound must not be greater than
+         the upper bound.
+
+    ■    There might be a generic “reverse” operator that takes an arbitrary one-dimensional array as
+         input and returns as output another such array containing the elements of the given one in
+         reverse order.
+
+In fact, the “selectors,” “THE_ operators,” and assignment and equality comparison operators
+already discussed are also effectively derived from certain generic operators.
+      Of course, the type generators that are of particular interest in this book are TUPLE and
+(especially) RELATION. See Chapters 4-6 for further discussion.
+
+
+CONCLUDING REMARKS
+
+As noted in earlier, the material of this chapter is likely to be less familiar to many readers than that
+of Chapter 2 was. It is therefore worth summarizing the main points we have covered.
+      First of all, a type is a named, finite set of values: namely, the set of all values that satisfy a
+certain type constraint, which is specified in Tutorial D, in the case of scalar types specifically, by
+a POSSREP definition and its subordinate CONSTRAINT specification.1 Every type has an
+associated set of read-only and update operators for operating on values and variables of the type in
+question. Values and variables are always typed; so also are attributes, (read-only) operators,
+parameters, and more generally expressions of arbitrary complexity.
+
+1
+    We will encounter another method of specifying type constraints when we get to Part IV of this book.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                page 77
+Part I / Preliminaries                                         Chapter 3 / Toward a Theory of Types
+
+
+       Types can be arbitrarily complex; thus, we can have types whose values are numbers, or
+strings, or dates, or times, or audio recordings, or maps, or video recordings, or XML documents, or
+geometric points (and so on). Types constrain operations, in that the operands to any given
+operation are required to be of the types defined for that operation (strong typing). Strong typing is
+a good idea because it allows certain errors to be caught (preferably at compile time, otherwise at
+run time).
+       Types can be system or user defined; they can also be scalar or nonscalar. A scalar type has
+no user-visible components. (The most important nonscalar types in the relational model are
+relation types, which were discussed in Chapter 2.) We distinguish between types and their physical
+representation (types are a model issue, physical representations are an implementation issue).
+However, we do require that user-defined scalar types in particular have at least one explicitly
+declared possible representation or “possrep.” Each such possrep causes automatic definition of
+one selector operator and, for each component of that possrep, one THE_ operator (also a
+corresponding THE_ pseudovariable). We support explicit type conversions but no implicit
+coercions. We also support the definition of any number of additional operators for scalar types,
+and we require that equality comparison (“=”) and assignment be available for every type (with
+prescribed semantics).
+       We also discussed type generators, which are compile-time operators that return types
+(ARRAY is a typical example, though not one that is supported in Tutorial D). Generated types
+have possreps (of a kind), constraints, and operators that are derived from the generic possreps,
+constraints, and operators associated with the applicable type generator.
+       One final point (not mentioned explicitly in the body of the chapter): Recall from Chapter 1
+that values—and hence sets of values also—“have no location in time or space”; conceptually, those
+sets of values already exist, and always will exist (think of type INTEGER, for example). It follows
+in particular that the operation that defines a scalar type (the TYPE statement, in Tutorial D) does
+not actually create the corresponding set of values; all it does is introduce a name by which that set
+of values can be referenced. Likewise, the operation that destroys a scalar type (DROP TYPE in
+Tutorial D) does not actually destroy the corresponding set of values, it merely drops the name that
+was introduced by the corresponding type definition.
+
+
+EXERCISES
+
+3.1    What is a type?
+
+3.2    What is a literal?
+
+3.3    State the rules regarding operand types for the assignment (“:=”) and equality comparison
+       (“=”) operators.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                   page 78
+Part I / Preliminaries                                         Chapter 3 / Toward a Theory of Types
+
+
+3.4    Elaborate on the following logical differences:
+
+       argument                    vs. parameter
+       generated type              vs. nongenerated type
+       physical representation     vs. possible representation
+       read-only operator          vs. update operator
+       scalar                      vs. nonscalar
+       type                        vs. representation
+       user-defined type           vs. system-defined type
+       user-defined operator       vs. system-defined operator
+
+3.5    Why is it desirable to distinguish between read-only and update operators?
+
+3.6    Explain the following in your own words: coercion; ordinal type; polymorphic operator;
+       pseudovariable; selector; strong typing; THE_ operator; type generator.
+
+3.7    Why are pseudovariables logically unnecessary?
+
+3.8    Give some examples of polymorphic operators. Are the operators of the relational algebra
+       polymorphic? What about aggregate operators such as SUM?
+
+3.9    Define an operator that, given a rational number, returns the cube of that number.
+
+3.10   Define a read-only operator that, given a point with cartesian coordinates x and y, returns the
+       point with cartesian coordinates f(x) and g(y), where f and g are predefined operators (of
+       type RATIONAL in each case).
+
+3.11   Repeat Exercise 3.10 but make the operator an update operator.
+
+3.12   Give a type definition for a scalar type called CIRCLE whose values are circles in two-
+       dimensional euclidean space. What selectors and THE_ operators apply to this type? Also:
+
+       a.   Define a set of read-only operators to compute the diameter, circumference, and area of
+            a given circle.
+
+       b.   Define an update operator to double the radius of a given circle (more precisely, to
+            update a given variable of type CIRCLE in such a way that its circle value is unchanged
+            except that the radius is twice what it was before).
+
+3.13   Give some examples of types for which it might be useful to define two or more distinct
+       possreps. Can you think of an example where distinct possreps for the same type have
+       different numbers of components?
+
+3.14   Give an appropriate set of scalar type definitions for the suppliers-and-parts database. Do
+       not attempt to write the relvar definitions.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                    page 79
+Part I / Preliminaries                                           Chapter 3 / Toward a Theory of Types
+
+
+3.15   We pointed out in the section “Selectors and THE_ Operators” in this chapter that it is
+       strictly incorrect to say that (e.g.) the quantity for a certain shipment is 100 (“a quantity is a
+       value of type QTY, not a value of type INTEGER”). As a consequence, Fig. 2.1 (in Chapter
+       2) is rather sloppy, inasmuch as it pretends that it is correct to think of, e.g., quantities as
+       integers. Given your answer to Exercise 3.14, show the correct way of referring to the
+       various scalar values in that figure.
+
+3.16   Given your answer to Exercise 3.14, which of the following scalar expressions are valid?
+       For those that are, state the type of the result; for the others, show an expression that will
+       achieve what appears to be the desired effect.
+       a.    CITY = 'London'
+       b.    SNAME || PNAME
+       c.    QTY * 100
+       d.    QTY + 100
+       e.    STATUS + 5
+       f.    'ABC' < CITY
+       g.    COLOR = CITY
+       h.    CITY || 'burg'
+
+3.17   It is sometimes suggested that types are really variables, in a sense. For example, employee
+       numbers might grow from three digits to four as a business expands, so we might need to
+       update “the set of all possible employee numbers.” Discuss.
+
+3.18   A type is a set of values, so (as noted in the introduction to this chapter) we can define an
+       empty type to be a type where the set in question is empty. Can you think of any uses for
+       such a type?
+
+3.19   A possrep has a set of components, so we might define some type as having an empty
+       possrep. What are the implications?
+
+3.20   The Manifesto requires “=” to apply to every type; more specifically, it requires v1 = v2 to
+       evaluate to TRUE if and only if v1 and v2 are the very same value. SQL, by contrast, does
+       not require “=” to apply to every type, nor does it prescribe the semantics in all cases where
+       it does apply. What are the implications of this state of affairs?
+
+3.21   (For discussion) As noted in the body of the chapter, there are those who would claim that
+       XML technology is destined to replace relational technology. There is an XML data model
+       (actually several different ones, of which the most important is probably the semistructured
+       data model); there is an XML data definition language (actually at least two of them); there
+       is an XML query language (at least three of them); and there are XML databases and XML
+       DBMSs. What do you think is the true nature—the true technical nature, that is—of the
+       relationship between these developments and relational technology? Note: A tutorial on
+       XML from a database perspective can be found in Chapter 27 of reference [76].
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      page 80
+                                          Part II:
+
+                        FORMAL SPECIFICATIONS
+
+This part of the book is provided mainly for reference; you probably should not even attempt to
+read it straight through—not on a first reading, anyway. Chapter 4 is The Third Manifesto itself
+(the “no frills” version); it consists of the various prescriptions, proscriptions, and very strong
+suggestions that together constitute the Manifesto proper, with almost no explanatory material at all.
+To put it another way, Chapter 4 lays down a set of rules that the language D must abide by. (We
+remind you that the name D refers generically to any language that conforms to the principles of the
+Manifesto; in principle, any number of distinct languages could qualify as a valid D.) Chapter 5
+then defines the language we call Tutorial D—i.e., a D defined primarily to serve as a basis for
+examples elsewhere in the book.
+      We stress the point that apart from (a) the references in OO Prescription 2 and OO Very
+Strong Suggestion 1 in Chapter 4 and (b) a few remarks in passing in Chapter 5, everything to do
+with type inheritance is ignored in these two chapters. The material of Part IV extends, but does not
+invalidate, the material presented in this part of the book.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen             page II.81

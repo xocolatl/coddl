@@ -1,0 +1,729 @@
+                                               Chapter 1
+
+                            Background and Overview
+
+This book is about the foundations of database technology. It is meant as a basis for self-study or as a
+text to accompany an advanced course on databases. We should immediately explain that “advanced”!
+The book is advanced not because of the subject matter, which is mostly not that difficult, but rather
+because of the treatment, which is meant to be fairly rigorous and detailed (even definitive, so far as it
+goes): more rigorous and detailed, perhaps, than might be suitable for a first course in the subject. But
+it is our belief that anyone who is serious about database technology—in particular, anyone who claims
+to be a database professional—really ought to be familiar with this material. Professionals need to
+know the foundations of their field, whatever that field might be.
+       What makes this book different? We feel there are two key features that make it stand out: its
+strong focus on the relational model, and its thorough treatment of type theory (and together, of course,
+the relational model and type theory are precisely the foundations referred to in the previous
+paragraph). To amplify:
+
+ ■    The relational model: We must stress that what we are not doing is proposing some kind of
+      “new” or “extended” relational model. Rather, we are concerned with what might be called the
+      “classical” version of that model; we have tried to provide as careful and accurate a description of
+      that classical model as we possibly can. It is true that we have taken the opportunity to dot a few
+      i’s and cross a few t’s (i.e., to perform a few minor tidying activities here and there); however, the
+      model as we describe it departs in no essential respects from Codd’s original vision as
+      documented in references [20-22]. (Indeed, we even toyed at one point with the idea of calling
+      the book A Relational Model of Data for Large Shared Data Banks.)
+
+ ■    Type theory: Relations in the relational model have attributes, and those attributes in turn have
+      types (also called domains). Thus, the relational model certainly assumes that types exist.
+      However, it nowhere says just what those types must be, nor does it have much to say about what
+      properties those types must have; in other words, the relational model and type theory are almost
+      completely independent of each other (they are orthogonal, to use the jargon). In this book, we
+      present a detailed theory of types that complements the relational model, and we explore some of
+      its implications. In particular, we show that our type theory serves as a basis for a comprehensive
+      model of type inheritance.
+
+      Who then is the book aimed at? Well, in at least one sense it is definitely not self-contained—it
+does assume you are seriously interested in database technology and are reasonably well acquainted
+with classical database theory and practice. However, we have tried to define and explain, as carefully
+as we could, any concepts that might be thought novel. Thus, we have tried to make the book suitable
+for both reference and tutorial purposes; moreover, we have clearly identified those portions of the
+book that are more formal in style and are provided primarily for reference. Thus, our intended
+audience is just about anyone with a serious interest in database technology, including but not limited to
+the following:
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                           2
+Part I / Preliminaries                                         Chapter 1 / Background and Overview
+
+
+ ■    Data and database administrators
+
+ ■    “Information modelers” and database designers
+
+ ■    Database application designers and implementers
+
+ ■    Database students, graduate and undergraduate
+
+ ■    Computer science professors specializing in database issues
+
+ ■    Database language designers and standardizers
+
+ ■    Database product implementers and other vendor personnel
+
+ ■    People responsible for database product evaluation and acquisition
+
+      For academic readers in particular, we should add that we have tried to present the material in a
+way that is clear, precise, correct, and uncluttered by the baggage—not to say mistakes—that often,
+sadly, seem to accompany commercial products. Thus, we believe the book provides an opportunity to
+acquire a firm understanding of database fundamentals without being distracted by irrelevancies.
+
+
+THE THIRD MANIFESTO
+
+This book is organized in large part around the ideas of The Third Manifesto. The Third Manifesto—
+the Manifesto for short—is a formal proposal by the present writers for a solid foundation for data and
+database management systems (DBMSs); like Codd’s original papers, therefore, it can be seen as an
+abstract blueprint for the design of a DBMS and the language interface to such a DBMS. Among other
+things, it lays the foundation for what we believe is the logically correct approach to integrating object
+and relational technologies, or in other words to building what are sometimes called “object/relational”
+DBMSs. (We will have more to say on this particular topic in the subsection “A Little History” later in
+this section.) However, we must immediately add that the ideas of the Manifesto are not limited to
+object/relational databases as such, but are applicable to other kinds of databases also: for example,
+temporal databases, spatial databases, and databases used in connection with the World Wide Web.
+They are also applicable to the design of “rule engines” (also known as “business logic servers”), which
+some writers regard as the next generation of general-purpose DBMS products [66].
+       Now, you will not be surprised to hear that the Manifesto rests squarely in the classical relational
+tradition. In other words, the ideas of the Manifesto are in no way intended to supersede those of the
+relational model, nor do they do so; rather, they use the ideas of the relational model as a base on which
+to build. The relational model is still highly relevant to database theory and practice and will remain so
+for as far out as anyone can see. Thus, we see our Manifesto as being very much in the spirit of Codd’s
+original work and continuing along the path he originally laid down. We are interested in evolution, not
+revolution.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          3
+Part I / Preliminaries                                          Chapter 1 / Background and Overview
+
+
+Why Did We Write It?
+
+We wrote the first version of the Manifesto [35] in the early 1990s because we were concerned about
+certain trends we observed in the database industry at that time (trends that, we should add, we continue
+to observe in some circles to this day). Among other things, we were concerned about certain well-
+publicized but ill-considered attempts to integrate object and relational technologies. Not that there is
+anything wrong with the idea of such integration per se, we hasten to add; the problem lay in the
+specific manner in which that integration was being attempted. Chapter 9 elaborates on this issue.
+      We were not the first writers to address these matters. In fact, one of our original aims in writing
+The Third Manifesto was to respond to two earlier ones (hence our choice of title):
+
+ ■    “The Object-Oriented Database System Manifesto” [2]
+
+ ■    “The Third-Generation Database System Manifesto” [130]
+
+Like our own Manifesto, each of these documents proposed a basis on which to build DBMSs.
+However:
+
+ ■    The first essentially ignored the relational model. In our opinion, this flaw was more than enough
+      to rule it out as a serious contender. In any case, it seemed to us that it failed to give firm
+      direction.
+
+ ■    The second did correctly embrace the relational model, but failed to emphasize (or indeed even
+      mention) the hopelessness of continuing to follow a commonly accepted perversion of that
+      model—namely, SQL—in pursuit of relational ideals. In other words, it simply assumed that
+      SQL, with all its faults, was (and is) an adequate realization of the relational model and hence an
+      adequate foundation on which to build.
+
+       Regarding SQL in particular, we feel that any attempt to move forward, if it is to stand the test of
+time, must reject SQL unequivocally. Our reasons for taking this position are too many and varied for
+us to spell them out in detail here; in any case, we have described them in depth in many other places
+(see, e.g., references [27], [41], [44-45], [51], and [62] among others if you want more specifics). Of
+course, we do realize that SQL databases and applications are going to be with us for a long time—to
+think otherwise would be quite unrealistic—and so we do have to pay some attention to the question of
+what to do about today’s SQL legacy. The Manifesto therefore does include some specific suggestions
+in this regard (see Chapter 10 for a detailed discussion).
+       Further analysis of the proposals of references [2] and [130] can be found in the annotation to
+those references in Appendix K. Also, a detailed examination of how SQL measures up to the ideas of
+the Manifesto can be found in Appendix H.
+
+What Problem Were We Trying to Solve?
+
+We need to explain what problem we were trying to solve when we first wrote our Manifesto. (What
+follows is an edited version of what we said at that time.) It was our belief—borne out by subsequent
+events—that DBMSs needed to evolve to deal with much more sophisticated kinds of data than they
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                           4
+Part I / Preliminaries                                          Chapter 1 / Background and Overview
+
+
+were capable of at the time; in other words, we needed to find a way of extending, dramatically, the
+range of possible kinds of data we could keep in our databases. For example, we might imagine a
+biological database that included a BIRD relation like the one shown in Fig. 1.1. Note: We follow
+convention in Fig. 1.1 and similar figures throughout this book in using double underlining to mark
+components of primary keys—despite the fact that (as we will see in the next chapter) the Manifesto
+does not require primary key support.
+╔═════════════════════════════════════════════════════════════════╗
+║           ┌────────┬───────┬─────┬───────┬──────┬──────┐        ║
+║      BIRD │ NAME   │ DESCR │ PIC │ VIDEO │ SONG │ MIGR │        ║
+║           ├════════┼───────┼─────┼───────┼──────┼──────┤        ║
+║           │ Robin │ xxxxx │ ... │ ..... │ ♪♫♪♫ │ .... │         ║
+║           │ Osprey │ xxxxx │ ... │ ..... │ ♪♪♪♪ │ .... │        ║
+║           │ ...... │ ..... │ ... │ ..... │ .... │ .... │        ║
+║                                                                 ║
+║      where NAME is a bird name                    (text)        ║
+║      and   DESCR is a description of that bird    (XML doc)     ║
+║      and   PIC   is a picture of the bird         (photo)       ║
+║      and   VIDEO is a movie of the bird           (video)       ║
+║      and   SONG is the bird's song                (audio)       ║
+║      and   MIGR is the bird's migration route     (map)         ║
+║                                                                 ║
+╚═════════════════════════════════════════════════════════════════╝
+Fig. 1.1: The BIRD relation
+
+       Before going any further, we should make it clear that, strictly speaking, the table in Fig. 1.1 is
+not really a relation at all, even though we said it was just now. Rather, it is a picture of a relation, as
+displayed on a computer screen perhaps, that contains among other things certain icons. Clicking on,
+say, the SONG (“♪♫♪♫”) icon in the Robin row in that picture might cause the system to play a
+recording of a robin singing; and, loosely speaking, it is that recording, not the icon, that is the actual
+value of the SONG component of the Robin row within the BIRD relation.
+       To get back to the main thread of our discussion: Of course, we would need to be able to operate
+on such new kinds of data, too. In the case of the BIRD relation, for example, we might want to find
+information concerning birds whose migration route includes Italy:
+      SELECT NAME, DESCR, SONG, VIDEO
+      FROM   BIRD
+      WHERE INCLUDES ( MIGR, COUNTRY('Italy') )
+
+Note: We use SQL as the basis for this example for reasons of familiarity, despite the fact that (as
+indicated in the previous subsection) the Manifesto expressly proscribes it.
+        So the problem we were addressing was this: How could we support new kinds of data within the
+classical relational framework? (Of course, we did take it as axiomatic that we wanted to stay in that
+framework; it would be unthinkable to walk away from what is, at the time of writing, well over 35
+years of relational research and development.) And the key to the solution was, of course, type theory:
+It all boiled down to the issue of what types of data we were allowed to keep within database relations.
+Hence our focus on type theory in this book.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            5
+Part I / Preliminaries                                                  Chapter 1 / Background and Overview
+
+
+Topics Deliberately Omitted
+
+As you know by now, this book is not about SQL (at least, not directly). Nor is it about commercial
+products. Rather, it is about principles (in this context, just another word for foundations). Why?
+Because principles endure;1 principles are solid; principles are what you need to know in order to be
+able to understand—and analyze, and evaluate, and perhaps judge—vendor claims, commercial
+products, the SQL language, and numerous other developments and pronouncements in the database
+field.
+       Of course, a real DBMS will necessarily include many features over and above those that can
+properly be regarded as foundation features as such. Such features include:
+
+    ■    Recovery and concurrency controls
+
+    ■    Security and authorization controls
+
+    ■    Stored and triggered procedures (the latter more usually known, somewhat inappropriately, as just
+         triggers)
+
+    ■    Support for the development of generic applications (e.g., some kind of call-level interface)
+
+    ■    Performance tuning and other administration controls
+
+and many other things besides. Now, we recognize that such features can be extremely important in
+practice—in fact, the quality of support for them can make or break a DBMS as a commercial
+proposition. As already stated, however, they are not part of the foundation per se; they are therefore
+not addressed in the Manifesto, and they are not discussed in the present book (at least, not much).
+      We also have little to say regarding matters of implementation. As explained in more detail in the
+section “Some Crucial Logical Differences” later in this chapter, we draw a sharp distinction between
+model issues and implementation ones, and we believe it is important to get the model right first before
+worrying about how to implement it—though we should immediately add that we have at least thought
+about implementation matters enough to have reason to believe that everything we propose is indeed
+implementable.2 In particular, much existing SQL implementation technology should be useful and
+usable in implementing the ideas of the Manifesto, even though we reject SQL as such. (In fact, we
+venture to suggest that implementing the Manifesto should actually be easier than implementing SQL,
+for reasons we hope will become clear as we proceed.)
+
+
+
+
+1
+    By contrast, products change all the time, and so does SQL.
+2
+  In this respect, we might again claim to be following Codd, who wrote, possibly tongue in cheek, in his famous 1970
+paper [21]: “Implementation problems are [not] discussed. Nevertheless, the material presented should be adequate for
+experienced systems programmers to visualize several approaches.”
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                         6
+Part I / Preliminaries                                                     Chapter 1 / Background and Overview
+
+
+What about Objects?
+
+Something else we need to explain at the outset has to do with our adoption—or lack thereof, rather, for
+the most part—of terminology from the object world.1 In the early to mid 1990s, there were those who
+argued that object technology was destined to replace relational technology. Few now subscribe to that
+position, but it might still be claimed that object technology at least does have some contributions to
+make to the database field. We do not dispute that claim; however, we prefer not to use object
+terminology, even when we make use of object concepts (or, at least, concepts that might have some
+counterpart in the object world), because we do not find that terminology appropriate to our purpose.
+For consider:
+
+    ■    First of all, the very term object itself does not seem to have a precise or universally agreed
+         meaning. Sometimes it seems to mean a value; sometimes a variable; sometimes even a type;
+         and there might be other interpretations as well. (Sometimes an object is defined to be an
+         instance, but that definition merely shifts the question of interpretation on to this latter term. In
+         this book, therefore, we avoid the use of the term instance also, except in very informal contexts.)
+
+    ■    As a label, moreover, that same term object is applied to a wide variety of quite distinct
+         endeavors. It is used among other things to describe a certain graphic interface style, a certain
+         programming style, certain programming languages (not the same thing as programming style, of
+         course), and certain analysis and design techniques—all of these in addition to a certain approach
+         to what is after all the principal focus of this book, database management. And it is quite clear
+         that the term does not mean the same thing in all of these different contexts (see, e.g., the
+         annotation to reference [9] in Appendix K).
+
+       Similar comments apply to other object terms as well (class, method, and so on). Given this state
+of affairs, therefore, and given also that we are trying to be precise in this book (for the most part, at
+any rate), we prefer to avoid terminology that might be subject to misinterpretation.
+       There is another point we need to make clear in this connection, though. In this book, we are (of
+course) interested in the field of database management. We are therefore interested in—among many
+other things—the applicability of object concepts and technology to that field. Please note, therefore,
+that all remarks made in this book concerning object concepts and technology must be understood in
+this light. We offer no opinion whatsoever regarding the usefulness of object ideas in any other
+context.
+
+A Little History
+
+Being organized as it is around The Third Manifesto, this book can be seen as a reincarnation of, and
+replacement for, two previous books (though it has been drastically revised, and in fact totally
+rewritten). The first of those previous books was published in 1998, under the title Foundation for
+Object/Relational Databases: The Third Manifesto [82]. We chose that title because “object/relational”
+DBMSs were a hot topic at the time; we were concerned in particular that certain portions of the
+industry were going about implementing such DBMSs in a way that seemed to us seriously flawed, and
+
+1
+    Throughout this book we favor the abbreviated form object over the longer term object-oriented.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                 7
+Part I / Preliminaries                                         Chapter 1 / Background and Overview
+
+
+we wanted to do our best to help correct matters. In retrospect, however, we now realize the title was a
+little unfortunate in at least two respects:
+
+ ■    It got the emphasis wrong, in that it suggested that the book was concerned with
+      “object/relational” databases exclusively, whereas (as already indicated) the ideas of the
+      Manifesto are much wider-ranging.
+
+ ■    In any case, we regard “object/relational” primarily as a marketing term. Indeed, it is our
+      contention that a true relational system—that is, a system that supported the relational model
+      properly, with all that such support entails—would in fact be an “object/relational” system (which
+      is why we usually set the term in quotation marks).
+
+      We went on to publish a revised version of that first book in 2000 under the somewhat better title
+Foundation for Future Database Systems: The Third Manifesto [83]. But that title too was not perfect.
+The problem with the future is, it never arrives!—and we would like to see the industry in general act
+on the ideas of the Manifesto as soon as possible (we take this subject seriously). Certainly there is
+room for improvement in the current crop of commercial products.
+      And so to the present book. This time we have chosen what we hope is a more appropriate title;
+in particular, we have tried to get away from the shortcomings of the two earlier titles. And we have, as
+already indicated, taken the opportunity to overhaul the text from beginning to end. Thus, although the
+overall message remains unchanged, what you hold in your hands is to all intents and purposes a brand
+new book.
+
+
+BACK TO THE RELATIONAL FUTURE
+
+It is a major thesis of both the Manifesto and this book that we need to move away from SQL and get
+back to our relational roots. In other words, we do not believe that SQL is capable of providing the
+kind of solid foundation we seek. Rather, we believe any such foundation must be firmly rooted in the
+relational model of data, first presented to the world in 1969 by E. F. Codd in reference [20].
+        Now, we have already said we acknowledge the desirability of supporting certain features that are
+commonly regarded as aspects of object orientation. However, we believe the features in question are
+orthogonal to (i.e., independent of) the relational model as such. In other words, we claim that the
+relational model needs no extension, no correction, no subsumption—and, above all, no perversion—in
+order for it to be possible to define some database language that (a) is truly relational, (b) does
+accommodate those desirable orthogonal features, and (c) can represent the firm foundation we seek.
+        Let there be such a language, and let its name be D. Please note immediately that no special
+significance attaches to this choice of name—we use it merely to refer generically to any language that
+conforms to the principles laid down in the Manifesto. There could be any number of distinct
+languages all qualifying as a valid D. We define one such language in this book; we call it Tutorial D,
+and we use it as the basis for most of our examples.
+        The Manifesto defines a variety of prescriptions and proscriptions that apply to any such D.
+Some of those prescriptions arise from the relational model, and these we call Relational Model
+Prescriptions (RM Prescriptions). Prescriptions that do not arise from the relational model we call
+Other Orthogonal Prescriptions (OO Prescriptions). We similarly classify the Manifesto’s
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         8
+Part I / Preliminaries                                                     Chapter 1 / Background and Overview
+
+
+proscriptions into RM and OO categories. The various prescriptions and proscriptions are itemized and
+discussed in detail in Parts II and III of this book.
+        In addition to the prescriptions and proscriptions just mentioned, the Manifesto includes a series
+of Very Strong Suggestions, likewise divided into RM and OO categories; again, see Parts II and III.
+Also, Part IV contains the definition of a model of type inheritance, and that model is likewise
+formulated as a series of prescriptions—Inheritance Model Prescriptions (IM Prescriptions). Please
+note, however, that almost everything to do with that inheritance model is ignored prior to Part IV,
+except for the occasional remark here and there. The material of Part IV extends, but does not
+invalidate, the material presented in earlier parts of the book.
+        For definiteness, we assume throughout the Manifesto and throughout this book that the language
+D is imperative in style. Like all such languages, therefore, it is based on the four core concepts type,
+value, variable, and operator.1 For example, we might have a type called INTEGER; the integer 3
+might be a value of that type; N might be a variable of that type, whose value at any given time is some
+integer value (i.e., some value of that type); and plus might be an operator that applies to integer values
+(i.e., to values of that type). See the section “Some Crucial Logical Differences” later in this chapter
+for further elaboration of these concepts.
+        As an aside, we remark that if it is true that the Manifesto can be regarded as defining a
+foundation for database technology, then the concepts of type, value, variable, and operator can be
+regarded as providing a foundation for that foundation. And since the value, variable, and operator
+concepts in turn all rely on the type concept, we might go further and say the type concept can be
+regarded as a foundation for the foundation for the foundation ... In other words, the type concept is the
+most fundamental of all, as we will soon see.
+        Back to the language D. We have said that D is imperative in style (or so we will assume). Now,
+some writers equate the term imperative with the term procedural, but we do not (even though they
+both refer to a style of programming in which the programmer explicitly directs the computer to carry
+out certain processes). Actually, neither term is very precisely defined; however, procedural usually
+connotes a rather low level of abstraction, while imperative does not (at least, not necessarily). In other
+words, procedural languages are imperative, but imperative languages are not necessarily procedural.
+In particular, the language D—or its relational portion, at any rate—is at a comparatively high level of
+abstraction and is thus imperative but not procedural.
+        One last point to close this section: Do not infer from our assumption of an imperative style that
+we discount the possibility of (e.g.) a functional style; at the time of writing, however, we have not
+investigated such a possibility in any depth. But we should point out that certain of the prescriptions,
+proscriptions, and suggestions spelled out in this book would have to be reformulated in the context of a
+functional D. For example, a functional D would obviously have no need of variables at all, in the
+usual programming sense of that term, and hence would not need any update operators either.
+
+
+
+
+1
+  Note that we distinguish between operators and operations—an operation is the process carried out when an operator is
+invoked. That said, however, we should say too that the terms can often be used interchangeably. For example, no real
+harm is done if we replace “operator” by “operation” in the sentence “Plus is an operator that takes two integers as input and
+returns another integer as output.”
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                             9
+Part I / Preliminaries                                                    Chapter 1 / Background and Overview
+
+
+SOME GUIDING PRINCIPLES
+
+Throughout our work on the Manifesto (and related work), we have tried to follow certain guiding
+principles, of which the most important—indeed, it underpins all the rest—is this:
+
+                                     All logical differences are big differences.
+
+The relevance of this maxim, which is due to Wittgenstein [91], is as follows. The relational model is
+at heart a formal system: just as a DBMS is, or an operating system (or indeed any computer program,
+come to that). Formal systems are what computers are, or can be made to be, good at. And, of course,
+the basis of any formal system is logic. It follows that with respect to formal systems in general, and
+with respect to the matters that are the concern of the Manifesto in particular, differences that are
+logical in nature are very important ones, and we need to pay very careful attention to them.
+       Incidentally, we might point out, slightly tongue in cheek, that Wittgenstein’s maxim has an
+interesting corollary: namely, that all logical mistakes are big mistakes. Because, of course, a mistake
+is a difference—a difference between what is right and what is wrong. And we do unfortunately
+observe a number of logical mistakes that have been made, and still are being made, in the industry as a
+whole ...
+       We further conjecture that the inverse of Wittgenstein’s maxim is true as well: namely, that all
+nonlogical differences are small differences—by which we mean, not that (e.g.) psychological
+differences are unimportant in general, but that they are unimportant from the point of view of formal
+systems in particular. In the context of the Manifesto specifically, therefore, we pay little attention to
+nonlogical considerations, such as matters of syntax. (Syntax is important from a human factors point
+of view, of course, and in our design of Tutorial D in particular we have naturally tried to favor good
+syntax over bad. However, we do not regard differences that are mere differences in syntax as logical
+differences, nor as very important ones.)
+       Another fundamental principle we have tried to follow is that of conceptual integrity (the term is
+due to Fred Brooks). In his classic The Mythical Man-Month [12], Brooks has this to say:
+
+      [Conceptual] integrity is the most important consideration in system design. It is better to have a system omit certain
+      anomalous features [and] to reflect one set of design ideas, than to have one that contains many good but independent
+      and uncoordinated ideas [italics in the original].
+
+And writing 20 years later, he adds:
+
+      A clean, elegant programming product must present ... a coherent mental model ... [Conceptual] integrity ... is the
+      most important factor in ease of use ... Today I am more convinced than ever. Conceptual integrity is central to
+      product quality [boldface and italics in the original].
+
+       Let us elaborate briefly on this question of conceptual integrity. In order to maintain integrity of
+concepts, it is clearly necessary to have some concepts in the first place. Furthermore, the concepts in
+question had better be carefully chosen, preferably few in number, agreed upon by all parties
+concerned, and indeed agreeable, not disagreeable, in nature. As an obvious example, suppose the
+product in question is a DBMS specifically, and suppose the agreed-upon concepts are those of the
+relational model. Then that product must adhere rigidly to all aspects of that model. In particular, it
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                          10
+Part I / Preliminaries                                                    Chapter 1 / Background and Overview
+
+
+must not sacrifice the conceptual integrity of that model to some vaguely defined goal such as “keeping
+the syntax simple” [31].
+      We will have occasion to refer to these guiding principles many times over in the pages ahead.
+
+
+SOME CRUCIAL LOGICAL DIFFERENCES
+
+The following logical differences are worth examining right away, since they are relevant to just about
+everything to be discussed in this book:
+
+    ■   Model vs. implementation
+
+    ■   Value vs. variable
+
+    ■   Value vs. appearance
+
+Many others will be identified in the chapters to come. See also reference [79].
+
+Model vs. Implementation
+
+The first logical difference we want to discuss is that between model and implementation. First some
+definitions:
+
+    ■   A model (sometimes referred to as a data model specifically) is an abstract, self-contained,
+        logical definition of the objects, operators, and so forth, that together constitute the abstract
+        machine with which users interact.1 The objects allow us to model the structure of data. The
+        operators allow us to model its behavior. Note: The term objects here is to be understood in its
+        generic sense, not in the special sense of object orientation. Also, the term users, here and
+        elsewhere throughout this book, is intended to mean end users and/or application programmers
+        and/or transactions, as the context demands.
+
+    ■   An implementation of a given model is a physical realization on a real computer system of the
+        components of the abstract machine that together constitute that model. Note: The term
+        implementation, here and elsewhere throughout this book, is to be understood to mean
+        implementation of “the system” (i.e., the DBMS itself), not implementation of some application
+        that runs on top of the DBMS.
+
+       As you can see, the distinction between model and implementation is really just an important
+special case of the familiar distinction between logical and physical aspects of a system. And just in
+case it might not be obvious, we would like to make it clear that our primary concern throughout the
+
+
+1
+  The term architecture is sometimes used with much the same meaning. To quote Brooks once again, “the architecture of a
+system [is] the complete and detailed specification of the user interface” [12]. We prefer model to architecture because over
+the years the latter term has grown to acquire a variety of meanings, most of them not very precise. (In fairness, we should
+admit that the same is also true of the term model to some extent [68]; certainly the term data model in particular has two
+very different meanings. See the annotation to reference [76] in Appendix K.)
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                          11
+Part I / Preliminaries                                                     Chapter 1 / Background and Overview
+
+
+Manifesto, and throughout this book, is with the model specifically, not the implementation (though our
+informal discussions and explanations do occasionally touch on matters of implementation for purposes
+of clarification).
+      Observe, incidentally, that keeping the model and its implementation rigorously separate—in
+particular, not cluttering up the model with implementation matters—is what enables us to achieve data
+independence [76,86]. Indeed, we fail to achieve that objective precisely to the extent that we fail to
+observe that separation.
+
+Value vs. Variable
+
+The second logical difference we want to elaborate on here is that between values and variables (where
+by variable we mean a variable in the usual programming sense). Following Cleaveland [19], we
+define these concepts as follows:
+
+    ■   A value is an “individual constant”: for example, the individual constant that is the integer 3. A
+        value has no location in time or space. However, values can be represented in memory by means
+        of some encoding, and such representations, or (our preferred term in this context) appearances,
+        do have locations in time and space. Indeed, any number of distinct appearances of the same
+        value can exist at any number of distinct locations in time and space, meaning, loosely, that any
+        number of different variables—see the bullet item immediately following—can have the same
+        value, at the same time or different times. Note in particular that, by definition, a value cannot
+        be updated; for if it could, then after such an update it would not be that value any longer (in
+        general).
+
+    ■   A variable is a holder for an appearance of a value. A variable does have a location in time and
+        space.1 Also, of course, variables, unlike values, can be updated; that is, the current value of the
+        variable in question can be replaced by another value, probably different from the previous one.
+        (Of course, the variable in question is still the same variable after the update
+
+      Please note very carefully that it is not just simple things like the integer 3 that are
+legitimate values. On the contrary, values can be arbitrarily complex; for example, a value might be a
+geometric point, or a polygon, or an X ray, or an XML document, or a fingerprint, or an array, or a
+stack, or a list, or a relation (and on and on). Analogous remarks apply to variables too, of course.
+      By the way, the distinction between values and variables might seem obvious; however, it is not
+always observed in the literature (in fact, it is easy to fall into traps in this area). By way of illustration,
+consider the following extract from a tutorial on object databases [137] (the italicized text in brackets is
+commentary by the present authors):
+
+        We distinguish the declared type of a variable from ... the type of the object that is the current
+        value of the variable [so an object is a value] ... We distinguish objects from values [so an object
+
+
+
+1
+  We are speaking intuitively here, not formally. The notion that variables “have location” is useful for explaining what
+variables are in an informal sense, but that notion is not part of our formal definition of a variable. That definition is
+explained later, in Chapter 14 in particular.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                           12
+Part I / Preliminaries                                            Chapter 1 / Background and Overview
+
+
+      is not a value after all] ... A mutator [is an operator such that it is] possible to observe its effect
+      on some object [so in fact an object is a variable].
+
+Value vs. Appearance
+
+The third and last logical difference we want to discuss here is the one, touched on in the preceding
+subsection, between a value per se and an appearance of that value in some particular context (in
+particular, an appearance as the current value of some variable). As already explained, the very same
+value can appear in many different contexts simultaneously. Each of those appearances consists,
+internally, of some encoding or physical representation of the value in question. For example, the
+integer value 12 occurs exactly once in the set of integers—there is exactly one integer 12 “in the
+universe,” as it were—but any number of variables might simultaneously contain an appearance of that
+integer as their current value, as in this Tutorial D example:
+      VAR X INTEGER ;       VAR Y INTEGER ;
+      X := 12 ;     /* assign the value 12 to the variable X */
+      Y := 12 ;     /* assign the value 12 to the variable Y */
+
+       What is more, some of those appearances might be physically represented by means of (say) a
+decimal encoding, and others by means of a binary encoding, of that particular integer (in the example,
+X might contain the “packed decimal” encoding 00010010 while Y contains the “pure binary” encoding
+00001100). Thus, there is also a logical difference between an appearance of a value, on the one hand,
+and the internal encoding or physical representation of that appearance, on the other; in fact, there
+might even be a logical difference between the encodings used for different appearances of the same
+value.
+       The foregoing remarks notwithstanding, we usually find it convenient, for fairly obvious reasons,
+to abbreviate encoding of an appearance of a value to just appearance of a value, or (more often) to
+just value, so long as there is no risk of ambiguity in doing so. Note carefully too that appearance of a
+value is a model concept, whereas encoding of an appearance is an implementation concept. For
+example, users certainly might need to know whether variables X and Y contain appearances of the
+same value (i.e., whether those variables “compare equal”); however, they do not need to know whether
+those appearances use the same physical encoding.
+
+
+CONCLUDING REMARKS
+
+As already explained, the Manifesto consists of a series of prescriptions, proscriptions, and very strong
+suggestions. For purposes of reference, and also to give some idea of the scope of the Manifesto, we
+show on the next page a mnemonic list of those prescriptions, proscriptions, and suggestions. We
+remind you that “OO” in that list stands for Other Orthogonal. Note: An analogous list for our
+inheritance model appears in Chapter 12. No significance should be attached to the sequence in which
+items appear in either list.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                             13
+                                                     7. No tuple-level operations
+RM Prescriptions
+                                                     8. No composite attributes
+ 1. Scalar types                                     9. No domain check override
+ 2. Scalar values are typed                         10. Not SQL
+ 3. Read-only vs. update operators
+ 4. Physical vs. possible representations           OO Prescriptions
+ 5. Expose possible representations
+                                                     1. Compile-time type checking
+ 6. Type generator TUPLE
+                                                     2. Type inheritance (conditional)
+ 7. Type generator RELATION
+                                                     3. Computational completeness
+ 8. Equality                                         4. Explicit transaction boundaries
+ 9. Tuples
+                                                     5. Nested transactions
+10. Relations                                        6. Aggregate operators and empty sets
+11. Scalar variables
+12. Tuple variables                                 OO Proscriptions
+13. Relation variables (relvars)
+14. Kinds of relvars                                 1. Relvars are not domains
+15. Candidate keys                                   2. No object IDs
+16. Databases
+17. Transactions                                    RM Very Strong Suggestions
+18. Relational algebra
+19. Relvar names, relation selectors, and recursion 1. System keys
+20. User-defined tuple and relational operators      2. Foreign keys
+21. Assignments                                      3. Candidate key inference
+22. Comparisons                                      4. Transition constraints
+23. Integrity constraints                            5. Quota queries
+24. Total database constraints                       6. Generalized transitive closure
+25. Catalog                                          7. User-defined generic operators
+26. Language design                                  8. SQL migration
+
+RM Proscriptions                                    OO Very Strong Suggestions
+
+ 1. No attribute ordering                            1. Type inheritance
+ 2. No tuple ordering                                2. Types and operators unbundled
+ 3. No duplicate tuples                              3. Single-level store
+ 4. No nulls
+ 5. No nullological mistakes
+ 6. No internal-level constructs
+
+      We close this chapter by confessing that we do feel a little uncomfortable with the idea of
+calling what is, after all, primarily a technical document a “manifesto.” According to Chambers
+Twentieth Century Dictionary, a manifesto is “a written declaration of the intentions, opinions, or
+motives” of some person or group (e.g., a political party). By contrast, The Third Manifesto is—we
+hope—a matter of science and logic, not mere “intentions, opinions, or motives.” Given the
+historical precedents that led us to write it, however, our title was effectively chosen for us.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      14
+Part I / Preliminaries                                          Chapter 1 / Background and Overview
+
+
+EXERCISES
+
+1.1    Define and distinguish between the terms database and DBMS as carefully as you can.
+       What do you regard as the foundations of database technology?
+
+1.2    What do you understand by the term orthogonality?
+
+1.3    Explain the following in your own words: architecture; implementation; conceptual
+       integrity; logical difference; data independence; model.
+
+1.4    What is The Third Manifesto? What problem was it originally intended to solve?
+
+1.5    In the body of this chapter, we said the concepts of type, value, variable, and operator can
+       be regarded as providing “a foundation for the foundation.” Explain this remark as carefully
+       as you can.
+
+1.6    What do you understand by the term “object/relational database”?
+
+1.7    Explain the logical differences between a value, an appearance of a value, and an encoding
+       of an appearance of a value.
+
+1.8    What is D?
+
+1.9    In the body of this chapter, we said the table in Fig. 1.1 was not a relation but, rather, a
+       picture of a relation (in general, in fact, there is always a logical difference between a thing
+       and a picture of that thing). What are some of the specific points of difference between the
+       table in Fig. 1.1 and the relation it depicts?
+
+1.10   Distinguish between imperative, procedural, and functional programming languages. Give
+       examples of each. Can you identify any other language styles?
+
+1.11   Who was E. F. Codd?
+
+1.12   If you are familiar with SQL, identify some of the major differences between it and the
+       relational model. Note: A precise definition of the relational model appears in the next
+       chapter.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      page 15

@@ -1,0 +1,1456 @@
+                                              Chapter 10
+
+                        RM Very Strong Suggestions
+
+
+RM VERY STRONG SUGGESTION 1: SYSTEM KEYS
+
+D should provide a mechanism according to which values of some specified candidate key (or
+certain components thereof) for some specified relvar are supplied by the system. It should also
+provide a mechanism according to which an arbitrary relation can be extended to include an
+attribute whose values (a) are unique within that relation (or within certain partitions of that
+relation), and (b) are once again supplied by the system.
+
+                                        ———  ———
+
+Caveat: We should make it clear at the outset here that RM Very Strong Suggestion 1 raises a
+number of issues (including but not limited to language design issues) that are not yet fully
+resolved. The discussion that follows should therefore be regarded not as a definitive statement, but
+rather just as notes toward the kind of functionality we feel is desirable. Note that the functionality
+in question is not currently included in Tutorial D, though we do believe it would be useful in an
+industrial-strength language.
+        With that caveat out of the way, we now observe that (as the text of the suggestion indicates)
+we are really talking about two separate but related ideas here. We begin with the familiar notion of
+default values, which we explain as follows. Let R be a relvar, and let R have an attribute A of
+declared type T. If attribute A is defined to have default value d (a value of type T, of course), then
+it is at least syntactically valid to specify tuples—more precisely, relations containing tuples—for
+insertion into R that do not include an explicit A component; such tuples are conceptually extended
+with an <A,T,d> triple before the actual insertion is done. For example, suppose attribute STATUS
+of the suppliers relvar S is defined to have default value 10, perhaps as follows (hypothetical
+syntax):
+      VAR S REAL RELATION { S#     S#,
+                            SNAME NAME,
+                            STATUS INTEGER,
+                            CITY   CHAR }
+                          KEY { S# }
+                          DEFAULT { STATUS 10 } ;
+
+Then the following INSERT might be syntactically valid:
+        INSERT S RELATION { TUPLE { S#    S#('S6'),
+                                    SNAME NAME('Lopez'),
+                                    CITY 'Madrid' } } ;
+
+The relation that is actually inserted looks like this:
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        227
+Part III / Informal Discussions and Explanations                      Chapter 10 / RM Very Strong Suggestions
+
+
+         RELATION { TUPLE { S#     S#('S6'),
+                            SNAME NAME('Lopez'),
+                            STATUS 10,
+                            CITY   'Madrid' } }
+
+An assignment analog of the foregoing INSERT might look as follows:
+         S := S UNION RELATION { TUPLE { S#     S#('S6'),
+                                         SNAME NAME('Lopez'),
+                                         STATUS DEFAULT ( S, STATUS ),
+                                         CITY   'Madrid' } } ;
+
+We are assuming here that the operator invocation DEFAULT (R,a) returns the default value of the
+specified attribute a (STATUS in the example) of the relvar denoted by the specified relvar
+reference R (S in the example).
+      Next, we suggest an extension to the foregoing mechanism according to which default values
+are provided by invoking some system-defined operator, instead of being defined explicitly as part
+of the attribute definition. For example, let relvar READING contain a set of instrument readings
+taken during the course of some experiment. Further, let that relvar include an attribute called
+READING#, defined as follows:
+        READING# INTEGER
+         ...
+        DEFAULT { READING# SERIAL () }
+
+        SERIAL here is the name of a system-defined operator, with semantics as follows:
+
+    ■   Let the very first INSERT into the READING relvar insert n tuples. Then those tuples will be
+        given READING# values 1, 2, ..., n (in some unspecified order).
+
+    ■   Let some subsequent INSERT into the READING relvar insert p tuples. Then those tuples
+        will be given READING# values N+1, N+2, ..., N+p (in some unspecified order), where N is
+        the highest READING# value previously assigned.1
+
+       For simplicity, we assume—though the assumption is perhaps not 100 percent necessary—
+that if SERIAL or other such operator is specified, then the attribute in question must obtain its
+values via the default mechanism; i.e., “the attribute is nonupdatable” (again, speaking somewhat
+loosely). We also assume that a means exists for a suitably skilled and authorized user (perhaps the
+database administrator) to define such operators. Observe that those operators will probably not be
+conventional scalar operators in the sense of RM Prescription 3. For one thing, they might require
+access to certain “environment variables” (e.g., the system clock) that might not be directly
+available to a conventional user of D. For another, they will typically involve, and might even
+
+
+1
+  We remark that these READING# values might be thought of as tuple IDs; note, however, that those tuple IDs are not
+hidden from the user, as they are in certain SQL systems. We point out too that there is an element of unpredictability
+involved in using the SERIAL operator. For example, if we insert (a relation containing) three tuples into an empty
+relvar, all in a single operation, we cannot say which tuple gets which ID—we know only that they get IDs 1, 2, and 3 in
+some unspecified order.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                        228
+Part III / Informal Discussions and Explanations             Chapter 10 / RM Very Strong Suggestions
+
+
+update, certain “hidden arguments” (i.e., arguments not mentioned explicitly when the operator is
+invoked); for example, one hidden argument to SERIAL is the highest value previously assigned.
+      Here now are some examples of further operators that could be useful in appropriate
+circumstances:
+
+ ■    SERIAL within some scope: For example, the relvar ORDER_LINE might include an
+      ORDER# attribute whose values are provided by some business process, together with a
+      LINE# attribute of type INTEGER with a default value defined thus:
+      DEFAULT { LINE# SERIAL () WITHIN ORDER# }
+
+ ■    NOW: This operator provides “the time now” (perhaps as a time or timestamp value, perhaps
+      as an integer, perhaps as a character string, depending on the type of the attribute in question).
+
+ ■    USERID: This operator provides the user ID of the user inserting the tuples in question.
+
+      To get back to RM Very Strong Suggestion 1 specifically, the relevance of all of the above to
+candidate keys should be obvious. For example, the complete definition of the ORDER_LINE
+relvar might look like this:
+       VAR ORDER_LINE REAL RELATION { ORDER# CHAR,
+                                      LINE# INTEGER,
+                                      ITEM# CHAR,
+                                      QTY    QTY,
+                                      ........ }
+                           KEY { ORDER#, LINE# }
+                           DEFAULT { LINE# SERIAL () WITHIN ORDER# } ;
+
+       We turn now to the second principal part of RM Very Strong Suggestion 1. The basic idea is
+as follows: We would like to be able to tag the tuples of the result of an arbitrary relational
+expression in such a way that the tuples remain distinct from one another, even if we “project away”
+the attribute(s) that would otherwise have made them so. Such a feature would be useful in our
+proposed support for SQL migration (see the discussion of RM Very Strong Suggestion 8 later in
+this chapter).
+       Now, you can probably see right away that we might be able to achieve the foregoing effect if
+we were allowed to invoke operators like SERIAL just as if they were ordinary scalar operators—in
+EXTEND, for example. The trouble is, however, that (as already noted) they are not ordinary scalar
+operators, because they typically involve certain hidden arguments. Instead, therefore, we suggest
+the introduction of a new relational operator, TAG. Here is an example of its use:
+      ( SP TAG WITHIN { S# } AS P#_SERIAL ) { ALL BUT P# }
+
+      Given our usual sample data, one possible result of evaluating this expression is shown in Fig.
+10.1. (The result is not unique, in general, because TAG, like SERIAL, involves some degree of
+unpredictability. However, we do require that such results be repeatable; that is, if x is an
+expression, we require that x always return the same output given the same input, even if it involves
+an invocation of TAG.)
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         229
+Part III / Informal Discussions and Explanations             Chapter 10 / RM Very Strong Suggestions
+
+
+╔═════════════════════════════════════════════════════════════════╗
+║                    ┌────┬─────┬───────────┐                     ║
+║                    │ S# │ QTY │ P#_SERIAL │                     ║
+║                    ├════┼─────┼═══════════┤                     ║
+║                    │ S1 │ 300 │         1 │                     ║
+║                    │ S1 │ 200 │         5 │                     ║
+║                    │ S1 │ 400 │         3 │                     ║
+║                    │ S1 │ 200 │         4 │                     ║
+║                    │ S1 │ 100 │         6 │                     ║
+║                    │ S1 │ 100 │         2 │                     ║
+║                    │ S2 │ 300 │         1 │                     ║
+║                    │ S2 │ 400 │         2 │                     ║
+║                    │ S3 │ 200 │         1 │                     ║
+║                    │ S4 │ 200 │         3 │                     ║
+║                    │ S4 │ 300 │         1 │                     ║
+║                    │ S4 │ 400 │         2 │                     ║
+║                    └────┴─────┴───────────┘                     ║
+╚═════════════════════════════════════════════════════════════════╝
+Fig. 10.1: TAG example: one possible result
+
+       Explanation: The TAG operation tags tuples of the relation resulting from evaluation of a
+specified relational expression (the relational expression in the example is just SP, and so the
+resulting relation is simply the current value of relvar SP, of course). The specification WITHIN
+{S#} means those tags are to be unique within distinct S# values (and we assume for simplicity that
+they start from one for each such S# value; of course, we could extend the definition of the TAG
+operator to allow the user to specify a different starting value). Thus, the overall result of the TAG
+operation in the example has attributes S#, P#, QTY, and P#_SERIAL (this last one due to the AS
+P#_SERIAL specification). We then “project away” the P# attribute to obtain a result such as that
+shown in Fig. 10.1. Note that the cardinality of the projection is necessarily the same as that of SP,
+whereas the same would not be true, in general, if we did not retain the P#_SERIAL attribute.
+       We remark finally that TAG could be useful in situations in which sensitive information
+needs to be concealed from certain users. For example, suppose we are given an employees relvar
+EMP, with attributes EMP# and SALARY. Then the expression
+      ( EMP TAG AS EMP_TAG ) { EMP_TAG, SALARY }
+
+could be used as the basis for defining a virtual relvar that would permit statistical analysis to be
+done on employee salaries without revealing exactly who earns what (in effect, the expression
+replaces employee numbers by tags).
+
+
+RM VERY STRONG SUGGESTION 2: FOREIGN KEYS
+
+D should include some declarative shorthand for expressing referential constraints (also known as
+foreign key constraints). [This VSS was later deleted].
+
+                                       ———  ———
+
+RM Prescription 23 requires support for the definition (and of course enforcement) of database
+constraints of potentially arbitrary complexity. And since a referential constraint is really just a
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                             230
+Part III / Informal Discussions and Explanations                     Chapter 10 / RM Very Strong Suggestions
+
+
+special case of such a constraint, it must of course be capable of formulation in terms of the support
+provided under RM Prescription 23. Here, for example, is a Tutorial D formulation (repeated from
+Chapter 2) of the referential constraint from shipments to suppliers:
+        CONSTRAINT DBC5 SP { S# }  S { S# } ;
+
+     RM Very Strong Suggestion 2 simply recognizes that it might be desirable to provide some
+more user-friendly special-case syntax for such constraints. For example:
+        VAR S    REAL RELATION { S# S#, ... } KEY { S# } ;
+
+        VAR SP REAL RELATION { S# S#, ... } KEY { S#, P# }
+                    FOREIGN KEY { S# } REFERENCES S ;
+
+        By way of a second example, consider the following:
+        VAR EMP REAL RELATION { EMP# EMP#, ..., MGR# EMP#, ... } KEY { EMP# }
+            FOREIGN KEY { MGR# } REFERENCES EMP { EMP# } ;1
+
+      Here attribute MGR# represents the employee number of the manager of the employee
+identified by EMP#, and the foreign key specification is shorthand for a CONSTRAINT statement
+of the form:
+        CONSTRAINT ... EMP { MGR# }  EMP { EMP# } RENAME ( EMP# AS MGR# ) ;
+
+Note the need to do some attribute renaming in this example.
+      Special casing such as the foregoing does at least provide explicit syntax for a pragmatically
+important concept, foreign key, that is not otherwise mentioned in the Manifesto (or in Tutorial D,
+come to that). It also provides a place to attach declarative specifications of certain referential
+actions—cascade delete, etc.—if such specifications are considered desirable, without necessarily
+having to get into the business of supporting triggered procedures in full generality. Note: The fact
+that we can update several relvars “simultaneously,” using multiple assignment, implies that there is
+no logical need to support such referential actions. However, there are good usability and
+productivity arguments in favor of providing such support, and we certainly do not preclude it—
+though it would be remiss of us not to point out that (as noted, rather obliquely, in Chapter 3) it does
+have the potential to violate The Assignment Principle.
+      We close this section with a few miscellaneous observations:
+
+    ■   Note that we allow foreign keys to reference any candidate key, instead of—as historically—
+        requiring them to reference a primary key specifically. In fact, for reasons explained in
+        Chapters 2 and 6, we do not prescribe any explicit support at all for primary keys as such
+        (though we do not prohibit them either).
+
+    ■   Referential constraints are usually thought of as applying to real relvars only. In the
+        Manifesto, by contrast, we regard them as applying to virtual relvars as well.
+
+1
+ This example is regretted. The failure to match on attribute names implies a dependency on attribute name ordering in
+composite foreign keys. See Chapter 13, “Inclusion Dependencies and Foreign Keys”, in Database Explorations.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                      231
+Part III / Informal Discussions and Explanations            Chapter 10 / RM Very Strong Suggestions
+
+
+ ■    It is possible—though good design practice might militate against it—for two distinct relvars
+      R1 and R2 each to involve a foreign key that references the other. Such a possibility suggests
+      that we might need something akin to multiple assignment for data definition operations also
+      (for otherwise it might not be possible to define R1 until R2 has been defined and vice versa).
+
+
+RM VERY STRONG SUGGESTION 3: CANDIDATE KEY INFERENCE
+
+Let RX be a relational expression. By definition, RX can be thought of as designating a relvar, R
+say—either a user-defined relvar (if RX is just a relvar name) or a system-defined relvar
+(otherwise). It is desirable, though not always entirely feasible, for the system to be able to infer
+the candidate keys of R, such that (among other things):
+
+ a.   If RX constitutes the defining expression for some virtual relvar R', then those inferred
+      candidate keys can be checked for consistency with the candidate keys explicitly defined for R'
+      and—assuming no conflict—become candidate keys for R'.
+
+ b.   Those inferred candidate keys can be included in the information about R that is made
+      available (in response to a “metaquery”) to a user of D.
+
+D should provide such functionality, but without any guarantee (a) that such inferred candidate
+keys are not proper supersets of actual candidate keys, or (b) that such an inferred candidate key is
+discovered for every actual candidate key.
+
+                                      ———  ———
+
+If K is a candidate key for relvar R, it follows from the definitions of candidate key and functional
+dependency (see Chapter 2) that:
+
+ ■    Because of the uniqueness property, the functional dependency (FD) K  A holds for every
+      attribute A of R.
+
+ ■    Because of the irreducibility property, there is no proper subset K' of K such that the FD K' 
+      A holds for every attribute A of R.
+
+By way of example, let R be the shipments relvar SP and K its sole key {S#,P#}. Then:
+
+ ■    It is the case that every attribute of SP is functionally dependent on the combination of
+      attributes {S#,P#}.
+
+ ■    It is not the case that every attribute of SP is functionally dependent on some proper subset of
+      that combination of attributes; to be specific, QTY is not. (By contrast, S# and P# both are,
+      trivially, thanks to the trivial FDs {S#}  {S#} and {P#}  {P#}. An FD is trivial if the
+      right side is a subset of the left side.)
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        232
+Part III / Informal Discussions and Explanations             Chapter 10 / RM Very Strong Suggestions
+
+
+       It follows from the foregoing that, if we know the FDs that hold for a given relvar, we can
+determine the keys for that relvar—they are, precisely, those irreducible combinations K of
+attributes such that the FD K  A holds for every attribute A of the relvar in question. Hence, in
+order to determine the keys for the result of some relational expression RX, we need to determine
+the corresponding FDs. In other words, we need an FD inference mechanism, which—assuming we
+know the FDs that hold in the base or real relvars—will let us infer the FDs that hold in the result of
+evaluating an arbitrary expression involving those real relvars. (And, of course, we do know the
+FDs that hold in the real relvars, because they will have been defined as constraints on the relvars in
+question.) Such an inference mechanism is presented in reference [28]. See also reference [108].
+       We remark that key inference is in fact a special case of constraint inference in general,
+support for which is required by RM Prescription 23. We mention keys explicitly here because of
+their pragmatic importance, and also because it might be desirable to use the special-case
+inferencing mechanism described in reference [28] instead of a more general mechanism that works
+for all constraints. As noted in our discussion of RM Prescription 23 in Chapter 6, however, there
+are known to be intrinsic limits on the degree to which such inferencing might be feasible in
+practice, which is why we allow for both of the following possibilities:
+
+ ■    The inference mechanism might in fact find proper superkeys rather than true candidate keys.
+      (Recall from Chapter 2 that a superkey is a superset of a key; in other words, a superkey
+      satisfies the uniqueness property but not necessarily the irreducibility property. A proper
+      superkey is a superkey that definitely does not satisfy the irreducibility property.)
+
+ ■    Also, the inference mechanism might fail to discover certain keys entirely.
+
+Implementations can thus compete with one another over their degree of success at inferring keys.
+
+
+RM VERY STRONG SUGGESTION 4: TRANSITION CONSTRAINTS
+
+D should support transition constraints—i.e., constraints on the transitions that a given database
+can make from one value to another.
+
+                                       ———  ———
+
+Here is an example (“no supplier’s status must ever decrease”):
+       CONSTRAINT TRC1 IS_EMPTY
+                  ( ( ( S' { S#, STATUS } RENAME ( STATUS AS STATUS' ) )
+                      JOIN
+                      ( S { S#, STATUS } ) )
+                    WHERE STATUS' > STATUS ) ;
+
+Explanation: We introduce the convention that a primed relvar name, such as S' in the example, is
+understood to refer to the corresponding relvar as it was prior to the update under consideration.
+The constraint in the example can thus be understood as follows: If (a) we join together (over
+supplier numbers) the relation that is the value of relvar S before the update and the relation that is
+the value afterwards, and (b) we pick out the tuples in that join for which the old status value is
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         233
+Part III / Informal Discussions and Explanations             Chapter 10 / RM Very Strong Suggestions
+
+
+greater than the new one, then (c) the final result must be empty. (Since the join is over supplier
+numbers, any tuple in the result of the join for which the old status value is greater than the new one
+would correspond to a supplier whose status had decreased.)
+      Now, constraint TRC1 is a transition constraint that applies to just a single relvar: namely, the
+suppliers relvar S. Here by contrast is an example of a transition constraint that applies to two
+relvars taken in combination (“the total quantity of any given part, taken over all suppliers, can
+never decrease”):
+      CONSTRAINT TRC2 IS_EMPTY (
+                 ( ( SUMMARIZE SP' PER ( S'{ S# } ) ADD ( SUM ( QTY ) AS SQ' ) )
+                   JOIN
+                   ( SUMMARIZE SP PER ( S { S# } ) ADD ( SUM ( QTY ) AS SQ ) ) )
+                 WHERE SQ' > SQ ) ;
+
+      Like the database constraints required by RM Prescription 23, transition constraints are
+checked at statement boundaries. Note: The database constraints of RM Prescription 23 are
+sometimes referred to as state constraints, because they refer to valid “states” of the database rather
+than valid transitions from one such “state” to another.
+
+
+RM VERY STRONG SUGGESTION 5: QUOTA QUERIES
+
+D should provide some shorthand for expressing quota queries. It should not be necessary to
+convert the relation concerned into (e.g.) an array in order to formulate such a query.
+
+                                       ———  ———
+
+A quota query is a query that specifies a desired limit, or quota, on the cardinality of the result: for
+example, the query “Get the three heaviest parts,” for which the specified quota is three. (Note,
+however, that the actual result cardinality might be either more or less than the specified quota, as
+we will soon see.) Here is a possible Tutorial D formulation of this example:
+       WITH ( P RENAME ( WEIGHT AS WT ) ) AS T1 ,
+            ( EXTEND P ADD ( COUNT ( T1 WHERE WT > WEIGHT )
+                        AS #_HEAVIER ) AS T2 ,
+            ( T2 WHERE #_HEAVIER < 3 ) AS T3 :
+       T3 { P#, PNAME, WEIGHT, COLOR, CITY }
+
+Given our usual sample data, the result consists of parts P2, P3, and P6.
+      Quota queries are quite common in practice. Now, such queries can be formulated in terms of
+our usual relational operators, as we have just seen, but such formulations do tend to be rather
+roundabout and cumbersome. It therefore seems worthwhile to consider the possibility of providing
+some more user-friendly way of expressing them; hence RM Very Strong Suggestion 5. To be
+specific, we propose introducing a new relational operator of the following form:
+      <rank>
+         ::= RANK <relation exp> BY ( <order item commalist> AS <attribute name> )
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          234
+Part III / Informal Discussions and Explanations                        Chapter 10 / RM Very Strong Suggestions
+
+
+     The <relation exp> must not be a <monadic or dyadic other built-in relation op inv>. We
+remind you of the syntax of <order item> (repeated from Chapter 5):
+       <order item>
+          ::=   <direction> <attribute ref>
+
+       <direction>
+          ::=   ASC | DESC
+
+       Here is a more or less self-explanatory example of the use of RANK:
+       RANK P BY ( DESC WEIGHT AS WEIGHT_RANK )
+
+       Given our usual sample data, the result of this operation is as shown in Fig. 10.2 (we assume
+that attribute WEIGHT_RANK in that result is of type INTEGER). The effect of the operation is
+thus to “rank” part tuples in order of descending weight (of course, there is no implication that the
+system must perform a physical sort in order to obtain the desired result). The original quota query
+“Get the three heaviest parts” is now straightforward:
+       ( r WHERE WEIGHT_RANK  3 ) { ALL BUT WEIGHT_RANK }
+
+where r denotes the result of the RANK operation. Note: Given our usual sample data, this
+expression does indeed yield a result relation of exactly three tuples. However, if (say) part P4 had
+weight 18 instead of 14, it would yield four tuples, not three; and if there were currently only two
+parts altogether instead of six, it would necessarily yield only two tuples. See reference [56] for
+further analysis of such matters.
+╔════════════════════════════════════════════════════════════════╗
+║     ┌────┬───────┬───────┬────────┬────────┬─────────────┐     ║
+║     │ P# │ PNAME │ COLOR │ WEIGHT │ CITY   │ WEIGHT_RANK │     ║
+║     ├════┼───────┼───────┼────────┼────────┼─────────────┤     ║
+║     │ P1 │ Nut   │ Red   │     12 │ London │           5 │     ║
+║     │ P2 │ Bolt │ Green │      17 │ Paris │            2 │     ║
+║     │ P3 │ Screw │ Blue │      17 │ Rome   │           2 │     ║
+║     │ P4 │ Screw │ Red   │     14 │ London │           4 │     ║
+║     │ P5 │ Cam   │ Blue │      12 │ Paris │            5 │     ║
+║     │ P6 │ Cog   │ Red   │     19 │ London │           1 │     ║
+║     └────┴───────┴───────┴────────┴────────┴─────────────┘     ║
+╚════════════════════════════════════════════════════════════════╝
+Fig. 10.2: RANK example (result)
+
+       RANK is just shorthand, of course1—the example just shown is equivalent to the following:
+       WITH ( P RENAME ( WEIGHT AS WT ) ) AS T1 :
+       EXTEND P ADD ( COUNT ( T1 WHERE WT > WEIGHT ) + 1 AS WEIGHT_RANK )
+
+       Here is another example:
+
+
+1
+  Despite the fact that we claimed the opposite in reference [83] (and therefore proposed a different solution to the
+problem of quota queries in that reference, one that we now explicitly disavow).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                             235
+Part III / Informal Discussions and Explanations             Chapter 10 / RM Very Strong Suggestions
+
+
+      S JOIN ( ( RANK S BY ( ASC STATUS AS SR ) ) WHERE SR  2 ) { STATUS }
+
+(“Get all suppliers whose status is one of the two smallest”; given our usual sample data, the two
+smallest status values are 10 and 20, and so the result consists of suppliers S1, S2, and S4). The
+second operand to the join is an expression denoting a relation with one attribute, called STATUS,
+that contains the two smallest status values. The join then yields a relation containing exactly those
+suppliers having one of those two status values.
+      The <rank> shorthand facilitates the formulation of many kinds of statistical queries. We
+give just one more example here:
+      ( ( RANK S BY ( DESC STATUS AS SR ) )
+        WHERE SR  ( COUNT ( S ) / 10 ) ) { ALL BUT SR }
+
+(“Get the top 10 percent of suppliers,” where by “the top 10 percent” we mean those suppliers
+whose status is greater than that of the other 90 percent, loosely speaking).
+
+
+RM VERY STRONG SUGGESTION 6: GENERALIZED TRANSITIVE CLOSURE
+
+D should provide some shorthand for expressing the generalized transitive closure operation,
+including the ability to specify generalized concatenate and aggregate operations.
+
+                                      ———  ———
+
+Tutorial D already includes support for the transitive closure operator TCLOSE; unfortunately,
+however, TCLOSE by itself is not adequate for dealing with all possible recursive queries, as we
+now explain.
+       It is convenient to begin by repeating, and amplifying, some of the remarks on transitive
+closure from the discussion of RM Prescription 19 in Chapter 6. Consider the bill-of-materials
+relation MMQ shown in Fig. 10.3 (an extended version of Fig. 6.1 from Chapter 6). As explained
+in Chapter 6, we can refer to that relation as a digraph relation, because it can be represented as a
+directed graph of nodes and directed arcs; the nodes are named and possibly labeled (see later), the
+arcs are directed and (again) possibly labeled. For example, in the particular case of the graph for
+relation MMQ (refer to Fig. 10.4):
+
+ ■    Each node is named for a particular part.
+
+ ■    There is an arc from node Pi to node Pj if and only if part Pi contains part Pj as an immediate
+      component.
+
+ ■    Each arc is labeled with the corresponding quantity.
+
+ ■    The nodes are unlabeled.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       236
+Part III / Informal Discussions and Explanations            Chapter 10 / RM Very Strong Suggestions
+
+
+╔═════════════════════════════════════════════════════════════════╗
+║          ┌──────────┬────┬──────────┬────┬─────┬─────┐          ║
+║      MMQ │ MAJOR_P# : P# │ MINOR_P# : P# │ QTY : QTY │          ║
+║          ├══════════╧════┼══════════╧════┼─────┴─────┤          ║
+║          │ P1            │ P2            │         5 │          ║
+║          │ P1            │ P3            │         3 │          ║
+║          │ P2            │ P3            │         2 │          ║
+║          │ P2            │ P4            │         7 │          ║
+║          │ P3            │ P5            │         4 │          ║
+║          │ P4            │ P6            │         8 │          ║
+║          └───────────────┴───────────────┴───────────┘          ║
+╚═════════════════════════════════════════════════════════════════╝
+Fig. 10.3: Relation MMQ
+
+
+╔═════════════════════════════════════════════════════════════════╗
+║                                                                 ║
+║                                part P1                          ║
+║                                                                 ║
+║                 5                                     3         ║
+║                                                                 ║
+║                                                                 ║
+║               part P2              2                            ║
+║                                                                 ║
+║                 7                                               ║
+║                                                                 ║
+║               part P4                          part P3          ║
+║                                                                 ║
+║                 8                                     4         ║
+║                                                                 ║
+║               part P6                          part P5          ║
+║                                                                 ║
+╚═════════════════════════════════════════════════════════════════╝
+Fig. 10.4: Graph of relation MMQ
+
+      As noted in Chapter 6, it is often convenient to replace a directed graph such as that of Fig.
+10.4 by a pure hierarchy with possibly repeated nodes, as in Fig. 10.5.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        237
+Part III / Informal Discussions and Explanations           Chapter 10 / RM Very Strong Suggestions
+
+
+╔═════════════════════════════════════════════════════════════════╗
+║                                                                 ║
+║                                part P1                          ║
+║                                                                 ║
+║                5                                      3         ║
+║                                                                 ║
+║                                                                 ║
+║               part P2                          part P3          ║
+║                                                                 ║
+║      2                        7                       4         ║
+║                                                                 ║
+║     part P3            part P4                                  ║
+║                                                part P5          ║
+║      4                        8                                 ║
+║                                                                 ║
+║                                                                 ║
+║     part P5            part P6                                  ║
+╚═════════════════════════════════════════════════════════════════╝
+Fig. 10.5: Graph of relation MMQ as a hierarchy
+
+      Now, in Chapter 6 we explained how TCLOSE could be applied to what was effectively the
+projection of relation MMQ over MAJOR_P# and MINOR_P#; Fig. 10.6 (a repeat of Fig. 6.4)
+shows the result. And we claimed that TCLOSE was important in connection with the part
+explosion problem—i.e., the problem of finding all components, at all levels, of some specified part.
+For example, consider the problem of “exploding” part P2. Here is a Tutorial D formulation of this
+query:
+      ( ( TCLOSE ( MM { MAJOR_P#, MINOR_P# } ) )
+        WHERE MAJOR_P# = P#('P2') ) { MINOR_P# }
+
+╔═════════════════════════════════════════════════════════════════╗
+║                ┌──────────┬────┬──────────┬────┐                ║
+║                │ MAJOR_P# : P# │ MINOR_P# : P# │                ║
+║                ├══════════╧════┼══════════╧════┤                ║
+║                │ P1            │ P2            │                ║
+║                │ P1            │ P3            │                ║
+║                │ P2            │ P3            │                ║
+║                │ P2            │ P4            │                ║
+║                │ P3            │ P5            │                ║
+║                │ P4            │ P6            │                ║
+║                │ P1            │ P4            │                ║
+║                │ P1            │ P5            │                ║
+║                │ P1            │ P6            │                ║
+║                │ P2            │ P5            │                ║
+║                │ P2            │ P6            │                ║
+║                └───────────────┴───────────────┘                ║
+╚═════════════════════════════════════════════════════════════════╝
+Fig. 10.6: Transitive closure of MMQ { MAJOR_P#, MINOR_P# }
+
+      The trouble is, what we really need is something rather more general than just TCLOSE per
+se. Consider the query “What is the total quantity of part P5 that is needed to make part P1?”
+Inspection of either Fig. 10.4 or Fig. 10.5 will quickly show that the answer is 52:
+
+ ■    For each path from node P1 to node P5, we multiply the quantities that are the arc labels along
+      that path.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      238
+Part III / Informal Discussions and Explanations            Chapter 10 / RM Very Strong Suggestions
+
+
+ ■    Then we add together all the products so obtained.
+
+Refer to Fig. 10.7.
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                                                                              ║
+║    ( 5 * 2 * 4 ) + ( 3 * 4 )        52                                       ║
+║                                                                              ║
+║                                                                              ║
+║                                                                              ║
+║     concatenate (*)                           aggregate (+)                  ║
+║     along paths                               across paths                   ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+Fig. 10.7: Total quantity of part P5 in part P1
+
+       In practice, it turns out that what is often wanted is not just a simple part explosion as such
+but, rather, a gross requirement—which is, loosely speaking, a combination of the “part explosion”
+and “total quantity” queries. In other words, we want a listing of all the parts that go to make up a
+given part, together with the corresponding total quantities. Following reference [93], therefore, we
+suggest a generalized version of the transitive closure operation that is intended to address problems
+of this general nature. The operator takes four operands:
+
+ 1.     A relation of nodes and node labels (see below)
+
+ 2.     A relation of directed arcs and arc labels
+
+ 3.     A concatenate operator
+
+ 4.     An aggregate operator
+
+      In our example, operand 1 is the parts relation (not explicitly mentioned in the foregoing
+discussion); operand 2 is relation MMQ; operand 3 is “*”; and operand 4 is “+”. The operation
+returns a ternary relation with heading
+      { X T, Y T, Z C }
+
+where X and Y are “node” attributes and are as in operand 2 (note that they both have the same type
+T), Z represents the computed value obtained by following all paths from node X to node Y and
+applying the concatenate and aggregate operators appropriately, and C is the type of that computed
+value. The body of the result contains a tuple for every path, direct or indirect, in the operand 2
+graph.
+       Note: As it happens, there are no node labels in the bill-of-materials example, but such is not
+always the case. For example, consider an airline schedule. Here the nodes denote cities, the node
+labels are minimum connection times, the arcs denote flights, and the arc labels are departure and
+arrival times. Note moreover that the bill-of-materials graph is acyclic, but the airline schedule
+graph is not. If there can be cycles in the graph, the concatenate operator must be defined to take
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        239
+Part III / Informal Discussions and Explanations                    Chapter 10 / RM Very Strong Suggestions
+
+
+care of them somehow; for example, in the airline schedule example, it must reject routes that visit
+the same city twice.
+
+
+RM VERY STRONG SUGGESTION 7: USER-DEFINED GENERIC OPERATORS
+
+D should provide some means for users to define their own generic operators, including in
+particular generic relational operators.
+
+                                           ———  ———
+
+For simplicity, the discussion that follows concentrates on relational operators specifically. The
+points are all applicable to other generic operators as well, of course, mutatis mutandis.
+       Recall from earlier chapters that the built-in relational operators are all generic, in the sense
+that they work for all relations (loosely speaking). The operator JOIN, for example, applies to any
+pair of relations whatsoever; there is no question of the relations in question having to conform to
+certain specific relation types (except of course that attributes with the same name must be of the
+same type). Moreover, those operators are generic precisely because they are associated with a type
+generator—namely, RELATION—instead of with some specific relation type; they therefore apply
+to every specific relation type that is defined by means of that type generator.1
+       RM Very Strong Suggestion 7 suggests that it would be advantageous for users to be able to
+define generic operators of their own. By way of example, suppose Tutorial D did not include
+direct support for the Great Divide. Then, if the suggestion under discussion were implemented, it
+would be possible for users to define a generic Great Divide operator of their own. User-defined
+aggregate operators provide another example (the built-in aggregate operators—SUM, MAX, and
+so on—are also generic in the foregoing sense); for instance, it might be possible to define a
+MEDIAN operator in this way.
+       We have no concrete suggestions to offer regarding user-defined generic operators at this
+time, because we believe the issue requires further study.
+       Note: The foregoing discussion raises another possibility—namely, that it would be nice if
+users could also define their own type generators. We do not go so far as to make this possibility a
+concrete part of RM Very Strong Suggestion 7, however, since we believe it requires further study
+(over and above the further study already mentioned in the previous paragraph).
+
+
+
+
+1
+  As mentioned in passing in Chapter 6, generic operators thus constitute another kind of polymorphism (we considered
+overloading polymorphism in Chapter 6, and we will be discussing inclusion polymorphism at length in Chapter 14).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                     240
+Part III / Informal Discussions and Explanations            Chapter 10 / RM Very Strong Suggestions
+
+
+RM VERY STRONG SUGGESTION 8: SQL MIGRATION
+
+SQL should be implementable in D—not because such implementation is desirable in itself, but so
+that a painless migration route might be available for current SQL users. To this same end, existing
+SQL databases should be convertible to a form that D programs can operate on without error.
+
+                                      ———  ———
+
+We reject SQL as a long-term foundation for the future. However, we are not so naïve as to think
+that SQL will ever disappear; rather, it is our hope that some D will be sufficiently superior to SQL
+that it will become the database language of choice, by a process of natural selection, and SQL will
+become “the database language of last resort.” In fact, we see a parallel with the world of
+programming languages, where COBOL has never disappeared (and never will); but COBOL has
+become “the programming language of last resort” for developing applications, because preferable
+alternatives exist. We see SQL as a kind of database COBOL, and we would like some D to
+become a preferable alternative to it.
+       To repeat something we said in Chapter 1, however, we do realize that SQL databases and
+applications are going to be with us for a long time—to think otherwise would be quite
+unrealistic—and so we do have to pay some attention to the question of what to do about today’s
+SQL legacy. Hence the present “very strong suggestion.”
+       Please note immediately that the suggestion in question does not mean that D needs to be a
+proper superset of SQL. Rather, it means that it should be possible to write a “front end”—i.e., a
+layer of D code on top of the true relational functionality of D—that (a) will accept SQL operations
+against converted SQL data and (b) will give the results that those SQL operations would have
+given if they had been executed against the original unconverted SQL data. We believe it should be
+possible to construct such a front end without contravening any of the prescriptions and
+proscriptions laid down in the Manifesto. (An analogous remark applies to the recommendation that
+SQL databases be convertible to D form, of course.) In fact—noting that D is computationally
+complete, and noting too that SQL front ends already exist for many nonSQL systems—we see no
+reason to doubt the feasibility of producing a front end such as the one under consideration.
+       Of course, we would not want a D database, even one that is really just a converted SQL
+database, to be accessible only via SQL; rather, we would like it to be available for use in native D
+mode as well. To that end, it is important for anyone involved in the development of such a front
+end to bear the following goals in mind:
+
+ ■    First of all (to repeat), users must be able to make direct use of D for ad hoc queries and for
+      developing new applications on the D version of the database.
+
+ ■    That D database should not be encumbered with material placed there solely to support the
+      SQL front end. Such material, having no obvious bearing on the enterprise the database is
+      intended to serve, might cause undue confusion for D users.
+
+ ■    SQL users should not be deprived of the benefits of the D optimizer. Such deprivation would
+      arise, for example, if the SQL front end used D as a mere access method, instead of mapping
+      high-level SQL expressions into equally high-level D expressions.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         241
+Part III / Informal Discussions and Explanations                      Chapter 10 / RM Very Strong Suggestions
+
+
+      We should add that it will almost certainly not be possible to achieve these goals 100 percent,
+though we do think they should be strongly striven for. The fact is, there are certain features in
+SQL that (as far as we can see) could only be fully supported in an SQL front end if D in turn
+contained analogous features of its own—and the features in question are either ones we explicitly
+proscribe or ones that would constitute blatant violations of D’s conceptual integrity (and such
+violations are implicitly proscribed by RM Prescription 26). We hope and believe that the SQL
+features in question are so pathological that uses of them will be few and far between, sufficiently
+so for it to be acceptable for such uses to be worked around on a case-by-case basis.1 Examples that
+come to mind are:
+
+    ■   View updating where the effects prescribed by SQL are logically incorrect (in particular, view
+        updating when WITH CASCADED CHECK OPTION is not specified)
+
+    ■   The SQL statement SET CONSTRAINTS (all constraints are “immediate” in D, and there is
+        no notion of dynamically switching them on and off)
+
+    ■   SQL expressions that select the same column twice without performing any kind of column
+        renaming (e.g., the SQL expression SELECT A, A FROM T)
+
+and so on
+      To return to the main thread of the discussion: We now proceed to offer a few practical
+suggestions for implementing the desired SQL front end. Of course, it goes without saying that our
+suggestions are nowhere near being a complete design—they are only “notes toward” such a
+design—but they do address certain questions that come to mind almost immediately when our RM
+Proscriptions in particular are considered in such a context.
+      First of all, we assume that the process of converting an SQL database to a D analog is
+reasonably “direct,” in the sense that (a) every SQL base table maps to a D real relvar, and (b) every
+column in such a base table maps to an attribute in the corresponding relvar. Under that
+assumption, of course, we are immediately confronted with the possibility that the base table in
+question might contain duplicate rows or nulls or both. Direct support for these features is
+expressly prohibited in D by RM Proscriptions 3 and 4, so what is to be done? This question is the
+topic of the two subsections immediately following.
+
+Duplicate Rows
+
+An SQL base table permits duplicate rows if and only if no key is declared for it via either
+PRIMARY KEY or UNIQUE. Given such a base table T, then, the D relvar R corresponding to T
+will have to have an extra attribute (i.e., one not corresponding to any column in T) to provide the
+necessary key functionality. That attribute can be declared with default SERIAL ()—meaning it
+constitutes a “system key”—if D supports RM Very Strong Suggestion 1 as discussed earlier in this
+chapter. The SQL front end can now support certain SQL INSERT operations by mapping them
+directly into D INSERTs; since values for the extra attribute are provided by the system, no
+
+1
+  In fact, we are somewhat skeptical as to whether the features in question are supported in existing SQL front ends
+either (or even in SQL DBMSs, in some cases).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                            242
+Part III / Informal Discussions and Explanations              Chapter 10 / RM Very Strong Suggestions
+
+
+corresponding attribute is needed in the relation to be inserted, and of course there is no
+corresponding column in the SQL table to be inserted into.
+        Unfortunately, if T permits duplicate rows, it follows that any table t to be inserted into T
+might contain duplicate rows as well. Let r be the D relation corresponding to t. Like R, therefore,
+r will need an extra attribute (i.e., one over and above those corresponding to the columns of t). Our
+suggested TAG relational operator can be used to provide that extra attribute; if we are not careful,
+however, we could now be faced with a situation in which each of r and R has an attribute that has
+no counterpart in the other. And even if we are careful to ensure the extra attributes do correspond
+(i.e., they have the same name—X, say—and the same type in both r and R), there is still the
+problem that, in general, the X values provided for r by TAG will clash with the X values already
+present in R. Note: We are assuming here that TAG generates X values that start again from one
+every time it is invoked; the clash occurs because {X} is supposed to be a key for R. One solution
+to this problem is to extend TAG to allow the user to specify a different starting value on different
+invocations, a possibility mentioned under RM Very Strong Suggestion 1.
+        We also need to address the problem of naming the systematically generated attributes that
+have no corresponding SQL columns. Happily, SQL expressly prohibits column names that begin
+with an underscore; assuming D has no such prohibition, therefore, we have here the basis of an
+obvious way to avoid naming clashes. What is more, the same approach could also simplify the
+task of the SQL front end in hiding the extra attributes from its users.
+        Next, we need to consider the question of duplicate rows that are dynamically generated—i.e.,
+the question of those SQL operators that can generate duplicate rows at run time. The operators in
+question are (a) SELECT without DISTINCT, (b) VALUES, and (c) UNION ALL:
+
+ ■      SELECT without DISTINCT and VALUES can both be implemented by using our suggested
+        TAG operator and having the front end discard attributes generated by TAG on presentation
+        of final results.
+
+ ■      The same treatment is not suitable for UNION ALL, but here an easy solution lies in merely
+        adding a constant attribute to the D relations corresponding to the SQL tables that are the
+        operands of the UNION ALL. For example, the SQL expression
+        SELECT * FROM T1 UNION CORRESPONDING ALL SELECT * FROM T2
+
+        can be mapped to the Tutorial D expression
+        ( EXTEND T1 ADD ( 1 AS _EXTRA ) ) UNION ( EXTEND T2 ADD ( 2 AS _EXTRA ) )
+
+        Again, of course, the front end would have to discard the extra attribute on presentation of the
+        final result.
+
+Nulls
+
+Nulls in SQL are hard to explain. There are many reasons for this state of affairs, but one important
+one is that, despite the fact that in SQL circles they are often explicitly called null values, SQL nulls
+are not really values at all but “marks” [23]. However (and regardless of whether or not you agree
+with this position), the fact is that nulls will have to map to values in D, because in D every
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          243
+Part III / Informal Discussions and Explanations            Chapter 10 / RM Very Strong Suggestions
+
+
+expression—be it an operator invocation, a simple literal, an attribute reference, a parameter
+reference, a variable reference, or whatever—always denotes a value specifically. With this point in
+mind, therefore, we offer the following observations:
+
+ ■    The built-in SQL type INTEGER is not the same as the built-in type of that name typically
+      found in conventional programming languages (and a similar observation applies to all of the
+      other built-in types in SQL). The reason is that, as the SQL standard puts it, “[every] data
+      type includes a special value, called the null value” [99].
+
+ ■    The Manifesto prescribes support for the built-in type boolean. The SQL standard does
+      support a type it calls BOOLEAN, but that type is not the same as the prescribed type for at
+      least the reasons explained in Appendix H, q.v. In any case, most SQL implementations do
+      not explicitly support type BOOLEAN (though they do support expressions—e.g., in
+      WHERE clauses—that return truth values, as the SQL standard requires).
+
+ ■    The SQL equality comparison operator is not the same as that found in conventional
+      languages. In particular, it is not the same as the equality comparison operator required in D.
+
+ ■    The other scalar operators of SQL, where they have apparent counterparts in conventional
+      languages, are not the same as those apparent counterparts. For example, the SQL operators
+      “+” and “||” (concatenate) are not the usual “+” and “||” operators. Indeed, the types of the
+      operands of those operators are not the usual types, as already noted above.
+
+      These four points, we suggest, crystallize the problems (or, at least, the major problems)
+arising from nulls that confront the implementer of an SQL front end. Now we make some
+observations regarding D that might point to ways of addressing those problems:
+
+ ■    As noted in the introduction to this part of the book, the Manifesto is intended to be open
+      ended; i.e., anything not explicitly prescribed is permitted, unless of course it leads to a
+      violation of something explicitly prescribed or proscribed. In particular, therefore, there are
+      no proscribed types, and there are no proscribed operators (generally speaking). Nor do we
+      have any prescriptions or proscriptions concerning concrete syntax, modulo RM Prescription
+      26.
+
+ ■    As a consequence of the foregoing point, D is at least theoretically permitted to have (e.g.) an
+      operator called “+” that is not the normal operator of that name. A similar remark applies to
+      “=”. That said, however, we venture to suggest that to use such names for SQL-like
+      perversions of the operators they normally stand for would be counter to the spirit of D. A
+      similar remark applies to the names of built-in types such as INTEGER and BOOLEAN (as
+      well as all of the other familiar ones—CHAR, DATE, TIME, and so on).
+
+ ■    But if D had a built-in type called INTEGER that was the same as the type of that name found
+      in conventional languages, it could certainly also have another type (built in or otherwise),
+      perhaps called SQL_INTEGER, with properties analogous to those of the SQL type called
+      INTEGER. A similar remark applies to other built-in types.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        244
+Part III / Informal Discussions and Explanations            Chapter 10 / RM Very Strong Suggestions
+
+
+ ■    Likewise, if D had “=” as its operator for equality comparison, it could also have another
+      operator (perhaps “sql=”) for the corresponding but different SQL operator. A similar remark
+      applies to other SQL scalar operators.
+
+       In other words, we would expect D to have first claim on the usual names for the most
+familiar types and operators, but to provide counterparts (or allow the user to define counterparts) to
+all of the corresponding but different SQL types and operators, with names that are different from
+those of SQL for those counterparts.
+       Now suppose SQL base table T has a column I of (SQL) type INTEGER. Suppose too that
+when base table T is mapped to D relvar T, column I becomes attribute I, of type SQL_INTEGER.
+We now point out certain consequences of the foregoing observations (using Tutorial D syntax
+specifically, as and where appropriate):
+
+ ■    The SQL expression
+      SELECT * FROM T WHERE I < 10
+
+      maps to the Tutorial D expression
+      T WHERE ( I sql< 10 ) = SQL_BOOLEAN ( 'TRUE' )
+
+      We explain this mapping as follows. First of all, the SQL “<” operator maps to a Tutorial D
+      analog of that operator (“sql<”). Since this latter operator does not yield values of the
+      Tutorial D type BOOLEAN, we must operate on its result with some operator that does—
+      namely, the Tutorial D equality comparison operator (“=”). Let the Tutorial D type
+      corresponding to operators such as sql< (and, in particular, sql=) be SQL_BOOLEAN, with
+      values SQL_BOOLEAN ('TRUE'), SQL_BOOLEAN ('FALSE'), and SQL_BOOLEAN
+      ('UNKNOWN'). In the example, then, the right comparand in the WHERE clause is specified
+      as an invocation of the selector corresponding to that type. In general, in fact, the SQL
+      WHERE clause “WHERE cond” will map to the D WHERE clause “WHERE (SQL_cond) =
+      SQL_BOOLEAN ('TRUE')” (where SQL_cond is the mapped version of cond, of course).
+
+ ■    The SQL expression
+      SELECT DISTINCT I, J, ..., K FROM T
+
+      can be mapped more directly into just
+      T { I, J, ..., K }
+
+      This straightforward mapping is possible because SQL reverts to the normal treatment of
+      equality in places where its usual treatment is impossible to apply in any sensible or
+      meaningful way.
+
+ ■    The SQL front end will certainly require SQL_INTEGER to be an ordinal type, because the
+      INTEGER type of SQL is such a type. Thus, the Tutorial D expression
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        245
+Part III / Informal Discussions and Explanations            Chapter 10 / RM Very Strong Suggestions
+
+
+      T WHERE I < SQL_INTEGER ('20')
+
+      might be valid. Whether the result of that expression includes those tuples of T for which the
+      I value is SQL_INTEGER ('NULL') will depend, of course, on how the operator “<“ is
+      defined for type SQL_INTEGER.
+
+ ■    The result of the Tutorial D expression
+      T WHERE I ≠ SQL_INTEGER ('20')
+
+      certainly does include those tuples of T for which the I value is SQL_INTEGER ('NULL'),
+      unlike its SQL counterpart:
+      SELECT * FROM T WHERE I <> 20
+
+      (The symbol “<>” here is SQL syntax for “≠”.) We venture to suggest that—at least in some
+      cases—D expressions involving tables derived from SQL databases with nulls will give
+      results that are more intuitively acceptable than those of SQL expressions.
+
+       The foregoing proposals, it has to be said, might make it difficult to meet our goal of making
+the converted SQL database usable “in native D mode.” At the same time, we are aware that some
+SQL database administrators today already implement a null-free policy (at least insofar as it is in
+fact possible to steer clear of nulls in SQL), and it would be a shame for users of such databases to
+have to put up with any inconvenience arising from a migration strategy that takes nulls into
+account. For databases that have been implemented under a null-free policy, therefore, we believe
+it should be possible to map the built-in types and operators of SQL directly to their obvious
+counterparts in D and deal manually with any SQL expressions that make use of operators that
+generate nulls dynamically (e.g., outer joins and aggregations over empty sets).
+       We now turn to certain other SQL features and idiosyncrasies that will require special
+attention in the SQL front end. Note: Most of the subsections that follow have to do with features
+introduced into SQL with SQL:1999, and tutorial descriptions of those features can be found in
+references [41] and [116-117]. There do not seem to be any tutorials available on SQL:2003 at the
+time of writing.
+
+SQL Column Names vs. D Attribute Names
+
+The following SQL peculiarities will need to be addressed:
+
+ ■    There is more than one way of referring to a column in SQL expressions. For example, the
+      SQL expression
+      SELECT T1.C FROM T AS T1
+
+      is equivalent to the SQL expression
+      SELECT C FROM T AS T1
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       246
+Part III / Informal Discussions and Explanations           Chapter 10 / RM Very Strong Suggestions
+
+
+     As a consequence, the result of the first expression yields a table whose sole column is named
+     C and not T1.C. Hence, the following expression (for example) is not valid in SQL:
+     SELECT T2.T1.C FROM ( SELECT T1.C FROM T AS T1 ) AS T2
+
+     It follows that if D adopts the simple approach to attribute naming and referencing used in
+     Tutorial D (an approach we would certainly recommend for consideration by other D
+     designers), then the mapping of SQL FROM clauses will be nontrivial. However, the
+     Tutorial D support for systematic renaming of all attributes could be useful in this
+     connection. For example, the SQL FROM clause
+     FROM T1, T2
+
+     could be mapped to
+     ( T1 RENAME ( PREFIX '' AS 'T1_' ) )
+     JOIN
+     ( T2 RENAME ( PREFIX '' AS 'T2_' ) )
+
+     This mapping would avoid the problem that arises when T1 and T2 have columns of the same
+     name. Of course, there would be obvious implications for mapping other parts of the overall
+     SQL expression that contained the FROM clause in question.
+
+ ■   The SQL expression
+     SELECT A + B FROM T
+
+     yields a table with an “anonymous” column. The SQL standard actually requires such
+     columns to acquire unpredictable column names, so the SQL front end to D could perhaps
+     simply follow the standard’s prescription in this respect (but taking the extra precaution of
+     ensuring that no two columns in the same table have the same name). Our previous
+     suggestion concerning attribute names beginning with underscores could be of help here.
+
+ ■   The SQL expression
+     SELECT * FROM T1 UNION SELECT * FROM T2
+
+     cannot in general be mapped to
+     T1 UNION T2
+
+     (why not?). Thus, it might be necessary to rename attributes so that corresponding attributes
+     in the operands of the union have the same name. Unfortunately, this fact implies that the
+     SQL-to-D database conversion process will have to keep some record of SQL left-to-right
+     column order, because there will (of course) be no analogous attribute ordering in D. (In fact,
+     such a record will be needed for several other reasons anyway—e.g., supporting SELECT * or
+     INSERT when no column names are specified.)
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          247
+Part III / Informal Discussions and Explanations            Chapter 10 / RM Very Strong Suggestions
+
+
+Character String Comparisons
+
+As noted in Chapter 6 (under RM Prescription 8), it is possible in SQL for the character strings
+      'AB'
+
+and
+      'AB '
+
+to be treated as equal; to be specific, they are treated as equal if and only if PAD SPACE applies to
+the applicable “collation” [41]. In effect, PAD SPACE means that trailing space characters are
+implicitly trimmed before the comparison is done. That implicit trimming will have to be made
+explicit in D.
+
+Cursors
+
+Cursor operations can be implemented as follows:
+
+ ■    OPEN causes the relation to be iterated over to be copied into an array (probably with some
+      appropriate locking), as in the <relation get> operation of Tutorial D (see Chapter 5).
+
+ ■    If “the cursor is updatable” [41], then each row in that array will have to include, either
+      explicitly or implicitly, some key value for the corresponding row from the underlying real
+      relvar.
+
+ ■    FETCH is straightforward.
+
+ ■    DELETE or UPDATE WHERE CURRENT—in some respects the most questionable of all
+      SQL operators—can be simulated by means of a D DELETE or UPDATE WHERE on the
+      underlying table, using the appropriate key value (which will have to be retrieved in response
+      to the corresponding FETCH, regardless of whether the key columns are “columns of the
+      cursor”). If the cursor is a scroll cursor, however, there are some tricky decisions to be made:
+
+      ●   DELETE: Suppose the cursor is positioned on the third row of a four-row result (i.e., that
+          row is the DELETE target). In some implementations the DELETE closes the gap, so
+          that FETCH ABSOLUTE 4 will now fail and FETCH ABSOLUTE 3 will fetch the
+          original fourth row; in others, the DELETE just marks the row as deleted and does not
+          close the gap, so that FETCH ABSOLUTE 3 will now fail and FETCH ABSOLUTE 4
+          will succeed. The standard allows either behavior.
+
+      ●   UPDATE: Here the standard specifies that the current row of the cursor is to be updated
+          as well as the corresponding base table row. However, it appears to overlook the fact that
+          elsewhere it states that the UPDATE target column names refer to columns of the
+          underlying base table, not columns of the cursor! For example, let table T have columns
+          X, Y, and Z, and let cursor CR1 be defined on SELECT X AS Y FROM T. Then the
+          effect of, e.g., UPDATE T SET X = 1, Y = 2, Z = 3 WHERE CURRENT OF CR1 is
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        248
+Part III / Informal Discussions and Explanations           Chapter 10 / RM Very Strong Suggestions
+
+
+          unclear. Presumably at most one of the three assignments can affect the sole column of
+          the cursor, and presumably the assignment to Z cannot be the one in question. It would
+          seem logical for the cursor column to be assigned 1, to keep it as a copy of T.X, but the
+          standard does not actually say as much. The front end might like to take guidance from
+          whichever SQL implementation it would most like to emulate.
+
+ARRAY Types
+
+The Third Manifesto does not prohibit D from including support for “collection” type generators, so
+D could legitimately support an ARRAY type generator, and we would certainly expect such
+support to include everything needed in connection with SQL’s array types. (Of course, if such an
+ARRAY type generator were indeed supported, it would presumably replace or subsume the limited
+array support described in Chapter 5. Note, however, that it would still be the case that array
+variables would not be allowed in the database, thanks to The Information Principle. See RM
+Prescription 16.)
+
+MULTISET Types
+
+D could support a MULTISET type generator as a direct counterpart to SQL:2003’s new
+MULTISET type constructor (though with the proviso that multiset variables would not be allowed
+in the database).
+
+ROW Types
+
+Everything needed in connection with SQL’s row types can easily be simulated in D by means of
+the tuple type support required by RM Prescriptions 6 and 9.
+
+XML Data
+
+D could support an XML type as a direct counterpart to SQL:2003’s type of that name (see
+reference [76] for a tutorial discussion of that new type). D’s support would necessarily include
+support for equality comparison (and all of the SQL constructs that depend on it, such as SELECT
+DISTINCT, NATURAL JOIN, FOREIGN KEY, and so on), over and above the XML facilities
+defined in the SQL standard.
+
+User-Defined Types
+
+SQL divides user-defined types into two kinds, “structured types” and “DISTINCT types.”
+However, the difference between the two appears to be artificial and without good justification; we
+would not expect D to embrace it, therefore, even if it does not directly contravene any of our
+prescriptions or proscriptions. (The terminology is bad, too, inasmuch as all user-defined types,
+even the so-called structured ones, are still best thought of as scalar types in our terms.)
+
+Representations: The most immediately obvious difference between structured and DISTINCT
+types is in the way their representations are specified. For a structured type, the representation is
+specified as a commalist of components called attributes (each consisting of an attribute-name/type-
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      249
+Part III / Informal Discussions and Explanations           Chapter 10 / RM Very Strong Suggestions
+
+
+name pair); for a DISTINCT type, the representation is specified as a single type name, and
+furthermore the specified type must be built in (e.g., INTEGER, REAL, BLOB). Both of these
+styles of specification are easily mappable to a D possrep, with just a single component in the case
+of a DISTINCT type.
+      Unfortunately, however, there is no notion in SQL of each “possrep” automatically having an
+associated selector operator (see below), and so there cannot be any notion of every value of the
+type in question being produced by some invocation of such a selector. This fact could give rise to
+some difficulty in connection with inheritance (see Part IV of this book). For example, suppose
+type POINT has the usual cartesian coordinates representation, with components X and Y. Then
+SQL will allow us to define a subtype of POINT—COLORED_POINT, say—whose values cannot
+be represented by X and Y components! (By X and Y components alone, that is. The
+representation for colored points would presumably involve three components—X, Y, and
+COLOR.) By contrast, a D version of this example might involve three types, not two: a dummy
+type corresponding to both uncolored and colored points, and two subtypes of that dummy type,
+POINT and COLORED_POINT, corresponding to uncolored and colored points, respectively. (See
+Chapter 14 for an explanation of dummy types, and Appendix G for an extended discussion of
+examples of this same general nature.)
+
+Operators implied by representations: RM Prescriptions 4 and 5 require each declared possrep
+to cause automatic provision of a corresponding selector operator and certain operators for exposing
+the possrep in question (THE_ operators, in Tutorial D). We have already observed that SQL has
+no counterpart to our selector; however, it does require each declared representation to cause
+automatic provision of certain observer and mutator methods. The “observer” methods correspond
+exactly to the read-only operators required by RM Prescription 5. The “mutator” methods do not
+correspond exactly to the update operators required by RM Prescription 5, however, because they
+are not update operators!—they do not operate on a variable specifically, and they do return a value.
+In fact, an SQL mutator method invocation is logically equivalent to a certain selector invocation
+(and hence can easily be implemented in the proposed front end). See Appendix H for further
+explanation.
+
+Lack of selector operators: The fact that SQL does not automatically provide selectors makes it
+likely that SQL type implementations will explicitly include user-defined analogs of those
+operators. But those analogs will be redundant with D’s selectors and might well conflict in name
+with them.
+
+Constructor functions: Let T be an SQL structured type; then T has an associated niladic
+constructor function that, when invoked, returns that value of type T whose every attribute has the
+default value defined for that attribute. While we would not expect D to provide direct analogs of
+such constructors, it should be clear that the SQL front end can easily do so.
+      We remark that certain other automatically provided SQL operators might also have no direct
+analogs in D, in which case they can be handled in like manner. Alternatively, D might include
+certain operators for the specific purpose of aiding SQL migration in this regard, operators that are
+not prescribed, nor even suggested, in the Manifesto as such. However, implementers considering
+such operators should watch out for possible violations of conceptual integrity; in particular, they
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      250
+Part III / Informal Discussions and Explanations             Chapter 10 / RM Very Strong Suggestions
+
+
+should make sure that any advantage for migrators from SQL is not outweighed by disadvantages
+conferred on direct users of D.
+
+Methods: SQL’s “methods” are SQL functions (i.e., read-only operators) of a certain special kind.
+In particular, they are bundled with certain types—that is, the definition of any given method is
+actually part of the definition of some user-defined type—and they therefore contravene OO Very
+Strong Suggestion 2. But that bundling can surely be confined to the SQL front end (i.e., it need not
+be supported in D itself). Similarly, SQL’s special method invocation syntax can be mapped to D’s
+own read-only operator invocation syntax.
+      A possible problem arises here in connection with inheritance, however. The problem is that,
+in our inheritance model (again, see Part IV of this book), we suggest that the process of “run-time
+binding” be done on the basis of the types of all arguments; however, the analogous process for
+SQL’s methods is done on the basis of the type of the argument corresponding to what SQL calls
+the “subject parameter” only. Care might thus be needed to ensure that an SQL method invocation,
+when mapped to some D read-only operator invocation, really does have exactly the desired effect.
+
+NOT INSTANTIABLE types: The SQL concept of a NOT INSTANTIABLE type makes sense
+only if the type in question has subtypes. It maps directly to our “union type” concept (once again,
+see Part IV).
+
+FINAL types: SQL allows a type to be specified as FINAL, prohibiting the subsequent definition
+of subtypes of that type. Support for FINAL could be provided directly in D if desired—in
+particular, if desired for SQL migration purposes—without contravening any aspect of the
+Manifesto. Without such support, FINAL types might constitute a small migration problem, but not
+one we believe to be particularly significant.
+
+Further remarks on type inheritance: Overall, SQL’s provisions for inheritance fall a long way
+short of conforming to our own inheritance model (see Appendix H for more details). So far as we
+are aware, however, all of the deviations are errors of omission, not commission (major examples
+include SQL’s notable lack of support for type constraints and consequent lack of support for
+specialization by constraint, also its lack of proper support for multiple inheritance). Such errors
+thus present no problem insofar as mapping to D is concerned, with one major exception—the lack
+of support for selectors (and we have already discussed some of the consequences of this particular
+failure earlier in this section).
+
+SQL Routines
+
+SQL’s user-defined procedures and functions (excluding methods) should be readily convertible to
+D update and read-only operators, respectively. User-defined methods will probably require some
+kind of special treatment as already discussed. Note that D would not contravene any of our
+prescriptions or proscriptions if it included special constructs to assist with support for SQL’s “user-
+defined casts and transforms” [99].
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         251
+Part III / Informal Discussions and Explanations                       Chapter 10 / RM Very Strong Suggestions
+
+
+REF Types
+
+A strong case can be made that SQL’s REF (“reference”) types violate OO Proscription 2. Even if
+you do not agree with this position, it is certainly true that a “D” that included any such support
+would be in violation of RM Prescription 26, with respect to conceptual integrity in particular.
+Thus, D will in fact not include any such support. Assuming D does support system keys, however,
+along the lines described under RM Very Strong Suggestion 1 earlier in this chapter, all SQL
+operators on REF values are certainly implementable, because the operators in question are all
+defined as shorthands for SQL expressions whose implementation in the SQL front end we have
+already discussed.
+
+Typed Tables
+
+For the purposes of this subsection and the next, we take the term typed table to mean an SQL base
+table or view whose definition is specified in part by reference to some structured type. Column
+names and types for a typed table “of (structured) type T” are taken from the attribute definitions
+that constitute the specified representation of T. Clearly, this particular aspect of typed tables could
+be supported in the SQL front end without requiring any analogous support in D itself. (Indeed, we
+would not expect any analogous support in D itself, since such support would come dangerously
+close to contravening OO Proscription 1.)
+      In addition to the columns implied by the definition of its associated type T, an SQL typed
+table has a column of type REF(T), the REF type implied by the existence of T. Such a column is
+called a “self-referencing column” and is required to have the uniqueness property. Moreover, it is
+possible for the values of such a column to be system generated. We see no great difficulty for the
+SQL front end here (see the remarks in the previous subsection regarding RM Very Strong
+Suggestion 1).
+
+Subtables and Supertables
+
+If “typed tables” TT1 and TT2 are “of” types T1 and T2, respectively, and if T2 is a subtype of T1,1
+then SQL allows table TT2 to be specified as a subtable of supertable TT1. For reasons explained at
+length in Appendix G, this notion is one we find especially suspect, and direct support for it in D is
+clearly out of the question. Indeed, we show in that same appendix how the problems that subtables
+and supertables are supposed to solve can easily be solved by conventional relational mechanisms,
+without the need for any new concepts at all. Those mechanisms should thus provide a basis for
+workarounds (probably manual ones) that might be needed in the case of applications that “take
+advantage of” this very dubious SQL feature.
+
+Triggered Procedures
+
+As noted in Chapter 1, The Third Manifesto is deliberately silent on the subject of triggered
+procedures. SQL’s CREATE TRIGGER could perhaps be supported by some direct counterpart in
+
+1
+  We stress the fact that the statement “T2 is a subtype of T1” here is to be interpreted in accordance with the SQL
+specifications, not in accordance with our own inheritance model.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                            252
+Part III / Informal Discussions and Explanations            Chapter 10 / RM Very Strong Suggestions
+
+
+D without violating any of our prescriptions or proscriptions, unless it led to violations of The
+Assignment Principle (note in particular in this connection that SQL’s BEFORE triggers are
+explicitly permitted to override source values).
+
+CUBE, ROLLUP, etc.
+
+The extensions to GROUP BY that came into the standard with SQL:1999, such as CUBE and
+ROLLUP, are all specified as shorthands for certain SQL:1992 expressions. They should therefore
+present no great problem for our SQL front end—despite the fact that provision of direct
+counterparts in D would represent a violation of conceptual integrity (because the operators in
+question effectively involve unions of relations of different types).
+
+WINDOW Clauses
+
+SQL:2003’s new WINDOW clauses do not violate any of our prescriptions or proscriptions, so
+direct counterparts could be provided in D.
+
+Identity and System-Generated Columns
+
+SQL:2003’s new “identity column” and “system-generated column” features do not violate any of
+our prescriptions or proscriptions, so direct counterparts could be provided in D. (In the case of
+identity columns, that direct counterpart would effectively constitute an adoption of RM Very
+Strong Suggestion 1.)
+
+Sequence Generators
+
+SQL:2003’s new sequence generators violate RM Prescription 16, for they are SQL database
+objects that are not even tables, let alone relvars. However, front-end support for sequence
+generators should be a simple matter if RM Very Strong Suggestion 1 is adopted to support identity
+columns. In SQL, identity columns are defined in terms of sequence generators. In an SQL front
+end to D, it could be the other way around; for example, NEXT VALUE FOR ... could be
+implemented by inserting a tuple into a relvar with a system-generated key and returning the
+cardinality of that relvar after the insert.
+
+
+EXERCISES
+
+10.1   Consider any SQL product that might be available to you. Does that product support
+       anything resembling the features discussed under RM Very Strong Suggestion 1?
+
+10.2   What is a superkey?
+
+10.3   Consider the referential actions (cascade delete, etc.) mentioned briefly under RM Very
+       Strong Suggestion 2. Do such actions violate The Assignment Principle? Justify your
+       answer.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         253
+Part III / Informal Discussions and Explanations              Chapter 10 / RM Very Strong Suggestions
+
+
+10.4   It has been suggested that CASCADE might be supported as an option on DELETE and
+       UPDATE instead of including it in a declarative foreign key specification; for example,
+       DELETE S WHERE S# = S#('S1') CASCADE would delete the S tuple for supplier S1 and
+       all of the SP tuples that referred to it. Evaluate this suggestion.
+
+10.5   We said under RM Very Strong Suggestion 2 that there were good usability and productivity
+       arguments in favor of supporting referential actions. What are those arguments?
+
+10.6   The relational model as originally defined required a foreign key to reference not just some
+       candidate key but, rather, a primary key specifically. What are the advantages of such a
+       requirement? What are the disadvantages?
+
+10.7   Design an extension to the FOREIGN KEY syntax suggested in this chapter that would
+       allow us to specify that every tuple of a specified relvar R has a value for a specified set of
+       attributes that appears as a value of a specified key in (a) exactly one, (b) at least one, (c) all,
+       of some specified set of relvars R1, R2, ..., Rn (n > 0).
+
+10.8   With reference to the usual suppliers-and-parts database, write an expression using RANK
+       to get all parts whose weight is exactly the third smallest.
+
+10.9   Using the syntax sketched under RM Very Strong Suggestion 4, write transition constraints
+       for the following “business rules” on the suppliers-and-parts database:
+
+       a.   Suppliers in Athens can move only to London or Paris, and suppliers in London can
+            move only to Paris.
+
+       b.   The total shipment quantity for a given part cannot be reduced in a single update to less
+            than half its current value.
+
+       (What do you think the qualification “in a single update” means here? Why is it important?
+       Is it important?)
+
+10.10 Define a Tutorial D operator for the “gross requirement” problem (see RM Very Strong
+      Suggestion 6).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            254

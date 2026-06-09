@@ -1,0 +1,400 @@
+                                                     Chapter 7
+
+                                         RM Proscriptions
+
+RM PROSCRIPTION 1: NO ATTRIBUTE ORDERING
+
+D shall include no concept of a “relation” whose attributes are distinguishable by ordinal position.
+Instead, for every relation r expressible in D, the attributes of r shall be distinguishable by name.
+
+                                             ———  ———
+
+By definition, the attributes of a relation—at least as that term is used in the relational model—have
+no left-to-right ordering and hence cannot be distinguished by ordinal position.1 Instead, they are
+distinguished by name. And in The Third Manifesto, by virtue of several of the RM Prescriptions
+taken together, every attribute of every relation is indeed distinguishable by name. To be more
+specific, every relation in D is obtained by evaluating some relational expression, and (at least in
+Tutorial D) the rules for such expressions are such as to guarantee that the desired property is
+satisfied. For let rx be such an expression. The
+
+    ■   If rx consists of a relational expression enclosed in parentheses, then its semantics are the
+        same as if those parentheses were removed.
+
+    ■   If rx consists of a relation selector invocation, then the attribute names are specified,
+        implicitly or explicitly, as part of that invocation.
+
+    ■   If rx consists of a relvar reference (in other words, a relvar name), then the attribute names are
+        specified, implicitly or explicitly, as part of the definition of the relvar in question.
+
+    ■   If rx consists of a THE_ operator invocation in which the possrep component being accessed
+        is relation valued, then the attribute names are specified, implicitly or explicitly, as part of the
+        definition of the relation-valued component in question.
+
+    ■   If rx consists of an attribute extractor invocation in which the attribute being accessed is
+        relation valued, then the attribute names are specified, implicitly or explicitly, as part of the
+        definition of the attribute in question.
+
+    ■   If rx consists of an invocation of a user-defined relational operator, then the attribute names
+        are specified, implicitly or explicitly, as part of the definition of the operator in question.
+
+
+
+
+1
+ For reasons that need not concern us here, relations in mathematics, unlike their counterparts in the relational model,
+do have a left-to-right order to their attributes (and likewise for tuples, of course).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                     page 202
+Part III / Informal Discussions and Explanations                                    Chapter 7 / RM Proscriptions
+
+
+    ■   If rx consists of an invocation of some built-in relational operator, then the attribute names are
+        inferred by means of the prescribed relation type inference mechanism.
+
+    ■   If rx consists of an <introduced name> or a <relation with expression>, then rx is basically
+        shorthand for one of the cases already considered.
+
+      Despite all of the foregoing, we still feel it worthwhile to state RM Proscription 1 explicitly,
+owing to the mistakes we observe in SQL in this connection (mistakes, in fact, that show—or,
+rather, are among those that show—that SQL tables are not true relations). Among other things, the
+proscription implies:
+
+    ■   No anonymous attributes, as in SQL’s SELECT A+B FROM T and its VALUES construct
+        (the latter of which is effectively SQL’s counterpart to the Manifesto’s relation selector)
+
+    ■   No duplicate attribute names, as in SQL’s SELECT A, A FROM T and SELECT T1.A, T2.A
+        FROM T1, T2
+
+    ■   No shorthands that rely on attribute ordering, as in SQL’s SELECT * INTO ... FROM T and
+        INSERT INTO T VALUES (...)1
+
+    ■   No hidden “tuple ID” or timestamp attributes, as in some of today’s SQL implementations
+
+      The problems caused by a failure to abide by RM Proscription 1 are discussed in detail in
+references [32] and [75].
+      A note on SQL: The experienced SQL user might observe that SQL applications can
+sometimes safely use what might be called “pseudorelational” expressions such as SELECT A+B
+FROM T by providing the required column names in the context (the context, that is, in which those
+expressions are embedded). For example, the expression
+        SELECT * FROM ( SELECT A + B FROM T ) AS X ( C )
+
+returns a table with a single column named C, despite the anonymous column in the table returned
+by the subquery SELECT A+B FROM T. Similarly, the expression
+        VALUES ( 1, 2 )
+
+returns a table with one row and two anonymous columns; however, in the expression
+        SELECT A FROM ( VALUES ( 1, 2 ) ) AS T ( A, B )
+
+the column names A and B are specified in the context. Analogous remarks apply to examples like
+this one:
+
+
+1
+ The problem with these SQL constructs is that they rely on the left-to-right attribute ordering as defined in the
+corresponding CREATE or ALTER TABLE statement(s), instead of on a left-to-right ordering specified within the
+SELECT or INSERT statement itself.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                  page 203
+Part III / Informal Discussions and Explanations                         Chapter 7 / RM Proscriptions
+
+
+      INSERT INTO T ( A, B ) VALUES ( 1, 2 ) ;
+
+       Clearly, applications that use such “pseudorelational” expressions only in safe contexts are
+immune to external changes in column order. Thus, it might be argued that the syntax SQL
+provides for “pseudorelational” expressions can conveniently be used in place of relational
+expressions in certain safe contexts. But admitting “pseudorelations” into the language at all gives
+rise to all sorts of needless complication for everybody concerned—end users, administrators,
+application developers, teachers, students, standardizers, DBMS implementers, and so on. Hence
+this proscription, and hence Tutorial D’s required attribute names in the syntax for its EXTEND,
+SUMMARIZE, and relation selector operators.
+
+
+RM PROSCRIPTION 2: NO TUPLE ORDERING
+
+D shall include no concept of a “relation” whose tuples are distinguishable by ordinal position.
+Instead, for every relation r expressible in D, the tuples of r shall be distinguishable by value.
+
+                                      ———  ———
+
+By definition, the tuples of a relation have no top-to-bottom ordering and hence cannot be
+distinguished by ordinal position. Of course, this fact does not mean that such an ordering cannot
+be imposed for, e.g., presentation purposes; however, it does mean that the effect of imposing such
+an ordering is to convert the relation into something that is not a relation (typically a one-
+dimensional array of tuples—see the discussion of RM Proscription 7 later in this chapter). It also
+means that:
+
+ ■    The operator that imposes the ordering is not a relational operator, precisely because the result
+      is not a relation.
+
+ ■    The operator in question therefore cannot appear in a relational expression; in particular, it
+      cannot appear in the definition of a virtual relvar.
+
+
+RM PROSCRIPTION 3: NO DUPLICATE TUPLES
+
+D shall include no concept of a “relation” containing two distinct tuples t1 and t2 such that the
+comparison “t1 = t2” evaluates to TRUE. It follows that (as already stated in RM Proscription 2),
+for every relation r expressible in D, the tuples of r shall be distinguishable by value.
+
+                                      ———  ———
+
+By definition, relations do not contain duplicate tuples. Yet SQL does permit duplicate “tuples” in
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                    page 204
+Part III / Informal Discussions and Explanations                                    Chapter 7 / RM Proscriptions
+
+
+its tables1—another of the many reasons why SQL tables are not true relations [72]. In the
+Manifesto, by contrast, duplicate tuples are absolutely, categorically, and unequivocally outlawed.
+What we tell you three times is true.
+
+
+RM PROSCRIPTION 4: NO NULLS
+
+D shall include no concept of a “relation” in which some “tuple” includes some “attribute” that
+does not have a value.
+                                            ———  ———
+
+By definition, tuples, and therefore relations, do not contain nulls (nulls are not values!). SQL,
+however, does permit nulls in its tables—yet another reason why SQL tables are not true relations.
+In the Manifesto, by contrast, nulls are absolutely, categorically, and unequivocally outlawed (and
+so too therefore is n-valued logic for any n > 2).
+
+
+RM PROSCRIPTION 5: NO NULLOLOGICAL MISTAKES
+
+D shall not forget that relations with no attributes are respectable and interesting, nor that
+candidate keys with no components are likewise respectable and interesting.
+
+                                            ———  ———
+
+Nullology is the study of the empty set [29] (it has nothing to with nulls!). Now, sets in general are
+ubiquitous in the relational world; for example, a relation has both a set of attributes and a set of
+tuples. And, since the empty set is certainly a set, it follows that wherever D permits sets in general
+to appear, it should permit empty sets in particular to appear as well. Two important special cases
+are those mentioned in this proscription: relations with no attributes and candidate keys with no
+components. We discussed the first of these under RM Prescription 10 in Chapter 6; now we offer a
+few words on the second.
+        Since relations and relvars with no attributes are permitted, candidate keys with no
+components (“empty keys”) must certainly be permitted too. Indeed, such a key is the only
+candidate key—the only possible candidate key!—for a relvar with no attributes; but other relvars
+(i.e., relvars with at least one attribute) can have empty keys, too. In fact, to say that relvar R has an
+empty key is to say, precisely and possibly usefully, that R never contains more than one tuple [29].
+Incidentally, if relvar R has an empty key, then that empty key is the only key for R (why?).
+        At the time of writing, SQL does not support either relations with no attributes or keys with
+no components. Note: These omissions are not the only nullological mistakes in SQL, but they are
+among the most egregious. Others include incorrect treatment, in a variety of ways, of relations
+with no tuples (see, e.g., references [49-50] and [62]), and inconsistent treatment, again in a variety
+
+1
+  Possibly because the SQL designers thought duplicate removal would be expensive, especially if the table in question
+in fact had no duplicates in the first place. However, reference [28] shows that it is often possible to prove that
+duplicates cannot occur, in which case the duplicate removal process can be “optimized away.”
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                  page 205
+Part III / Informal Discussions and Explanations                         Chapter 7 / RM Proscriptions
+
+
+of ways, of dyadic relational operators when the relations involved have no common attributes (see,
+e.g., reference [41]). See also the discussion of OO Prescription 6 in Chapter 8.
+
+
+RM PROSCRIPTION 6: NO INTERNAL-LEVEL CONSTRUCTS
+
+D shall include no constructs that relate to, or are logically affected by, the “physical” or
+“storage” or “internal” levels of the system.
+
+                                      ———  ———
+
+This proscription is a logical consequence of the strong separation we insist on between model and
+implementation (it should be obvious that allowing implementation considerations to show through
+at the model level undermines physical data independence, and it can adversely affect portability
+and intersystem operability, too). Here are some specific corollaries of this proscription:
+
+ ■    The mapping between public application relvars and database relvars (discussed under RM
+      Prescription 14 in Chapter 6) is defined by means of some logically distinct mapping
+      language and is not visible to the application.
+
+ ■    Like the relational model, the Manifesto deliberately does not say which database relvars if
+      any are physically stored and which not; in particular, it expressly does not say that real ones
+      are physically stored and virtual ones not, nor does it say anything about the storage structures
+      to be used for those relvars that are physically stored. To do otherwise would be quite
+      inappropriate. However, we remark that many SQL implementations use storage structures
+      that bear a close resemblance to the perceived structure of a relation, thereby encouraging bad
+      practice such as “denormalization” and the use of nulls. For better approaches, see references
+      [81] and [134].
+
+ ■    RM Prescription 4 refers to “some kind of storage structure definition language.” RM
+      Proscription 6 implies that the statements of that language—in particular, the mappings of
+      databases to physical storage—must be cleanly separable from everything in D.
+
+ ■    As discussed at several points in Chapter 6, the storage structure definition language
+      mentioned in RM Prescription 4 is used to define (among other things) physical
+      representations of scalar values and variables. Those physical representations are thus hidden
+      from the user—i.e., they are not visible in D. Analogous remarks apply to tuple and relation
+      values and variables, of course, as well as to scalar ones.
+
+      Note: RM Proscription 6 does not prohibit support for operators that expose certain aspects of
+the implementation for, e.g., debugging purposes (EXPLAIN, which is supported by several of
+today’s SQL products, is an example of such an operator). However, we do not regard such
+operators as part of D.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                     page 206
+Part III / Informal Discussions and Explanations                           Chapter 7 / RM Proscriptions
+
+
+RM PROSCRIPTION 7: NO TUPLE-LEVEL OPERATIONS
+
+D shall support no tuple-at-a-time operations on relvars or relations.
+
+                                       ———  ———
+
+The operators of the relational algebra—which are, by definition, all read-only operators—are set-
+at-a-time, in the sense that their operands and results are whole relations (i.e., sets of tuples, loosely
+speaking) rather than individual tuples per se. As a consequence, there is never any need for
+applications to access some relation a tuple at a time in order to compute some desired result, and D
+is therefore expressly prohibited from supporting such operations. If the application does need to
+process some relation tuple by tuple for some reason (perhaps for display or printing purposes), it
+should not have to access that relation piecemeal as SQL does with its operation of “fetching via a
+cursor.” In Tutorial D, we prefer the approach of simply “loading” the tuples of the relation in
+question, in some specified order, into a local array variable, after which the application can iterate
+over the array elements in the familiar fashion. Here is an example:
+      VAR I INTEGER ;
+      VAR SX S# ;
+      VAR QX QTY ;
+      VAR SQA ARRAY TUPLE { S# S#, QTY QTY } ;
+
+      LOAD SQA
+      FROM ( SP WHERE P# = P#('P1') ) { S#, QTY }
+      ORDER ( ASC S# ) ;
+
+      DO I := 1 TO COUNT ( SQA ) ;
+         BEGIN ;
+            SX := S# FROM SQA (I) ,                            /* “fetch” ith S# */
+            QX := QTY FROM SQA (I) ;                           /* and QTY values */
+            /* now process SX and QX */
+         END ;
+      END DO ;
+
+       Note that this approach does not imply that the array variable need be accommodated entirely
+in main memory (i.e., it can “spill” out on to the disk if necessary). Note also that the load
+operation does not necessarily need to behave like a “breakpoint” (meaning the last tuple must be
+loaded before the instruction immediately following the LOAD can be executed). Thus, we see no
+reason why all of the requirements satisfied by SQL’s “FETCH via a cursor” cannot be satisfied at
+least equally well by our approach.
+       As for update operators, the intent of the proscription is to prohibit D from supporting, e.g., an
+operation that inserts just a single tuple into a relvar, if that operation is the only means of inserting
+tuples into relvars (as was the case in some early SQL implementations). Multi-tuple INSERTs are
+effectively mandated by our required support for relational assignment. If a single-tuple INSERT is
+supported, it must be definable as shorthand for inserting a relation of cardinality one. Similar
+remarks apply to DELETE and UPDATE operators, if supported.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      page 207
+Part III / Informal Discussions and Explanations                         Chapter 7 / RM Proscriptions
+
+
+RM PROSCRIPTION 8: NO COMPOSITE ATTRIBUTES
+
+D shall not include any specific support for “composite” or “compound” attributes, since such
+functionality can more cleanly be achieved, if desired, through the type support already prescribed.
+
+                                      ———  ———
+
+It is sometimes suggested—see, for example, reference [23]—that it should be possible somehow to
+combine, say, attributes S# and P# from the shipments relvar SP into a single composite attribute,
+S#_P# say. Reference [53] argues against this idea, strongly. It does not seem appropriate, or
+necessary, to repeat all of the arguments of reference [53] here; suffice it to say that the kind of
+“composite attribute” support typically proposed mixes together all kinds of notions that would be
+better kept separate. As RM Proscription 8 suggests, the functionality in question can effectively be
+achieved anyway, if desired, by means of the type support prescribed elsewhere in the Manifesto.
+
+
+RM PROSCRIPTION 9: NO DOMAIN CHECK OVERRIDE
+
+D shall include no “domain check override” operators, since such operators are both ad hoc and
+unnecessary.
+
+                                      ———  ———
+
+Recall that domain is just another term for type, and “domain check override” [23] thus means, in
+essence, overriding the system’s type-checking mechanism: on the face of it, not a very desirable
+goal! Space precludes a detailed explanation here, but basically the objective is to allow, e.g., joins
+to be done even when the join attributes are defined on different domains (i.e., are of different
+types). However, closer analysis reveals that the whole idea is based on a failure to make a clear
+distinction between types and representations. Not only is it ad hoc and unnecessary, therefore (as
+RM Proscription 9 states), but it simply does not stand up at all, logically speaking, under proper
+scrutiny, and we therefore reject it.
+
+
+RM PROSCRIPTION 10: NOT SQL
+
+D shall not be called SQL
+
+                                      ———  ———
+
+Little seems necessary by way of elaboration here; we are merely trying to “head off at the pass”
+certain marketing tricks—not without precedent—that we suspect might be tried if some version of
+D were ever to become a commercial reality.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                    page 208
+Part III / Informal Discussions and Explanations                       Chapter 7 / RM Proscriptions
+
+
+EXERCISES
+
+7.1    Why is the prohibition against top-to-bottom tuple ordering (RM Proscription 2) a good
+       idea?
+
+7.2    Suppose that, RM Prescription 1 notwithstanding, there were a left-to-right ordering to the
+       attributes of a relation. Define as precisely as you can a UNION operator for such
+       “relations.”
+
+7.3    Which of the RM Proscriptions does SQL violate? Which of those violations constitute
+       violations of The Information Principle?
+
+7.4    (Repeated from the body of the chapter) If relvar R has an empty key K, then that key K is
+       the only candidate key for R. Why?
+
+7.5    Why are tuple-at-a-time operators prohibited (RM Proscription 7)?
+
+7.6    Why are composite attributes prohibited (RM Proscription 8)?
+
+7.7    What exactly is wrong with “domain check override” (RM Proscription 9)?
+
+7.8    What in a nutshell is the objection to nulls and many-valued logic (RM Proscription 4)?
+       What is the argument in favor of these constructs?
+
+7.9    In the suppliers-and-parts database, suppose some parts have no color and some have an
+       unknown weight. Modify the design of Fig. 2.1 (in Chapter 2) accordingly. Note: This
+       exercise might be suitable as a basis for group discussion.
+
+7.10   Consider any SQL product that might be available to you. Does that product involve any
+       violations of RM Proscription 6? Identify as many such violations as you can. If possible,
+       perform this exercise for at least two different SQL products and compare the results.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                 page 209

@@ -1,0 +1,929 @@
+                                                   Appendix J
+
+         The Next 25 Years of the Relational Model?
+
+                   This appendix appeared in the two previous editions of this book
+                   but not in this edition. We have resurrected it here for historical
+                   interest, considering that some readers may not have seen it before.
+
+
+REMARKS ON REPUBLICATION
+
+This appendix consists of a lightly edited version of an interview conducted by Rick van der Lans1
+with the present authors in 1994 [39]. The original abstract (the original English language abstract,
+that is—the first published version of the interview was in Dutch) read as follows:
+
+      For the past [several years] Hugh Darwen and Chris Date have been working on a document with the intriguing
+      title: The Third Manifesto ... The objective of this document is (to quote the authors) to ‘present a manifesto for
+      the future direction of data and database management systems.’ It can be seen as an attempt to give a reasonably
+      complete definition of a new version of the relational model; it can also be seen, more specifically, as an
+      alternative to two previous manifestos on database systems. In this interview the authors clarify certain aspects
+      of [their Manifesto] and explain why they wrote it.
+
+       What follows is basically the English language version of the original interview [41], with just
+a few revisions (all very minor). The footnotes are new.
+       Note: Since Codd’s first paper on the relational model [20] appeared in 1969, 1994 was the
+relational model’s Silver Jubilee. It thus seemed appropriate at the time of the interview to give
+some thought to the next 25 years; hence our choice of title (for both the interview itself and this
+appendix). We are grateful to Rick van der Lans, also to InfoIT Inc., publishers of InfoDB (where
+the English language version first appeared), for permission to republish the material in the present
+book.
+
+
+INTRODUCTION
+
+As indicated in the abstract, The Third Manifesto has been written by Hugh Darwen and Chris Date,
+two well-known names in the database world. Why did they write it? What are its goals? Why the
+“third” manifesto? To enable the reader to understand the following interview better, we first
+discuss why there are now three manifestos related to database technology. We also briefly
+
+
+1
+  Rick F. van der Lans is an independent consultant, author, and lecturer specializing in database technology,
+development tools, and information modeling. He is Managing Director of R20/Consultancy, a company based in The
+Netherlands. He served for over six years on the Dutch committee responsible for developing the international (ISO)
+standard for SQL.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                         541
+Appendixes                                           Appendix J / The Next 25 Years of The Relational Model?
+
+
+describe the objectives and backgrounds of the first two, for the benefit of readers who might not be
+familiar with them.
+       As we all know, relational technology has always been under attack. From its birth it has
+been criticized. In the first few years the main objection was that it was “just theory”—it was “just
+plain impossible” to build a commercial system on relational concepts. Then, when the first
+relational products came on the market, they were considered to be too slow for building OLTP
+systems. Now that relational products have proven that they can support hundreds of users on
+multi-gigabyte databases, the latest cry is that relational technology is not suitable for new
+application requirements. The application of the future wants to store so-called unstructured data
+(images, sound, free text), and wants to perform complex operations, such as scanning images or
+compressing sound. The question is: Are these criticisms truly valid? In other words, has
+relational technology finally met its Waterloo? Is it really not suitable for new application
+requirements?
+       Some people believe we need a new type of database system, based not on relational concepts
+but on object-oriented concepts (such as inheritance, classes, polymorphism, etc.). This is why
+object-oriented (OO) DBMSs have received so much attention recently. However, one
+disadvantage of commercial OO systems has been (and still is) that they use a variety of different
+terminology. Partly for this reason, in 1989 a manifesto was written entitled The Object-Oriented
+Database System Manifesto [2]. This manifesto listed rules to which a system should conform in
+order to be called an object-oriented DBMS. It was intended to bring some order and structure to
+the confusing world of OODBMSs. Because the authors all had an OO background, their
+assumption was that the database of the future needs an OO foundation, not a relational one.
+       One year later, in 1990, a second manifesto was published with the title: Third-Generation
+Database System Manifesto [129]. In a way this document was a response to the first manifesto. It
+was written by another group of database experts, mainly people with a relational background,
+including Michael Stonebraker (at that time with Ingres) and James Gray (at that time with DEC).
+The opinion of these authors was that no new data model was needed—extending the relational
+model with new concepts could do the job. Their aim was to define a set of required characteristics
+for all future DBMSs. Those characteristics (defined through a set of tenets and propositions) were
+based on new application and business requirements.
+       Note that neither of the first two manifestos tried to define new database models or new
+languages; they simply listed requirements, or in other words minimal characteristics, that DBMSs
+really ought (in the authors’ opinions) to adhere to.
+       The Third Manifesto [40] has a different standpoint. It tries to give a reasonably formal and
+complete definition of a new version of the relational model. This new version, which the authors
+call D,1 is still compatible with the classic relational model as originally defined by Dr. E. F. Codd.
+However, by defining certain concepts, especially domains, more precisely, the authors believe they
+can show that the relational model is suitable for the new application requirements referred to
+above.
+
+
+1
+  This characterization of our objectives is not really accurate. First, D is just a language (any language) that realizes
+the ideas of The Third Manifesto in some concrete form. Second, The Third Manifesto does attempt to define the
+relational model very precisely—as noted in Chapter 1, in fact, we would like it to be seen in part as a definitive
+statement of that model—but we would never claim that it constitutes “a new version” of that model.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                             542
+Appendixes                                          Appendix J / The Next 25 Years of The Relational Model?
+
+
+      The main body of The Third Manifesto is divided into six sections: Relational Model
+Prescriptions, Proscriptions, and Very Strong Suggestions, and OO Prescriptions, Proscriptions, and
+Very Strong Suggestions.1 By the way, OO here stands for Other Orthogonal!—it includes, but is
+not limited to, features that are commonly regarded as part of object orientation. A small amount of
+new terminology is introduced, such as relational variable (relvar), in order to clarify certain
+aspects of the relational model. The document is still in draft form; however, the authors feel it is
+stable enough to serve as a basis for an interview such as the one that follows.
+
+
+BACKGROUND
+
+van der Lans: Let’s start with some background. Could you explain what your goal was in
+writing The Third Manifesto? Why did you write it? What do you hope or expect will happen
+to it?
+
+Darwen: Our goal was to alert “the market” to the possibility of a future in which users could:
+
+    ■   Control and enjoy their own data;
+
+    ■   And be able to ask any questions of that data that might arise;
+
+    ■   And have sufficient confidence in the answers provided by the system to take actions that
+        might be suggested by those answers, even bold actions.
+
+We wrote the Manifesto because current database products do not, in our opinion, hold out such
+promise; because neither of the two previous manifestos, in our opinion, clearly shows the right way
+forward; and because we think we can see a clear way forward, solidly based on a theory that has
+already stood the test of time—namely, the relational model of data.
+      What will happen to the Manifesto? Very likely, “the market,” in its complacency, will
+continue to embrace either SQL or the current OODBMSs, in the mistaken belief that our goals will
+be met that way. Alternatively, we might find that “the market” doesn’t share our goals. Less
+pessimistically, we would like somebody to be inspired to define the language we have generically
+called D, and we would like that effort in turn to inspire somebody to implement that language
+(even if initially just in a standalone, single-user environment suitable for domestic, scientific, or
+small enterprise use).
+      If this last situation materializes, people will be able to see and touch something that really is
+a Prince [26] in comparison with what’s currently available. Put it another way: Let’s agree that,
+say, Pascal, or Ada, or <your own favorite language> is a Prince alongside the much derided but
+very widely used COBOL, FORTRAN, or BASIC; we want there to be a database Pascal, or Ada,
+or <your own favorite language>, too.
+
+
+
+
+1
+  In the interview as originally published the various prescriptions, proscriptions, and “very strong suggestions” were
+summarized in a sidebar. That sidebar is omitted from this appendix.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                          543
+Appendixes                                  Appendix J / The Next 25 Years of The Relational Model?
+
+
+van der Lans: What are the two or three main deviations from or extensions to the classical
+relational model as defined by Codd? Are there areas of the Manifesto that are not
+“compatible” with the relational model?
+
+Date: Well, first of all it’s important to understand that “the classical relational model” itself has
+evolved over time. Or perhaps it would be more accurate to say that our own understanding of it
+has evolved over time, so that we now have a clearer notion of what domains really are, what
+candidate keys really are, even what relations themselves really are (and so on). In the most recent
+edition of my book An Introduction to Database Systems, I’ve tried to describe our current
+understanding of the model as carefully as I can [81]. I must emphasize, however, that we are
+indeed talking evolution here, not revolution; the relational model as we currently see it is not
+wildly different from Codd’s original vision, it’s just more carefully pinned down in certain
+respects, and slightly extended here and there (e.g., with additional operators).
+      Having said all that, I would now like to state categorically that there are NO “deviations” in
+our Manifesto from the relational model as we now understand it (i.e., as documented in reference
+[81]). And the sole “extension”—which isn’t in fact an extension at all!—is that domains are seen
+for what they really are, which is data types: possibly system-defined data types, more generally
+user-defined data types, of potentially arbitrary complexity.
+      You see, people tend to think of the relational model as dealing only with very simple data
+types, like numbers and strings. In fact, however, the relational model nowhere states what data
+types are allowed. The question as to what data types are allowed IS COMPLETELY
+ORTHOGONAL TO the question of supporting the relational model as such. So you can have a
+data type (or domain—they’re the same thing) of engineering blueprints, or books, or time series, or
+architectural drawings, or videos, or X-rays, or absolutely anything else you like.
+      Of course, you must understand that support for user-defined data types includes support for
+user-defined operators, and most likely support for data type inheritance too (subtypes and
+supertypes). I’m sure we’ll come back to these topics later.
+      No, there are no areas of the Manifesto that are incompatible with the relational model.
+
+Darwen: Chris is right, we don’t deviate from the relational model, nor do we extend it. A
+language that conforms to our Manifesto is entirely compatible with the classical relational model.
+By contrast, we do deviate a great deal from SQL, but that is (of course) because SQL deviates a
+great deal from the relational model, as well as being a rather poorly designed language by any
+measure.
+      Some might say that our demand for support for data types of arbitrary complexity is a
+deviation from or extension to the relational model. We think that those who interpret the relational
+model’s insistence on “atomicity” as meaning that the only data types you can have are numbers,
+strings, dates, and times are those who have axes of their own to grind and want there to be
+weaknesses in the relational model.
+
+van der Lans: What is the history of the Manifesto? How did it evolve? When did you start
+thinking about it? Why the decision to publish a draft first?
+
+Darwen: The idea of writing a manifesto first entered my mind when the other two came to my
+attention, in about 1991 I suppose. I just couldn’t bear the idea of leaving the last word with them.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       544
+Appendixes                                         Appendix J / The Next 25 Years of The Relational Model?
+
+
+Also, Chris and I had been talking about devising a proper relational language ever since 1988 or
+so, when we started to collaborate on various database writings (including our attempt—at once
+hilarious and depressing—to produce a clarifying guide to the SQL:1992 standard [51]). However,
+we both really knew that such talk was idle and dreamy, for we both lead very busy professional
+lives that leave little time for such backroom work. One day, over a beer somewhere, I turned to
+Chris and said “Oh, by the way, I know what the language is called: D,” and he nodded his
+immediate comprehension and assent. However, I keep the joke (that it stands for “Date and
+Darwen’s Database Dream”) for my lectures: We don’t see any need for an explanation in the
+Manifesto itself.
+       Things came to a head after the publication of the SQL:1992 standard, when I, as a member of
+the ISO SQL committee SC21, turned my attention to the evolving SQL3 proposals. [Note: As
+explained in the preface to the present book, “SQL3” was for many years a code name for what
+ultimately became the SQL:1999 standard.] I discovered that people were proposing to use the new
+“abstract data type” facility for defining tables, as well as for the obviously theoretically correct
+purpose of defining columns; and I discovered that, as might be expected of such a peculiar idea, it
+just didn’t hold water, technically. (It was eventually abandoned in SQL3, at the summer 1993
+SC21 meeting in Yokohama.1)
+       Worse, I discovered that those OODBMSs that were attempting to provide ad hoc query and
+declarative integrity support, à la relational, were making the same fatal mistake. The mooted
+manifesto could wait no longer, and I promised Chris that I would deliver an initial draft in early
+1994—which I did, in February of that year. That draft was five pages long; our current draft is
+(regrettably) 30 pages2 ... However, the first draft’s structure and style have survived this expansion,
+I’m glad to say. Since that first draft, there have been countless faxes, phone calls, and
+consultations with other people, not to mention numerous weekend slogs over Chris’s computer at
+his home in California.
+
+Date: As Hugh says, we’d been thinking for several years about the idea of trying to design the
+“ideal” database language (well, if not ideal, then at least a language that was much more faithful
+than SQL to the principles of the relational model). Certainly I remember discussing such an idea
+many times in the mid to late 1980s. But it was the increasing emphasis in the marketplace on OO
+database technology, and especially the recent (mostly flawed) attempts to marry OO and relational
+ideas together, that finally got us moving ... I guess it was the fact that the industry seemed to be on
+the brink of making what was arguably an even bigger mistake than the original SQL decision that
+spurred us to get something down on paper at last. As Hugh has explained, he wrote the first draft
+in early 1994 (so the structure of the document as a series of prescriptions, proscriptions, and “very
+strong suggestions” is due to him), and we have collaborated on every iteration since then.
+       I wouldn’t say we’ve exactly “published” the draft yet. All we’ve done is distributed it to a
+fairly wide group of technical people (both in Europe and in the USA—elsewhere too as a matter of
+fact), in order to get feedback that will help us feel more comfortable about whatever the final
+
+
+1
+    But see the final section of Appendix H.
+2
+  The expansion was due mainly to the addition of clarifying commentary. As you can see from Chapter 3 of the
+present book, the final version of the Manifesto as such—not counting the inheritance prescriptions, which were added
+later anyway—is still only some ten or so pages.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                       545
+Appendixes                                        Appendix J / The Next 25 Years of The Relational Model?
+
+
+version looks like. By the way, I’d like to mention that the feedback so far has been almost entirely
+positive; no one has shown that the complete project is misguided!—so we’re beginning to get a
+fairly warm feeling about the whole idea. We’d like to have the final version ready sometime
+before the end of this year.1 As for actual publication of that version, we’re still examining our
+options.
+
+van der Lans: What is Codd’s opinion on The Third Manifesto, if he has read it?
+
+Date: I don’t know if Codd has read the document yet. We look forward to hearing his opinion in
+due course.
+
+van der Lans: Have the DBMS vendors already shown interest in the language D?
+
+Darwen: The language D doesn’t yet exist! In any case, we didn’t really expect the vendor
+community to display any immediate interest in either D per se or the Manifesto in general (though
+in fact it would already be not quite right to say there’s been no interest at all). After all, the
+vendors are heavily committed to SQL; they’re not going to risk huge amounts of venture capital on
+an alternative until a clear demand emerges for such a thing. From their perspective, a self-
+proclaimed “manifesto” by a couple of pundits who’ve been getting up the vendors’ collective nose
+for many years does not by itself constitute such a clear demand, obviously. Our most realistic hope
+is that interest is aroused in the more aware sections of the user and academic communities.
+Somebody has to define a D, and then somebody has to persuade some vendor to make a D
+implementation.
+
+van der Lans: Isn’t your Manifesto too late, since we already have products on the market
+that try to combine relational and OO technology, such as UniSQL and Illustra (previously
+known as Montage)2—especially since you’ve chosen a different approach for integration?
+And what about the OO support in SQL3?
+
+Date: We feel it’s important to try to lay down what we think is the right way to move forward,
+even if there are huge obstacles to overcome in making such a move. After all, what’s the
+alternative? If you just accept the status quo, progress is impossible (this is true in all walks of
+life!). Furthermore, we’re very concerned that—as I’ve already mentioned—the industry seems to
+be about to make a very big mistake: We MUST speak out, if only as a matter of professional
+honesty and technical credibility. And at the very least we’d like to influence the way database
+principles are taught in universities and the like—perhaps get university prototypes built too. Of
+course, we’d be delighted if some vendor saw fit to build an actual product, and we’re still lobbying
+...
+
+
+
+
+1
+  We did have a “final” version ready by the end of 1994 [40,42]. The Manifesto as documented in the present book is
+a considerably—but (mostly) compatibly!—refined and extended version of that 1994 original.
+2
+ Illustra was subsequently purchased by Informix Software Inc. and the technology incorporated (as the Universal
+Data Option) into Informix’s own Online Dynamic Server DBMS product.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                        546
+Appendixes                                  Appendix J / The Next 25 Years of The Relational Model?
+
+
+Darwen: The existence of COBOL, FORTRAN, and BASIC (not to mention C) didn’t make it too
+late for Pascal, Ada, and <your own favorite language that is not COBOL, FORTRAN, or BASIC>.
+True, SQL3 will have user-defined data type support and inheritance (and you can call this “OO
+support” if you think those two things are sufficient to justify the use of the term)—but SQL3 will
+also have SQL. With or without “OO support,” SQL is not a suitable foundation for the future of
+data. “Different approach for integration?” Well, our approach is the same as that part of SQL3’s
+abstract data type support (“value ADTs”) that is generally agreed to be reasonably sound and likely
+to survive and appear in the next published SQL standard. However, I believe at least one of the
+products you mention treats object classes as relations, instead of or as well as treating them as data
+types, and that’s something we expressly forbid in our Manifesto. [Ed: More on these matters
+later.]
+
+THE THIRD MANIFESTO AND SQL
+
+van der Lans: The next question is probably for Hugh: Is The Third Manifesto compatible
+with the working draft of SQL3? If not, do you think the committee has chosen the wrong
+path to extend SQL with OO concepts?
+
+Darwen: I presume you’re talking about our approach of using the relational domain concept as the
+point of rapprochement with OO, since compatibility with SQL is otherwise the Manifesto’s most
+obvious proscription! As I just mentioned, the Manifesto in its general approach is compatible with
+SQL3’s “value ADTs”; however, we expressly forbid anything like SQL3’s so-called “object
+ADTs” (a part of SQL3 that is in any case in an immature state of development). Also, our
+Manifesto expressly forbids nulls; currently, SQL3 permits nulls to appear among the secret
+components of an encapsulated complex value, adding a Whole New Dimension to the profusion of
+strange effects caused by these unpleasant creatures.
+
+van der Lans: The document says “We do not believe that the database language SQL is
+capable of providing a firm foundation for the future.” Does this mean we should get rid of
+SQL? Or what do you want the market to do with their SQL investment?
+
+Date: Well, the document also says “... we do pay some attention to the question of what to do
+about today’s SQL legacy.” Of course SQL data and SQL applications are going to be with us for
+many, many years—to think otherwise would be quite unrealistic. So what we have to do is provide
+a way to migrate SQL data to D databases. And we have to provide a way of implementing SQL
+operations via a D interface against that migrated data. We do have some ideas as to how to do this.
+[Ed: Hugh will be elaborating on these ideas later.]
+
+
+TECHNICAL CONTENT
+
+van der Lans: In the document you make a distinction between pre- and proscriptions.
+What’s the difference?
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        547
+Appendixes                                    Appendix J / The Next 25 Years of The Relational Model?
+
+
+Date: Well, you’re right, there’s really no logical difference at all, in the sense that it’s often a little
+arbitrary as to whether a given requirement should be expressed as a prescription or a proscription.
+For example, the proscription that there be no tuple-at-a-time relational operations could equally
+well have been expressed as a prescription that all relational operations be set-at-a-time (or, rather,
+relation-at-a-time). It was our general intent, however, that the proscriptions would add little or no
+technical substance to the overall proposal; rather, they’re supposed to be implied by the
+prescriptions already stated. But we felt quite strongly that it was necessary to state certain
+proscriptions explicitly by way of clarification, in order to avoid some of the mistakes that have
+been made in the past—especially since they (the proscriptions) are often not obviously implied by
+the prescriptions.
+
+van der Lans: Why did you introduce a distinction between relvars and relations? What are
+the advantages of doing this?
+
+Darwen: It’s obvious when you think about it. The distinction is exactly the distinction that’s
+made in normal programming languages between variables and values. A relation is a value—for
+example, the value currently assigned to the relvar named EMPLOYEE. When some employee gets
+a salary raise, we might say that we update some EMPLOYEE tuple; whether or not we say that, the
+result is that the relvar EMPLOYEE now has a value (a relation) that is not the same as the value
+(another relation) that it had before the update.
+       Before we introduced the term “relvar,” people tended to say “relation” when they meant the
+value and also “relation” when they meant the variable, and that usage frequently led to dreadful
+confusions that really should never have arisen at all. We’ll be very happy, of course, if those who
+prefer to use the term “table” for “relation” will follow our example and use “table variable”
+(“tablevar”? “tabvar”?) for “relvar.”
+
+Date: We didn’t introduce the distinction, we merely clarified it. The concepts definitely are
+distinct, but they’ve been very much confused over the past 25 years. The advantages of stressing
+the distinction are thus precision and clarity of thinking.
+        I’d like to repeat here something I said in another interview recently, for Data Base
+Newsletter [62]. If I say, in some programming language, “DECLARE N INTEGER,” then N is a
+variable whose values are integers—different integers at different times. Likewise, if I say, in SQL,
+“CREATE TABLE T,” then T is a variable whose values are relations (or tables)—different
+relations at different times. We say loosely that T is a relation, but it really isn’t. It’s a relation-
+valued variable.
+        In mathematics, if the value 4 is inserted into the set {1,2,3}—I’m speaking very loosely
+here!—the result is a different set, namely the set {1,2,3,4}. It’s not an “updated version” of the old
+set, it’s a different set. Similarly, if I insert a row into T, the original relation value of T is replaced
+by another relation that includes the additional row. The value of the relation-valued variable T is
+now a different relation. In other words, a relation is a value, not a variable. A relation-valued
+variable—we call it a relvar for short—is a variable whose values are different relations at different
+times.
+        Having said all that, I must also say that it’s very difficult to get out of the habit of saying
+“relation” when we really mean “relvar”! But I think in future we really ought to try to be a little bit
+more careful.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                             548
+Appendixes                                         Appendix J / The Next 25 Years of The Relational Model?
+
+
+van der Lans: In the Manifesto, you say that relations are not object classes. You
+categorically reject this equation. For a lot of people relations and object classes are both
+“things you can populate,” and therefore they are the same kind of thing. Could you explain
+what you mean when you say they’re not the same?
+
+Date: Actually, we’ve revised the Manifesto to say that relvars (not relations) aren’t classes, and
+I’ll interpret your question in this light.
+        First of all, let me say that it’s always difficult to debate matters sensibly when there’s no
+consensus on what even the most basic terms mean. In the case of OO specifically, there’s still no
+universally agreed abstract “OO model” (indeed, part of what we’re trying to achieve with our
+Manifesto is precisely to define such a model, or at least to start to do so). Thus, different people
+have different understandings of different OO terms. In particular, different people attach different
+meanings to the term “object class.”
+        So we have to put a stake in the ground and say what we mean by the term. So far as we’re
+concerned, an object class is a data type (with all that that entails). In other words, it’s a domain—
+since we’ve already said that a domain is a data type. And domains and relvars simply aren’t the
+same thing. A relvar, by definition, is a variable, not a type.
+        Of course, when I put it like that, it sounds obvious. It hardly seems worth fussing about. But
+the point is, so many people are getting this one wrong! This is exactly The Great Blunder1 that
+some of the “object/relational” products have already made. And the implications of having such a
+massive confusion at the absolute foundation of the system are highly nontrivial.
+        (As an aside, I should probably mention that while many OO people would agree with us that
+a class is a type, others would use the term “type” to mean “type” per se, and then would use
+“class” to mean the set of all currently existing instances of a given type. For these latter people, I
+suppose the term “class” is closer to our relvar notion. At least their “class” is a variable. But there
+are still major differences having to do with encapsulation and related matters, which I’m sure we’ll
+get to later in this interview.)
+
+Darwen: I don’t understand why relations (and classes) are characterized as “things you can
+populate.” Like many database people, I use the term “populate” when speaking informally, but I
+apply it to what we now call relvars, not relations (the thing that populates a relvar is a relation).
+However, I’d like to return to this point in a moment, for the justification for our position is actually
+independent of whether we’re talking about variables or just sets of values, and it goes like this:
+      First, we agree that a relation is in a certain sense a set and that an object class is in a certain
+sense a set—this much they do have in common. However:
+
+    ■   A relation is a set of symbol-arrangements (in other words, tuples), each of which is to be
+        interpreted as a statement concerning certain things—a proposition (more precisely, a
+        proposition that is held to be true). The symbols in the symbol-arrangement represent the
+        things the statement is about. Such a symbol-arrangement has all and only the “properties”
+        (or “behavior” or “functionality”—feel free to choose your term, the concept is the same)
+
+
+
+1
+    Actually The First Great Blunder (see Appendix B).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                           549
+Appendixes                                          Appendix J / The Next 25 Years of The Relational Model?
+
+
+        prescribed for tuples by the relational model. And in this prescription—some might even call
+        it a restriction—lie the strength and the generality of the relational model.
+
+    ■   An object class, by contrast, is a set of symbols, not symbol-arrangements. Those symbols
+        represent just things, things whose properties are not prescribed by some general model but
+        rather are prescribed individually for each class. (Don’t be confused by the fact that the
+        symbols in some object classes—not all!—might in fact be tuples; such tuples constitute the
+        secret, encapsulated representation of the values in the object class in question, and that
+        representation is permitted to change, under the covers, without affecting external interfaces.)1
+
+       The other issue—and here I return to the point about “things you can populate”—is
+orthogonal to the issue of whether object classes are domains or relations, but I’ll have to address it
+now because not everybody realizes it is orthogonal. It’s the question of whether the object class
+POLYGON (for example) is the set of all polygons imaginable or just the variable containing “all
+the polygons we happen to be interested in at the moment.” It’s my observation that many OO
+people talk in a very fuzzy way about this distinction (one that is so easily and clearly made in the
+relational model that one can only lament the poor teaching, or lack of teaching, of the relational
+model in recent times).
+       Anyway, it matters not which view of “object class” you take, I say in both cases that it’s not
+the same as “relation,” and my reason is the same in both cases:
+
+    ■   In the case where class POLYGON is the set of all imaginable polygons, well, this concept
+        obviously corresponds to the relational concept of “domain” or “data type.”
+
+    ■   In the case where the object class POLYGON is some finite set of judiciously (or
+        injudiciously!) chosen polygons that varies from database to database, well, we have no
+        directly corresponding concept in the relational model, and it’s another of the relational
+        model’s strengths that we need no such concept. The only “variable sets” we deal in are sets
+        of tuples. If you wish to reason in relational style about your arbitrary set of polygons, you’ll
+        just have to make that set into a unary relation—in SQL terms, a table with a single column of
+        data type POLYGON (and don’t forget to name the column!).
+             Now I’ve shown a way in which one of the various interpretations of “object class” can
+        become close enough to the concept of “relation” to perhaps be useful; but this is precisely the
+        one correspondence between object class and relation that I don’t see mentioned by OO
+        people or products!
+
+
+
+1
+  We were a little confused over encapsulation in 1994! It is true that, as stated here, some object classes might contain
+values (i.e., scalar values) whose secret, encapsulated representation is tuples. More to the point, however, some
+classes might contain values that are known to the user to be tuples—i.e., nonsecret, nonencapsulated tuples (see RM
+Prescription 6).
+       Some of our other remarks in this interview on the subject of encapsulation are (we now realize) slightly off base
+too; we decided not to change them, however, because to do so smacked too much of rewriting history, and in any case
+they are mostly not very incorrect. But it is only fair to warn you to be a little careful in interpreting the remarks in
+question.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                          550
+Appendixes                                            Appendix J / The Next 25 Years of The Relational Model?
+
+
+      Actually, I’d much prefer our jingle on this matter to be “a row is not an object,” clearly
+covering both of the foregoing possible meanings of “object class.” However, we’ve gone for the
+consequence of that jingle, namely the jingle “an object class is not a relation” (and hence, a
+fortiori, not a relvar). We opted for this latter version because “object class = relation” is the
+manner in which “row = object” is expressed, or so we observe, by those OO people seeking
+rapprochement but going about it the wrong (according to our thesis) way.
+
+van der Lans: Why is it necessary to distinguish between relvars and domains? Why not
+make domains queryable too?
+
+Darwen: Domains are there before the database is there, while the database is there, and they’re
+still there afterwards, when the database has gone away. What’s more, they remain—in principle—
+constant throughout this time. The elements of domains are not propositions,1 and therefore they do
+not represent truths from which further truths can be concluded by logical reasoning. That—
+concluding further truths from given truths—is what queries do. Thus, it doesn’t make sense to
+“query a domain.”
+        Now, you might say it would be handy to be able to derive, say, from the domain that is the
+set of all polygons imaginable, the set of all pairs of regular polygons where both members of the
+pair have the same number of sides. Well, if you really want to do that, you’ll have to treat the
+domain as a unary relation (otherwise, how can we obtain the required binary relation result?), and
+now you aren’t looking at a domain any more. What’s more, you should ask yourself the interesting
+question “What’s the domain of the single attribute of this unary relation?” Furthermore, you
+should note that the relational model has no objection to infinite domains, such as the domain of all
+imaginable polygons; but it certainly does object to infinite relations (though that objection might
+not be due to any fundamental reason, but might merely be a useful and safe restriction in practice).
+        Of course, the foregoing should not be interpreted as a prohibition of support for adding new
+domains or dropping domains or changing the definition of existing domains. If you add a domain,
+for example, you can imagine that you’re saying that this domain was “there” all the time, really,
+only there wasn’t a need to say so before. If you drop a domain, you’re saying that there is no
+longer any need, after all, to say anything about the existence of this domain (which is a reasonable
+thing to say only if you no longer make any use of the domain). And changing the definition of a
+domain is like dropping and adding at the same time, carrying with it an opportunity, in some
+circumstances, for the domain to be kept in use throughout the change without loss of integrity.
+
+Date: Relvars and domains certainly are distinct. Here are a couple of very important differences
+between them:
+
+    ■    Domains are static, relvars are dynamic (loosely speaking). The domain CITY, for example,
+         consists of all possible cities—its value is static, it doesn’t change over time (or rather, if it
+         does change, then that’s what you might call a “metalevel” change, a change to the
+         “metadata,” a definitional change; it’s like changing employee numbers from three digits to
+         five). The value of a relvar, by contrast, certainly does change over time (i.e., it’s dynamic); a
+
+1
+    More accurately, they are usually not propositions (a domain of propositions is certainly a legal domain).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                      551
+Appendixes                                          Appendix J / The Next 25 Years of The Relational Model?
+
+
+        relvar is a variable, and that’s what “variable” means. But changing the value of a relvar is
+        not a big deal, it happens all the time; it’s certainly not a “definitional” change.
+
+    ■   Domains encapsulate, relations don’t. Values from domains, which is to say values in row-
+        and-column cells in relations, can be operated upon solely by means of the operators defined
+        for the domain in question.1 When a domain is defined, the operators that act upon values
+        from that domain have to be defined as well (this is true even for system-defined domains
+        such as INTEGER, where the operators are “+”, “-”, “<“, and so on). The “innards” of the
+        domain values are not exposed (except to the code that implements the operators); in other
+        words, the representation is hidden. So domain values are encapsulated.
+             Relations, by contrast, expose their innards to the user, which makes it possible to
+        perform operations that get at those innards—doing joins and other operations that depend on
+        the structure of the relation. The structure of the relation is not hidden, whereas the structure
+        of values inside the relation is hidden.
+             Of course, when I talk about exposing the structure of a relation to the user, I’m talking
+        about the logical structure. What the relation looks like physically is both undefined and
+        irrelevant, so far as the model is concerned.
+
+      I could sum up the foregoing by saying: A domain IS a type; a relation HAS a type. They’re
+not the same thing!
+
+
+MORE ON SQL
+
+van der Lans: In your presentations in London and Amsterdam in April 1994 you stated that
+SQL should be definable on top of D. Can this be done if D doesn’t support “sets” with
+duplicate rows (i.e., bags)?
+
+Darwen: I’m glad you said definable—we don’t absolutely insist on it being actually defined, and
+we’d be delighted if it weren’t, if “the market” could see its way into the future without needing
+such an SQL implementation (but of course it can’t).
+      In any case, several reviewers have raised what is essentially an extended form of your
+question—“How can SQL be implementable in D, when D is expressly prohibited from supporting
+(a) duplicate rows and (b) nulls?”—and I’m glad to have the opportunity to address it here.
+Although duplicates and nulls must indeed be absent from D, they could be simulated by a frontend
+layer of code on top of D as follows:
+
+    ■   An SQL base table for which no candidate keys are declared could be implemented as a D
+        database relvar with a system-supplied key. The frontend could make sure that the extra
+        attribute needed for this key didn’t appear as a column visible to the SQL user. Similarly,
+        when an SQL query requires generation of duplicate rows, the frontend would use a special D
+
+
+1
+  This sentence is correct, but it does not follow that “domains encapsulate”; for example, as noted in an earlier
+footnote, a domain might contain values that are nonencapsulated tuples. But the paragraph is still broadly correct
+overall.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                           552
+Appendixes                                             Appendix J / The Next 25 Years of The Relational Model?
+
+
+         operator to generate a “keying” attribute which would be discarded (by the frontend, not by
+         the D implementation) so that it doesn’t appear as a column in the SQL result. UNION ALL
+         can be simulated by generating an extra distinguishing attribute in each operand. Again, the
+         frontend would discard this attribute so that it didn’t appear as a column in the SQL result.
+
+    ■    Nulls can be simulated by devising domains that include special values to be interpreted as
+         null in addition to all the regular values. For example, the domain INTEGER_WITH_NULL
+         would include (perhaps) the symbol “?” in addition to the usual symbols representing
+         integers. The frontend would support the definition of suitable operators in connection with
+         this domain, in order to allow the idiosyncratic behavior of SQL nulls to be simulated.
+
+van der Lans: The NULL value has not been included. Does that mean that if you don’t know
+the value for a certain attribute, you’ll assign an empty set?
+
+Date: This question requires a rather careful response, or rather sequence of responses.
+
+    ■    First of all, I wish you wouldn’t use the term “null value.” Part of the point about nulls is
+         precisely that they’re not values. Some of the SQL mistakes in this area stem from exactly
+         this confusion. (I’m assuming, of course, that you’re referring to the kind of null that SQL
+         tries—but fails—to support, namely the kind that requires a logic with more than two truth
+         values. I’ll leave discussion of a different kind of null to Hugh.)
+
+    ■    Once you understand that nulls aren’t values, you’re led inevitably to the conclusion that
+         “relations” that contain nulls aren’t relations (check the formal definition of “relation” if you
+         don’t believe me). So you’ve abandoned the relational model, and all bets are off! This is the
+         fundamental reason why we reject nulls in our Manifesto ... though we can get much more
+         specific about the problems that nulls cause, if we really have to.
+
+    ■    Your question implies, correctly, that we permit relations to contain values that are sets.
+         Please note carefully, however, that we allow relations to contain sets in such a way as not to
+         violate the requirements of first normal form. Specifically, we insist that any such contained
+         sets be encapsulated.1 We explicitly do not espouse the concept of “NF² relations,” in which
+         such sets are not encapsulated [121]. We believe we can achieve the functionality we desire
+         without the complexities that the NF² notion seems to imply.
+
+    ■    We would represent a missing value by an empty set if an empty set correctly represented the
+         desired semantics. For example, if relation DEPT has attributes DEPT# (department number)
+         and EMPS (set of employee numbers for employees in the relevant department), the EMPS
+         value for a department with no employees would indeed be correctly represented by an empty
+         set of employee numbers. But other types of missing information are better represented in
+         other ways. For example, the best “middle initial” value for a person with no middle initial is
+         an empty string. The best “birthdate” value for an employee with an unknown birthdate is “?”
+         or “UNKNOWN.” And so on.
+
+1
+    This assertion is incorrect. See the earlier footnotes on encapsulation.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                              553
+Appendixes                                   Appendix J / The Next 25 Years of The Relational Model?
+
+
+Darwen: “[Do you] mean that if you don’t know the value for a certain attribute, you’ll assign an
+empty set?” No. In any case, the empty set could be placed at a row/column intersection only if the
+relevant domain is set-valued. If the value for a certain attribute, in a certain tuple to be inserted
+into a certain relvar, is literally not known, then the tuple in question cannot be constructed and
+therefore cannot be inserted.
+       I’m interested in your choice of terminology here: “NULL value.” We don’t have a problem
+with the concept we would infer from such terminology! A value, by definition, is a member of
+some domain. If you have a domain one of whose elements you choose to represent by the symbol
+NULL, well, that’s fine. You must, of course, define all the operators that are available in
+connection with this domain, and the definitions of the operators might or might not involve some
+special treatment of the element for which you chose the symbol NULL. But there’s one thing
+you’re absolutely prohibited from doing, and that’s to say that NULL and NULL are anything other
+than the same symbol; that is, that the comparison NULL = NULL ever returns anything but true
+(nor, for that matter, is “anything but true” ever permitted to be anything but false!).
+       I’d like to mention here my conjecture that user-defined domains could provide a basis for a
+sound, consistent, and noncounterintuitive treatment of the thorny old “missing information”
+problem, without getting involved in abstruse and unpleasant areas such as 3-or-more-valued logic
+(I touched on this point in the second part of my answer to the previous question). Some will scoff
+at this notion, and I admit that I don’t see a way of treating null marks orthogonally with respect to
+data types (as SQL attempted to do); but we’ve been waiting for more than 20 years for somebody,
+scoffer or not, to come up with a better approach, and nobody, in our well-documented opinion
+(Chris has written extensively on this subject, and I’ve pitched in, too), has yet done so.
+
+
+MISCELLANEOUS QUESTIONS
+
+van der Lans: You say that a transaction can interact with one database only. Does this imply
+that multisite updates are not allowed?
+
+Date: Certainly not. “Database” is a logical concept. How a given database maps to physical data
+is not defined in the model (nor should it be). We certainly do not preclude the possibility that it
+maps to physical data stored at several distinct sites.
+
+van der Lans: Why did you exclude triggers? In the Stonebraker manifesto this feature was
+classified as important.
+
+Darwen: We don’t prohibit triggers. We see no reason to demand them, either, in our Manifesto.
+They’re not an essential part of the firm foundation for the future that we propose.
+
+Date: We did suggest that referential actions such as cascade delete might be supported, and these
+are a special kind of “trigger.” But note that cascade delete and suchlike are declarative. As an
+article of faith, we prefer declarative solutions to procedural ones, and of course triggers are usually
+procedural in nature. So we need to be convinced further of a genuine need for them.
+       By the way, I think “trigger” is a silly term. Why is our field (database technology, or
+computer technology in general, I suppose) so bad at choosing appropriate terminology? A more
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         554
+Appendixes                                         Appendix J / The Next 25 Years of The Relational Model?
+
+
+accurate term would be “triggered procedure” (the trigger per se then being the event that triggers
+the procedure). But I digress.
+
+van der Lans: Why no inheritance on the relvar level, but only on the domain level? Did I
+miss something?
+
+Darwen: Presumably you mean something along the lines of SQL3’s subtables and supertables.
+We don’t prohibit such a thing, if somebody can come up with a good model for it; at this time,
+however, we don’t see any need to demand or even strongly suggest it.1
+
+Date: Our principal concern was to figure out what the concept of inheritance means in relational
+terms, and that’s domain inheritance, not relvar inheritance. I might mention that even with domain
+inheritance we’re having extraordinary difficulty in coming to grips with a good model ... As Bruce
+Lindsay of IBM remarked in this regard (in a recent presentation), there aren’t any good models out
+there, there are only various people’s favorite methodologies. We’re doing our best to come up
+with a good model, but the Manifesto still says only that IF inheritance is supported, THEN it must
+be in accordance with “some clearly defined and generally agreed model.” In an appendix to the
+Manifesto, we’ve begun to sketch our own idea of what such a model might look like.2
+
+van der Lans: About the naming of the Manifesto and the language D: First of all, I would
+rename The Third Manifesto; it looks too much like the Third-Generation DBMS Manifesto. I
+have already talked to people about this, and it certainly confuses them. Second, the name D
+sounds as if it is the sequel to C. And why do you call it a language? Isn’t it database logic,
+like predicate and propositional logic?
+
+Darwen: We struggled to find a title for the paper. It had to include the word “manifesto,” as we
+do very much want it to be judged alongside the other two. We considered something like “A
+Manifesto for Rapprochement,” but decided that that put too much emphasis on just one of its
+themes, albeit an important one. Eventually the short, neutral title took our fancy more than
+anything else, in spite of its using a word already used in the title of one of our predecessors.
+       As for “D,” well, the modishness of single-letter names was certainly something to do with
+the choice, but I’ve already given the main explanation in an earlier response. Do note, though, that
+it’s not actually proposed as a name of a database language—it’s merely a symbol we use, in the
+document, to refer generically to whatever conforming language(s) might arise from the Manifesto.
+
+Date: As Hugh has explained, the name “D” is meant to denote one or more languages, so in a
+sense D certainly is—or, rather, will be—a language, just as (e.g.) SQL is a language. (Well, no,
+not just as SQL is a language; it’s our hope and intent that D will be much better than SQL, of
+course!) I’d just like to add that, in my opinion, “database logic” (in other words, the relational
+
+
+1
+    See Appendix E.
+2
+  That appendix grew into Part IV of the present book, of course. We hope it is obvious that we now feel we are much
+closer to that desirable “good model” than we were back in 1994. In fact, we have now revised our Manifesto to say
+that IF inheritance is supported, THEN it must be in accordance with the model described in Part IV of the present book.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                        555
+Appendixes                                         Appendix J / The Next 25 Years of The Relational Model?
+
+
+model) is a language too (rather abstract, to be sure, inasmuch as it doesn’t prescribe a specific
+syntax).
+
+van der Lans: You say that each base relvar should have a candidate key. Should you not
+define “candidate key”? And what if the relvar has no columns?
+
+Darwen: Hmm. You’re not the first to suggest that we include a definition of the term “candidate
+key”; in that case, aren’t there any other well-known terms from relational theory that we should
+also define?
+        Regarding columnless relvars, I’ve already pointed out, in my writings about TABLE_DEE
+and TABLE_DUM [29,33], that the only subset of the empty set is the empty set itself, from which
+it follows that the only candidate key—and hence the primary key—for a relvar with no attributes is
+the empty set. In fact, empty candidate keys are mentioned in the Manifesto in the same
+proscription that mentions relations with no columns.
+        A moment’s reflection shows that an empty candidate key has all the usual properties of
+candidate keys. Indeed, it’s perhaps the smallest of my own contributions to the current SQL3 draft
+that empty primary keys are now supported. However, although my proposal was readily accepted
+by the majority of the ISO SQL committee, I understand that many of the vendor representatives
+still think it was really some sort of joke on my part. Of course TABLE_DEE and TABLE_DUM
+are funny, but they’re deadly serious, too.1
+
+van der Lans: What happens to attributes if a domain is destroyed?
+
+Darwen: No need to spell anything out in the Manifesto, here. If you say a certain set of things you
+once wanted your database to include statements about is no longer required, it had better be the
+case that your database no longer has anything to say about those things. No, I would not subscribe
+to a “cascaded delete” idea in this context; even less would I subscribe to SQL’s scatty handling of
+dropped “domains” (domains in the SQL sense, not the relational sense), where a column defined
+on a dropped domain suddenly becomes defined on the underlying data type of that domain instead!
+
+van der Lans: Why are your prescriptions regarding computational completeness and explicit
+transaction boundaries “OO Prescriptions” and not “RM Prescriptions”? They’re not
+specific to OO, or are they?
+
+Date: Don’t forget that for the purposes of the Manifesto OO stands for “Other Orthogonal”!—as
+explained in the introduction to the document. I agree that these prescriptions are not specific to
+object-oriented, but they’re not specific to relational either. They’re orthogonal.
+
+van der Lans: Maybe you should explain why certain things are forbidden, such as cursor
+updates (or at least give some references to articles that include such explanations).
+
+
+
+1
+  That the vendors did not accept the importance of empty keys is perhaps reinforced by the fact that the feature in
+question got moved into SQL4 (see Appendix F of reference [51]) in 1994, and then into oblivion when SQL4 itself
+became empty in early 1997.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                            556
+Appendixes                                  Appendix J / The Next 25 Years of The Relational Model?
+
+
+Darwen: SQL-style cursors are not needed at all in D. However, we don’t rule out the possibility
+that applications will sometimes need to iterate over some collection of rows in some order; we just
+insist that such a collection be treated as what it is, a list or array (and not a relation).
+
+Date: We do state in the introduction [i.e., to the original document] that we intend “to follow this
+Manifesto with further publications describing various aspects of our ideas in more depth.” We
+didn’t want the document to get any bigger than it already is. On the specific point you mention, we
+prohibit cursor updates because such operations are by definition row-level, and the relational
+model is set-level. Some set-level operations simply cannot be simulated by a sequence of row-
+level updates. For example, consider a relvar called EMPS that is subject to the constraint that the
+salaries of employees E1 and E2 must always be the same. Then any attempt to change the salary
+of employee E1 (only) must necessarily fail.
+
+van der Lans: Maybe you should emphasize that physical storage aspects should not lead to
+restrictions on the update side. For example, in some products you can’t delete rows from a
+table with a statement if that same delete statement refers to the table from which it tries to
+delete.
+
+Date: We originally said that D shall include no constructs that “relate to” physical storage. We’ve
+since strengthened this statement to include the requirement that nothing in D shall be logically
+affected by physical storage matters.
+       Your example, incidentally, I think is an example of a logical limitation (it’s the well-known
+“Halloween problem”). It’s just that the system is too lazy to make a copy of the table in question.
+I don’t see that it has anything to do with physical storage matters. A better example would be a
+rule that says you can’t update the partitioning column of a partitioned base table. This really is a
+case of “physical storage aspects” causing update restrictions.
+
+van der Lans: Where do you say that NULL is not allowed?
+
+Darwen: In one of our RM Proscriptions (which [at least in its original form] is really little more
+than a reiteration of the precise definition we offer for “tuple”). In SQL, NULL is stated to be a
+“value” (“symbol” would be a better term) that belongs to no data type. We’ll allow that symbol
+you suggest (“NULL”) so long as it does belong to the data type of the column in which you want it
+to be permitted.
+
+van der Lans: By the way, is the difference between a domain and a relvar that a domain has
+a fixed (nonupdatable) value, while the value of a relvar can always change (i.e., it can be
+assigned another value)?
+
+Darwen: That’s one of the differences. Another is that a domain is a set of symbols representing
+things that are talked about in the enterprise, while a relation is a set of tuples representing true
+statements about such things. Another is that the members of a domain don’t have to be tuples,
+while the members of a relation certainly do.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         557
+Appendixes                                        Appendix J / The Next 25 Years of The Relational Model?
+
+
+Date: As I said earlier, domains are static, relvars are dynamic (this is another way of saying what
+you’re saying). Another difference is that domains are types, while relvars have types. And
+another is: Domains encapsulate, relvars don’t!1
+
+
+
+
+1
+    See the earlier footnotes on encapsulation.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         558

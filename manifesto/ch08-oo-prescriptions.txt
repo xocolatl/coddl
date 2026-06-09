@@ -1,0 +1,341 @@
+                                                    Chapter 8
+
+                                        OO Prescriptions
+
+OO PRESCRIPTION 1: COMPILE-TIME TYPE CHECKING
+
+D shall permit compile-time type checking.
+
+                                            ———  ———
+
+By this prescription, we mean merely that, insofar as feasible, it shall be possible to check at
+compile time that no type errors can occur at run time; in other words, type errors shall be
+detectable by inspection of the program source text alone (again, insofar as feasible). Of course,
+this requirement does not preclude the possibility of “compile and go” or interpretive
+implementations.
+       Compile-time type checking is also known as static type checking. It is widely regarded as a
+desirable objective [135]. We remark, however, that it cannot be fully achieved if (but only if) type
+inheritance is supported; that is, there will be certain situations with inheritance in which type
+checking cannot be completed until run time—hence the “insofar as feasible” qualifications above.
+See OO Prescription 2 (also the discussion of the TREAT operator in Chapter 14) for further
+discussion.
+       Incidentally, it has been suggested that OO Prescription 1 is in conflict with RM Prescription
+25 (which requires the catalog to be updatable), because updating the catalog at run time could
+invalidate the type checking that was done at compile time. But all that is needed to avoid this
+problem is a mechanism for repeating the type checking at run time—perhaps by recompiling the
+source code—if such updates occur. Some DBMS products behave in exactly this manner today.
+
+
+OO PRESCRIPTION 2: TYPE INHERITANCE (CONDITIONAL)
+
+If D supports type inheritance, then such support shall conform to the inheritance model defined in
+Part IV of this book. [More text later added here]
+
+                                            ———  ———
+
+Despite the fact that languages and products that support some kind of type inheritance do exist
+(and indeed have done so for some time), and despite the fact that type inheritance has been
+discussed for many years in books and articles and presentations, there is still no consensus in the
+data management community on a formal, rigorous, and abstract type inheritance model. To quote
+reference [131]:
+
+      The basic idea of inheritance is quite simple ... [and yet, despite] its central role in current object systems,
+      inheritance is still quite a controversial mechanism ... [A] comprehensive view of inheritance is still missing.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                     page 210
+Part III / Informal Discussions and Explanations                          Chapter 8 / OO Prescriptions
+
+
+       Part IV of this book describes an inheritance model that (we believe) could serve to fill this
+gap. The model in question is one that has been developed and refined over the past several years
+by the present authors, and we offer it as a serious candidate for consideration by the community at
+large. We do not include it as a mandatory component of the Manifesto, however—we merely
+insist that if type inheritance is supported at all, then that support shall be based on the model
+described in Part IV.
+       As an aside, we speculate that one reason for the aforementioned lack of consensus is that
+inheritance was first introduced in the context of software engineering; i.e., it was more of an
+implementation idea than a theoretical one, intended primarily to simplify certain aspects of
+software development and maintenance (see, e.g., references [9] and [100]). Its application to, and
+attempted incorporation into, an abstract theory of data came later. If this speculation is correct,
+then there is a parallel that can usefully be drawn with the development of database systems in
+general. To spell that parallel out:
+
+ ■    The early (hierarchic and network) database systems can be seen as attempts to impose a thin
+      layer of abstraction over certain implementation techniques that were in wide use at the time.
+
+ ■    However, those systems never really succeeded in making the clear distinction between model
+      and implementation that we now regard as so important.
+
+ ■    Indeed, that distinction was not properly made until 1969, when the relational model—a true,
+      abstract, implementation-independent model (or theory) of data—was first defined.
+
+       Analogously, we see at least some of the current inheritance “models” not as true models per
+se, but merely as attempts to abstract just a little from certain current implementation techniques
+(and again we observe a failure to make a clear distinction between model and implementation).
+       We should also say something about the distinction between single and multiple inheritance.
+Briefly (and somewhat loosely), single inheritance means each subtype has a single supertype, and
+hence inherits properties from just that one type; multiple inheritance means a subtype can have two
+or more supertypes, and hence can inherit properties from two or more types. (Of course, these
+ideas are elaborated, considerably, in Part IV of this book.) Now, it has often been argued that it
+might be possible to support single inheritance only, without worrying about the additional
+complexities (if any) of multiple inheritance. Our position, by contrast, is rather different: We
+believe that single inheritance logically implies multiple inheritance, and hence that support for
+single inheritance by itself makes little sense. Thus, we require that, if D supports inheritance at all,
+it must support multiple inheritance in particular. (This latter requirement does not imply that an
+implementation that supports inheritance needs to support every last detail of our model, however;
+for example, it might be possible to omit support for what we call dummy types.)
+       We observe finally that support for inheritance implies certain extensions to—among other
+things—the definitions in Chapters 4 and 6 of scalar, tuple, and relation values and scalar, tuple, and
+relation variables. As indicated under OO Prescription 1 above, it also implies a need to relax the
+static type checking requirement slightly. See Part IV for further discussion (especially Chapter
+14).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                     page 211
+Part III / Informal Discussions and Explanations                         Chapter 8 / OO Prescriptions
+
+
+OO PRESCRIPTION 3: COMPUTATIONAL COMPLETENESS
+
+D shall be computationally complete. That is, D may support, but shall not require, invocation
+from so-called host programs written in languages other than D. Similarly, D may support, but
+shall not require, the use of other languages for implementation of user-defined operators.
+
+                                      ———  ———
+
+The general intent of this prescription is twofold:
+
+ ■    It must be possible to write entire applications in D, instead of having to use one language for
+      database access and another for general computation. In other words, we do not endorse the
+      “embedded data sublanguage” approach adopted in SQL (we do not prohibit it, either, but we
+      do insist that users should have the option of not having to use it). Note: Over the years, the
+      idea that users should not have to use an embedded data sublanguage in order to access the
+      database has been proposed by many people, including one of the present authors [42]. As
+      noted in Chapter 5, one important consequence of that idea is that we can avoid the problem
+      of “impedance mismatch” between the types available inside the database and those available
+      outside; i.e., there is no need to map between the (arbitrarily complex) types used inside the
+      database and the (possibly rather simple, and almost certainly different) types provided by
+      some host language.
+
+ ■    It must be possible to use D to write the code that implements user-defined operators, instead
+      of having to resort to using some other language for this purpose. Note: Several examples of
+      Tutorial D operator definitions were given in Chapters 3 and 6. However, we did note in
+      those chapters that certain operators—specifically, those selectors and THE_ operators that
+      make use of the highly protected operators that expose physical representations—could not be
+      defined entirely in D, since those protected operators are themselves not part of D. Further,
+      we note that the ability to define operators in some other language leads to the possibility of
+      writing programs in D that invoke operators provided by some third party (e.g., operators
+      included in an off-the-shelf library package).
+
+       We should add that we do not intend this prescription to undermine such matters as D’s
+optimizability unduly. Nor do we intend it to be a recipe for the use of procedural constructs such
+as loops to subvert the system’s support for declarative queries and the like. Rather, the point is that
+computational completeness will be needed (in general) for the implementation of user-defined
+operators anyway, and to be able to implement such operators in D itself might well be more
+convenient than having to make excursions into some other language—excursions that in any case
+are likely to cause problems for optimizers. We do recognize that it might prove necessary in
+practice to prohibit the use of certain D features outside the code that implements such operators, so
+long as such prohibitions do not too severely restrict what can be done by a free-standing
+application (i.e., one that does not require invocation from some program written in some other
+language).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                    page 212
+Part III / Informal Discussions and Explanations                             Chapter 8 / OO Prescriptions
+
+
+OO PRESCRIPTION 4: EXPLICIT TRANSACTION BOUNDARIES
+
+Transaction initiation shall be performed only by means of an explicit “begin transaction”
+operator. Transaction termination shall be performed only by means of a “commit” or “rollback”
+operator; commit must always be explicit, but rollback can be implicit (if and only if the transaction
+fails through no fault of its own). If transaction TX terminates with commit (“normal
+termination”), changes made by TX to the applicable database shall be committed. If transaction
+TX terminates with rollback (“abnormal termination”), changes made by TX to the applicable
+database shall be rolled back.
+
+                                        ———  ———
+
+We require, noncontroversially, that all database operations be performed within the context of
+some transaction; here we are simply trying once again to avoid certain mistakes we observe in the
+design of SQL. To be specific:
+
+    ■   Prior to 1999, the SQL standard had no explicit “begin transaction” operator; instead, a
+        transaction was started implicitly whenever the application executed a “transaction-initiating”
+        statement while no transaction was currently in progress.1 One consequence of this omission
+        was that there was no obvious way to provide “transaction-wide” information—for example,
+        isolation level [96]—that was specific to just one transaction. Of course, the Manifesto does
+        not directly address isolation level or similar matters at all, but it does at least provide the
+        explicit “begin transaction” operator that is needed as a basis for addressing them. (Perhaps
+        we should add that, regarding isolation level specifically, the only level we would want to
+        support—i.e., the only one we would regard as logically correct—would be whatever level is
+        defined to provide total isolation; all others have the potential for causing logical mistakes.)
+
+    ■   SQL allows transactions to terminate implicitly as well, in which case—to quote reference
+        [41]—“the system ... automatically executes either a ROLLBACK or a COMMIT ... it is
+        implementation-dependent which” (!). Note: The term implementation-dependent is defined
+        by the SQL standard to mean “possibly differing between SQL-implementations, but not
+        specified by this International Standard and not required to be specified ... for any particular
+        SQL-implementation.” So whether the system executes a COMMIT or a ROLLBACK might
+        not even be documented! It could even change from release to release.
+
+      As for the explanations in this prescription of normal vs. abnormal termination: The objective
+here is simply to spell out the fact that databases, and therefore relvars contained within databases,
+possess the property of persistence. In fact, as indicated in our discussion of RM Prescription 16 in
+Chapter 6, database relvars are the only variables to possess this property.
+
+
+
+
+1
+  An explicit START—not BEGIN—TRANSACTION operator was added in 1999, but its use is optional (it has to be,
+because it still has to be possible for compatibility reasons to begin transactions implicitly as well).
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        page 213
+Part III / Informal Discussions and Explanations                          Chapter 8 / OO Prescriptions
+
+
+OO PRESCRIPTION 5: NESTED TRANSACTIONS
+
+D shall support nested transactions—i.e., it shall permit a parent transaction TX to initiate a child
+transaction TX' before TX itself has terminated, in which case:
+
+ a.   TX and TX' shall interact with the same database (as is in fact required by RM Prescription
+      17).
+
+ b.   Whether TX shall be required to suspend execution while TX' executes shall be
+      implementation defined. However, TX shall not be allowed to terminate before TX'
+      terminates; in other words, TX' shall be wholly contained within TX.
+
+ c.   Rollback of TX shall include the rolling back of TX' even if TX' has terminated with commit.
+      In other words, “commit” is always interpreted within the parent context (if such exists) and
+      is subject to override by the parent transaction (again, if such exists).
+
+                                       ———  ———
+
+The idea of nested transactions can be thought of as a generalization of the familiar notion of
+savepoints [96]. Savepoints allow a transaction to be organized as a sequence of actions that can be
+rolled back individually (loosely speaking); nesting, by contrast, allows a transaction to be
+organized, recursively, as a hierarchy of such actions. In other words:
+
+ ■    BEGIN TRANSACTION is extended to support subtransactions (i.e., if BEGIN
+      TRANSACTION is issued when a transaction is already running, it starts a child transaction).
+
+ ■    COMMIT “commits” but only within the relevant parent scope (if this transaction is a child).
+
+ ■    ROLLBACK undoes work back to the start of this particular subtransaction (including
+      children, grandchildren, etc., of this subtransaction, even if these latter transactions terminated
+      with commit).
+
+       Note that nested transactions will be awkward to implement—from a purely syntactic point of
+view!—in a language that lacks an explicit BEGIN TRANSACTION statement (see the previous
+prescription): There has to be some explicit way of indicating that an inner transaction is to be
+started, and marking the point to roll back to if that inner transaction fails. Note further that (as our
+earlier remarks indicate) we do explicitly require the syntax for beginning and ending an inner
+transaction to be the same as that for beginning and ending an outermost transaction. This
+requirement is in the interest of modular programming—an application should be able to begin a
+transaction without having to know whether that transaction will be part of some outer transaction.
+
+
+OO PRESCRIPTION 6: AGGREGATE OPERATORS AND EMPTY SETS
+
+Let AggOp be an aggregate operator, such as SUM. If the argument to some given invocation of
+AggOp happens to be empty, then:
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                     page 214
+Part III / Informal Discussions and Explanations                                     Chapter 8 / OO Prescriptions
+
+
+    a.   If AggOp is essentially just shorthand for some iterated scalar dyadic operator Op (the
+         dyadic operator is “+” in the case of SUM), and if an identity value exists for Op (the identity
+         value is 0 in the case of “+”), then the result of that invocation of AggOp shall be that
+         identity value.
+
+    b.   Otherwise, the result of that invocation of AggOp shall be undefined.
+
+                                            ———  ———
+
+The general concept of identity values was discussed under RM Prescription 10 in Chapter 6.
+Identity values corresponding to the aggregate operators supported in Tutorial D are as follows:
+
+    ■    AVG: None
+
+    ■    COUNT, SUM: Zero
+
+    ■    MAX, MIN: “Negative infinity” and “positive infinity,” respectively (where negative infinity
+         and positive infinity refer to the lowest and highest value of the applicable—necessarily
+         ordinal—type, respectively)1
+
+    ■    AND: TRUE
+
+    ■    OR and XOR: FALSE
+
+    ■    EXACTLY: See below
+
+    ■    UNION and D_UNION: An empty relation
+
+    ■    INTERSECT: A universal relation
+
+      EXACTLY is a special case, because it takes an additional argument (viz., a nonnegative
+integer). Let that argument have value n. Then, if the aggregate argument is empty, the operator
+returns TRUE if n is zero and FALSE otherwise.
+      Incidentally, it is worth pointing out that COUNT can be regarded as a special case of SUM.
+For example, the expression
+         COUNT ( S )
+
+is logically equivalent to this one:
+         SUM ( EXTEND S ADD ( 1 AS ONE ), ONE )
+
+      We remark that SQL satisfies OO Prescription 6 for COUNT but fails for everything else. To
+be specific, for all of the aggregate operators it supports apart from COUNT, it defines the result of
+
+1
+  For certain data types (e.g., CHAR) where “positive infinity” is very large, the implementation might want to outlaw,
+or at least flag, invocations of MIN on an empty set (if those invocations really need the result to be materialized).
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                   page 215
+Part III / Informal Discussions and Explanations                          Chapter 8 / OO Prescriptions
+
+
+applying the operator in question to an empty set to be null. In particular, it defines both the SUM
+and the AVG of an empty set to be null.
+
+
+EXERCISES
+
+8.1    Why is compile-time type checking a good idea?
+
+8.2    What do you understand by the term computational completeness?
+
+8.3    What is a data sublanguage?
+
+8.4    What do you understand by the term impedance mismatch?
+
+8.5    OO Prescription 6 explains the effect of the aggregate operators on an empty set. What
+       should the effect be in each case if the argument is a singleton set instead (i.e., a set of
+       cardinality one)?
+
+8.6    At least one commercially available product violates OO Prescription 5 by supporting
+       autonomous subtransactions, meaning that a given child transaction can issue a “global
+       commit” whose effects persist even if the corresponding parent transaction subsequently
+       terminates with rollback. One purpose of such a feature is to allow an audit trail to be
+       maintained that includes a record of failed transactions as well as successful ones.
+       Discuss.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                     page 216

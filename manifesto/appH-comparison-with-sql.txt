@@ -1,0 +1,1127 @@
+                                          Appendix H
+
+                           A Comparison with SQL
+
+Naturally we believe the ideas of The Third Manifesto are valuable in and of themselves. However,
+we also believe they can be useful as a yardstick or framework—i.e., as a basis against which (as
+noted in Chapter 1) alternative proposals, and indeed concrete implementations, can be carefully
+analyzed, criticized, evaluated, and perhaps judged. In this appendix, we use that framework to
+examine the SQL standard [99] in particular. Please note immediately, however, that we expressly
+do not want our ideas to be used in connection with any kind of “checklist” evaluation (neither of
+the SQL standard nor of anything else). We do think those ideas can serve as a convenient
+framework for structuring discussions, but they are not meant to serve as a basis for some kind of
+scoring scheme. We are not interested in scoring schemes.
+       Back to the SQL standard per se. As the formal name “SQL:2003” suggests, the current
+version of that standard was ratified in late 2003, when it replaced the previous version
+(“SQL:1999”). It consists of a series of separate documents, called Parts; most of the material that
+is relevant to this appendix is in Part 2, “SQL/Foundation” (see the annotation to reference [99] in
+Appendix K for further discussion). In principle, SQL:2003 includes the whole of SQL:1999—with
+a few comparatively minor exceptions—as a proper subset. In this appendix, however, we follow
+the usual convention of using the formal name “SQL:2003” only when we want to emphasize the
+point that we are discussing some aspect of the language that was not present in SQL:1999.
+Elsewhere, we adopt the convention that the unqualified name “SQL” refers to SQL:2003, the most
+recent version, specifically (where it makes any difference).
+       Before going any further, we need to acknowledge the fact that one of the present authors was
+actively involved in the production of SQL standards for several years (from 1988 to 2004, to be
+precise). Therefore—just in case any reader, possibly seeing some conflict of interest in that
+involvement, might think of raising an eyebrow at some of the stark differences to be observed
+between the SQL standard and our Manifesto—we would like to take a moment to point out some
+of the ways in which we as independent manifesto writers enjoy certain freedoms that SQL
+standardizers do not:
+
+ ■   First and foremost, we do not have to deal with The Shackle of Compatibility [27]. SQL
+     standardizers at large might very well share our regrets over (e.g.) nulls and duplicate rows,
+     but they are powerless to remove them from the standard, just as vendors are powerless to
+     remove them from products already shipped and perhaps widely used.
+
+ ■   Second, the design and implementation of established products might have an adverse effect
+     on the feasibility and cost-effectiveness of proposed SQL extensions.
+
+ ■   Third, an SQL standardizer whose participation is funded by an employer, say, might
+     sometimes feel obliged to place the commercial interests of that employer above his or her
+     own personal opinions, should there be any conflict.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       506
+Appendixes                                                                  Appendix H / A Comparison with SQL
+
+
+    ■   Fourth, an SQL standardizer has to make compromises within a large group of people with
+        perhaps widely differing opinions and interests. By contrast, coauthors with closely shared
+        opinions and interests have to make hardly any compromises at all, especially on matters
+        considered by both to be very important.
+
+       It follows from the foregoing that the criticisms that follow are definitely not intended as, nor
+should they be taken as, criticisms of the individuals involved in the production of the SQL
+standard. Nor do we necessarily mean to suggest that we think the SQL standard could and should
+have been more closely aligned with The Third Manifesto. Indeed, it is our recognition of the
+inevitability of misalignment that makes us advocate serious consideration of something that might
+supersede SQL in the long term.
+       Comparison format: The bulk of this appendix consists of a series of point-by-point
+comparisons of pertinent features of SQL with the various prescriptions, proscriptions, and
+suggestions from the body of the book. The comparisons are presented mostly as bald statements of
+fact; for the most part, we do not restate opinions, give value judgments, or comment on the relative
+severity of various points. Also, we use the terms conforms and fails, in boldface, to indicate our
+general finding in connection with each point. Very often these terms have to be qualified, and
+sometimes both are used in connection with the same point. For example, SQL sometimes
+conforms to (say) a certain prescription in some respects but fails in others; sometimes it conforms
+as far as it goes but does not go far enough; sometimes it conforms vacuously, because none of the
+most widely used implementations actually includes the required feature; sometimes it fails not
+because of specifics of the feature at hand, but rather because that feature depends on some other
+feature on which it fails in turn. Such dependencies are appropriately indicated.
+       We now proceed with our point-by-point comparisons.
+
+RM PRESCRIPTIONS
+
+1. Scalar types
+
+SQL conforms, sort of. User-defined scalar types can be defined and destroyed by means of
+appropriate CREATE TYPE and DROP TYPE statements (though there are some questions over
+the extent to which such types are truly scalar—see the next paragraph). Built-in scalar types
+(BOOLEAN, INTEGER, REAL, DECIMAL, CHARACTER, DATE, TIME, TIMESTAMP, XML,
+etc.) are also supported, of course. Each such type is a named set of scalar values and is distinct
+from all the rest.1 Values and variables of such types can be operated upon solely by means of the
+operators defined for the type in question. (We remark in passing that SQL does not use the term
+operator in the same generic way as the Manifesto does, but reserves it for built-in functions like
+“+” and “-” that make use of some special notation—typically infix notation, though “+” and “-”
+can also be used as monadic prefix operators.)
+
+
+
+1
+  Actually there is some confusion here. Certain pairs of built-in types—REAL and FLOAT, for example—seem to be
+regarded as both distinct and not distinct, depending on context. If they are distinct, they are certainly not disjoint as
+required by RM Prescription 1; if they are not distinct, they violate the requirement (again part of RM Prescription 1)
+that two types that are really the same type must have the same name.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                           507
+Appendixes                                                                     Appendix H / A Comparison with SQL
+
+
+        Our reasons for saying “sort of” in the previous paragraph are as follows. First, user-defined
+scalar types in SQL fall into two broad categories, “DISTINCT types” and “structured types.” As
+explained under RM Very Strong Suggestion 8 in Chapter 10, DISTINCT types are limited to
+having a representation that involves just one type, which must be built in (and hence scalar). By
+contrast, structured types can have a representation involving any number of types, and those types
+can be either built in or user defined (and they do not need to be scalar, either). What is more, there
+is at least one context in which a structured type—which is a scalar type, by definition, and usually
+behaves like one—nevertheless behaves as if it were not scalar: namely, when the type in question
+is used as a basis for creating a table that is “of” that type.
+        SQL also meets our requirement for operators whose purpose is to expose each declared
+possible representation for a given type. For user-defined types, it requires exactly one
+representation to be specified, and the implementation automatically provides appropriate operators
+for each component of that representation. For built-in types, it provides appropriate literals.
+        SQL fails in that it is possible for a user-defined type to have nothing corresponding to a
+selector operator; that is, no such operators are provided automatically, though it is always possible
+to provide a user-defined one to serve the purpose. It is true that certain operators are provided
+automatically for user-defined types, including something called a constructor function. However,
+every invocation of such a function always returns the same value (specified, explicitly or
+implicitly, by the type definer). In other words, what such a function really does is allocate storage
+and initialize it to contain the “value” whose every immediate component is the applicable
+default1—it does not support the selection of an arbitrary value of that type, as RM Prescription 1
+requires.
+        SQL also fails in that it does not really meet our requirement for a built-in boolean type. To
+be specific, its BOOLEAN type, which might have been thought to fit the bill, suffers from certain
+anomalies arising from SQL’s idiosyncratic concept of nulls and its foundation in three-valued
+logic. That type does include just the two values we prescribe, TRUE and FALSE—but we make
+that prescription precisely because we require D to be based on two-valued logic! We would
+naturally expect a language based on three-valued logic, as SQL is, to support three “boolean”
+values (TRUE, FALSE, and UNKNOWN), not two. But SQL represents the UNKNOWN truth
+value not by a value at all but by means of the SQL-style null. Null is not a value in SQL because it
+does not have all the properties of values.2 In particular, it is not always treated as equal to itself
+and unequal to everything else, though it is sometimes so treated.
+        While we are on the subject of SQL’s BOOLEAN type, we should mention that it suffers
+from certain further anomalies as well—anomalies that, while they might not violate RM
+Prescription 1 per se, certainly do violate other prescriptions (RM Prescription 26 and OO
+Prescription 6 in particular). For example, if B is a column of type BOOLEAN, a WHERE clause
+of the form WHERE B is invalid; and if B happens to be empty, the aggregate operators EVERY
+and ANY applied to B both return null (instead of the logically correct results, which are TRUE and
+FALSE, respectively).
+
+
+1
+    We set “value” in quotes here because defaults are often defined to be null and null is not a value at all.
+2
+  There are major logical differences, in fact, (a) between nulls and values in general, and (b) between null and “the
+third truth value”—i.e., UNKNOWN—in particular. See, e.g., reference [76] for further discussion.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                              508
+Appendixes                                                                 Appendix H / A Comparison with SQL
+
+
+       In any case, SQL’s support for BOOLEAN is somewhat vacuous, because in most
+implementations the type name is not available, as a consequence of which support for the type is
+subject to severe restrictions. Such an implementation does support certain boolean expressions
+(e.g., CITY = 'La Paz'), which can be used in certain contexts—for example, a constraint definition,
+a CASE expression, or the WHERE clause of a query (as in any SQL system). However, such an
+implementation does not permit BOOLEAN as such to be the explicit declared type of anything
+(e.g., a column). Furthermore, in the case of columns in particular, it cannot be the implicit
+declared type either, and so boolean expressions are not permitted as items in a SELECT clause.
+Furthermore, the aggregate functions EVERY and ANY are typically not supported at all and thus
+cannot even be invoked in a HAVING clause.
+       SQL does not support empty types.
+
+2. Scalar values are typed
+
+SQL conforms (except for the possible overlap among certain built-in types noted under RM
+Prescription 1).
+
+3. Read-only vs. update operators
+
+SQL conforms with respect to our prescribed user-defined update operator support, via its
+CREATE PROCEDURE statement. It also conforms with respect to our prescribed user-defined
+read-only operator support, in that the output parameters that can be declared in CREATE
+PROCEDURE statements are prohibited in CREATE FUNCTION and CREATE METHOD
+statements (though we note that—unlike our read-only operators—SQL functions and methods are
+allowed to update the database, so long as their definition includes the option MODIFIES SQL
+DATA). SQL also conforms to our prescription regarding the ability to destroy user-defined
+operators, via certain DROP statements.
+
+4. Physical vs. possible representations
+
+SQL conforms in that it does permit a representation (at most one) to be specified for a given user-
+defined type, and such a specification does involve components as assumed in RM Prescription 4.
+It fails in that (as already noted) it does not automatically provide selector operators. It also fails
+because every representation must involve at least one component.
+
+5. Expose possible representations
+
+SQL conforms, subject to its shortcomings with respect to RM Prescription 4. To repeat some
+material from Chapter 10 (RM Very Strong Suggestion 8), the components of a representation are
+called attributes1 (not to be confused with tuple and relation attributes as defined in the Manifesto),
+and each attribute definition automatically causes definition of one observer method and one
+mutator method. An SQL observer method is a read-only operator, of course, but an SQL mutator
+
+
+1
+ We are making a tacit assumption here that the type in question is a structured type specifically. The situation with
+DISTINCT types is slightly different, but the differences are not important for present purposes.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                         509
+Appendixes                                                     Appendix H / A Comparison with SQL
+
+
+is not the corresponding update operator that might have been expected (and the term is thus being
+used in a somewhat unconventional manner). However, it is at least true that assignment of the
+result of invoking such a method back to the applicable variable can achieve the required
+“mutation” effect. For example, let T be a type, let V be a variable of type T, let C be a component
+of the representation of type T, let TC be the type of that component, and let X be an expression of
+type TC. Then the assignment
+      SET V = V.C ( X ) ;       /* exp on right is a mutator invocation */
+
+updates V such that its C component is set to the value of X and all other components remain
+unchanged. Further, a shorthand is available that permits the foregoing assignment to be
+abbreviated to just
+      SET V.C = X ;
+
+V.C here is thus SQL’s counterpart to our THE_C(V) pseudovariable.
+     Nesting is supported on the left side, too, as in the following example:
+      SET LS.BEGIN.X = Z ;
+
+(Compare the discussion of nested THE_ pseudovariables in Chapter 6.) Note: As this example
+suggests, throughout this appendix we use semicolons as statement terminators, as in direct SQL
+[41,99].
+
+6. Type generator TUPLE
+
+SQL conforms to the following extent. First, it supports a ROW type constructor, which is the
+obvious analog of our TUPLE type generator (SQL uses the term constructor rather than our
+preferred generator). The components of a row type are called fields; thus, the SQL analog of our
+heading is an ordered list (not a set—see below) of ordered pairs of the form <F,T>, where F is a
+field name and T is the name of the corresponding type (which is not necessarily scalar). A row
+type can be used for all of the purposes mentioned in RM Prescription 6.
+       SQL fails in that it assigns significance to the left-to-right order of <F,T> pairs (in other
+words, those pairs form an ordered list, not a set, as already noted). Thus, for example, the row
+types
+      ROW ( F1 T1, F2 T2 )
+
+and
+      ROW ( F2 T2, F1 T1 )
+
+are different types in SQL.
+      SQL also fails because it has no counterpart—or sometimes no direct counterpart—to certain
+of our required tuple operators (WRAP, UNWRAP, tuple RENAME, tuple EXTEND, etc.).
+      SQL also fails because every row type must involve at least one field. Moreover, SQL’s row
+type support has to be regarded as vacuous, as it is typically not included in actual implementations.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       510
+Appendixes                                                                  Appendix H / A Comparison with SQL
+
+
+7. Type generator RELATION
+
+SQL fails, having nothing that corresponds to our RELATION type generator.1 It might be thought
+that the MULTISET type constructor (new in SQL:2003) could be made to serve the purpose, but it
+really cannot, even though a table is a multiset of rows and a row type can be the element type of a
+multiset type. For one thing, relations (or relation bodies, rather) are sets, not multisets. For
+another, an SQL row, in general, fails to conform to our definition of tuple. For a third, this support
+is vacuous because most implementations at the time of writing do not support either row types or
+multiset types. Also, the update operators INSERT, DELETE, UPDATE, and MERGE are not
+defined for variables whose declared type is of the form ROW (...) MULTISET.
+       SQL’s use of structured types as “named table types” and various associated facilities together
+mean it also fails in connection with our requirement that relation types have names of a certain
+prescribed form.
+       SQL also fails because it has no direct counterpart to our required GROUP and UNGROUP
+operators.
+
+8. Equality
+
+SQL fails. For certain types, equality is not even defined! To be specific, equality for user-defined
+type T is—for some strange reason—defined only if an ordering is defined for T, and not all user-
+defined types are required to have an ordering. Equality is also undefined for the built-in type
+XML.
+      SQL also fails because (as we saw in Chapter 6) it is possible in SQL for, e.g., the comparison
+       'AB' = 'AB '
+
+to give TRUE, while the comparison
+       CHAR_LENGTH ('AB') = CHAR_LENGTH ('AB ')
+
+gives FALSE (the left comparand evaluates to two and the right one to three). Note: The example
+is an illustration of a more general phenomenon: namely, that SQL regards certain data values as
+“equal but distinguishable.” For further discussion, see reference [41].
+       We further remark that it is possible in SQL for the expression X = Y not to return TRUE and
+yet for X and Y to be otherwise indistinguishable. Such is the case, for example, when X IS NULL
+and Y IS NULL both give TRUE.
+       SQL also fails here, seriously, in connection with user-defined types; the definer of such a
+type can (and in fact must, if “=“ is to be supported at all) specify the algorithm by which the
+system is to determine equality of values of the type, and there is no requirement, or even
+suggestion, that that algorithm abide by RM Prescription 8.
+
+
+1
+  Except for “created temporary tables,” which are not tables at all but table type constructors of a very special and
+restricted kind [41,99]. (A TABLE type constructor was included in early drafts of SQL:1999, but it ran into
+difficulties, was shelved in the hope of speeding up the overall standardization process, and was not revived in
+SQL:2003.)
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                              511
+Appendixes                                                      Appendix H / A Comparison with SQL
+
+
+       We remark finally that several of today’s SQL DBMSs fail to support equality for the
+standard’s CHARACTER LARGE OBJECT (CLOB) and BINARY LARGE OBJECT (BLOB)
+types.
+
+9. Tuples
+
+SQL conforms to the extent that its row concept is a counterpart to our tuple concept.
+      SQL fails by attaching significance to the ordinal positions of row components (i.e., field
+values). Also, we require tuple components to have names; row components in SQL have names
+only when those names can be, and are, provided by the context in which the row in question is
+used. In particular, SQL’s row value constructor (its analog of our tuple selector) takes the form
+      [ ROW ] ( <exp commalist> )
+
+and thus provides no way of specifying field names (also, it must be nonempty).
+      SQL further fails in that a field “value” can be null, which, as we have already observed in
+connection with RM Prescription 1, does not have all the properties required for it to qualify as a
+value.
+
+10. Relations
+
+SQL conforms to the extent that its table concept is a counterpart to our relation concept. An SQL
+table has:
+
+  A counterpart to our heading, in the form of an ordered list of <C,T> pairs, where C is a column
+    name and T is the name of the corresponding type (which is not necessarily scalar)
+
+  A counterpart to our body, in the form of a bag or multiset (sometimes a set) of rows
+
+      It narrowly escapes failure to conform to our requirement for every attribute or column to
+have a name—even though it does allow the user to write an expression that yields a table that
+contains columns for which no name is specified explicitly. It does so by requiring the system to
+generate a name for each such column. However, such names are not required to be unique, since
+SQL does in general permit distinct columns of the same table to have the same name!
+      The VALUES construct of SQL provides a counterpart to our prescribed relation selector,
+though of course it suffers from the failures we have already observed in connection with relations
+in general.
+      SQL fails in the following respects:
+
+ ■    Every table must have at least one column.
+
+ ■    Significance is attached to the left-to-right order of columns.
+
+ ■    Two or more distinct columns of the same table can have the same name.
+
+ ■    The collection of rows corresponding to our body is, in general, a bag, not a set.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       512
+Appendixes                                                      Appendix H / A Comparison with SQL
+
+
+ ■    There is no direct counterpart to our relation-valued attributes (loosely, table-valued columns
+      are not supported, though, bizarrely, columns of type ROW (...) MULTISET are).
+
+ ■    Rows do not fully conform to our prescription for tuples (as already noted under RM
+      Prescription 9).
+
+     We observe too that, in its nomenclature at least, SQL does not adequately distinguish
+between table values and table variables.
+
+11. Scalar variables
+
+SQL conforms (apart from its support for nulls).
+
+12. Tuple variables
+
+SQL conforms insofar as it conforms to RM Prescriptions 6 and 9.
+
+13. Relation variables (relvars)
+
+SQL conforms (to a greater extent than it does to RM Prescriptions 7 and 10), thanks to its support
+for base tables, views, and declared temporary tables, its counterpart to our real, virtual, and private
+relvars, respectively. As noted under RM Prescription 7, there is no counterpart in general to our
+RELATION type generator; however, a base or declared temporary table definition can make use of
+a construct that is somewhat analogous: namely, an ordered list of <C,T> pairs, where C is a column
+name and T is the name of the corresponding type (which is not necessarily scalar). Further, no two
+columns of a given base or declared temporary table are permitted to have the same name. (This
+latter fact notwithstanding, SQL still attaches significance to the left-to-right order of the columns.)
+       SQL fails because it allows a base table to be “of” some structured type,* instead of in terms
+of an ordered list of <C,T> pairs. Certain operators—in particular, certain dereferencing
+operators—and certain other properties apply to such base tables that do not apply to base tables
+defined in the more usual way. Thus, SQL effectively supports two different kinds of base tables, a
+fact we would certainly regard as violating the spirit, if not the letter, of RM Prescription 13. What
+is more, we would also regard this second kind of base table as contravening RM Prescription 26
+(because they violate orthogonality, parsimony, and conceptual integrity), RM Proscription 6
+(because they mix logical and physical issues), OO Proscription 2 (because of their support for
+dereferencing), and possibly other prescriptions and proscriptions as well.
+       SQL also fails inasmuch as, at any isolation level other than SERIALIZABLE, updating a
+base table is not logically equivalent to a simple relational assignment. The same is also likely to be
+true if any triggered procedures have been defined for the pertinent base table.
+
+14. Kinds of relvars
+
+SQL conforms insofar as it conforms to RM Prescription 13. It fails in that it provides no
+counterpart to our public relvars.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        513
+Appendixes                                                       Appendix H / A Comparison with SQL
+
+
+15. Candidate keys
+
+SQL fails. It permits but does not require keys for a base or declared temporary table, and does not
+even permit them for a view. In addition, SQL permits one key to be a proper superset of another,
+in which case it is blatantly not a key but a proper superkey.
+
+16. Databases
+
+Strictly speaking, there is no such thing as a database in SQL. Instead, there is something called
+SQL-data, which is “data described by SQL-schemas—data that is under the control of an SQL-
+implementation in an SQL-environment” [99]. However, some might say that SQL conforms to
+the general intent of RM Prescription 16, inasmuch as “SQL-data” really means database relvars,
+loosely speaking. Others might say it fails, because tables that are “of” some structured type carry
+certain extra baggage, causing them to violate the uniformity of structure and operators that was a
+prime objective of the relational model.
+
+17. Transactions
+
+SQL conforms.
+
+18. Relational algebra
+
+SQL conforms in that (a) all of the prescribed operators are directly or indirectly available, and (b)
+it is possible to ensure by judicious use of the language that the operands to invocations of these
+operators are effectively true relations (i.e., they are tables whose columns have distinct names,
+whose bodies are sets, and whose rows contain no nulls). However, it fails in some cases, notably
+MATCHING and NOT MATCHING, DIVIDEBY, SUMMARIZE, RENAME, and GROUP and
+UNGROUP, to provide these operators “without excessive circumlocution.”
+       That said, we should note that at the time of writing:
+
+    ■   Many well-known SQL products have failed to implement NATURAL JOIN or JOIN with
+        the USING option. As a result, the SQL analog of our own JOIN operation sometimes
+        involves a very great deal of “excessive circumlocution” indeed (specifically, when tables of
+        high degree are involved).
+
+    ■   Most well-known SQL products have failed to implement the CORRESPONDING versions
+        of UNION, INTERSECT, and EXCEPT. As a result, there is often no direct SQL analog of
+        our UNION, INTERSECT, and MINUS operators (which place no significance on left-to-
+        right column ordering, of course).
+
+    ■   The most important feature of all so far as expressive completeness is concerned—namely,
+        the ability to specify table expressions1 of arbitrary complexity in the FROM clause—is still
+        absent from some implementations.
+
+
+1
+    The standard SQL term is query expression.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        514
+Appendixes                                                     Appendix H / A Comparison with SQL
+
+
+19. Relvar names, relation selectors, and recursion
+
+SQL conforms with respect to relation selector invocations and recursion. First, a VALUES
+invocation is a valid table expression. Second, the WITH clause permits a table expression to be
+given a name and for that very name to be referenced in that very expression, thereby supporting
+what are commonly known as recursive queries (which are also supported via CREATE VIEW).
+      SQL fails to permit a table name to be a valid table expression. The current value of a named
+table can be referenced by writing the word TABLE, or alternatively SELECT * FROM, in front of
+the name in question; however, we do not regard these features as satisfying this part of RM
+Prescription 19.
+
+20. User-defined tuple and relation operators
+
+SQL conforms to some extent, with its support for nonupdatable views. However, it fails in that its
+view definitions cannot be parameterized. Note: Most of the remarks under RM Prescription 7
+regarding SQL’s support for types of the form ROW (...) MULTISET apply here also, mutatis
+mutandis.
+
+21. Assignments
+
+SQL conforms, more or less, with respect to scalar and tuple assignment (apart from known
+violations of The Assignment Principle and other failures already noted in connection with tuples).
+It also supports assignment to targets of MULTISET types, including in particular those of types
+ROW (...) MULTISET. However, it fails with respect to relational assignment, because “relvars”—
+base tables and updatable views, in SQL terms—cannot be directly assigned to; they can only have
+their current values “modified” via INSERT, DELETE, UPDATE, and MERGE (and even there
+violations of The Assignment Principle can occur).
+       SQL’s conformance includes support for multiple assignment in connection with scalar and
+tuple assignment, and also in connection with assignment to MULTISET targets. But, crucially,
+this support does not directly extend to its table update operators INSERT, DELETE, UPDATE,
+and MERGE.
+       We observe too that there is a certain anomaly in the SQL provisions for assignment, arising
+from its support for nulls. To be specific, it is not always the case that, immediately following the
+assignment SET X = Y, the comparison X = Y gives TRUE (in other words, The Assignment
+Principle is violated again). Further, when this anomalous circumstance arises, it is not necessarily
+the case that Y is null. For example, Y could be a value of some user-defined type T such that Y.C
+IS NULL gives TRUE for some component (attribute) C of Y, while Y IS NULL is FALSE.
+
+22. Comparisons
+
+SQL conforms to this prescription with respect to scalar comparisons. It also conforms with
+respect to tuple comparisons, subject to failures already noted in connection with tuples, and subject
+also to the failure that it expressly does support the “tuple”—or, rather, row—comparison operators
+“<“, “>“, etc. It also conforms to our prescription for an operator to test membership of a tuple in a
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       515
+Appendixes                                                      Appendix H / A Comparison with SQL
+
+
+relation, via that version of its IN operator that takes a row expression on the left side and a table
+expression on the right side.
+       SQL also conforms to this prescription with respect to relation comparisons, but only very
+circuitously (a fact that is slightly odd, since SQL does provide more direct support for multiset
+comparisons). For example, let tables T1 and T2 denote true relations of the same relation type (in
+Manifesto terms). Then an SQL analog of the relation comparison T1 = T2 can be expressed as
+follows:
+      NOT EXISTS ( SELECT * FROM T1 EXCEPT CORRESPONDING SELECT * FROM T2 )
+      AND
+      NOT EXISTS ( SELECT * FROM T2 EXCEPT CORRESPONDING SELECT * FROM T1 )
+
+23. Integrity constraints
+
+SQL conforms with respect to database constraints, insofar as it does permit the definition of such
+constraints of arbitrary complexity. It also supports a certain degree of constraint inference, via
+functional dependency analysis. However, it also fails on at least two counts: its support for
+deferred constraints, which are checked only when the user “switches on” the necessary checking
+(end-of-transaction at the latest) by means of SET CONSTRAINTS—all constraint checking is
+immediate in the Manifesto—and its support for updatable views that are specified without WITH
+CASCADED CHECK OPTION.
+      For reasons explained in detail in Appendix F, SQL fails completely with respect to type
+constraints. Note: Do not be misled by the fact that (as noted in passing in Chapter 3) SQL does
+include something it calls “domains,” and those “domains” do have associated constraints. But
+those “domains” are not true types—they are nothing to do with true relational domains—and those
+“domain constraints” are not true type constraints; rather, they are database constraints, in Manifesto
+terms, that happen to have been specified in a rather unorthodox way.
+
+24. Total database constraints
+
+SQL conforms insofar as it conforms to RM Prescription 23.
+
+25. Catalog
+
+SQL conforms in that its catalogs are themselves collections of tables (meaning table variables, of
+course).
+      SQL fails to support assignment to those tables for two reasons. First, the tables in question
+are nonupdatable views (so they are not really table variables!); second, SQL in any case has
+deficient support for relation assignment, as already noted under RM Prescription 21.
+
+26. Language design
+
+SQL fails to some considerable extent by most, if not all, of the generally agreed yardsticks of good
+language design. More specifically, it fails with respect to at least the following measures:
+conceptual integrity, syntactic consistency, parsimony, and orthogonality.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        516
+Appendixes                                                     Appendix H / A Comparison with SQL
+
+
+ ■   It fails with respect to conceptual integrity in its treatment of nulls, for example. The
+     originally intended interpretation of nulls when they were first introduced into SQL was
+     “value unknown,” and this interpretation accounts for the behavior of nulls in (e.g.)
+     comparisons. Yet SQL sometimes generates nulls in circumstances where such an
+     interpretation is utterly inappropriate. The nulls that result from OUTER JOIN, for example,
+     might perhaps signify “not applicable”; the null that results from attempting to compute the
+     average of an empty set of numbers surely signifies “undefined”; and the null that results from
+     an attempt to sum that same set is just a perverse way of indicating zero. We remind you too
+     that null is also used in SQL to signify “the third truth value” (see the discussion of RM
+     Prescription 1, earlier in this appendix).
+           On another front, SQL claims that its tables, in general, are bags (multisets) of rows; yet
+     the normal union operator on bags is not directly provided, and considerable circumlocution is
+     required to obtain its effect.
+           In any case, SQL concepts are not agreeably few, and they include many that in our
+     opinion are not agreeable at all—for example, nulls, three-valued logic, left-to-right column
+     ordering, duplicate rows, anonymous columns, subtables and supertables (see Appendix G),
+     and many others.
+
+ ■   SQL fails with respect to syntactic consistency in the various ways it uses AS to give a name
+     to an expression. In some contexts, such as the SELECT and FROM clauses, the expression
+     comes before the AS and the name after. In others, such as the CREATE VIEW statement
+     and the WITH clause, the name comes before and the expression after. And in some cases the
+     AS is optional, while in others it is required.
+          SQL also fails in this respect in that the keyword TABLE sometimes means any named
+     table (as in the query expression TABLE T) and sometimes a base table specifically (as in
+     CREATE TABLE T).
+          SQL also fails in this respect in that some options that are expressed using the keyword
+     WITH have explicit converses using WITHOUT, while others do not. Cursor declarations
+     can be WITH or WITHOUT both HOLD and RETURN. DESCRIBE can be WITH or
+     WITHOUT NESTING. A view definition can be WITH CHECK OPTION but cannot be
+     WITHOUT it. A privilege can be granted WITH GRANT OPTION but cannot be granted
+     WITHOUT it.
+          By way of another example (based on one in reference [41]), consider the following
+     expressions:
+     SELECT * FROM ( A NATURAL JOIN B ) AS T
+     SELECT * FROM ( A UNION B ) AS T
+     TABLE A UNION TABLE B
+     TABLE A NATURAL JOIN TABLE B
+     SELECT * FROM A UNION SELECT * FROM B
+     SELECT * FROM A NATURAL JOIN SELECT * FROM B
+     ( TABLE A ) UNION ( TABLE B )
+     ( TABLE A ) NATURAL JOIN ( TABLE B )
+     ( TABLE A ) AS AA NATURAL JOIN ( TABLE B ) AS BB
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       517
+Appendixes                                                     Appendix H / A Comparison with SQL
+
+
+     Some of these expressions are syntactically valid and others not, and it is a nontrivial exercise
+     to figure out or remember which are which.
+
+ ■   SQL fails with respect to parsimony in the remarkable (and regrettable) degree of
+     redundancy—the variety of different ways, that is, sometimes radically different ways, of
+     achieving the same effect—that has been noted by the present authors among others (see, e.g.
+     reference [62]). For example, the plugging of those “holes” in the original SQL language that
+     rendered it relationally incomplete has made all of the following features logically redundant:
+     GROUP BY, HAVING, subqueries, and correlation names. And of these, we venture to
+     suggest that HAVING, at least, is positively undesirable.
+
+ ■   With respect to orthogonality, SQL:1992 had already addressed many of the complaints that
+     very early on made SQL quite notorious among computer languages. However, some
+     violations remained and persist in SQL:2003, along with a few more that were introduced in
+     SQL:1999 (e.g., restrictions on the use of ROW types). For example:
+
+     ●    The availability of the CASCADE option of DROP depends on the kind of object being
+          dropped.
+
+     ●    It is not possible to define subtypes of built-in types or DISTINCT types.
+
+     ●    The VALUES ARE SYSTEM GENERATED feature in column definitions is available
+          only for base tables that are “of” a user-defined type. At least on the face of it, it would
+          appear that these two features, “of” and VALUES ARE SYSTEM GENERATED, should
+          be orthogonal.
+
+     The foregoing list of criticisms is not exhaustive.
+
+
+RM PROSCRIPTIONS
+
+1. No attribute ordering
+
+SQL fails. Examples of where SQL attaches significance to the left-to-right order of columns
+include:
+
+ ■   SELECT *
+
+ ■   UNION, INTERSECT, EXCEPT (without CORRESPONDING in each case)
+
+ ■   CREATE VIEW (if column names are specified)
+
+ ■   INSERT (if no column names are specified)
+
+ ■   Row comparisons and assignments
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       518
+Appendixes                                                                Appendix H / A Comparison with SQL
+
+
+    ■   IN (of rows and tables)
+
+    ■   VALUES
+
+2. No tuple ordering
+
+SQL conforms.
+
+3. No duplicate tuples
+
+SQL fails. Duplicate rows can arise in at least the following ways:
+
+    ■   SELECT without DISTINCT
+
+    ■   INSERT into a base table for which no candidate key is specified
+
+    ■   UNION ALL
+
+    ■   Specifying the same row more than once in an invocation of VALUES
+
+4. No nulls
+
+SQL fails.
+
+5. No nullological mistakes
+
+SQL fails. Examples:
+
+    ■   Requiring at least one column in every table
+
+    ■   Requiring at least one expression in the SELECT clause
+
+    ■   Requiring at least one column in every key
+
+     Note: RM Proscription 5 specifically addresses only tables and keys, but we note here for
+purposes of reference certain further nullological mistakes in SQL:
+
+    ■   Requiring at least one table reference in the FROM clause1
+
+    ■   Requiring at least one item in ORDER BY (though in this case the desired effect can be
+        obtained by omitting the clause)
+
+    ■   Several errors in the handling of empty tables (for example, treating such a table as a null in
+        the context of a scalar subquery)
+
+
+1
+    Some implementations commendably do not adhere to this restriction.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                             519
+Appendixes                                                    Appendix H / A Comparison with SQL
+
+
+6. No internal-level constructs
+
+SQL conforms.
+
+7. No tuple-level operations
+
+SQL fails. Its FETCH operation (not to be confused with our TUPLE FROM operator) retrieves an
+individual row. Worse, its DELETE and UPDATE WHERE CURRENT OF CURSOR operations
+operate on individual rows.
+
+8. No composite attributes
+
+SQL conforms.
+
+9. No domain check override
+
+SQL conforms.
+
+10. Not SQL
+
+SQL fails. The language defined in the SQL specification is called SQL.
+
+
+OO PRESCRIPTIONS
+
+1. Compile-time type checking
+
+SQL conforms.
+
+2. Type inheritance (conditional)
+
+SQL fails by definition here, because it does not abide by the inheritance model described in Part
+IV of this book. We can be more specific than this, however, and we will be under the various IM
+Prescriptions later in this appendix.
+
+3. Computational completeness
+
+SQL conforms via its Persistent Stored Modules feature, SQL/PSM.
+
+4. Explicit transaction boundaries
+
+SQL conforms, almost, with respect to transaction termination, but fails with respect to transaction
+initiation, which is allowed (and in some implementations required) to be implicit. Note: The
+reason for that “almost” qualifier is explained in Chapter 8.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      520
+Appendixes                                                      Appendix H / A Comparison with SQL
+
+
+5. Nested transactions
+
+SQL fails. It does provide some analogous and useful functionality by means of its savepoint
+feature, but establishing a savepoint is not the same as starting a transaction [96]. In any case, one
+of the purposes of being able to nest transactions is to allow a unit of work to be specified
+independently of whether that unit is to be executed as an outermost transaction or as part of some
+encompassing transaction. Starting a transaction and establishing a savepoint are distinct operations
+in SQL, and they use different syntax.
+
+6. Aggregate operators and empty sets
+
+SQL fails, because SUM, AVG, MAX, MIN, EVERY, and ANY all incorrectly return null if
+invoked on an empty argument. Note: For simplicity we ignore here the additional aggregate
+operators introduced with what was originally called “SQL/OLAP” (see reference [76]), which have
+since been folded into Part 2 of the standard, “SQL/Foundation.”
+
+
+OO PROSCRIPTIONS
+
+1. Relvars are not domains
+
+It might be argued that SQL conforms, despite its support for what we called “the second kind of
+base table” under RM Prescription 13 earlier in this appendix, because it turns out that rows in such
+tables are just rows and not values of the type that the table is declared to be “of.” We prefer to say
+it fails, because there is no doubt that support for that second kind of base table was motivated by a
+desire to perceive object classes as analogous to relvars. For example, an operator is provided to
+derive a value of the “of” type from a given row, and the system-generated REF values in the “self-
+referencing column” of such a table are intended to be analogous to object IDs (they thus prevent
+SQL from supporting type inheritance according to the model proposed in this book).
+
+2. No object IDs
+
+Again it might be argued the SQL conforms, because even though (to repeat) its system-generated
+REF values do look very much like object IDs, they also manage not quite to violate the letter of
+OO Proscription 2. We prefer to say it fails, for the reason given in connection with OO
+Proscription 1.
+
+
+RM VERY STRONG SUGGESTIONS
+
+1. System keys
+
+SQL conforms, via its “identity columns” feature (new in SQL:2003), and also to some extent via
+its VALUES ARE SYSTEM GENERATED feature which, as we have already observed under RM
+Prescription 26, is not as generally available as we feel it might be. It has no analog of our
+suggested TAG operator.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        521
+Appendixes                                                      Appendix H / A Comparison with SQL
+
+
+2. Foreign keys
+
+SQL conforms.
+
+3. Candidate key inference
+
+SQL conforms insofar as it conforms to RM Prescription 15. Note: Although SQL does require
+candidate keys to be inferred for query results, it makes only limited use of the results of such
+inference. The details are beyond the scope of this appendix.
+
+4. Transition constraints
+
+SQL fails. Note: It might be possible to use CREATE TRIGGER to achieve some (not all) of the
+same functionality as a general declarative transition constraint, but CREATE TRIGGER is at least
+partly procedural in nature. In particular, it specifies when the triggered procedure is to be invoked
+(e.g., ON UPDATE). One consequence is that it might be possible—for example—to subvert an
+UPDATE triggered procedure by executing a DELETE followed by an INSERT instead of
+executing an UPDATE per se.
+
+5. Quota queries
+
+SQL conforms via its support for the functions RANK and DENSE_RANK.
+
+6. Generalized transitive closure
+
+SQL conforms, via its support for recursion in WITH clauses and view definitions.
+
+7. User-defined generic operators
+
+SQL fails.
+
+8. SQL migration
+
+Not applicable (SQL is not a valid D).
+
+
+OO VERY STRONG SUGGESTIONS
+
+1. Type inheritance
+
+SQL necessarily fails, because it fails on OO Prescription 2.
+
+2. Types and operators unbundled
+
+SQL partly conforms and partly fails. Some operators (namely, those specifically designated as
+“methods”) must be bundled, others must not.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        522
+Appendixes                                                     Appendix H / A Comparison with SQL
+
+
+3. Single-level store
+
+SQL conforms to some extent, through its feature SQL/PSM, but fails when used as an “embedded
+data sublanguage.”
+
+
+IM PRESCRIPTIONS
+
+1. Types are sets
+
+SQL conforms.
+
+2. Subtypes are subsets
+
+SQL conforms, but in a rather peculiar way, inasmuch as the set of all values of type T is not fully
+known until all proper subtypes of T have been defined. Note: The requirement that proper
+subtypes be proper subsets is not really supported, however, since SQL does not support type
+constraints (as we saw under RM Prescription 23).
+
+3. “Subtype of” is reflexive
+
+SQL conforms.
+
+4. Proper subtypes
+
+SQL conforms, except as noted under IM Prescription 2.
+
+5. “Subtype of” is transitive
+
+SQL conforms.
+
+6. Immediate subtypes
+
+SQL conforms (but it uses the term direct in place of the more apt immediate).
+
+7. Root types disjoint
+
+SQL conforms for single inheritance. It also conforms for multiple inheritance insofar as it
+supports multiple inheritance at all (which is not very far—see IM Prescription 22, later). Note:
+The SQL term for root type is maximal supertype (not to be confused with a maximal type in the
+sense of IM Prescription 20). Oddly, the SQL term for leaf type is not minimal subtype but leaf
+type.
+
+8. Scalar values with inheritance
+
+SQL conforms for single inheritance. It also conforms for multiple inheritance, insofar as it
+supports multiple inheritance at all.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      523
+Appendixes                                                       Appendix H / A Comparison with SQL
+
+
+9. Scalar variables with inheritance
+
+SQL conforms.
+
+10. Specialization by constraint
+
+SQL fails completely; in fact, as we saw earlier, it does not support type constraints at all.
+
+11. Assignment with inheritance
+
+SQL conforms.
+
+12. Equality etc. with inheritance
+
+SQL necessarily fails, owing to its failure on RM Prescription 8. What is more—in terms of our
+running example from Chapter 14—SQL would even allow a comparison between an ellipse and a
+polygon to give TRUE. In other words, there is no requirement that the most specific types be the
+same in order for the comparison to give TRUE.
+
+13. Join etc. with inheritance
+
+SQL conforms insofar as it conforms to IM Prescription 12.
+
+14. TREAT
+
+SQL conforms inasmuch as it does support a TREAT operator (in fact the operator in question is
+called TREAT). However, it fails to support a TREAT pseudovariable.
+
+15. Type testing
+
+SQL conforms. Here is the SQL analog of our IS_T(X):
+      TYPE ( X ) [ IS ] OF ( T )
+
+The optional IS is a noiseword. The expression following OF is a parenthesized commalist of <type
+specification>s (possibly including specifications of the form TYPE (<exp>), so SQL also supports
+an analog of our IS_SAME_TYPE_AS (Y,X)). Analogous remarks apply to all of the other
+operators discussed in this subsection (see below).
+      SQL also supports an analog of our relational operator R:IS_T(A). However, its support is
+clumsy. Let R denote a relation with attributes A, B, and C. Then the SQL analog of our R:IS_T(A)
+looks like this:
+      ( SELECT DISTINCT TREAT A AS T AS A, B, C
+        FROM   R
+        WHERE TYPE ( A ) IS OF ( T ) )
+
+Such expressions become increasingly cumbersome as the number of attributes increases.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      524
+Appendixes                                                      Appendix H / A Comparison with SQL
+
+
+     SQL also supports “most specific type” analogs of the foregoing operators. Here is the SQL
+analog of IS_MS_T(X):
+      TYPE ( X ) [ IS ] OF ( ONLY T )
+
+(However, we cannot help remarking in passing that the keyword ONLY here is very misleading if
+T is not a root type.) And—with the same assumptions as before—here is the SQL analog of
+R:IS_MS_T(A):
+      ( SELECT DISTINCT TREAT A AS T AS A, B, C
+        FROM   R
+        WHERE TYPE ( A ) IS OF ( ONLY T ) )
+
+      SQL also provides an operator that returns the most specific type of its argument as a
+character string.
+
+16. Read-only operator inheritance and value substitutability
+
+SQL conforms.
+
+17. Operator signatures
+
+In our discussion of IM Prescription 17 in Chapter 14, we suggested that all arguments to a given
+operator invocation should participate equally in the run-time binding process. SQL nearly
+conformed to this suggestion when inheritance was first introduced (in SQL:1999) but was changed
+at the eleventh hour. The reason for the change was that Java and C++, the two most likely host
+languages for applications using the “object” portions of SQL, themselves do not conform to the
+suggestion; rather, they perform run-time binding on the basis of the first argument only. As a
+result, SQL now supports both (a) Java- and C++-style methods (sometimes called selfish methods),
+for which the binding process is performed at run time on the basis of the most specific type of the
+first argument only, and (b) “nonmethod” operators called functions and procedures, for which the
+binding process is performed at compile time on the basis (necessarily) of the declared types of all
+arguments. Thus, SQL fails on this part of IM Prescription (a) for methods (because of their
+“selfish” nature) and (b) for functions and procedures (because here there is no run-time binding at
+all).
+       With regard to the different kinds of signatures required by IM Prescription 17, SQL’s
+methods conform fully, while its functions and procedures do so only partially (in effect,
+specification and version signatures are combined in the latter case).
+       SQL has no requirement that if several versions of a given operator exist under the covers,
+then those versions all implement the same semantics.
+
+18. Read-only parameters to update operators
+
+SQL conforms.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                     525
+Appendixes                                                                    Appendix H / A Comparison with SQL
+
+
+19. Update operator inheritance and variable substitutability
+
+SQL fails. It requires update operators to be inherited unconditionally.
+
+20. Union, dummy, and maximal and minimal types
+
+Not clear. SQL does support both (a) INSTANTIABLE types and NOT INSTANTIABLE types
+and (b) types that have a declared representation and types that do not. An INSTANTIABLE type
+with a declared representation is the straightforward case, of course. A NOT INSTANTIABLE
+type might correspond to our union type (regular or dummy depending on whether it has a declared
+representation or not), though it is hard to be sure. An INSTANTIABLE type with no proper
+supertype and no declared representation seems to be a type with exactly one value, like a Tutorial
+D type with a <possrep def> that contains no <possrep component def>s. An INSTANTIABLE
+nonroot type that adds no attributes to its inherited representation appears to be the degenerate case
+of subtyping by extension whereby the subtype does not actually “extend” its supertype at all.
+Perhaps such a subtype might be used for cases where specialization by constraint would be
+appropriate, if only it were available. But the responsibility for avoiding nonsenses such as
+noncircular circles would then lie with the type user instead of the type definer.
+
+21. Tuple/relation subtypes and supertypes
+
+SQL conforms with respect to tuples. Having no relation type generator at all, it obviously fails
+with respect to relations. (We remark, however, that SQL does support array and multiset subtypes
+and supertypes, and these constructs are defined in a manner analogous to the way the Manifesto
+defines tuple and relation subtypes and supertypes. Thus, for example, the type T' MULTISET is a
+subtype of the type T MULTISET if and only if T' is a subtype of T.)
+
+22. Tuple/relation values with inheritance
+
+SQL conforms with respect to tuples, albeit vacuously, inasmuch as tuple parameters to user-
+defined operators are not supported1 (in fact the support is vacuous anyway because most
+implementations at the time of writing do not support row types at all). Having no relation type
+generator at all, it obviously fails with respect to relations.
+
+23. Maximal and minimal tuple/relation types
+
+SQL fails.
+
+
+
+
+1
+  This conformance corresponds to the only kind of multiple inheritance supported by SQL. (Actually, SQL is usually
+described as not supporting multiple inheritance at all; however, Chapter 16 of the present book shows that multiple
+inheritance is necessarily supported to some degree, even if only implicitly, if (a) single inheritance for scalar types, and
+(b) tuple and/or relation types, are both supported.)
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                             526
+Appendixes                                                    Appendix H / A Comparison with SQL
+
+
+24. Tuple/relation most specific types
+
+SQL conforms with respect to tuples, vacuously. Having no relation type generator at all, it
+obviously fails with respect to relations.
+
+25. Tuple/relation variables with inheritance
+
+SQL conforms with respect to tuples. Having no relation type generator at all, it obviously fails
+with respect to relations.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                     527

@@ -1,0 +1,1848 @@
+                                           Appendix K
+
+                       References and Bibliography
+
+                            This is Appendix J in the book as published.
+
+This final appendix provides a consolidated and annotated list of references for the entire book. We
+should immediately admit that some of the annotation is rather opinionated, in that it includes
+commentary of a critical nature (sometimes positive and sometimes negative). We should also
+apologize for the embarrassingly large number of references to publications by ourselves; such a
+state of affairs is almost unavoidable, however, given the nature of the book and of our subject.
+        Note: In addition to the references explicitly mentioned in what follows, other relevant
+material can be found on the websites www.thethirdmanifesto.com and www.dbdebunk.com.
+
+   1.   Anon.: Private communication (March 1999).
+
+        This item is discussed in detail in Appendix G.
+
+   2.   Malcolm Atkinson, François Bancilhon, David DeWitt, Klaus Dittrich, David Maier, and
+        Stanley Zdonik: “The Object-Oriented Database System Manifesto,” Proc. 1st International
+        Conference on Deductive and Object-Oriented Databases, Kyoto, Japan (1989). New York,
+        N.Y.: Elsevier Science (1990).
+
+        Like our own Manifesto, this reference proposes a foundation for future DBMSs. As noted
+        in Chapter 1, however, it virtually ignores the relational model; in fact, it does not seem to
+        take the idea of a model, as such, very seriously at all. To quote: “With respect to the
+        specification of the system, we are taking a Darwinian approach: We hope that, out of the
+        set of experimental prototypes being built, a fit model will emerge. We also hope that viable
+        implementation technology for that model will evolve simultaneously.” In other words, the
+        authors are suggesting that the code should be written first, and that a model might possibly
+        be developed later by abstracting from that code. By contrast, we believe it would be better
+        to develop the model first (which is what happened in the relational case, of course).
+              Be that as it may, the paper goes on to propose the following as mandatory features—
+        i.e., features that, it suggests, must be supported if the DBMS in question is to deserve the
+        label “object-oriented”):
+
+        1. Collections                8. User-defined types
+        2. Object IDs                 9. Persistence
+        3. Encapsulation            10. Large databases
+        4. Types or classes         11. Concurrency
+        5. Inheritance              12. Recovery
+        6. Late binding             13. Ad hoc query
+        7. Computational completeness
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       559
+Appendixes                                                   Appendix K / References and Bibliography
+
+
+      It also discusses certain optional features, including multiple inheritance and compile-time
+      type checking; certain open features, including “programming paradigm” (“we see no reason
+      why we should impose one programming paradigm more than another: the logic
+      programming style, the functional programming style, or the imperative programming style
+      could all be chosen”); and certain features on which the authors could reach no consensus,
+      including—a little surprisingly, considering their importance—views and integrity
+      constraints.
+            Here in a nutshell are our own positions on the proposed mandatory features (only).
+      Please note that our comments are based on the premise that the object of the exercise is to
+      define features of a good, genuine, general-purpose DBMS. We do not deny that the
+      features mentioned might be useful for a highly specialized DBMS that is tied to some
+      specific application area such as CAD/CAM, with no need for (say) integrity constraint
+      support—but then we would question whether such a system is truly a DBMS, as that term
+      is usually understood (see the annotation to references [9] and [100]).
+
+      ■      We agree that Numbers 8 and (probably) 5 are important. Number 4 is implied by
+             Number 8. Number 6 is more or less implied by Number 5 (and therefore probably
+             important too), but it is really an implementation matter, not part of the model (it is
+             what we called run-time binding in Chapter 14). We also agree with Number 7.
+
+      ■      We agree that Numbers 10-13 are important, but they are independent of whether the
+             system is object-oriented, relational, or something else entirely. (The point is worth
+             repeating from Chapter 6, however, that ad hoc query support in particular can be
+             difficult to provide in a pure object system, because it clashes with the goal of
+             encapsulation and the idea that all access has to be by means of predefined methods.
+             We note too that providing many different data structures at the logical level, as object
+             systems typically do, inevitably makes the query interface, if any, more complicated.
+             See OQL [17] for an illustration of this point and reference [57] for an elaboration of
+             the argument.)
+
+      ■      With regard to Numbers 1 and 9, the only kind of “collection” we really want, and
+             certainly the only kind of data construct we want to possess the property of
+             “persistence,” is, very specifically, the database relvar. This reference, by contrast,
+             argues for the “persistence orthogonal to type” idea [3].
+
+      ■      We think the emphasis on encapsulation (Number 3) is slightly off base. What is
+             important is to distinguish between type and representation (and hence, in database
+             terms, to achieve data independence [86]). After all, unencapsulated relations can
+             provide just as much data independence, in principle, as encapsulated objects can [76].
+
+      ■      We reject Number 2 outright [59-60].
+
+           We should add that—and it is to the credit of the authors that they recognize as much—
+      their paper was never really intended to be more than a stake in the ground: “We have taken
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                            560
+Appendixes                                                   Appendix K / References and Bibliography
+
+
+       a position, not so much expecting it to be the final word as to erect a provisional landmark to
+       orient further debate.”
+
+  3.   Malcolm P. Atkinson and O. Peter Buneman: “Types and Persistence in Database
+       Programming Languages,” ACM Comp. Surv. 19, No. 2 (June 1987).
+
+       One of the earliest papers, if not the earliest, to articulate the position that persistence should
+       be orthogonal to type (see references [57] and [65] for counterarguments). This paper is a
+       good starting point for reading in the area of database programming languages in general
+       (database programming languages being perceived by many people as the sine qua non of
+       object database systems; see, for example, reference [17]).
+
+  4.   Kenneth Baclawski and Bipin Indurkhya: Technical Correspondence, CACM 37, No. 9
+       (September 1994).
+
+       This item is discussed in Appendix F.
+
+  5.   Catriel Beeri and Philip A. Bernstein: “Computational Problems Related to the Design of
+       Normal Form Relational Schemas,” ACM TODS 4, No. 1 (March 1979).
+
+       To quote from the abstract: “[It] is shown that most interesting algorithmic questions about
+       ... keys are NP-complete and are therefore probably not amenable to fast algorithmic
+       solutions.”
+
+  6.   Jon Bentley: “Little Languages,” in More Programming Pearls. Reading, Mass.: Addison-
+       Wesley (1988).
+
+       This paper illustrates and discusses the following “yardsticks of language design”:
+
+       1. Orthogonality                 5. Similarity
+       2. Generality                    6. Extensibility
+       3. Parsimony                     7. Openness
+       4. Completeness
+
+       Regarding orthogonality in particular, see reference [54]. The term parsimony, incidentally,
+       is nicely defined in Chambers Twentieth Century Dictionary as “praiseworthy ... avoidance
+       of excess.” Parsimony is of course related to Occam’s Razor (“entities should not be
+       multiplied beyond necessity”).
+
+  7.   Elisa Bertino and Lorenzo Martino: Object-Oriented Database Systems: Concepts and
+       Architectures. Reading, Mass.: Addison-Wesley (1993).
+
+       Many publications from the object world try to draw a distinction (as we do not) between
+       type and class, and this reference is one such: “Object-oriented systems can be classified
+       into two main categories—systems supporting the notion of class and those supporting the
+       notion of type ... [Although] there are no clear lines of demarcation between them, the two
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                           561
+Appendixes                                                            Appendix K / References and Bibliography
+
+
+         concepts are fundamentally different [sic] ... Often the concepts type and class are used
+         interchangeably. However, when both are present in the same language, the type is used to
+         indicate the specification of the interface of a set of objects, while class is an
+         implementational notion [so why is it “in the language” at all?]. Therefore ... a type is a set
+         of objects which share the same behavior ... [and] a class is a set of objects which have
+         exactly the same internal structure and therefore the same attributes and the same methods.
+         [But if all objects in a “class” have the same attributes and the same methods, is not that
+         class a type, by the authors’ own definition?] The class defines the implementation of a set
+         of objects, while a type describes how such objects can be used.” (Contrast ODMG [17],
+         which uses the terms type and class in almost exactly the opposite way.)
+              The authors then go on to say: “With inheritance, a class called a subclass can be
+         defined on the basis of the definition of another class called a superclass.” Surely—in
+         accordance with their own earlier definitions—they should be talking in terms of types here,
+         not classes? And then they add: “The specification hierarchy (often called subtype
+         hierarchy) expresses ... subtyping relationships which mean that an instance of the subtype
+         can be used in every context in which an instance of the supertype can correctly appear
+         (substitutability).” Observe that they do now speak of types, not classes. Observe too that
+         we now have two new terms for the type hierarchy ... Finally, observe the failure to
+         distinguish properly between values and variables (note the reference to “instances”), and
+         the consequent failure to distinguish between value substitutability and variable
+         substitutability.
+
+    8.   Garrett Birkhoff: Lattice Theory (American Mathematical Society Colloquium Publications
+         Volume 25). Providence, R.I.: American Mathematical Society (1967).
+
+    9.   Michael Blaha and William Premerlani: Object-Oriented Modeling and Design for
+         Database Applications. Upper Saddle River, N.J.: Prentice-Hall (1998).
+
+         Blaha and Premerlani’s book is not really concerned with the kinds of issues that are the
+         principal concern of The Third Manifesto; rather, it is concerned with a particular design
+         methodology called “Object Modeling Technique” (OMT for short). Nevertheless, we do
+         have our reasons for mentioning it here, which we will get to in just a moment.
+               OMT is a variant of the well-known entity/relationship model; like most such, therefore,
+         it relies extensively on the use of graphical symbols (“boxes and arrows” and so forth). The
+         book consists primarily of an in-depth description of OMT, with emphasis on its relevance
+         to the design of databases in particular.1 An OMT database design does not, or at least
+         should not, depend on the capabilities of any particular DBMS; Blaha and Premerlani
+         therefore also offer a detailed discussion of how to map such a design to a design that is
+         specific to a particular object or SQL DBMS.
+
+1
+  The book says that OMT is “especially helpful with database applications”—but this remark is a little puzzling,
+because databases are generally supposed to be designed, as far as possible, in a way that is independent of the
+applications that will use them. However, it is possible, given OMT’s object “look and feel,” that it is principally meant
+to help with the design of application-specific databases (in this connection, see the annotation to references [2] and
+[57]).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                          562
+Appendixes                                                Appendix K / References and Bibliography
+
+
+            One reason we mention OMT at all is because it provides a good example of a point we
+       made in Chapter 1: namely, that even the term object itself has a variety of different
+       meanings in the object world. In the present context, it clearly means what the database
+       community would more usually call an entity—implying among other things that it is not
+       encapsulated—whereas in object programming languages it generally means something that
+       definitely is encapsulated. Note: These remarks are not meant to disparage Blaha and
+       Premerlani’s book, of course; we are only using it to illustrate a point.
+            Following on from this point, we now observe that, presumably because OMT objects
+       are really entities, OMT maps them to tuples in relvars instead of to values in domains.
+       (More precisely, it maps classes to relvars instead of to domains.) OMT is not alone in this
+       regard, of course (many other design methodologies do exactly the same thing); however,
+       we speculate—and this is the crux of the matter—that it is this state of affairs (i.e., that
+       “object modeling” is really just “entity/relationship modeling” by another name) that is the
+       source of the infamous “relvar = class” mistake that we discussed at some length in Chapter
+       9.
+            We note in passing that the book uses several other terms in addition to “object” and
+       “class” in ways that are at odds with the way we use them in the Manifesto. For example, on
+       page 46 we find: “Do not confuse a domain with a class.” At this point the book is certainly
+       using class to mean what we definitely would call a domain or—preferably—type (though
+       elsewhere it seems to use it to mean a collection instead), so its use of domain does not
+       accord with ours. And it uses inheritance to mean not type inheritance as discussed in Part
+       IV of our own book, but instead something akin to the rather suspect “subtables and
+       supertables” notion discussed in Appendix G. Polymorphism is mentioned only in passing,
+       and substitutability not at all.
+            Finally, the book also contains an interesting observation regarding code reuse. Recall
+       from Part IV that code reuse is one of the objectives of type inheritance. Of course, reuse
+       does not imply inheritance, but the kinds of reuse that are not related to inheritance are not
+       new. And in this connection, the book makes the following point regarding DBMS code
+       specifically: “DBMSs are intended to provide generic functionality for a wide variety of
+       applications ... You are achieving reuse when you can use generic DBMS code, rather than
+       custom-written application code” [our italics]. We agree, and observe that such reuse is
+       supported very well by relational DBMSs, less well by object DBMSs.
+
+ 10.   George Boolos: Logic, Logic, and Logic. Cambridge, Mass.: Harvard University Press
+       (1998).
+
+       Though not the primary reason we include this reference, we observe with some pleasure
+       that the title of one of the essays in Boolos’s book is “To Be Is to Be a Value of a Variable
+       (or to Be Some Values of Some Variables).”
+
+ 11.   Walter Bright: “The D Programming Language” (title of a class advertised in the brochure
+       for the Software Development Conference, Santa Clara, Calif., March 15-19, 2004).
+
+       We include this reference mainly so that we can make it clear that “The D Programming
+       Language” mentioned is not our D (which we first described in print in early 1995 [35]).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       563
+Appendixes                                                  Appendix K / References and Bibliography
+
+
+       The following verbatim extract from the description of the subject class will serve to
+       highlight some of the differences between D and D: “The D Programming Language retains
+       the look and feel of C++, eliminates obsolete and error-prone features like the primitive
+       preprocessor and replaces them with modern equivalents. D adds power programming
+       features like nested functions, modules, try-catch-finally, garbage collection, delegates,
+       dynamic closures, extending C arrays to be fully dynamic arrays, associative arrays,
+       integrated Unicode support, versioning, inline assembler, strong typedefs, etc. With today’s
+       emphasis on delivering more reliable software in less time, D adds Design by Contract and
+       Unit Testing smoothly integrated into the syntax. Guaranteed initialization, automatic
+       memory management, improved reference types and optional array bounds checking prevent
+       large swaths of common errors. The language is easy to parse and analyze, enabling code
+       management tools to be quickly produced. Anyone familiar with C++ will have little
+       difficulty upgrading to D. D has struck a responsive chord in the programming community
+       and is experiencing explosive growth.”
+
+ 12.   Frederick P. Brooks, Jr.: The Mythical Man-Month (20th anniversary edition). Reading,
+       Mass.: Addison-Wesley (1995).
+
+       The source of the principle of conceptual integrity.
+
+ 13.   John P. Burgess and Gideon Rosen: A Subject with No Object: Strategies for Nominalistic
+       Interpretation of Mathematics. Oxford, U.K.: Oxford University Press (1997).
+
+       We include this reference on the strength of the following quote from an Oxford University
+       Press brochure advertising it, which might be viewed as bolstering our philosophical
+       position regarding the nature of values (see Chapter 1): “Numbers and other mathematical
+       objects are exceptional in having no location in space or time or relations of cause and
+       effect. This [fact] makes it difficult to account for the possibility of the knowledge of such
+       objects, leading many philosophers to embrace nominalism, the doctrine that there are no
+       such objects, and to embark on ambitious projects for interpreting mathematics so as to
+       preserve the subject while eliminating the objects.”
+
+ 14.   Luca Cardelli: “A Semantics of Multiple Inheritance,” in reference [136].
+
+       After we had developed the inheritance model described in Part IV of the present book, we
+       were interested to discover that this paper by Cardelli had previously proposed some of the
+       same ideas (including analogs of our TREAT and IS_T operators and union types). It even
+       mentions the possibility of alpha and omega (calling them “anything” and “nothing,”
+       respectively), though it goes on to reject them. It is significant to note, however, that all of
+       this work was done in the context of “the EXTENDS relationship” (see Appendix G), not
+       specialization by constraint.
+
+ 15.   Luca Cardelli and Peter Wegner: “On Understanding Types, Data Abstraction, and
+       Polymorphism,” ACM Comp. Surv. 17, No. 4 (December 1985).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         564
+Appendixes                                                 Appendix K / References and Bibliography
+
+
+       A nice quote from this paper: “A major purpose of type systems is to avoid embarrassing
+       questions about representations, and to forbid situations in which these questions might
+       come up.” Indeed, type vs. representation is one of the great logical differences, a point we
+       have tried to make abundantly clear in the present book.
+
+ 16.   R. G. G. Cattell: Object Data Management (revised edition). Reading, Mass.: Addison-
+       Wesley (1994).
+
+       The first book-length tutorial on the application of object technology to database
+       management. (Reference [128] is another good, though much less extensive, tutorial on the
+       same general subject.) The following edited extract suggests that the field was certainly a
+       long way from any kind of consensus when the book was written: “Programming languages
+       may need new syntax ... swizzling, replication, and new access methods also need further
+       study ... new end-user and application development tools [are] required ... more powerful
+       query-language features [must be] developed ... new research in concurrency control is
+       needed ... timestamps and object-based concurrency semantics need more exploration ...
+       performance models are needed ... new work in knowledge management needs to be
+       integrated with object and data management capabilities ... this [will lead to] a complex
+       optimization problem [and] few researchers have [the necessary] expertise ... federated
+       [object] databases require more study.”
+
+ 17.   R. G. G. Cattell and Douglas K. Barry (eds.): The Object Data Standard: ODMG 3.0. San
+       Francisco, Calif.: Morgan Kaufmann (2000).
+
+       A detailed comparison between an earlier version of ODMG (Version 2.0) and the proposals
+       of The Third Manifesto can be found at the website www.thethirdmanifesto.com.
+
+ 18.   Donald D. Chamberlin: “Relations and References—Another Point of View,” InfoDB 10,
+       No. 6 (April 1997).
+
+       See the annotation to reference [59].
+
+ 19.   J. Craig Cleaveland: An Introduction to Data Types. Reading, Mass.: Addison-Wesley
+       (1986).
+
+ 20.   E. F. Codd: “Derivability, Redundancy, and Consistency of Relations Stored in Large Data
+       Banks,” IBM Research Report RJ599 (August 19th, 1969).
+
+       Codd’s very first paper on what became the relational model of data (it is essentially a
+       preliminary version of reference [21]).
+
+ 21.   E. F. Codd: “A Relational Model of Data for Large Shared Data Banks,” CACM 13, No. 6
+       (June 1970). Republished in “Milestones of Research,” CACM 26, No. 1 (January 1982).
+
+       The first widely available description of the original relational model, by its inventor (the
+       first published description was reference [20]).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        565
+Appendixes                                                  Appendix K / References and Bibliography
+
+
+ 22.   E. F. Codd: “Relational Completeness of Data Base Sublanguages,” in Randall Rustin (ed.):
+       Data Base Systems: Courant Computer Science Symposia 6. Englewood Cliffs, N.J.:
+       Prentice-Hall (1972).
+
+       This is the paper in which Codd first formally defined the original algebraic operators
+       (definitions did appear in references [20-21] also, but they were somewhat less formal, or at
+       least less complete). Note: One slightly unfortunate aspect of the paper is that it assumes
+       “for notational and expository convenience” that the attributes of a relation have a left-to-
+       right ordering and hence can be identified by their ordinal position (though Codd does say
+       that “names rather than position numbers [should] be used [in practice]”—and he had
+       previously said much the same thing in reference [21]). The paper therefore does not
+       mention an attribute RENAME operator, and it does not consider the question of result type
+       inference. Possibly as a consequence of these omissions, the same criticisms can still be
+       leveled today (a) at many discussions of the algebra in the literature, (b) at today’s SQL
+       products, and (c) to a slightly lesser extent, at the SQL standard as well.
+
+ 23.   E. F. Codd: The Relational Model for Database Management Version 2. Reading, Mass.:
+       Addison-Wesley (1990).
+
+       Codd spent much of the late 1980s revising and extending the original relational model (“the
+       Relational Model Version 1” or RM/V1), and this book was the result. It describes “the
+       Relational Model Version 2” or RM/V2. (We include this reference primarily in order to
+       make it clear that the version of the relational model on which The Third Manifesto is based
+       is not “RM/V2,” nor indeed “RM/V1” as this reference defines it. Rather, it is, as noted in
+       Chapter 1, the version described in references [47] and [76].)
+
+ 24.   E. F. Codd and C. J. Date: “Interactive Support for Nonprogrammers: The Relational and
+       Network Approaches,” in reference [36].
+
+       The paper that introduced the concept of essentiality, a concept that is critical to a proper
+       understanding of data models in general. The relational model basically has just one
+       essential data construct, the relation itself. The object model, by contrast, has many: sets,
+       bags, lists, arrays, and so forth (not to mention object IDs), though typically not relations.
+       See references [48] and [61] for further explanation.
+
+ 25.   O. J. Dahl and K. Nygaard: “SIMULA—An Algol-Based Simulation Language,” CACM 9,
+       No. 9 (September 1966).
+
+       As the name suggests, SIMULA was originally intended specifically for programming
+       simulations (e.g., of mechanical systems). However, it is often cited as the very first object
+       programming language.
+
+ 26.   Hugh Darwen (writing as Andrew Warden): “TABLE_DEE and TABLE_DUM,” in
+       reference [37].
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         566
+Appendixes                                                          Appendix K / References and Bibliography
+
+
+ 27.   Hugh Darwen: “The Askew Wall: A Personal Perspective,” in reference [38].
+
+ 28.   Hugh Darwen: “The Role of Functional Dependence in Query Decomposition,” in reference
+       [38].
+
+ 29.   Hugh Darwen: “The Nullologist in Relationland; or, Nothing Really Matters,” in reference
+       [38].
+
+ 30.   Hugh Darwen: “Outer Join with No Nulls and Fewer Tears,” in reference [38].
+
+ 31.   Hugh Darwen: “Valid Time and Transaction Time Proposals: Language Design Aspects,” in
+       Opher Etzion, Sushil Jajodia, and Suryanaryan Sripada (eds.): Temporal Databases:
+       Research and Practice. New York, N.Y.: Springer Verlag (1998).
+
+       This paper includes and discusses a set of language design principles that are similar but not
+       identical to those of reference [6]:
+
+       1. Precise specification              5. Syntactic consistency
+       2. Encouragement of Good              6. Orthogonality
+          Practice                           7. Parsimony
+       3. Generality                         8. Syntactic substitution
+       4. Semantic consistency               9. Conceptual integrity
+
+       Regarding syntactic substitution in particular, the paper has this to say:
+
+             A language definition should start with a few judiciously chosen primitive operators ... Subsequent
+             development is, where possible, by defining new operators in terms of ... previously defined [ones]. Most
+             importantly, syntactic substitution does not refer to an imprecise principle such as might be expressed as
+             “A is something like, possibly very like, B,” where A is some proposed new syntax and B is some
+             expression using previously defined operators. If A is close in meaning to B but cannot be specified by
+             true syntactic substitution, then we have a situation that is disagreeable and probably unacceptable, in
+             stark contrast to true syntactic substitution, which can be very agreeable and acceptable indeed.
+
+       As should be clear from the body of the present book, we applied the principle of true
+       syntactic substitution liberally in the design of Tutorial D.
+
+ 32.   Hugh Darwen: “The Importance of Column Names” (presentation slides),
+       www.thethirdmanifesto.com (October 1, 2003).
+
+ 33.   Hugh Darwen: “How to Handle Missing Information Without Using Nulls” (presentation
+       slides), www.thethirdmanifesto.com (May 9, 2003).
+
+       In Appendix G, we briefly touched on a technique for designing databases involving missing
+       information according to which, e.g., parts with no color are moved out of the regular parts
+       relvar into a separate relvar of their own. This presentation elaborates on this technique.
+       See also reference [113].
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                       567
+Appendixes                                               Appendix K / References and Bibliography
+
+
+ 34.   Hugh Darwen and C. J. Date: “Into the Great Divide,” in reference [38].
+
+ 35.   Hugh Darwen and C. J. Date: The Third Manifesto. ACM SIGMOD Record 24, No. 1
+       (March 1995).
+
+       The first “official” version of the Manifesto. The Manifesto as described in the present book
+       consists of a considerably revised and extended (but by and large compatible) version.
+
+ 36.   C. J. Date: Relational Database: Selected Writings. Reading, Mass.: Addison-Wesley
+       (1986).
+
+ 37.   C. J. Date: Relational Database Writings 1985-1989. Reading, Mass.: Addison-Wesley
+       (1990).
+
+ 38.   C. J. Date (with Hugh Darwen): Relational Database Writings 1989-1991. Reading, Mass.:
+       Addison-Wesley (1992).
+
+ 39.   C. J. Date: Relational Database Writings 1991-1994. Reading, Mass.: Addison-Wesley
+       (1995).
+
+ 40.   C. J. Date (with Hugh Darwen and David McGoveran): Relational Database Writings 1994-
+       1997. Reading, Mass.: Addison-Wesley (1998).
+
+ 41.   C. J. Date (with Hugh Darwen): A Guide to the SQL Standard (4th edition). Reading,
+       Mass.: Addison-Wesley (1997).
+
+       A complete tutorial reference and guide to the SQL:1992 standard as it had become by 1997
+       (it includes coverage of both SQL/CLI and SQL/PSM, which were added to “the 1992
+       standard” in 1995 and 1996, respectively). The book contains numerous examples of
+       violations of good language design principles! In particular, it includes an appendix,
+       Appendix D, that documents “many aspects of the standard that appear to be inadequately
+       defined, or even incorrectly defined, at this time.” Although SQL:1992 has since been
+       formally superseded (first by SQL:1999 and then by the current standard SQL:2003 [99]),
+       just about everything in this 1997 book—in Appendix D in particular—is still applicable
+       today.
+
+ 42.   C. J. Date: “An Architecture for High-Level Language Database Extensions,” Proc. ACM
+       SIGMOD International Conference on Management of Data, Washington, D.C. (June 1976).
+       A revised version of this paper entitled “An Introduction to the Unified Database Language
+       (UDL)” can be found in reference [36].
+
+ 43.   C. J. Date: “Some Principles of Good Language Design,” in reference [36].
+
+ 44.   C. J. Date: “A Critique of the SQL Database Language,” in reference [36].
+
+ 45.   C. J. Date: “What’s Wrong with SQL?”, in reference [37].
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                     568
+Appendixes                                                   Appendix K / References and Bibliography
+
+
+ 46.   C. J. Date: “The Principle of Cautious Design,” in reference [38].
+
+       To quote: “The Principle of Cautious Design says, in effect, that whenever we are faced
+       with a design choice, say between alternative A and alternative B (where A is upward
+       compatible with B), and the full implications of alternative B are not yet known, then the
+       recommendation is to go with alternative A.” Our decision to prohibit coercions in Tutorial
+       D can be seen as an application of this principle. By contrast, the decision to permit
+       duplicate rows in SQL can be seen as a case in which the principle was flouted.
+
+ 47.   C. J. Date: “Notes Toward a Reconstituted Definition of the Relational Model Version 1
+       (RM/V1),” in reference [38].
+
+ 48.   C. J. Date: “Essentiality,” in reference [39].
+
+ 49.   C. J. Date: “Nothing in Excess,” in reference [39].
+
+ 50.   C. J. Date: “Empty Bags and Identity Crises,” in reference [39].
+
+ 51.   C. J. Date: “How We Missed the Relational Boat,” in reference [39].
+
+ 52.   C. J. Date: “The Primacy of Primary Keys: An Investigation,” in reference [39].
+
+ 53.   C. J. Date: “We Don’t Need Composite Columns,” in reference [40].
+
+ 54.   C. J. Date: “A Note on Orthogonality,” in reference [40].
+
+       Orthogonality means independence; a language is said to display orthogonality if it provides
+       (a) a comparatively small set of primitive constructs, together with (b) a consistent set of
+       rules for putting those constructs together, and (c) every possible combination of those
+       constructs is both valid and meaningful (i.e., a deliberate attempt has been made to avoid
+       arbitrary restrictions). Such orthogonality is desirable because the less orthogonal a
+       language is, the more complicated it is and—paradoxically but simultaneously—the less
+       powerful it is:
+
+       ■     The language is more complicated because of the additional rules needed to define and
+             document the exceptions and special cases.
+
+       ■     The language is less powerful because the purpose of those additional rules is precisely
+             to prohibit certain combinations of constructs and hence to reduce the language’s
+             functionality.
+
+       In a nutshell: “Orthogonal design maximizes expressive power while avoiding deleterious
+       superfluities” (from the Algol 68 specifications).
+
+ 55.   C. J. Date: “Objects and Relations: Forty-Seven Points of Light,” in reference [40].
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       569
+Appendixes                                                           Appendix K / References and Bibliography
+
+
+       A blow-by-blow response to reference [103].
+
+ 56.   C. J. Date: “Quota Queries” (in three parts), in reference [40].
+
+ 57.   C. J. Date: “Why ‘The Object Model’ Is Not a Data Model,” in reference [40].
+
+       This paper argues among other things that (a) “the object model” is really a storage model,
+       not a data model, and that partly because of that fact (b) object and relational systems are
+       more different than is usually realized. The following excerpt captures the essence of the
+       argument:
+
+             Object databases grew out of a desire on the part of object application programmers—for a variety of
+             application-specific reasons—to keep their application-specific objects in persistent memory. That
+             persistent memory might perhaps be regarded as a database, but the important point is that it was indeed
+             application-specific; it was not a shared, general-purpose database, intended to be suitable for
+             applications that might not have been foreseen at the time the database was defined. As a consequence,
+             many features that database professionals regard as essential were simply not requirements in the object
+             world, at least not originally. Thus, there was little perceived need for:
+
+             1. Data sharing across applications
+             2. Physical data independence
+             3. Ad hoc queries
+             4. Views and logical data independence
+             5. Application-independent, declarative integrity constraints
+             6. Data ownership and a flexible security mechanism
+             7. Concurrency control
+             8. A general-purpose catalog
+             9. Application-independent database design
+
+             These requirements all surfaced later, after the basic idea of storing objects in a database was first
+             conceived, and thus all constitute add-on features to the original object model ... One important
+             consequence of all of the foregoing is that there really is a difference in kind between an object DBMS
+             and a relational DBMS. In fact, it could be argued that an object DBMS is not really a DBMS at all—at
+             least, not in the same sense that a relational DBMS is a DBMS. For consider:
+
+             ■    A relational DBMS comes ready for use. In other words, as soon as the system is installed, users
+                  (application programmers and end users) can start building databases, writing applications, running
+                  queries, and so on.
+
+             ■    An object DBMS, by contrast, can be thought of as a kind of DBMS construction kit. When it is
+                  originally installed, it is not available for immediate use by application programmers and end users.
+                  Instead, it must first be tailored by suitably skilled technicians, who must define the necessary
+                  classes and methods, etc. (the system provides a set of building blocks—class library maintenance
+                  tools, method compilers, etc.—for this purpose). Only when that tailoring activity is complete will
+                  the system be available for use by application programmers and end users; in other words, the result
+                  of that tailoring will indeed more closely resemble a DBMS in the more familiar sense of the term.
+
+             ■    Note further that the resultant “tailored” DBMS will be application-specific; it might, for example,
+                  be suitable for CAD/CAM applications, but be essentially useless for, e.g., medical applications. In
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                        570
+Appendixes                                                         Appendix K / References and Bibliography
+
+
+                  other words, it will still not be a general-purpose DBMS, in the same sense that a relational DBMS
+                  is a general-purpose DBMS.
+
+          The paper also argues against the “persistence orthogonal to type” idea, as follows:
+
+              The object model requires support for a full complement of type generators ... Examples include
+              STRUCT (or TUPLE), LIST, ARRAY, SET, BAG, and so on. These generators can be combined in
+              arbitrary ways; thus, for example, an array of lists of bags of arrays of [integers] might constitute a
+              single object in suitable circumstances. Along with object IDs, the availability of these type
+              generators essentially means that any data structure that can be created in an application program
+              can be created as an object in an object database—and further that the structure of such objects is
+              visible to the user. For example, consider the object, EX say, that is (or rather denotes) the collection
+              of employees in a given department. Then EX might be implemented either as a linked list or as an
+              array, and users will have to know which it is (because the access operators will differ accordingly).
+                    This “anything goes” approach to what can be stored in the database is a major point of
+              difference between the object and relational models, of course, and it deserves a little further
+              discussion here. In essence:
+
+              ■      The object model says we can store anything we like—any data structure we can create with the
+                     usual programming language mechanisms.
+
+              ■      The relational model effectively says the same thing, but then goes on to insist that whatever we
+                     do store be presented to the user in pure relational form.
+
+              More precisely, the relational model—quite rightly—says nothing about what can be physically stored
+              ... It therefore imposes no limits on what data structures are allowed at the physical level; the only
+              requirement is that whatever structures are in fact physically stored must be mapped to relations at the
+              logical level and hence be hidden from the user. Relational systems thus make a clear distinction
+              between logical and physical (data model vs. implementation), while object systems do not. One
+              consequence is that—contrary to conventional wisdom—object systems might very well provide less
+              data independence than relational systems. For example, suppose the implementation in some object
+              database of the object EX mentioned above (denoting the collection of employees in a given
+              department) is changed from an array to a linked list. What are the implications for existing code that
+              accesses that object EX?
+
+ 58.   C. J. Date: “Faults and Defaults” (in five parts), in reference [40].
+
+       SQL addresses the problem of missing information by means of nulls, but nulls constitute a
+       clear violation of the relational model (see RM Proscription 4). So what can we do about
+       missing information? This paper describes one approach: the “default” or “special values”
+       scheme. Another approach, not totally unrelated, is described in references [33] and [113].
+       See also reference [30].
+
+ 59.   C. J. Date: “Don’t Mix Pointers and Relations!” and “Don’t Mix Pointers and Relations—
+       Please!”, both in reference [40].
+
+       The first of these two articles argues strongly against the idea that relational databases
+       should be allowed to include pointers to data as well as data per se. (In particular, therefore,
+       it attacks the SQL standard [99], which supports something very close if not identical to
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                        571
+Appendixes                                                 Appendix K / References and Bibliography
+
+
+       such an idea.) In reference [18], Chamberlin offers a rebuttal to some of the arguments of
+       that first article. The second article was written as a direct response to Chamberlin’s
+       rebuttal.
+
+ 60.   C. J. Date: “Object Identifiers vs. Relational Keys,” in reference [40].
+
+       Presents detailed arguments in support of the position that object IDs are, first and foremost,
+       a performance feature and should not be part of the model as seen by the user. To elaborate
+       briefly, the paper argues that (a) object IDs do perform some of the same functions as
+       relational keys, but they are certainly not just “keys pure and simple” (not even what are
+       sometimes called surrogate keys)—they carry a lot of additional baggage with them; (b) the
+       baggage in question is strongly motivated by performance considerations and does not
+       belong in the model. The Third Manifesto proscribes object IDs in part (but only in part)
+       because of that extra baggage.
+
+ 61.   C. J. Date: “Relational Really Is Different,” in reference [70].
+
+ 62.   C. J. Date: “Grievous Bodily Harm” (in two parts), DBP&D 11, Nos. 5 and 6 (May-June
+       1998).
+
+       One criticism of SQL is that it is an extremely redundant language, in the sense that, for all
+       but the most trivial of queries, it provides far too many different ways of formulating the
+       query in question (and some of the differences between formulations are quite radical).
+       Such redundancies do not make the language more general, they just make it more
+       complicated—with significant negative consequences for documentation, teaching, learning,
+       remembering, applying, and (last but not least) implementation. This paper describes some
+       major SQL redundancies in detail (including the GROUP BY and HAVING constructs in
+       particular) and discusses some of the consequences of such redundancies.
+
+ 63.   C. J. Date: “Fifty Ways to Quote Your Query,” www.dbpd.com (July 1998).
+
+       More on SQL redundancies.
+
+ 64.   C. J. Date: “Encapsulation Is a Red Herring,” www.dbpd.com (September 1998).
+
+       Encapsulation implies data independence. As noted in Appendix B, however, we would
+       rather not use the term (preferring the more traditional term scalar). Part of the justification
+       for our position here is that, in principle, “encapsulated objects” cannot provide any more
+       data independence than unencapsulated relations can. For example, there is no fundamental
+       reason why a relation representing points, with cartesian coordinate attributes X and Y,
+       should not be physically stored in terms of polar coordinates R and THETA instead. Thus,
+       encapsulation per se is really not the issue.
+
+ 65.   C. J. Date: “Persistence Not Orthogonal to Type,” www.dbpd.com (October 1998).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        572
+Appendixes                                                 Appendix K / References and Bibliography
+
+
+ 66.   C. J. Date: WHAT Not HOW: The Business Rules Approach to Application Development.
+       Reading, Mass.: Addison-Wesley (2000).
+
+ 67.   C. J. Date: “What Do You Mean, ‘Post-Relational’?”, www.dbdebunk.com (June 2000);
+       “Great News, The Relational Model Is Very Much Alive!”, www.dbdebunk.com (August
+       2000); “There’s Only One Relational Model!”, www.dbdebunk.com (February 2001).
+
+       The relational model has been attacked and criticized (and misunderstood) from the moment
+       it first appeared to this day. These articles are responses to three comparatively recent
+       attacks.
+
+ 68.   C. J. Date: “Models, Models, Everywhere, Nor Any Time to Think,” www.dbdebunk.com
+       (November 2000).
+
+       The term model is one of the most overused (not to say abused) terms in the IT world,
+       especially in the database sector. This article was written in an attempt to alert readers to
+       some of the worst excesses in this regard.
+
+ 69.   C. J. Date: “Basic Concepts in UML: A Request for Clarification” (in two parts),
+       www.dbdebunk.com (December 2000).
+
+       An attempt to make sense of the Unified Modeling Language, UML.
+
+ 70.   C. J. Date: The Database Relational Model: A Retrospective Review and Analysis. Reading,
+       Mass.: Addison-Wesley (2001).
+
+       This short book (160 pages) is offered as a careful, unbiased, retrospective review and
+       analysis of Codd’s relational contribution as documented in his 1970s papers. It examines
+       the following papers in detail (as well as touching on several others in passing):
+
+       ■      “Derivability, Redundancy, and Consistency of Relations Stored in Large Data Banks”
+             [20]
+
+       ■     “A Relational Model of Data for Large Shared Data Banks” [21]
+
+       ■     “Relational Completeness of Data Base Sublanguages” [22]
+
+       ■     “Interactive Support for Nonprogrammers: The Relational and Network Approaches”
+             [24]
+
+       ■     “A Data Base Sublanguage Founded on the Relational Calculus,” Proc. 1971 ACM
+             SIGFIDET Workshop on Data Description, Access and Control, San Diego, CA
+             (November 1971)
+
+       ■     “Further Normalization of the Data Base Relational Model,” in Randall J. Rustin (ed.),
+             Data Base Systems, Courant Computer Science Symposia Series 6, Prentice Hall (1972)
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        573
+Appendixes                                                             Appendix K / References and Bibliography
+
+
+       ■     “Extending the Database Relational Model to Capture More Meaning,” ACM TODS 4,
+             No. 4 (December 1979)
+
+       Note: We give the original publication information for the last three because those papers
+       are not referenced elsewhere in the present book.
+
+ 71.   C. J. Date: “Is a Circle an Ellipse?”, www.dbdebunk.com (July 2001).
+
+       As noted in Chapter 14, the question of whether a circle is an ellipse is a surprisingly
+       controversial one, at least in the object world. Consider the following extract from the book
+       The C++ Programming Language (3rd edition), by Bjarne Stroustrup [90]:
+
+             [In] mathematics a circle is a kind of an ellipse, but in most programs a circle should not be derived from
+             an ellipse or an ellipse derived from a circle. The often-heard arguments “because that’s the way it is in
+             mathematics” and “because the representation of a circle is a subset of that of an ellipse” are not
+             conclusive and most often wrong. This is because for most programs, the key property of a circle is that
+             it has a center and a fixed distance to its perimeter. All behavior of a circle (all operations) must maintain
+             this property (invariant ...). On the other hand, an ellipse is characterized by two focal points that in
+             many programs can be changed independently of each other. If those focal points coincide, the ellipse
+             looks like a circle, but it is not a circle because its operations do not preserve the circle invariant. In most
+             systems, this difference will be reflected by having a circle and an ellipse provide sets of operations that
+             are not subsets of each other.
+
+       Reference [71] analyzes the foregoing extract in detail and presents arguments—based, of
+       course, on our own inheritance model—to support the conclusion that a circle is an ellipse
+       after all.
+
+ 72.   C. J. Date: “Double Trouble, Double Trouble” (in two parts), www.dbdebunk.com (April
+       2002).
+
+ 73.   C. J. Date: “What Does Substitutability Really Mean?” (in three parts), www.dbdebunk.com
+       (July 2002).
+
+       An investigation into substitutability and “the Liskov Substitution Principle,” LSP. The first
+       part examines a couple of tutorial descriptions of LSP and finds them to be deficient in
+       several respects. That examination in turn paves the way for a detailed discussion, in the
+       other two parts, of the research paper [106] in which, according to reference [123], the LSP
+       concept originated.
+
+ 74.   C. J. Date: “What First Normal Form Really Means,” www.dbdebunk.com (June 2003).
+
+       First normal form has been the subject of much misunderstanding over the years (on our
+       own part as much as anybody else’s, we hasten to add). This paper is an attempt to set the
+       record straight—even to be definitive, as far as possible. The crux of the argument is that
+       the concept of atomicity (in terms of which first normal form was originally defined) has no
+       absolute meaning.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                             574
+Appendixes                                                           Appendix K / References and Bibliography
+
+
+ 75.   C. J. Date: “A Sweet Disorder,” www.dbdebunk.com (August 2003).
+
+       Paraphrasing, RM Proscription 1 states that there shall be no left-to-right ordering to the
+       attributes of a relation. As is well known, SQL violates this proscription. The present paper
+       explores some of the consequences, which turn out to be less trivial than one might think.
+
+ 76.   C. J. Date: An Introduction to Database Systems (8th edition). Boston, Mass.: Addison-
+       Wesley (2004).
+
+       This book includes an extensive tutorial on the relational model and a somewhat less
+       extensive tutorial on the inheritance model described in Part IV of the present book. The
+       following quote (slightly edited here) is germane to the overall theme of the Manifesto:
+
+             The term data model is used in the literature with two quite different meanings. [The first is identical to
+             that given for the term model, unqualified, in the subsection “Model vs. Implementation” in Chapter 1 of
+             the present book.] The second is as a model of the persistent data of some particular enterprise ... The
+             difference between the two meanings can be characterized as follows:
+
+             ■    A data model in the first sense is like a programming language—albeit one that is somewhat
+                  abstract—whose constructs can be used to solve a wide variety of specific problems, but in and of
+                  themselves have no direct connection with any such specific problem.
+
+             ■    A data model in the second sense is like a specific program written in that language. In other words,
+                  a data model in the second sense takes the facilities provided by some model in the first sense and
+                  applies them to some specific problem. It can be regarded as a specific application of some model
+                  in the first sense.
+
+       It goes without saying that the term is used throughout the present book in the first of these
+       two senses.
+
+ 77.   C. J. Date: “Why We Need Type BOOLEAN,” www.BRCommunity.com (May 2004).
+
+ 78.   C. J. Date: “The Logic of Business Rules,” www.dbdebunk.com (June 2004).
+
+       This paper is essentially a tutorial on elementary ideas from logic. To quote from the
+       abstract: “[This paper] shows how certain key concepts from elementary logic can be used
+       to simplify the task of formulating business rules whose interpretation is clear, precise, and
+       unambiguous. The concepts in question are described and illustrated in tutorial fashion. No
+       prior knowledge of logic is assumed.”
+
+ 79.   C. J. Date: “On the Notion of Logical Difference”; “On the Logical Difference Between
+       Model and Implementation”; and “On the Logical Differences Between Types, Values, and
+       Variables” (in two parts), www.dbdebunk.com (August 2004).
+
+ 80.   C. J. Date: Database in Depth: Relational Theory for Practitioners. Sebastopol, Calif.:
+       O’Reilly Media, Inc. (2005).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                         575
+Appendixes                                                 Appendix K / References and Bibliography
+
+
+       This book is an informal, but careful and detailed, treatment of the relational model and
+       related matters for readers who already have some practical database experience but want to
+       know more about the theory on which their experience is based.
+
+ 81.   C. J. Date: Go Faster! The TransRelationaltm Approach to DBMS Implementation. To
+       appear.
+
+       This book is a detailed tutorial on a radically new approach to implementing the relational
+       model. It is based on reference [134] but covers much more ground than that reference
+       does. Note: A considerably abbreviated version of this material, covering read-only
+       operations and main-memory data only, can be found in Appendix A of reference [76].
+
+ 82.   C. J. Date and Hugh Darwen: Foundation for Object/Relational Databases: The Third
+       Manifesto. Reading, Mass.: Addison-Wesley (1998).
+
+ 83.   C. J. Date and Hugh Darwen: Foundation for Future Database Systems: The Third
+       Manifesto (2nd edition). Reading, Mass.: Addison-Wesley (2000).
+
+ 84.   C. J. Date and Hugh Darwen: “Multiple Assignment,” www.dbdebunk.com (February 2004).
+
+ 85.   C. J. Date, Hugh Darwen, and Nikos A. Lorentzos: Temporal Data and the Relational
+       Model. San Francisco, Calif.: Morgan Kaufmann (2003).
+
+       As the title indicates, this book is an examination into the application of the relational model
+       to the problem of temporal database management specifically. One aspect of that problem is
+       the issue of granularity: that is, dealing with time measured in (say) months vs. days, or
+       hours vs. seconds. It turns out that the inheritance model discussed in the present book can
+       help with that issue.
+
+ 86.   C. J. Date and P. Hopewell: “Storage Structures and Physical Data Independence” and “File
+       Definition and Logical Data Independence,” both in Proc. 1971 ACM SIGFIDET Workshop
+       on Data Definition, Access, and Control, San Diego, California (November 1971).
+
+ 87.   C. J. Date and David McGoveran: “A New Database Design Principle,” in reference [39].
+       See also C. J. Date: “Data Redundancy and Database Design” (in two parts),
+       www.dbdebunk.com (March/April 2005), and “Data Redundancy and Database Design:
+       Further Thoughts Number One,” www.dbdebunk.com (July 2005).
+
+ 88.   C. J. Date and David McGoveran: “Updating Union, Intersection, and Difference Views”
+       and “Updating Joins and Other Views,” both in reference [39].
+
+       These two informal papers were the first to discuss the view updating mechanism proposed
+       in reference [114] and elaborated in Appendix E.
+
+ 89.   Andrew Eisenberg and Jim Melton: “SQL:1999, Formerly Known as SQL3,” ACM
+       SIGMOD Record 28, No. 1 (March 1999).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        576
+Appendixes                                                            Appendix K / References and Bibliography
+
+
+       A tutorial overview of SQL:1999, which was the first version of the standard to include
+       “object” support. Note: Observing that, while this article certainly described the “object”
+       features of SQL:1999, it did nothing to justify them, the authors of the present book wrote to
+       the then editor of SIGMOD Record as follows:
+
+             With reference to [the subject article]—in particular, with reference to the sections entitled “Objects ...
+             Finally” and “Using REF Types”—we have a question: What useful purpose is served by the features
+             described in those sections? To be more specific, what useful functionality is provided that can’t be
+             obtained via features already found in SQL:1992?
+
+       Our letter was not published, however, and to this day our question remains unanswered.
+
+ 90.   Margaret A. Ellis and Bjarne Stroustrup: The Annotated C++ Reference Manual. Reading,
+       Mass.: Addison-Wesley (1990). See also Bjarne Stroustrup: The Design and Evolution of
+       C++, Addison-Wesley (1994) and The C++ Programming Language (3rd edition),
+       Addison-Wesley (1997).
+
+ 91.   P. T. Geach: “History of the Corruptions of Logic,” in Logic Matters. Oxford, U.K.: Basil
+       Blackwell (1972).
+
+       The source of the maxim “All logical differences are big differences.” The complete quote
+       is: “As I once heard Wittgenstein say, all logical differences are big differences; in logic we
+       are not making subtle distinctions, as it were between flavours that pass over into one
+       another by delicate gradations.”
+
+ 92.   Adele Goldberg and David Robson: Smalltalk-80: The Language and Its Implementation.
+       Reading, Mass.: Addison-Wesley (1983).
+
+       According to reference [125], object-oriented programming has its roots in Smalltalk, and
+       “the phrase object-oriented programming originated with the development of the Smalltalk
+       language” (though Smalltalk in turn was surely influenced by SIMULA [25]). And in this
+       book on Smalltalk (by two of the researchers responsible for its design and development),
+       Goldberg and Robson state categorically that “an object consists of some private memory
+       and a set of operations ... An object’s public properties are the messages that make up its
+       interface ... An object’s private properties are a set of instance variables that make up its
+       private memory.” In other words, it is indeed the case (as we claimed in Chapter 9 and
+       elsewhere) that pure objects have no public instance variables, and further that many object
+       systems are not pure.
+
+ 93.   Nathan Goodman: “Bill of Materials in Relational Database,” InfoDB 5, No. 1
+       (Spring/Summer 1990).
+
+ 94.   James Gosling, Bill Joy, and Guy Steele: The Java Language Specification. Reading,
+       Mass.: Addison-Wesley (1996).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                           577
+Appendixes                                                  Appendix K / References and Bibliography
+
+
+ 95.   Ian Graham, Julia Bischof, and Brian Henderson-Sellars: “Associations Considered a Bad
+       Thing,” Journal of Object-Oriented Programming (February 1997).
+
+       We include this paper in this appendix because we find it a good illustration of the gulf that
+       sometimes seems to exist between the object and database worlds (or communities). First,
+       however, we should explain what the paper is trying to achieve. The authors’ thesis is that
+       treating “associations” (or “relationships”) either as “first-class objects” in their own right or
+       as some totally different kind of construct (as in ODMG [17]) compromises encapsulation
+       and reusability. They therefore propose, in effect, that, e.g., the association between
+       suppliers and parts should not be represented not by means of “shipments” as such, but
+       rather, redundantly, by a parts attribute within suppliers and a suppliers attribute within parts
+       (the two attributes in question being explicitly declared to the system to be “inverses” of
+       each other). And they then go on to propose a set of rules for maintaining referential
+       integrity given such a design and for keeping the inverse attributes in synch with each other.
+            We do not want to comment on the foregoing proposals as such. What we do want to
+       do is quote and offer some comments on some remarks from the paper that, we believe,
+       illustrate the gulf we mentioned:
+
+       ■     “A study of the literature of semantic data modeling ... reveals that there are two
+             fundamental ways to connect data structures or entity types [sic]: constructors and
+             pointers ... [In] the first approach, emphasis is placed on building structures using
+             constructors such as the tuple or the set. In the second, the stress is on linking types
+             using attributes.” Comment: From the context, “building structures using constructors”
+             seems to mean that connections between data structures—”or entity types” (?)—are
+             represented by foreign keys, or something very like foreign keys, while “linking types
+             using attributes” means those connections are represented by pointers instead. At the
+             very least, therefore, there does seem to be a terminological gulf.
+
+       ■     “In the 1980s the former approach [i.e., ‘building structures using constructors’] was
+             dominant, largely because of the popularity and widespread use of relational databases.
+             In entity-relationship models there are two logical types: entity-relationships and
+             relationship-relationships. Both are represented by sets of tuples and no links between
+             them are stored; the run-time system of the DBMS must search for the linkages.”
+             Comment: Quite apart from (a) the fact that “entity-relationship models” have very
+             little to do with relational databases anyway, and (b) the fact that the phrase “two
+             logical types” is a little mysterious, the final sentence here betrays a serious lack of
+             understanding of the relational model and relational implementation technology (which
+             was well over 20 years old, incidentally, when this paper was published).
+
+       ■     “Attempts to enrich [sic] the relational model led quickly to systems with more than two
+             relationship types. [Do they mean more than one?] This unsatisfactory situation soon
+             led to suggestions to replace these arbitrary type systems with a single notion of classes
+             reminiscent of object-oriented programming ... The pointer-based approach is far more
+             natural to an OO thinker [we agree!], but one suspects that the popularity of methods
+             such as OMT [is] because developers with a relational background find the approach
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                          578
+Appendixes                                                Appendix K / References and Bibliography
+
+
+             familiar and anodyne. The danger here is that object-oriented principles will be
+             ignored and highly relational models produced instead of true object-oriented ones
+             [boldface added].” Comment: OMT is described in reference [9].
+
+ 96.   Jim Gray and Andreas Reuter: Transaction Processing: Concepts and Techniques. San
+       Mateo, Calif.: Morgan Kaufmann (1993).
+
+       The standard and definitive text on transaction management.
+
+ 97.   Mark Greaves: “From Z to A” (private communication, June 16th, 1999).
+
+ 98.   Patrick Hall, Peter Hitchcock, and Stephen Todd: “An Algebra of Relations for Machine
+       Computation,” Conf. Record of the 2nd ACM Symposium on Principles of Programming
+       Languages, Palo Alto, Calif. (January 1975).
+
+       This paper was the first to recognize the important role of attribute names in the operators of
+       a relational algebra; it has significantly influenced the thinking and output over the years of
+       the present authors, and many of its ideas find expression again in Tutorial D. See also
+       references [120] and [133].
+
+ 99.   International Organization for Standardization (ISO): Database Language SQL, Document
+       ISO/IEC 9075:2003 (2003).
+
+       This reference is, of course, the official SQL standard (known to the cognoscenti as ISO/IEC
+       9075, or sometimes just ISO 9075). The standard is not a single document—it consists of an
+       open-ended series of separate Parts (ISO 9075-1, -2, etc.), under the general title
+       Information Technology—Database Languages—SQL. Parts are sometimes added to the
+       current edition of the SQL standard, subsequent to its publication. The Parts of SQL:2003 at
+       the time of publication of this book are:
+
+       Part 1: Framework (SQL/Framework)
+       Part 2: Foundation (SQL/Foundation)
+       Part 3: Call-Level Interface (SQL/CLI)
+       Part 4: Persistent Stored Modules (SQL/PSM)
+       Part 5: There is no Part 5
+       Part 6: There is no Part 6
+       Part 7: There is no Part 7
+       Part 8: There is no Part 8
+       Part 9: Management of External Data (SQL/MED)
+       Part 10: Object Language Bindings (SQL/OLB)
+       Part 11: The Information and Definition Schemas (SQL/Schemata)
+       Part 12: There is no Part 12
+       Part 13: Java Routines and Types (SQL/JRT)
+       Part 14: XML-Related Specifications (SQL/XML)
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       579
+Appendixes                                                 Appendix K / References and Bibliography
+
+
+      The features of primary concern to the present book—see Appendix H—mostly belong in
+      Part 2. Note: Reference [89] is a tutorial overview of the features that were new in the
+      previous edition, SQL:1999; reference [41] is also relevant. Much other pertinent material,
+      including in particular the draft of a Technical Corrigendum (begun before SQL:2003 was
+      even ratified!), can be found at ftp://sqlstandards.org/SC32/WG3.
+           By the way, it is worth mentioning that, although SQL is widely recognized as the
+      international “relational” database standard, the standard documents do not describe it as
+      such; in fact, they never use the term “relation” at all! (Indeed, they do not use the term
+      “database” either; instead, as noted in Appendix H, they talk about something called “SQL-
+      data,” which is “data described by SQL-schemas—data that is under the control of an SQL-
+      implementation in an SQL-environment.”)
+
+ 100. Ivar Jacobson (with Magnus Christerson, Patrik Jonsson, and Gunnar Övergaard): Object-
+      Oriented Software Engineering (revised printing). Reading, Mass.: Addison-Wesley (1994).
+
+      A widely respected book on software engineering. It presents a methodology called OOSE
+      (Object-Oriented Software Engineering), a simplified version of a more extensive approach
+      called Objectory. From a database perspective, however, we do find it a little puzzling,
+      especially with respect to encapsulation and type vs. class (in fact, with respect to model vs.
+      implementation in general). For example: “The behavior and information are encapsulated
+      in the object” [page 48, boldface in the original], but “each ... attribute [of the class] will
+      become one column in the table” (page 277). Tables are not encapsulated. And: “A type is
+      defined by the manipulations you can do with the type. A class is more than that. You can
+      also look inside a class ... to see its information structure ... [A] class is [an] implementation
+      of a type” [page 50, italics in the original]. These statements are clear enough, of course,
+      but the book then goes on to talk almost exclusively in terms of classes where types would
+      seem more appropriate.
+           Many of the comments in the annotation to reference [9] apply here too, mutatis
+      mutandis. In particular, as the previous paragraph suggests, OOSE objects, like OMT
+      objects, seem to correspond for the most part to what the database community would call
+      entities—and we remind you of our speculation that this state of affairs is the source of the
+      “relvar = class” mistake.
+           One last quote: “Most of the methods used in the industry today, for both information
+      and technical system development, are based on a functional and/or data-driven
+      decomposition of the system. These approaches differ in many ways from the approach
+      taken by object-oriented methods where data and functions are highly integrated.” It seems
+      to us that here the authors put their collective finger on a significant mismatch between
+      object and database thinking. Databases are meant to be somewhat divorced from
+      “functions”; as noted in a footnote under reference [9], databases are usually supposed to be
+      designed separately from the applications that use them. Thus, it seems to us once again that
+      the term database as used in the object community really means a database that is
+      application specific, not (as is more usual in the database community) one that is general
+      purpose.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         580
+Appendixes                                                    Appendix K / References and Bibliography
+
+
+101.   W. Kent: “Consequences of Assuming a Universal Relation,” ACM TODS 6, No. 4
+       (December 1981).
+
+102.   Won Kim: “Object-Oriented Database Systems: Promises, Reality, and the Future,” Proc.
+       19th International Conference on Very Large Data Bases, Dublin, Ireland (August 24-27,
+       1993).
+
+103.   Won Kim: “On Marrying Relations and Objects: Relation-Centric and Object-Centric
+       Perspectives,” Data Base Newsletter 22, No. 6 (November/December 1994).
+
+       Reference [55] is a detailed response to this paper.
+
+104.   Won Kim: “Bringing Object/Relational Down to Earth,” DBP&D 10, No. 7 (July 1997).
+
+       In this article, Kim claims that “confusion is sure to reign” in the marketplace for
+       object/relational DBMSs because, first, “an inordinate weight has been placed on the role of
+       data type extensibility” and, second, “the measure of a product’s object/relational
+       completeness ... is a potentially serious area of perplexity.” He goes on to propose “a
+       practical metric for object/relational completeness that can be used as a guideline for
+       determining whether a product is truly [object/relational]”—an idea that inevitably invites
+       comparison with the approach taken in reference [2] to the question of determining whether
+       a DBMS is truly object-oriented.
+            Kim’s scheme (metric is really not the mot juste, since there is nothing quantitative
+       about it) involves the following criteria:
+
+       1. Data model                   5. Performance and scalability
+       2. Query language               6. Database tools
+       3. Mission-critical services    7. Harnessing the power
+       4. Computational model
+
+            With respect to Criterion Number 1, Kim takes the position—very different from
+       ours—that the data model must be “the Core Object Model defined by the Object
+       Management Group” [127], which “comprises the relational data model as well as the core
+       object-oriented modeling concepts of object-oriented programming languages.” According
+       to Kim, it thus includes all of the following concepts: class (Kim adds “or type”—?),
+       instance, attribute, integrity constraints, object IDs, encapsulation, (multiple) class
+       inheritance, (multiple) ADT inheritance, data of type reference, set-valued attributes, class
+       attributes, class methods, and more besides.
+            (By the way, note that relations—which of course we regard as both crucial and
+       fundamental—are never explicitly mentioned. Kim claims that the OMG Core Object
+       Model includes the entire relational model in addition to everything in the foregoing list of
+       concepts, but in fact it does not [127].)
+            As for Criterion Number 2 (“query language”), Kim’s position—again very different
+       from ours, in at least two major ways—is that the language must be some kind of “Object
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                      581
+Appendixes                                                 Appendix K / References and Bibliography
+
+
+       SQL” (i.e., a version of SQL that has been extended to deal with all of the various constructs
+       just listed).
+            Criteria Numbers 3-6 all have to do with the implementation rather than the model. In
+       other words, they might be important in practice, but they cannot, by definition, make the
+       difference between a system that is object/relational and one that is not. In other words, it is
+       not clear exactly what Kim’s metric is supposed to be measuring.
+            The final criterion (“harnessing the power”) constitutes an interesting, and major, point
+       of difference between Kim’s position and ours. It is our opinion that user-defined types
+       constitute the primary justification for object/relational systems, as explained in Chapter 1.
+       Kim’s opinion, by contrast, is that user-defined types are merely a secondary feature
+       (indeed, they have been “oversold”), and they constitute just one aspect of “harnessing the
+       power.” (The other, he claims, is the ability of an object/relational DBMS to act as the basis
+       for “heterogeneous database fusion”—i.e., to serve as a unified front end to a variety of
+       disparate databases “including RDBs, OODBs, hierarchical databases, CODASYL
+       databases, and even flat files.” But such functionality is properly ascribed to what is more
+       usually called data access middleware, not to object/relational DBMSs. See reference [76].)
+
+105.   Donald E. Knuth: The Art of Computer Programming, Volume 1: Fundamental Algorithms
+       (3rd edition). Reading, Mass.: Addison-Wesley (1997).
+
+106.   Barbara Liskov and Jeannette Wing: “A Behavioral Notion of Subtyping,” ACM
+       Transactions on Programming Languages and Systems 16, No. 6 (November 1994).
+
+       What we have called substitutability in this book is called by some “the Liskov Substitution
+       Principle” (LSP), and this paper is identified—e.g., by reference [123]—as the source of that
+       principle. However, the nearest the paper seems to come to stating any such principle is the
+       following sentence: “[Objects] of the subtype ought to behave the same as those of the
+       supertype as far as anyone or any program using supertype objects can tell.” If this
+       statement is intended as a formal definition, it hardly seems very precise. (In any case, some
+       degree of substitutability was included in SIMULA [25], which predated the present paper
+       by nearly 30 years.) Note: Reference [73] is, in part, a detailed commentary on this paper.
+
+107.   Mary E. S. Loomis: Object Databases: The Essentials. Reading, Mass.: Addison-Wesley
+       (1995).
+
+108.   Claudio L. Lucchesi and Sylvia L. Osborn: “Candidate Keys for Relations,” J. Comp. and
+       Sys. Sciences 17, No. 2 (1978).
+
+       This paper presents an efficient algorithm for inferring candidate keys from functional
+       dependencies.
+
+109.   David Maier: “Comments on the Third-Generation Database System Manifesto,” Tech.
+       Report No. CS/E 91-012, Oregon Graduate Center, Beaverton, Ore. (April 1991).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                        582
+Appendixes                                                            Appendix K / References and Bibliography
+
+
+       A review and analysis of the proposals of reference [130]. Maier is highly critical of just
+       about everything in that latter document; we agree with some of his criticisms and disagree
+       with others. However, we do find the following remarks interesting (they bear out our
+       contention that objects involve just one good idea—namely, proper data type support):
+
+             Many of us in the object-oriented database field have struggled to distill out the essence of “object-
+             orientedness” for a database system ... My own thinking about ... the most important features of OODBs
+             has changed over time. At first I thought [they were] inheritance and the message model. Later I came to
+             think that object identity, support for complex state, and encapsulation of behavior were more important.
+             Recently, after starting to hear from users of OODBMSs about what they most value about those systems,
+             I think that type extensibility is the key. Identity, complex state, and encapsulation are still important, but
+             [only] insomuch as they support the creation of new data types.
+
+110.   James Martin and James J. Odell: Object-Oriented Methods: A Foundation (2nd edition).
+       Englewood Cliffs, N.J.: Prentice-Hall (1997).
+
+       As explained in Appendix F, we believe strongly that specialization by constraint or S by C
+       is the only conceptually valid way to define a subtype (from a regular supertype, at least).
+       Thus, we allow a selector invocation to return a value whose most specific type is some
+       proper subtype of the specified target type, and we allow an update to some component of a
+       variable (loosely speaking) to have the side effect of changing the current most specific type
+       of that variable up or down or even “sideways.” However, we did also note in that appendix
+       that we were at odds with most of the object world over such issues (see, e.g., reference
+       [123]). Reference [110] seems to be one of the few publications from the object world to
+       support our position. Consider the following extracts:
+
+       ■     Pages 29-30: “[The] collection of concepts that applies to an object can change over
+             time—a phenomenon called dynamic classification ... Most OO programming
+             languages [insist that] an object can be an instance of only one ... class for life ...
+             However, in OO analysis, we are not modeling how computer languages and databases
+             work, we are analyzing the enterprise world as people understand it.” Comment: This
+             extract seems to be agreeing with us that S by C is what is needed in the real world but
+             object systems do not support it.
+
+       ■     Page 29: “Specifying the method of ... classification changes [i.e., changes in most
+             specific type] is a technique at the very heart of OO process specification.”
+
+       ■     Page 128: “A classification event is the classification of an existing object. For
+             example, ... a PERSON object [might become] a member of the EMPLOYEE set ... A
+             declassification event is the declassification of an existing object. [For example, ...] a
+             PERSON object [might be removed from] ... the EMPLOYEE set—after which the
+             object remains a PERSON, but is no longer an EMPLOYEE.” Comment:
+             Unfortunately, however, Martin and Odell nowhere address the question of how such
+             “classifications and declassifications” might actually be effected in practice, whereas
+             our model explains these aspects in detail (we even offer some remarks on how they
+             might be implemented). Of course, since their book is really concerned with object
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                            583
+Appendixes                                                    Appendix K / References and Bibliography
+
+
+             analysis and design, not object application programming (database or otherwise), such
+             lack of specificity might perhaps be justified.
+
+          Anyway, we are naturally pleased to find that Martin and Odell agree with us regarding
+      S by C. That said, however, we have to say too that we find several other aspects of their
+      book a little puzzling. Here are a few examples:
+
+      ■      Page 26: “An object is anything to which a concept applies. It is an instance of a
+             type.” Comment: This definition would certainly seem to suggest that values and
+             variables are both objects. However, the business of values vs. variables is never
+             discussed, although examples of objects in the book certainly include both. Value is not
+             in the glossary; variable is, but it is defined as “synonymous with field,” where a field
+             in turn is defined as “an implementation of a property.”
+
+      ■      Page 143: “All operations ... require objects as variables.”
+
+      ■      Page 361: “[An] argument [is] ... any object that is a parameter.”
+
+      ■      Page 40: “A ... relation ... is a type whose instances are tuples.” Comment: Quite
+             apart from (a) the fact that a relation has a type but is not a type and (b) the fact that
+             instances of a relation type are, by definition, relations, not tuples, it is clear that (c)
+             “instances” here means values, whereas such is usually not the case at other places in
+             the book.
+
+      ■      Page 15 and elsewhere: “The extension [of a concept] is the set of all objects to which
+             the concept applies.” Comment: “All objects” here should probably be taken to mean
+             “all current objects.” Certainly it is clear that in many places in the book the term
+             extension refers to a “time-varying” set (i.e., to a variable). For example (page 386):
+             The extension of the concept MORTAL [is] the collection, or set, of things to which the
+             definition applies ... The set of MORTAL objects, therefore is not a fixed collection.
+
+      ■      Page 354: “[The term] extension [is] used interchangeably with set.” Page 27: “[A]
+             set is a particular collection, or class, of objects.”
+
+      ■      Page 27: “Class is technically considered to be the correct word when referring to the
+             collection of objects to which a concept applies ... Some [writers] argue that set and
+             class mean the same thing. Since class has a different meaning in OO programming
+             languages, the word set will be used to avoid confusion. It is worth noting, however,
+             that the inspiration for using the term class in OO originally came from the centuries-
+             old mathematical notion.”
+
+      ■      Pages 33-35: “[We use] the term concept ... to mean a notion or idea that we apply to
+             objects in our awareness ... A recommended term for concept in the object-oriented
+             analysis standards community is type. Therefore ... the name type will be used ... In [the
+             Unified Modeling Language] UML, there is a basic concept called class. Here, classes
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                             584
+Appendixes                                                Appendix K / References and Bibliography
+
+
+             used in analysis are called types and classes used for implementation purposes are
+             called implementation classes.” Comment: Regarding UML and (especially) UML
+             terminology, see reference [69].
+
+111.   Nelson Mattos and Linda G. DeMichiel: “Recent Design Trade-Offs in SQL3,” ACM
+       SIGMOD Record 23, No. 4 (December 1994).
+
+       This paper is discussed in Appendix F.
+
+112.   James D. McCawley: Everything that Linguists Have Always Wanted to Know about Logic
+       (but were ashamed to ask). Chicago, Ill.: University of Chicago Press (1981). Note: A
+       second edition of this book was published in 1993.
+
+113.   David McGoveran: “Nothing from Nothing” (in four parts), in reference [40].
+
+       Part I of this paper explains the crucial role of logic in database systems. Part II shows why
+       that logic must be two-valued logic (2VL) specifically, and why attempts to use three-valued
+       logic (3VL) are misguided. Part III examines the “missing information” problems that 3VL
+       is supposed to solve. Part IV describes a set of pragmatic solutions to those problems that
+       do not involve 3VL.
+
+114.   David O. McGoveran: “Accessing and Updating Views and Relations in a Relational
+       Database,” U.S. Patent Application 10/114,609 (April 2, 2002).
+
+115.   Jim Melton: “A Shift in the Landscape (Assessing SQL3’s New Object Direction),”
+       DBP&D 9, No. 8 (August 1996).
+
+116.   Jim Melton: Advanced SQL:1999—Understanding Object-Relational and Other Advanced
+       Features. San Francisco, Calif.: Morgan Kaufmann (2003).
+
+117.   Jim Melton and Alan R. Simon: SQL:1999—Understanding Relational Components. San
+       Francisco, Calif.: Morgan Kaufmann (2002).
+
+118.   Bertrand Meyer: “The Many Faces of Inheritance: A Taxonomy of Taxonomy,” IEEE
+       Computer 29, No. 5 (May 1996).
+
+119.   R. Morrison: S-Algol Reference Manual, Internal Report CSR-80-81, Dept. of Computer
+       Science, University of Edinburgh (February 1981).
+
+120.   M. G. Notley: “The Peterlee IS/1 System,” IBM U.K. Scientific Centre Report UKSC-0018
+       (March 1972).
+
+121.   Raymond Reiter: “Towards a Logical Reconstruction of Relational Database Theory,” in
+       Michael L. Brodie, John Mylopoulos, and Joachim W. Schmidt (eds.), On Conceptual
+       Modelling: Perspectives from Artificial Intelligence, Databases, and Programming
+       Languages. New York, N.Y.: Springer-Verlag (1984).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       585
+Appendixes                                                 Appendix K / References and Bibliography
+
+
+122.   Mark A. Roth, Henry F. Korth, and Abraham Silberschatz: “Extended Algebra and Calculus
+       for Nested Relational Databases,” ACM TODS 13, No. 4 (December 1988).
+
+123.   James Rumbaugh: “A Matter of Intent: How to Define Subclasses,” Journal of Object-
+       Oriented Programming (September 1996).
+
+       This paper is briefly discussed in Appendix F, but we add one further comment here. The
+       paper is among the many we have seen that fail to distinguish properly between values and
+       variables. To quote: “Barbara Liskov is responsible for the Liskov Substitution Principle
+       that an instance of a subclass must be substitutable and usable wherever a variable [our
+       italics] of one of its ancestor classes is allowed. This principle has helped to avoid a lot of
+       confusion in forming class hierarchies and affects most discussions of OO classification.”
+       As we saw in Chapter 14, however, there is a logical difference between value
+       substitutability and variable substitutability; the former is applicable 100 percent, but the
+       latter is not.
+
+124.   Cynthia Maro Saracco: Universal Database Management: A Guide to Object/Relational
+       Technology. San Francisco, Calif.: Morgan Kaufmann (1999).
+
+       A readable high-level overview of object/relational systems. However, we note that Saracco
+       embraces (as does Stonebraker, incidentally, in reference [129], q.v.) a form of inheritance
+       that is based on a version of “subtables and supertables”—a notion that, as explained in
+       Appendix G, we are somewhat skeptical about anyway—that is different from the version
+       espoused by the SQL standard. To be specific, suppose table PGMR (“programmers”) is a
+       subtable of supertable EMP (“employees”). Then Saracco and Stonebraker both regard
+       EMP as containing rows only for employees who are not programmers, whereas SQL would
+       regard it as containing rows for all employees.
+
+125.   Robert W. Sebesta: Concepts of Programming Languages (6th edition). Boston, Mass.:
+       Addison-Wesley (2004).
+
+126.   Richard T. Snodgrass (ed.): The TSQL2 Temporal Query Language. Norwell, Mass.:
+       Kluwer Academic Publishers (1995).
+
+127.   Richard Mark Soley and William Kent: “The OMG Object Model,” in Won Kim (ed.):
+       Modern Database Systems: The Object Model, Interoperability, and Beyond. New York,
+       N.Y.: ACM Press / Reading, Mass.: Addison-Wesley (1995).
+
+       The ODMG Object Model [17] is based on the “core object model” of the Object
+       Management Group, OMG. OMG (like ODMG) is not a formal standards body, but it “is
+       developing standards in the form of wholesale agreements among member companies” (of
+       which there were “about 340” at the time this paper was written).
+             The OMG core object model is based on “a small number of basic concepts: objects,
+       operations, types, and subtyping.” Note that values and variables are not included in this
+       list; however, the paper does also recognize something it calls nonobjects, and gives as
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         586
+Appendixes                                                 Appendix K / References and Bibliography
+
+
+      examples of “nonobject types” such things as CHAR and BOOLEAN, suggesting that
+      “nonobjects” might perhaps be values (or perhaps a “nonobject type” is just a primitive
+      built-in type?). Moreover, objects are certainly variables, although the term variable is not
+      used. But then the paper goes on to say that objects and nonobjects together “represent the
+      set of denotable values in the core object model” [our italics].
+           Objects have object IDs, nonobjects do not. Further, objects have behavior and no user-
+      visible structure: “In the core object model, operations are used to model the external
+      interface to state” (state here meaning the object’s current value). But the paper then adds,
+      somewhat confusingly, that “attributes and relationships ... can be used to model the
+      externally visible declarations of state more succinctly.”
+           Another puzzle concerns the distinction between read-only vs. update operators (to use
+      Third Manifesto terminology). OMG expressly does not make any such distinction; in fact,
+      it “defines a pass-by-value argument passing semantics,” implying that operators are always
+      read-only. However, it clearly also allows operations that produce “side effects, manifested
+      in changes of state.” There seems to be a contradiction here.
+           OMG also draws a distinction between subtyping and inheritance: “Subtyping [can be
+      intuitively defined thus:] ... one type is a subtype of another if the first is a specialization or
+      refinement of the second ... if S is a subtype of T, an object of type S may be used wherever
+      an object of type T may be used [note that this definition seems (a) to propose variable
+      substitutability, since it is clear that objects are variables, and (b) not to propose value
+      substitutability, since values are apparently not objects] ... Inheritance is a notational
+      mechanism for defining a type S in terms of another type T ... Intuitively, inherit means that
+      the operations defined for T are also defined for ... S.” So far, the distinction does not seem
+      very clear! Anyway, the paper continues: “Subtyping is a relationship between interfaces
+      (types). Inheritance can apply to both interfaces and implementations; that is, both
+      interfaces and implementations can be inherited. The core object model is concerned with ...
+      interfaces, ... not ... implementations.” So why is the distinction even mentioned?
+           The paper then goes on to say (on the face of it, rather startlingly): “Whether [the set of
+      operations defined for S] is a superset of [the set of operations defined for T] or the two are
+      disjoint sets is an implementation issue and does not affect the core object model
+      semantics.”
+           It has to be said too that the OMG model of subtyping and/or inheritance—like that of
+      ODMG [17], q.v.—appears to be considerably underspecified. Many of the features of our
+      own inheritance model (see Part IV of this book)—for example, TREAT, the semantics of
+      assignments, the semantics of equality comparisons, notions such as “most specific common
+      supertype,” and numerous other aspects—seem to have no counterpart at all.
+           Finally, objects in OMG, even though they are variables, can never change their type; in
+      particular, they cannot be further specialized, implying that (e.g.) an object of type employee
+      can never subsequently acquire the more specific type manager. Such restrictions surely
+      constitute grounds for rejecting the frequently heard claims to the effect that objects—at
+      least, OMG-style objects—are “a good model of reality”; as noted by Martin and Odell
+      [110], real-world objects certainly do acquire and lose types dynamically (for example, an
+      employee can certainly become or cease to be a manager).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                         587
+Appendixes                                                Appendix K / References and Bibliography
+
+
+            By the way, the singular nature of the book in which Soley and Kent’s paper appears
+       should not go unremarked. Its overall title is Modern Database Systems—yet it contains
+       almost nothing on relational theory, which (in our opinion) is certainly relevant to “modern
+       database systems,” and will remain so for future ones, too, for as far out as anyone can see.
+       The book in fact consists of two parts: “Next-Generation Database Technology” (512 pages)
+       and “Technology for Interoperating Legacy Databases” (188 pages). Part I in turn consists
+       entirely of a single subpart, “Object-Oriented Database” (Part Ia; there is no Part Ib). In
+       other words, the book subscribes to the position—a position in stark contrast to our own—
+       that object DBMSs are the “next generation”; it therefore also subscribes to the position that
+       we need to deal with the problem of “legacy databases” (by which the book clearly means
+       SQL databases specifically)—a position we might agree with, though we have a different
+       interpretation of what it really means.
+
+128.   Jacob Stein and David Maier: “Concepts in Object-Oriented Data Management,” DBP&D 1,
+       No. 4 (April 1988).
+
+       A good and still useful early tutorial on the basic concepts of object database systems.
+
+129.   Michael Stonebraker and Paul Brown (with Dorothy Moore): Object-Relational DBMSs:
+       Tracking the Next Great Wave (2nd edition). San Francisco, Calif.: Morgan Kaufmann
+       (1999).
+
+       This book is a tutorial on object/relational systems. It is heavily—in fact, almost
+       exclusively—based on the Universal Data Option of Informix’s Dynamic Server product.
+       That Universal Data Option was based on an earlier system called Illustra, a commercial
+       product that Stonebraker himself was instrumental in developing. Regrettably, the book
+       seems nowhere to come right out and agree with our position that (a) a true
+       “object/relational” system would be nothing more nor less than a true relational system, nor
+       that (b) today’s “relational” systems are not true relational systems at all, but SQL systems
+       merely.
+            The book claims that a “good” object/relational DBMS must possess the following four
+       “cornerstone characteristics,” with features as indicated:
+
+       1. Base type extension
+
+             ■      Dynamic linking of user-defined functions
+             ■      Client or server activation of user-defined functions
+             ■      Secure user-defined functions
+             ■      Callback in user-defined functions
+             ■      User-defined access methods
+             ■      Arbitrary-length data types
+
+       2. Complex objects
+
+             ■      Type constructors
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       588
+Appendixes                                                                Appendix K / References and Bibliography
+
+
+                ■          User-defined functions
+                ■          Arbitrary-length data types
+                ■          SQL support
+
+           3. Inheritance
+
+                ■          Data and function inheritance
+                ■          Overloading
+                ■          Inheritance of types, not tables
+                ■          Multiple inheritance
+
+           4. Rule system
+
+                ■          Events and actions are retrieves as well as updates
+                ■          Integration of rules with inheritance and type extension
+                ■          Rich execution semantics for rules
+                ■          No infinite loops
+
+           To elaborate:
+
+           1.   Base type extension: The book uses this term to mean that users must be able to define
+                their own scalar types and operators (it uses the term functions, however, reserving
+                operators for functions like “+” that make use of some special notation; it also—very
+                unfortunately, in our opinion—asserts that “a data type is both information and
+                operations [whereas] the relational notion of a domain includes only the stored
+                representation, and there is no behavior associated with a domain”1). Dynamic linking
+                is self-explanatory. Client or server activation means it must be possible to execute
+                user-defined functions in the same address space as the DBMS (at the server) and also
+                in other address spaces (at the client); moreover, such executions must be secure—i.e.,
+                they must not be allowed to read or (worse) write anything that is supposed to be
+                protected. (For obvious reasons, this problem is particularly severe if the execution
+                occurs at the server.) Callback means that user-defined functions must be allowed to
+                perform database operations. User-defined access methods means that type definers or
+                implementers must be permitted to extend the system by introducing new storage
+                structures and corresponding access code. Arbitrary-length data types should be self-
+                explanatory.
+                     Note: The Third Manifesto suggests that function definitions and type definitions
+                are better kept separate instead of being bundled together (OO Very Strong Suggestion
+                2). The book agrees with this position.
+
+           2.   Complex objects: The book uses this term to mean that certain type generators—it uses
+                the term type constructors—must be supported. (A “complex object” is presumably
+
+
+1
+    This claim cannot be correct (if taken literally, “no behavior” implies no operators at all, not even “=”).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                       589
+Appendixes                                                     Appendix K / References and Bibliography
+
+
+             either a value or a variable of such a generated type.) In particular, the following type
+             generators “must” be supported:
+
+             ■        Composites (records)
+             ■        Sets
+             ■        References
+
+                  Composites correspond, more or less, to our TUPLE type generator (though there
+             seems to be some confusion over whether or not values and variables of the generated
+             type are encapsulated). Sets are perhaps self-explanatory (note, however, that the
+             corresponding type generator is not the same as our RELATION type generator). As
+             for references, here is a quote: “An object/relational DBMS allows a column in a table
+             to contain ... a [pointer] to a [row] ... in another table ... [The] actual value stored ... is
+             an [object identifier or] OID.” Our Manifesto categorically prohibits such a state of
+             affairs, of course (see OO Proscription 2, also reference [59]); in fact, we find here,
+             regrettably, a certain amount of confusion over the values vs. variables distinction and
+             the model vs. implementation distinction once again.
+                  The user-defined functions and arbitrary-length data types features just mean that
+             (of course) generated types are indeed types; hence, users must be able to define
+             functions that operate on values and variables of such generated types, and there must
+             not be any implementation restrictions on the physical size of (the internally encoded
+             versions of) such values and variables.
+                  Last, we agree with the SQL support feature, but only as an aid to migration (see
+             the discussion of RM Very Strong Suggestion 8 in Chapter 10).
+
+      3.     Inheritance: We agree with the need for inheritance. Unfortunately, the book uses this
+             term to refer not to type inheritance as we understand that term, but rather to the
+             business of “subtables and supertables”—a very different notion, as we tried to explain
+             in Appendix G. While we do not necessarily reject that notion, we do claim that it is
+             not type inheritance, and it does not provide the functionality we feel is needed. We
+             also note that the book does not really address the question of an abstract inheritance
+             model, nor does it mention most of the intrinsic complexities that seem to arise with
+             inheritance in general (see Part IV of this book).
+                  For the record, however, we offer a few comments on the features the book lists
+             under its inheritance heading. Data and function inheritance means the “subtable”
+             inherits both columns and (user-defined) functions from the “supertable.” Overloading
+             means polymorphism (but it is indeed, as stated, overloading polymorphism, not
+             inclusion polymorphism). Inheritance of types, not tables means—to use the
+             terminology of The Third Manifesto—that relation type definitions and relvar
+             definitions are kept separate, and hence that several relvars can be of the same
+             separately and explicitly named relation type. (The Manifesto takes the exact opposite
+             approach, for reasons explained in Chapter 3.) Multiple inheritance is self-explanatory
+             (at least, the basic idea is—the consequences are not, as we tried to show in Chapter
+             15).
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                              590
+Appendixes                                                   Appendix K / References and Bibliography
+
+
+       4.    Rule system: We agree that a rule system might well be desirable in practice, but rule
+             systems are (at least arguably) independent of whether the system is object/relational or
+             something else. We therefore choose not to discuss them here.
+
+            It is noteworthy that the book nowhere discusses the debate over the equations domain
+       = class vs. relvar = class (see OO Proscription 1). Indeed, the examples tend to suggest that
+       relvar = class is the right equation, though the book never comes out to say as much
+       explicitly, and Stonebraker is on record elsewhere as stating that the opposite is the case.
+
+130.   Michael Stonebraker, Lawrence A. Rowe, Bruce G. Lindsay, James Gray, Michael Carey,
+       Michael Brodie, Philip Bernstein, and David Beech: “Third-Generation Database System
+       Manifesto,” ACM SIGMOD Record 19, No. 3 (September 1990).
+
+       In part, this paper is a response to—i.e., counterproposal or rebuttal to—the proposals of
+       reference [2]. We should explain the title. Basically, first-generation database systems are
+       the old hierarchic and network (CODASYL) systems, such as IMS and IDMS; second-
+       generation systems are relational (or at least SQL) systems; and third-generation systems are
+       whatever comes next. A direct quote: “Second-generation systems made a major
+       contribution in two areas, nonprocedural data access and data independence, and these
+       advances must not be compromised by third-generation systems.” (We would argue that
+       relational systems made many more than two “major contributions”!) In other words, third-
+       generation systems—whatever else they might do—must certainly support the relational
+       model. Unfortunately, the authors then go on to say that supporting the relational model
+       really means supporting SQL ...
+            The following features are claimed as essential requirements of a third-generation
+       DBMS (we have paraphrased the original somewhat):
+
+       1.    Provide traditional database services plus richer object structures and rules
+
+             ■       Rich type system
+             ■       Inheritance
+             ■       Functions and encapsulation
+             ■       Optional system-assigned tuple IDs
+             ■       Rules (e.g., integrity rules), not tied to specific objects
+
+       2.    Subsume second-generation DBMSs
+
+             ■       Navigation only as a last resort
+             ■       Intensional and extensional set definitions (meaningcollections that are
+                     maintained automatically by thesystem and collections that are maintained
+                     manually by the user, respectively)
+             ■       Updatable views
+             ■       Clustering, indexes, etc., hidden from the user
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                       591
+Appendixes                                                               Appendix K / References and Bibliography
+
+
+           3.   Support open systems
+
+                ■          Multiple language support
+                ■          Persistence orthogonal to type
+                ■          SQL (characterized as “intergalactic dataspeak”)
+                ■          Queries and results must be the lowest level of client/server communication
+
+           Again we offer our own comments and reactions:
+
+           1.   Traditional database services and richer object structures and rules: Of course we
+                agree with “traditional database services.” We also agree with “rich type system” and
+                “inheritance,” so long as it is understood that (a) type is just another word for domain,
+                and (b) the sole use made of such types insofar as the database is concerned is as the
+                domains over which database relvars are defined.1 “Functions”—we prefer operators—
+                are implied by “rich type system.” Regarding “encapsulation,” see Appendix B.
+                Regarding “tuple IDs,” there seems to be some confusion here between tuples and
+                “objects,” a point that might be the cause for some alarm; we reject object IDs, of
+                course, but we support the idea of system keys, and such keys might possibly be
+                thought of as (user-visible) “tuple IDs.” As for rules: We certainly support integrity
+                rules specifically, of course; further, we do not preclude support for other kinds of rules
+                (though such support might be regarded as a secondary matter).
+
+           2.   Subsume second-generation DBMSs: If “subsume” here means that the relational
+                model must be subsumed, then we reject the suggestion (but perhaps it does not mean
+                that). “Navigation only as a last resort”: We take a firmer stand and reject navigation
+                entirely; we believe it is incumbent on anyone who thinks that navigation is ever
+                necessary to show first that a nonnavigational (relational) solution is logically—or at
+                least effectively—impossible. We also reject “extensional set definitions” (in the sense
+                meant here), because the meaning of such a set is hidden in some application instead of
+                being exposed in the database. We agree with support for updatable views. Finally, we
+                also agree that access mechanisms—indexes and the like—should be hidden from the
+                user (they are not always hidden in certain object systems, but they were always
+                supposed to be hidden in relational systems).
+
+           3.   Support open systems: We agree with this objective in principle, but we reject the idea
+                of “persistence orthogonal to type,” and of course we also reject SQL (we are in this
+                business for the long haul). We do agree with the general sense of “queries and results
+                being the lowest level of client/server communication,” but remark that this objective
+                seems to be in conflict with the earlier objectives concerning “extensional set
+                definition” and “navigation.”
+
+131.       Andrew Taivalsaari: “On the Notion of Inheritance,” ACM Comp. Surv. 28, No. 3
+           (September 1996).
+
+1
+    And as the types of those database relvars themselves, of course, in the case of relation types.
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                 592
+Appendixes                                                          Appendix K / References and Bibliography
+
+
+132.   S. J. P. Todd: “The Peterlee Relational Test Vehicle—A System Overview,” IBM Sys. J. 15,
+       No. 4 (1976).
+
+       The Peterlee Relational Test Vehicle (PRTV) was an experimental system developed at the
+       IBM U.K. Scientific Centre in Peterlee, England. It was based on an earlier prototype—
+       possibly the very first implementation of Codd’s ideas—called IS/1 [120]. It supported an
+       algebraic language called ISBL (Information System Base Language), which was based on
+       proposals documented in reference [98]. The ideas in the Manifesto regarding relation type
+       inference can be traced back to ISBL, as well as to the proposals of reference [98].
+
+133.   Stephen Todd: Private communication (1988).
+
+134.   U.S. Patent and Trademark Office: Value-Instance-Connectivity Computer-Implemented
+       Database. U.S. Patent No. 6,009,432 (December 28, 1999).
+
+135.   Andrew Wright: “On Sapphire and Type-Safe Languages,” CACM 46, No. 4 (April 2003).
+
+       A quote from this paper:
+
+             [A] language is said to be “type-safe” [if] its implementation ensures, via some combination of compile-
+             and run-time checks, that the value a variable takes on or a function is passed always matches the
+             language’s notion of the variable’s or function’s type ... Type safety makes program development and
+             debugging easier by making program behavior more understandable. More importantly, type safety
+             prevents an adversary from turning a type violation into a security breach. While an adversary might be
+             able to provide inputs that trigger a run-time check, memory corruption cannot occur. There is no way
+             the adversary can cause a buffer to overflow and be reinterpreted as a sequence of machine instructions.
+
+       Comment: It seems a trifle odd to say a language is type-safe if its implementation has some
+       property; if the language is defined in a way that prohibits type violations, an
+       implementation that permits such violations is surely just incorrect. But we certainly agree
+       with the general sense of the extract quoted.
+
+136.   Stanley B. Zdonik and David Maier (eds.): Readings in Object-Oriented Database Systems.
+       San Francisco, Calif.: Morgan Kaufmann (1990).
+
+137.   Stanley B. Zdonik and David Maier: “Fundamentals of Object-Oriented Databases,” in
+       reference [136].
+
+
+
+
+Copyright © 2014 C. J. Date and Hugh Darwen                                                                       593
+
