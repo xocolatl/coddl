@@ -1,32 +1,24 @@
-//! Hand-rolled state-machine lexer for Coddl source.
+//! Tokenizer for Coddl source.
 //!
-//! Lexing is fundamentally a state machine. Two cases in particular —
-//! nested block comments (depth counting) and the three numeric literal
-//! shapes (integer / rational / approximate, disambiguated by what
-//! follows the digits) — translate directly to a small `Lexer` struct
-//! with a single byte cursor and a few helper methods. A combinator
-//! library would handle this but with more ceremony; `chumsky` stays in
-//! the dep list for the parser layer where its combinators shine.
+//! The lexer is a hand-rolled state machine over a UTF-8 byte cursor.
+//! Two cases in particular shape that choice: nested block comments
+//! (depth counting) and the three numeric literal shapes (integer,
+//! rational, approximate — disambiguated by what follows the digits).
+//! Both translate directly to a small `Lexer` struct with a single
+//! cursor and a few helpers.
 //!
-//! ## Public contract (Coddl-rewritability)
+//! ## Contract
 //!
 //! - Input: a `&str` source buffer and a `FileId`.
-//! - Output: a [`LexOutput`] with the token sequence and any diagnostics.
-//!   Both vectors; no streams, no iterators in the public API. A Coddl
-//!   rewrite mirrors this directly: `oper lex { source: Text, file:
-//!   FileId } : Tuple { tokens: Sequence Token, diagnostics: Sequence
-//!   Diagnostic }`.
-//! - The lexer **never panics** on any byte sequence. Unknown characters
-//!   produce a `TokenKind::Error` token plus an error diagnostic, and
-//!   the lexer continues.
-//! - Spans are recorded in bytes, end-exclusive. The lexeme of a token is
+//! - Output: a [`LexOutput`] with the token sequence and any
+//!   diagnostics. Both are vectors; no streams in the public API.
+//! - The lexer **never panics** on any byte sequence. Unknown
+//!   characters produce a `TokenKind::Error` token plus an error
+//!   diagnostic, and the lexer continues.
+//! - Spans are byte offsets, end-exclusive. The lexeme of a token is
 //!   `source[token.span.start..token.span.end]`.
-//!
-//! ## Trivia
-//!
-//! Whitespace and comments are emitted as first-class tokens — the
-//! parser layer skips them, the CST keeps them. This is what makes the
-//! lossless tree from §13 possible.
+//! - Whitespace and comments are emitted as first-class tokens — the
+//!   parser skips them, the syntax tree keeps them.
 
 use coddl_diagnostics::{Diagnostic, FileId, Span};
 use unicode_ident::{is_xid_continue, is_xid_start};

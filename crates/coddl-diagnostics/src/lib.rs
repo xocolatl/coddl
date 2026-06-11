@@ -2,7 +2,7 @@
 //!
 //! Every analysis pass is `fn(Input) -> (Output, Vec<Diagnostic>)`. The
 //! CLI driver renders these to the terminal; `coddl-lsp` serializes
-//! them to `PublishDiagnostics`. See ARCHITECTURE.md §12.
+//! them to LSP `PublishDiagnostics`.
 
 use std::fmt;
 
@@ -13,11 +13,8 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct FileId(pub u32);
 
-/// Byte-range source span.
-///
-/// Every AST and IR node carries one of these (RM §12 discipline #1).
-/// `start` and `end` are byte offsets into the file's UTF-8 source;
-/// `end` is exclusive.
+/// Byte-range source span. `start` and `end` are byte offsets into the
+/// file's UTF-8 source; `end` is exclusive.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Span {
     pub file: FileId,

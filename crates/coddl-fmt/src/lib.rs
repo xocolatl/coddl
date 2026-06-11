@@ -1,12 +1,12 @@
 //! Canonical formatter for Coddl source.
 //!
-//! Exposed two ways from one library: as a `coddl fmt` driver subcommand
-//! and as the LSP `textDocument/formatting` handler. See ARCHITECTURE.md §13.
+//! Exposed two ways from one library: as the `coddl fmt` driver
+//! subcommand and as the LSP `textDocument/formatting` handler.
 //!
-//! The formatter walks the CST produced by `coddl-syntax` (lossless, preserves
-//! every token and trivia) and re-emits canonical source. The output is
-//! idempotent — `format(format(x, opts), opts) == format(x, opts)` for every
-//! valid input. This is a unit-test invariant, not a hope.
+//! The formatter walks the lossless syntax tree from `coddl-syntax`
+//! and re-emits canonical source. Output is idempotent —
+//! `format(format(x, opts), opts) == format(x, opts)` for every valid
+//! input — verified by unit tests.
 
 use coddl_diagnostics::Diagnostic;
 
@@ -32,7 +32,7 @@ impl Default for Edition {
     }
 }
 
-/// User-configurable formatter knobs. Intentionally tiny — see §13.
+/// User-configurable formatter knobs. Intentionally tiny.
 #[derive(Clone, Debug)]
 pub struct FormatOptions {
     pub edition: Edition,
@@ -54,7 +54,7 @@ impl Default for FormatOptions {
 ///
 /// `diagnostics` carries parse errors picked up while building the CST
 /// (the formatter still attempts to format around recoverable syntax
-/// errors — `chumsky` recovery from §12 applies here too).
+/// errors — the parser's recovery applies here too).
 pub struct FormatOutput {
     pub text: String,
     pub diagnostics: Vec<Diagnostic>,
@@ -64,11 +64,12 @@ pub struct FormatOutput {
 ///
 /// Pure: same input + same options → same output. The buffer doesn't need
 /// to be syntactically perfect; the formatter formats what parses and
-/// preserves the rest verbatim. See §12 discipline #4 (pure analyses).
+/// preserves the rest verbatim. Pure: same input + same options
+/// always produce the same output.
 pub fn format(source: &str, _opts: &FormatOptions) -> FormatOutput {
-    // TODO (milestone 2): parse to CST, walk, emit canonical output.
-    // For now this is a no-op so the workspace builds and the wiring
-    // through `coddl-driver` and `coddl-lsp` is exercised.
+    // TODO: parse to CST, walk, emit canonical output. The current
+    // no-op identity lets the wiring through `coddl-driver` and
+    // `coddl-lsp` be exercised end-to-end.
     FormatOutput {
         text: source.to_owned(),
         diagnostics: Vec::new(),

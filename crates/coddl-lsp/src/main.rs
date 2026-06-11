@@ -1,10 +1,10 @@
 //! `coddl-lsp` — the Coddl language server.
 //!
 //! Thin `tower-lsp` adapter: owns document state and request dispatch,
-//! delegates all analysis to the frontend crates (`coddl-syntax`,
-//! `coddl-types`, …). v1 scope: syntax highlighting (TextMate grammar
-//! in the VSCode extension) plus diagnostics (warnings/errors) flowing
-//! from the frontend's `Vec<Diagnostic>`. See ARCHITECTURE.md §12.
+//! delegates analysis to the frontend crates. Surface capabilities
+//! today are syntax highlighting (driven by the VSCode extension's
+//! TextMate grammar) plus diagnostics streamed from the frontend's
+//! `Vec<Diagnostic>` output.
 
 use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::*;
@@ -76,7 +76,7 @@ impl LanguageServer for CoddlLsp {
     }
 
     async fn did_change(&self, _params: DidChangeTextDocumentParams) {
-        // TODO: full re-parse + re-typecheck (v1) — salsa later (§12).
+        // TODO: full re-parse + re-typecheck; incremental via salsa later.
     }
 }
 

@@ -49,9 +49,9 @@ pub struct StmtId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TempRelRef(pub u32);
 
-/// Placeholder types — these will land in milestone 1 alongside the
-/// real RelIR plan and type-system definitions. Kept as opaque
-/// structs here so trait signatures compile.
+/// Opaque shapes used by the `Backend` and `Conn` trait signatures.
+/// The real definitions live in `coddl-relir` and `coddl-types`; the
+/// emitter only sees them as values to render.
 pub struct RelPlan;
 pub struct Schema;
 pub struct TypeMap;

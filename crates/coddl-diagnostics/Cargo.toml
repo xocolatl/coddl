@@ -5,6 +5,6 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "Shared span and diagnostic types for the Coddl compiler frontend (ARCHITECTURE.md §12)."
+description = "Shared span and diagnostic types for the Coddl compiler frontend."
 
 [dependencies]

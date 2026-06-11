@@ -1,54 +1,34 @@
-//! Lexer, parser, and concrete syntax tree (CST) for Coddl source.
+//! Lexer, parser, and concrete syntax tree for Coddl source.
 //!
-//! Surface syntax: uniform named-argument prefix style (ARCHITECTURE.md §3).
-//! The parser uses `chumsky` with error recovery enabled — never bail on
-//! the first syntax error; produce a tree with `Error` nodes where things
-//! broke (§12 discipline #2).
+//! The parser produces a lossless concrete syntax tree: every token,
+//! every comment, every byte of whitespace is preserved in the tree.
+//! The typed AST consumed by the type checker and downstream passes is
+//! a typed view derived from the CST, not a separate structure. One
+//! tree, two views, no drift.
 //!
-//! ## CST, not a plain AST (§13)
-//!
-//! The parser produces a **lossless concrete syntax tree** — every token,
-//! every comment, every byte of whitespace preserved. The typed AST that
-//! the type checker and downstream passes consume is a *view* derived
-//! from the CST, not a separate structure.
-//!
-//! Every CST node carries a [`coddl_diagnostics::Span`] (§12 discipline #1).
-//!
-//! ## Coddl-rewritability
-//!
-//! The public surface of this crate is shaped so a future Coddl
-//! self-host rewrite mirrors it 1:1. Concretely:
-//!
-//! - `Token` and `TokenKind` are plain data — a `#[repr(C)]` record and
-//!   a flat enum. Both translate directly to a Coddl `Tuple` and a Coddl
-//!   sum type once those land.
-//! - `lex(source, file) -> LexOutput` is a pure function; no state, no
-//!   trait objects, no async.
-//! - Diagnostics are values returned alongside the output (§12 discipline #3).
-//!
-//! Internally the lexer uses `chumsky` because it does the job well; the
-//! consumer-facing data doesn't care.
+//! The public surface — `Token`, `TokenKind`, `SyntaxKind`,
+//! `SyntaxNode`, `lex`, and the AST view types — is plain data and pure
+//! functions. No streams, no trait objects, no async at the API
+//! boundary. Diagnostics are returned alongside output values, not
+//! raised.
 
-pub mod token;
+pub mod ast;
+pub mod cst;
 pub mod lexer;
+pub mod syntax_kind;
+pub mod token;
 
-pub use token::{Token, TokenKind};
+pub use cst::{CoddlLanguage, CstBuilder, SyntaxElement, SyntaxNode, SyntaxToken};
 pub use lexer::{lex, LexOutput};
+pub use syntax_kind::SyntaxKind;
+pub use token::{Token, TokenKind};
 
-use coddl_diagnostics::{Diagnostic, Span};
+use coddl_diagnostics::Diagnostic;
 
-/// Result of parsing a source buffer: a (possibly partial) tree plus any
-/// diagnostics produced along the way.
-pub struct ParseOutput<T> {
-    pub tree: T,
+/// A parsed source buffer: the syntax tree plus any diagnostics
+/// collected while building it. The tree is always well-formed; nodes
+/// for unrecoverable source ranges carry [`SyntaxKind::PARSE_ERROR`].
+pub struct ParseOutput {
+    pub tree: SyntaxNode,
     pub diagnostics: Vec<Diagnostic>,
-}
-
-/// Placeholder for the top-level AST view — a Coddl program.
-///
-/// Will grow into the real AST in milestone 1 step 1, derived from the CST.
-#[derive(Debug, Default)]
-pub struct Program {
-    pub span: Span,
-    // TODO: items (oper decls, scalar type decls, relvar decls, constraint decls, …)
 }
