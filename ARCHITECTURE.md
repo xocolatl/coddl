@@ -16,7 +16,7 @@ Coddl is its own D — not Tutorial D. It conforms to TTM's RM/OO Prescriptions 
 **Rust** (chosen). Sum-type enums and exhaustive pattern matching are the right tools for AST/IR work; the language has no garbage collector and no managed runtime to drag into end-user binaries; FFI is `extern "C"` natively; and `#[repr(C)]` plus the borrow checker make the LLVM/runtime ABI tractable to keep correct over time. Performance and long-term-planning principles both push hard toward Rust over the GC'd alternatives we considered.
 
 Stack:
-- **Parser**: `chumsky`. Combinator-based, top-tier error reporting, evolves well as the grammar changes. `winnow` is the perf-first alternative — revisit if parser cost ever shows up in real profiles, but error quality wins at this stage of the language.
+- **Parser**: hand-rolled recursive descent over the lexer's token stream, driving a `rowan` green-tree builder. Same playbook as `rust-analyzer`: predictable error recovery, exact span control, and the parser maps 1:1 onto the productions in the grammar appendix. No combinator library.
 - **LLVM**: emit LLVM IR as text and shell out to `llc`/`clang`. We deliberately avoid `llvm-sys`/`inkwell` — version-coupling churn, build complexity, and we don't need programmatic IR introspection in the foreseeable plan. Text emission is fast and forward-compatible.
 - **Databases**: backend-specific crates behind a trait. `rusqlite` for SQLite, `postgres` (sync) for Postgres. Avoid `sqlx`'s compile-time SQL checking — we emit our own SQL and don't want a second SQL parser in our build.
 - **Pretty-printing / formatting**: the `pretty` crate for SQL and LLVM IR emission where the structure benefits from combinators; plain `std::fmt::Write` where it doesn't.
@@ -28,7 +28,7 @@ Stack:
 ```
 source.cdl
    │
-   ▼  lex + parse (chumsky; uniform named-argument prefix syntax — see §3)
+   ▼  lex + parse (hand-rolled state machine + recursive descent; uniform named-argument prefix syntax — see §3)
   AST
    │
    ▼  name resolution, module/import resolution
@@ -427,7 +427,7 @@ coddl/
   Cargo.toml                       # workspace
   crates/
     coddl-diagnostics/             # shared span + diagnostic types (used by every frontend crate)
-    coddl-syntax/                  # chumsky lexer/parser, AST (with error recovery)
+    coddl-syntax/                  # lexer + recursive-descent parser, CST (rowan) + AST view
     coddl-types/                   # type checker, type representation
     coddl-relir/                   # relational IR + optimizer
     coddl-procir/                  # procedural IR (backend-agnostic SSA)
@@ -551,7 +551,7 @@ The RelIR optimizer's job is to draw the line between them as low (close to the 
 
 ## 11. First milestone
 
-1. Lex + parse the uniform-prefix-syntax core (RM Pre 1, 6–10, 13–14, 18): scalar declarations, possrep/selector, relvar declarations, `join`, `where`/`restrict`, `extend`, simple `summarize`, `rename`, `project`. Multiple assignment. **Establish the spans-on-every-node and diagnostics-as-values discipline from §12 here** — these are project-wide invariants, not LSP-conditional. The parser uses `chumsky`'s error-recovery mode from day one.
+1. Lex + parse the uniform-prefix-syntax core (RM Pre 1, 6–10, 13–14, 18): scalar declarations, possrep/selector, relvar declarations, `join`, `where`/`restrict`, `extend`, simple `summarize`, `rename`, `project`. Multiple assignment. **Establish the spans-on-every-node and diagnostics-as-values discipline from §12 here** — these are project-wide invariants, not LSP-conditional. The parser does error recovery from day one (no bailing on the first syntax error; emit `PARSE_ERROR` CST nodes and continue).
 2. Type-check headings, possreps, and selector signatures. Enforce no-nulls, no-duplicates at the type level. Verify candidate keys are declared and minimal. Type errors propagate via `Error` types, not cascades.
 3. Lower to RelIR (sugar → A core during the same pass). Emit SQLite SQL honoring every rule in §5.
 4. Hand-write the Rust runtime that runs the SQL and prints rows — no LLVM yet. Implement explicit transactions and multiple assignment.
@@ -579,7 +579,7 @@ Tree-sitter (more accurate, incremental highlighting) is a possible upgrade late
 The LSP isn't an add-on bolted on at the end — its requirements shape the rest of the frontend. These constraints land on the compiler from day one, in line with long-term planning:
 
 1. **Spans on every AST/IR node.** Every token, every AST node, every typed-AST node, every diagnostic carries `(file_id, byte_range)`. Retrofitting spans is a project-wide refactor — write them in from the first lexer token.
-2. **Error recovery in the parser.** `chumsky` produces a best-effort AST with `Error` nodes rather than failing on the first syntax error. The type checker treats `Error` types as propagating-but-not-cascading — don't pile a hundred type errors on top of one parse error.
+2. **Error recovery in the parser.** The recursive-descent parser produces a best-effort CST with `PARSE_ERROR` nodes wrapping unrecoverable token ranges rather than failing on the first syntax error. The type checker treats `Error` types as propagating-but-not-cascading — don't pile a hundred type errors on top of one parse error.
 3. **Diagnostics-as-values.** No `panic!` or `eprintln!` for user-visible errors anywhere in the frontend. Every pass returns its diagnostics in a `Vec<Diagnostic>` alongside the (possibly partial) result. CLI and LSP differ only in presentation.
 4. **Pure analyses.** Every frontend pass is `fn(Input) -> (Output, Vec<Diagnostic>)` — no globals, no I/O, no hidden state. The LSP can call any pass on any buffer at any time.
 
