@@ -1,0 +1,24 @@
+[package]
+name = "coddl-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Coddl CLI: compile, run, repl."
+
+[[bin]]
+name = "coddl"
+path = "src/main.rs"
+
+[dependencies]
+coddl-diagnostics.workspace = true
+coddl-syntax.workspace = true
+coddl-types.workspace = true
+coddl-relir.workspace = true
+coddl-procir.workspace = true
+coddl-sqlemit.workspace = true
+coddl-execlocal.workspace = true
+coddl-codegen-llvm.workspace = true
+coddl-runtime.workspace = true
+coddl-fmt.workspace = true

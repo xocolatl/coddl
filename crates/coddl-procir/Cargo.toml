@@ -1,0 +1,12 @@
+[package]
+name = "coddl-procir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Procedural SSA IR — backend-agnostic (ARCHITECTURE.md §4)."
+
+[dependencies]
+coddl-diagnostics.workspace = true
+coddl-types.workspace = true

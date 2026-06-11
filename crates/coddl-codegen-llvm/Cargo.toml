@@ -1,0 +1,12 @@
+[package]
+name = "coddl-codegen-llvm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "ProcIR → LLVM IR text emission (v1 codegen backend)."
+
+[dependencies]
+coddl-procir.workspace = true
+pretty.workspace = true

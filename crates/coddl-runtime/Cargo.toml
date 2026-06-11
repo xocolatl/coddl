@@ -1,0 +1,23 @@
+[package]
+name = "coddl-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "extern \"C\" runtime linked into compiled Coddl binaries (ARCHITECTURE.md §6)."
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[features]
+default = ["sqlite"]
+sqlite = ["dep:coddl-backend-sqlite"]
+postgres = ["dep:coddl-backend-postgres"]
+
+[dependencies]
+coddl-diagnostics.workspace = true
+coddl-execlocal.workspace = true
+coddl-sqlemit.workspace = true
+coddl-backend-sqlite = { workspace = true, optional = true }
+coddl-backend-postgres = { workspace = true, optional = true }

@@ -1,0 +1,20 @@
+[package]
+name = "coddl-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Coddl language server (LSP) — thin tower-lsp adapter over the frontend crates (ARCHITECTURE.md §12)."
+
+[[bin]]
+name = "coddl-lsp"
+path = "src/main.rs"
+
+[dependencies]
+coddl-diagnostics.workspace = true
+coddl-syntax.workspace = true
+coddl-types.workspace = true
+coddl-fmt.workspace = true
+tower-lsp.workspace = true
+tokio.workspace = true

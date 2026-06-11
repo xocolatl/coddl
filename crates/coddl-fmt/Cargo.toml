@@ -1,0 +1,12 @@
+[package]
+name = "coddl-fmt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Canonical formatter for Coddl source — the library behind `coddl fmt` and the LSP's textDocument/formatting (ARCHITECTURE.md §13)."
+
+[dependencies]
+coddl-diagnostics.workspace = true
+coddl-syntax.workspace = true

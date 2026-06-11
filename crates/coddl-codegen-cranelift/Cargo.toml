@@ -1,0 +1,11 @@
+[package]
+name = "coddl-codegen-cranelift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "ProcIR → Cranelift (planned). REPL JIT + toolchain-free AOT."
+
+[dependencies]
+coddl-procir.workspace = true

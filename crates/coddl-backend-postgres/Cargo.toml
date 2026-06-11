@@ -1,0 +1,12 @@
+[package]
+name = "coddl-backend-postgres"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Postgres implementation of the Coddl Backend/Conn traits."
+
+[dependencies]
+coddl-sqlemit.workspace = true
+postgres.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "coddl-codegen-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "ProcIR → direct WASM via wasm-encoder (optional)."
+
+[dependencies]
+coddl-procir.workspace = true

@@ -32,6 +32,7 @@ These are decided. Don't relitigate; flag explicitly if a proposal would break o
 - **RelIR = Algebra A core + sugar layer.** EXTEND/WHERE/SUMMARIZE desugar to JOIN via "operators-as-relations." Work at the A level when proposing IR nodes or rewrites.
 - **Surface syntax: uniform named-argument prefix style** (the form Tutorial D's own authors propose in ch. 5, pp. 127–128, but never adopt — Coddl does). Default form is `OP { paramName expr, paramName expr }` with braces. Infix retained for `=`, `<`, `+`, etc.; parenthesized positional kept for `COUNT`, `SIN`, `IS_*`.
 - **The frontend serves both the CLI driver and the VSCode LSP.** Every AST/IR node carries `(file_id, byte_range)` spans from the first lexer token; every analysis pass is `fn(Input) -> (Output, Vec<Diagnostic>)` with no `panic!`/`eprintln!` for user-visible errors; the parser recovers from errors rather than bailing. These aren't LSP-conditional — retrofitting any of them is a project-wide refactor. See ARCHITECTURE.md §12.
+- **`coddl-syntax` produces a CST, not a plain AST.** The formatter (`coddl fmt`) needs every byte preserved (whitespace, comments). The parser produces a lossless concrete syntax tree; the AST is a typed view derived from it that the typechecker and downstream passes consume. Same backing storage, two views — don't propose a lossy AST or a side-channel trivia stream. See ARCHITECTURE.md §13.
 
 ## Architecture sections worth knowing by number
 
@@ -49,6 +50,7 @@ When citing the design doc in a discussion, ARCHITECTURE.md is organized as:
 - §10 risks worth deciding early
 - §11 first milestone
 - §12 editor tooling (LSP + VSCode extension)
+- §13 code formatter (`coddl fmt`)
 
 ## Operational notes
 

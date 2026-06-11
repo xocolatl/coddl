@@ -1,0 +1,12 @@
+[package]
+name = "coddl-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Type checker and type representation (ARCHITECTURE.md §7)."
+
+[dependencies]
+coddl-diagnostics.workspace = true
+coddl-syntax.workspace = true

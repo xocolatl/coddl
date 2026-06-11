@@ -1,0 +1,13 @@
+[package]
+name = "coddl-sqlemit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "RelIR → SQL emitter and the Backend/Conn traits (ARCHITECTURE.md §5)."
+
+[dependencies]
+coddl-diagnostics.workspace = true
+coddl-relir.workspace = true
+coddl-types.workspace = true
