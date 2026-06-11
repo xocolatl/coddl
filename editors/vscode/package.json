@@ -1,0 +1,65 @@
+{
+    "name": "coddl",
+    "displayName": "Coddl",
+    "description": "Language support for Coddl: syntax highlighting and diagnostics via coddl-lsp.",
+    "version": "0.0.0",
+    "publisher": "coddl",
+    "private": true,
+    "engines": {
+        "vscode": "^1.85.0"
+    },
+    "categories": [
+        "Programming Languages"
+    ],
+    "main": "./out/extension.js",
+    "activationEvents": [
+        "onLanguage:coddl"
+    ],
+    "contributes": {
+        "languages": [
+            {
+                "id": "coddl",
+                "aliases": ["Coddl", "coddl"],
+                "extensions": [".cdl"],
+                "configuration": "./language-configuration.json"
+            }
+        ],
+        "grammars": [
+            {
+                "language": "coddl",
+                "scopeName": "source.coddl",
+                "path": "./syntaxes/coddl.tmLanguage.json"
+            }
+        ],
+        "configuration": {
+            "type": "object",
+            "title": "Coddl",
+            "properties": {
+                "coddl.lsp.path": {
+                    "type": "string",
+                    "default": "coddl-lsp",
+                    "description": "Path to the coddl-lsp binary. Resolved against $PATH if it is not absolute."
+                },
+                "coddl.lsp.trace.server": {
+                    "type": "string",
+                    "enum": ["off", "messages", "verbose"],
+                    "default": "off",
+                    "description": "Trace LSP traffic between VSCode and coddl-lsp."
+                }
+            }
+        }
+    },
+    "scripts": {
+        "compile": "tsc -p .",
+        "watch": "tsc -p . --watch",
+        "vscode:prepublish": "tsc -p ."
+    },
+    "dependencies": {
+        "vscode-languageclient": "^9.0.1"
+    },
+    "devDependencies": {
+        "@types/node": "^20.10.0",
+        "@types/vscode": "^1.85.0",
+        "typescript": "^5.3.0"
+    }
+}

@@ -1,0 +1,153 @@
+{
+    "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+    "name": "Coddl",
+    "scopeName": "source.coddl",
+    "fileTypes": ["cdl"],
+    "patterns": [
+        { "include": "#comments" },
+        { "include": "#strings" },
+        { "include": "#numbers" },
+        { "include": "#constants" },
+        { "include": "#keywords" },
+        { "include": "#types" },
+        { "include": "#operators" },
+        { "include": "#identifiers" }
+    ],
+    "repository": {
+        "comments": {
+            "patterns": [
+                {
+                    "name": "comment.line.double-dash.coddl",
+                    "match": "--.*$"
+                }
+            ]
+        },
+        "strings": {
+            "patterns": [
+                {
+                    "name": "string.quoted.double.coddl",
+                    "begin": "\"",
+                    "end": "\"",
+                    "patterns": [
+                        {
+                            "name": "constant.character.escape.coddl",
+                            "match": "\\\\."
+                        }
+                    ]
+                }
+            ]
+        },
+        "numbers": {
+            "patterns": [
+                {
+                    "name": "constant.numeric.rational.coddl",
+                    "match": "\\b[0-9]+\\.[0-9]+\\b"
+                },
+                {
+                    "name": "constant.numeric.integer.coddl",
+                    "match": "\\b[0-9]+\\b"
+                }
+            ]
+        },
+        "constants": {
+            "patterns": [
+                {
+                    "name": "constant.language.boolean.coddl",
+                    "match": "\\b(TRUE|FALSE|true|false)\\b"
+                },
+                {
+                    "name": "constant.language.relation.coddl",
+                    "match": "\\b(TABLE_DEE|TABLE_DUM)\\b"
+                }
+            ]
+        },
+        "keywords": {
+            "patterns": [
+                {
+                    "name": "keyword.declaration.coddl",
+                    "match": "\\b(program|oper|relvar|type|possrep|constraint|var|key)\\b"
+                },
+                {
+                    "name": "storage.modifier.coddl",
+                    "match": "\\b(real|base|virtual|private|public)\\b"
+                },
+                {
+                    "name": "keyword.control.coddl",
+                    "match": "\\b(if|then|else|end|do|to|return)\\b"
+                },
+                {
+                    "name": "keyword.other.iteration.coddl",
+                    "match": "\\b(load|array|from|order|asc|desc|by)\\b"
+                },
+                {
+                    "name": "keyword.other.relational.coddl",
+                    "match": "\\b(join|times|union|intersect|minus|where|extend|summarize|rename|project|group|ungroup|wrap|unwrap|semijoin|semiminus|tclose)\\b"
+                },
+                {
+                    "name": "keyword.operator.logical.coddl",
+                    "match": "\\b(and|or|not)\\b"
+                },
+                {
+                    "name": "keyword.other.transaction.coddl",
+                    "match": "\\b(begin|commit|rollback|transaction|savepoint)\\b"
+                },
+                {
+                    "name": "keyword.other.coddl",
+                    "match": "\\b(with|as|add|the)\\b"
+                }
+            ]
+        },
+        "types": {
+            "patterns": [
+                {
+                    "name": "support.type.builtin.coddl",
+                    "match": "\\b(INTEGER|RATIONAL|CHARACTER|CHAR|BOOLEAN)\\b"
+                },
+                {
+                    "name": "support.type.generator.coddl",
+                    "match": "\\b(TUPLE|RELATION|tuple|relation)\\b"
+                }
+            ]
+        },
+        "operators": {
+            "patterns": [
+                {
+                    "name": "keyword.operator.assignment.coddl",
+                    "match": ":="
+                },
+                {
+                    "name": "keyword.operator.comparison.coddl",
+                    "match": "<>|<=|>=|<|>|="
+                },
+                {
+                    "name": "keyword.operator.arithmetic.coddl",
+                    "match": "\\+|-|\\*|/"
+                },
+                {
+                    "name": "punctuation.separator.coddl",
+                    "match": "[,;:]"
+                }
+            ]
+        },
+        "identifiers": {
+            "patterns": [
+                {
+                    "name": "entity.name.function.coddl",
+                    "match": "\\b([a-z_][A-Za-z0-9_#]*)(?=\\s*\\{)"
+                },
+                {
+                    "name": "variable.parameter.named-arg.coddl",
+                    "match": "(?<=[\\{,]\\s*)([A-Za-z_][A-Za-z0-9_#]*)\\s*(?=:)"
+                },
+                {
+                    "name": "entity.name.type.coddl",
+                    "match": "\\b[A-Z][A-Za-z0-9_]*[#]?\\b"
+                },
+                {
+                    "name": "variable.other.coddl",
+                    "match": "\\b[a-z_][A-Za-z0-9_#]*\\b"
+                }
+            ]
+        }
+    }
+}
