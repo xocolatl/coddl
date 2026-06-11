@@ -227,6 +227,8 @@ impl<'a> Parser<'a> {
     fn parse_item(&mut self) {
         if self.at_keyword("program") {
             self.parse_program_decl();
+        } else if self.at_keyword("oper") {
+            self.parse_oper_decl();
         } else {
             self.parse_unknown_item();
         }
@@ -244,6 +246,130 @@ impl<'a> Parser<'a> {
         }
         if !self.eat(SyntaxKind::SEMICOLON) {
             self.error("P0003", "expected `;` after program declaration");
+        }
+
+        self.finish_node();
+    }
+
+    /// `oper <name> <heading> <body>;`. The return-type clause (`: Type`
+    /// or `-> Type`) is intentionally not parsed yet — the syntax for it
+    /// is open. Until it settles, an operator with a return type will
+    /// trigger the "expected `[`" or "expected `;`" diagnostic on the
+    /// stray punctuation.
+    fn parse_oper_decl(&mut self) {
+        debug_assert!(self.at_keyword("oper"));
+        self.start_node(SyntaxKind::OPER_DECL);
+        self.bump(); // "oper"
+
+        if !self.eat(SyntaxKind::IDENT) {
+            self.error("P0004", "expected operator name");
+        }
+
+        if self.at(SyntaxKind::L_BRACE) {
+            self.parse_heading();
+        } else {
+            self.error("P0005", "expected `{` to start parameter heading");
+        }
+
+        if self.at(SyntaxKind::L_BRACKET) {
+            self.parse_block();
+        } else {
+            self.error("P0006", "expected `[` to start operator body");
+        }
+
+        if !self.eat(SyntaxKind::SEMICOLON) {
+            self.error("P0007", "expected `;` after operator declaration");
+        }
+
+        self.finish_node();
+    }
+
+    /// `{ <param>, … }` — the structural type used both as an operator's
+    /// parameter list and as a `Tuple H` heading. Empty `{}` is valid;
+    /// trailing comma is accepted.
+    fn parse_heading(&mut self) {
+        debug_assert!(self.at(SyntaxKind::L_BRACE));
+        self.start_node(SyntaxKind::HEADING);
+        self.bump(); // {
+
+        if self.eat(SyntaxKind::R_BRACE) {
+            self.finish_node();
+            return;
+        }
+
+        loop {
+            self.parse_param();
+
+            if !self.eat(SyntaxKind::COMMA) {
+                break;
+            }
+            // Trailing comma is OK — `{ x: T, }` is the same as `{ x: T }`.
+            if self.at(SyntaxKind::R_BRACE) {
+                break;
+            }
+        }
+
+        if !self.eat(SyntaxKind::R_BRACE) {
+            self.error("P0008", "expected `}` to close parameter heading");
+        }
+
+        self.finish_node();
+    }
+
+    /// `<name>: <type>`. Both the name and the colon are individually
+    /// recoverable so a typo in one doesn't sink the whole parameter.
+    fn parse_param(&mut self) {
+        self.start_node(SyntaxKind::PARAM);
+
+        if !self.eat(SyntaxKind::IDENT) {
+            self.error("P0009", "expected parameter name");
+        }
+        if !self.eat(SyntaxKind::COLON) {
+            self.error("P0010", "expected `:` after parameter name");
+        }
+        self.parse_type_ref();
+
+        self.finish_node();
+    }
+
+    /// A type expression. Today only a single identifier is recognised;
+    /// `Tuple H`, `Relation H`, `Sequence T`, and qualified names land
+    /// alongside the rest of expression parsing.
+    fn parse_type_ref(&mut self) {
+        self.start_node(SyntaxKind::TYPE_REF);
+        if !self.eat(SyntaxKind::IDENT) {
+            self.error("P0011", "expected type name");
+        }
+        self.finish_node();
+    }
+
+    /// `[ … ]` body. Today the content is consumed as flat tokens; once
+    /// statement and expression productions arrive, the contents will
+    /// be wrapped in `LET_STMT` / `EXPR_STMT` / `CALL_EXPR` / etc. Nested
+    /// `[…]` is respected via a depth counter so the matching close
+    /// bracket is found correctly.
+    fn parse_block(&mut self) {
+        debug_assert!(self.at(SyntaxKind::L_BRACKET));
+        self.start_node(SyntaxKind::BLOCK);
+        self.bump(); // [
+
+        let mut depth: u32 = 1;
+        while depth > 0 {
+            match self.current() {
+                SyntaxKind::EOF => {
+                    self.error("P0012", "unclosed operator body");
+                    break;
+                }
+                SyntaxKind::L_BRACKET => {
+                    depth += 1;
+                    self.bump();
+                }
+                SyntaxKind::R_BRACKET => {
+                    depth -= 1;
+                    self.bump();
+                }
+                _ => self.bump(),
+            }
         }
 
         self.finish_node();
@@ -411,6 +537,164 @@ mod tests {
             top,
             vec![SyntaxKind::PROGRAM_DECL, SyntaxKind::PROGRAM_DECL]
         );
+    }
+
+    #[test]
+    fn minimal_oper_decl() {
+        let out = parse_str("oper main {} [];");
+        assert!(
+            out.diagnostics.is_empty(),
+            "expected no diagnostics, got {:?}",
+            out.diagnostics
+        );
+        assert_eq!(out.tree.text(), "oper main {} [];");
+
+        let decl = out.tree.first_child().unwrap();
+        assert_eq!(decl.kind(), SyntaxKind::OPER_DECL);
+
+        let child_kinds: Vec<_> = decl
+            .children_with_tokens()
+            .map(|el| el.kind())
+            .filter(|k| !k.is_trivia())
+            .collect();
+        assert_eq!(
+            child_kinds,
+            vec![
+                SyntaxKind::IDENT, // "oper"
+                SyntaxKind::IDENT, // "main"
+                SyntaxKind::HEADING,
+                SyntaxKind::BLOCK,
+                SyntaxKind::SEMICOLON,
+            ]
+        );
+    }
+
+    #[test]
+    fn oper_decl_with_single_param() {
+        let out = parse_str("oper add { x: Integer } [];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+
+        let decl = out.tree.first_child().unwrap();
+        let heading = decl
+            .children()
+            .find(|n| n.kind() == SyntaxKind::HEADING)
+            .unwrap();
+        let params: Vec<_> = heading.children().collect();
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].kind(), SyntaxKind::PARAM);
+        assert_eq!(params[0].text(), "x: Integer");
+    }
+
+    #[test]
+    fn oper_decl_with_multiple_params() {
+        let out = parse_str("oper add { x: Integer, y: Integer } [];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let decl = out.tree.first_child().unwrap();
+        let heading = decl
+            .children()
+            .find(|n| n.kind() == SyntaxKind::HEADING)
+            .unwrap();
+        let params: Vec<_> = heading.children().collect();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].text(), "x: Integer");
+        assert_eq!(params[1].text(), "y: Integer");
+    }
+
+    #[test]
+    fn oper_decl_with_trailing_comma_in_heading() {
+        let out = parse_str("oper f { x: Integer, } [];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let heading = out
+            .tree
+            .first_child()
+            .unwrap()
+            .children()
+            .find(|n| n.kind() == SyntaxKind::HEADING)
+            .unwrap();
+        assert_eq!(heading.children().count(), 1);
+    }
+
+    #[test]
+    fn oper_body_preserves_nested_brackets() {
+        // The outer body has a nested [...] which must not be mistaken
+        // for the matching close bracket.
+        let src = "oper f {} [ [ inner ] more ];";
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.tree.text(), src);
+        let body = out
+            .tree
+            .first_child()
+            .unwrap()
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BLOCK)
+            .unwrap();
+        assert_eq!(body.text(), "[ [ inner ] more ]");
+    }
+
+    #[test]
+    fn hello_world_parses_clean() {
+        let src = "program hello_world;\n\
+                   \n\
+                   oper main {}\n\
+                   [\n\
+                       write_line{message: \"Hello, world!\"};\n\
+                   ];\n";
+        let out = parse_str(src);
+        assert!(
+            out.diagnostics.is_empty(),
+            "expected hello-world to parse clean, got {:?}",
+            out.diagnostics
+        );
+        assert_eq!(out.tree.text(), src);
+
+        let top_kinds: Vec<_> = out.tree.children().map(|n| n.kind()).collect();
+        assert_eq!(
+            top_kinds,
+            vec![SyntaxKind::PROGRAM_DECL, SyntaxKind::OPER_DECL]
+        );
+    }
+
+    #[test]
+    fn missing_oper_name_diagnoses() {
+        let out = parse_str("oper {} [];");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0004"));
+    }
+
+    #[test]
+    fn missing_oper_heading_diagnoses() {
+        let out = parse_str("oper main [];");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0005"));
+    }
+
+    #[test]
+    fn missing_oper_body_diagnoses() {
+        let out = parse_str("oper main {};");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0006"));
+    }
+
+    #[test]
+    fn missing_oper_semicolon_diagnoses() {
+        let out = parse_str("oper main {} []");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0007"));
+    }
+
+    #[test]
+    fn missing_param_colon_diagnoses() {
+        let out = parse_str("oper f { x Integer } [];");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0010"));
+    }
+
+    #[test]
+    fn missing_param_type_diagnoses() {
+        let out = parse_str("oper f { x: } [];");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0011"));
+    }
+
+    #[test]
+    fn unclosed_body_diagnoses() {
+        let out = parse_str("oper f {} [ stuff ");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0012"));
     }
 
     #[test]

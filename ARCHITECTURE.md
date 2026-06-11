@@ -398,13 +398,21 @@ For every possrep `PR` of type `T` the system synthesizes:
 ### Type generators
 
 - `Tuple { a: T, b: U, … }` and `Relation { a: T, b: U, … }` are type generators producing structurally-identified types: `Tuple H1 = Tuple H2` iff `H1 = H2` as sets of `{name: type}` pairs. Same for `Relation`. Attribute order is immaterial. Both generators may take zero attributes (`reltrue` and `relfalse` are the only inhabitants of `Relation { }` — see naming note below).
+- **`Tuple {}` is the unit type** — the type of a tuple with no attributes. It has exactly one value, written `{}` (the empty tuple literal). This is Coddl's analogue of Rust's `()`, Swift's `Void`, or the unit type in ML. An `oper` declared without an explicit return clause implicitly returns `Tuple {}`, and a body whose tail expression is `{}` (or whose last statement leaves nothing on the tail) yields the unit value. The two spellings `Tuple {}` and the value `{}` are unambiguous in context — one appears in type position, the other in expression position.
 - `Sequence T` is the ordered counterpart — a finite ordered list of values of element type `T`, duplicates allowed, position significant. It's the procedural-side companion to `Relation`: where `Relation H` is an unordered set of tuples (RM Pro 1, 3), `Sequence Tuple H` is an ordered list of tuples (the canonical iteration form, see §9 `load`). The element type `T` may be any type — primitives (`Sequence Integer`), tuples (`Sequence Tuple H` — the typical case), or even relations (`Sequence Relation H` — useful for results of a parametric query over many parameter sets, or for relation-valued batches). The brackets-vs-braces rule applies: `Sequence` literals use `[v1, v2, v3]`. Two `Sequence T1` and `Sequence T2` are equal iff `T1 = T2` and the elements are pairwise equal in order.
 - Headings may include relation-valued and tuple-valued attributes (nesting permitted; RM Pre 6–7).
 - A *relvar* is a named variable of some `Relation H` type. Per RM Pre 14, every relvar has at least one declared candidate key (RM Pre 15), possibly the empty key (which forces cardinality ≤ 1). Coddl classifies relvars by lifetime and provenance, with one of the following kinds at declaration time — a database relvar (`real`/`base` — backed by storage; or `virtual` — a view) or an application relvar (`private` to the running program; or `public` — the program's view onto a slice of the database). The same four-kind classification appears in Tutorial D (ch. 5 p. 105) because the underlying distinctions are real ones, not because we're copying it.
 
 #### Naming note: `reltrue` and `relfalse`
 
-The two inhabitants of `Relation { }` (the nullary relation type) are called `reltrue` (cardinality 1 — the relation containing the empty tuple) and `relfalse` (cardinality 0 — the empty relation). TTM and Tutorial D call them `TABLE_DEE` and `TABLE_DUM`, which is opaque even to readers who know TTM. Coddl renames them after their semantic role: relational `reltrue` is the multiplicative identity of the join semiring and behaves like boolean true under projection-away-of-everything; `relfalse` is the zero of the same semiring. The TTM names are evocative of D and DUM but require a footnote every time; the new names need none.
+The two inhabitants of the type `Relation {}` (the nullary relation type — relation with empty heading) are called `reltrue` (cardinality 1, containing the empty tuple) and `relfalse` (cardinality 0, the empty relation). TTM and Tutorial D call them `TABLE_DEE` and `TABLE_DUM`, opaque even to readers who know TTM. Coddl renames them after their semantic role: `reltrue` is the multiplicative identity of the join semiring and behaves like boolean true under projection-away-of-everything; `relfalse` is the zero of the same semiring.
+
+In terms of the type generators, the literal forms decode as:
+
+- `relfalse` ≡ `Relation {}` (an empty relation literal — no tuples).
+- `reltrue`  ≡ `Relation { Tuple {} }` ≡ `Relation { {} }` (a relation literal containing the one and only empty tuple).
+
+The `Relation { … }` syntax is contextual: in **type** position it's the type generator with a heading; in **value** position it's a relation literal whose body is a comma-list of tuple-valued expressions. The empty form `Relation {}` is the value form (the type form needs no inhabitants to be named). The empty tuple `{}` may also be written `Tuple {}` in expression position — the `Tuple` constructor and the bare braced literal are equivalent for tuple values.
 
 ### Relations are fully first-class
 
