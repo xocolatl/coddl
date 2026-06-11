@@ -1,4 +1,40 @@
-/target
+# ── Rust / Cargo ─────────────────────────────────────────────────────────
+# Build output. `target/` may also appear inside nested crates (e.g. when
+# someone runs cargo from a sub-directory); ignore everywhere.
+/target/
+**/target/
+
+# Cargo's own backup files.
 Cargo.lock.bak
 **/*.rs.bk
+
+# rust-analyzer / IDE caches.
+.rust-analyzer/
+
+# rustc / LLVM tooling outputs that occasionally land at the repo root.
+/*.profraw
+/*.profdata
+
+# Criterion / cargo-bench output.
+/criterion/
+
+# Coverage tooling (grcov, tarpaulin, llvm-cov).
+/coverage/
+/tarpaulin-report.html
+*.lcov
+
+# ── Editor / OS noise ────────────────────────────────────────────────────
 .DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.iml
+
+# ── Local scratchpad ─────────────────────────────────────────────────────
+# Anywhere we want a quick local-only workspace. Used today under
+# examples/.local for scratch .cdl files.
+.local/
+**/.local/

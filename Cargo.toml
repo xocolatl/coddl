@@ -28,6 +28,7 @@ publish = false
 
 [workspace.dependencies]
 chumsky = "0.9"
+unicode-ident = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 postgres = "0.19"
 tower-lsp = "0.20"

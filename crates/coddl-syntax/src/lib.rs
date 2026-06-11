@@ -12,12 +12,28 @@
 //! the type checker and downstream passes consume is a *view* derived
 //! from the CST, not a separate structure.
 //!
-//! Reason: the formatter (`coddl-fmt`) needs every byte; the LSP wants
-//! incremental re-parse later (under `salsa`); a side-channel trivia stream
-//! makes "where does this comment attach?" a re-decision every formatter
-//! pass. One lossless tree, two views, no drift.
-//!
 //! Every CST node carries a [`coddl_diagnostics::Span`] (§12 discipline #1).
+//!
+//! ## Coddl-rewritability
+//!
+//! The public surface of this crate is shaped so a future Coddl
+//! self-host rewrite mirrors it 1:1. Concretely:
+//!
+//! - `Token` and `TokenKind` are plain data — a `#[repr(C)]` record and
+//!   a flat enum. Both translate directly to a Coddl `Tuple` and a Coddl
+//!   sum type once those land.
+//! - `lex(source, file) -> LexOutput` is a pure function; no state, no
+//!   trait objects, no async.
+//! - Diagnostics are values returned alongside the output (§12 discipline #3).
+//!
+//! Internally the lexer uses `chumsky` because it does the job well; the
+//! consumer-facing data doesn't care.
+
+pub mod token;
+pub mod lexer;
+
+pub use token::{Token, TokenKind};
+pub use lexer::{lex, LexOutput};
 
 use coddl_diagnostics::{Diagnostic, Span};
 

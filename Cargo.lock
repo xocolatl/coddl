@@ -279,6 +279,7 @@ version = "0.0.0"
 dependencies = [
  "chumsky",
  "coddl-diagnostics",
+ "unicode-ident",
 ]
 
 [[package]]

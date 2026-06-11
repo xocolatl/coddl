@@ -10,3 +10,4 @@ description = "Lexer, parser, and AST for Coddl source (ARCHITECTURE.md §3 surf
 [dependencies]
 coddl-diagnostics.workspace = true
 chumsky.workspace = true
+unicode-ident.workspace = true
