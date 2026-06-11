@@ -107,14 +107,6 @@ pub trait Backend {
 /// step rows, ship in-memory relations to temp tables.
 pub trait Conn {
     fn prepare(&mut self, sql: &SqlString) -> Result<StmtId>;
-    fn bind_and_step<'a>(
-        &'a mut self,
-        id: StmtId,
-        params: &[Value],
-    ) -> Result<RowIter<'a>>;
-    fn materialize_temp(
-        &mut self,
-        heading: &Heading,
-        rows: &[Tuple],
-    ) -> Result<TempRelRef>;
+    fn bind_and_step<'a>(&'a mut self, id: StmtId, params: &[Value]) -> Result<RowIter<'a>>;
+    fn materialize_temp(&mut self, heading: &Heading, rows: &[Tuple]) -> Result<TempRelRef>;
 }

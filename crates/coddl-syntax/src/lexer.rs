@@ -67,10 +67,8 @@ impl<'a> Lexer<'a> {
             self.next_token();
         }
         let end = self.source.len() as u32;
-        self.tokens.push(Token::new(
-            TokenKind::Eof,
-            Span::new(self.file, end, end),
-        ));
+        self.tokens
+            .push(Token::new(TokenKind::Eof, Span::new(self.file, end, end)));
     }
 
     // ── cursor helpers ───────────────────────────────────────────────────
@@ -311,7 +309,7 @@ impl<'a> Lexer<'a> {
 
     fn lex_char(&mut self, start: usize) {
         self.bump(); // opening '\''
-        // Empty literal: '' — emit Error, parser will deal with it.
+                     // Empty literal: '' — emit Error, parser will deal with it.
         if self.peek() == Some('\'') {
             self.bump();
             let span = self.span(start);
@@ -357,7 +355,11 @@ impl<'a> Lexer<'a> {
             let extra_start = self.pos;
             self.bump_while(|c| c != '\'' && c != '\n');
             let bad_span = Span::new(self.file, extra_start as u32, self.pos as u32);
-            self.diag(bad_span, "E0006", "character literal must contain exactly one codepoint");
+            self.diag(
+                bad_span,
+                "E0006",
+                "character literal must contain exactly one codepoint",
+            );
             if self.peek() == Some('\'') {
                 self.bump();
             }
@@ -393,7 +395,7 @@ impl<'a> Lexer<'a> {
 
         // Distinguish Integer / Rational / Approximate by what follows.
         match self.peek() {
-            Some('.') if self.peek_n(1).map_or(false, is_dec_digit) => {
+            Some('.') if self.peek_n(1).is_some_and(is_dec_digit) => {
                 // Rational: digits '.' digits …
                 self.bump(); // '.'
                 self.bump_while(|c| is_dec_digit(c) || c == '_');
@@ -444,7 +446,7 @@ impl<'a> Lexer<'a> {
         if matches!(self.peek_n(i), Some('+') | Some('-')) {
             i += 1;
         }
-        self.peek_n(i).map_or(false, is_dec_digit)
+        self.peek_n(i).is_some_and(is_dec_digit)
     }
 
     // ── identifiers and word-glyph operators ─────────────────────────────
@@ -481,7 +483,7 @@ impl<'a> Lexer<'a> {
 // ── digit predicates (no Unicode-friendly `is_*` for binary/octal) ───────
 
 fn is_dec_digit(c: char) -> bool {
-    matches!(c, '0'..='9')
+    c.is_ascii_digit()
 }
 fn is_bin_digit(c: char) -> bool {
     matches!(c, '0' | '1')
@@ -490,7 +492,7 @@ fn is_oct_digit(c: char) -> bool {
     matches!(c, '0'..='7')
 }
 fn is_hex_digit(c: char) -> bool {
-    matches!(c, '0'..='9' | 'a'..='f' | 'A'..='F')
+    c.is_ascii_hexdigit()
 }
 
 #[cfg(test)]
@@ -530,18 +532,18 @@ mod tests {
         let kinds: Vec<_> = out.tokens.iter().map(|t| t.kind).collect();
         assert_eq!(
             kinds,
-            vec![TokenKind::LineComment, TokenKind::Whitespace, TokenKind::Eof]
+            vec![
+                TokenKind::LineComment,
+                TokenKind::Whitespace,
+                TokenKind::Eof
+            ]
         );
     }
 
     #[test]
     fn block_comment_nests() {
         let src = "/* outer /* inner */ still outer */";
-        let kinds: Vec<_> = lex_all(src)
-            .tokens
-            .iter()
-            .map(|t| t.kind)
-            .collect();
+        let kinds: Vec<_> = lex_all(src).tokens.iter().map(|t| t.kind).collect();
         assert_eq!(kinds, vec![TokenKind::BlockComment, TokenKind::Eof]);
     }
 
@@ -571,10 +573,7 @@ mod tests {
 
     #[test]
     fn char_literal_with_escape() {
-        assert_eq!(
-            lex_kinds(r"'\n'"),
-            vec![TokenKind::CharLit, TokenKind::Eof]
-        );
+        assert_eq!(lex_kinds(r"'\n'"), vec![TokenKind::CharLit, TokenKind::Eof]);
     }
 
     #[test]
@@ -703,10 +702,7 @@ mod tests {
 
     #[test]
     fn assign_vs_colon() {
-        assert_eq!(
-            lex_kinds(":="),
-            vec![TokenKind::Assign, TokenKind::Eof]
-        );
+        assert_eq!(lex_kinds(":="), vec![TokenKind::Assign, TokenKind::Eof]);
         assert_eq!(lex_kinds(":"), vec![TokenKind::Colon, TokenKind::Eof]);
     }
 
@@ -752,7 +748,11 @@ mod tests {
                        write_line{message: \"Hello, world!\"};\n\
                    ];\n";
         let out = lex_all(src);
-        assert!(out.diagnostics.is_empty(), "expected no diagnostics, got {:?}", out.diagnostics);
+        assert!(
+            out.diagnostics.is_empty(),
+            "expected no diagnostics, got {:?}",
+            out.diagnostics
+        );
 
         // Strip trivia for readability.
         use TokenKind::*;
@@ -765,24 +765,13 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                Ident,   // program
-                Ident,   // hello_world
-                Semicolon,
-                Ident,   // oper
-                Ident,   // main
-                LBrace,
-                RBrace,
-                LBracket,
-                Ident,   // write_line
-                LBrace,
-                Ident,   // message
-                Colon,
-                StringLit,
-                RBrace,
-                Semicolon,
-                RBracket,
-                Semicolon,
-                Eof,
+                Ident, // program
+                Ident, // hello_world
+                Semicolon, Ident, // oper
+                Ident, // main
+                LBrace, RBrace, LBracket, Ident, // write_line
+                LBrace, Ident, // message
+                Colon, StringLit, RBrace, Semicolon, RBracket, Semicolon, Eof,
             ]
         );
     }

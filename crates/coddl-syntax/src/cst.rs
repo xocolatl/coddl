@@ -138,12 +138,6 @@ mod tests {
     use super::*;
     use coddl_diagnostics::FileId;
 
-    fn collect_kinds(node: &SyntaxNode) -> Vec<SyntaxKind> {
-        node.children_with_tokens()
-            .map(|el| el.kind())
-            .collect()
-    }
-
     #[test]
     fn builder_round_trips_a_minimal_tree() {
         // Build `oper main {}` by hand and verify the structure.

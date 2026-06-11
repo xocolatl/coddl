@@ -53,10 +53,7 @@ impl LanguageServer for CoddlLsp {
         }
         let line_count = source.lines().count().max(1) as u32;
         Ok(Some(vec![TextEdit {
-            range: Range::new(
-                Position::new(0, 0),
-                Position::new(line_count, 0),
-            ),
+            range: Range::new(Position::new(0, 0), Position::new(line_count, 0)),
             new_text: out.text,
         }]))
     }

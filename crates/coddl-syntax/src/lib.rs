@@ -15,11 +15,13 @@
 pub mod ast;
 pub mod cst;
 pub mod lexer;
+pub mod parser;
 pub mod syntax_kind;
 pub mod token;
 
 pub use cst::{CoddlLanguage, CstBuilder, SyntaxElement, SyntaxNode, SyntaxToken};
 pub use lexer::{lex, LexOutput};
+pub use parser::parse;
 pub use syntax_kind::SyntaxKind;
 pub use token::{Token, TokenKind};
 

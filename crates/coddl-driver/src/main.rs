@@ -1,16 +1,10 @@
 //! `coddl` — the command-line driver.
-//!
-//! Subcommands implemented today:
-//! - `lex <file>`  — run the lexer on a file and print the token stream.
-//! - `fmt <file>`  — run the formatter (stub passthrough until rules land).
-//! - `--version`   — print the build version.
-//!
-//! Planned: `parse`, `check`, `compile`, `run`, `repl`.
 
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
 use coddl_diagnostics::FileId;
+use coddl_syntax::{SyntaxElement, SyntaxNode};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -20,14 +14,14 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("lex") => cmd_lex(&args[2..]),
+        Some("parse") => cmd_parse(&args[2..]),
         Some("fmt") => cmd_fmt(&args[2..]),
         _ => {
-            eprintln!("coddl: skeleton driver");
-            eprintln!();
             eprintln!("usage: coddl <subcommand> [args]");
             eprintln!();
             eprintln!("subcommands:");
             eprintln!("  lex <file>     run the lexer on <file> (or stdin if -)");
+            eprintln!("  parse <file>   parse <file> and dump the syntax tree");
             eprintln!("  fmt <file>     run the formatter on <file> (or stdin if -)");
             eprintln!("  --version      print version");
             ExitCode::from(2)
@@ -110,6 +104,63 @@ impl std::fmt::Display for DisplayLexeme<'_> {
             }
         }
         f.write_str("\"")
+    }
+}
+
+fn cmd_parse(args: &[String]) -> ExitCode {
+    let Some(source) = read_input(args, "parse") else {
+        return ExitCode::from(1);
+    };
+
+    let out = coddl_syntax::parse(&source, FileId(0));
+
+    let stdout = io::stdout();
+    let mut w = stdout.lock();
+    dump_node(&mut w, &out.tree, &source, 0);
+
+    if !out.diagnostics.is_empty() {
+        for d in &out.diagnostics {
+            eprintln!(
+                "{}: {} [{}] at {}..{}",
+                d.severity, d.message, d.code, d.span.start, d.span.end
+            );
+        }
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
+/// Pretty-print a syntax tree in the rust-analyzer style:
+/// `KIND@start..end "lexeme"` for tokens, recursively indented for nodes.
+fn dump_node(w: &mut impl Write, node: &SyntaxNode, source: &str, indent: usize) {
+    let range = node.text_range();
+    let _ = writeln!(
+        w,
+        "{:indent$}{:?}@{}..{}",
+        "",
+        node.kind(),
+        usize::from(range.start()),
+        usize::from(range.end()),
+        indent = indent * 2,
+    );
+    for child in node.children_with_tokens() {
+        match child {
+            SyntaxElement::Node(n) => dump_node(w, &n, source, indent + 1),
+            SyntaxElement::Token(t) => {
+                let r = t.text_range();
+                let lexeme = &source[usize::from(r.start())..usize::from(r.end())];
+                let _ = writeln!(
+                    w,
+                    "{:indent$}{:?}@{}..{} {}",
+                    "",
+                    t.kind(),
+                    usize::from(r.start()),
+                    usize::from(r.end()),
+                    DisplayLexeme(lexeme),
+                    indent = (indent + 1) * 2,
+                );
+            }
+        }
     }
 }
 
