@@ -4,13 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-Coddl is a compiler-in-design for a D-family relational language conforming to *The Third Manifesto* (Date & Darwen). Queries compile to SQL (SQLite first, Postgres later) against a pluggable backend; everything else compiles to LLVM IR and links against a Haskell runtime exposed via `foreign export ccall`.
+Coddl is a compiler-in-design for a relational language conforming to *The Third Manifesto* (Date & Darwen). Coddl is its own D — *not* Tutorial D. Queries compile to SQL (SQLite first, Postgres later) against a pluggable backend; everything else compiles via ProcIR (a backend-agnostic SSA IR; v1 emits LLVM IR text, Cranelift/WASM planned) and links against a Rust `staticlib` runtime exposed through C ABI.
 
 **There is no source code yet.** The repo currently contains:
 - `ARCHITECTURE.md` — the binding design document. Read this before suggesting *any* design change.
 - `manifesto/` — plain-text mirror of *Databases, Types, and the Relational Model: The Third Manifesto* (3rd ed., 2014), one file per chapter/appendix, plus `INDEX.md`. The text is the spec Coddl conforms to.
 
-No build commands, test commands, or lint commands exist yet — don't invent them. Cabal/Haskell tooling will land alongside the first packages (see ARCHITECTURE.md §8 for the planned layout).
+No build commands, test commands, or lint commands exist yet — don't invent them. Cargo/Rust tooling will land alongside the first crates (see ARCHITECTURE.md §8 for the planned layout).
 
 ## Working with the Manifesto reference
 
@@ -22,13 +22,16 @@ No build commands, test commands, or lint commands exist yet — don't invent th
 
 These are decided. Don't relitigate; flag explicitly if a proposal would break one.
 
+- **Coddl is its own D — not Tutorial D.** Tutorial D is the Manifesto's reference D, useful as prior art, not a spec we follow. Where TTM prescribes behavior, Coddl conforms. Where TTM is silent, design the answer to fit the core principles below; convergence with Tutorial D's specific choice is incidental, not a goal. Sanctioned design freedoms are enumerated in ARCHITECTURE.md §3 (host language, surface syntax, evaluation strategy, IR choice); flag any proposed new design freedom explicitly rather than slipping it in.
+- **Performance and long-term planning are core principles.** Runtime cost is a first-class concern — features that force unavoidable overhead the user can't opt out of are rejected. IRs, type representations, and crate boundaries are designed so deferred features land without rewrites. Keep data structures wider than current need; semantic boundaries over expedient ones. See ARCHITECTURE.md intro for the four-principle list.
 - **Third Manifesto conformance is binding.** All RM/OO Prescriptions and Proscriptions adopted. See ARCHITECTURE.md §3 for the full list and the VSS adoption schedule.
-- **No nulls. Ever.** RM Pro 4 is absolute. The type system has no nullable-attribute facility; the SQL backend never emits `NULL`, `NULLABLE`, `IS NULL`, or outer joins. Missing-information is a user-level `Maybe[T]` ADT or a database-design choice. Do not propose nullable anything.
+- **No nulls. Ever.** RM Pro 4 is absolute. The type system has no nullable-attribute facility; the SQL backend never emits `NULL`, `NULLABLE`, `IS NULL`, or outer joins. The canonical TTM answer for missing information is **vertical decomposition** — split the relvar so absence of a fact = absence of a tuple in a side relvar (ch. 7 exercise 7.9). User-defined sum-type scalars are *permitted* but not recommended; propose decomposition first. Do not propose nullable anything.
 - **No duplicates, no ordinal-position semantics on attributes/tuples, no tuple-at-a-time on relvars, no pointer attributes** (RM Pro 1–3, 7; OO Pro 2). Iteration over relations goes only via `LOAD ARRAY ... ORDER (...)` then a counted `DO` loop.
-- **Relations are fully first-class and lazy; scalars are strict.** A relation expression doesn't run until forced. Equality is observational (RM Pre 8) — heading + tuple set, regardless of how the relation was built. Don't propose pervasive Haskell-style thunked scalars.
-- **Host language is Haskell.** `megaparsec` for parsing; LLVM IR via text emission + `llc`/`clang` (not `llvm-hs`); `hasql` (Postgres) and `direct-sqlite` (SQLite) behind a typeclass; runtime is a Haskell library linked via `foreign export ccall`. Settled — don't suggest a host-language switch unless explicitly asked.
+- **Relations are fully first-class and lazy; scalars are strict.** A relation expression doesn't run until forced. Equality is observational (RM Pre 8) — heading + tuple set, regardless of how the relation was built. Don't propose pervasive thunked/lazy scalars — laziness is a relation-level choice, not an evaluation strategy for the whole language.
+- **Host language is Rust.** `chumsky` for parsing; LLVM IR via text emission + `llc`/`clang` (not `llvm-sys`/`inkwell`); `rusqlite` (SQLite) and `postgres` (Postgres) behind a trait; runtime is a Rust `staticlib` exposing `extern "C"` symbols. Settled — don't suggest a host-language switch unless explicitly asked. ProcIR is backend-agnostic at the node level; Cranelift and direct WASM emission are planned codegen siblings (§4, §8).
 - **RelIR = Algebra A core + sugar layer.** EXTEND/WHERE/SUMMARIZE desugar to JOIN via "operators-as-relations." Work at the A level when proposing IR nodes or rewrites.
-- **Surface syntax: uniform named-argument prefix style** (the form Tutorial D's own authors propose in ch. 5, pp. 127–128). Default form is `OP { paramName expr, paramName expr }` with braces. Infix retained for `=`, `<`, `+`, etc.; parenthesized positional kept for `COUNT`, `SIN`, `IS_*`. Don't propose Tutorial D's prose syntax verbatim.
+- **Surface syntax: uniform named-argument prefix style** (the form Tutorial D's own authors propose in ch. 5, pp. 127–128, but never adopt — Coddl does). Default form is `OP { paramName expr, paramName expr }` with braces. Infix retained for `=`, `<`, `+`, etc.; parenthesized positional kept for `COUNT`, `SIN`, `IS_*`.
+- **The frontend serves both the CLI driver and the VSCode LSP.** Every AST/IR node carries `(file_id, byte_range)` spans from the first lexer token; every analysis pass is `fn(Input) -> (Output, Vec<Diagnostic>)` with no `panic!`/`eprintln!` for user-visible errors; the parser recovers from errors rather than bailing. These aren't LSP-conditional — retrofitting any of them is a project-wide refactor. See ARCHITECTURE.md §12.
 
 ## Architecture sections worth knowing by number
 
@@ -41,10 +44,11 @@ When citing the design doc in a discussion, ARCHITECTURE.md is organized as:
 - §5 storage abstraction + mandatory SQL emission rules table
 - §6 runtime (`libcoddl_runtime`)
 - §7 type system (possreps, selectors, THE_, type generators)
-- §8 cabal project layout
+- §8 Cargo workspace layout
 - §9 execution model (LOAD iteration, multiple assignment, transactions, relation handles)
 - §10 risks worth deciding early
 - §11 first milestone
+- §12 editor tooling (LSP + VSCode extension)
 
 ## Operational notes
 

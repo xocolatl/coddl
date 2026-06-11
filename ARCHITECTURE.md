@@ -1,27 +1,34 @@
 # Coddl — Architecture Sketch
 
-A compiler for a D-family relational language conforming to Date and Darwen's *Third Manifesto*. Query fragments compile to SQL and run against a pluggable storage backend (SQLite first, Postgres later). Everything else compiles to LLVM IR and links against a small native runtime that owns the DB connection.
+A compiler for a relational language conforming to Date and Darwen's *Third Manifesto*. Query fragments compile to SQL and run against a pluggable storage backend (SQLite first, Postgres later); everything else compiles to LLVM IR and links against a small Rust runtime exposed through C ABI.
 
-Coddl is *not* Tutorial D. It honors the same prescriptions and proscriptions but diverges on surface syntax (see §3) and adopts Algebra A as the canonical intermediate form (see §4).
+Coddl is its own D — not Tutorial D. It conforms to TTM's RM/OO Prescriptions and Proscriptions (§3) and designs its own surface syntax, IRs, and runtime around the principles below.
+
+**Core principles** — binding on every design choice in this document. A proposal that violates one needs an explicit override, not a quiet exception.
+
+1. **Performance.** Runtime cost is a first-class concern. The host language (Rust), the runtime (no GC, no managed RTS in user binaries), the FFI layer (zero-copy `#[repr(C)]` values), and the IR (Algebra A — push-down-friendly) are chosen for it. Features that force unavoidable overhead the user can't opt out of are rejected. When two designs are otherwise equivalent, the one with the lower steady-state cost wins.
+2. **Long-term planning.** IR shapes, type representations, and crate boundaries are designed so deferred Manifesto features (VSS 7 heading polymorphism, transition constraints, type inheritance) and unanticipated extensions land without a rewrite. No painting into corners — keep the data structures wider than current need, and the boundaries semantic rather than expedient.
+3. **Conformance over convenience.** When TTM prescribes a behavior, Coddl ships it — even when a non-conforming shortcut would be easier. Sanctioned design freedoms (host language, surface syntax, evaluation strategy, IR choice) are enumerated in §3 and bounded there.
+4. **Few primitives, layered sugar.** Algebra A core operators (§4); operators-as-relations; no special cases. Surface sugar — EXTEND, WHERE, SUMMARIZE — desugars during lowering. Sugar lives in one place, not woven through the IR.
 
 ## 1. Host language
 
-**Haskell** (chosen). ADTs are the right tool for AST/IR work, pattern matching keeps the lowering passes readable, and GHC's RTS is well-suited to hosting the runtime end-users link against.
+**Rust** (chosen). Sum-type enums and exhaustive pattern matching are the right tools for AST/IR work; the language has no garbage collector and no managed runtime to drag into end-user binaries; FFI is `extern "C"` natively; and `#[repr(C)]` plus the borrow checker make the LLVM/runtime ABI tractable to keep correct over time. Performance and long-term-planning principles both push hard toward Rust over the GC'd alternatives we considered.
 
 Stack:
-- **Parser**: `megaparsec`. Good error messages, easy to evolve.
-- **LLVM**: emit LLVM IR as text and shell out to `llc`/`clang`. `llvm-hs` is the alternative but its version-coupling churn isn't worth it for a project that doesn't need programmatic IR introspection; we can always switch later. Haskell is excellent at producing well-formatted text.
-- **Databases**: backend-specific libraries behind a typeclass. `hasql` for Postgres (fast, type-safe), `direct-sqlite` for SQLite. Avoid HDBC.
-- **Pretty-printing / formatting**: `prettyprinter` for both SQL and LLVM IR emission.
-- **Build**: a single `cabal.project` with one package per crate-equivalent (see §7).
-- **Runtime**: also Haskell, exposed via `foreign export ccall`. Compiled Coddl binaries link against the GHC RTS. The cost (RTS dependency in end-user binaries) is worth the benefit: the RelIR→SQL emitter is a single library used by both the compiler and the runtime, with no duplication.
+- **Parser**: `chumsky`. Combinator-based, top-tier error reporting, evolves well as the grammar changes. `winnow` is the perf-first alternative — revisit if parser cost ever shows up in real profiles, but error quality wins at this stage of the language.
+- **LLVM**: emit LLVM IR as text and shell out to `llc`/`clang`. We deliberately avoid `llvm-sys`/`inkwell` — version-coupling churn, build complexity, and we don't need programmatic IR introspection in the foreseeable plan. Text emission is fast and forward-compatible.
+- **Databases**: backend-specific crates behind a trait. `rusqlite` for SQLite, `postgres` (sync) for Postgres. Avoid `sqlx`'s compile-time SQL checking — we emit our own SQL and don't want a second SQL parser in our build.
+- **Pretty-printing / formatting**: the `pretty` crate for SQL and LLVM IR emission where the structure benefits from combinators; plain `std::fmt::Write` where it doesn't.
+- **Build**: a single Cargo workspace, one crate per subsystem (see §8). Release builds with LTO and `codegen-units = 1` for the compiler binary; the runtime is a `staticlib` so user binaries don't take a dynamic linker hit.
+- **Runtime**: a Rust crate exposing `extern "C"` symbols (see §6). Compiled Coddl binaries link against it directly — no managed runtime, no allocator surprises. The RelIR→SQL emitter (`coddl-sqlemit`) is a single crate used by both the compiler and the runtime; no duplication, no FFI seam between them.
 
 ## 2. Pipeline
 
 ```
 source.cdl
    │
-   ▼  lex + parse (megaparsec; uniform named-argument prefix syntax — see §3)
+   ▼  lex + parse (chumsky; uniform named-argument prefix syntax — see §3)
   AST
    │
    ▼  name resolution, module/import resolution
@@ -42,23 +49,34 @@ source.cdl
    │
    └──────────────► ProcIR (SSA-ish, LLVM-shaped)
                       │
-                      ▼  LLVM IR text emission (prettyprinter)
+                      ▼  LLVM IR text emission (`pretty` crate)
                       │
-                      ▼  llc / clang
-                      object file → linked against libcoddl_runtime + GHC RTS
+                      ▼  llc / clang   (target triple selects native or wasm32)
+                      object file → linked against libcoddl_runtime (Rust staticlib)
 ```
 
 The two IRs meet only at query-call sites: ProcIR holds the relation as a `Relation` handle (see §9) plus the parameters it needs to bind; the runtime returns rows that ProcIR consumes as tuples.
 
+Every frontend pass also returns a `Vec<Diagnostic>` alongside its (possibly partial) output — the CLI driver renders them to the terminal; `coddl-lsp` serializes them as `PublishDiagnostics` (see §12). The pipeline above is the happy path; on the unhappy path, partial results and diagnostics flow back together rather than the pipeline halting.
+
 ## 3. Conformance to the Third Manifesto
 
-Coddl conforms to *The Third Manifesto* (Date & Darwen, 3rd ed., 2014). The summary below is binding on design choices throughout this document.
+Coddl conforms to *The Third Manifesto* (Date & Darwen, 3rd ed., 2014). The RM/OO Prescriptions and Proscriptions listed below are binding on design choices throughout this document.
+
+**Coddl is its own D.** Tutorial D is the Manifesto's reference D, useful as a study aid and prior-art benchmark, not a spec Coddl follows. Where TTM prescribes behavior, Coddl conforms. Where TTM is silent, Coddl picks the answer aligned with the core principles in the intro — convergence with Tutorial D's specific choice is incidental, not a goal. The design choices TTM doesn't dictate, and which this document fixes, are:
+
+1. **Host language and runtime stack.** Rust + LLVM-text codegen + a C-ABI Rust runtime. See §1, §6.
+2. **Surface syntax.** Uniform named-argument prefix style, in the spirit of the form the Manifesto's authors propose in ch. 5 (pp. 127–128) but never adopt. See "Surface syntax" below.
+3. **Evaluation strategy.** Lazy relations, strict scalars. TTM doesn't address evaluation; this is our choice. See §9.
+4. **Canonical RelIR.** Algebra A as the IR core, which the authors recommend for any industrial-strength D (Appendix A). See §4.
+
+Anything beyond this list is *not* a sanctioned design freedom — propose explicitly and add to the list rather than slipping it in.
 
 ### Adopted (RM/OO Prescriptions and Proscriptions — non-negotiable)
 
 - **Scalar types** carry possreps with selectors and THE_ accessors; named types are disjoint; no implicit coercion (RM Pre 1–5).
 - **TUPLE H and RELATION H** are type generators with structural identity by heading (RM Pre 6–7). Tuple/relation type equality is set-equality of `{name → type}` pairs.
-- **No nulls. Ever.** Missing-information modeling uses a user-defined `Maybe[T]` ADT and a database-design choice (split tables, sentinel relvars). The SQL backend must never emit `NULL` for an attribute value, never emit `NULLABLE` columns, never use `IS NULL` predicates, and must wrap any operator that SQL would otherwise produce a null from (RM Pro 4, see §4).
+- **No nulls. Ever.** Missing information is handled by **vertical decomposition**: split the relvar so the absence of a fact is the absence of a tuple in a side relvar, rather than a placeholder in an attribute. This is the canonical TTM answer — see ch. 7 RM Pro 4 and exercise 7.9. The type system *permits* a user-defined sum-type scalar (e.g., an `Optional` with `Some`/`None` possreps), since arbitrary user-defined scalars are allowed, but it isn't the recommended approach and shouldn't be the first thing reached for. The SQL backend must never emit `NULL` for an attribute value, never emit `NULLABLE` columns, never use `IS NULL` predicates, and must wrap any operator that SQL would otherwise produce a null from (see §5).
 - **No duplicate tuples**, **no ordinal-position semantics** for attributes or tuples, **no composite attributes** (use TUPLE-typed attributes instead), **no domain-check override**, **no internal-level constructs in source** (RM Pro 1, 2, 3, 6, 8, 9).
 - **No tuple-at-a-time operations on relvars or relations** (RM Pro 7). Iteration over a relation is only available via the `LOAD` construct (§9) which orders, materializes into an array, then iterates the array — the iteration boundary forces a deliberate materialization.
 - **First-class TUPLE and RELATION types**, including parameters, return values, attribute types (so relation-valued attributes are allowed) (RM Pre 6–7, 9–10, 13).
@@ -76,10 +94,13 @@ Coddl conforms to *The Third Manifesto* (Date & Darwen, 3rd ed., 2014). The summ
 ### Adopted (RM Very Strong Suggestions worth committing to in v1)
 
 - **System keys** (VSS 1): `DEFAULT` operator-invocation clauses, a relational `TAG` operator (window-function lowering: `ROW_NUMBER() OVER (PARTITION BY …)`), nonupdatable system-default attributes.
-- **Foreign-key shorthand** (VSS 2 — formally deleted in later revisions, but worth keeping as parser sugar that desugars to a subset-constraint). Defer cascade actions.
 - **Candidate-key inference** (VSS 3), minimally: propagate FDs through project/equijoin/restrict and surface inferred keys to the catalog. Best-effort.
 - **Transition constraints** (VSS 4): primed-relvar syntax (`S'`) in `CONSTRAINT` bodies; pre-image captured by the runtime over delta sets, not by SQL triggers.
 - **Quota queries** (VSS 5): `RANK r BY (DESC attr AS rankcol)` desugaring at the parser, lowering to `RANK()`/`DENSE_RANK()` window functions.
+
+### Not adopted (matching the current Manifesto edition)
+
+- **Foreign-key shorthand** (former VSS 2) — the authors formally deleted this VSS in later editions, and Coddl follows suit. Users write the general subset-constraint form directly: `CONSTRAINT SP{S#} ⊆ S{S#}` (RM Pre 23). This is what FK shorthand desugared to anyway, and it sidesteps the positional-matching example the authors regretted.
 
 ### Deferred to a later milestone
 
@@ -91,16 +112,16 @@ Coddl conforms to *The Third Manifesto* (Date & Darwen, 3rd ed., 2014). The summ
 
 - **SQL migration** (VSS 8). Out of scope for v1. Influence on the design is limited to: keep the type system extensible enough to add a parallel `SQL_*` type family later, and keep built-in operator names addressable (don't hardwire `=` to one type).
 
-### Syntactic divergence from Tutorial D
+### Surface syntax
 
-Tutorial D's authors themselves admit (ch. 5, "A Remark on Syntax", pp. 127–128) that Tutorial D's operator syntax "is not very consistent" — mixed prefix/infix, positional matching that "violates the spirit, if not the letter, of RM Proscription 1." They propose a uniform style: prefix for everything, argument matching by name, braces for argument bundles:
+Tutorial D's own authors observe (ch. 5, "A Remark on Syntax", pp. 127–128) that Tutorial D's operator syntax "is not very consistent" — mixed prefix/infix, positional matching that "violates the spirit, if not the letter, of RM Proscription 1." They sketch a uniform style they prefer but stop short of adopting: prefix for everything, argument matching by name, braces for argument bundles:
 
 ```
 CARTESIAN { Y 2.5, X 5.0 }     -- not CARTESIAN ( 5.0, 2.5 )
 JOIN      { left R, right S }  -- name the slots
 ```
 
-**Coddl adopts this uniform named-argument prefix style as the default.** Concessions: infix forms for `=`, `<`, `+` and friends are retained (the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-unfriendly names); a small set of monadic operators (`COUNT`, `SIN`, `IS_*`) keep parenthesized positional form. Everything else — including the relational algebra, selectors, EXTEND, SUMMARIZE, GROUP, UNGROUP — is named-prefix with braces. This eliminates the relational-algebra/scalar-op syntactic distinction the authors regret.
+**Coddl takes this as its default.** Concessions: infix forms for `=`, `<`, `+` and friends are retained (the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-unfriendly names); a small set of monadic operators (`COUNT`, `SIN`, `IS_*`) keep parenthesized positional form. Everything else — including the relational algebra, selectors, EXTEND, SUMMARIZE, GROUP, UNGROUP — is named-prefix with braces. This eliminates the relational-algebra/scalar-op syntactic distinction the authors regret, and matches RM Pro 1 (no ordinal-position semantics) at the surface where it's easiest to enforce.
 
 ## 4. Two IRs, one boundary
 
@@ -120,37 +141,47 @@ Every RelIR node carries:
 
 The optimizer's job is to draw the SQL-vs-in-process cut as close to the leaves as possible (see §9).
 
-### ProcIR — procedural / LLVM-bound IR
+### ProcIR — procedural SSA IR
 
 SSA blocks with typed values, plus a small set of relation-aware ops:
 - `query(plan_id, [params...]) -> Relation`
-- `force(Relation) -> MaterializedRelation`
 - `load(Relation, OrderSpec) -> Array<Tuple>` — the only sanctioned iteration path
 - `assign_relvar(name, plan_id, [params...])` (relational assignment)
 - `multi_assign([(target, plan_id, params)…])` — atomic, MA semantics per RM Pre 21
 - `begin_tx / commit_tx / rollback_tx`
 
-These lower to calls into the runtime ABI.
+These lower to calls into the runtime ABI. There is no `force` op: relation expressions evaluate on each use against current relvar state; explicit materialization, when wanted, is `LOAD ARRAY` or assignment to a temporary relvar.
+
+**Backend-agnostic by design.** ProcIR is shaped for SSA codegen in general, not LLVM specifically — a long-term-planning concession that costs little now and preserves room to add backends without rewriting the IR. The IR carries no LLVM-specific intrinsic names, metadata, or calling conventions at the node level; per-backend specifics live in the codegen crate (§8).
+
+- **LLVM IR text (v1).** Emit text, shell out to `llc`/`clang`. The same emitter covers native targets (x86-64, aarch64) *and* `wasm32-*` via the target triple — WASM-via-LLVM is essentially free at the codegen layer.
+- **Cranelift (planned).** Both IRs are SSA with the same value-model surface; the lowering is largely a different printer over the same ProcIR walk. Use cases: REPL JIT for fast query iteration, and toolchain-free AOT for deployments that don't want `clang` in the image.
+- **Direct WASM via `wasm-encoder` (optional).** Worth keeping the door open for browser/wasmtime targets that don't want LLVM at all in the build. Lower priority than Cranelift; revisit when the use case lands.
+
+Runtime portability is the harder half — see §6 and §8 (Cargo features) for how the SQL backends get gated out of `wasm32-*` builds.
 
 ## 5. Storage abstraction
 
-A pair of typeclasses, one for the (pure) SQL-emitting half and one for the (effectful) connection half:
+A pair of Rust traits, one for the (pure) SQL-emitting half and one for the (effectful) connection half:
 
-```haskell
-class Backend b where
-  dialect      :: Proxy b -> Dialect
-  emitSelect   :: Proxy b -> RelPlan -> SqlString
-  emitDdl      :: Proxy b -> Schema  -> [SqlString]
-  typeMap      :: Proxy b -> TypeMap            -- CoddlType ↔ SQL type
-  open         :: Proxy b -> DSN -> IO (Conn b)
+```rust
+trait Backend {
+    type Conn: Conn;
+    fn dialect(&self) -> Dialect;
+    fn emit_select(&self, plan: &RelPlan) -> SqlString;
+    fn emit_ddl(&self, schema: &Schema) -> Vec<SqlString>;
+    fn type_map(&self) -> &TypeMap;                       // CoddlType ↔ SQL type
+    fn open(&self, dsn: &Dsn) -> Result<Self::Conn>;
+}
 
-class Conn c where
-  prepare         :: c -> SqlString -> IO StmtId
-  bindAndStep     :: c -> StmtId -> [Value] -> IO RowIter
-  materializeTemp :: c -> Heading -> [Tuple] -> IO TempRelRef
+trait Conn {
+    fn prepare(&mut self, sql: &SqlString) -> Result<StmtId>;
+    fn bind_and_step<'a>(&'a mut self, id: StmtId, params: &[Value]) -> Result<RowIter<'a>>;
+    fn materialize_temp(&mut self, heading: &Heading, rows: &[Tuple]) -> Result<TempRelRef>;
+}
 ```
 
-Packages: `coddl-backend-sqlite`, `coddl-backend-postgres`. The compiler picks one at build/CLI time; the LLVM-emitted binary links against exactly one runtime that wraps the chosen `Conn` instance. Don't go overboard with `Proxy`/`Tagged` machinery — a per-backend record-of-functions (à la `BackendOps`) may end up cleaner than a typeclass once you start passing backends around as values; decide once the second backend exists.
+Crates: `coddl-backend-sqlite`, `coddl-backend-postgres`. Selection is a Cargo-feature on the runtime crate; the LLVM-emitted binary links against exactly one runtime that wraps the chosen `Conn`. If passing backends around as values gets clumsy with the associated-type trait, switch to a `dyn`-friendly `BackendOps` record-of-fn-pointers — the per-call dispatch cost is negligible against query latency. Decide once the second backend lands. Cargo features also gate SQL backends out of `wasm32-*` builds where the C dependencies of `rusqlite`/`postgres` don't link (see §6).
 
 Keep SQL emission to a **portable subset** (CTEs, window functions, standard joins) and isolate dialect divergence behind backend methods. Golden-file tests per backend: `RelIR plan → expected SQL` for each dialect.
 
@@ -178,17 +209,23 @@ Same as before (§9, "Relations flowing back into SQL"): backend method `materia
 
 ## 6. Runtime (`libcoddl_runtime`)
 
-A Haskell library exposed via `foreign export ccall`. Compiled Coddl binaries link against it and the GHC RTS. Responsibilities:
+A Rust crate exposing `extern "C"` entry points, built as a `staticlib` by default (`cdylib` later if plugin loading lands). Compiled Coddl binaries link against it directly — no managed runtime, no garbage collector, no startup overhead beyond the program's own. Responsibilities:
 - Own the DB connection pool.
 - Cache prepared statements by `plan_id` (compiler assigns at codegen time).
-- Marshal LLVM-side value structs ↔ backend parameter binders. Use `Foreign.Storable` and `CStruct`-shaped types; keep the on-the-wire layout matched by hand to what LLVM codegen emits, with a generator producing both sides from a single description if it starts drifting.
+- Marshal LLVM-side value structs ↔ backend parameter binders. `#[repr(C)]` Rust structs match the layout LLVM emits exactly; no marshaling cost beyond field reads, no FFI shim allocation. A single source-of-truth description (see §10 risk #8) generates both the LLVM struct text and the Rust `#[repr(C)]` declaration so they can't drift.
 - Provide a row iterator the LLVM-emitted code can drive (cursor handle + `coddl_next` returning a tagged-union row).
-- Host the in-process RelIR executor (§8) and the RelIR→SQL emitter (the same library the compiler uses).
+- Host the in-process RelIR executor (§9) and the RelIR→SQL emitter (the same crate the compiler uses, `coddl-sqlemit` — no duplication, no FFI seam between compiler and runtime).
 - Map errors to a single error code + thread-local message.
 
-LLVM IR calls these exports as plain C functions. The runtime is where SQLite vs Postgres lives at runtime — the compiled program is backend-agnostic if you're disciplined about not leaking dialect-specific values through the ABI.
+LLVM IR calls these exports as plain C functions. The runtime is where SQLite vs Postgres lives at runtime — the compiled program is backend-agnostic if we're disciplined about not leaking dialect-specific values through the ABI.
 
-**On the GHC RTS in user binaries.** It brings garbage collection, green threads, and some startup cost. None of these conflict with LLVM-emitted code so long as foreign calls don't allocate Haskell heap pointers that escape into LLVM-managed memory. Coddl-side values that cross the boundary (tuples, relation handles) must be pinned or copied. Document this discipline in the runtime package.
+**Performance posture.** The runtime is on the hot path for every relation operation that crosses the SQL/in-process boundary. Allocate per-query with a bump arena; free at query completion (a typed arena per heading is the natural unit). Avoid `Box<dyn Trait>` on tuple values; specialize over heading or use a fixed-size value layout. Pull row buffers from prepared statements directly into Coddl tuple memory where the dialect permits — zero-copy is the default, copy only when alignment or lifetime forces it. Abort-on-panic (`panic = "abort"`) for release builds: smaller stack-unwinding tables and a single failure mode at the FFI boundary.
+
+**FFI boundary discipline.** Values crossing into LLVM-emitted code are `#[repr(C)]` or primitive. No Rust enums-with-payload across the boundary unless tagged-C-style. No `Vec`/`String` raw pointers without an explicit owner declaration. The discipline is enforced by a single layout-description module in the runtime crate, mirrored from there into LLVM codegen.
+
+**Portability and backends as features.** SQL backends are Cargo features on the runtime crate (`sqlite`, `postgres`). `wasm32-*` builds drop these — the C dependencies of `rusqlite`/`postgres` don't link to wasm32-unknown-unknown — and either run with only the in-process executor (materialized relations, no DB) or proxy SQL through wasm host imports if a wasmtime/JS host is in play. Same crate split, different feature set at build time.
+
+**Why Rust over plain C for the runtime.** A C `libcoddl_runtime` would be ~50–300 KB smaller as a `staticlib`; nothing else recommends it for our case. The two non-trivial runtime jobs — the in-process RelIR executor and the RelIR→SQL emitter — are tree walks over sum types, which Rust enums + pattern matching handle naturally and C reinvents painfully. The SQL emitter is the same crate the compiler uses; a C runtime would either duplicate it (two versions to keep in lockstep forever — against long-term planning) or call into a Rust crate (a Rust runtime with extra steps). Connection pooling and prepared-statement caching are markedly less code against `rusqlite`/`postgres` than against `sqlite3.h`/`libpq-fe.h`. Where binary size or non-Rust embedding ever does matter, the hot value-marshaling layer can drop to `#![no_std]` Rust or a small C TU without touching the executor or emitter — picking Rust now doesn't lock out a leaner future.
 
 ## 7. Type system
 
@@ -202,17 +239,19 @@ For every possrep `PR` of type `T` the system synthesizes:
 
 **Type constraints** (the `POSSREP CONSTRAINT` predicate) are checked at every selector invocation — that's the sole choke point because values of `T` can only be constructed via the selector. Type-constraint violations are run-time errors; argument-type mismatches are compile-time.
 
-Built-in scalar types: `INT`, `RATIONAL`, `BOOLEAN`, `CHARACTER` (variable length, no padding), `TEXT`, `DATE`, `TIMESTAMP`, `UUID`, `BYTES`. Each has fixed mappings to (a) LLVM type, (b) SQLite affinity + `CHECK` constraints where needed, (c) Postgres type.
+**Built-in scalar types (v1)**: `INTEGER`, `RATIONAL`, `CHARACTER`, `CHAR`, `BOOLEAN`. The names happen to overlap most Ds' built-ins because TTM's Appendix C modeling exercises assume them, but the list is Coddl's choice, not borrowed. Everything else — `DATE`, `TIMESTAMP`, `UUID`, `BYTES`, fixed-width numerics, decimal, currency — is a user-defined scalar type with one or more declared possreps. This is the modeling exercise TTM Appendix C walks through; Coddl ships a small standard library of these definitions but they aren't built into the language. Each built-in has fixed mappings to (a) LLVM type, (b) SQLite affinity + `CHECK` constraints where needed, (c) Postgres type; user-defined scalars get their mappings via possrep components.
 
-**No implicit coercion.** Distinct named scalar types are disjoint; `INT` and `RATIONAL` cannot be silently mixed. Equality `=` is type-monomorphic per RM Pre 8 ("indistinguishable for all operators on T").
+`INTEGER` is mathematically unbounded per TTM, which forces big-integer arithmetic at runtime — a real cost against the performance principle. Whether to also ship bounded-width built-ins (`INT32`/`INT64`) as primitives, or to keep them as user-defined possrep-constrained scalars over `INTEGER`, is an open decision (§10 risk #8).
 
-**No nulls.** Period. The type system has no nullable-attribute facility. Missing-information modeling is a database-design problem the user solves with a `Maybe[T]` sum (defined in user code), with sentinel relvars, or with split tables. The SQL backend never sees a request to emit a NULL.
+**No implicit coercion.** Distinct named scalar types are disjoint; `INTEGER` and `RATIONAL` cannot be silently mixed. Equality `=` is type-monomorphic per RM Pre 8 ("indistinguishable for all operators on T").
+
+**No nulls.** Period. The type system has no nullable-attribute facility. Missing information is a database-design problem the user solves through **vertical decomposition** — splitting the relvar so the absence of a fact is the absence of a tuple in a side relvar (the canonical TTM answer; ch. 7, RM Pro 4). A user-defined sum-type scalar (`Optional` with `Some`/`None` possreps) is permitted by the type system but not the recommended approach. The SQL backend never sees a request to emit a NULL.
 
 ### Type generators
 
 - `TUPLE { a: T, b: U, … }` and `RELATION { a: T, b: U, … }` are type generators producing structurally-identified types: `TUPLE H1 = TUPLE H2` iff `H1 = H2` as sets of `<name, type>` pairs. Same for `RELATION`. Attribute order is immaterial. Both generators may take zero attributes (`TABLE_DEE` and `TABLE_DUM` are the only inhabitants of `RELATION { }`).
 - Headings may include relation-valued and tuple-valued attributes (nesting permitted; RM Pre 6–7).
-- A *relvar* is a named, persistent variable of some `RELATION H` type, backed by storage in the chosen backend. Relvars are real, virtual (views), or application-private (RM Pre 14). Every relvar has at least one declared candidate key (RM Pre 15) — including possibly the empty key (which forces cardinality ≤ 1).
+- A *relvar* is a named variable of some `RELATION H` type. Per RM Pre 14, every relvar has at least one declared candidate key (RM Pre 15), possibly the empty key (which forces cardinality ≤ 1). Coddl classifies relvars by lifetime and provenance, with one of the following kinds at declaration time — a database relvar (`REAL`/`BASE` — backed by storage; or `VIRTUAL` — a view) or an application relvar (`PRIVATE` to the running program; or `PUBLIC` — the program's view onto a slice of the database). The same four-kind classification appears in Tutorial D (ch. 5 p. 105) because the underlying distinctions are real ones, not because we're copying it.
 
 ### Relations are fully first-class
 
@@ -224,38 +263,50 @@ Type inference for relational expressions is mandatory and mechanical from opera
 - **FD propagation** for candidate-key inference (VSS 3) — best-effort.
 - **Constraint propagation** (RM Pre 23): predicates known to hold on operands propagate through restrict, project, join, extend, etc. Used for view-constraint checking and as optimizer hints.
 
-## 8. Project layout (Cabal multi-package)
+### Where constraints can live
+
+Integrity constraints attach only to **database relvars** (real, virtual). Coddl does not support constraints on application relvars (private or public), tuple variables, or scalar variables — there's "no logical reason why it should not," as TTM acknowledges (ch. 5 p. 106), but the cost in implementation complexity outweighs the payoff for the use cases we've identified so far. Revisit if a concrete need surfaces.
+
+## 8. Project layout (Cargo workspace)
 
 ```
 coddl/
-  cabal.project
-  packages/
-    coddl-syntax/            # megaparsec lexer/parser, AST
-    coddl-types/             # type checker, type representation
-    coddl-relir/             # relational IR + optimizer
-    coddl-procir/            # procedural IR
-    coddl-sqlemit/           # RelIR → SQL (dialect-agnostic core; used by both compiler and runtime)
-    coddl-execlocal/         # in-process RelIR executor over materialized relations
-    coddl-backend-sqlite/
-    coddl-backend-postgres/
-    coddl-llvm/              # ProcIR → LLVM IR (text emission via prettyprinter)
-    coddl-runtime/           # foreign-export-ccall library linked into compiled binaries
-    coddl-driver/            # CLI: compile, run, repl
-  test/
-    golden/                  # SQL emission goldens per backend
-    e2e/                     # compile + run end-to-end
+  Cargo.toml                       # workspace
+  crates/
+    coddl-diagnostics/             # shared span + diagnostic types (used by every frontend crate)
+    coddl-syntax/                  # chumsky lexer/parser, AST (with error recovery)
+    coddl-types/                   # type checker, type representation
+    coddl-relir/                   # relational IR + optimizer
+    coddl-procir/                  # procedural IR (backend-agnostic SSA)
+    coddl-sqlemit/                 # RelIR → SQL (dialect-agnostic core; used by compiler and runtime)
+    coddl-execlocal/               # in-process RelIR executor over materialized relations
+    coddl-backend-sqlite/          # Cargo feature on the runtime
+    coddl-backend-postgres/        # Cargo feature on the runtime
+    coddl-codegen-llvm/            # ProcIR → LLVM IR text emission (v1)
+    coddl-codegen-cranelift/       # ProcIR → Cranelift (planned; REPL JIT + toolchain-free AOT)
+    coddl-codegen-wasm/            # ProcIR → wasm-encoder (optional; revisit when needed)
+    coddl-runtime/                 # extern "C" staticlib linked into compiled binaries
+    coddl-driver/                  # CLI: compile, run, repl
+    coddl-lsp/                     # tower-lsp language server; thin adapter over the frontend crates (see §12)
+  editors/
+    vscode/                        # VSCode extension: TextMate grammar + language client (see §12)
+  tests/
+    golden/                        # SQL emission goldens per backend
+    e2e/                           # compile + run end-to-end
   examples/
 ```
 
+Release builds: LTO on, `codegen-units = 1` for the driver and runtime crates; `panic = "abort"` for the runtime (smaller unwinding tables, single failure mode at the FFI seam). `wasm32-*` targets build the runtime with `--no-default-features` to drop the SQL backend crates.
+
 ## 9. Execution model
 
-**Relations are lazy.** Scalars are strict. A relation expression doesn't run until it's forced — by iteration, by materialization, by being shipped into another query, or by an explicit `force`. Equality is by value (heading + tuple set), so two relations built by different routes that yield the same tuples are equal regardless of evaluation history. This is a language-level commitment per RM Pre 8.
+**Relations are lazy.** Scalars are strict. A relation expression is a thunk: it doesn't run at construction, only when something needs its tuples — iteration via `LOAD`, being shipped into another query, being assigned to a relvar, being compared with `=`, being passed to a user-defined operator that consumes it. There is **no `force` keyword** in Coddl; each use re-evaluates the expression against current relvar state. (Laziness itself is design choice #3 in §3; TTM doesn't address evaluation strategy.) Equality is by value (heading + tuple set), so two relations built by different routes that yield the same tuples are equal regardless of evaluation history (RM Pre 8).
 
-Because relations are first-class, the calling convention has to be uniform: any function that takes a relation must accept a value it can read, re-query, and pass onward. Combined with laziness, that means **materialization happens on first force**, not at construction; streamed cursors and plan-backed handles let multiple forces share work or avoid it entirely.
+Because relations are first-class, the calling convention has to be uniform: any function that takes a relation must accept a value it can read, re-query, and pass onward. The runtime may memoize a handle's result when it can prove the source relvars haven't changed since the previous use, but that's an optimization invisible to the user.
 
 ### Iteration: the LOAD primitive
 
-There is no tuple-at-a-time access to relvars or relations (RM Pro 7). The only iteration primitive is `LOAD`, modeled on Tutorial D:
+There is no tuple-at-a-time access to relvars or relations (RM Pro 7). The only iteration primitive is `LOAD`, which forces the relation, imposes an order, and writes the tuples into a local array:
 
 ```
 VAR A ARRAY TUPLE { S# S#, QTY QTY } ;
@@ -266,6 +317,8 @@ END DO ;
 ```
 
 `LOAD` is the syntactic and semantic gate between the set-oriented and procedural worlds: it forces the relation, imposes an order (the order is part of the operation, not a property of the relation), and writes the tuples into a local array. The array is then iterable by a counted `DO` loop. This is the *only* sanctioned path; the compiler rejects any other attempt to step through tuples one at a time.
+
+The reverse direction — `LOAD <relvar target> FROM <array var ref>` — is also supported: it assigns the (set-valued) projection of the array's tuples back into a relvar. Useful for round-tripping procedurally-built arrays into relational form.
 
 ### Multiple assignment
 
@@ -280,15 +333,17 @@ The procedural IR therefore has a `multi_assign` primitive, not just a sequence 
 
 ### Transactions
 
-`BEGIN TRANSACTION` / `COMMIT` / `ROLLBACK` are explicit (OO Pre 4). Nested transactions are supported (OO Pre 5): a nested `BEGIN` starts a child; child `COMMIT` is conditional on the parent; child `ROLLBACK` undoes only the child's work. A relation handle captured before a write within the same transaction continues to read pre-write contents (snapshot semantics by default). The SQL backend uses SAVEPOINT for child transactions, but the runtime tracks the parent/child relationship explicitly because SQL `SAVEPOINT` doesn't model true nesting.
+`BEGIN TRANSACTION` / `COMMIT` / `ROLLBACK` are explicit (OO Pre 4). Nested transactions are supported (OO Pre 5): a nested `BEGIN` starts a child; child `COMMIT` is conditional on the parent; child `ROLLBACK` undoes only the child's work. The SQL backend uses SAVEPOINT for child transactions, but the runtime tracks the parent/child relationship explicitly because SQL `SAVEPOINT` doesn't model true nesting.
+
+A relation handle captured before a write within the same transaction **re-evaluates on use** and so sees post-write state — the consequence of the lazy/thunk semantics above. If the user wants to freeze the pre-write tuples, they `LOAD` the relation into an array (or assign it to a private relvar) before the write. This avoids any pre-image / copy-on-write machinery in the runtime.
 
 ### Relation values at runtime
 
 A first-class relation is one of three things, behind a single `Relation` handle:
 
-1. **Plan-backed** — a `plan_id` plus its already-bound parameters. Hasn't executed yet. Cheapest. Used when the value is consumed by another query (the optimizer splices the plan in) or iterated exactly once.
-2. **Materialized** — a runtime-owned buffer of tuples (arena-allocated, or a backend temp table for large ones). Used when the value is consumed more than once, passed into procedural code that operates on it without re-querying, or escapes a scope.
-3. **Cursor** — a live result set being drained. Compiler-only optimization for `for tup in rel { … }` loops where `rel` is provably single-use.
+1. **Plan-backed** — a `plan_id` plus its already-bound parameters. The default. Each use re-evaluates against current relvar state. The runtime may memoize the result when source-relvar invalidation is provably absent, but that's an optimization, not a semantic guarantee.
+2. **Materialized** — a runtime-owned buffer of tuples (arena-allocated, or a backend temp table for large ones). Used when tuples are already in memory: relation literals (`RELATION { tup1, tup2 }`), results of the in-process executor, in-memory inputs being shipped back into SQL via temp table.
+3. **Cursor** — a live result set being drained. Compiler-only optimization for `LOAD ... ORDER (...)` flows where the array is consumed once and never escapes — lets the runtime stream rows from the backend into the array slot-by-slot instead of buffering them all.
 
 Materialization strategy:
 - Small (under a threshold, say 10k tuples or N bytes): in-memory arena, columnar or row, indexed on demand if hit by a join.
@@ -335,16 +390,47 @@ The RelIR optimizer's job is to draw the line between them as low (close to the 
 5. **The Assignment Principle for views.** RM Pre 21: inserting into a view must fail if the inserted tuple wouldn't appear in the view. Generically computing this from a virtual-relvar definition is hard; the Manifesto allows the system to refuse views it can't update. Decide early: which view shapes Coddl will accept updates against, which it will reject at definition time, which it will accept and check at runtime.
 6. **Heading polymorphism design space.** VSS 7 is deferred for v1, but the type system must keep headings first-class so that future row-polymorphic operator signatures don't require a rewrite. Don't bake monomorphic dispatch into the IR; allow heading-typed parameters at the type-rep level even if no surface syntax yet exposes them.
 7. **Specialize vs. runtime-plan.** Specializing relation-polymorphic functions on heading at compile time keeps things simple but can blow up code size in pathological cases. Have the runtime planner (§9, "Plans built at runtime") ready from the start so you can fall back when specialization isn't viable.
+8. **FFI struct-layout single source of truth.** ProcIR's tuple/value layout, the Rust runtime's `#[repr(C)]` types, and the LLVM IR text the compiler emits all describe the same memory. Drift between them is silent at compile time and a debug nightmare at runtime. Build a single layout description (a Rust type with derives that generates both the LLVM struct emission and the matching `#[repr(C)]` declaration) before the second value type lands. Same for the tagged-union row representation. This is a long-term-planning bill we pay now or pay tenfold later.
+9. **`INTEGER` precision and arithmetic cost.** TTM's `INTEGER` is mathematically unbounded; shipping it as the only integer built-in forces bignum arithmetic on what 99% of users will use as a machine int. Decide before user-defined possrep machinery ships: keep `INTEGER` unbounded and lean on user-defined `INT32`/`INT64`, or add bounded built-ins at the cost of one more documented type. The performance principle leans toward bounded built-ins; the conformance principle leans toward keeping the TTM name unbounded.
 
 ## 11. First milestone
 
-1. Lex + parse the uniform-prefix-syntax core (RM Pre 1, 6–10, 13–14, 18): scalar declarations, possrep/selector, relvar declarations, JOIN, WHERE/`restrict`, EXTEND, simple SUMMARIZE, RENAME, project. Multiple assignment.
-2. Type-check headings, possreps, and selector signatures. Enforce no-nulls, no-duplicates at the type level. Verify candidate keys are declared and minimal.
+1. Lex + parse the uniform-prefix-syntax core (RM Pre 1, 6–10, 13–14, 18): scalar declarations, possrep/selector, relvar declarations, JOIN, WHERE/`restrict`, EXTEND, simple SUMMARIZE, RENAME, project. Multiple assignment. **Establish the spans-on-every-node and diagnostics-as-values discipline from §12 here** — these are project-wide invariants, not LSP-conditional. The parser uses `chumsky`'s error-recovery mode from day one.
+2. Type-check headings, possreps, and selector signatures. Enforce no-nulls, no-duplicates at the type level. Verify candidate keys are declared and minimal. Type errors propagate via `Error` types, not cascades.
 3. Lower to RelIR (sugar → A core during the same pass). Emit SQLite SQL honoring every rule in §5.
-4. Hand-write a runtime that runs the SQL and prints rows — no LLVM yet. Implement explicit transactions and multiple assignment.
+4. Hand-write the Rust runtime that runs the SQL and prints rows — no LLVM yet. Implement explicit transactions and multiple assignment.
 5. Add the in-process RelIR executor for `RELATION` literals and constructed relations.
-6. Add ProcIR + LLVM with `LOAD`, counted `DO` loops, and `query → relation → load → iterate`.
-7. Add the Postgres backend behind the same `Backend` typeclass. Confirm the golden SQL tests fork cleanly per dialect.
+6. Add ProcIR + the LLVM codegen crate with `LOAD`, counted `DO` loops, and `query → relation → load → iterate`. Link the runtime as a `staticlib` and confirm the FFI struct layout matches the LLVM emission.
+7. Add the Postgres backend behind the same `Backend` trait. Confirm the golden SQL tests fork cleanly per dialect.
 8. Add user-defined scalar types with possreps, selectors, THE_ ops, and POSSREP CONSTRAINTs. Confirm equality works through the possrep round-trip.
 
 VSS adoptions (system keys/TAG, FK shorthand, candidate-key inference, transition constraints, RANK quota queries) come after the milestone above is end-to-end on a toy program.
+
+## 12. Editor tooling (LSP + VSCode extension)
+
+A VSCode extension shipping a TextMate grammar for instant lexical highlighting, paired with `coddl-lsp` — a Rust language server built on the same frontend crates as the compiler. v1 scope is the two capabilities currently committed: **syntax highlighting and diagnostics (warnings/errors)**. Hover, go-to-definition, find-references, completion, and semantic-token enhancements are designed-for but not v1 work.
+
+### Crates and project shape
+
+- `coddl-diagnostics` — shared diagnostic data type: `(file_id, byte_range)` span + severity + code + message + optional related-spans. Every frontend crate (`coddl-syntax`, `coddl-types`, `coddl-relir`, `coddl-sqlemit`) produces and consumes this type. The CLI driver renders to terminal; `coddl-lsp` serializes to `PublishDiagnostics`.
+- `coddl-lsp` — language server binary on `tower-lsp` over stdio. Owns document state and request dispatch; no analysis logic of its own — it calls into the frontend crates and forwards their output. Adding hover / go-to-def later is straightforward once `coddl-types` exposes symbol tables.
+- `editors/vscode/` — VSCode extension (TypeScript). Ships the TextMate grammar (`syntaxes/coddl.tmLanguage.json`), language configuration (brackets, comments, indent rules), and a client that spawns `coddl-lsp` from `PATH` or a configured location.
+
+Tree-sitter (more accurate, incremental highlighting) is a possible upgrade later; maintaining a second parser in lockstep with `coddl-syntax` is real cost and defers until concrete demand surfaces.
+
+### Discipline this imposes on the frontend (lands in milestone 1, not "when the LSP arrives")
+
+The LSP isn't an add-on bolted on at the end — its requirements shape the rest of the frontend. These constraints land on the compiler from day one, in line with long-term planning:
+
+1. **Spans on every AST/IR node.** Every token, every AST node, every typed-AST node, every diagnostic carries `(file_id, byte_range)`. Retrofitting spans is a project-wide refactor — write them in from the first lexer token.
+2. **Error recovery in the parser.** `chumsky` produces a best-effort AST with `Error` nodes rather than failing on the first syntax error. The type checker treats `Error` types as propagating-but-not-cascading — don't pile a hundred type errors on top of one parse error.
+3. **Diagnostics-as-values.** No `panic!` or `eprintln!` for user-visible errors anywhere in the frontend. Every pass returns its diagnostics in a `Vec<Diagnostic>` alongside the (possibly partial) result. CLI and LSP differ only in presentation.
+4. **Pure analyses.** Every frontend pass is `fn(Input) -> (Output, Vec<Diagnostic>)` — no globals, no I/O, no hidden state. The LSP can call any pass on any buffer at any time.
+
+### Performance posture
+
+v1: full re-parse + re-typecheck per buffer edit. Coddl programs are small and the Rust frontend is fast; latency won't be the bottleneck on realistic files. **Long-term planning:** route analyses through `salsa` (rust-analyzer's incremental-computation library) once response latency matters. The pure-analysis discipline above makes that migration mechanical rather than architectural — every pass is already shaped like a salsa query.
+
+### Out of scope for v1
+
+Formatting (`coddl fmt`), code lenses, refactorings, debug adapter protocol. Sockets for these live in `coddl-lsp` once core diagnostics + hover + go-to-def land.
