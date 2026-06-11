@@ -17,8 +17,21 @@
         "comments": {
             "patterns": [
                 {
-                    "name": "comment.line.double-dash.coddl",
-                    "match": "--.*$"
+                    "name": "comment.line.double-slash.coddl",
+                    "match": "//.*$"
+                },
+                {
+                    "include": "#block_comment"
+                }
+            ]
+        },
+        "block_comment": {
+            "name": "comment.block.coddl",
+            "begin": "/\\*",
+            "end": "\\*/",
+            "patterns": [
+                {
+                    "include": "#block_comment"
                 }
             ]
         },

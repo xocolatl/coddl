@@ -1,0 +1,65 @@
+// possrep-date.cdl
+//
+// A user-defined Date scalar type with one possrep and a validation
+// constraint. Exercises: type declaration, possrep, possrep constraint,
+// selector invocation, THE_ accessor, oper with a scalar return type,
+// if/then/else, typed local variable.
+//
+// OPEN syntax questions surfaced here:
+//   - type-decl body delimiter: braces (unordered set of possrep/constraint
+//     decls) vs brackets (ordered body) — using braces with `;` separators
+//     for now since possreps within a type are unordered.
+//   - possrep constraint: trailing `where <predicate>` clause attached to
+//     the possrep, vs a separate `constraint <name> { ... }` declaration
+//     inside the type block. Using the trailing `where` form here.
+//   - selector invocation: `Date.ymd { ... }` (TypeName.possrepName {...})
+//     vs just `ymd { ... }` (possrep name in scope when type is known).
+//     Using qualified form for now.
+//   - accessor: `today.ymd.y` (the_y on the ymd view of today) — dotted
+//     access into the possrep. Tutorial D's THE_Y(today) flattened to a
+//     property-access expression.
+//   - oper return type: `-> Type` (Rust-like arrow). `:` is taken for
+//     name-value pairs inside `{}`, so `->` for "produces type."
+//   - `if cond [...] else [...];` — brackets-vs-braces says ordered bodies
+//     are brackets. No `then` keyword; the `[` opens the consequent.
+//   - `return <expr>;` — explicit return statement inside an `oper` body.
+//   - `mod` for integer modulo — textual operator, prefix-form per
+//     "no reserved words" with §3 surface syntax. Tutorial D uses `MOD`
+//     positional. Using `mod` infix here because it's so common in
+//     arithmetic — surfaces tension with the prefix-form rule.
+
+program possrep_date;
+
+type Date {
+    possrep ymd { y: Integer, m: Integer, d: Integer }
+        where m >= 1 and m <= 12
+              and d >= 1
+              and d <= days_in_month { year: y, month: m };
+};
+
+oper days_in_month { year: Integer, month: Integer } -> Integer
+[
+    if month = 2 [
+        if is_leap_year { year: year } [
+            return 29;
+        ] else [
+            return 28;
+        ];
+    ];
+    if month = 4 or month = 6 or month = 9 or month = 11 [
+        return 30;
+    ];
+    return 31;
+];
+
+oper is_leap_year { year: Integer } -> Boolean
+[
+    return (year mod 400 = 0)
+        or ((year mod 4 = 0) and (year mod 100 <> 0));
+];
+
+oper main {}
+[
+    var today: Date := Date.ymd { y: 2026, m: 6, d: 11 };
+    write_line { message: "The year is {today.ymd.y}" };
+];

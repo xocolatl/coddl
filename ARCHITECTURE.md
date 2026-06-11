@@ -155,6 +155,13 @@ User code is not *required* to follow PascalCase for types and relvars — that'
 
 Implications for the lexer and parser: identifiers are matched case-sensitively. Contextual keyword recognition (next section) looks for the lowercase form only — `Program` at the start of a file is a user identifier, not the keyword.
 
+### Comments
+
+- **Line comments** start with `//` and run to the end of the line.
+- **Block comments** are delimited by `/*` and `*/` and **nest**. `/* outer /* inner */ still outer */` is one well-formed comment; the lexer counts depth on each `/*` and `*/`. The motivation is purely ergonomic — commenting out a region that already contains a block comment Just Works, with no need to surgically convert the inner pairs first.
+
+The lexer treats both kinds as trivia and attaches them to the CST per §13 so the formatter can preserve them. The choice of `//` over the `--` from Tutorial D / SQL is a deliberate move away from the SQL pedigree where it costs nothing — `--` collides with the binary minus and "negative literal" patterns under enough lookahead pressure that committing to it would constrain unrelated grammar choices.
+
 ### Reserved words: none
 
 Coddl has no hard-reserved identifiers. At the lexer level there is no `KEYWORD` token type — every alphanumeric/underscore/`#` token is an `IDENT`. The parser recognizes specific identifiers as keywords in specific syntactic positions (`program` at the start of a file, `oper` at a statement boundary, PascalCase identifiers in type position resolving against the type table, the built-in constants `true` / `false` / `reltrue` / `relfalse` in expression position, etc.).
@@ -512,7 +519,7 @@ The formatter is opinionated and has few knobs. A `fmt` whose output drifts betw
 - **Operator spacing**: one space around `=`, `<`, `>`, `+`, `-`, `*`, `/`, `,`; no space around `.`.
 - **Trailing commas**: required in multi-line bracketed lists, forbidden in single-line ones (so adding then removing a wrap is idempotent).
 - **Blank lines**: preserve user blank lines between top-level items, collapsed to at most one consecutive blank.
-- **Comments**: preserved as-is, attached to the following node by default. Block-leading `--` comments stay on their own line; trailing `--` comments stay trailing.
+- **Comments**: preserved as-is, attached to the following node by default. Block-leading `//` comments stay on their own line; trailing `//` comments stay trailing. `/* */` block comments (including nested ones) keep their existing line breaks; the formatter doesn't reflow content inside them.
 
 Idempotency is a unit-test invariant: `fmt(fmt(x)) == fmt(x)` for every input in `examples/` and `tests/`.
 
