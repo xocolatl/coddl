@@ -53,11 +53,11 @@
             "patterns": [
                 {
                     "name": "constant.language.boolean.coddl",
-                    "match": "\\b(TRUE|FALSE|true|false)\\b"
+                    "match": "\\b(true|false)\\b"
                 },
                 {
                     "name": "constant.language.relation.coddl",
-                    "match": "\\b(TABLE_DEE|TABLE_DUM)\\b"
+                    "match": "\\b(reltrue|relfalse)\\b"
                 }
             ]
         },
@@ -101,11 +101,11 @@
             "patterns": [
                 {
                     "name": "support.type.builtin.coddl",
-                    "match": "\\b(INTEGER|RATIONAL|CHARACTER|CHAR|BOOLEAN)\\b"
+                    "match": "\\b(Integer|Rational|Character|Char|Boolean)\\b"
                 },
                 {
                     "name": "support.type.generator.coddl",
-                    "match": "\\b(TUPLE|RELATION|tuple|relation)\\b"
+                    "match": "\\b(Tuple|Relation|Sequence)\\b"
                 }
             ]
         },

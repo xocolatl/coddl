@@ -9,7 +9,7 @@ Coddl is its own D — not Tutorial D. It conforms to TTM's RM/OO Prescriptions 
 1. **Performance.** Runtime cost is a first-class concern. The host language (Rust), the runtime (no GC, no managed RTS in user binaries), the FFI layer (zero-copy `#[repr(C)]` values), and the IR (Algebra A — push-down-friendly) are chosen for it. Features that force unavoidable overhead the user can't opt out of are rejected. When two designs are otherwise equivalent, the one with the lower steady-state cost wins.
 2. **Long-term planning.** IR shapes, type representations, and crate boundaries are designed so deferred Manifesto features (VSS 7 heading polymorphism, transition constraints, type inheritance) and unanticipated extensions land without a rewrite. No painting into corners — keep the data structures wider than current need, and the boundaries semantic rather than expedient.
 3. **Conformance over convenience.** When TTM prescribes a behavior, Coddl ships it — even when a non-conforming shortcut would be easier. Sanctioned design freedoms (host language, surface syntax, evaluation strategy, IR choice) are enumerated in §3 and bounded there.
-4. **Few primitives, layered sugar.** Algebra A core operators (§4); operators-as-relations; no special cases. Surface sugar — EXTEND, WHERE, SUMMARIZE — desugars during lowering. Sugar lives in one place, not woven through the IR.
+4. **Few primitives, layered sugar.** Algebra A core operators (§4); operators-as-relations; no special cases. Surface sugar — `extend`, `where`, `summarize` — desugars during lowering. Sugar lives in one place, not woven through the IR.
 
 ## 1. Host language
 
@@ -75,15 +75,15 @@ Anything beyond this list is *not* a sanctioned design freedom — propose expli
 ### Adopted (RM/OO Prescriptions and Proscriptions — non-negotiable)
 
 - **Scalar types** carry possreps with selectors and THE_ accessors; named types are disjoint; no implicit coercion (RM Pre 1–5).
-- **TUPLE H and RELATION H** are type generators with structural identity by heading (RM Pre 6–7). Tuple/relation type equality is set-equality of `{name → type}` pairs.
+- **`Tuple H` and `Relation H`** are type generators with structural identity by heading (RM Pre 6–7). Tuple/relation type equality is set-equality of `{name: type}` pairs.
 - **No nulls. Ever.** Missing information is handled by **vertical decomposition**: split the relvar so the absence of a fact is the absence of a tuple in a side relvar, rather than a placeholder in an attribute. This is the canonical TTM answer — see ch. 7 RM Pro 4 and exercise 7.9. The type system *permits* a user-defined sum-type scalar (e.g., an `Optional` with `Some`/`None` possreps), since arbitrary user-defined scalars are allowed, but it isn't the recommended approach and shouldn't be the first thing reached for. The SQL backend must never emit `NULL` for an attribute value, never emit `NULLABLE` columns, never use `IS NULL` predicates, and must wrap any operator that SQL would otherwise produce a null from (see §5).
-- **No duplicate tuples**, **no ordinal-position semantics** for attributes or tuples, **no composite attributes** (use TUPLE-typed attributes instead), **no domain-check override**, **no internal-level constructs in source** (RM Pro 1, 2, 3, 6, 8, 9).
-- **No tuple-at-a-time operations on relvars or relations** (RM Pro 7). Iteration over a relation is only available via the `LOAD` construct (§9) which orders, materializes into an array, then iterates the array — the iteration boundary forces a deliberate materialization.
-- **First-class TUPLE and RELATION types**, including parameters, return values, attribute types (so relation-valued attributes are allowed) (RM Pre 6–7, 9–10, 13).
-- **Compile-time type checking** (OO Pre 1). Type-constraint violations (a selector argument failing its POSSREP CONSTRAINT) remain run-time.
+- **No duplicate tuples**, **no ordinal-position semantics** for attributes or tuples, **no composite attributes** (use `Tuple`-typed attributes instead), **no domain-check override**, **no internal-level constructs in source** (RM Pro 1, 2, 3, 6, 8, 9).
+- **No tuple-at-a-time operations on relvars or relations** (RM Pro 7). Iteration over a relation is only available via the `load` construct (§9) which orders, materializes into an array, then iterates the array — the iteration boundary forces a deliberate materialization.
+- **First-class `Tuple` and `Relation` types**, including parameters, return values, attribute types (so relation-valued attributes are allowed) (RM Pre 6–7, 9–10, 13).
+- **Compile-time type checking** (OO Pre 1). Type-constraint violations (a selector argument failing its `possrep`'s `constraint`) remain run-time.
 - **Computational completeness** (OO Pre 3). Coddl is the whole language; no host required.
 - **Explicit transactions, nested transactions** (OO Pre 4, 5).
-- **Aggregate identity on empty sets** (OO Pre 6) — SUM=0, AND=TRUE, OR=FALSE, etc.
+- **Aggregate identity on empty sets** (OO Pre 6) — `sum`=0, `and`=`true`, `or`=`false`, etc.
 - **Relvars are not domains; no pointer attributes** in database relvars (OO Pro 1, 2).
 - **Observational equality** (RM Pre 8): two values are equal iff indistinguishable under every operator on their type.
 - **Multiple assignment** with the Manifesto's stated semantics (RM Pre 21): expand sugar; fold duplicate targets via WITH; evaluate all RHSs; assign atomically; check database constraints at the end of the whole MA (not per individual assignment, not at COMMIT).
@@ -121,7 +121,49 @@ CARTESIAN { Y 2.5, X 5.0 }     -- not CARTESIAN ( 5.0, 2.5 )
 JOIN      { left R, right S }  -- name the slots
 ```
 
-**Coddl takes this as its default.** Concessions: infix forms for `=`, `<`, `+` and friends are retained (the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-unfriendly names); a small set of monadic operators (`COUNT`, `SIN`, `IS_*`) keep parenthesized positional form. Everything else — including the relational algebra, selectors, EXTEND, SUMMARIZE, GROUP, UNGROUP — is named-prefix with braces. This eliminates the relational-algebra/scalar-op syntactic distinction the authors regret, and matches RM Pro 1 (no ordinal-position semantics) at the surface where it's easiest to enforce.
+**Coddl takes this as its default, with one variation: a colon between name and value.** The authors' examples above are space-separated; Coddl uses `name: value`. So the same examples in Coddl are:
+
+```
+cartesian { Y: 2.5, X: 5.0 }
+join      { left: R, right: S }
+```
+
+Reason: the colon makes the name/value boundary unambiguous when values are themselves identifiers or call expressions (`{ left: R, right: S join T }` reads clearly; `{ left R, right S join T }` requires the reader to know `R`/`S`/`T` aren't named-arg names). The colon also matches the way the same shape is written when `{ ... }` appears in a value position as a tuple literal (`{x: 1, y: 2}`), so one separator works in both roles.
+
+Concessions: infix forms for the *symbolic* operators `=`, `<>`, `<`, `>`, `<=`, `>=`, `+`, `-`, `*`, `/` are retained (the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-unfriendly names); a small set of monadic operators (`count`, `sin`, `is_*`) keep parenthesized positional form. Everything else — including the relational algebra, selectors, `extend`, `summarize`, `group`, `ungroup`, and the textual logical operators `and` / `or` / `not` — is named-prefix with braces. This eliminates the relational-algebra/scalar-op syntactic distinction the authors regret, and matches RM Pro 1 (no ordinal-position semantics) at the surface where it's easiest to enforce.
+
+### Brackets vs braces encode ordering
+
+A consistent two-character distinction across the entire surface syntax:
+
+- **`{ ... }` (curly braces) — unordered.** A set-like collection where position is meaningless. Used for named-argument lists, `Tuple` and `Relation` literals, heading declarations, and parameter lists in `oper` declarations. Reordering the contents preserves meaning: `write_line { message: "hi {x}", params: {x: "world"} }` and `write_line { params: {x: "world"}, message: "hi {x}" }` are identical programs.
+
+- **`[ ... ]` (square brackets) — ordered.** A sequence where position is semantically significant. Used for `Sequence T` literals (`[1, 2, 3]`, `[tup1, tup2, tup3]`), operator bodies (statements run in order), `load` ordering specs, and any other context where the reader's expectation is "this is a sequence." Reordering changes meaning.
+
+- **`( ... )` (parentheses)** — kept for expression grouping and for the small set of monadic operators that retain parenthesized positional form (`count`, `sin`, `is_*`).
+
+This maps directly onto TTM. Tuples, relations, and headings have no ordinal position semantics (RM Pro 1); they get `{ ... }`. Procedural code is sequential by nature; it gets `[ ... ]`. The punctuation tells the reader which kind of collection they're looking at without having to recall any context.
+
+### Identifier case
+
+Coddl is case-sensitive: `foo` and `Foo` are distinct identifiers. The language uses three case styles, applied consistently to built-ins and recommended for user code:
+
+- **lowercase / snake_case** — keywords (`program`, `oper`, `where`, `join`, `load`, `if`, `then`, `else`, ...), built-in operators (`and`, `or`, `not`, `count`, `sum`, `extend`, ...), built-in constants (`true`, `false`, `reltrue`, `relfalse`), and user-named operators, variables, attributes, and parameters.
+- **PascalCase** — type names, both built-in (`Integer`, `Rational`, `Character`, `Char`, `Boolean`, `Tuple`, `Relation`) and user-defined (`Customer`, `OrderLine`, `EmailAddress`); and relvar names by convention (`Customer`, `Suppliers`, `OrderLines`).
+
+User code is not *required* to follow PascalCase for types and relvars — that's convention, not language. The language only enforces case sensitivity (so `customer` and `Customer` are different identifiers) and the canonical case of built-in identifiers (the `Integer` built-in is `Integer`, never `integer` or `INTEGER`).
+
+Implications for the lexer and parser: identifiers are matched case-sensitively. Contextual keyword recognition (next section) looks for the lowercase form only — `Program` at the start of a file is a user identifier, not the keyword.
+
+### Reserved words: none
+
+Coddl has no hard-reserved identifiers. At the lexer level there is no `KEYWORD` token type — every alphanumeric/underscore/`#` token is an `IDENT`. The parser recognizes specific identifiers as keywords in specific syntactic positions (`program` at the start of a file, `oper` at a statement boundary, PascalCase identifiers in type position resolving against the type table, the built-in constants `true` / `false` / `reltrue` / `relfalse` in expression position, etc.).
+
+This is a deliberate ergonomic choice for a relational language whose users will model real domains with attribute names like `name`, `type`, `from`, `to`, `order`, `value`, `with`, `by`, `and`. Hard-reserving any of those is a tax we don't want to pay. The cost is the prefix-only constraint on textual operators already noted above — `and`, `or`, `not` are recognized in expression position contextually, not as reserved tokens.
+
+The TextMate grammar still pattern-highlights these words at the lexical level (highlighting is a UX hint, not a lex check); the LSP's semantic tokens correct mis-highlightings later where a user has used such a word as an identifier.
+
+Revisit if the parser's context-sensitivity proves unmanageable in practice, but the bias is strongly toward keeping the user identifier space unfettered.
 
 ## 4. Two IRs, one boundary
 
@@ -131,7 +173,7 @@ The Manifesto's authors argue (Appendix A) that any industrial-strength D should
 
 **A core**: `AND` (natural join, generalizes TIMES and INTERSECT), `OR` (heading-agnostic union), `NOT` (relational complement), `REMOVE` (project-away one attribute — existential elimination), `RENAME`, plus `TCLOSE`. Minimally these reduce further to `REMOVE` + `NOR` (or `NAND`) + `TCLOSE`, but the seven above are the practical primitives.
 
-**Sugar layer** (desugars to A core): `Project`, `Restrict (WHERE)`, `Join`, `Union`, `Minus`, `Intersect`, `SemiJoin`, `SemiMinus`, `Extend`, `Summarize`, `Group`, `Ungroup`, `Wrap`, `Unwrap`. Crucially, **operators are themselves relations** in the A formulation: a scalar function `f(X, Y) -> Z` is an (n+1)-ary relcon `F{X, Y, Z}`, and `EXTEND r ADD (X+Y AS C)` desugars to `r JOIN (PLUS RENAME(X AS A, Y AS B, Z AS C))`. `WHERE`-clauses similarly desugar to JOINs against constant relations. This collapses much of the operator zoo into pure JOIN-and-REMOVE, which is what the optimizer actually wants.
+**Sugar layer** (desugars to A core): `Project`, `Restrict` (surface `where`), `Join`, `Union`, `Minus`, `Intersect`, `SemiJoin`, `SemiMinus`, `Extend`, `Summarize`, `Group`, `Ungroup`, `Wrap`, `Unwrap` — PascalCase as Rust enum-variant names; the corresponding surface keywords are lowercase (`join`, `union`, `extend`, …). Crucially, **operators are themselves relations** in the A formulation: a scalar function `f(X, Y) -> Z` is an (n+1)-ary relcon `F{X, Y, Z}`, and surface `extend r add { c: X+Y }` desugars to `r JOIN (PLUS RENAME(X AS A, Y AS B, Z AS C))` at the A level. Surface `where`-clauses similarly desugar to JOINs against constant relations. This collapses much of the operator zoo into pure JOIN-and-REMOVE, which is what the optimizer actually wants.
 
 Every RelIR node carries:
 - a **heading** (RM Pre 9): `{attribute → declared type}`
@@ -150,7 +192,7 @@ SSA blocks with typed values, plus a small set of relation-aware ops:
 - `multi_assign([(target, plan_id, params)…])` — atomic, MA semantics per RM Pre 21
 - `begin_tx / commit_tx / rollback_tx`
 
-These lower to calls into the runtime ABI. There is no `force` op: relation expressions evaluate on each use against current relvar state; explicit materialization, when wanted, is `LOAD ARRAY` or assignment to a temporary relvar.
+These lower to calls into the runtime ABI. There is no `force` op: relation expressions evaluate on each use against current relvar state; explicit materialization, when wanted, is `load ... array` or assignment to a temporary relvar.
 
 **Backend-agnostic by design.** ProcIR is shaped for SSA codegen in general, not LLVM specifically — a long-term-planning concession that costs little now and preserves room to add backends without rewriting the IR. The IR carries no LLVM-specific intrinsic names, metadata, or calling conventions at the node level; per-backend specifics live in the codegen crate (§8).
 
@@ -200,8 +242,8 @@ These are not optimizations; they're correctness requirements imposed by the Man
 | Always emit explicit `BEGIN` / `COMMIT`. Never rely on SQL's implicit transaction start. Set constraints `IMMEDIATE` at session start; never `INITIALLY DEFERRED`. | OO Pre 4; RM Pre 23 (statement-boundary check). |
 | Avoid SQL `CHARACTER` / `CHAR(n)` entirely; use `VARCHAR`/`TEXT`. SQL's `CHAR` pads with trailing blanks under equality — violates RM Pre 8. | RM Pre 8. |
 | Every base table emitted from a relvar has a `PRIMARY KEY` from the relvar's declared candidate key (RM Pre 15). The candidate key with the fewest attributes wins ties; the rest become `UNIQUE`. The compiler verifies minimality before emission. | RM Pre 15. |
-| `TABLE_DEE` / `TABLE_DUM` (nullary relations): emit as `(SELECT) WHERE TRUE` / `WHERE FALSE`. SQLite/Postgres tolerate this; non-conforming backends would need a synthesized dummy column. | RM Pro 5. |
-| SQLite-specific: `BOOLEAN` lowers to `INTEGER CHECK (col IN (0, 1))`. Avoid the SQLite affinity-coercion footguns by always `CAST`-ing on `INSERT`. | dialect quirk. |
+| `reltrue` / `relfalse` (nullary relations): emit as `(SELECT) WHERE TRUE` / `WHERE FALSE`. SQLite/Postgres tolerate this; non-conforming backends would need a synthesized dummy column. | RM Pro 5. |
+| SQLite-specific: Coddl `Boolean` lowers to SQL `INTEGER CHECK (col IN (0, 1))`. Avoid the SQLite affinity-coercion footguns by always `CAST`-ing on `INSERT`. | dialect quirk. |
 
 ### Sending in-memory relations back into SQL
 
@@ -237,21 +279,26 @@ For every possrep `PR` of type `T` the system synthesizes:
 - A **selector** of declared type `T`, one parameter per component (selector name = possrep name). Every value of `T` must be producible by an all-literal selector invocation.
 - A **THE_C accessor** per component `C`: read-only in source position; pseudovariable in target position (`THE_C(V) := x` is sugar for `V := PR(…, x in slot C, …)`).
 
-**Type constraints** (the `POSSREP CONSTRAINT` predicate) are checked at every selector invocation — that's the sole choke point because values of `T` can only be constructed via the selector. Type-constraint violations are run-time errors; argument-type mismatches are compile-time.
+**Type constraints** (the `possrep`'s `constraint` predicate) are checked at every selector invocation — that's the sole choke point because values of `T` can only be constructed via the selector. Type-constraint violations are run-time errors; argument-type mismatches are compile-time.
 
-**Built-in scalar types (v1)**: `INTEGER`, `RATIONAL`, `CHARACTER`, `CHAR`, `BOOLEAN`. The names happen to overlap most Ds' built-ins because TTM's Appendix C modeling exercises assume them, but the list is Coddl's choice, not borrowed. Everything else — `DATE`, `TIMESTAMP`, `UUID`, `BYTES`, fixed-width numerics, decimal, currency — is a user-defined scalar type with one or more declared possreps. This is the modeling exercise TTM Appendix C walks through; Coddl ships a small standard library of these definitions but they aren't built into the language. Each built-in has fixed mappings to (a) LLVM type, (b) SQLite affinity + `CHECK` constraints where needed, (c) Postgres type; user-defined scalars get their mappings via possrep components.
+**Built-in scalar types (v1)**: `Integer`, `Rational`, `Character`, `Char`, `Boolean`. PascalCase per §3 "Identifier case." The names happen to overlap most Ds' built-ins because TTM's Appendix C modeling exercises assume them, but the list is Coddl's choice, not borrowed. Everything else — `Date`, `Timestamp`, `Uuid`, `Bytes`, fixed-width numerics, decimal, currency — is a user-defined scalar type with one or more declared possreps. This is the modeling exercise TTM Appendix C walks through; Coddl ships a small standard library of these definitions but they aren't built into the language. Each built-in has fixed mappings to (a) LLVM type, (b) SQLite affinity + `CHECK` constraints where needed, (c) Postgres type; user-defined scalars get their mappings via possrep components.
 
-`INTEGER` is mathematically unbounded per TTM, which forces big-integer arithmetic at runtime — a real cost against the performance principle. Whether to also ship bounded-width built-ins (`INT32`/`INT64`) as primitives, or to keep them as user-defined possrep-constrained scalars over `INTEGER`, is an open decision (§10 risk #8).
+`Integer` is mathematically unbounded per TTM, which forces big-integer arithmetic at runtime — a real cost against the performance principle. Whether to also ship bounded-width built-ins (`Int32`/`Int64`) as primitives, or to keep them as user-defined possrep-constrained scalars over `Integer`, is an open decision (§10 risk #8).
 
-**No implicit coercion.** Distinct named scalar types are disjoint; `INTEGER` and `RATIONAL` cannot be silently mixed. Equality `=` is type-monomorphic per RM Pre 8 ("indistinguishable for all operators on T").
+**No implicit coercion.** Distinct named scalar types are disjoint; `Integer` and `Rational` cannot be silently mixed. Equality `=` is type-monomorphic per RM Pre 8 ("indistinguishable for all operators on T").
 
 **No nulls.** Period. The type system has no nullable-attribute facility. Missing information is a database-design problem the user solves through **vertical decomposition** — splitting the relvar so the absence of a fact is the absence of a tuple in a side relvar (the canonical TTM answer; ch. 7, RM Pro 4). A user-defined sum-type scalar (`Optional` with `Some`/`None` possreps) is permitted by the type system but not the recommended approach. The SQL backend never sees a request to emit a NULL.
 
 ### Type generators
 
-- `TUPLE { a: T, b: U, … }` and `RELATION { a: T, b: U, … }` are type generators producing structurally-identified types: `TUPLE H1 = TUPLE H2` iff `H1 = H2` as sets of `<name, type>` pairs. Same for `RELATION`. Attribute order is immaterial. Both generators may take zero attributes (`TABLE_DEE` and `TABLE_DUM` are the only inhabitants of `RELATION { }`).
+- `Tuple { a: T, b: U, … }` and `Relation { a: T, b: U, … }` are type generators producing structurally-identified types: `Tuple H1 = Tuple H2` iff `H1 = H2` as sets of `{name: type}` pairs. Same for `Relation`. Attribute order is immaterial. Both generators may take zero attributes (`reltrue` and `relfalse` are the only inhabitants of `Relation { }` — see naming note below).
+- `Sequence T` is the ordered counterpart — a finite ordered list of values of element type `T`, duplicates allowed, position significant. It's the procedural-side companion to `Relation`: where `Relation H` is an unordered set of tuples (RM Pro 1, 3), `Sequence Tuple H` is an ordered list of tuples (the canonical iteration form, see §9 `load`). The element type `T` may be any type — primitives (`Sequence Integer`), tuples (`Sequence Tuple H` — the typical case), or even relations (`Sequence Relation H` — useful for results of a parametric query over many parameter sets, or for relation-valued batches). The brackets-vs-braces rule applies: `Sequence` literals use `[v1, v2, v3]`. Two `Sequence T1` and `Sequence T2` are equal iff `T1 = T2` and the elements are pairwise equal in order.
 - Headings may include relation-valued and tuple-valued attributes (nesting permitted; RM Pre 6–7).
-- A *relvar* is a named variable of some `RELATION H` type. Per RM Pre 14, every relvar has at least one declared candidate key (RM Pre 15), possibly the empty key (which forces cardinality ≤ 1). Coddl classifies relvars by lifetime and provenance, with one of the following kinds at declaration time — a database relvar (`REAL`/`BASE` — backed by storage; or `VIRTUAL` — a view) or an application relvar (`PRIVATE` to the running program; or `PUBLIC` — the program's view onto a slice of the database). The same four-kind classification appears in Tutorial D (ch. 5 p. 105) because the underlying distinctions are real ones, not because we're copying it.
+- A *relvar* is a named variable of some `Relation H` type. Per RM Pre 14, every relvar has at least one declared candidate key (RM Pre 15), possibly the empty key (which forces cardinality ≤ 1). Coddl classifies relvars by lifetime and provenance, with one of the following kinds at declaration time — a database relvar (`real`/`base` — backed by storage; or `virtual` — a view) or an application relvar (`private` to the running program; or `public` — the program's view onto a slice of the database). The same four-kind classification appears in Tutorial D (ch. 5 p. 105) because the underlying distinctions are real ones, not because we're copying it.
+
+#### Naming note: `reltrue` and `relfalse`
+
+The two inhabitants of `Relation { }` (the nullary relation type) are called `reltrue` (cardinality 1 — the relation containing the empty tuple) and `relfalse` (cardinality 0 — the empty relation). TTM and Tutorial D call them `TABLE_DEE` and `TABLE_DUM`, which is opaque even to readers who know TTM. Coddl renames them after their semantic role: relational `reltrue` is the multiplicative identity of the join semiring and behaves like boolean true under projection-away-of-everything; `relfalse` is the zero of the same semiring. The TTM names are evocative of D and DUM but require a footnote every time; the new names need none.
 
 ### Relations are fully first-class
 
@@ -301,25 +348,27 @@ Release builds: LTO on, `codegen-units = 1` for the driver and runtime crates; `
 
 ## 9. Execution model
 
-**Relations are lazy.** Scalars are strict. A relation expression is a thunk: it doesn't run at construction, only when something needs its tuples — iteration via `LOAD`, being shipped into another query, being assigned to a relvar, being compared with `=`, being passed to a user-defined operator that consumes it. There is **no `force` keyword** in Coddl; each use re-evaluates the expression against current relvar state. (Laziness itself is design choice #3 in §3; TTM doesn't address evaluation strategy.) Equality is by value (heading + tuple set), so two relations built by different routes that yield the same tuples are equal regardless of evaluation history (RM Pre 8).
+**Relations are lazy.** Scalars are strict. A relation expression is a thunk: it doesn't run at construction, only when something needs its tuples — iteration via `load`, being shipped into another query, being assigned to a relvar, being compared with `=`, being passed to a user-defined operator that consumes it. There is **no `force` keyword** in Coddl; each use re-evaluates the expression against current relvar state. (Laziness itself is design choice #3 in §3; TTM doesn't address evaluation strategy.) Equality is by value (heading + tuple set), so two relations built by different routes that yield the same tuples are equal regardless of evaluation history (RM Pre 8).
 
 Because relations are first-class, the calling convention has to be uniform: any function that takes a relation must accept a value it can read, re-query, and pass onward. The runtime may memoize a handle's result when it can prove the source relvars haven't changed since the previous use, but that's an optimization invisible to the user.
 
-### Iteration: the LOAD primitive
+### Iteration: the `load` primitive
 
-There is no tuple-at-a-time access to relvars or relations (RM Pro 7). The only iteration primitive is `LOAD`, which forces the relation, imposes an order, and writes the tuples into a local array:
+There is no tuple-at-a-time access to relvars or relations (RM Pro 7). The only iteration primitive is `load`, which forces the relation, imposes an order, and writes the tuples into a local array:
 
 ```
-VAR A ARRAY TUPLE { S# S#, QTY QTY } ;
-LOAD A FROM ( SP WHERE P# = P#('P1') ) { S#, QTY } ORDER ( ASC S# ) ;
-DO i := 1 TO COUNT(A) ;
-  -- process A[i]
-END DO ;
+var A: Sequence Tuple { S#: S#, QTY: QTY };
+load A from ( SP where P# = P#('P1') ) { S#, QTY } order ( asc S# );
+do i := 1 to count(A) [
+    -- process A[i]
+];
 ```
 
-`LOAD` is the syntactic and semantic gate between the set-oriented and procedural worlds: it forces the relation, imposes an order (the order is part of the operation, not a property of the relation), and writes the tuples into a local array. The array is then iterable by a counted `DO` loop. This is the *only* sanctioned path; the compiler rejects any other attempt to step through tuples one at a time.
+`A` here has type `Sequence Tuple { S#: S#, QTY: QTY }` — an ordered list of tuples. `load` populates the sequence from a relation with a given order; the counted `do` loop walks it by position. The old `array` keyword from the Tutorial D-style precursor is gone — `Sequence T` is the proper type, not a sigil.
 
-The reverse direction — `LOAD <relvar target> FROM <array var ref>` — is also supported: it assigns the (set-valued) projection of the array's tuples back into a relvar. Useful for round-tripping procedurally-built arrays into relational form.
+`load` is the syntactic and semantic gate between the set-oriented and procedural worlds: it forces the relation, imposes an order (the order is part of the operation, not a property of the relation), and writes the tuples into a local array. The array is then iterable by a counted `do` loop. This is the *only* sanctioned path; the compiler rejects any other attempt to step through tuples one at a time.
+
+The reverse direction — `load <relvar target> from <array var ref>` — is also supported: it assigns the (set-valued) projection of the array's tuples back into a relvar. Useful for round-tripping procedurally-built arrays into relational form.
 
 ### Multiple assignment
 
@@ -336,15 +385,15 @@ The procedural IR therefore has a `multi_assign` primitive, not just a sequence 
 
 `BEGIN TRANSACTION` / `COMMIT` / `ROLLBACK` are explicit (OO Pre 4). Nested transactions are supported (OO Pre 5): a nested `BEGIN` starts a child; child `COMMIT` is conditional on the parent; child `ROLLBACK` undoes only the child's work. The SQL backend uses SAVEPOINT for child transactions, but the runtime tracks the parent/child relationship explicitly because SQL `SAVEPOINT` doesn't model true nesting.
 
-A relation handle captured before a write within the same transaction **re-evaluates on use** and so sees post-write state — the consequence of the lazy/thunk semantics above. If the user wants to freeze the pre-write tuples, they `LOAD` the relation into an array (or assign it to a private relvar) before the write. This avoids any pre-image / copy-on-write machinery in the runtime.
+A relation handle captured before a write within the same transaction **re-evaluates on use** and so sees post-write state — the consequence of the lazy/thunk semantics above. If the user wants to freeze the pre-write tuples, they `load` the relation into an array (or assign it to a private relvar) before the write. This avoids any pre-image / copy-on-write machinery in the runtime.
 
 ### Relation values at runtime
 
 A first-class relation is one of three things, behind a single `Relation` handle:
 
 1. **Plan-backed** — a `plan_id` plus its already-bound parameters. The default. Each use re-evaluates against current relvar state. The runtime may memoize the result when source-relvar invalidation is provably absent, but that's an optimization, not a semantic guarantee.
-2. **Materialized** — a runtime-owned buffer of tuples (arena-allocated, or a backend temp table for large ones). Used when tuples are already in memory: relation literals (`RELATION { tup1, tup2 }`), results of the in-process executor, in-memory inputs being shipped back into SQL via temp table.
-3. **Cursor** — a live result set being drained. Compiler-only optimization for `LOAD ... ORDER (...)` flows where the array is consumed once and never escapes — lets the runtime stream rows from the backend into the array slot-by-slot instead of buffering them all.
+2. **Materialized** — a runtime-owned buffer of tuples (arena-allocated, or a backend temp table for large ones). Used when tuples are already in memory: relation literals (`Relation { tup1, tup2 }`), results of the in-process executor, in-memory inputs being shipped back into SQL via temp table.
+3. **Cursor** — a live result set being drained. Compiler-only optimization for `load ... order (...)` flows where the array is consumed once and never escapes — lets the runtime stream rows from the backend into the array slot-by-slot instead of buffering them all.
 
 Materialization strategy:
 - Small (under a threshold, say 10k tuples or N bytes): in-memory arena, columnar or row, indexed on demand if hit by a join.
@@ -385,25 +434,25 @@ The RelIR optimizer's job is to draw the line between them as low (close to the 
 ## 10. Risks worth deciding early
 
 1. **Materialization thresholds.** First-class relations mean the runtime constantly chooses between in-memory and temp-table representation. Pick a default policy (size-based, with an explicit `@materialize` / `@stream` annotation as escape hatches) before you write the runtime allocator.
-2. **How honest about SQL are you willing to be?** Operators-as-relations (§4) makes EXTEND/WHERE/SUMMARIZE all reduce to JOIN, which is push-down-friendly — but pushing down requires SQL-expressible scalar functions. Start by pushing pure-relational algebra; evaluate scalar UDFs in the in-process executor unless they have a known SQL equivalent.
-3. **POSSREP canonicalization.** RM Pre 8's "indistinguishable" rule means a user-defined type with a non-canonical possrep (e.g., `RATIONAL{N, D}` without `COPROME` constraint; polar `POINT{R, θ}` for the origin allowing any θ) breaks equality. The compiler must require POSSREP CONSTRAINTs that force a canonical form, or refuse to synthesize `=` and warn loudly. Decide whether canonicalization is the user's responsibility (require, refuse otherwise) or the system's (rewrite to canonical form behind the scenes) before shipping user-defined types.
+2. **How honest about SQL are you willing to be?** Operators-as-relations (§4) makes surface `extend`/`where`/`summarize` all reduce to JOIN at the A level, which is push-down-friendly — but pushing down requires SQL-expressible scalar functions. Start by pushing pure-relational algebra; evaluate scalar UDFs in the in-process executor unless they have a known SQL equivalent.
+3. **Possrep canonicalization.** RM Pre 8's "indistinguishable" rule means a user-defined type with a non-canonical possrep (e.g., `Rational { N: N, D: D }` without a coprime constraint; polar `Point { R: R, θ: θ }` for the origin allowing any θ) breaks equality. The compiler must require possrep constraints that force a canonical form, or refuse to synthesize `=` and warn loudly. Decide whether canonicalization is the user's responsibility (require, refuse otherwise) or the system's (rewrite to canonical form behind the scenes) before shipping user-defined types.
 4. **Transition constraint pre-image capture.** VSS 4's primed-relvar syntax requires the runtime to keep a snapshot of every relvar touched within a statement until the constraint check completes. For multi-relvar transitions this is non-trivial; decide whether the snapshot is row-level (delta sets) or relvar-level (copy-on-write) before adding VSS 4 to the runtime.
 5. **The Assignment Principle for views.** RM Pre 21: inserting into a view must fail if the inserted tuple wouldn't appear in the view. Generically computing this from a virtual-relvar definition is hard; the Manifesto allows the system to refuse views it can't update. Decide early: which view shapes Coddl will accept updates against, which it will reject at definition time, which it will accept and check at runtime.
 6. **Heading polymorphism design space.** VSS 7 is deferred for v1, but the type system must keep headings first-class so that future row-polymorphic operator signatures don't require a rewrite. Don't bake monomorphic dispatch into the IR; allow heading-typed parameters at the type-rep level even if no surface syntax yet exposes them.
 7. **Specialize vs. runtime-plan.** Specializing relation-polymorphic functions on heading at compile time keeps things simple but can blow up code size in pathological cases. Have the runtime planner (§9, "Plans built at runtime") ready from the start so you can fall back when specialization isn't viable.
 8. **FFI struct-layout single source of truth.** ProcIR's tuple/value layout, the Rust runtime's `#[repr(C)]` types, and the LLVM IR text the compiler emits all describe the same memory. Drift between them is silent at compile time and a debug nightmare at runtime. Build a single layout description (a Rust type with derives that generates both the LLVM struct emission and the matching `#[repr(C)]` declaration) before the second value type lands. Same for the tagged-union row representation. This is a long-term-planning bill we pay now or pay tenfold later.
-9. **`INTEGER` precision and arithmetic cost.** TTM's `INTEGER` is mathematically unbounded; shipping it as the only integer built-in forces bignum arithmetic on what 99% of users will use as a machine int. Decide before user-defined possrep machinery ships: keep `INTEGER` unbounded and lean on user-defined `INT32`/`INT64`, or add bounded built-ins at the cost of one more documented type. The performance principle leans toward bounded built-ins; the conformance principle leans toward keeping the TTM name unbounded.
+9. **`Integer` precision and arithmetic cost.** TTM's `INTEGER` (Coddl's `Integer`) is mathematically unbounded; shipping it as the only integer built-in forces bignum arithmetic on what 99% of users will use as a machine int. Decide before user-defined possrep machinery ships: keep `Integer` unbounded and lean on user-defined `Int32`/`Int64`, or add bounded built-ins at the cost of one more documented type. The performance principle leans toward bounded built-ins; the conformance principle leans toward keeping the TTM-derived name unbounded.
 
 ## 11. First milestone
 
-1. Lex + parse the uniform-prefix-syntax core (RM Pre 1, 6–10, 13–14, 18): scalar declarations, possrep/selector, relvar declarations, JOIN, WHERE/`restrict`, EXTEND, simple SUMMARIZE, RENAME, project. Multiple assignment. **Establish the spans-on-every-node and diagnostics-as-values discipline from §12 here** — these are project-wide invariants, not LSP-conditional. The parser uses `chumsky`'s error-recovery mode from day one.
+1. Lex + parse the uniform-prefix-syntax core (RM Pre 1, 6–10, 13–14, 18): scalar declarations, possrep/selector, relvar declarations, `join`, `where`/`restrict`, `extend`, simple `summarize`, `rename`, `project`. Multiple assignment. **Establish the spans-on-every-node and diagnostics-as-values discipline from §12 here** — these are project-wide invariants, not LSP-conditional. The parser uses `chumsky`'s error-recovery mode from day one.
 2. Type-check headings, possreps, and selector signatures. Enforce no-nulls, no-duplicates at the type level. Verify candidate keys are declared and minimal. Type errors propagate via `Error` types, not cascades.
 3. Lower to RelIR (sugar → A core during the same pass). Emit SQLite SQL honoring every rule in §5.
 4. Hand-write the Rust runtime that runs the SQL and prints rows — no LLVM yet. Implement explicit transactions and multiple assignment.
-5. Add the in-process RelIR executor for `RELATION` literals and constructed relations.
-6. Add ProcIR + the LLVM codegen crate with `LOAD`, counted `DO` loops, and `query → relation → load → iterate`. Link the runtime as a `staticlib` and confirm the FFI struct layout matches the LLVM emission.
+5. Add the in-process RelIR executor for `Relation` literals and constructed relations.
+6. Add ProcIR + the LLVM codegen crate with `load`, counted `do` loops, and `query → relation → load → iterate`. Link the runtime as a `staticlib` and confirm the FFI struct layout matches the LLVM emission.
 7. Add the Postgres backend behind the same `Backend` trait. Confirm the golden SQL tests fork cleanly per dialect.
-8. Add user-defined scalar types with possreps, selectors, THE_ ops, and POSSREP CONSTRAINTs. Confirm equality works through the possrep round-trip.
+8. Add user-defined scalar types with possreps, selectors, `the_` ops, and possrep constraints. Confirm equality works through the possrep round-trip.
 
 VSS adoptions (system keys/TAG, FK shorthand, candidate-key inference, transition constraints, RANK quota queries) come after the milestone above is end-to-end on a toy program.
 
@@ -458,8 +507,8 @@ The formatter is opinionated and has few knobs. A `fmt` whose output drifts betw
 
 - **Indent**: 4 spaces (`indent_width` config; revisit if real demand surfaces).
 - **Line width**: 100 columns soft; hard if a single token can't be split.
-- **Braces**: `{` on the same line as the keyword/operator that opens them; `}` on its own line aligned with the opener — except trivial single-line bodies (`OP { x 1, y 2 }`) which stay inline up to the line-width limit.
-- **Named arguments inside braces**: one per line if any single arg makes the whole call exceed the line width; otherwise stay on the line. No alignment of names across lines (it churns under add/remove).
+- **Braces**: `{` on the same line as the keyword/operator that opens them; `}` on its own line aligned with the opener — except trivial single-line bodies (`OP { x: 1, y: 2 }`) which stay inline up to the line-width limit.
+- **Named arguments inside braces**: one space after the colon (`name: value`), one space after the inter-arg comma. One per line if any single arg makes the whole call exceed the line width; otherwise stay on the line. No alignment of names or colons across lines (it churns under add/remove).
 - **Operator spacing**: one space around `=`, `<`, `>`, `+`, `-`, `*`, `/`, `,`; no space around `.`.
 - **Trailing commas**: required in multi-line bracketed lists, forbidden in single-line ones (so adding then removing a wrap is idempotent).
 - **Blank lines**: preserve user blank lines between top-level items, collapsed to at most one consecutive blank.
