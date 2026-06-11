@@ -223,7 +223,7 @@ The lexer treats both kinds as trivia and attaches them to the CST per §13 so t
     - `42`, `0xff`, `0b1010`, `0o17`, `0d99` → **`Integer`** (base prefixes are case-insensitive; `0d` is the explicit-decimal prefix).
     - `42.0`, `3.14` → **`Rational`** (digits-dot-digits; both sides need at least one digit; no `42.` or `.5`).
     - `42e0`, `4.2e1`, `1e-9` → **`Approximate`** (exponent required; mantissa integer- *or* rational-shaped).
-  Underscores between digits are decoration and stripped before conversion: `1_000_000`, `0xff_ff_ff`. The exponent marker `e` and the hex digits `a`–`f` are case-insensitive; the formatter normalises to lowercase. The three-shape split is unambiguous: the lexer picks one of `Integer`/`Rational`/`Approximate` from the literal's *form* alone, without inference.
+  Underscores between digits are decoration and stripped before conversion: `1_000_000`, `0xff_ff_ff`. The exponent marker `e` and the hex digits `a`–`f` are case-insensitive; the formatter normalizes to lowercase. The three-shape split is unambiguous: the lexer picks one of `Integer`/`Rational`/`Approximate` from the literal's *form* alone, without inference.
 
 ### Method-style call syntax (UFCS via `self`)
 
@@ -683,11 +683,11 @@ Value semantics is a property of the *surface language*, not the compiled output
 What the compiler does with the surface guarantee, behind the scenes (none of this is user-visible, none of it requires user annotation):
 
 - **Escape analysis** stack-allocates values that don't outlive their function — no heap touch, no refcount ops.
-- **Move optimisation** transfers ownership when the caller's copy is dead (refcount `1 → 1`, not `1 → 2 → 1`). A small Coddl-aware pass plus LLVM's optimiser take care of this.
+- **Move optimization** transfers ownership when the caller's copy is dead (refcount `1 → 1`, not `1 → 2 → 1`). A small Coddl-aware pass plus LLVM's optimizer take care of this.
 - **Refcount elision** removes `incref`/`decref` pairs that cancel within one function.
 - **Scalar replacement of aggregates (SROA)** breaks up tuples never observed as a whole into register-resident scalars.
-- **Specialisation** monomorphises relation-polymorphic operators per heading at compile time; the runtime sees concrete types and concrete layouts (§9 "Plans built at runtime" covers the fallback).
-- **Small-value inlining** keeps small `Integer`s, `Character`s, `Boolean`s, `Byte`s unboxed, and likely small `Text`/`Binary` too — small-string-optimisation-style.
+- **Specialisation** monomorphizes relation-polymorphic operators per heading at compile time; the runtime sees concrete types and concrete layouts (§9 "Plans built at runtime" covers the fallback).
+- **Small-value inlining** keeps small `Integer`s, `Character`s, `Boolean`s, `Byte`s unboxed, and likely small `Text`/`Binary` too — small-string-optimization-style.
 
 Stack vs heap vs arena at runtime is decided by the compiler from data-flow analysis, not by user annotation:
 
@@ -695,7 +695,7 @@ Stack vs heap vs arena at runtime is decided by the compiler from data-flow anal
 |---|---|---|
 | Primitives | `Text`, `Binary` beyond an inline-storage threshold | Per-query / per-transaction scratch |
 | Non-escaping tuples (post escape analysis) | `Sequence T` buffers | Materialised intermediate relations |
-| `let mut` locals | `Relation H` plan handles + materialised rows | Lex / parse output for one source file |
+| `let mut` locals | `Relation H` plan handles + materialized rows | Lex / parse output for one source file |
 | Short-lived refcount cells | Closure captures that outlive their frame | The CST for one buffer |
 
 The two layers exist deliberately: the user reasons about *values*; the compiler reasons about *representations*. That separation is what lets Coddl have a clean value-semantics language *and* native-speed compiled output — neither paying GC tax nor demanding lifetime annotations from the user.
@@ -704,7 +704,7 @@ The two layers exist deliberately: the user reasons about *values*; the compiler
 
 | Layer | Mechanism |
 |---|---|
-| Primitives (`Integer`, `Rational`, `Approximate`, `Boolean`, `Character`, `Byte`) | Unboxed value types on the stack. `Integer` is a bignum, so it's boxed under the hood with small-integer optimisation. |
+| Primitives (`Integer`, `Rational`, `Approximate`, `Boolean`, `Character`, `Byte`) | Unboxed value types on the stack. `Integer` is a bignum, so it's boxed under the hood with small-integer optimization. |
 | Boxed values (`Text`, `Binary`, `Tuple H`, `Relation H`, `Sequence T`) | Heap-allocated, **atomic reference counting**, freed at refcount = 0. |
 | Compound updates (sequence concat, tuple-field update, relation insert) | Structural sharing + copy-on-write. If refcount = 1, mutate the buffer in place; otherwise allocate a new one referencing the old's tail. |
 | Per-query / per-transaction scratch | Bump arena, freed wholesale at scope end. |

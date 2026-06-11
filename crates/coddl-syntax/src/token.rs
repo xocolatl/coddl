@@ -27,10 +27,10 @@ impl Token {
 
 /// The lexical kind of a token. Flat enum — no payloads.
 ///
-/// The lexer normalises Unicode operator-glyph synonyms (`⋈`, `≤`, `⊆`,
+/// The lexer normalizes Unicode operator-glyph synonyms (`⋈`, `≤`, `⊆`,
 /// etc.) to the same `TokenKind` as their ASCII counterparts (`Ident` for
 /// `⋈`/`join`, `LtEq` for `≤`/`⊆`/`<=`, …). The CST keeps the original
-/// byte range so the formatter can reproduce or normalise per
+/// byte range so the formatter can reproduce or normalize per
 /// `format.edition`.
 ///
 /// Trivia (`Whitespace`, `LineComment`, `BlockComment`) is emitted by the
@@ -115,7 +115,7 @@ pub enum TokenKind {
     // ── special ──────────────────────────────────────────────────────────
     /// End of input.
     Eof,
-    /// Unrecognised input — the lexer emits this with a diagnostic and
+    /// Unrecognized input — the lexer emits this with a diagnostic and
     /// continues. Lets the parser keep recovering rather than bailing.
     Error,
 }

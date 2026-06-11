@@ -11,6 +11,11 @@ use rowan::GreenNodeBuilder;
 
 use crate::syntax_kind::SyntaxKind;
 
+/// Re-export of rowan's checkpoint so the parser can stash a tree
+/// position and later wrap children created since that point inside
+/// a new interior node (the postfix-call pattern).
+pub use rowan::Checkpoint;
+
 /// The `rowan::Language` marker for Coddl. A zero-sized phantom type;
 /// the only thing it does is tell `rowan` how to convert between
 /// `rowan::SyntaxKind(u16)` and our [`SyntaxKind`] enum.
@@ -95,6 +100,23 @@ impl<'a> CstBuilder<'a> {
     pub fn start_node(&mut self, kind: SyntaxKind) {
         self.inner
             .start_node(<CoddlLanguage as rowan::Language>::kind_to_raw(kind));
+    }
+
+    /// Save the current position so [`start_node_at`] can later wrap
+    /// children created since this point in a new interior node.
+    pub fn checkpoint(&self) -> Checkpoint {
+        self.inner.checkpoint()
+    }
+
+    /// Start a new interior node retroactively at `checkpoint`,
+    /// re-parenting any children created since that point. Used for
+    /// postfix-like productions (e.g. wrapping a parsed primary
+    /// expression in `CALL_EXPR` once `{ … }` is seen).
+    pub fn start_node_at(&mut self, checkpoint: Checkpoint, kind: SyntaxKind) {
+        self.inner.start_node_at(
+            checkpoint,
+            <CoddlLanguage as rowan::Language>::kind_to_raw(kind),
+        );
     }
 
     /// Close the most recently started interior node.

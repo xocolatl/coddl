@@ -121,7 +121,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Emit any pending trivia and then the next non-trivia token. The
-    /// synthetic EOF token is recognised and not emitted.
+    /// synthetic EOF token is recognized and not emitted.
     fn bump(&mut self) {
         self.bump_trivia();
         if self.pos < self.tokens.len() {
@@ -146,6 +146,14 @@ impl<'a> Parser<'a> {
 
     fn start_node(&mut self, kind: SyntaxKind) {
         self.builder.start_node(kind);
+    }
+
+    fn checkpoint(&self) -> crate::cst::Checkpoint {
+        self.builder.checkpoint()
+    }
+
+    fn start_node_at(&mut self, cp: crate::cst::Checkpoint, kind: SyntaxKind) {
+        self.builder.start_node_at(cp, kind);
     }
 
     fn finish_node(&mut self) {
@@ -332,7 +340,7 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
-    /// A type expression. Today only a single identifier is recognised;
+    /// A type expression. Today only a single identifier is recognized;
     /// `Tuple H`, `Relation H`, `Sequence T`, and qualified names land
     /// alongside the rest of expression parsing.
     fn parse_type_ref(&mut self) {
@@ -343,39 +351,139 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
-    /// `[ … ]` body. Today the content is consumed as flat tokens; once
-    /// statement and expression productions arrive, the contents will
-    /// be wrapped in `LET_STMT` / `EXPR_STMT` / `CALL_EXPR` / etc. Nested
-    /// `[…]` is respected via a depth counter so the matching close
-    /// bracket is found correctly.
+    /// `[ <stmt>; <stmt>; … ]` body. Each statement is parsed
+    /// individually; nested `[…]` inside a statement's expression is
+    /// handled by that expression's own recursion, not by depth
+    /// counting here.
     fn parse_block(&mut self) {
         debug_assert!(self.at(SyntaxKind::L_BRACKET));
         self.start_node(SyntaxKind::BLOCK);
         self.bump(); // [
 
-        let mut depth: u32 = 1;
-        while depth > 0 {
-            match self.current() {
-                SyntaxKind::EOF => {
-                    self.error("P0012", "unclosed operator body");
-                    break;
-                }
-                SyntaxKind::L_BRACKET => {
-                    depth += 1;
-                    self.bump();
-                }
-                SyntaxKind::R_BRACKET => {
-                    depth -= 1;
-                    self.bump();
-                }
-                _ => self.bump(),
-            }
+        while !self.at(SyntaxKind::R_BRACKET) && !self.at(SyntaxKind::EOF) {
+            self.parse_stmt();
         }
 
+        if !self.eat(SyntaxKind::R_BRACKET) {
+            self.error("P0012", "unclosed operator body");
+        }
         self.finish_node();
     }
 
-    /// Wrap an unrecognised top-level item in a `PARSE_ERROR` node and
+    /// One statement. Today only the expression-statement form
+    /// (`<expr>;`) is recognized; `let` / `mut` / `return` / etc.
+    /// arrive when their semantics are settled.
+    fn parse_stmt(&mut self) {
+        // Defensive: never enter at a block-closing or terminal token.
+        if matches!(self.current(), SyntaxKind::R_BRACKET | SyntaxKind::EOF) {
+            return;
+        }
+
+        let cp = self.checkpoint();
+        let before = self.pos;
+        self.parse_expr();
+
+        if self.pos == before {
+            // No progress — bump one token to avoid infinite loop and
+            // let the BLOCK loop try again past it.
+            self.bump();
+            return;
+        }
+
+        self.start_node_at(cp, SyntaxKind::EXPR_STMT);
+        if !self.eat(SyntaxKind::SEMICOLON) {
+            self.error("P0013", "expected `;` after expression");
+        }
+        self.finish_node();
+    }
+
+    /// An expression. Parses a primary, then chains postfix forms
+    /// (today only the brace-delimited call form `<expr>{ … }`). Field
+    /// access (`.x`) and indexing (`[i]`) join the loop once their
+    /// semantic decisions are in.
+    fn parse_expr(&mut self) {
+        let cp = self.checkpoint();
+        if !self.parse_primary_expr() {
+            return;
+        }
+
+        while self.at(SyntaxKind::L_BRACE) {
+            self.start_node_at(cp, SyntaxKind::CALL_EXPR);
+            self.parse_arg_list();
+            self.finish_node();
+        }
+    }
+
+    /// A primary expression — the atomic forms an expression can start
+    /// with. Returns `true` if anything was consumed.
+    fn parse_primary_expr(&mut self) -> bool {
+        match self.current() {
+            SyntaxKind::IDENT => {
+                self.start_node(SyntaxKind::NAME_REF);
+                self.bump();
+                self.finish_node();
+                true
+            }
+            SyntaxKind::STRING_LIT
+            | SyntaxKind::CHAR_LIT
+            | SyntaxKind::INTEGER_LIT
+            | SyntaxKind::RATIONAL_LIT
+            | SyntaxKind::APPROXIMATE_LIT => {
+                self.start_node(SyntaxKind::LITERAL);
+                self.bump();
+                self.finish_node();
+                true
+            }
+            _ => {
+                self.error("P0014", "expected expression");
+                false
+            }
+        }
+    }
+
+    /// `{ <named_arg>, … }` — the call-site argument list. Empty and
+    /// trailing-comma forms are both accepted.
+    fn parse_arg_list(&mut self) {
+        debug_assert!(self.at(SyntaxKind::L_BRACE));
+        self.start_node(SyntaxKind::ARG_LIST);
+        self.bump(); // {
+
+        if self.eat(SyntaxKind::R_BRACE) {
+            self.finish_node();
+            return;
+        }
+
+        loop {
+            self.parse_named_arg();
+            if !self.eat(SyntaxKind::COMMA) {
+                break;
+            }
+            if self.at(SyntaxKind::R_BRACE) {
+                break;
+            }
+        }
+
+        if !self.eat(SyntaxKind::R_BRACE) {
+            self.error("P0015", "expected `}` to close argument list");
+        }
+        self.finish_node();
+    }
+
+    /// `<name>: <expr>` inside an argument list. The shorthand bare
+    /// `<name>` (= `<name>: <name>`) is deferred.
+    fn parse_named_arg(&mut self) {
+        self.start_node(SyntaxKind::NAMED_ARG);
+        if !self.eat(SyntaxKind::IDENT) {
+            self.error("P0016", "expected argument name");
+        }
+        if !self.eat(SyntaxKind::COLON) {
+            self.error("P0017", "expected `:` after argument name");
+        }
+        self.parse_expr();
+        self.finish_node();
+    }
+
+    /// Wrap an unrecognized top-level item in a `PARSE_ERROR` node and
     /// recover at the next top-level anchor.
     fn parse_unknown_item(&mut self) {
         self.start_node(SyntaxKind::PARSE_ERROR);
@@ -500,7 +608,7 @@ mod tests {
 
     #[test]
     fn unknown_top_level_item_becomes_parse_error_and_recovers() {
-        // `oper main {} [];` isn't recognised yet — it should wrap in
+        // `oper main {} [];` isn't recognized yet — it should wrap in
         // PARSE_ERROR, recover at the top-level `;`, and then parse
         // the `program` decl that follows.
         let src = "oper main {} []; program foo;";
@@ -615,25 +723,111 @@ mod tests {
     }
 
     #[test]
-    fn oper_body_preserves_nested_brackets() {
-        // The outer body has a nested [...] which must not be mistaken
-        // for the matching close bracket.
-        let src = "oper f {} [ [ inner ] more ];";
-        let out = parse_str(src);
+    fn block_with_single_expr_stmt() {
+        let out = parse_str("oper f {} [ x; ];");
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
-        assert_eq!(out.tree.text(), src);
-        let body = out
+        let block = out
             .tree
             .first_child()
             .unwrap()
             .children()
             .find(|n| n.kind() == SyntaxKind::BLOCK)
             .unwrap();
-        assert_eq!(body.text(), "[ [ inner ] more ]");
+        let stmts: Vec<_> = block.children().collect();
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0].kind(), SyntaxKind::EXPR_STMT);
+        let name_ref = stmts[0].first_child().unwrap();
+        assert_eq!(name_ref.kind(), SyntaxKind::NAME_REF);
+        assert_eq!(name_ref.text(), "x");
     }
 
     #[test]
-    fn hello_world_parses_clean() {
+    fn literal_expr_stmt() {
+        let out = parse_str("oper f {} [ \"hi\"; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let stmt = out
+            .tree
+            .first_child()
+            .unwrap()
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BLOCK)
+            .unwrap()
+            .first_child()
+            .unwrap();
+        let lit = stmt.first_child().unwrap();
+        assert_eq!(lit.kind(), SyntaxKind::LITERAL);
+        assert_eq!(lit.text(), "\"hi\"");
+    }
+
+    #[test]
+    fn call_with_no_args() {
+        let out = parse_str("oper f {} [ foo{}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let call = out
+            .tree
+            .first_child()
+            .unwrap()
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BLOCK)
+            .unwrap()
+            .first_child()
+            .unwrap()
+            .first_child()
+            .unwrap();
+        assert_eq!(call.kind(), SyntaxKind::CALL_EXPR);
+        let kids: Vec<_> = call.children().map(|n| n.kind()).collect();
+        assert_eq!(kids, vec![SyntaxKind::NAME_REF, SyntaxKind::ARG_LIST]);
+        let arg_list = call
+            .children()
+            .find(|n| n.kind() == SyntaxKind::ARG_LIST)
+            .unwrap();
+        assert_eq!(arg_list.children().count(), 0);
+    }
+
+    #[test]
+    fn call_with_named_args_and_trailing_comma() {
+        let out = parse_str("oper f {} [ foo{x: 1, y: 2,}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let arg_list = out
+            .tree
+            .first_child()
+            .unwrap()
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BLOCK)
+            .unwrap()
+            .first_child()
+            .unwrap()
+            .first_child()
+            .unwrap()
+            .children()
+            .find(|n| n.kind() == SyntaxKind::ARG_LIST)
+            .unwrap();
+        let args: Vec<_> = arg_list.children().collect();
+        assert_eq!(args.len(), 2);
+        assert!(args.iter().all(|a| a.kind() == SyntaxKind::NAMED_ARG));
+        assert_eq!(args[0].text(), "x: 1");
+        assert_eq!(args[1].text(), "y: 2");
+    }
+
+    #[test]
+    fn multiple_statements_in_block() {
+        let out = parse_str("oper f {} [ a; b; c; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let stmts: Vec<_> = out
+            .tree
+            .first_child()
+            .unwrap()
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BLOCK)
+            .unwrap()
+            .children()
+            .collect();
+        assert_eq!(stmts.len(), 3);
+        assert!(stmts.iter().all(|s| s.kind() == SyntaxKind::EXPR_STMT));
+    }
+
+    #[test]
+    fn hello_world_parses_clean_with_full_structure() {
         let src = "program hello_world;\n\
                    \n\
                    oper main {}\n\
@@ -653,6 +847,62 @@ mod tests {
             top_kinds,
             vec![SyntaxKind::PROGRAM_DECL, SyntaxKind::OPER_DECL]
         );
+
+        let oper = out
+            .tree
+            .children()
+            .find(|n| n.kind() == SyntaxKind::OPER_DECL)
+            .unwrap();
+        let block = oper
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BLOCK)
+            .unwrap();
+        let expr_stmt = block.first_child().unwrap();
+        assert_eq!(expr_stmt.kind(), SyntaxKind::EXPR_STMT);
+        let call = expr_stmt.first_child().unwrap();
+        assert_eq!(call.kind(), SyntaxKind::CALL_EXPR);
+
+        let call_kids: Vec<_> = call.children().map(|n| n.kind()).collect();
+        assert_eq!(call_kids, vec![SyntaxKind::NAME_REF, SyntaxKind::ARG_LIST]);
+
+        let arg = call
+            .children()
+            .find(|n| n.kind() == SyntaxKind::ARG_LIST)
+            .unwrap()
+            .first_child()
+            .unwrap();
+        assert_eq!(arg.kind(), SyntaxKind::NAMED_ARG);
+        assert_eq!(arg.first_child().unwrap().kind(), SyntaxKind::LITERAL);
+    }
+
+    #[test]
+    fn missing_stmt_semicolon_diagnoses() {
+        let out = parse_str("oper f {} [ x ];");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0013"));
+    }
+
+    #[test]
+    fn missing_expr_at_stmt_start_diagnoses() {
+        let out = parse_str("oper f {} [ ; ];");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0014"));
+    }
+
+    #[test]
+    fn missing_arg_list_close_diagnoses() {
+        let out = parse_str("oper f {} [ foo{x: 1; ];");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0015"));
+    }
+
+    #[test]
+    fn missing_arg_name_diagnoses() {
+        let out = parse_str("oper f {} [ foo{: 1}; ];");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0016"));
+    }
+
+    #[test]
+    fn missing_arg_colon_diagnoses() {
+        let out = parse_str("oper f {} [ foo{x 1}; ];");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0017"));
     }
 
     #[test]
