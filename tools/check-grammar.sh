@@ -1,16 +1,18 @@
 #!/usr/bin/env sh
 # tools/check-grammar.sh
 #
-# Verify the docs/ tree is in lockstep with the syntax and types crates.
+# Verify the docs/ tree is in lockstep with the syntax, types, and
+# procir crates.
 #
 # Two invariants:
 #   1. Every `fn parse_<name>` in parser.rs (outside #[cfg(test)] code)
 #      has a `<name>` rule (kebab-case) defined in docs/grammar.md.
-#   2. Every `"E####"` / `"P####"` / `"T####"` diagnostic code emitted
-#      anywhere in crates/coddl-syntax/src/ or crates/coddl-types/src/
-#      appears in some docs/*.md file. Which file owns which code prefix
-#      is documentation discipline; the script only enforces that
-#      every emitted code is documented somewhere.
+#   2. Every `"E####"` / `"P####"` / `"T####"` / `"L####"` diagnostic
+#      code emitted anywhere in crates/coddl-syntax/src/,
+#      crates/coddl-types/src/, or crates/coddl-procir/src/ appears in
+#      some docs/*.md file. Which file owns which code prefix is
+#      documentation discipline; the script only enforces that every
+#      emitted code is documented somewhere.
 #
 # Exits 0 if both invariants hold, 1 with a summary of what's missing
 # otherwise. POSIX shell only — no Python, no Rust.
@@ -58,11 +60,13 @@ done
 # Harvest every `"X####"` literal across the syntax and types crates;
 # verify each appears in some docs/*.md.
 code_sources=$(
-    find "$ROOT/crates/coddl-syntax/src" "$ROOT/crates/coddl-types/src" \
+    find "$ROOT/crates/coddl-syntax/src" \
+         "$ROOT/crates/coddl-types/src" \
+         "$ROOT/crates/coddl-procir/src" \
         -name '*.rs' -type f 2>/dev/null
 )
 codes=$(
-    grep -hoE '"[EPT][0-9]{4}"' $code_sources 2>/dev/null \
+    grep -hoE '"[EPTL][0-9]{4}"' $code_sources 2>/dev/null \
         | tr -d '"' \
         | sort -u
 )
@@ -78,7 +82,7 @@ for code in $codes; do
 done
 
 if [ "$failed" -eq 0 ]; then
-    echo "check-grammar: docs/ is in sync with crates/coddl-syntax + crates/coddl-types"
+    echo "check-grammar: docs/ is in sync with crates/coddl-syntax + crates/coddl-types + crates/coddl-procir"
 fi
 
 exit "$failed"

@@ -9,4 +9,5 @@ description = "Procedural SSA IR — backend-agnostic (ARCHITECTURE.md §4)."
 
 [dependencies]
 coddl-diagnostics.workspace = true
+coddl-syntax.workspace = true
 coddl-types.workspace = true

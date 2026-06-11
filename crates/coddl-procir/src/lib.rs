@@ -8,3 +8,11 @@
 //! conventions at the node level — per-backend specifics live in the
 //! codegen crates (`coddl-codegen-llvm`, `coddl-codegen-cranelift`,
 //! `coddl-codegen-wasm`).
+
+pub mod codegen;
+pub mod ir;
+pub mod lower;
+
+pub use codegen::Codegen;
+pub use ir::{BasicBlock, BlockId, Const, Function, Inst, Module, ProcType, Terminator, ValueId};
+pub use lower::{lower, LowerOutput};

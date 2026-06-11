@@ -19,17 +19,22 @@ use coddl_syntax::{parse, SyntaxKind};
 use crate::builtins::Builtins;
 use crate::ty::Type;
 
-/// The output of one `check` pass: every diagnostic, from the parser
-/// and the typechecker together. The typechecker doesn't filter parse
-/// errors — downstream tools see the full picture.
-#[derive(Debug, Default)]
+/// The output of one `check` pass: the parsed CST root and every
+/// diagnostic from the parser and the typechecker together. The
+/// typechecker doesn't filter parse errors — downstream tools see the
+/// full picture. The tree is always present (the parser's error
+/// recovery guarantees this); downstream passes lower the same tree
+/// without re-parsing.
+#[derive(Debug)]
 pub struct CheckOutput {
+    pub tree: SyntaxNode,
     pub diagnostics: Vec<Diagnostic>,
 }
 
 /// Tokenize, parse, and type-check `source`.
 pub fn check(source: &str, file: FileId) -> CheckOutput {
     let parse_out = parse(source, file);
+    let tree = parse_out.tree.clone();
     let mut tc = TypeChecker {
         file,
         builtins: Builtins::new(),
@@ -39,6 +44,7 @@ pub fn check(source: &str, file: FileId) -> CheckOutput {
         tc.check_root(&root);
     }
     CheckOutput {
+        tree,
         diagnostics: tc.diagnostics,
     }
 }
@@ -403,5 +409,19 @@ mod tests {
     fn unresolved_name_ref_diagnoses_t0001() {
         let src = "oper f {} [ unknown_var; ];";
         assert!(codes(src).contains(&"T0001"));
+    }
+
+    #[test]
+    fn check_output_exposes_tree() {
+        // Clean program — the tree is the parsed Root.
+        let ok = check(HELLO_WORLD, FileId(0));
+        assert_eq!(ok.tree.kind(), SyntaxKind::ROOT);
+
+        // Even with errors the tree is still surfaced, so downstream
+        // passes can decide what to do with the diagnostic-bearing
+        // input without re-parsing.
+        let bad = check("oper main {} []", FileId(0));
+        assert_eq!(bad.tree.kind(), SyntaxKind::ROOT);
+        assert!(!bad.diagnostics.is_empty());
     }
 }

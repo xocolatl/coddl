@@ -16,6 +16,7 @@ fn main() -> ExitCode {
         Some("lex") => cmd_lex(&args[2..]),
         Some("parse") => cmd_parse(&args[2..]),
         Some("check") => cmd_check(&args[2..]),
+        Some("lower") => cmd_lower(&args[2..]),
         Some("fmt") => cmd_fmt(&args[2..]),
         _ => {
             eprintln!("usage: coddl <subcommand> [args]");
@@ -24,6 +25,7 @@ fn main() -> ExitCode {
             eprintln!("  lex <file>     run the lexer on <file> (or stdin if -)");
             eprintln!("  parse <file>   parse <file> and dump the syntax tree");
             eprintln!("  check <file>   typecheck <file> (or stdin if -)");
+            eprintln!("  lower <file>   lower <file> to ProcIR and dump it");
             eprintln!("  fmt <file>     run the formatter on <file> (or stdin if -)");
             eprintln!("  --version      print version");
             ExitCode::from(2)
@@ -172,6 +174,32 @@ fn cmd_check(args: &[String]) -> ExitCode {
     };
 
     let out = coddl_types::check(&source, FileId(0));
+
+    if out.diagnostics.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        for d in &out.diagnostics {
+            eprintln!(
+                "{}: {} [{}] at {}..{}",
+                d.severity, d.message, d.code, d.span.start, d.span.end
+            );
+        }
+        ExitCode::from(1)
+    }
+}
+
+fn cmd_lower(args: &[String]) -> ExitCode {
+    let Some(source) = read_input(args, "lower") else {
+        return ExitCode::from(1);
+    };
+
+    let out = coddl_procir::lower(&source, FileId(0));
+
+    if let Some(module) = &out.module {
+        let stdout = io::stdout();
+        let mut w = stdout.lock();
+        let _ = writeln!(w, "{module}");
+    }
 
     if out.diagnostics.is_empty() {
         ExitCode::SUCCESS
