@@ -15,30 +15,25 @@
 //   - projection: `R { a, b }` — naked attribute names in `{}` (no values).
 //     A degenerate case of the named-set form. Tutorial D writes the same.
 //     Alternative: `project { rel: R, attrs: { a, b } }` (verbose canonical).
-//   - relational restriction (`where`): `R where { p }` (with a single
-//     anonymous predicate slot) vs `R where { p: <predicate> }` (named).
-//     Using anonymous form because the predicate is the only argument
-//     and naming it adds noise — but this is the first non-uniform case.
-//   - join: `R join S` infix despite the no-textual-infix rule? Or
-//     `join { a: R, b: S }` with arbitrary placeholder names? Using infix
-//     here to surface the tension — natural join is too common to be
-//     prefix without complaint.
-//   - subset (⊆) for inclusion constraint: keyword `subset` (textual,
-//     could be prefix `subset { left: ..., right: ... }`) vs `<=` infix
-//     symbolic. Using `subset` infix here for the same reason as join.
+//   - relational restriction: settled — `where` is infix per §3 with
+//     scope injection (predicate identifiers resolve against the left
+//     operand's heading). `R where p`, no braces, lowest precedence.
+//   - join: settled — infix per §3 "Surface syntax". `R join S`.
+//   - subset (⊆) for inclusion constraint: settled — `<=` polymorphic
+//     over relations (subset/superset). No separate `subset` keyword.
 //   - operator with relation-typed return: heading specified inline in
 //     the return-type clause. `-> Relation { p#: P#, ... }` parses as
 //     a type generator application.
 
 program suppliers_and_parts;
 
-type S# { possrep s { val: Char }; };
-type P# { possrep p { val: Char }; };
-type Name { possrep n { val: Char }; };
+type S# { possrep s { val: Text }; };
+type P# { possrep p { val: Text }; };
+type Name { possrep n { val: Text }; };
 type Qty { possrep q { val: Integer } where val >= 0; };
-type Color { possrep c { val: Char }; };
+type Color { possrep c { val: Text }; };
 type Weight { possrep w { val: Rational } where val > 0; };
-type City { possrep c { val: Char }; };
+type City { possrep c { val: Text }; };
 type Status { possrep s { val: Integer } where val >= 0 and val <= 100; };
 
 relvar S real {
@@ -64,14 +59,14 @@ relvar SP real {
 
 // Referential integrity. RM Pre 23: constraints are checked at every
 // statement boundary, including the end of a multiple-assignment.
-constraint sp_supplier_ref: SP { s# } subset S { s# };
-constraint sp_part_ref:     SP { p# } subset P { p# };
+constraint sp_supplier_ref: SP { s# } <= S { s# };
+constraint sp_part_ref:     SP { p# } <= P { p# };
 
 // A query operator: for a given supplier, the parts they supply.
 // Result heading: { p#: P#, pname: Name, qty: Qty }.
 oper parts_for_supplier { supplier: S# } -> Relation { p#: P#, pname: Name, qty: Qty }
 [
-    return ((SP where { s# = supplier }) join P) { p#, pname, qty };
+    return ((SP where s# = supplier) join P) { p#, pname, qty };
 ];
 
 oper main {}
@@ -80,7 +75,7 @@ oper main {}
     // wraps each top-level statement in an implicit BEGIN/COMMIT
     // (see §5 mandatory SQL emission rules).
     var london_suppliers: Relation { s#: S#, sname: Name } :=
-        (S where { city = City.c { val: "London" } }) { s#, sname };
+        (S where city = City.c { val: "London" }) { s#, sname };
 
     write_line { message: "London suppliers: {count(london_suppliers)}" };
 ];

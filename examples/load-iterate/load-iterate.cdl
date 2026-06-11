@@ -31,7 +31,7 @@ oper main {}
 [
     // Materialize the supplier-S1 part shipments, in ascending part-number order.
     var s1_parts: Sequence Tuple { p#: P#, qty: Qty };
-    load s1_parts from (SP where { s# = S#.s { val: "S1" } }) { p#, qty }
+    load s1_parts from (SP where s# = S#.s { val: "S1" }) { p#, qty }
         order [ asc p# ];
 
     // Walk the sequence by position.

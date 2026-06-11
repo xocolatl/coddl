@@ -30,8 +30,8 @@ oper relocate_supplier { s: S#, new_city: City, new_status: Status } -> Boolean
     // Multiple assignment: one statement, atomic, single constraint check.
     // (Both writes target the same relvar; the MA semantics in §9 fold
     // duplicate targets via WITH before evaluating.)
-    update S where { s# = s } set { city: new_city },
-    update S where { s# = s } set { status: new_status };
+    update S where s# = s set { city: new_city },
+    update S where s# = s set { status: new_status };
 
     return true;
 ];

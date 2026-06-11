@@ -125,12 +125,37 @@ JOIN      { left R, right S }  -- name the slots
 
 ```
 cartesian { Y: 2.5, X: 5.0 }
-join      { left: R, right: S }
+R join S                              -- join is infix, see below
 ```
 
-Reason: the colon makes the name/value boundary unambiguous when values are themselves identifiers or call expressions (`{ left: R, right: S join T }` reads clearly; `{ left R, right S join T }` requires the reader to know `R`/`S`/`T` aren't named-arg names). The colon also matches the way the same shape is written when `{ ... }` appears in a value position as a tuple literal (`{x: 1, y: 2}`), so one separator works in both roles.
+Reason for the colon: it makes the name/value boundary unambiguous when values are themselves identifiers or call expressions (`{ left: R, right: S join T }` reads clearly; `{ left R, right S join T }` requires the reader to know `R`/`S`/`T` aren't named-arg names). The colon also matches the way the same shape is written when `{ ... }` appears in a value position as a tuple literal (`{x: 1, y: 2}`), so one separator works in both roles.
 
-Concessions: infix forms for the *symbolic* operators `=`, `<>`, `<`, `>`, `<=`, `>=`, `+`, `-`, `*`, `/` are retained (the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-unfriendly names); a small set of monadic operators (`count`, `sin`, `is_*`) keep parenthesized positional form. Everything else — including the relational algebra, selectors, `extend`, `summarize`, `group`, `ungroup`, and the textual logical operators `and` / `or` / `not` — is named-prefix with braces. This eliminates the relational-algebra/scalar-op syntactic distinction the authors regret, and matches RM Pro 1 (no ordinal-position semantics) at the surface where it's easiest to enforce.
+Three operator-shape categories, with deliberate exceptions:
+
+- **Infix for binary operators**, symbolic *and* textual:
+  - Symbolic: `=`, `<>`, `<`, `>`, `<=`, `>=`, `+`, `-`, `*`, `/`. The comparison operators `<=` and `>=` are polymorphic: scalar comparison on scalars (as ever); **subset** and **superset** on relations (`R <= S` iff every tuple in `R` appears in `S`; `S >= R` iff `R <= S`). `<` and `>` give strict subset / superset analogously. Identical headings are required for the relation overload — checked at compile time. There's no separate `subset` keyword; `<=` covers it.
+  - Textual relational: `join`, `times`, `intersect`, `union`, `minus`, `where`.
+  - Textual logical: `and`, `or`. (Both `Boolean × Boolean → Boolean`. `or` < `and` < `not` < comparison on the precedence ladder; final ordering deferred to the parser phase.)
+  - Textual arithmetic: `mod`. (`Integer × Integer → Integer`. Binds at multiplicative precedence, alongside `*` and `/`. Defined only for `Integer` in v1 — extending to `Rational`/`Approximate` needs a separate semantic decision.)
+
+  Reason: the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-unfriendly names, and the textual binary ops all have natural infix readings from math and SQL. No-reserved-words still holds — `join` is recognized contextually in expression position; it remains a valid identifier elsewhere.
+
+  **`times` and `intersect` are typed aliases of `join`.** Both lower to the same `AND` node in Algebra A (§4 — `AND` generalizes TIMES and INTERSECT). The aliases exist for intent-signaling and compile-time enforcement: `times` requires the two heading sets to be **disjoint** (otherwise the user meant `join`, not a cartesian product, and the type checker catches the slip); `intersect` requires the two heading sets to be **identical**. Both checks are static, both are zero-cost at runtime.
+
+  **`union` and `minus` require identical headings.** `union` lowers to A-core `OR` (heading-agnostic relational union, restricted at the type level to matching headings since Coddl has no nulls). `minus` lowers to `AND NOT` (set difference is `R join (NOT S)` when headings match). Both checks are static; mismatched-heading attempts are rejected at compile time with a diagnostic.
+
+  **`where` (restriction) is also infix and special-cased in two ways.** The right operand is a *predicate*, not another relation, and that has two consequences:
+
+  - **Scope injection.** Identifiers in the predicate resolve against the left operand's heading first, the enclosing scope second. `SP where s# = supplier` reads as: `s#` is the SP attribute; `supplier` is a parameter from the enclosing `oper`. The parser and typechecker inject the left operand's heading into the predicate's name-resolution scope automatically. This is the first construct with a non-uniform scoping rule; every later construct that takes a predicate (`extend`, `summarize`'s aggregate expressions, possrep constraints) reuses the same machinery.
+  - **Precedence.** `where` binds looser than `=`, `<`, `+`, `and`, `or` — the predicate is expected to be a full scalar expression. `R where x = 1 and y > 0` parses as `R where ((x = 1) and (y > 0))` without parentheses. Practically `where` sits at the bottom of the infix precedence ladder, alongside `union`/`minus` (each of those also "consumes everything to its right" in a chain like `R join S where p` → `(R join S) where p`). Full precedence table lands when the parser does — exact order is deferred until then.
+
+- **Parenthesized positional for monadic operators**: `count(R)`, `sin(x)`, `is_*(...)`, `not(p)`. Single argument, name-free, conventional shape.
+
+- **Named-prefix with braces for everything else** — n-ary or structured operands: selectors, `oper` calls in general, `extend`, `summarize`, `rename`, `group`, `ungroup`, `wrap`, `unwrap`. These all have meaningful name slots that would be lost in a positional form.
+
+This eliminates the relational-algebra/scalar-op syntactic distinction the authors regret, and matches RM Pro 1 (no ordinal-position semantics) at the surface where it's easiest to enforce.
+
+Operator precedence among the infix textual operators is a separate decision and is deferred until the parser starts on expressions — the examples here use parentheses to disambiguate (`(R join S) where { p }`).
 
 ### Brackets vs braces encode ordering
 
@@ -149,11 +174,38 @@ This maps directly onto TTM. Tuples, relations, and headings have no ordinal pos
 Coddl is case-sensitive: `foo` and `Foo` are distinct identifiers. The language uses three case styles, applied consistently to built-ins and recommended for user code:
 
 - **lowercase / snake_case** — keywords (`program`, `oper`, `where`, `join`, `load`, `if`, `then`, `else`, ...), built-in operators (`and`, `or`, `not`, `count`, `sum`, `extend`, ...), built-in constants (`true`, `false`, `reltrue`, `relfalse`), and user-named operators, variables, attributes, and parameters.
-- **PascalCase** — type names, both built-in (`Integer`, `Rational`, `Character`, `Char`, `Boolean`, `Tuple`, `Relation`) and user-defined (`Customer`, `OrderLine`, `EmailAddress`); and relvar names by convention (`Customer`, `Suppliers`, `OrderLines`).
+- **PascalCase** — type names, both built-in (`Integer`, `Rational`, `Text`, `Character`, `Boolean`, `Tuple`, `Relation`, `Sequence`) and user-defined (`Customer`, `OrderLine`, `EmailAddress`); and relvar names by convention (`Customer`, `Suppliers`, `OrderLines`).
 
 User code is not *required* to follow PascalCase for types and relvars — that's convention, not language. The language only enforces case sensitivity (so `customer` and `Customer` are different identifiers) and the canonical case of built-in identifiers (the `Integer` built-in is `Integer`, never `integer` or `INTEGER`).
 
 Implications for the lexer and parser: identifiers are matched case-sensitively. Contextual keyword recognition (next section) looks for the lowercase form only — `Program` at the start of a file is a user identifier, not the keyword.
+
+#### Identifier shape
+
+- **Lexical class**: Unicode UAX #31 — `XID_Start` for the first character, `XID_Continue` for subsequent. The lexer NFKC-normalizes identifiers before comparison so visually equivalent character sequences denote the same identifier (e.g. `é` precomposed = `e` + combining acute).
+- **Leading single underscore** (`_foo`) marks an identifier the developer is OK with being unused — the typechecker won't warn about unused locals or parameters whose name starts with `_`. Same convention as Rust.
+- **Bare `_`** is the wildcard / "don't care" pattern. Reserved as a single-character form for (planned) pattern matching's catch-all branch and any other "I don't want to name this" slot.
+- **Leading `__` (double underscore) is reserved for compiler-internal use** and rejected from user identifiers. This gives the desugarer, optimizer, and runtime a private namespace (`__plan_42`, `__tmp_join_lhs`, `__coddl_runtime_call`) that cannot ever shadow user code. snake_case with internal underscores (`foo_bar`, `write_line`, `_unused`) is unaffected — the rule is purely a leading-prefix check.
+
+### Unicode operator glyphs
+
+A small set of single-codepoint mathematical glyphs lex as **exact synonyms** for their ASCII / keyword counterparts. The lexer emits the same token either way; grammar productions name only the ASCII form, but `R ⋈ S` and `R join S` are interchangeable in source.
+
+Glyphs assigned so far (more added as their corresponding operators are settled):
+
+| ASCII | Glyph(s) | Codepoint(s) |
+|---|---|---|
+| `join` | `⋈` | U+22C8 |
+| `union` | `∪` | U+222A |
+| `intersect` | `∩` | U+2229 |
+| `minus` | `∖` | U+2216 SET MINUS (**not** U+005C reverse solidus — that's the string-escape character) |
+| `<=` | `≤`, `⊆` | U+2264, U+2286 |
+| `>=` | `≥`, `⊇` | U+2265, U+2287 |
+| `<` | `⊂` | U+2282 (mostly useful in the relational strict-subset reading; scalar `<` keeps its ASCII form) |
+| `>` | `⊃` | U+2283 |
+| `<>` | `≠` | U+2260 |
+
+Deliberately **not** in the synonym set: Greek letters (`π σ ρ γ` — too easily mistaken for ordinary identifiers in non-math source), Boolean truth-value glyphs (`⊤ ⊥`), and the empty-set glyph (`∅`). The formatter normalizes to one canonical form per `format.edition`; the formatter rule is deferred until that edition lands but the default will likely be ASCII for searchability, with a project-level option to flip to glyphs.
 
 ### Comments
 
@@ -161,6 +213,45 @@ Implications for the lexer and parser: identifiers are matched case-sensitively.
 - **Block comments** are delimited by `/*` and `*/` and **nest**. `/* outer /* inner */ still outer */` is one well-formed comment; the lexer counts depth on each `/*` and `*/`. The motivation is purely ergonomic — commenting out a region that already contains a block comment Just Works, with no need to surgically convert the inner pairs first.
 
 The lexer treats both kinds as trivia and attaches them to the CST per §13 so the formatter can preserve them. The choice of `//` over the `--` from Tutorial D / SQL is a deliberate move away from the SQL pedigree where it costs nothing — `--` collides with the binary minus and "negative literal" patterns under enough lookahead pressure that committing to it would constrain unrelated grammar choices.
+
+### Literals
+
+- **Text** literals: double-quoted, e.g. `"hello, world"`. Standard escape sequences `\n`, `\r`, `\t`, `\"`, `\\`, and `\u{HHHHHH}` for a Unicode codepoint (1–6 hex digits, value ≤ U+10FFFF, outside the UTF-16 surrogate range D800–DFFF). Multi-line is permitted — raw newlines are kept as-is.
+- **Character** literals: single-quoted, exactly one codepoint, e.g. `'a'`, `'\n'`, `'\u{1F600}'`. The lexer rejects empty `''` and multi-codepoint `'ab'` at the lexical level. Escape syntax matches Text.
+- **Boolean** literals: `true`, `false`.
+- **Numeric** literals — three lexical shapes, one per numeric type:
+    - `42`, `0xff`, `0b1010`, `0o17`, `0d99` → **`Integer`** (base prefixes are case-insensitive; `0d` is the explicit-decimal prefix).
+    - `42.0`, `3.14` → **`Rational`** (digits-dot-digits; both sides need at least one digit; no `42.` or `.5`).
+    - `42e0`, `4.2e1`, `1e-9` → **`Approximate`** (exponent required; mantissa integer- *or* rational-shaped).
+  Underscores between digits are decoration and stripped before conversion: `1_000_000`, `0xff_ff_ff`. The exponent marker `e` and the hex digits `a`–`f` are case-insensitive; the formatter normalises to lowercase. The three-shape split is unambiguous: the lexer picks one of `Integer`/`Rational`/`Approximate` from the literal's *form* alone, without inference.
+
+### Method-style call syntax (UFCS via `self`)
+
+Any `oper` whose heading contains a parameter literally named `self` can be invoked as a method on that parameter's value:
+
+```
+oper to_codepoints { self: Text } : Sequence Character [
+    /* ... */
+];
+
+let chars = textvar.to_codepoints {};
+// same as:
+let chars = to_codepoints { self: textvar };
+```
+
+Pure sugar — the surface form `x.f { ... }` desugars to `f { self: x, ... }` at parse time. Both spellings are accepted; the CST records the original so the formatter can preserve it.
+
+`self` is a convention, not a reserved word. The method-call sugar fires only for headings whose parameter is literally named `self`; the slot's *position* in the heading is irrelevant (headings are unordered). There is no separate "method" declaration — methods are ordinary `oper`s with this one parameter-name convention.
+
+**Dispatch is by static type of the receiver.** If two opers named `to_codepoints` exist with different `self` parameter types (`{ self: Text }` and `{ self: Bytes }`, say), the typechecker picks the one whose `self` type matches the receiver. Static overloading on `self` only — other parameters don't participate.
+
+**Method call vs possrep accessor:**
+- `x.possrep_name` (no braces) is the possrep accessor — returns the possrep view of `x`. Inherited from §7.
+- `x.method_name { ... }` (with braces, including empty `{}`) is a method call.
+
+The braces are the parser's disambiguation: `x.method` (no braces) is *always* an accessor; `x.method {}` is *always* a method call, even with zero arguments.
+
+This mirrors UFCS in D / Nim and Rust's method syntax — but without an `impl` block: methods are just opers with a `self` parameter.
 
 ### Reserved words: none
 
@@ -288,11 +379,19 @@ For every possrep `PR` of type `T` the system synthesizes:
 
 **Type constraints** (the `possrep`'s `constraint` predicate) are checked at every selector invocation — that's the sole choke point because values of `T` can only be constructed via the selector. Type-constraint violations are run-time errors; argument-type mismatches are compile-time.
 
-**Built-in scalar types (v1)**: `Integer`, `Rational`, `Character`, `Char`, `Boolean`. PascalCase per §3 "Identifier case." The names happen to overlap most Ds' built-ins because TTM's Appendix C modeling exercises assume them, but the list is Coddl's choice, not borrowed. Everything else — `Date`, `Timestamp`, `Uuid`, `Bytes`, fixed-width numerics, decimal, currency — is a user-defined scalar type with one or more declared possreps. This is the modeling exercise TTM Appendix C walks through; Coddl ships a small standard library of these definitions but they aren't built into the language. Each built-in has fixed mappings to (a) LLVM type, (b) SQLite affinity + `CHECK` constraints where needed, (c) Postgres type; user-defined scalars get their mappings via possrep components.
+**Built-in scalar types (v1)**: `Integer`, `Rational`, `Approximate`, `Text`, `Character`, `Binary`, `Byte`, `Boolean`. PascalCase per §3 "Identifier case." Everything else — `Date`, `Timestamp`, `Uuid`, fixed-width numerics, decimal, currency — is a user-defined scalar type with one or more declared possreps. This is the modeling exercise TTM Appendix C walks through; Coddl ships a small standard library of these definitions but they aren't built into the language. Each built-in has fixed mappings to (a) LLVM type, (b) SQLite affinity + `CHECK` constraints where needed, (c) Postgres type; user-defined scalars get their mappings via possrep components.
+
+**Three numeric types** — `Integer`, `Rational`, `Approximate` — with no implicit conversion between them. `Integer` is mathematically unbounded (a bignum at runtime); `Rational` is exact rational arithmetic (also potentially unbounded); `Approximate` is bounded-precision floating-point (maps to f64). The literal shapes (§3 "Literals") pick one without inference: `42` is `Integer`, `42.0` is `Rational`, `42e0` is `Approximate`. Code that needs Approximate-cost arithmetic on integer values writes `42e0`, not `42`. Users who need a bounded fast integer (e.g. `Int32`, `Int64`) define it as a user-defined possrep-constrained scalar over `Integer` (see §10 risk #9).
+
+**`Text` and `Character` are separate types.** `Text` is an opaque character string — you cannot index into it (`t[2]` is a type error), cannot ask its length in code points without explicit conversion, and cannot pattern-match on its internal representation. `Character` is a single Unicode code point. A planned standard-library function (TBD spelling) converts `Text` to `Sequence Character` and back; that's the only sanctioned route between the two. The split matches Rust's `String` / `char` distinction and TTM's Appendix-A "scalar is atomic" rule (`Text`'s opacity is what lets the backend store it as `TEXT` / `VARCHAR` / a hash, depending on workload, without leaking implementation through indexing). Coddl deliberately departs from TTM's `CHARACTER` (a.k.a. `CHAR`) shorthand-for-string convention — see TTM ch. 6 p. 134 — because Coddl needs the names for two distinct types.
+
+**`Binary` and `Byte` mirror the same opacity split.** `Binary` is an opaque byte blob (`b[2]` is a type error; backend may store as `BLOB` / `bytea` / a hash / a chunk-table without leaking through indexing). `Byte` is a single octet (0–255). The planned conversion functions are `oper to_bytes { self: Binary } : Sequence Byte` and `oper from_bytes { bytes: Sequence Byte } : Binary`, paralleling `to_codepoints` / `from_codepoints` on `Text`. Decisions deferred: bitwise operators on `Byte` (`&`, `|`, `^`, `~`, `<<`, `>>` — settle when a concrete need surfaces), explicit `Byte` ↔ `Integer` conversion, UTF-8 encoders / decoders between `Text` and `Binary` (`to_utf8` is fallible-free; `from_utf8` needs the planned sum-type story for invalid input).
 
 `Integer` is mathematically unbounded per TTM, which forces big-integer arithmetic at runtime — a real cost against the performance principle. Whether to also ship bounded-width built-ins (`Int32`/`Int64`) as primitives, or to keep them as user-defined possrep-constrained scalars over `Integer`, is an open decision (§10 risk #8).
 
 **No implicit coercion.** Distinct named scalar types are disjoint; `Integer` and `Rational` cannot be silently mixed. Equality `=` is type-monomorphic per RM Pre 8 ("indistinguishable for all operators on T").
+
+**Static operator overloading is permitted.** A few comparison operators resolve to distinct underlying operators depending on the operand type family — most notably, `<=` and `>=` are scalar comparison on scalars and **subset** / **superset** on relations (`<` and `>` give strict subset / superset). The same identifier names two operators; the type checker picks which based on operand types at compile time. RM Pre 8 monomorphism is preserved because each underlying operator is type-monomorphic; the surface `<=` is just a shared spelling, the same way `+` can be spelled by `Integer` addition and `Rational` addition without violating RM Pre 8.
 
 **No nulls.** Period. The type system has no nullable-attribute facility. Missing information is a database-design problem the user solves through **vertical decomposition** — splitting the relvar so the absence of a fact is the absence of a tuple in a side relvar (the canonical TTM answer; ch. 7, RM Pro 4). A user-defined sum-type scalar (`Optional` with `Some`/`None` possreps) is permitted by the type system but not the recommended approach. The SQL backend never sees a request to emit a NULL.
 
