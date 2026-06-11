@@ -15,6 +15,7 @@ fn main() -> ExitCode {
         }
         Some("lex") => cmd_lex(&args[2..]),
         Some("parse") => cmd_parse(&args[2..]),
+        Some("check") => cmd_check(&args[2..]),
         Some("fmt") => cmd_fmt(&args[2..]),
         _ => {
             eprintln!("usage: coddl <subcommand> [args]");
@@ -22,6 +23,7 @@ fn main() -> ExitCode {
             eprintln!("subcommands:");
             eprintln!("  lex <file>     run the lexer on <file> (or stdin if -)");
             eprintln!("  parse <file>   parse <file> and dump the syntax tree");
+            eprintln!("  check <file>   typecheck <file> (or stdin if -)");
             eprintln!("  fmt <file>     run the formatter on <file> (or stdin if -)");
             eprintln!("  --version      print version");
             ExitCode::from(2)
@@ -161,6 +163,26 @@ fn dump_node(w: &mut impl Write, node: &SyntaxNode, source: &str, indent: usize)
                 );
             }
         }
+    }
+}
+
+fn cmd_check(args: &[String]) -> ExitCode {
+    let Some(source) = read_input(args, "check") else {
+        return ExitCode::from(1);
+    };
+
+    let out = coddl_types::check(&source, FileId(0));
+
+    if out.diagnostics.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        for d in &out.diagnostics {
+            eprintln!(
+                "{}: {} [{}] at {}..{}",
+                d.severity, d.message, d.code, d.span.start, d.span.end
+            );
+        }
+        ExitCode::from(1)
     }
 }
 

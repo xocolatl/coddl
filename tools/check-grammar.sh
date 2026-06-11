@@ -1,13 +1,16 @@
 #!/usr/bin/env sh
 # tools/check-grammar.sh
 #
-# Verify docs/grammar.md is in lockstep with crates/coddl-syntax.
+# Verify the docs/ tree is in lockstep with the syntax and types crates.
 #
 # Two invariants:
 #   1. Every `fn parse_<name>` in parser.rs (outside #[cfg(test)] code)
 #      has a `<name>` rule (kebab-case) defined in docs/grammar.md.
-#   2. Every `"E####"` / `"P####"` diagnostic code emitted in the
-#      syntax crate appears in docs/grammar.md.
+#   2. Every `"E####"` / `"P####"` / `"T####"` diagnostic code emitted
+#      anywhere in crates/coddl-syntax/src/ or crates/coddl-types/src/
+#      appears in some docs/*.md file. Which file owns which code prefix
+#      is documentation discipline; the script only enforces that
+#      every emitted code is documented somewhere.
 #
 # Exits 0 if both invariants hold, 1 with a summary of what's missing
 # otherwise. POSIX shell only — no Python, no Rust.
@@ -17,7 +20,6 @@ set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 GRAMMAR="$ROOT/docs/grammar.md"
 PARSER="$ROOT/crates/coddl-syntax/src/parser.rs"
-LEXER="$ROOT/crates/coddl-syntax/src/lexer.rs"
 
 if [ ! -f "$GRAMMAR" ]; then
     echo "check-grammar: docs/grammar.md not found at $GRAMMAR" >&2
@@ -25,10 +27,6 @@ if [ ! -f "$GRAMMAR" ]; then
 fi
 if [ ! -f "$PARSER" ]; then
     echo "check-grammar: parser source not found at $PARSER" >&2
-    exit 1
-fi
-if [ ! -f "$LEXER" ]; then
-    echo "check-grammar: lexer source not found at $LEXER" >&2
     exit 1
 fi
 
@@ -57,25 +55,30 @@ done
 
 # 2. Diagnostic codes.
 #
-# Every `"E####"` / `"P####"` literal in the syntax crate sources must
-# show up somewhere in the grammar doc. We harvest test assertions too
-# (`d.code == "P0017"`), since they pin down which codes are exercised
-# and act as a cross-check.
+# Harvest every `"X####"` literal across the syntax and types crates;
+# verify each appears in some docs/*.md.
+code_sources=$(
+    find "$ROOT/crates/coddl-syntax/src" "$ROOT/crates/coddl-types/src" \
+        -name '*.rs' -type f 2>/dev/null
+)
 codes=$(
-    grep -hoE '"[EP][0-9]{4}"' "$PARSER" "$LEXER" \
+    grep -hoE '"[EPT][0-9]{4}"' $code_sources 2>/dev/null \
         | tr -d '"' \
         | sort -u
 )
 
+# All docs/*.md files. Joined as space-separated for the grep below.
+doc_files=$(find "$ROOT/docs" -maxdepth 1 -name '*.md' -type f 2>/dev/null)
+
 for code in $codes; do
-    if ! grep -qE "(^| )$code( |\$|\|)" "$GRAMMAR"; then
+    if ! grep -lqE "(^| )$code( |\$|\|)" $doc_files 2>/dev/null; then
         echo "check-grammar: diagnostic $code is emitted but not documented" >&2
         failed=1
     fi
 done
 
 if [ "$failed" -eq 0 ]; then
-    echo "check-grammar: docs/grammar.md is in sync with crates/coddl-syntax"
+    echo "check-grammar: docs/ is in sync with crates/coddl-syntax + crates/coddl-types"
 fi
 
 exit "$failed"

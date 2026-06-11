@@ -327,6 +327,7 @@ impl<'a> Parser<'a> {
     /// `<name>: <type>`. Both the name and the colon are individually
     /// recoverable so a typo in one doesn't sink the whole parameter.
     fn parse_param(&mut self) {
+        self.bump_trivia();
         self.start_node(SyntaxKind::PARAM);
 
         if !self.eat(SyntaxKind::IDENT) {
@@ -344,6 +345,7 @@ impl<'a> Parser<'a> {
     /// `Tuple H`, `Relation H`, `Sequence T`, and qualified names land
     /// alongside the rest of expression parsing.
     fn parse_type_ref(&mut self) {
+        self.bump_trivia();
         self.start_node(SyntaxKind::TYPE_REF);
         if !self.eat(SyntaxKind::IDENT) {
             self.error("P0011", "expected type name");
@@ -419,6 +421,7 @@ impl<'a> Parser<'a> {
     fn parse_primary_expr(&mut self) -> bool {
         match self.current() {
             SyntaxKind::IDENT => {
+                self.bump_trivia();
                 self.start_node(SyntaxKind::NAME_REF);
                 self.bump();
                 self.finish_node();
@@ -429,6 +432,7 @@ impl<'a> Parser<'a> {
             | SyntaxKind::INTEGER_LIT
             | SyntaxKind::RATIONAL_LIT
             | SyntaxKind::APPROXIMATE_LIT => {
+                self.bump_trivia();
                 self.start_node(SyntaxKind::LITERAL);
                 self.bump();
                 self.finish_node();
@@ -472,6 +476,7 @@ impl<'a> Parser<'a> {
     /// `<name>: <expr>` inside an argument list. The shorthand bare
     /// `<name>` (= `<name>: <name>`) is deferred.
     fn parse_named_arg(&mut self) {
+        self.bump_trivia();
         self.start_node(SyntaxKind::NAMED_ARG);
         if !self.eat(SyntaxKind::IDENT) {
             self.error("P0016", "expected argument name");
@@ -608,10 +613,11 @@ mod tests {
 
     #[test]
     fn unknown_top_level_item_becomes_parse_error_and_recovers() {
-        // `oper main {} [];` isn't recognized yet — it should wrap in
-        // PARSE_ERROR, recover at the top-level `;`, and then parse
-        // the `program` decl that follows.
-        let src = "oper main {} []; program foo;";
+        // `relvar foo { x: T };` isn't recognized at the top level
+        // yet — it should wrap in PARSE_ERROR, recover at the
+        // top-level `;`, and then parse the `program` decl that
+        // follows.
+        let src = "relvar foo { x: T }; program foo;";
         let out = parse_str(src);
         assert_eq!(out.tree.text(), src);
 
