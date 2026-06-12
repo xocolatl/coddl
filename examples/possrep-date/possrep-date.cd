@@ -1,4 +1,4 @@
-// possrep-date.cdl
+// possrep-date.cd
 //
 // A user-defined Date scalar type with one possrep and a validation
 // constraint. Exercises: type declaration, possrep, possrep constraint,

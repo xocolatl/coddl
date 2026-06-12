@@ -33,7 +33,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ],
         synchronize: {
             fileEvents: vscode.workspace.createFileSystemWatcher(
-                '**/*.{cdl,cddb,cdmap,cdstore}',
+                '**/*.{cd,cddb,cdmap,cdstore}',
             ),
         },
     };

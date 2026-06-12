@@ -44,11 +44,27 @@ fn coddl_parse_cddb_round_trips_example() {
     );
 }
 
+// `.cdmap` integration test omitted: hello-world-db is identity-mapped
+// (the catalog's relvars are reused under the same names), so the
+// example doesn't ship a `.cdmap` file. The `.cdmap` parser is
+// exercised thoroughly by the unit tests in
+// `coddl_syntax::parser_cdmap`; an end-to-end driver test against an
+// example file lands when a non-identity adapter example appears
+// (Phase 16+).
+
 #[test]
-fn coddl_parse_cdmap_round_trips_example() {
+fn coddl_parse_cdmap_stdin_round_trips() {
+    // Confirm the driver dispatches `.cdmap` correctly when fed an
+    // explicit path — using a tempfile since the project doesn't ship
+    // a `.cdmap` example today.
+    use std::io::Write;
+    let mut tmp = tempfile::NamedTempFile::with_suffix(".cdmap").expect("tempfile");
+    writeln!(tmp, "map myapp to mydb;\nGreetings = Greetings;").expect("write");
+    let path = tmp.into_temp_path();
+
     let out = coddl()
         .args(["parse"])
-        .arg(companion_path("hello-world-db.cdmap"))
+        .arg(&path)
         .output()
         .expect("spawn coddl");
     assert!(
@@ -86,7 +102,7 @@ fn coddl_parse_cdstore_round_trips_example() {
 
 #[test]
 fn coddl_check_rejects_cddb_file() {
-    // Downstream passes are .cdl-only today — `check` rejects dialect
+    // Downstream passes are .cd-only today — `check` rejects dialect
     // input with a clear error.
     let out = coddl()
         .args(["check"])
@@ -99,7 +115,7 @@ fn coddl_check_rejects_cddb_file() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("only accepts .cdl files"),
+        stderr.contains("only accepts .cd files"),
         "expected dialect-rejection message, got stderr:\n{stderr}"
     );
 }
@@ -107,15 +123,15 @@ fn coddl_check_rejects_cddb_file() {
 #[test]
 fn coddl_lex_works_on_any_dialect() {
     // The lexer is dialect-agnostic; `coddl lex` should succeed on a
-    // `.cdmap` file even though its grammar is different.
+    // `.cddb` file even though its grammar is different.
     let out = coddl()
         .args(["lex"])
-        .arg(companion_path("hello-world-db.cdmap"))
+        .arg(companion_path("greetings.cddb"))
         .output()
         .expect("spawn coddl");
     assert!(
         out.status.success(),
-        "coddl lex <.cdmap> failed: stderr=\n{}",
+        "coddl lex <.cddb> failed: stderr=\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);

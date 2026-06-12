@@ -1,4 +1,4 @@
-// transaction.cdl
+// transaction.cd
 //
 // `transaction [ ... ]` is a block expression. Its body is an
 // ordered sequence of statements optionally followed by a tail

@@ -3,7 +3,7 @@
 //! Coddl programs are spread across four file kinds with distinct
 //! grammars and roles:
 //!
-//! - `.cdl`     — application source
+//! - `.cd`      — application source
 //! - `.cddb`    — database catalog
 //! - `.cdmap`   — external → conceptual adapter
 //! - `.cdstore` — conceptual → physical binding
@@ -19,7 +19,7 @@ use std::path::Path;
 /// shape of every analysis pipeline call depends on this.
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
 pub enum FileKind {
-    /// `.cdl` — application source (`program`, `oper`, `let`, …).
+    /// `.cd` — application source (`program`, `oper`, `let`, …).
     Cd,
     /// `.cddb` — database catalog (`database`, `base relvar`,
     /// `virtual relvar`, …).
@@ -37,7 +37,7 @@ impl FileKind {
     /// to a [`FileKind`]. Returns `None` for unrecognized extensions.
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext {
-            "cdl" => Some(FileKind::Cd),
+            "cd" => Some(FileKind::Cd),
             "cddb" => Some(FileKind::Cddb),
             "cdmap" => Some(FileKind::Cdmap),
             "cdstore" => Some(FileKind::Cdstore),
@@ -58,7 +58,7 @@ impl FileKind {
     /// Inverse of [`from_extension`](Self::from_extension).
     pub fn extension(self) -> &'static str {
         match self {
-            FileKind::Cd => "cdl",
+            FileKind::Cd => "cd",
             FileKind::Cddb => "cddb",
             FileKind::Cdmap => "cdmap",
             FileKind::Cdstore => "cdstore",
@@ -73,7 +73,7 @@ mod tests {
 
     #[test]
     fn from_extension_resolves_every_dialect() {
-        assert_eq!(FileKind::from_extension("cdl"), Some(FileKind::Cd));
+        assert_eq!(FileKind::from_extension("cd"), Some(FileKind::Cd));
         assert_eq!(FileKind::from_extension("cddb"), Some(FileKind::Cddb));
         assert_eq!(FileKind::from_extension("cdmap"), Some(FileKind::Cdmap));
         assert_eq!(FileKind::from_extension("cdstore"), Some(FileKind::Cdstore));
@@ -83,7 +83,7 @@ mod tests {
     fn from_extension_rejects_unknown() {
         assert_eq!(FileKind::from_extension("rs"), None);
         assert_eq!(FileKind::from_extension(""), None);
-        assert_eq!(FileKind::from_extension("CDL"), None); // case-sensitive
+        assert_eq!(FileKind::from_extension("CD"), None); // case-sensitive
     }
 
     #[test]

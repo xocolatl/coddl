@@ -23,7 +23,7 @@
             {
                 "id": "coddl",
                 "aliases": ["Coddl", "coddl"],
-                "extensions": [".cdl"],
+                "extensions": [".cd"],
                 "configuration": "./language-configuration.json"
             },
             {

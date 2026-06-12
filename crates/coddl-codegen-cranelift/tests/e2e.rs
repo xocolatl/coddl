@@ -1,6 +1,6 @@
 //! End-to-end test for the Cranelift backend.
 //!
-//! Lowers `examples/hello-world/hello-world.cdl` to ProcIR, emits a
+//! Lowers `examples/hello-world/hello-world.cd` to ProcIR, emits a
 //! native object file via Cranelift, invokes `cc` to link with the
 //! runtime staticlib, runs the binary, and asserts stdout equals
 //! `"Hello, world!\n"`. Fails loudly if `cc` is missing or the

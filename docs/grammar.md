@@ -194,10 +194,17 @@ function that implements it.
 ```
 <root>          ::= { <item> } ;                              -- parse_root
 <item>          ::= <program-decl>
+                  | <database-binding>
                   | <oper-decl>
                   | <unknown-item> ;                          -- parse_item
 
 <program-decl>  ::= 'program' <identifier> ';' ;              -- parse_program_decl
+
+<database-binding> ::= 'database' <identifier> ';' ;          -- parse_database_binding
+                       -- Binds this program to a catalog. The compiler
+                       -- discovers <name>.cddb and <name>.cdstore from
+                       -- the declared name. Absent → program uses no
+                       -- public relvars.
 
 <oper-decl>     ::= 'oper' <identifier> <heading>
                     [ <return-clause> ]
@@ -210,7 +217,7 @@ function that implements it.
 
 <key-clause>    ::= 'key' '{' [ <identifier> commalist ] '}' ; -- parse_key_clause
                     -- Candidate-key clause on a relvar declaration.
-                    -- Shared between `.cdl` application relvars (Phase 15)
+                    -- Shared between `.cd` application relvars (Phase 15)
                     -- and `.cddb` database relvars (today).
 
 <block>         ::= '[' { <stmt> } [ <expr> ] ']' ;            -- parse_block
@@ -296,6 +303,8 @@ enforces that.
 | P0017 | Expected `:` after argument name                        |
 | P0018 | `let` statement is malformed (missing name, `=`, or RHS)|
 | P0019 | `transaction` not followed by `[`                       |
+| P0020 | Expected database name (in `database <Name>;`)          |
+| P0021 | Expected `;` after `database <Name>`                    |
 | P0022 | Expected `{` to start key clause                        |
 | P0023 | Expected key attribute name                             |
 | P0024 | Expected `}` to close key clause                        |

@@ -7,7 +7,7 @@ base catalog relvar maps to a physical table and column set.
 
 For the overall four-file architecture, see `ARCHITECTURE.md` and
 `.local/phases.md` (Phase 14). Lexical productions are shared with
-`.cdl` — see `docs/grammar.md`.
+`.cd` — see `docs/grammar.md`.
 
 **Last sync:** unreleased — Phase 14.
 

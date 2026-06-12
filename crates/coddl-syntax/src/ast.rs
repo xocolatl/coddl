@@ -87,6 +87,7 @@ impl Root {
 #[derive(Debug, Clone)]
 pub enum Item {
     ProgramDecl(ProgramDecl),
+    DatabaseBinding(DatabaseBinding),
     OperDecl(OperDecl),
 }
 
@@ -94,6 +95,7 @@ impl Item {
     pub fn cast(syntax: SyntaxNode) -> Option<Self> {
         Some(match syntax.kind() {
             SyntaxKind::PROGRAM_DECL => Item::ProgramDecl(ProgramDecl { syntax }),
+            SyntaxKind::DATABASE_BINDING => Item::DatabaseBinding(DatabaseBinding { syntax }),
             SyntaxKind::OPER_DECL => Item::OperDecl(OperDecl { syntax }),
             _ => return None,
         })
@@ -102,6 +104,7 @@ impl Item {
     pub fn syntax(&self) -> &SyntaxNode {
         match self {
             Item::ProgramDecl(d) => d.syntax(),
+            Item::DatabaseBinding(d) => d.syntax(),
             Item::OperDecl(d) => d.syntax(),
         }
     }
@@ -115,6 +118,18 @@ impl ProgramDecl {
     /// The declared program name. `program` itself is also an IDENT in
     /// the tree (contextual keyword), so the name is the *second* IDENT
     /// child.
+    pub fn name(&self) -> Option<SyntaxToken> {
+        nth_token(&self.syntax, SyntaxKind::IDENT, 1)
+    }
+}
+
+// ── DatabaseBinding ──────────────────────────────────────────────────────
+
+ast_node!(pub DatabaseBinding, DATABASE_BINDING);
+
+impl DatabaseBinding {
+    /// The declared database name. The `database` keyword occupies
+    /// the first IDENT slot; the name is the second.
     pub fn name(&self) -> Option<SyntaxToken> {
         nth_token(&self.syntax, SyntaxKind::IDENT, 1)
     }
@@ -422,15 +437,27 @@ mod tests {
 
     #[test]
     fn root_items_in_order() {
-        let root = ast("program p; oper f {} [];");
+        let root = ast("program p; database d; oper f {} [];");
         let kinds: Vec<_> = root
             .items()
             .map(|i| match i {
                 Item::ProgramDecl(_) => "program",
+                Item::DatabaseBinding(_) => "database",
                 Item::OperDecl(_) => "oper",
             })
             .collect();
-        assert_eq!(kinds, vec!["program", "oper"]);
+        assert_eq!(kinds, vec!["program", "database", "oper"]);
+    }
+
+    #[test]
+    fn database_binding_name_resolves() {
+        let root = ast("program p; database greetings;");
+        let mut items = root.items();
+        let _ = items.next(); // skip program
+        let Item::DatabaseBinding(binding) = items.next().unwrap() else {
+            panic!("expected DatabaseBinding");
+        };
+        assert_eq!(binding.name().unwrap().text(), "greetings");
     }
 
     #[test]

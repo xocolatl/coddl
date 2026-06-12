@@ -3,7 +3,7 @@
 //! Invokes the built `coddl` binary as a subprocess (located via the
 //! `CARGO_BIN_EXE_coddl` env var that Cargo sets for integration
 //! tests). Each test exercises one of the new subcommands —
-//! `coddl run` or `coddl compile` — against `hello-world.cdl` and
+//! `coddl run` or `coddl compile` — against `hello-world.cd` and
 //! asserts the resulting binary's stdout.
 //!
 //! Tests fail loudly if `clang` / `cc` is missing on PATH or if the
@@ -19,9 +19,9 @@ fn workspace_root() -> PathBuf {
     p
 }
 
-/// `examples/<name>/<name>.cdl` is the on-disk convention.
+/// `examples/<name>/<name>.cd` is the on-disk convention.
 fn example_path(name: &str) -> PathBuf {
-    workspace_root().join(format!("examples/{name}/{name}.cdl"))
+    workspace_root().join(format!("examples/{name}/{name}.cd"))
 }
 
 fn hello_world_path() -> PathBuf {

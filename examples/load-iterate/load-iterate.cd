@@ -1,11 +1,11 @@
-// load-iterate.cdl
+// load-iterate.cd
 //
 // The §9 LOAD pattern: cross the set-oriented / procedural seam.
 // A relation gets `load`ed into a `Sequence Tuple H` with an explicit
 // order; then a counted `do` loop walks the sequence by position.
 // This is the only sanctioned tuple-at-a-time access (RM Pro 7).
 //
-// Depends on the schema in suppliers-and-parts.cdl.
+// Depends on the schema in suppliers-and-parts.cd.
 //
 // OPEN syntax questions:
 //   - `load <var> from <relation> { proj } order ( ... );` — statement form.

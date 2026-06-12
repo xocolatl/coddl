@@ -178,11 +178,11 @@ panic with a clear message if `clang` / `cc` is missing on PATH.
 
 ```sh
 cargo build -p coddl-runtime
-cargo run -q -p coddl-driver -- emit-llvm examples/hello-world/hello-world.cdl > /tmp/hello.ll
+cargo run -q -p coddl-driver -- emit-llvm examples/hello-world/hello-world.cd > /tmp/hello.ll
 clang /tmp/hello.ll target/debug/libcoddl_runtime.a -o /tmp/hello_llvm
 /tmp/hello_llvm                 # prints Hello, world!
 
-cargo run -q -p coddl-driver -- emit-obj examples/hello-world/hello-world.cdl -o /tmp/hello.o
+cargo run -q -p coddl-driver -- emit-obj examples/hello-world/hello-world.cd -o /tmp/hello.o
 cc /tmp/hello.o target/debug/libcoddl_runtime.a -o /tmp/hello_cranelift
 /tmp/hello_cranelift            # also prints Hello, world!
 

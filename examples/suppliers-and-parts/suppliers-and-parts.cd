@@ -1,4 +1,4 @@
-// suppliers-and-parts.cdl
+// suppliers-and-parts.cd
 //
 // The canonical C. J. Date textbook schema: suppliers (S), parts (P),
 // and shipments (SP). Exercises relvar declarations with candidate keys,

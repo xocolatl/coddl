@@ -77,16 +77,16 @@ fn read_input(args: &[String], cmd: &str) -> Option<(String, FileKind)> {
     }
 }
 
-/// Reject input that isn't `.cdl`. Used by every subcommand whose
+/// Reject input that isn't `.cd`. Used by every subcommand whose
 /// downstream pipeline (typecheck / lower / emit / compile / run /
-/// fmt) is `.cdl`-only today; the dialect-aware pipeline lands in
+/// fmt) is `.cd`-only today; the dialect-aware pipeline lands in
 /// later phases.
 fn require_cd(kind: FileKind, cmd: &str) -> Result<(), ExitCode> {
     if kind == FileKind::Cd {
         Ok(())
     } else {
         eprintln!(
-            "coddl {cmd}: only accepts .cdl files today; \
+            "coddl {cmd}: only accepts .cd files today; \
              .{ext} pipeline support lands in later phases",
             ext = kind.extension(),
         );

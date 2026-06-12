@@ -2,14 +2,14 @@
 
 This document is the authoritative spec for the `.cdmap` dialect — the
 external → conceptual adapter file. A `.cdmap` file binds an
-application's `public relvar`s (declared in a `.cdl` program) to the
+application's `public relvar`s (declared in a `.cd` program) to the
 database's catalog relvars (declared in a `.cddb`) through a chain of
 project / rename clauses. Today's parser accepts identity mappings
 only; richer chains land in Phase 16.
 
 For the overall four-file architecture, see `ARCHITECTURE.md` and
 `.local/phases.md` (Phase 14). Lexical productions are shared with
-`.cdl` — see `docs/grammar.md`.
+`.cd` — see `docs/grammar.md`.
 
 **Last sync:** unreleased — Phase 14.
 
@@ -31,7 +31,7 @@ to one database, followed by zero or more identity mapping entries.
 
 <cdmap-header>  ::= 'map' <identifier> 'to' <identifier> ';' ; -- parse_cdmap_header
                     -- The first <identifier> is the program name
-                    -- (matches `program <name>;` in the .cdl); the
+                    -- (matches `program <name>;` in the .cd); the
                     -- second is the database name (matches
                     -- `database <name>;` in the .cddb).
 
@@ -45,9 +45,9 @@ to one database, followed by zero or more identity mapping entries.
 header positions. Coddl has no hard-reserved words.
 
 The `=` here is a **definition** (in the spirit of `let x = expr` in
-`.cdl`), not an assignment. The `.cdmap` line establishes that the
+`.cd`), not an assignment. The `.cdmap` line establishes that the
 external name is *defined as* the catalog expression on the right;
-assignment (`:=`) is reserved for `.cdl`'s relvar mutation operator.
+assignment (`:=`) is reserved for `.cd`'s relvar mutation operator.
 
 
 ## Deliberately not yet in the grammar

@@ -35,6 +35,6 @@ Thumbs.db
 
 # ── Local scratchpad ─────────────────────────────────────────────────────
 # Anywhere we want a quick local-only workspace. Used today under
-# examples/.local for scratch .cdl files.
+# examples/.local for scratch .cd files.
 .local/
 **/.local/

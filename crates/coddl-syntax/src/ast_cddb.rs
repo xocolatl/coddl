@@ -80,7 +80,7 @@ impl BaseRelvarDecl {
     }
 
     /// The relvar's heading (`{ a: T, b: U, … }`). Reuses the shared
-    /// `.cdl` AST type since the production is identical.
+    /// `.cd` AST type since the production is identical.
     pub fn heading(&self) -> Option<Heading> {
         ast::child(&self.syntax)
     }

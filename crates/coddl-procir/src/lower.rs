@@ -183,6 +183,10 @@ impl Lowerer {
         for item in root.items() {
             match item {
                 Item::ProgramDecl(p) => self.lower_program_decl(&p),
+                Item::DatabaseBinding(_) => {
+                    // The binding is a parse-time label today; runtime
+                    // wiring lands with Phase 21's SQLite materialization.
+                }
                 Item::OperDecl(o) => {
                     let func = self.lower_oper_decl(&o);
                     self.functions.push(func);

@@ -1,4 +1,4 @@
-// multi-assign.cdl
+// multi-assign.cd
 //
 // RM Pre 21 multiple assignment. All RHSs evaluate first against the
 // pre-MA state, all writes apply atomically, then all applicable
@@ -21,7 +21,7 @@
 //     before MA fold-in (§9 step 1). Using `delete`/`insert` here.
 //   - Same `where { p }` form as suppliers-and-parts; same caveats.
 //
-// Depends on the schema in suppliers-and-parts.cdl.
+// Depends on the schema in suppliers-and-parts.cd.
 
 program multi_assign;
 

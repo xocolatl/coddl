@@ -58,7 +58,7 @@ change.
 
 ## Adding a new example
 
-1. Drop the program at `examples/<name>/<name>.cdl`.
+1. Drop the program at `examples/<name>/<name>.cd`.
 2. In `crates/coddl-driver/tests/e2e.rs`, add the three test
    functions following the hello-world pattern.
 3. Run `cargo test --workspace`. Both per-backend tests must pass;

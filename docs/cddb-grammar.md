@@ -5,11 +5,11 @@ database catalog source family member. A `.cddb` file declares the
 *conceptual schema* of one database: the truth about its logical shape,
 independent of any consuming application's view.
 
-For the overall four-file architecture (`.cdl` / `.cddb` / `.cdmap` /
+For the overall four-file architecture (`.cd` / `.cddb` / `.cdmap` /
 `.cdstore`), see `ARCHITECTURE.md` and the higher-level discussion in
 `.local/phases.md` (Phase 14). Lexical productions, comments,
 whitespace, identifiers, literals, and punctuation are **shared with
-`.cdl`** — see `docs/grammar.md`. This document covers only the
+`.cd`** — see `docs/grammar.md`. This document covers only the
 syntactic productions specific to `.cddb`.
 
 **Last sync:** unreleased — Phase 14. Every commit that adds, removes,

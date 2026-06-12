@@ -26,7 +26,7 @@ Stack:
 ## 2. Pipeline
 
 ```
-source.cdl
+source.cd
    │
    ▼  lex + parse (hand-rolled state machine + recursive descent; uniform named-argument prefix syntax — see §3)
   AST

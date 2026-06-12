@@ -12,7 +12,7 @@
 //! <virtual-relvar-decl>  ::= 'virtual' 'relvar' IDENT '=' <unknown-body> ';'
 //! ```
 //!
-//! `<heading>` and `<key-clause>` are shared with `.cdl` via the
+//! `<heading>` and `<key-clause>` are shared with `.cd` via the
 //! corresponding `Parser` methods. `<unknown-body>` is parsed by
 //! consuming tokens to the next top-level `;` — virtual relvar RHS
 //! semantics land in Phase 16.

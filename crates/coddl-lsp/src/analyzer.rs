@@ -91,7 +91,7 @@ impl Analyzer {
     /// miss; reuses the cached snapshot when its version matches the
     /// document's current version.
     ///
-    /// For `.cdl` documents, runs the full `coddl_types::check`
+    /// For `.cd` documents, runs the full `coddl_types::check`
     /// pipeline (parse + typecheck + hints). For dialect documents
     /// (`.cddb` / `.cdmap` / `.cdstore`), runs the parser only — the
     /// typecheck pass for the new dialects lands in later phases.
@@ -196,7 +196,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_caches_per_version() {
         let analyzer = Analyzer::new();
-        let uri = url("file:///test.cdl");
+        let uri = url("file:///test.cd");
         analyzer
             .put_document(uri.clone(), 1, "oper main {} [];".to_string())
             .await;
@@ -209,7 +209,7 @@ mod tests {
     #[tokio::test]
     async fn did_change_invalidates_snapshot() {
         let analyzer = Analyzer::new();
-        let uri = url("file:///test.cdl");
+        let uri = url("file:///test.cd");
         analyzer
             .put_document(uri.clone(), 1, "oper main {} [];".to_string())
             .await;
@@ -231,7 +231,7 @@ mod tests {
     #[tokio::test]
     async fn closed_document_returns_none() {
         let analyzer = Analyzer::new();
-        let uri = url("file:///test.cdl");
+        let uri = url("file:///test.cd");
         analyzer
             .put_document(uri.clone(), 1, "oper main {} [];".to_string())
             .await;
@@ -290,7 +290,7 @@ mod tests {
         // put while a version-1 snapshot was in flight, callers
         // after version-2 see version-2 data.
         let analyzer = Arc::new(Analyzer::new());
-        let uri = url("file:///test.cdl");
+        let uri = url("file:///test.cd");
         analyzer
             .put_document(uri.clone(), 1, "oper main {} [];".to_string())
             .await;

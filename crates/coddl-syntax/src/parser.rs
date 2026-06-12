@@ -240,7 +240,7 @@ impl<'a> Parser<'a> {
 
     // ── Productions ──────────────────────────────────────────────────
 
-    /// Entry point for `.cdl` source. Wraps every top-level item in a
+    /// Entry point for `.cd` source. Wraps every top-level item in a
     /// [`SyntaxKind::ROOT`] node and flushes any trivia at the head or
     /// tail of the file.
     pub(crate) fn parse_root(&mut self) {
@@ -257,11 +257,33 @@ impl<'a> Parser<'a> {
     fn parse_item(&mut self) {
         if self.at_keyword("program") {
             self.parse_program_decl();
+        } else if self.at_keyword("database") {
+            self.parse_database_binding();
         } else if self.at_keyword("oper") {
             self.parse_oper_decl();
         } else {
             self.parse_unknown_item();
         }
+    }
+
+    /// `database <Name>;` — binds this program to a catalog. The
+    /// compiler discovers `<Name>.cddb` and `<Name>.cdstore` from the
+    /// declared name. v1 expects at most one binding per program;
+    /// duplicate bindings are tolerated at parse time and caught by
+    /// downstream validation (Phase 16).
+    fn parse_database_binding(&mut self) {
+        debug_assert!(self.at_keyword("database"));
+        self.start_node(SyntaxKind::DATABASE_BINDING);
+        self.bump(); // `database`
+
+        if !self.eat(SyntaxKind::IDENT) {
+            self.error("P0020", "expected database name");
+        }
+        if !self.eat(SyntaxKind::SEMICOLON) {
+            self.error("P0021", "expected `;` after `database <Name>`");
+        }
+
+        self.finish_node();
     }
 
     /// `program <name>;`. The trailing semicolon is required; missing
@@ -604,7 +626,7 @@ impl<'a> Parser<'a> {
     }
 
     /// `key { a, b, … }` — candidate-key clause on a relvar declaration.
-    /// Shared between `.cddb` base relvars (today) and `.cdl` public /
+    /// Shared between `.cddb` base relvars (today) and `.cd` public /
     /// private relvars (Phase 15). The leading `key` keyword has already
     /// been seen at the dispatch site.
     ///
@@ -761,6 +783,33 @@ mod tests {
         let out = parse_str("program foo");
         assert_eq!(out.tree.text(), "program foo");
         assert!(out.diagnostics.iter().any(|d| d.code == "P0003"));
+    }
+
+    #[test]
+    fn database_binding_parses_clean() {
+        let out = parse_str("program p;\ndatabase greetings;\n");
+        assert!(
+            out.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            out.diagnostics
+        );
+        let kinds: Vec<_> = out.tree.children().map(|n| n.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec![SyntaxKind::PROGRAM_DECL, SyntaxKind::DATABASE_BINDING]
+        );
+    }
+
+    #[test]
+    fn database_binding_missing_name_diagnoses_p0020() {
+        let out = parse_str("database ;");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0020"));
+    }
+
+    #[test]
+    fn database_binding_missing_semicolon_diagnoses_p0021() {
+        let out = parse_str("database greetings");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0021"));
     }
 
     #[test]

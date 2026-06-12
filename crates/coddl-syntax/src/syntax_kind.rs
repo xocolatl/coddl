@@ -129,9 +129,16 @@ pub enum SyntaxKind {
     NAMED_ARG,
 
     /// `key { a, b, … }` candidate-key clause on a relvar declaration.
-    /// Shared between `.cdl` application relvars and `.cddb` database
+    /// Shared between `.cd` application relvars and `.cddb` database
     /// relvars.
     KEY_CLAUSE,
+
+    /// `database <Name>;` declaration in `.cd` source, binding the
+    /// program to its database. Structurally identical to `.cddb`'s
+    /// `DATABASE_DECL` but used in the inverse role — there it
+    /// declares the catalog; here it declares which catalog the
+    /// program consumes.
+    DATABASE_BINDING,
 
     // ── `.cddb` dialect — database catalog ───────────────────────────
     /// Root of a parsed `.cddb` document.
@@ -304,6 +311,7 @@ mod tests {
             SyntaxKind::BLOCK,
             SyntaxKind::CALL_EXPR,
             SyntaxKind::KEY_CLAUSE,
+            SyntaxKind::DATABASE_BINDING,
             SyntaxKind::CDDB_ROOT,
             SyntaxKind::DATABASE_DECL,
             SyntaxKind::BASE_RELVAR_DECL,
