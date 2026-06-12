@@ -22,13 +22,13 @@
 //   - subset (⊆) for inclusion constraint: settled — `<=` polymorphic
 //     over relations (subset/superset). No separate `subset` keyword.
 //   - operator with relation-typed return: heading specified inline in
-//     the return-type clause. `-> Relation { p#: P#, ... }` parses as
+//     the return-type clause. `-> Relation { pid: PID, ... }` parses as
 //     a type generator application.
 
 program suppliers_and_parts;
 
-type S# { possrep s { val: Text }; };
-type P# { possrep p { val: Text }; };
+type SID { possrep s { val: Text }; };
+type PID { possrep p { val: Text }; };
 type Name { possrep n { val: Text }; };
 type Qty { possrep q { val: Integer } where val >= 0; };
 type Color { possrep c { val: Text }; };
@@ -37,36 +37,36 @@ type City { possrep c { val: Text }; };
 type Status { possrep s { val: Integer } where val >= 0 and val <= 100; };
 
 relvar S real {
-    s#: S#,
+    sid: SID,
     sname: Name,
     status: Status,
     city: City,
-} key { s# };
+} key { sid };
 
 relvar P real {
-    p#: P#,
+    pid: PID,
     pname: Name,
     color: Color,
     weight: Weight,
     city: City,
-} key { p# };
+} key { pid };
 
 relvar SP real {
-    s#: S#,
-    p#: P#,
+    sid: SID,
+    pid: PID,
     qty: Qty,
-} key { s#, p# };
+} key { sid, pid };
 
 // Referential integrity. RM Pre 23: constraints are checked at every
 // statement boundary, including the end of a multiple-assignment.
-constraint sp_supplier_ref: SP { s# } <= S { s# };
-constraint sp_part_ref:     SP { p# } <= P { p# };
+constraint sp_supplier_ref: SP { sid } <= S { sid };
+constraint sp_part_ref:     SP { pid } <= P { pid };
 
 // A query operator: for a given supplier, the parts they supply.
-// Result heading: { p#: P#, pname: Name, qty: Qty }.
-oper parts_for_supplier { supplier: S# } -> Relation { p#: P#, pname: Name, qty: Qty }
+// Result heading: { pid: PID, pname: Name, qty: Qty }.
+oper parts_for_supplier { supplier: SID } -> Relation { pid: PID, pname: Name, qty: Qty }
 [
-    return ((SP where s# = supplier) join P) { p#, pname, qty };
+    return ((SP where sid = supplier) join P) { pid, pname, qty };
 ];
 
 oper main {}
@@ -74,8 +74,8 @@ oper main {}
     // An ad-hoc query at the top level — no transaction; the runtime
     // wraps each top-level statement in an implicit BEGIN/COMMIT
     // (see §5 mandatory SQL emission rules).
-    var london_suppliers: Relation { s#: S#, sname: Name } :=
-        (S where city = City.c { val: "London" }) { s#, sname };
+    var london_suppliers: Relation { sid: SID, sname: Name } :=
+        (S where city = City.c { val: "London" }) { sid, sname };
 
     write_line { message: "London suppliers: {count(london_suppliers)}" };
 ];
