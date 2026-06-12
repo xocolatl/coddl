@@ -87,18 +87,26 @@ unnamed-address constant for the bytes and records `Text { ptr_op:
 expands each `Text`-typed argument into two operands at the LLVM
 call site.
 
-**Worked example.** Hello-world lowers to:
+**Worked example.** Hello-world lowers to (the `coddl_runtime_init`
+and `coddl_runtime_shutdown` calls are auto-injected by ProcIR
+lowering around `main`'s body — see `docs/procir.md` — and flow
+through the standard `Inst::Call` path; the backend has no special-
+case for them):
 
 ```llvm
 ; ModuleID = 'hello_world'
 
 declare void @coddl_write_line(ptr, i64)
+declare i64 @coddl_runtime_init()
+declare i64 @coddl_runtime_shutdown()
 
 @.str.0 = private unnamed_addr constant [13 x i8] c"Hello, world!"
 
 define i32 @main() {
 block_0:
+    %v0 = call i64 @coddl_runtime_init()
     call void @coddl_write_line(ptr @.str.0, i64 13)
+    %v2 = call i64 @coddl_runtime_shutdown()
     ret i32 0
 }
 ```
@@ -138,8 +146,11 @@ call. `Unit`-returning callees don't update the value map.
 
 **Artifact shape.** A platform object file — Mach-O on macOS, ELF on
 Linux. Exported symbol: `main`. Imported symbols: every distinct
-extern referenced (today: `coddl_write_line`). Read-only data
-section contains every string literal in the module.
+extern referenced (today: `coddl_write_line`, `coddl_runtime_init`,
+`coddl_runtime_shutdown` — the latter two are auto-injected by
+ProcIR lowering around `main`'s body, see `docs/procir.md`; the
+backend has no special-case for them). Read-only data section
+contains every string literal in the module.
 
 
 ## End-to-end pipeline

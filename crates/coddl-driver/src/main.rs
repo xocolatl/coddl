@@ -1,9 +1,13 @@
 //! `coddl` — the command-line driver.
 
-use std::io::{self, Read, Write};
-use std::process::ExitCode;
+mod link;
+mod runtime;
 
-use coddl_diagnostics::FileId;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
+
+use coddl_diagnostics::{Diagnostic, FileId, Severity};
 use coddl_syntax::{SyntaxElement, SyntaxNode};
 
 fn main() -> ExitCode {
@@ -19,6 +23,8 @@ fn main() -> ExitCode {
         Some("lower") => cmd_lower(&args[2..]),
         Some("emit-llvm") => cmd_emit_llvm(&args[2..]),
         Some("emit-obj") => cmd_emit_obj(&args[2..]),
+        Some("compile") => cmd_compile(&args[2..]),
+        Some("run") => cmd_run(&args[2..]),
         Some("fmt") => cmd_fmt(&args[2..]),
         _ => {
             eprintln!("usage: coddl <subcommand> [args]");
@@ -31,6 +37,11 @@ fn main() -> ExitCode {
             eprintln!("  emit-llvm <file>     emit LLVM IR text for <file>");
             eprintln!("  emit-obj <file>      emit a native object file via Cranelift");
             eprintln!("                       [-o <path>] writes to <path> (default stdout)");
+            eprintln!("  compile <file>       compile <file> to a native binary");
+            eprintln!("                       [--backend=llvm|cranelift] (default llvm)");
+            eprintln!("                       [-o <path>] (default <basename> in CWD)");
+            eprintln!("  run <file>           compile + run <file>, propagating exit code");
+            eprintln!("                       [--backend=llvm|cranelift] (default cranelift)");
             eprintln!("  fmt <file>           run the formatter on <file> (or stdin if -)");
             eprintln!("  --version            print version");
             ExitCode::from(2)
@@ -324,6 +335,249 @@ fn cmd_emit_obj(args: &[String]) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// Which backend a `compile` or `run` invocation should use. Defaults
+/// differ per subcommand: `compile` defaults to LLVM (optimized
+/// AOT), `run` to Cranelift (fast iteration).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Backend {
+    Llvm,
+    Cranelift,
+}
+
+impl Backend {
+    fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "llvm" => Ok(Backend::Llvm),
+            "cranelift" => Ok(Backend::Cranelift),
+            other => Err(format!(
+                "unknown backend `{other}` (expected `llvm` or `cranelift`)"
+            )),
+        }
+    }
+}
+
+/// Parse the `--backend=<name>` and `-o <path>` flags out of an
+/// argument list. Whatever isn't a known flag becomes a positional
+/// argument; the caller decides what to do with positionals.
+struct CompileArgs {
+    backend: Option<Backend>,
+    output: Option<String>,
+    positional: Vec<String>,
+}
+
+fn parse_compile_args(args: &[String], cmd: &str) -> Result<CompileArgs, ExitCode> {
+    let mut backend: Option<Backend> = None;
+    let mut output: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if let Some(value) = arg.strip_prefix("--backend=") {
+            match Backend::parse(value) {
+                Ok(b) => backend = Some(b),
+                Err(msg) => {
+                    eprintln!("coddl {cmd}: {msg}");
+                    return Err(ExitCode::from(2));
+                }
+            }
+            i += 1;
+        } else if arg == "-o" {
+            if i + 1 >= args.len() {
+                eprintln!("coddl {cmd}: `-o` requires a path argument");
+                return Err(ExitCode::from(2));
+            }
+            output = Some(args[i + 1].clone());
+            i += 2;
+        } else {
+            positional.push(arg.clone());
+            i += 1;
+        }
+    }
+
+    Ok(CompileArgs {
+        backend,
+        output,
+        positional,
+    })
+}
+
+fn print_diagnostics(diagnostics: &[Diagnostic]) {
+    for d in diagnostics {
+        eprintln!(
+            "{}: {} [{}] at {}..{}",
+            d.severity, d.message, d.code, d.span.start, d.span.end
+        );
+    }
+}
+
+/// Lower `source` to ProcIR. Returns `None` if any error diagnostic
+/// was emitted; diagnostics print to stderr unconditionally.
+fn lower_or_bail(source: &str) -> Option<coddl_procir::Module> {
+    let out = coddl_procir::lower(source, FileId(0));
+    print_diagnostics(&out.diagnostics);
+    if out
+        .diagnostics
+        .iter()
+        .any(|d| d.severity == Severity::Error)
+    {
+        return None;
+    }
+    out.module
+}
+
+/// Build the binary for `module` at `output_path` using `backend`,
+/// using `scratch` for intermediate artifacts.
+fn build_binary(
+    module: &coddl_procir::Module,
+    backend: Backend,
+    output_path: &Path,
+    runtime: &Path,
+    scratch: &tempfile::TempDir,
+    cmd: &str,
+) -> Result<(), ExitCode> {
+    use coddl_procir::Codegen as _;
+    match backend {
+        Backend::Llvm => {
+            let mut be = coddl_codegen_llvm::LlvmBackend::new();
+            let ir = be.emit(module).map_err(|err| {
+                eprintln!("coddl {cmd}: {err}");
+                ExitCode::from(1)
+            })?;
+            link::link_llvm_ir(&ir, output_path, runtime, scratch).map_err(|err| {
+                eprintln!("coddl {cmd}: {err}");
+                ExitCode::from(1)
+            })
+        }
+        Backend::Cranelift => {
+            let mut be = coddl_codegen_cranelift::CraneliftBackend::new().map_err(|err| {
+                eprintln!("coddl {cmd}: {err}");
+                ExitCode::from(1)
+            })?;
+            let obj = be.emit(module).map_err(|err| {
+                eprintln!("coddl {cmd}: {err}");
+                ExitCode::from(1)
+            })?;
+            link::link_cranelift_object(&obj, output_path, runtime, scratch).map_err(|err| {
+                eprintln!("coddl {cmd}: {err}");
+                ExitCode::from(1)
+            })
+        }
+    }
+}
+
+fn cmd_compile(args: &[String]) -> ExitCode {
+    let parsed = match parse_compile_args(args, "compile") {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let backend = parsed.backend.unwrap_or(Backend::Llvm);
+
+    let Some(source) = read_input(&parsed.positional, "compile") else {
+        return ExitCode::from(1);
+    };
+    let Some(module) = lower_or_bail(&source) else {
+        return ExitCode::from(1);
+    };
+
+    let output_path = match parsed.output {
+        Some(p) => PathBuf::from(p),
+        None => match parsed.positional.first().map(String::as_str) {
+            Some(path) if path != "-" => {
+                let stem = Path::new(path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("a.out");
+                PathBuf::from(stem)
+            }
+            _ => {
+                eprintln!("coddl compile: stdin input requires `-o <path>`");
+                return ExitCode::from(2);
+            }
+        },
+    };
+
+    let runtime = match runtime::discover() {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("coddl compile: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let scratch = match tempfile::tempdir() {
+        Ok(t) => t,
+        Err(err) => {
+            eprintln!("coddl compile: tempdir: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    match build_binary(
+        &module,
+        backend,
+        &output_path,
+        &runtime,
+        &scratch,
+        "compile",
+    ) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(code) => code,
+    }
+}
+
+fn cmd_run(args: &[String]) -> ExitCode {
+    let parsed = match parse_compile_args(args, "run") {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let backend = parsed.backend.unwrap_or(Backend::Cranelift);
+    if parsed.output.is_some() {
+        eprintln!("coddl run: `-o` is not accepted; use `coddl compile` to write a binary");
+        return ExitCode::from(2);
+    }
+
+    let Some(source) = read_input(&parsed.positional, "run") else {
+        return ExitCode::from(1);
+    };
+    let Some(module) = lower_or_bail(&source) else {
+        return ExitCode::from(1);
+    };
+
+    let runtime = match runtime::discover() {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("coddl run: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let scratch = match tempfile::tempdir() {
+        Ok(t) => t,
+        Err(err) => {
+            eprintln!("coddl run: tempdir: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    let binary = scratch.path().join("coddl_run");
+
+    if let Err(code) = build_binary(&module, backend, &binary, &runtime, &scratch, "run") {
+        return code;
+    }
+
+    let status = match Command::new(&binary).status() {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("coddl run: spawn {}: {err}", binary.display());
+            return ExitCode::from(1);
+        }
+    };
+    match status.code() {
+        Some(code) => ExitCode::from(code as u8),
+        None => ExitCode::from(128), // killed by signal
+    }
 }
 
 fn cmd_fmt(args: &[String]) -> ExitCode {

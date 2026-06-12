@@ -133,6 +133,24 @@ impl Lowerer {
         });
     }
 
+    /// Register a runtime entry-point extern whose name *is* its
+    /// linkage symbol (`coddl_runtime_init`, `coddl_runtime_shutdown`).
+    /// Used by `main`'s init/shutdown wrapping; the synthetic extern
+    /// participates in the same `seen_externs` deduplication as the
+    /// builtin-mapped externs.
+    fn ensure_runtime_extern(&mut self, linkage: &'static str) {
+        if !self.seen_externs.insert(linkage) {
+            return;
+        }
+        self.functions.push(Function {
+            name: linkage.to_string(),
+            linkage_name: linkage.to_string(),
+            params: Vec::new(),
+            return_type: ProcType::Integer,
+            blocks: Vec::new(),
+        });
+    }
+
     // ── Walks ────────────────────────────────────────────────────────
 
     fn lower_root(&mut self, root: &Root) -> Module {
@@ -185,9 +203,39 @@ impl Lowerer {
             }
         }
 
+        let is_main = name == "main";
+
         let block_id = self.fresh_block();
+
+        // The compiled program's startup must call the runtime before
+        // touching any other extern (ARCHITECTURE.md §6). Today the
+        // stubs are no-ops, but wiring it now means future runtime
+        // work — DB connection pool, prepared-statement cache,
+        // arena setup — slots in without a codegen change.
+        if is_main {
+            self.ensure_runtime_extern("coddl_runtime_init");
+            let dst = self.fresh_value();
+            self.insts.push(Inst::Call {
+                dst: Some(dst),
+                callee: "coddl_runtime_init".to_string(),
+                args: Vec::new(),
+                return_type: ProcType::Integer,
+            });
+        }
+
         if let Some(body) = decl.body() {
             self.lower_block(&body);
+        }
+
+        if is_main {
+            self.ensure_runtime_extern("coddl_runtime_shutdown");
+            let dst = self.fresh_value();
+            self.insts.push(Inst::Call {
+                dst: Some(dst),
+                callee: "coddl_runtime_shutdown".to_string(),
+                args: Vec::new(),
+                return_type: ProcType::Integer,
+            });
         }
 
         let block = BasicBlock {
@@ -422,24 +470,47 @@ mod tests {
     }
 
     #[test]
-    fn hello_world_lowers_to_two_functions() {
+    fn hello_world_lowers_to_four_functions() {
+        // `main` plus three runtime externs: write_line for the user
+        // call, init + shutdown for the auto-wrapped startup
+        // housekeeping ARCHITECTURE.md §6 requires.
         let m = lower_ok(HELLO_WORLD);
         let names: Vec<_> = m.functions.iter().map(|f| f.name.as_str()).collect();
-        assert!(
-            names.contains(&"main") && names.contains(&"write_line"),
-            "expected main + write_line in {names:?}"
-        );
-        assert_eq!(m.functions.len(), 2);
+        for needed in [
+            "main",
+            "write_line",
+            "coddl_runtime_init",
+            "coddl_runtime_shutdown",
+        ] {
+            assert!(names.contains(&needed), "expected {needed} in {names:?}");
+        }
+        assert_eq!(m.functions.len(), 4);
     }
 
     #[test]
-    fn hello_world_main_body_is_const_call_return() {
+    fn hello_world_main_body_is_init_const_call_shutdown() {
         let m = lower_ok(HELLO_WORLD);
         let main = m.functions.iter().find(|f| f.name == "main").unwrap();
         assert_eq!(main.blocks.len(), 1);
         let block = &main.blocks[0];
-        assert_eq!(block.insts.len(), 2);
+        assert_eq!(block.insts.len(), 4);
+
+        // 1. init wrapper call.
         match &block.insts[0] {
+            Inst::Call {
+                callee,
+                args,
+                return_type: ProcType::Integer,
+                ..
+            } => {
+                assert_eq!(callee, "coddl_runtime_init");
+                assert!(args.is_empty());
+            }
+            other => panic!("expected init Call, got {other:?}"),
+        }
+
+        // 2. string constant.
+        match &block.insts[1] {
             Inst::Const {
                 value: Const::Text(bytes),
                 ty: ProcType::Text,
@@ -447,7 +518,9 @@ mod tests {
             } => assert_eq!(bytes, b"Hello, world!"),
             other => panic!("expected Const Text, got {other:?}"),
         }
-        match &block.insts[1] {
+
+        // 3. write_line call.
+        match &block.insts[2] {
             Inst::Call {
                 dst: None,
                 callee,
@@ -457,7 +530,21 @@ mod tests {
                 assert_eq!(callee, "coddl_write_line");
                 assert_eq!(args.len(), 1);
             }
-            other => panic!("expected Call, got {other:?}"),
+            other => panic!("expected write_line Call, got {other:?}"),
+        }
+
+        // 4. shutdown wrapper call.
+        match &block.insts[3] {
+            Inst::Call {
+                callee,
+                args,
+                return_type: ProcType::Integer,
+                ..
+            } => {
+                assert_eq!(callee, "coddl_runtime_shutdown");
+                assert!(args.is_empty());
+            }
+            other => panic!("expected shutdown Call, got {other:?}"),
         }
         assert!(matches!(block.terminator, Terminator::Return(None)));
     }
@@ -480,13 +567,20 @@ mod tests {
         let m = lower_ok(src);
         let main = m.functions.iter().find(|f| f.name == "main").unwrap();
         let block = &main.blocks[0];
-        match &block.insts[0] {
-            Inst::Const {
-                value: Const::Text(bytes),
-                ..
-            } => assert_eq!(bytes, b"a\nb"),
-            other => panic!("expected Const Text, got {other:?}"),
-        }
+        // `main`'s body is wrapped by init/shutdown; the user's
+        // string constant lives between them.
+        let text_const = block
+            .insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::Const {
+                    value: Const::Text(bytes),
+                    ..
+                } => Some(bytes.as_slice()),
+                _ => None,
+            })
+            .expect("expected a Const Text in main");
+        assert_eq!(text_const, b"a\nb");
     }
 
     #[test]
@@ -519,6 +613,9 @@ mod tests {
 
     #[test]
     fn call_to_write_line_uses_coddl_prefix_in_linkage_name() {
+        // Among `main`'s calls, exactly one routes a Text argument —
+        // that's the write_line site. Its callee must be the linkage
+        // name, not the surface name.
         let m = lower_ok(HELLO_WORLD);
         let main = m.functions.iter().find(|f| f.name == "main").unwrap();
         let call = main
@@ -526,7 +623,7 @@ mod tests {
             .iter()
             .flat_map(|b| &b.insts)
             .find_map(|i| match i {
-                Inst::Call { callee, .. } => Some(callee.as_str()),
+                Inst::Call { callee, args, .. } if !args.is_empty() => Some(callee.as_str()),
                 _ => None,
             })
             .unwrap();

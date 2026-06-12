@@ -76,6 +76,7 @@ walk shape. Each `check_<x>` in `coddl-types::checker` has a sibling
 | `Root`         | `Module { program_name, functions }`. Iterates items in source order.                        |
 | `ProgramDecl`  | Sets `Module::program_name`. No instruction emitted.                                         |
 | `OperDecl`     | One `Function` with one `BasicBlock` (`block_0`) and `Terminator::Return(None)`. Heading params become `Function::params` typed via `ProcType`. |
+| `OperDecl` named `main` | As above, *plus* the body is wrapped with `Inst::Call("coddl_runtime_init")` at the top and `Inst::Call("coddl_runtime_shutdown")` at the bottom. Synthetic externs for both are registered through the same `seen_externs` dedup that handles the builtin → extern map. ARCHITECTURE.md §6 mandates this; the runtime stubs are no-ops today but wiring it in lowering means future runtime growth (DB pool, prepared-statement cache) lands without a codegen change. |
 | `Heading` / `Param` / `TypeRef` | Consumed into `Function::params`.                                                |
 | `Block`        | Inlined into the surrounding `Function`'s sole `BasicBlock` today; multi-block control-flow lands when `if` / `match` / `while` do. |
 | `Stmt::ExprStmt` | `lower_expr` is called and its result discarded.                                           |

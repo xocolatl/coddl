@@ -217,6 +217,7 @@ dependencies = [
  "coddl-sqlemit",
  "coddl-syntax",
  "coddl-types",
+ "tempfile",
 ]
 
 [[package]]
