@@ -5,7 +5,20 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "ProcIR → Cranelift (planned). REPL JIT + toolchain-free AOT."
+description = "ProcIR → Cranelift object emission. REPL JIT + toolchain-free AOT."
 
 [dependencies]
 coddl-procir.workspace = true
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+cranelift-module.workspace = true
+cranelift-native.workspace = true
+cranelift-object.workspace = true
+target-lexicon.workspace = true
+
+[dev-dependencies]
+coddl-diagnostics.workspace = true
+coddl-procir.workspace = true
+coddl-runtime.workspace = true
+object.workspace = true
+tempfile.workspace = true

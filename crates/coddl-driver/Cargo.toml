@@ -20,5 +20,6 @@ coddl-procir.workspace = true
 coddl-sqlemit.workspace = true
 coddl-execlocal.workspace = true
 coddl-codegen-llvm.workspace = true
+coddl-codegen-cranelift.workspace = true
 coddl-runtime.workspace = true
 coddl-fmt.workspace = true

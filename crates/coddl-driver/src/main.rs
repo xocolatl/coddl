@@ -17,17 +17,22 @@ fn main() -> ExitCode {
         Some("parse") => cmd_parse(&args[2..]),
         Some("check") => cmd_check(&args[2..]),
         Some("lower") => cmd_lower(&args[2..]),
+        Some("emit-llvm") => cmd_emit_llvm(&args[2..]),
+        Some("emit-obj") => cmd_emit_obj(&args[2..]),
         Some("fmt") => cmd_fmt(&args[2..]),
         _ => {
             eprintln!("usage: coddl <subcommand> [args]");
             eprintln!();
             eprintln!("subcommands:");
-            eprintln!("  lex <file>     run the lexer on <file> (or stdin if -)");
-            eprintln!("  parse <file>   parse <file> and dump the syntax tree");
-            eprintln!("  check <file>   typecheck <file> (or stdin if -)");
-            eprintln!("  lower <file>   lower <file> to ProcIR and dump it");
-            eprintln!("  fmt <file>     run the formatter on <file> (or stdin if -)");
-            eprintln!("  --version      print version");
+            eprintln!("  lex <file>           run the lexer on <file> (or stdin if -)");
+            eprintln!("  parse <file>         parse <file> and dump the syntax tree");
+            eprintln!("  check <file>         typecheck <file> (or stdin if -)");
+            eprintln!("  lower <file>         lower <file> to ProcIR and dump it");
+            eprintln!("  emit-llvm <file>     emit LLVM IR text for <file>");
+            eprintln!("  emit-obj <file>      emit a native object file via Cranelift");
+            eprintln!("                       [-o <path>] writes to <path> (default stdout)");
+            eprintln!("  fmt <file>           run the formatter on <file> (or stdin if -)");
+            eprintln!("  --version            print version");
             ExitCode::from(2)
         }
     }
@@ -212,6 +217,113 @@ fn cmd_lower(args: &[String]) -> ExitCode {
         }
         ExitCode::from(1)
     }
+}
+
+fn cmd_emit_llvm(args: &[String]) -> ExitCode {
+    let Some(source) = read_input(args, "emit-llvm") else {
+        return ExitCode::from(1);
+    };
+
+    let lower_out = coddl_procir::lower(&source, FileId(0));
+    for d in &lower_out.diagnostics {
+        eprintln!(
+            "{}: {} [{}] at {}..{}",
+            d.severity, d.message, d.code, d.span.start, d.span.end
+        );
+    }
+    let Some(module) = lower_out.module else {
+        return ExitCode::from(1);
+    };
+
+    let mut backend = coddl_codegen_llvm::LlvmBackend::new();
+    use coddl_procir::Codegen as _;
+    match backend.emit(&module) {
+        Ok(text) => {
+            let stdout = io::stdout();
+            let mut w = stdout.lock();
+            if w.write_all(text.as_bytes()).is_err() {
+                return ExitCode::from(1);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("coddl emit-llvm: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn cmd_emit_obj(args: &[String]) -> ExitCode {
+    // Parse an optional `-o <path>` from `args`. The remaining positional
+    // is the input file (or stdin via `-`).
+    let mut out_path: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" => {
+                if i + 1 >= args.len() {
+                    eprintln!("coddl emit-obj: `-o` requires a path argument");
+                    return ExitCode::from(2);
+                }
+                out_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            other => {
+                positional.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+
+    let Some(source) = read_input(&positional, "emit-obj") else {
+        return ExitCode::from(1);
+    };
+
+    let lower_out = coddl_procir::lower(&source, FileId(0));
+    for d in &lower_out.diagnostics {
+        eprintln!(
+            "{}: {} [{}] at {}..{}",
+            d.severity, d.message, d.code, d.span.start, d.span.end
+        );
+    }
+    let Some(module) = lower_out.module else {
+        return ExitCode::from(1);
+    };
+
+    let mut backend = match coddl_codegen_cranelift::CraneliftBackend::new() {
+        Ok(b) => b,
+        Err(err) => {
+            eprintln!("coddl emit-obj: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    use coddl_procir::Codegen as _;
+    let bytes = match backend.emit(&module) {
+        Ok(b) => b,
+        Err(err) => {
+            eprintln!("coddl emit-obj: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    match out_path {
+        Some(path) => {
+            if let Err(err) = std::fs::write(&path, &bytes) {
+                eprintln!("coddl emit-obj: write {path}: {err}");
+                return ExitCode::from(1);
+            }
+        }
+        None => {
+            let stdout = io::stdout();
+            let mut w = stdout.lock();
+            if w.write_all(&bytes).is_err() {
+                return ExitCode::from(1);
+            }
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn cmd_fmt(args: &[String]) -> ExitCode {

@@ -10,3 +10,9 @@ description = "ProcIR → LLVM IR text emission (v1 codegen backend)."
 [dependencies]
 coddl-procir.workspace = true
 pretty.workspace = true
+
+[dev-dependencies]
+coddl-diagnostics.workspace = true
+coddl-procir.workspace = true
+coddl-runtime.workspace = true
+tempfile.workspace = true

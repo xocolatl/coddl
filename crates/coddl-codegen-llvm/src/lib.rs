@@ -5,3 +5,9 @@
 //! and we don't need programmatic IR introspection). The same emitter
 //! covers native targets and `wasm32-*` via the target triple.
 //! See ARCHITECTURE.md §1, §4.
+
+pub mod emit;
+pub mod error;
+
+pub use emit::LlvmBackend;
+pub use error::LlvmEmitError;

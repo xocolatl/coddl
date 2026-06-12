@@ -16,6 +16,7 @@
 //! struct layouts here are the single source of truth — LLVM codegen
 //! mirrors them; drift between the two is a debug nightmare.
 
+use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// FFI error codes. `0` is success; any nonzero value is a failure whose
@@ -73,6 +74,23 @@ pub unsafe extern "C" fn coddl_runtime_shutdown() -> CoddlStatus {
     CoddlStatus::Ok
 }
 
+/// Write `len` bytes from `ptr` to stdout, followed by a newline.
+/// The compiled program's `write_line` operator lowers to a call to
+/// this symbol.
+///
+/// # Safety
+/// `ptr` must point to at least `len` initialized bytes; the slice
+/// is read only for the duration of the call. UTF-8 validity is the
+/// caller's responsibility — the runtime writes raw bytes.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_write_line(ptr: *const u8, len: usize) {
+    let slice = std::slice::from_raw_parts(ptr, len);
+    let stdout = std::io::stdout();
+    let mut w = stdout.lock();
+    let _ = w.write_all(slice);
+    let _ = w.write_all(b"\n");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,5 +103,14 @@ mod tests {
             assert_eq!(coddl_runtime_shutdown(), CoddlStatus::Ok);
             assert_eq!(coddl_runtime_shutdown(), CoddlStatus::Ok);
         }
+    }
+
+    #[test]
+    fn write_line_callable_through_pointer() {
+        // Smoke test: round-trip an empty slice through the C ABI and
+        // confirm the call doesn't UB. Output verification is done
+        // by the codegen e2e tests, which check the printed text.
+        let bytes: &[u8] = b"";
+        unsafe { coddl_write_line(bytes.as_ptr(), bytes.len()) };
     }
 }
