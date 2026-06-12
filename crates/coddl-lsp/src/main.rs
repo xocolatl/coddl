@@ -1,48 +1,46 @@
 //! `coddl-lsp` — the Coddl language server.
 //!
-//! Thin `tower-lsp` adapter: owns document state and request dispatch,
-//! delegates analysis to the frontend crates. Capabilities today:
-//! syntax highlighting (driven by the VSCode extension's TextMate
-//! grammar), document formatting via `coddl-fmt`, and inlay hints
-//! surfacing inferred types from `coddl-types`. Diagnostics streaming,
-//! semantic tokens, hover, and completion all reuse the same
-//! document state + frontend pipeline when they land.
+//! Thin `tower-lsp` adapter over an `Analyzer` (per-document
+//! analysis cache + version tracking + threaded compute). Today's
+//! capabilities: document sync, formatting via `coddl-fmt`,
+//! inferred-type inlay hints, and push-on-edit diagnostics. Each
+//! future feature (hover, go-to-def, completion, semantic tokens)
+//! lands as a handler that calls `analyzer.snapshot(uri)` and
+//! reads what it needs.
 
+mod analyzer;
 mod line_index;
+mod lsp_convert;
 
-use std::collections::HashMap;
+use std::sync::Arc;
 
-use coddl_diagnostics::FileId;
-use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-use crate::line_index::LineIndex;
+use crate::analyzer::Analyzer;
 
-/// Per-document state. Today just the source text — the typechecker
-/// re-runs on each request, which is fast enough for hello-world-
-/// sized files. When perf matters, this is where the parsed CST,
-/// type tables, and incremental-recompile state move in.
 struct CoddlLsp {
     client: Client,
-    documents: RwLock<HashMap<Url, String>>,
+    analyzer: Arc<Analyzer>,
 }
 
 impl CoddlLsp {
-    async fn put_document(&self, uri: Url, text: String) {
-        let mut docs = self.documents.write().await;
-        docs.insert(uri, text);
-    }
-
-    async fn remove_document(&self, uri: &Url) {
-        let mut docs = self.documents.write().await;
-        docs.remove(uri);
-    }
-
-    async fn read_document(&self, uri: &Url) -> Option<String> {
-        let docs = self.documents.read().await;
-        docs.get(uri).cloned()
+    /// Compute the snapshot for `uri` and push its diagnostics to
+    /// the client. Used by `did_open` and `did_change` to surface
+    /// errors as the user types.
+    async fn publish_diagnostics_for(&self, uri: &Url) {
+        let Some(snap) = self.analyzer.snapshot(uri).await else {
+            return;
+        };
+        let diagnostics: Vec<_> = snap
+            .diagnostics
+            .iter()
+            .map(|d| lsp_convert::diagnostic(d, &snap.line_index))
+            .collect();
+        self.client
+            .publish_diagnostics(uri.clone(), diagnostics, Some(snap.version))
+            .await;
     }
 }
 
@@ -78,21 +76,38 @@ impl LanguageServer for CoddlLsp {
     // ── Document sync ───────────────────────────────────────────────
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        self.put_document(params.text_document.uri, params.text_document.text)
+        let uri = params.text_document.uri.clone();
+        self.analyzer
+            .put_document(
+                params.text_document.uri,
+                params.text_document.version,
+                params.text_document.text,
+            )
             .await;
+        self.publish_diagnostics_for(&uri).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        // We advertise `TextDocumentSyncKind::FULL`, so each change
-        // event carries the entire buffer; the last one wins.
-        if let Some(change) = params.content_changes.into_iter().last() {
-            self.put_document(params.text_document.uri, change.text)
-                .await;
-        }
+        // FULL sync mode: each change carries the whole buffer.
+        let Some(change) = params.content_changes.into_iter().last() else {
+            return;
+        };
+        let uri = params.text_document.uri.clone();
+        self.analyzer
+            .put_document(
+                params.text_document.uri,
+                params.text_document.version,
+                change.text,
+            )
+            .await;
+        self.publish_diagnostics_for(&uri).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.remove_document(&params.text_document.uri).await;
+        let uri = params.text_document.uri;
+        self.analyzer.close_document(&uri).await;
+        // Clear any lingering squiggles from the editor's view.
+        self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
 
     // ── Formatting ──────────────────────────────────────────────────
@@ -101,17 +116,14 @@ impl LanguageServer for CoddlLsp {
         &self,
         params: DocumentFormattingParams,
     ) -> LspResult<Option<Vec<TextEdit>>> {
-        let source = match self.read_document(&params.text_document.uri).await {
-            Some(s) => s,
-            None => return Ok(None),
+        let Some(snap) = self.analyzer.snapshot(&params.text_document.uri).await else {
+            return Ok(None);
         };
-        let out = coddl_fmt::format(&source, &coddl_fmt::FormatOptions::default());
-        if out.text == source {
+        let out = coddl_fmt::format(&snap.source, &coddl_fmt::FormatOptions::default());
+        if out.text.as_str() == snap.source.as_ref() {
             return Ok(None);
         }
-        // Replace the entire buffer. A future tightening compares
-        // line-by-line and emits minimal edits.
-        let line_count = source.lines().count().max(1) as u32;
+        let line_count = snap.source.lines().count().max(1) as u32;
         Ok(Some(vec![TextEdit {
             range: Range::new(Position::new(0, 0), Position::new(line_count, 0)),
             new_text: out.text,
@@ -121,27 +133,19 @@ impl LanguageServer for CoddlLsp {
     // ── Inlay hints ────────────────────────────────────────────────
 
     async fn inlay_hint(&self, params: InlayHintParams) -> LspResult<Option<Vec<InlayHint>>> {
-        let source = match self.read_document(&params.text_document.uri).await {
-            Some(s) => s,
-            None => return Ok(None),
+        let Some(snap) = self.analyzer.snapshot(&params.text_document.uri).await else {
+            return Ok(None);
         };
-        let check_out = coddl_types::check(&source, FileId(0));
-        let line_index = LineIndex::new(&source);
-
-        let hints: Vec<InlayHint> = check_out
+        let hints: Vec<InlayHint> = snap
             .hints
             .iter()
             .map(|h| {
-                // Label prefix follows the surface syntax: `: T` for
-                // a binding annotation, `-> T` for an operator return
-                // clause. The leading space on `OperReturn` ghosts in
-                // between the heading and the body.
                 let label = match h.kind {
                     coddl_types::HintKind::LetBinding => format!(": {}", h.ty),
                     coddl_types::HintKind::OperReturn => format!(" -> {}", h.ty),
                 };
                 InlayHint {
-                    position: line_index.position(h.span.start),
+                    position: snap.line_index.position(h.span.start),
                     label: InlayHintLabel::String(label),
                     kind: Some(InlayHintKind::TYPE),
                     tooltip: None,
@@ -162,7 +166,7 @@ async fn main() {
     let stdout = tokio::io::stdout();
     let (service, socket) = LspService::new(|client| CoddlLsp {
         client,
-        documents: RwLock::new(HashMap::new()),
+        analyzer: Arc::new(Analyzer::new()),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
