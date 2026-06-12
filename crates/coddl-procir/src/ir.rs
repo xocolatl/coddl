@@ -11,6 +11,8 @@
 
 use std::fmt;
 
+pub use coddl_types::{Heading, Type};
+
 /// One compilation unit.
 #[derive(Clone, Debug)]
 pub struct Module {
@@ -72,6 +74,29 @@ pub enum Inst {
         args: Vec<ValueId>,
         return_type: ProcType,
     },
+    /// Build a tuple value from its fields, in canonical heading
+    /// order. The `heading` is the type-level shape; `fields` holds
+    /// the SSA values, one per attribute, paired with the attribute
+    /// name. Tuples are pure value types — no heap, no RC. Backends
+    /// represent them as a compile-time grouping over the field SSA
+    /// values; at ABI boundaries the fields flatten into their
+    /// component scalar operands (the same shape as `Text → (ptr,
+    /// len)`, recursive for nested tuples).
+    TupleLit {
+        dst: ValueId,
+        fields: Vec<(String, ValueId)>,
+        heading: Heading,
+    },
+    /// Project a single field out of a tuple. `field_type` is the
+    /// attribute's ProcType (carried so backends needn't re-lookup
+    /// through the heading). Like `TupleLit`, this is a compile-time
+    /// projection — no runtime work.
+    TupleField {
+        dst: ValueId,
+        src: ValueId,
+        field_name: String,
+        field_type: ProcType,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -93,11 +118,17 @@ pub enum Const {
 }
 
 /// Machine-level type. Not the surface `Type` from `coddl-types` —
-/// `Tuple H` becomes a struct layout (deferred), `Relation` and
-/// `Sequence` become runtime handles (`Pointer`). Every built-in
-/// scalar gets a variant from day one so backends can pattern-match
+/// `Relation` and `Sequence` become runtime handles (`Pointer`).
+/// `Tuple(H)` carries the same heading the typechecker reasoned about;
+/// at ABI boundaries each attribute flattens into its component
+/// scalar operands (nested tuples recursively). Every built-in scalar
+/// gets a variant from day one so backends can pattern-match
 /// exhaustively.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// Not `Copy` — the `Tuple` variant carries a heap-backed heading.
+/// Clone is cheap relative to typical compile-time data sizes; runtime
+/// never touches `ProcType` values.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProcType {
     Integer,
     Rational,
@@ -109,6 +140,7 @@ pub enum ProcType {
     Boolean,
     Unit,
     Pointer,
+    Tuple(Heading),
 }
 
 // ── Display ──────────────────────────────────────────────────────────
@@ -127,18 +159,19 @@ impl fmt::Display for BlockId {
 
 impl fmt::Display for ProcType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            ProcType::Integer => "Integer",
-            ProcType::Rational => "Rational",
-            ProcType::Approximate => "Approximate",
-            ProcType::Text => "Text",
-            ProcType::Character => "Character",
-            ProcType::Binary => "Binary",
-            ProcType::Byte => "Byte",
-            ProcType::Boolean => "Boolean",
-            ProcType::Unit => "Unit",
-            ProcType::Pointer => "Pointer",
-        })
+        match self {
+            ProcType::Integer => f.write_str("Integer"),
+            ProcType::Rational => f.write_str("Rational"),
+            ProcType::Approximate => f.write_str("Approximate"),
+            ProcType::Text => f.write_str("Text"),
+            ProcType::Character => f.write_str("Character"),
+            ProcType::Binary => f.write_str("Binary"),
+            ProcType::Byte => f.write_str("Byte"),
+            ProcType::Boolean => f.write_str("Boolean"),
+            ProcType::Unit => f.write_str("Unit"),
+            ProcType::Pointer => f.write_str("Pointer"),
+            ProcType::Tuple(h) => write!(f, "Tuple {h}"),
+        }
     }
 }
 
@@ -188,6 +221,22 @@ impl fmt::Display for Inst {
                 }
                 f.write_str(")")
             }
+            Inst::TupleLit { dst, fields, .. } => {
+                write!(f, "{dst} = tuple_lit {{")?;
+                for (i, (name, v)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{name}: {v}")?;
+                }
+                f.write_str("}")
+            }
+            Inst::TupleField {
+                dst,
+                src,
+                field_name,
+                ..
+            } => write!(f, "{dst} = field {src}.{field_name}"),
         }
     }
 }
@@ -343,6 +392,7 @@ mod tests {
             ProcType::Boolean,
             ProcType::Unit,
             ProcType::Pointer,
+            ProcType::Tuple(Heading::empty()),
         ] {
             let s = ty.to_string();
             assert!(!s.is_empty());

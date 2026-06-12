@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use coddl_procir::{
-    BasicBlock, Codegen, Const, Function, Inst, Module, ProcType, Terminator, ValueId,
+    BasicBlock, Codegen, Const, Function, Inst, Module, ProcType, Terminator, Type, ValueId,
 };
 
 use crate::error::LlvmEmitError;
@@ -43,11 +43,43 @@ impl Codegen for LlvmBackend {
 
 /// Per-value representation kept during the walk. `Text` values are
 /// two LLVM operands even though ProcIR sees them as one logical
-/// value.
+/// value; `Tuple` values are a compile-time grouping over per-field
+/// `ValueRepr`s, which flatten recursively at ABI boundaries.
 #[derive(Debug, Clone)]
 enum ValueRepr {
-    Scalar { ty: String, op: String },
-    Text { ptr_op: String, len_op: String },
+    Scalar {
+        ty: String,
+        op: String,
+    },
+    Text {
+        ptr_op: String,
+        len_op: String,
+    },
+    /// Heading-canonical, name-sorted (matches the ProcIR
+    /// `Inst::TupleLit::heading`'s `attrs()` order).
+    Tuple {
+        fields: Vec<(String, ValueRepr)>,
+    },
+}
+
+impl ValueRepr {
+    /// Append the LLVM operand spelling(s) for this value to a list
+    /// of call-site operands. Scalars contribute one entry; Text two
+    /// (ptr, i64); Tuples flatten recursively in canonical order.
+    fn push_call_operands(&self, out: &mut Vec<String>) {
+        match self {
+            ValueRepr::Scalar { ty, op } => out.push(format!("{ty} {op}")),
+            ValueRepr::Text { ptr_op, len_op } => {
+                out.push(format!("ptr {ptr_op}"));
+                out.push(format!("i64 {len_op}"));
+            }
+            ValueRepr::Tuple { fields } => {
+                for (_, f) in fields {
+                    f.push_call_operands(out);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -115,12 +147,12 @@ impl Emitter {
     fn emit_extern(&mut self, func: &Function) -> Result<(), LlvmEmitError> {
         let mut params: Vec<String> = Vec::new();
         for (_, pty) in &func.params {
-            push_param_types(&mut params, *pty);
+            push_param_types(&mut params, pty);
         }
         writeln!(
             self.body,
             "declare {ret} @{linkage}({args})",
-            ret = llvm_return_type(func.return_type),
+            ret = llvm_return_type(&func.return_type),
             linkage = func.linkage_name,
             args = params.join(", "),
         )
@@ -136,12 +168,12 @@ impl Emitter {
         let ret_ty = if is_main {
             "i32".to_string()
         } else {
-            llvm_return_type(func.return_type)
+            llvm_return_type(&func.return_type)
         };
 
         let mut params: Vec<String> = Vec::new();
         for (pname, pty) in &func.params {
-            push_param_decl(&mut params, pname, *pty);
+            push_param_decl(&mut params, pname, pty);
         }
         self.values.clear();
 
@@ -202,7 +234,57 @@ impl Emitter {
                 callee,
                 args,
                 return_type,
-            } => self.lower_call(*dst, callee, args, *return_type),
+            } => self.lower_call(*dst, callee, args, return_type),
+            Inst::TupleLit { dst, fields, .. } => {
+                // Pure compile-time grouping — no LLVM op emitted.
+                let mut repr_fields: Vec<(String, ValueRepr)> =
+                    Vec::with_capacity(fields.len());
+                for (name, v) in fields {
+                    let repr = self
+                        .values
+                        .get(v)
+                        .ok_or_else(|| {
+                            LlvmEmitError::UnsupportedInst(format!(
+                                "undefined tuple field value {v:?}"
+                            ))
+                        })?
+                        .clone();
+                    repr_fields.push((name.clone(), repr));
+                }
+                self.values
+                    .insert(*dst, ValueRepr::Tuple { fields: repr_fields });
+                Ok(())
+            }
+            Inst::TupleField {
+                dst,
+                src,
+                field_name,
+                ..
+            } => {
+                // Project a single attribute out of the source tuple's
+                // ValueRepr — also a pure compile-time operation.
+                let src_repr = self.values.get(src).ok_or_else(|| {
+                    LlvmEmitError::UnsupportedInst(format!("undefined tuple source {src:?}"))
+                })?;
+                let field_repr = match src_repr {
+                    ValueRepr::Tuple { fields } => fields
+                        .iter()
+                        .find(|(n, _)| n == field_name)
+                        .map(|(_, r)| r.clone())
+                        .ok_or_else(|| {
+                            LlvmEmitError::UnsupportedInst(format!(
+                                "tuple {src:?} has no field `{field_name}`"
+                            ))
+                        })?,
+                    other => {
+                        return Err(LlvmEmitError::UnsupportedInst(format!(
+                            "field access on non-tuple value: {other:?}"
+                        )));
+                    }
+                };
+                self.values.insert(*dst, field_repr);
+                Ok(())
+            }
         }
     }
 
@@ -232,7 +314,7 @@ impl Emitter {
         dst: Option<ValueId>,
         callee: &str,
         args: &[ValueId],
-        return_type: ProcType,
+        return_type: &ProcType,
     ) -> Result<(), LlvmEmitError> {
         let mut call_args: Vec<String> = Vec::new();
         for arg in args {
@@ -241,13 +323,7 @@ impl Emitter {
                 .get(arg)
                 .ok_or_else(|| LlvmEmitError::UnsupportedInst(format!("undefined value {arg:?}")))?
                 .clone();
-            match repr {
-                ValueRepr::Scalar { ty, op } => call_args.push(format!("{ty} {op}")),
-                ValueRepr::Text { ptr_op, len_op } => {
-                    call_args.push(format!("ptr {ptr_op}"));
-                    call_args.push(format!("i64 {len_op}"));
-                }
-            }
+            repr.push_call_operands(&mut call_args);
         }
 
         let ret_ty = llvm_return_type(return_type);
@@ -300,6 +376,11 @@ impl Emitter {
                             "returning Text by value not yet supported".into(),
                         ));
                     }
+                    ValueRepr::Tuple { .. } => {
+                        return Err(LlvmEmitError::UnsupportedInst(
+                            "returning Tuple by value not yet supported".into(),
+                        ));
+                    }
                 }
             }
             Terminator::Unreachable => {
@@ -312,14 +393,15 @@ impl Emitter {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-fn llvm_return_type(ty: ProcType) -> String {
+fn llvm_return_type(ty: &ProcType) -> String {
     match ty {
         ProcType::Unit => "void".to_string(),
+        ProcType::Tuple(h) if h.is_empty() => "void".to_string(),
         other => llvm_value_type(other).to_string(),
     }
 }
 
-fn llvm_value_type(ty: ProcType) -> &'static str {
+fn llvm_value_type(ty: &ProcType) -> &'static str {
     match ty {
         ProcType::Integer => "i64",
         ProcType::Rational => "i64",
@@ -331,26 +413,72 @@ fn llvm_value_type(ty: ProcType) -> &'static str {
         ProcType::Boolean => "i1",
         ProcType::Unit => "void",
         ProcType::Pointer => "ptr",
+        // Non-flattened tuple uses are limited to multi-attribute
+        // returns, which need return-pair codegen and aren't on Phase
+        // 18's path. Empty tuples lower to `void` via
+        // `llvm_return_type` before reaching this branch.
+        ProcType::Tuple(_) => unreachable!(
+            "Tuple ProcType must be flattened at ABI boundaries; bare Tuple seen in scalar context"
+        ),
     }
 }
 
-fn push_param_types(out: &mut Vec<String>, ty: ProcType) {
+/// Recursively flatten a `ProcType` into the LLVM IR types it occupies
+/// at an ABI boundary. Text/Binary expand to `(ptr, i64)`; Tuple
+/// expands per-attribute in canonical heading order, nested tuples
+/// recursively. Empty Tuple contributes zero entries.
+fn push_param_types(out: &mut Vec<String>, ty: &ProcType) {
     match ty {
         ProcType::Text | ProcType::Binary => {
             out.push("ptr".to_string());
             out.push("i64".to_string());
         }
+        ProcType::Tuple(heading) => {
+            for (_, attr_ty) in heading.attrs() {
+                push_param_types(out, &proc_type_from_attr(attr_ty));
+            }
+        }
         other => out.push(llvm_value_type(other).to_string()),
     }
 }
 
-fn push_param_decl(out: &mut Vec<String>, name: &str, ty: ProcType) {
+/// Same recursion as [`push_param_types`], but emits `<ty> %<name>`
+/// fragments for use in a `define` line. Each leaf attribute gets a
+/// unique LLVM SSA name derived from the surface field-path
+/// (`%user.address.zip.ptr`, etc.).
+fn push_param_decl(out: &mut Vec<String>, name: &str, ty: &ProcType) {
     match ty {
         ProcType::Text | ProcType::Binary => {
             out.push(format!("ptr %{name}.ptr"));
             out.push(format!("i64 %{name}.len"));
         }
+        ProcType::Tuple(heading) => {
+            for (attr_name, attr_ty) in heading.attrs() {
+                let sub_name = format!("{name}.{attr_name}");
+                push_param_decl(out, &sub_name, &proc_type_from_attr(attr_ty));
+            }
+        }
         other => out.push(format!("{ty} %{name}", ty = llvm_value_type(other))),
+    }
+}
+
+/// Heading attributes carry surface `Type`s; backends reason in
+/// `ProcType`. This is the same mapping the lowerer uses; centralized
+/// here so the codegen helpers don't need to depend on the lowerer
+/// module.
+fn proc_type_from_attr(ty: &Type) -> ProcType {
+    match ty {
+        Type::Integer => ProcType::Integer,
+        Type::Rational => ProcType::Rational,
+        Type::Approximate => ProcType::Approximate,
+        Type::Text => ProcType::Text,
+        Type::Character => ProcType::Character,
+        Type::Binary => ProcType::Binary,
+        Type::Byte => ProcType::Byte,
+        Type::Boolean => ProcType::Boolean,
+        Type::Tuple(h) => ProcType::Tuple(h.clone()),
+        Type::Relation(_) => ProcType::Pointer,
+        Type::Unknown => unreachable!("Type::Unknown reached codegen"),
     }
 }
 
@@ -437,8 +565,55 @@ mod tests {
             ProcType::Boolean,
             ProcType::Pointer,
         ] {
-            assert!(!llvm_value_type(ty).is_empty(), "{ty:?}");
+            assert!(!llvm_value_type(&ty).is_empty(), "{ty:?}");
         }
-        assert_eq!(llvm_return_type(ProcType::Unit), "void");
+        assert_eq!(llvm_return_type(&ProcType::Unit), "void");
+    }
+
+    // ── Tuple ABI flattening (Phase 18) ──────────────────────────────
+
+    #[test]
+    fn tuple_let_field_access_flattens_call_to_one_text_pair() {
+        // A let-bound tuple has its field projected and passed to
+        // write_line. At the LLVM call site this should reduce to the
+        // same `(ptr @.str.0, i64 N)` pair as the direct literal —
+        // tuples are pure compile-time grouping.
+        let src = "oper main {} [ \
+                   let t = {message: \"hi\"}; \
+                   write_line{message: t.message}; \
+                   ];";
+        let ir = emit_ok(src);
+        assert!(
+            ir.contains("call void @coddl_write_line(ptr @.str.0, i64 2)"),
+            "expected flattened call site, got:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn empty_tuple_param_decl_contributes_zero_operands() {
+        // Direct unit test of the flattening helper: an empty tuple
+        // parameter must declare zero operands.
+        let mut params = Vec::new();
+        push_param_types(
+            &mut params,
+            &ProcType::Tuple(coddl_procir::Heading::empty()),
+        );
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn nested_tuple_param_flattens_recursively() {
+        // A tuple { inner: Tuple { ptr: Text } } as a parameter
+        // expands into the same (ptr, i64) pair as a bare Text.
+        let heading = coddl_procir::Heading::new(vec![(
+            "inner".to_string(),
+            Type::Tuple(coddl_procir::Heading::new(vec![(
+                "msg".to_string(),
+                Type::Text,
+            )])),
+        )]);
+        let mut params = Vec::new();
+        push_param_types(&mut params, &ProcType::Tuple(heading));
+        assert_eq!(params, vec!["ptr".to_string(), "i64".to_string()]);
     }
 }

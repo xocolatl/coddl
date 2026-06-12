@@ -14,5 +14,8 @@ pub mod ir;
 pub mod lower;
 
 pub use codegen::Codegen;
-pub use ir::{BasicBlock, BlockId, Const, Function, Inst, Module, ProcType, Terminator, ValueId};
+pub use ir::{
+    BasicBlock, BlockId, Const, Function, Heading, Inst, Module, ProcType, Terminator, Type,
+    ValueId,
+};
 pub use lower::{lower, LowerOutput};

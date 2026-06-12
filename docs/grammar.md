@@ -256,14 +256,23 @@ function that implements it.
 <let-stmt>      ::= 'let' <identifier> [ ':' <type-ref> ]
                     '=' <expr> ';' ;                           -- parse_let_stmt
 
-<expr>          ::= <primary-expr> { <arg-list> } ;            -- parse_expr
+<expr>          ::= <primary-expr> { <postfix> } ;            -- parse_expr
+<postfix>       ::= <arg-list>                                 -- call: CALL_EXPR
+                  | <field-access-tail> ;                      -- field access: FIELD_ACCESS
+<field-access-tail> ::= '.' <identifier> ;
 <primary-expr>  ::= <name-ref>
                   | <literal>
-                  | <transaction-expr> ;                       -- parse_primary_expr
+                  | <transaction-expr>
+                  | <tuple-lit> ;                              -- parse_primary_expr
 <transaction-expr> ::= 'transaction' <block> ;                 -- parse_transaction_expr
 <name-ref>      ::= <identifier> ;
 <arg-list>      ::= '{' [ <named-arg> commalist ] '}' ;        -- parse_arg_list
 <named-arg>     ::= <identifier> ':' <expr> ;                  -- parse_named_arg
+<tuple-lit>     ::= '{' [ <named-arg> commalist ] '}' ;        -- parse_tuple_lit
+                    -- Same grammar as <arg-list>; the wrapping node
+                    -- kind (TUPLE_LIT vs ARG_LIST) distinguishes a
+                    -- tuple value from a call-site argument list.
+                    -- Empty '{}' is the unit value, type Tuple {}.
 
 <unknown-item>  ::= -- error recovery: any tokens until the next
                     -- top-level ';' at bracket-depth zero or EOF.
@@ -295,10 +304,10 @@ the parser. Listed here so the omission is explicit, not implied:
 - **Statement forms** other than `<let-stmt>` and `<expr> ';'` —
   `mut`, `return`, `insert`, `delete`, `update`.
 - **Type / relvar / constraint declarations** at the top level.
-- **Literals**: tuple `{ … }` and sequence `[ … ]` in expression
-  position; relation literals `Relation { … }`.
-- **Field access** (`x.y`) and **indexing** (`s[i]`) in expression
-  postfix position.
+- **Literals**: sequence `[ … ]` in expression position; relation
+  literals `Relation { … }`. (Tuple `{ … }` literals and dot-prefix
+  field access landed in Phase 18.)
+- **Indexing** (`s[i]`) in expression postfix position.
 - **Pattern matching**, **`if`/`else`**, **anonymous opers**.
 
 
@@ -338,6 +347,8 @@ enforces that.
 | P0026 | Expected relvar name                                    |
 | P0027 | Expected `{` to start relvar heading                    |
 | P0028 | Expected `;` after relvar declaration                   |
+| P0029 | Expected `}` to close tuple literal                     |
+| P0030 | Expected field name after `.`                           |
 
 Note: missing-type-after-`:` (let annotation) and missing-type-
 after-`->` (operator return clause) both surface as `P0011`

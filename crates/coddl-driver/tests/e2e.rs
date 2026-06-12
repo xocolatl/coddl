@@ -257,6 +257,98 @@ fn transaction_byte_identical_across_backends() {
     assert_eq!(llvm.stdout, b"ok\n");
 }
 
+// ── Tuple let + field access (Phase 18) ───────────────────────────────
+
+/// Inline-source program exercising tuple literal + field access. The
+/// e2e suite owns the canonical Phase 18 program rather than depending
+/// on an `examples/` dir — the latter is a deletable scratchpad.
+const TUPLE_LET_SRC: &str = "\
+program tuple_let;
+oper main {} [
+    let t = {message: \"hi\"};
+    write_line { message: t.message };
+];
+";
+
+/// Write the inline tuple-let program to a tempdir and return both
+/// the tempdir handle (kept alive by the caller) and the source path.
+fn write_tuple_let(tmp: &tempfile::TempDir) -> PathBuf {
+    let src_path = tmp.path().join("tuple-let.cd");
+    std::fs::write(&src_path, TUPLE_LET_SRC).expect("write tuple-let.cd");
+    src_path
+}
+
+#[test]
+fn tuple_let_llvm_backend_prints_hi() {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = write_tuple_let(&tmp);
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(&src)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "tuple-let LLVM run failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"hi\n");
+}
+
+#[test]
+fn tuple_let_cranelift_backend_prints_hi() {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = write_tuple_let(&tmp);
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(&src)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "tuple-let Cranelift run failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"hi\n");
+}
+
+#[test]
+fn tuple_let_byte_identical_across_backends() {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = write_tuple_let(&tmp);
+    let llvm = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(&src)
+        .output()
+        .expect("spawn LLVM");
+    assert!(
+        llvm.status.success(),
+        "LLVM run failed: stderr=\n{}",
+        String::from_utf8_lossy(&llvm.stderr)
+    );
+    let cranelift = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(&src)
+        .output()
+        .expect("spawn Cranelift");
+    assert!(
+        cranelift.status.success(),
+        "Cranelift run failed: stderr=\n{}",
+        String::from_utf8_lossy(&cranelift.stderr)
+    );
+    assert_eq!(
+        llvm.stdout,
+        cranelift.stdout,
+        "tuple-let backends disagree:\n  LLVM:      {:?}\n  Cranelift: {:?}",
+        String::from_utf8_lossy(&llvm.stdout),
+        String::from_utf8_lossy(&cranelift.stdout)
+    );
+    assert_eq!(llvm.stdout, b"hi\n");
+}
+
 #[test]
 fn coddl_run_unknown_backend_fails_clearly() {
     // No `ensure_runtime_built()` needed — we never get to linking.

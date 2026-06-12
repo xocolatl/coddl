@@ -14,11 +14,11 @@ use std::collections::{HashMap, HashSet};
 
 use coddl_diagnostics::{Diagnostic, FileId, Severity};
 use coddl_syntax::ast::{
-    AstNode, Block, CallExpr, Expr, ExprStmt, Item, LetStmt, Literal, NamedArg, OperDecl,
-    ProgramDecl, Root, Stmt, TransactionExpr,
+    AstNode, Block, CallExpr, Expr, ExprStmt, FieldAccess, Item, LetStmt, Literal, NamedArg,
+    OperDecl, ProgramDecl, Root, Stmt, TransactionExpr, TupleLit,
 };
 use coddl_syntax::SyntaxKind;
-use coddl_types::check;
+use coddl_types::{check, Heading, Type};
 
 use crate::ir::{
     BasicBlock, BlockId, Const, Function, Inst, Module, ProcType, Terminator, ValueId,
@@ -85,8 +85,17 @@ struct Lowerer {
     insts: Vec<Inst>,
     /// Stack of binding scopes. The outermost layer is the function's
     /// parameter scope; each `transaction [...]` block pushes a new
-    /// layer; `let` statements insert into the topmost layer.
-    locals: Vec<HashMap<String, ValueId>>,
+    /// layer; `let` statements insert into the topmost layer. Each
+    /// entry stores the binding's `ValueId` and its `ProcType` so
+    /// later walks (tuple construction, field access) know the static
+    /// shape of a `NameRef` lookup result.
+    locals: Vec<HashMap<String, (ValueId, ProcType)>>,
+    /// Type of every SSA value defined in the current function. Built
+    /// up as each `Inst` is emitted; consulted by lowerings that need
+    /// the static type of a base expression (notably field access on
+    /// a let-bound tuple, where the heading lives in the source
+    /// `ValueId`'s `ProcType::Tuple`).
+    value_types: HashMap<ValueId, ProcType>,
 }
 
 impl Lowerer {
@@ -99,6 +108,7 @@ impl Lowerer {
             next_block: 0,
             insts: Vec::new(),
             locals: vec![HashMap::new()],
+            value_types: HashMap::new(),
         }
     }
 
@@ -110,15 +120,18 @@ impl Lowerer {
         self.locals.pop();
     }
 
-    fn bind_local(&mut self, name: String, v: ValueId) {
+    fn bind_local(&mut self, name: String, v: ValueId, ty: ProcType) {
         self.locals
             .last_mut()
             .expect("scope stack empty")
-            .insert(name, v);
+            .insert(name, (v, ty));
     }
 
-    fn lookup_local(&self, name: &str) -> Option<ValueId> {
-        self.locals.iter().rev().find_map(|l| l.get(name).copied())
+    fn lookup_local(&self, name: &str) -> Option<(ValueId, ProcType)> {
+        self.locals
+            .iter()
+            .rev()
+            .find_map(|l| l.get(name).cloned())
     }
 
     fn fresh_value(&mut self) -> ValueId {
@@ -139,6 +152,24 @@ impl Lowerer {
         self.insts.clear();
         self.locals.clear();
         self.locals.push(HashMap::new());
+        self.value_types.clear();
+    }
+
+    /// Look up an SSA value's static type. Diagnostic-free input always
+    /// has a recorded type for every consumed value; an unbound id is
+    /// an internal lowerer bug.
+    fn value_type(&self, v: ValueId) -> ProcType {
+        self.value_types
+            .get(&v)
+            .cloned()
+            .unwrap_or_else(|| unreachable!("unbound ValueId {v}"))
+    }
+
+    /// Bind a freshly-defined SSA value to its `ProcType`. Every
+    /// instruction-emission helper goes through this so `value_types`
+    /// stays in sync without per-call-site duplication.
+    fn record_type(&mut self, v: ValueId, ty: ProcType) {
+        self.value_types.insert(v, ty);
     }
 
     fn lookup_extern(&self, surface: &str) -> Option<&'static BuiltinExtern> {
@@ -155,9 +186,9 @@ impl Lowerer {
             params: ext
                 .params
                 .iter()
-                .map(|(n, t)| ((*n).to_string(), *t))
+                .map(|(n, t)| ((*n).to_string(), t.clone()))
                 .collect(),
-            return_type: ext.return_type,
+            return_type: ext.return_type.clone(),
             blocks: Vec::new(),
         });
     }
@@ -267,6 +298,7 @@ impl Lowerer {
         if is_main {
             self.ensure_runtime_extern("coddl_runtime_init");
             let dst = self.fresh_value();
+            self.record_type(dst, ProcType::Integer);
             self.insts.push(Inst::Call {
                 dst: Some(dst),
                 callee: "coddl_runtime_init".to_string(),
@@ -280,6 +312,7 @@ impl Lowerer {
         if is_main {
             self.ensure_runtime_extern("coddl_runtime_shutdown");
             let dst = self.fresh_value();
+            self.record_type(dst, ProcType::Integer);
             self.insts.push(Inst::Call {
                 dst: Some(dst),
                 callee: "coddl_runtime_shutdown".to_string(),
@@ -328,7 +361,11 @@ impl Lowerer {
         }
         match block.tail_expr() {
             Some(expr) => self.lower_expr(&expr),
-            None => self.fresh_value(),
+            None => {
+                let v = self.fresh_value();
+                self.record_type(v, ProcType::Unit);
+                v
+            }
         }
     }
 
@@ -342,8 +379,9 @@ impl Lowerer {
             None => return,
         };
         let id = self.lower_expr(&value_expr);
+        let ty = self.value_type(id);
         if let Some(name_tok) = stmt.name() {
-            self.bind_local(name_tok.text().to_string(), id);
+            self.bind_local(name_tok.text().to_string(), id, ty);
         }
     }
 
@@ -358,20 +396,104 @@ impl Lowerer {
             Expr::Literal(lit) => self.lower_literal(lit),
             Expr::Call(call) => self.lower_call(call),
             Expr::Transaction(t) => self.lower_transaction_expr(t),
+            Expr::TupleLit(t) => self.lower_tuple_lit(t),
+            Expr::FieldAccess(f) => self.lower_field_access(f),
             Expr::NameRef(n) => {
                 // First try a let-bound local; that's the only value
                 // source the surface language currently exposes.
                 if let Some(name_tok) = n.ident() {
-                    if let Some(v) = self.lookup_local(name_tok.text()) {
+                    if let Some((v, _ty)) = self.lookup_local(name_tok.text()) {
                         return v;
                     }
                 }
                 // Parameter references and any other unconsumed
                 // NameRef fall through to a placeholder. Today no
-                // such case reaches a downstream consumer.
-                self.fresh_value()
+                // such case reaches a downstream consumer; record
+                // Unit so `value_type` stays total.
+                let v = self.fresh_value();
+                self.record_type(v, ProcType::Unit);
+                v
             }
         }
+    }
+
+    /// Lower a `{a: e1, b: e2, …}` tuple literal. Each field's
+    /// expression lowers in source order; the resulting
+    /// `(name, ValueId)` pairs are reordered to canonical (name-sorted)
+    /// heading order in the emitted `Inst::TupleLit`. The heading
+    /// itself is built from the per-field static types — which the
+    /// typechecker already enforces match the surface declaration.
+    fn lower_tuple_lit(&mut self, tup: &TupleLit) -> ValueId {
+        let mut field_pairs: Vec<(String, ValueId, ProcType)> = Vec::new();
+        for field in tup.fields() {
+            let name_tok = match field.name() {
+                Some(t) => t,
+                None => continue,
+            };
+            let value_expr = match field.value() {
+                Some(v) => v,
+                None => continue,
+            };
+            let id = self.lower_expr(&value_expr);
+            let ty = self.value_type(id);
+            field_pairs.push((name_tok.text().to_string(), id, ty));
+        }
+        // Canonical order — `Heading::new` will sort the type-level
+        // pairs identically; emitting the SSA fields in the same order
+        // means backends can iterate the heading and the fields in
+        // lockstep without re-sorting.
+        field_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let heading = Heading::new(
+            field_pairs
+                .iter()
+                .map(|(n, _, ty)| (n.clone(), type_from_proc(ty)))
+                .collect(),
+        );
+        let fields: Vec<(String, ValueId)> = field_pairs
+            .into_iter()
+            .map(|(n, v, _)| (n, v))
+            .collect();
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Tuple(heading.clone()));
+        self.insts.push(Inst::TupleLit {
+            dst,
+            fields,
+            heading,
+        });
+        dst
+    }
+
+    /// Lower `<expr>.<field>`. The base's `ProcType` must be a
+    /// `Tuple(H)` after typecheck; the field's `ProcType` is derived
+    /// from `H`'s entry for the named attribute via `proc_type_from_type`.
+    fn lower_field_access(&mut self, fa: &FieldAccess) -> ValueId {
+        let base_expr = fa.base().expect("typechecked field-access has a base");
+        let src = self.lower_expr(&base_expr);
+        let src_ty = self.value_type(src);
+        let heading = match &src_ty {
+            ProcType::Tuple(h) => h.clone(),
+            other => unreachable!("field access on non-tuple `{other}` survived typecheck"),
+        };
+        let field_name = fa
+            .field()
+            .expect("typechecked field-access has a field token")
+            .text()
+            .to_string();
+        let field_type = heading
+            .lookup(&field_name)
+            .map(proc_type_from_type)
+            .unwrap_or_else(|| {
+                unreachable!("unknown field `{field_name}` survived typecheck")
+            });
+        let dst = self.fresh_value();
+        self.record_type(dst, field_type.clone());
+        self.insts.push(Inst::TupleField {
+            dst,
+            src,
+            field_name,
+            field_type,
+        });
+        dst
     }
 
     fn lower_transaction_expr(&mut self, txn: &TransactionExpr) -> ValueId {
@@ -406,6 +528,7 @@ impl Lowerer {
             other => unreachable!("literal kind {other:?} not yet lowered"),
         };
         let dst = self.fresh_value();
+        self.record_type(dst, ty.clone());
         self.insts.push(Inst::Const { dst, value, ty });
         dst
     }
@@ -420,7 +543,7 @@ impl Lowerer {
             .lookup_extern(&surface)
             .unwrap_or_else(|| unreachable!("unknown callee `{surface}` survived typecheck"));
         let linkage = ext.linkage.to_string();
-        let return_type = ext.return_type;
+        let return_type = ext.return_type.clone();
 
         // Lower each argument in the order the operator declared its
         // parameters; the typechecker has guaranteed every declared
@@ -442,7 +565,9 @@ impl Lowerer {
         let dst = if matches!(return_type, ProcType::Unit) {
             None
         } else {
-            Some(self.fresh_value())
+            let v = self.fresh_value();
+            self.record_type(v, return_type.clone());
+            Some(v)
         };
         self.insts.push(Inst::Call {
             dst,
@@ -454,7 +579,55 @@ impl Lowerer {
         // fresh id so the surrounding expression machinery has a place
         // to plug in once it grows real consumers. Today nothing reads
         // it.
-        dst.unwrap_or_else(|| self.fresh_value())
+        dst.unwrap_or_else(|| {
+            let v = self.fresh_value();
+            self.record_type(v, ProcType::Unit);
+            v
+        })
+    }
+}
+
+/// Convert a surface `Type` (as it appears in a `Heading`) to its
+/// machine-level `ProcType`. The mapping is total over the types the
+/// typechecker can produce for a tuple field. Diagnostic-free input
+/// never reaches `Type::Unknown` here; `Type::Relation` lands when
+/// Phase 19 wires relation values into tuple cells.
+fn proc_type_from_type(ty: &Type) -> ProcType {
+    match ty {
+        Type::Integer => ProcType::Integer,
+        Type::Rational => ProcType::Rational,
+        Type::Approximate => ProcType::Approximate,
+        Type::Text => ProcType::Text,
+        Type::Character => ProcType::Character,
+        Type::Binary => ProcType::Binary,
+        Type::Byte => ProcType::Byte,
+        Type::Boolean => ProcType::Boolean,
+        Type::Tuple(h) => ProcType::Tuple(h.clone()),
+        Type::Relation(_) => ProcType::Pointer,
+        Type::Unknown => unreachable!("Type::Unknown survived typecheck"),
+    }
+}
+
+/// Recover a surface `Type` for a `ProcType` we previously derived
+/// from one. The mapping is exact for scalar/tuple cases — the only
+/// information loss happens at `Relation` cells (which become
+/// `Pointer` in ProcType). Phase 18's lowering only carries scalar
+/// and tuple cells, so this round-trip is exact today.
+fn type_from_proc(pt: &ProcType) -> Type {
+    match pt {
+        ProcType::Integer => Type::Integer,
+        ProcType::Rational => Type::Rational,
+        ProcType::Approximate => Type::Approximate,
+        ProcType::Text => Type::Text,
+        ProcType::Character => Type::Character,
+        ProcType::Binary => Type::Binary,
+        ProcType::Byte => Type::Byte,
+        ProcType::Boolean => Type::Boolean,
+        ProcType::Unit => Type::unit(),
+        ProcType::Tuple(h) => Type::Tuple(h.clone()),
+        ProcType::Pointer => {
+            unreachable!("Pointer ProcType in a tuple field — not reachable in Phase 18")
+        }
     }
 }
 
@@ -842,5 +1015,104 @@ mod tests {
         assert_eq!(parse_integer_literal("0b101010"), 42);
         assert_eq!(parse_integer_literal("0o52"), 42);
         assert_eq!(parse_integer_literal("1_000"), 1000);
+    }
+
+    // ── Tuple lit + field access (Phase 18) ──────────────────────────
+
+    #[test]
+    fn tuple_let_field_access_threaded_through_call() {
+        // The tuple's `message` field becomes a TupleField project;
+        // its value flows into write_line's `message` argument.
+        let src = "oper main {} [ \
+                   let t = {message: \"hi\"}; \
+                   write_line{message: t.message}; \
+                   ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let insts = &main.blocks[0].insts;
+
+        // Find the TupleLit instruction.
+        let tuple_dst = insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::TupleLit { dst, fields, .. } => {
+                    assert_eq!(fields.len(), 1);
+                    assert_eq!(fields[0].0, "message");
+                    Some(*dst)
+                }
+                _ => None,
+            })
+            .expect("TupleLit emitted");
+
+        // Find the TupleField projecting `message` from the tuple.
+        let field_dst = insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::TupleField {
+                    dst,
+                    src,
+                    field_name,
+                    field_type,
+                } if *src == tuple_dst && field_name == "message" => {
+                    assert_eq!(*field_type, ProcType::Text);
+                    Some(*dst)
+                }
+                _ => None,
+            })
+            .expect("TupleField emitted");
+
+        // Find the write_line call and confirm it consumes the field's
+        // ValueId as its argument.
+        let arg = insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::Call { callee, args, .. } if callee == "coddl_write_line" => {
+                    Some(args.first().copied())
+                }
+                _ => None,
+            })
+            .expect("write_line call present")
+            .expect("write_line call has an arg");
+        assert_eq!(arg, field_dst);
+    }
+
+    #[test]
+    fn empty_tuple_lit_emits_inst_with_empty_heading() {
+        // `{}` in expression position must lower to an Inst::TupleLit
+        // with no fields and an empty heading.
+        let src = "oper main {} [ let _u = {}; ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let inst = main.blocks[0]
+            .insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::TupleLit { fields, heading, .. } => Some((fields.clone(), heading.clone())),
+                _ => None,
+            })
+            .expect("TupleLit emitted");
+        assert!(inst.0.is_empty());
+        assert!(inst.1.is_empty());
+    }
+
+    #[test]
+    fn tuple_fields_emitted_in_canonical_order() {
+        // Source order is reversed alphabetically; the emitted
+        // Inst::TupleLit's fields list and heading must both be sorted.
+        let src = "oper main {} [ let _t = {z: 1, a: 2}; ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let (fields, heading) = main.blocks[0]
+            .insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::TupleLit { fields, heading, .. } => Some((fields.clone(), heading.clone())),
+                _ => None,
+            })
+            .expect("TupleLit emitted");
+        let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["a", "z"]);
+        let attr_names: Vec<&str> = heading.attrs().iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(attr_names, vec!["a", "z"]);
     }
 }

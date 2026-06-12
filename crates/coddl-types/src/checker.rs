@@ -11,9 +11,9 @@ use std::collections::{HashMap, HashSet};
 
 use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{
-    AstNode, Block, CallExpr, Expr, ExprStmt, Heading as AstHeading, Item, KeyClause, LetStmt,
-    NamedArg, OperDecl, PrivateRelvarDecl, ProgramDecl, PublicRelvarDecl, Root, Stmt,
-    TransactionExpr,
+    AstNode, Block, CallExpr, Expr, ExprStmt, FieldAccess, Heading as AstHeading, Item, KeyClause,
+    LetStmt, NamedArg, OperDecl, PrivateRelvarDecl, ProgramDecl, PublicRelvarDecl, Root, Stmt,
+    TransactionExpr, TupleLit,
 };
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
@@ -648,6 +648,80 @@ impl TypeChecker {
             },
             Expr::Call(call) => self.check_call(call, scope),
             Expr::Transaction(t) => self.check_transaction_expr(t, scope),
+            Expr::TupleLit(t) => self.check_tuple_lit(t, scope),
+            Expr::FieldAccess(f) => self.check_field_access(f, scope),
+        }
+    }
+
+    /// Walk a `{ name: expr, … }` literal. Each field's expression is
+    /// typechecked independently; duplicates emit T0015 and the second
+    /// occurrence is skipped. The result is `Tuple H` where `H` is the
+    /// canonical (name-sorted) heading built from the surviving fields.
+    fn check_tuple_lit(&mut self, tup: &TupleLit, scope: &mut Scope) -> Type {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut fields: Vec<(String, Type)> = Vec::new();
+        for field in tup.fields() {
+            let name_tok = match field.name() {
+                Some(t) => t,
+                None => continue,
+            };
+            let name = name_tok.text().to_string();
+            let ty = match field.value() {
+                Some(v) => self.check_expr(&v, scope),
+                None => Type::Unknown,
+            };
+            if !seen.insert(name.clone()) {
+                self.error(
+                    self.token_span(&name_tok),
+                    "T0015",
+                    format!("duplicate field `{name}` in tuple literal"),
+                );
+                continue;
+            }
+            fields.push((name, ty));
+        }
+        Type::Tuple(Heading::new(fields))
+    }
+
+    /// Walk `<expr>.<field>`. The base must be of type `Tuple H`; the
+    /// field name must exist in `H`. T0016 fires when the base isn't a
+    /// tuple; T0017 when the field isn't in the heading.
+    fn check_field_access(&mut self, fa: &FieldAccess, scope: &mut Scope) -> Type {
+        let base_ty = match fa.base() {
+            Some(b) => self.check_expr(&b, scope),
+            None => return Type::Unknown,
+        };
+        let field_tok = match fa.field() {
+            Some(t) => t,
+            // Parser already emitted P0030; nothing more to add here.
+            None => return Type::Unknown,
+        };
+        let field_name = field_tok.text();
+        match base_ty {
+            Type::Unknown => Type::Unknown,
+            Type::Tuple(ref heading) => match heading.lookup(field_name) {
+                Some(ty) => ty.clone(),
+                None => {
+                    self.error(
+                        self.token_span(&field_tok),
+                        "T0017",
+                        format!("unknown field `{field_name}` in tuple {heading}"),
+                    );
+                    Type::Unknown
+                }
+            },
+            other => {
+                let span = fa
+                    .base()
+                    .map(|b| self.node_span(b.syntax()))
+                    .unwrap_or_else(|| self.node_span(fa.syntax()));
+                self.error(
+                    span,
+                    "T0016",
+                    format!("field access requires a tuple value, but base has type {other}"),
+                );
+                Type::Unknown
+            }
         }
     }
 
@@ -1254,5 +1328,58 @@ mod tests {
         let bad = check("oper main {} []", FileId(0), FileKind::Cd);
         assert_eq!(bad.tree.kind(), SyntaxKind::ROOT);
         assert!(!bad.diagnostics.is_empty());
+    }
+
+    // ── Tuple literals + field access (Phase 18) ─────────────────────
+
+    #[test]
+    fn tuple_let_with_field_access_checks_clean() {
+        // A let-bound tuple flowing into a call argument through field
+        // access. The tuple's `message` field is Text, matching
+        // write_line's expected parameter type.
+        let src = "oper main {} [ \
+                   let t = {message: \"hi\"}; \
+                   write_line{message: t.message}; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn duplicate_field_in_tuple_lit_diagnoses_t0015() {
+        let src = "oper main {} [ let t = {a: 1, a: 2}; ];";
+        assert!(codes(src).contains(&"T0015"));
+    }
+
+    #[test]
+    fn field_access_on_non_tuple_diagnoses_t0016() {
+        let src = "oper main {} [ let n = 1; let _x = n.field; ];";
+        assert!(codes(src).contains(&"T0016"));
+    }
+
+    #[test]
+    fn unknown_field_diagnoses_t0017() {
+        let src = "oper main {} [ let t = {a: 1}; let _x = t.b; ];";
+        assert!(codes(src).contains(&"T0017"));
+    }
+
+    #[test]
+    fn empty_tuple_lit_types_as_unit() {
+        // The implicit-unit case made explicit: `{}` is Tuple {}.
+        // No diagnostics, and the let binding's hint is Tuple {}.
+        let src = "oper main {} [ let _t = {}; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn field_access_returns_attribute_type() {
+        // `t.a` is Integer; passing it as a Text-typed arg fires
+        // T0004, proving the field's type flows correctly.
+        let src = "oper main {} [ \
+                   let t = {a: 1}; \
+                   write_line{message: t.a}; \
+                   ];";
+        assert!(codes(src).contains(&"T0004"));
     }
 }

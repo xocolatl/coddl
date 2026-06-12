@@ -30,7 +30,7 @@ A ProcIR `Module` is one compilation unit. Field-by-field:
 | `BlockId`      | `u32`                                                   |
 | `ValueId`      | `u32` — SSA value name, rendered `%n`                   |
 | `Const`        | `Integer(i64)`, `Text(Vec<u8>)`, `Unit`                 |
-| `ProcType`     | `Integer`, `Rational`, `Approximate`, `Text`, `Character`, `Binary`, `Byte`, `Boolean`, `Unit`, `Pointer` |
+| `ProcType`     | `Integer`, `Rational`, `Approximate`, `Text`, `Character`, `Binary`, `Byte`, `Boolean`, `Unit`, `Pointer`, `Tuple(Heading)` |
 
 Key invariants the lowering pass and the backends both rely on:
 
@@ -44,10 +44,13 @@ Key invariants the lowering pass and the backends both rely on:
 - **SSA: every `Inst` defines at most one `ValueId`.** `Inst::Call`
   whose `return_type` is `Unit` has `dst == None`.
 - **`ProcType` is the machine-level type, not the surface type.**
-  `Tuple H` becomes a struct layout (deferred). `Relation` and
+  `ProcType::Tuple(Heading)` carries the typechecker's `Heading`
+  directly; at ABI boundaries it flattens per-attribute in canonical
+  heading order (nested tuples recursively). `Relation` and
   `Sequence` become runtime handles (`Pointer`). Every built-in
   scalar gets a variant from day one so backends can pattern-match
-  exhaustively.
+  exhaustively. `ProcType` is `Clone`, not `Copy` — the `Tuple`
+  variant is heap-backed.
 
 
 ## Instruction table
@@ -56,6 +59,8 @@ Key invariants the lowering pass and the backends both rely on:
 |----------------------|---------------------------------------------------------------------------|-----------------------|---------------------------------------------------------------------------|
 | `Const`              | `value: Const`, `ty: ProcType`                                            | `dst: ValueId`        | Materialize a compile-time constant of type `ty`.                         |
 | `Call`               | `callee: String` (linkage name), `args: Vec<ValueId>`, `return_type`      | `dst: Option<ValueId>` | Call the named function. `dst` is `None` iff `return_type == Unit`.       |
+| `TupleLit`           | `fields: Vec<(String, ValueId)>` (canonical-order), `heading: Heading`    | `dst: ValueId`        | Bundle the fields into a tuple value typed `Tuple(heading)`. No runtime op — the value is a compile-time grouping over the field SSA values; backends carry it as a `ValueRepr::Tuple` and flatten at ABI boundaries. |
+| `TupleField`         | `src: ValueId` (tuple), `field_name: String`, `field_type: ProcType`      | `dst: ValueId`        | Project one attribute out of `src`. Pure compile-time projection in backends — `dst` binds the field's existing `ValueRepr`. |
 
 ## Terminator table
 
@@ -85,6 +90,8 @@ walk shape. Each `check_<x>` in `coddl-types::checker` has a sibling
 | `Expr::Call`   | Lowers each declared parameter's argument expression in source-declaration order, emits the synthetic extern `Function` on first reference, then `Inst::Call` to its `linkage_name`. |
 | `Expr::NameRef` | Looks up the name in the local scope stack (innermost-first). Returns the bound `ValueId` so downstream consumers thread it through. |
 | `Expr::Transaction` | Pushes a local scope, walks the body via `Block`, pops the scope. The body's `ValueId` becomes the expression's value. Transparent today — no `Inst` for the `transaction` wrapper itself. Future runtime semantics slot in here as synthetic begin/commit/rollback calls. |
+| `Expr::TupleLit` | Lowers each field's value expression, sorts the `(name, ValueId, ProcType)` triples into canonical (name-sorted) heading order, then emits `Inst::TupleLit { fields, heading }`. The heading is built from the per-field static types — which the typechecker already enforces. Empty `{}` lowers to `Inst::TupleLit` with empty fields + empty heading. |
+| `Expr::FieldAccess` | Lowers the base expression, asserts its `ProcType` is `Tuple(H)` (a typechecker invariant — `T0016` blocks non-tuple bases), looks up the field's `Type` in `H`, converts to `ProcType` via the same scalar/tuple recursion the lowerer uses for parameters, then emits `Inst::TupleField`. |
 
 Locals share the same `ValueId` namespace as computed values —
 there's no separate "variable" concept in ProcIR. A `let x = expr`

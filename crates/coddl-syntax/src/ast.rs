@@ -373,13 +373,16 @@ impl ExprStmt {
 
 /// Expression variants. The set will grow as the parser does; for now
 /// the kinds recognized are name references, literals, brace-call
-/// expressions, and `transaction` block expressions.
+/// expressions, `transaction` block expressions, tuple literals, and
+/// dot-prefixed field access.
 #[derive(Debug, Clone)]
 pub enum Expr {
     NameRef(NameRef),
     Literal(Literal),
     Call(CallExpr),
     Transaction(TransactionExpr),
+    TupleLit(TupleLit),
+    FieldAccess(FieldAccess),
 }
 
 impl Expr {
@@ -389,6 +392,8 @@ impl Expr {
             SyntaxKind::LITERAL => Expr::Literal(Literal { syntax }),
             SyntaxKind::CALL_EXPR => Expr::Call(CallExpr { syntax }),
             SyntaxKind::TRANSACTION_EXPR => Expr::Transaction(TransactionExpr { syntax }),
+            SyntaxKind::TUPLE_LIT => Expr::TupleLit(TupleLit { syntax }),
+            SyntaxKind::FIELD_ACCESS => Expr::FieldAccess(FieldAccess { syntax }),
             _ => return None,
         })
     }
@@ -399,6 +404,8 @@ impl Expr {
             Expr::Literal(l) => l.syntax(),
             Expr::Call(c) => c.syntax(),
             Expr::Transaction(t) => t.syntax(),
+            Expr::TupleLit(t) => t.syntax(),
+            Expr::FieldAccess(f) => f.syntax(),
         }
     }
 }
@@ -484,6 +491,49 @@ impl NamedArg {
     /// The value expression on the right of the `:`.
     pub fn value(&self) -> Option<Expr> {
         self.syntax.children().find_map(Expr::cast)
+    }
+}
+
+// ── Tuple literals + field access ────────────────────────────────────────
+
+ast_node!(pub TupleLit, TUPLE_LIT);
+
+impl TupleLit {
+    /// All named fields in source order. Each field shares the
+    /// `NamedArg` view with call-site arguments — same `name: value`
+    /// shape, different parent node.
+    pub fn fields(&self) -> impl Iterator<Item = NamedArg> + '_ {
+        children(&self.syntax)
+    }
+}
+
+ast_node!(pub FieldAccess, FIELD_ACCESS);
+
+impl FieldAccess {
+    /// The expression being projected from. `None` is a parse-recovery
+    /// edge case (e.g. a `.` with no preceding primary).
+    pub fn base(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// The post-`.` field-name token. `None` when the parser recovered
+    /// past a missing identifier (P0030).
+    pub fn field(&self) -> Option<SyntaxToken> {
+        // The base expression contains its own IDENTs (e.g., NAME_REF);
+        // the field's IDENT is the one that lives directly under the
+        // FIELD_ACCESS node *after* the `.` token. Walk the direct
+        // child elements and pick the IDENT that follows DOT.
+        let mut seen_dot = false;
+        for el in self.syntax.children_with_tokens() {
+            if let Some(tok) = el.into_token() {
+                match tok.kind() {
+                    SyntaxKind::DOT => seen_dot = true,
+                    SyntaxKind::IDENT if seen_dot => return Some(tok),
+                    _ => {}
+                }
+            }
+        }
+        None
     }
 }
 
@@ -693,5 +743,65 @@ mod tests {
         let tok = lit.token().unwrap();
         assert_eq!(tok.kind(), SyntaxKind::STRING_LIT);
         assert_eq!(tok.text(), "\"Hello, world!\"");
+    }
+
+    #[test]
+    fn tuple_lit_fields_iterate() {
+        let root = ast("oper f {} [ let t = {a: 1, b: \"x\"}; ];");
+        // Drill: oper → block → let_stmt → tuple_lit
+        let tup_node = root
+            .syntax()
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::TUPLE_LIT)
+            .unwrap();
+        let tup = TupleLit::cast(tup_node).unwrap();
+        let fields: Vec<NamedArg> = tup.fields().collect();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name().unwrap().text(), "a");
+        assert_eq!(fields[1].name().unwrap().text(), "b");
+    }
+
+    #[test]
+    fn empty_tuple_lit_has_no_fields() {
+        let root = ast("oper f {} [ let t = {}; ];");
+        let tup_node = root
+            .syntax()
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::TUPLE_LIT)
+            .unwrap();
+        let tup = TupleLit::cast(tup_node).unwrap();
+        assert_eq!(tup.fields().count(), 0);
+    }
+
+    #[test]
+    fn field_access_resolves_base_and_field() {
+        let root = ast("oper f {} [ t.message; ];");
+        let fa_node = root
+            .syntax()
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::FIELD_ACCESS)
+            .unwrap();
+        let fa = FieldAccess::cast(fa_node).unwrap();
+        let Expr::NameRef(base) = fa.base().unwrap() else {
+            panic!("expected NameRef base");
+        };
+        assert_eq!(base.ident().unwrap().text(), "t");
+        assert_eq!(fa.field().unwrap().text(), "message");
+    }
+
+    #[test]
+    fn chained_field_access_base_is_inner_field_access() {
+        let root = ast("oper f {} [ t.a.b; ];");
+        let outer_node = root
+            .syntax()
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::FIELD_ACCESS)
+            .unwrap();
+        let outer = FieldAccess::cast(outer_node).unwrap();
+        assert_eq!(outer.field().unwrap().text(), "b");
+        let Expr::FieldAccess(inner) = outer.base().unwrap() else {
+            panic!("expected nested FieldAccess");
+        };
+        assert_eq!(inner.field().unwrap().text(), "a");
     }
 }

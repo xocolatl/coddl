@@ -37,10 +37,32 @@ and a length — even though ProcIR sees them as one logical `ValueId`.
 | `Boolean`     | `_Bool`               | `i1` (LLVM) / `I8` (Cranelift) | `I8`                        |
 | `Unit`        | _(no operand)_        | `void` (return only) | _(omitted from params and returns)_   |
 | `Pointer`     | `void*`               | `ptr`                | pointer type from target_config       |
+| `Tuple(H)`    | _(flatten per attribute in canonical heading order)_ | _(flatten recursively into leaf scalars)_ | _(flatten recursively into leaf scalars)_ |
 
 `Rational` and `Approximate` aren't exercised by hello-world; the
 mappings are placeholders that compile-clean exhaustive matches in
 both backends but aren't load-bearing yet.
+
+### ABI flattening
+
+Two ABI types decompose at C-call boundaries:
+
+- **`Text` / `Binary`** — one `ValueId` becomes two operands at the
+  call site: a pointer and an `i64` length. Externs declare two
+  consecutive parameters in the corresponding positions.
+- **`Tuple(H)`** — one `ValueId` becomes the recursive concatenation
+  of its attributes' ABI operands, in canonical heading order
+  (`Heading::attrs()`). A `Tuple { a: Integer, b: Text }` lowers to
+  three operands at the call site: `i64`, `ptr`, `i64`. Nested
+  tuples nest. Empty `Tuple {}` contributes zero operands —
+  effectively a no-op argument.
+
+Tuples are pure compile-time grouping in both backends: each
+`Inst::TupleLit` and `Inst::TupleField` updates the per-`ValueId`
+`ValueRepr` map without emitting any LLVM op / Cranelift `builder.ins`
+op. The work happens at ABI boundaries, where the recursive
+`push_param_types` / `push_call_operands` helpers walk the
+`ValueRepr::Tuple` tree and emit one leaf operand per attribute.
 
 
 ## The `main` special case
@@ -80,6 +102,7 @@ extern declarations and the first `define` line.
 |-----------|---------------------------------|-------------------------------------|
 | `Scalar`  | `ty: String`, `op: String`      | A single LLVM operand with its type prefix. |
 | `Text`    | `ptr_op: String`, `len_op: String` | Two operands for C-call expansion.       |
+| `Tuple`   | `fields: Vec<(String, ValueRepr)>` | Compile-time grouping in canonical heading order; flattens recursively at ABI boundaries. |
 
 `Inst::Const { value: Text(bytes), ty: Text, dst }` emits a private
 unnamed-address constant for the bytes and records `Text { ptr_op:

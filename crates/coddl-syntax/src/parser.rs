@@ -519,20 +519,39 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
-    /// An expression. Parses a primary, then chains postfix forms
-    /// (today only the brace-delimited call form `<expr>{ … }`). Field
-    /// access (`.x`) and indexing (`[i]`) join the loop once their
-    /// semantic decisions are in.
+    /// An expression. Parses a primary, then chains postfix forms:
+    /// brace-delimited call (`<expr>{ … }`) and dot-prefixed field
+    /// access (`<expr>.<name>`). The loop iterates so chained postfix
+    /// (`f{}.x`, `t.a.b`, etc.) works uniformly.
     fn parse_expr(&mut self) {
+        // Flush any leading trivia into the parent node before the
+        // checkpoint — otherwise a retroactive `start_node_at(cp, …)`
+        // for CALL_EXPR / FIELD_ACCESS would wrap the trivia inside the
+        // expression.
+        self.bump_trivia();
         let cp = self.checkpoint();
         if !self.parse_primary_expr() {
             return;
         }
 
-        while self.at(SyntaxKind::L_BRACE) {
-            self.start_node_at(cp, SyntaxKind::CALL_EXPR);
-            self.parse_arg_list();
-            self.finish_node();
+        loop {
+            match self.current() {
+                SyntaxKind::L_BRACE => {
+                    self.start_node_at(cp, SyntaxKind::CALL_EXPR);
+                    self.parse_arg_list();
+                    self.finish_node();
+                }
+                SyntaxKind::DOT => {
+                    self.start_node_at(cp, SyntaxKind::FIELD_ACCESS);
+                    self.bump(); // `.`
+                    self.bump_trivia();
+                    if !self.eat(SyntaxKind::IDENT) {
+                        self.error("P0030", "expected field name after `.`");
+                    }
+                    self.finish_node();
+                }
+                _ => break,
+            }
         }
     }
 
@@ -562,11 +581,47 @@ impl<'a> Parser<'a> {
                 self.finish_node();
                 true
             }
+            SyntaxKind::L_BRACE => {
+                self.parse_tuple_lit();
+                true
+            }
             _ => {
                 self.error("P0014", "expected expression");
                 false
             }
         }
+    }
+
+    /// `{ <named_arg>, … }` in expression position — a tuple literal.
+    /// Empty `{}` is the unit value (`Tuple {}`); a non-empty form
+    /// names each attribute. Same grammar as [`parse_arg_list`], but
+    /// the wrapping node is `TUPLE_LIT` so the AST can distinguish a
+    /// tuple value from a call-site argument list.
+    fn parse_tuple_lit(&mut self) {
+        debug_assert!(self.at(SyntaxKind::L_BRACE));
+        self.bump_trivia();
+        self.start_node(SyntaxKind::TUPLE_LIT);
+        self.bump(); // {
+
+        if self.eat(SyntaxKind::R_BRACE) {
+            self.finish_node();
+            return;
+        }
+
+        loop {
+            self.parse_named_arg();
+            if !self.eat(SyntaxKind::COMMA) {
+                break;
+            }
+            if self.at(SyntaxKind::R_BRACE) {
+                break;
+            }
+        }
+
+        if !self.eat(SyntaxKind::R_BRACE) {
+            self.error("P0029", "expected `}` to close tuple literal");
+        }
+        self.finish_node();
     }
 
     /// `transaction [ ... ]` — a block expression. The body parses
@@ -1447,6 +1502,111 @@ mod tests {
         assert!(
             out.diagnostics.iter().any(|d| d.code == "P0011"),
             "expected P0011, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn empty_tuple_literal_parses() {
+        let out = parse_str("oper f {} [ let t = {}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let tuple = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::TUPLE_LIT)
+            .expect("TUPLE_LIT in tree");
+        assert_eq!(tuple.children().count(), 0);
+        assert_eq!(tuple.text(), "{}");
+    }
+
+    #[test]
+    fn tuple_literal_with_named_fields_parses() {
+        let out = parse_str("oper f {} [ let t = {a: 1, b: \"x\"}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let tuple = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::TUPLE_LIT)
+            .expect("TUPLE_LIT in tree");
+        let fields: Vec<_> = tuple.children().collect();
+        assert_eq!(fields.len(), 2);
+        assert!(fields.iter().all(|f| f.kind() == SyntaxKind::NAMED_ARG));
+    }
+
+    #[test]
+    fn tuple_literal_trailing_comma_parses() {
+        let out = parse_str("oper f {} [ let t = {a: 1, b: 2,}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let tuple = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::TUPLE_LIT)
+            .expect("TUPLE_LIT in tree");
+        assert_eq!(tuple.children().count(), 2);
+    }
+
+    #[test]
+    fn unterminated_tuple_literal_diagnoses_p0029() {
+        let out = parse_str("oper f {} [ let t = {a: 1 ; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0029"),
+            "expected P0029, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn field_access_parses() {
+        let out = parse_str("oper f {} [ t.message; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let fa = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::FIELD_ACCESS)
+            .expect("FIELD_ACCESS in tree");
+        // Base is a NAME_REF; the IDENT after `.` is the field token.
+        let base = fa.first_child().unwrap();
+        assert_eq!(base.kind(), SyntaxKind::NAME_REF);
+        assert_eq!(base.text(), "t");
+        assert_eq!(fa.text(), "t.message");
+    }
+
+    #[test]
+    fn chained_field_access_nests() {
+        let out = parse_str("oper f {} [ t.a.b; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        // Outer FIELD_ACCESS wraps the inner one.
+        let outer = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::FIELD_ACCESS)
+            .expect("FIELD_ACCESS in tree");
+        let inner = outer.first_child().unwrap();
+        assert_eq!(inner.kind(), SyntaxKind::FIELD_ACCESS);
+        assert_eq!(inner.text(), "t.a");
+        assert_eq!(outer.text(), "t.a.b");
+    }
+
+    #[test]
+    fn tuple_then_field_access_chain() {
+        // `{a: 1}.a` — a tuple literal followed by a field access.
+        let out = parse_str("oper f {} [ {a: 1}.a; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let fa = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::FIELD_ACCESS)
+            .expect("FIELD_ACCESS in tree");
+        let base = fa.first_child().unwrap();
+        assert_eq!(base.kind(), SyntaxKind::TUPLE_LIT);
+    }
+
+    #[test]
+    fn field_access_missing_ident_diagnoses_p0030() {
+        let out = parse_str("oper f {} [ t.; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0030"),
+            "expected P0030, got {:?}",
             out.diagnostics
         );
     }

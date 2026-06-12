@@ -162,6 +162,8 @@ each `parse_<x>` has a corresponding `check_<x>`.
     numeric kinds to the matching numeric type).
   - `Call` is `check_call`.
   - `Transaction` is `check_transaction_expr`.
+  - `TupleLit` is `check_tuple_lit`.
+  - `FieldAccess` is `check_field_access`.
 - **`check_transaction_expr`** — pushes a scope layer, walks the
   body with `check_block`, pops the layer, and returns the body's
   result type.
@@ -174,6 +176,18 @@ each `parse_<x>` has a corresponding `check_<x>`.
   type mismatches between the argument's expression and the
   parameter's declared type (`T0004`). When the argument matches a
   declared parameter, it's marked provided.
+- **`check_tuple_lit`** — walks each field's value expression in
+  source order, collecting `(name, Type)` pairs. Duplicate field
+  names emit `T0015` and the second occurrence is dropped from the
+  heading. The collected pairs flow into `Heading::new` (which sorts
+  them into canonical order); the result is `Type::Tuple(heading)`.
+  Empty `{}` types as `Type::unit()` — the generalized way to write
+  the unit value at expression position.
+- **`check_field_access`** — typechecks the base expression. If the
+  base isn't a `Type::Tuple(_)`, emits `T0016` and returns
+  `Type::Unknown`. Otherwise consults `Heading::lookup` for the
+  field name; on miss emits `T0017` and returns `Type::Unknown`; on
+  hit returns the attribute's type.
 
 
 ## Typecheck diagnostics
@@ -198,3 +212,6 @@ check script enforces that.
 | T0012 | Duplicate relvar — name already declared in this file    |
 | T0013 | Key attribute is not in the relvar's heading             |
 | T0014 | Relvar kind is not legal for this dialect (`public`/`private` in `.cddb`, `base`/`virtual` in `.cd`) |
+| T0015 | Duplicate field name in tuple literal                    |
+| T0016 | Field access on a value whose type isn't a tuple         |
+| T0017 | Unknown field name in tuple field access                 |
