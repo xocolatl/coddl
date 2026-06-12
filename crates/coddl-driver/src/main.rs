@@ -20,6 +20,7 @@ fn main() -> ExitCode {
         Some("lex") => cmd_lex(&args[2..]),
         Some("parse") => cmd_parse(&args[2..]),
         Some("check") => cmd_check(&args[2..]),
+        Some("plan") => cmd_plan(&args[2..]),
         Some("lower") => cmd_lower(&args[2..]),
         Some("emit-llvm") => cmd_emit_llvm(&args[2..]),
         Some("emit-obj") => cmd_emit_obj(&args[2..]),
@@ -32,7 +33,11 @@ fn main() -> ExitCode {
             eprintln!("subcommands:");
             eprintln!("  lex <file>           run the lexer on <file> (or stdin if -)");
             eprintln!("  parse <file>         parse <file> and dump the syntax tree");
-            eprintln!("  check <file>         typecheck <file> (or stdin if -)");
+            eprintln!("  check <file>         typecheck <file> (or stdin if -);");
+            eprintln!("                       cross-validates companions when <file>.cd");
+            eprintln!("                       declares public relvars");
+            eprintln!("  plan <file>          discover .cd companions, validate the chain,");
+            eprintln!("                       dump the resolved Plan");
             eprintln!("  lower <file>         lower <file> to ProcIR and dump it");
             eprintln!("  emit-llvm <file>     emit LLVM IR text for <file>");
             eprintln!("  emit-obj <file>      emit a native object file via Cranelift");
@@ -221,6 +226,79 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // plan layer is Phase 16) so check() just surfaces parse errors.
     let out = coddl_types::check(&source, FileId(0), kind);
 
+    let mut diagnostics = out.diagnostics.clone();
+
+    // When the input is a `.cd` file path (not stdin) and declares
+    // public relvars, run the plan pass to cross-validate companions.
+    // Stdin-fed `.cd` skips the plan pass — there's no path to anchor
+    // companion-file discovery against.
+    let has_public_relvars = out
+        .relvars
+        .iter()
+        .any(|(_, info)| info.kind == coddl_types::RelvarKind::Public);
+    if kind == FileKind::Cd && has_public_relvars {
+        if let Some(path) = args.first().filter(|s| s.as_str() != "-") {
+            let plan_out = coddl_plan::discover_and_validate(Path::new(path));
+            for d in &plan_out.diagnostics {
+                if d.code.starts_with("PL") {
+                    diagnostics.push(d.clone());
+                }
+            }
+        }
+    }
+
+    if diagnostics.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        for d in &diagnostics {
+            eprintln!(
+                "{}: {} [{}] at {}..{}",
+                d.severity, d.message, d.code, d.span.start, d.span.end
+            );
+        }
+        ExitCode::from(1)
+    }
+}
+
+fn cmd_plan(args: &[String]) -> ExitCode {
+    let path = match args.first().map(String::as_str) {
+        Some("-") | None => {
+            eprintln!("coddl plan: requires a `.cd` file path (stdin is unsupported)");
+            return ExitCode::from(2);
+        }
+        Some(p) => PathBuf::from(p),
+    };
+
+    let kind = FileKind::from_path(&path).unwrap_or(FileKind::Cd);
+    if let Err(code) = require_cd(kind, "plan") {
+        return code;
+    }
+
+    let out = coddl_plan::discover_and_validate(&path);
+
+    if let Some(plan) = &out.plan {
+        let stdout = io::stdout();
+        let mut w = stdout.lock();
+        let _ = writeln!(w, "program: {}", plan.program_name);
+        let _ = writeln!(
+            w,
+            "database: {}",
+            plan.database_name.as_deref().unwrap_or("(none)")
+        );
+        let _ = writeln!(w, "backend: {:?}", plan.backend_kind);
+        let _ = writeln!(w, "resolved ({}):", plan.resolved.len());
+        for r in &plan.resolved {
+            let _ = writeln!(
+                w,
+                "  {} → {} (table {:?}, {:?})",
+                r.app_name, r.catalog_name, r.table_name, r.write_policy
+            );
+            for (attr, col) in &r.columns {
+                let _ = writeln!(w, "    {attr}: {col:?}");
+            }
+        }
+    }
+
     if out.diagnostics.is_empty() {
         ExitCode::SUCCESS
     } else {
@@ -230,7 +308,16 @@ fn cmd_check(args: &[String]) -> ExitCode {
                 d.severity, d.message, d.code, d.span.start, d.span.end
             );
         }
-        ExitCode::from(1)
+        // Any error severity = exit 1.
+        let has_error = out
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Severity::Error);
+        if has_error {
+            ExitCode::from(1)
+        } else {
+            ExitCode::SUCCESS
+        }
     }
 }
 

@@ -211,6 +211,7 @@ dependencies = [
  "coddl-diagnostics",
  "coddl-execlocal",
  "coddl-fmt",
+ "coddl-plan",
  "coddl-procir",
  "coddl-relir",
  "coddl-runtime",
@@ -246,6 +247,16 @@ dependencies = [
  "coddl-types",
  "tokio",
  "tower-lsp",
+]
+
+[[package]]
+name = "coddl-plan"
+version = "0.0.0"
+dependencies = [
+ "coddl-diagnostics",
+ "coddl-syntax",
+ "coddl-types",
+ "tempfile",
 ]
 
 [[package]]

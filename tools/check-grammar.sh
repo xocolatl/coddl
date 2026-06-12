@@ -72,15 +72,17 @@ done
 # Harvest every `"X####"` literal across the syntax, types, and procir
 # crates; verify each appears in some docs/*.md. Recognized prefixes:
 # E (lexer), P (.cd parser), T (typechecker), L (lower),
-# PB (.cddb parser), PM (.cdmap parser), PS (.cdstore parser).
+# PB (.cddb parser), PM (.cdmap parser), PS (.cdstore parser),
+# PL (.cd project plan, coddl-plan crate).
 code_sources=$(
     find "$ROOT/crates/coddl-syntax/src" \
          "$ROOT/crates/coddl-types/src" \
          "$ROOT/crates/coddl-procir/src" \
+         "$ROOT/crates/coddl-plan/src" \
         -name '*.rs' -type f 2>/dev/null
 )
 codes=$(
-    grep -hoE '"(P[BMS]|[EPTL])[0-9]{4}"' $code_sources 2>/dev/null \
+    grep -hoE '"(P[BMSL]|[EPTL])[0-9]{4}"' $code_sources 2>/dev/null \
         | tr -d '"' \
         | sort -u
 )
@@ -96,7 +98,7 @@ for code in $codes; do
 done
 
 if [ "$failed" -eq 0 ]; then
-    echo "check-grammar: docs/ is in sync with crates/coddl-syntax + crates/coddl-types + crates/coddl-procir"
+    echo "check-grammar: docs/ is in sync with crates/coddl-syntax + crates/coddl-types + crates/coddl-procir + crates/coddl-plan"
 fi
 
 exit "$failed"
