@@ -183,19 +183,28 @@ impl Block {
     pub fn statements(&self) -> impl Iterator<Item = Stmt> + '_ {
         self.syntax.children().filter_map(Stmt::cast)
     }
+
+    /// The block's tail expression, if any. A tail expression is an
+    /// `Expr` direct child of the BLOCK node (not wrapped in
+    /// `EXPR_STMT` or `LET_STMT`) and supplies the block's value.
+    pub fn tail_expr(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
 }
 
-/// Statement variants. Today only `ExprStmt` exists; `let` / `mut` /
-/// `return` / `insert` / `delete` / `update` arrive when their semantics
-/// are settled.
+/// Statement variants. `let` is a binding; `ExprStmt` evaluates an
+/// expression and discards the result. `mut` / `return` / `insert` /
+/// `delete` / `update` arrive when their semantics are settled.
 #[derive(Debug, Clone)]
 pub enum Stmt {
+    Let(LetStmt),
     ExprStmt(ExprStmt),
 }
 
 impl Stmt {
     pub fn cast(syntax: SyntaxNode) -> Option<Self> {
         Some(match syntax.kind() {
+            SyntaxKind::LET_STMT => Stmt::Let(LetStmt { syntax }),
             SyntaxKind::EXPR_STMT => Stmt::ExprStmt(ExprStmt { syntax }),
             _ => return None,
         })
@@ -203,8 +212,25 @@ impl Stmt {
 
     pub fn syntax(&self) -> &SyntaxNode {
         match self {
+            Stmt::Let(s) => s.syntax(),
             Stmt::ExprStmt(s) => s.syntax(),
         }
+    }
+}
+
+ast_node!(pub LetStmt, LET_STMT);
+
+impl LetStmt {
+    /// The binding's name (the IDENT immediately after `let`).
+    pub fn name(&self) -> Option<SyntaxToken> {
+        // Skip the `let` IDENT (contextual keyword); the binding name
+        // is the second IDENT child token.
+        nth_token(&self.syntax, SyntaxKind::IDENT, 1)
+    }
+
+    /// The right-hand-side expression.
+    pub fn value(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
     }
 }
 
@@ -221,13 +247,14 @@ impl ExprStmt {
 // ── Expressions ──────────────────────────────────────────────────────────
 
 /// Expression variants. The set will grow as the parser does; for now
-/// the kinds recognized are name references, literals, and brace-call
-/// expressions.
+/// the kinds recognized are name references, literals, brace-call
+/// expressions, and `transaction` block expressions.
 #[derive(Debug, Clone)]
 pub enum Expr {
     NameRef(NameRef),
     Literal(Literal),
     Call(CallExpr),
+    Transaction(TransactionExpr),
 }
 
 impl Expr {
@@ -236,6 +263,7 @@ impl Expr {
             SyntaxKind::NAME_REF => Expr::NameRef(NameRef { syntax }),
             SyntaxKind::LITERAL => Expr::Literal(Literal { syntax }),
             SyntaxKind::CALL_EXPR => Expr::Call(CallExpr { syntax }),
+            SyntaxKind::TRANSACTION_EXPR => Expr::Transaction(TransactionExpr { syntax }),
             _ => return None,
         })
     }
@@ -245,7 +273,17 @@ impl Expr {
             Expr::NameRef(n) => n.syntax(),
             Expr::Literal(l) => l.syntax(),
             Expr::Call(c) => c.syntax(),
+            Expr::Transaction(t) => t.syntax(),
         }
+    }
+}
+
+ast_node!(pub TransactionExpr, TRANSACTION_EXPR);
+
+impl TransactionExpr {
+    /// The block body. `None` only on parse-recovery edge cases.
+    pub fn body(&self) -> Option<Block> {
+        child(&self.syntax)
     }
 }
 
@@ -407,7 +445,9 @@ mod tests {
         let stmts: Vec<_> = o.body().unwrap().statements().collect();
         assert_eq!(stmts.len(), 3);
         for s in &stmts {
-            let Stmt::ExprStmt(e) = s;
+            let Stmt::ExprStmt(e) = s else {
+                panic!("expected ExprStmt, got {s:?}")
+            };
             match e.expr().unwrap() {
                 Expr::NameRef(_) => {}
                 other => panic!("expected NameRef, got {other:?}"),
@@ -444,7 +484,9 @@ mod tests {
         // 3. body has one EXPR_STMT
         let stmts: Vec<_> = o.body().unwrap().statements().collect();
         assert_eq!(stmts.len(), 1);
-        let Stmt::ExprStmt(expr_stmt) = &stmts[0];
+        let Stmt::ExprStmt(expr_stmt) = &stmts[0] else {
+            panic!("expected ExprStmt")
+        };
 
         // 4. statement is a call expression
         let Expr::Call(call) = expr_stmt.expr().unwrap() else {

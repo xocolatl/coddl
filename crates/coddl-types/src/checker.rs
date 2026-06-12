@@ -7,17 +7,48 @@
 //! → `check_oper_decl`, etc.); `docs/typecheck.md` is the spec they
 //! enforce.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{
-    AstNode, Block, CallExpr, Expr, ExprStmt, Item, NamedArg, OperDecl, ProgramDecl, Root, Stmt,
+    AstNode, Block, CallExpr, Expr, ExprStmt, Item, LetStmt, NamedArg, OperDecl, ProgramDecl, Root,
+    Stmt, TransactionExpr,
 };
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
 use coddl_syntax::{parse, SyntaxKind};
 
 use crate::builtins::Builtins;
 use crate::ty::Type;
+
+/// A stack of binding scopes — the outermost layer is an operator's
+/// parameter scope; each `transaction [...]` block pushes a new layer;
+/// `let` statements insert into the topmost layer. Lookups walk
+/// innermost-first so inner bindings shadow outer ones.
+#[derive(Default)]
+struct Scope {
+    layers: Vec<HashMap<String, Type>>,
+}
+
+impl Scope {
+    fn push(&mut self) {
+        self.layers.push(HashMap::new());
+    }
+
+    fn pop(&mut self) {
+        self.layers.pop();
+    }
+
+    fn insert(&mut self, name: String, ty: Type) {
+        self.layers
+            .last_mut()
+            .expect("scope stack is empty")
+            .insert(name, ty);
+    }
+
+    fn lookup(&self, name: &str) -> Option<&Type> {
+        self.layers.iter().rev().find_map(|l| l.get(name))
+    }
+}
 
 /// The output of one `check` pass: the parsed CST root and every
 /// diagnostic from the parser and the typechecker together. The
@@ -90,15 +121,19 @@ impl TypeChecker {
     }
 
     fn check_oper_decl(&mut self, decl: &OperDecl) {
-        // Resolve declared parameters into a scope. Duplicate names
-        // are rejected here so the body sees a well-formed scope.
-        let mut params: Vec<(String, Type)> = Vec::new();
+        let mut scope = Scope::default();
+        scope.push(); // operator parameter layer
+
+        // Resolve declared parameters into the parameter layer.
+        // Duplicate names are rejected here so the body sees a
+        // well-formed scope.
+        let mut param_count: usize = 0;
         let mut seen: HashSet<String> = HashSet::new();
         if let Some(heading) = decl.heading() {
             for param in heading.params() {
                 let name_tok = match param.name() {
                     Some(t) => t,
-                    None => continue, // parse error already reported
+                    None => continue,
                 };
                 let name = name_tok.text().to_string();
                 if !seen.insert(name.clone()) {
@@ -112,15 +147,16 @@ impl TypeChecker {
 
                 let ty = match param.type_ref().and_then(|tr| tr.name()) {
                     Some(name_tok) => self.resolve_type_name(&name_tok),
-                    None => Type::Unknown, // parse error already reported
+                    None => Type::Unknown,
                 };
-                params.push((name, ty));
+                scope.insert(name, ty);
+                param_count += 1;
             }
         }
 
         // Entry-point rule: `main` must take no parameters.
         if let Some(name_tok) = decl.name() {
-            if name_tok.text() == "main" && !params.is_empty() {
+            if name_tok.text() == "main" && param_count > 0 {
                 self.error(
                     self.token_span(&name_tok),
                     "T0006",
@@ -129,9 +165,28 @@ impl TypeChecker {
             }
         }
 
+        // All operators implicitly return `Tuple {}` today; an
+        // explicit return type is a future-phase concern. Anything
+        // else the body produces is a type error.
         if let Some(body) = decl.body() {
-            self.check_block(&body, &params);
+            let body_ty = self.check_block(&body, &mut scope);
+            if !body_ty.assignable_to(&Type::unit()) {
+                let span = body
+                    .tail_expr()
+                    .map(|e| self.node_span(e.syntax()))
+                    .unwrap_or_else(|| self.node_span(body.syntax()));
+                self.error(
+                    span,
+                    "T0009",
+                    format!(
+                        "operator body produces {body_ty}, but operator returns {}",
+                        Type::unit()
+                    ),
+                );
+            }
         }
+
+        scope.pop();
     }
 
     fn resolve_type_name(&mut self, token: &SyntaxToken) -> Type {
@@ -149,31 +204,46 @@ impl TypeChecker {
         }
     }
 
-    fn check_block(&mut self, block: &Block, params: &[(String, Type)]) {
+    fn check_block(&mut self, block: &Block, scope: &mut Scope) -> Type {
         for stmt in block.statements() {
             match stmt {
-                Stmt::ExprStmt(e) => self.check_expr_stmt(&e, params),
+                Stmt::Let(l) => self.check_let_stmt(&l, scope),
+                Stmt::ExprStmt(e) => self.check_expr_stmt(&e, scope),
             }
         }
-    }
-
-    fn check_expr_stmt(&mut self, stmt: &ExprStmt, params: &[(String, Type)]) {
-        if let Some(expr) = stmt.expr() {
-            let _ = self.check_expr(&expr, params); // result discarded
+        match block.tail_expr() {
+            Some(expr) => self.check_expr(&expr, scope),
+            None => Type::unit(),
         }
     }
 
-    fn check_expr(&mut self, expr: &Expr, params: &[(String, Type)]) -> Type {
+    fn check_let_stmt(&mut self, stmt: &LetStmt, scope: &mut Scope) {
+        // Infer the RHS type and bind. Missing name or value here
+        // means the parser already reported the recovery; we still
+        // walk what's parseable to keep diagnostics flowing.
+        let ty = match stmt.value() {
+            Some(v) => self.check_expr(&v, scope),
+            None => Type::Unknown,
+        };
+        if let Some(name_tok) = stmt.name() {
+            scope.insert(name_tok.text().to_string(), ty);
+        }
+    }
+
+    fn check_expr_stmt(&mut self, stmt: &ExprStmt, scope: &mut Scope) {
+        if let Some(expr) = stmt.expr() {
+            let _ = self.check_expr(&expr, scope); // result discarded
+        }
+    }
+
+    fn check_expr(&mut self, expr: &Expr, scope: &mut Scope) -> Type {
         match expr {
             Expr::NameRef(n) => {
-                // A bare NameRef in expression position with no callable
-                // following it is a value reference. Today the only
-                // values in scope are parameters.
                 let Some(ident) = n.ident() else {
                     return Type::Unknown;
                 };
                 let name = ident.text();
-                if let Some((_, ty)) = params.iter().find(|(n, _)| n == name) {
+                if let Some(ty) = scope.lookup(name) {
                     return ty.clone();
                 }
                 self.error(
@@ -191,11 +261,25 @@ impl TypeChecker {
                 Some(SyntaxKind::APPROXIMATE_LIT) => Type::Approximate,
                 _ => Type::Unknown,
             },
-            Expr::Call(call) => self.check_call(call, params),
+            Expr::Call(call) => self.check_call(call, scope),
+            Expr::Transaction(t) => self.check_transaction_expr(t, scope),
         }
     }
 
-    fn check_call(&mut self, call: &CallExpr, params: &[(String, Type)]) -> Type {
+    fn check_transaction_expr(&mut self, txn: &TransactionExpr, scope: &mut Scope) -> Type {
+        // `transaction [ ... ]` is a block expression; its value is
+        // the body block's value. The scope push gates inner
+        // bindings from leaking out.
+        scope.push();
+        let ty = match txn.body() {
+            Some(b) => self.check_block(&b, scope),
+            None => Type::unit(),
+        };
+        scope.pop();
+        ty
+    }
+
+    fn check_call(&mut self, call: &CallExpr, scope: &mut Scope) -> Type {
         // The callee must be a `NameRef` whose lexeme is in builtins.
         let callee = call.callee();
         let callee_name_tok = match &callee {
@@ -225,7 +309,7 @@ impl TypeChecker {
         let mut provided: HashSet<String> = HashSet::new();
         if let Some(arg_list) = call.args() {
             for arg in arg_list.args() {
-                self.check_named_arg(&arg, &sig, params, &mut seen, &mut provided);
+                self.check_named_arg(&arg, &sig, scope, &mut seen, &mut provided);
             }
         }
 
@@ -251,7 +335,7 @@ impl TypeChecker {
         &mut self,
         arg: &NamedArg,
         sig: &crate::builtins::OperSig,
-        params: &[(String, Type)],
+        scope: &mut Scope,
         seen: &mut HashSet<String>,
         provided: &mut HashSet<String>,
     ) {
@@ -277,7 +361,7 @@ impl TypeChecker {
             .map(|(_, t)| t.clone());
 
         let arg_ty = match arg.value() {
-            Some(v) => self.check_expr(&v, params),
+            Some(v) => self.check_expr(&v, scope),
             None => Type::Unknown,
         };
 
@@ -378,6 +462,79 @@ mod tests {
     fn duplicate_arg_diagnoses_t0008() {
         let src = "oper main {} [ write_line{message: \"a\", message: \"b\"}; ];";
         assert!(codes(src).contains(&"T0008"));
+    }
+
+    #[test]
+    fn let_binds_for_later_statements() {
+        // A let binding is visible to subsequent statements in the
+        // same block. The call here resolves `msg` against the let
+        // binding, not against the empty operator parameter scope.
+        let src = "oper main {} [ let msg = \"hi\"; write_line{message: msg}; ];";
+        assert!(
+            diagnostics(src).is_empty(),
+            "unexpected diagnostics: {:?}",
+            diagnostics(src)
+        );
+    }
+
+    #[test]
+    fn let_shadows_outer_binding() {
+        // The inner let with the same name as an outer binding should
+        // be silently allowed; the inner shadows the outer.
+        let src = "oper f { x: Integer } [ let x = \"shadowed\"; write_line{message: x}; ];";
+        assert!(
+            diagnostics(src).is_empty(),
+            "unexpected diagnostics: {:?}",
+            diagnostics(src)
+        );
+    }
+
+    #[test]
+    fn transaction_expr_type_is_tail_expression_type() {
+        // The transaction's body's tail expression is a Text, so the
+        // overall let-bound value is Text — write_line accepts it.
+        let src = "oper main {} [ let ok = transaction [ \"ok\" ]; write_line{message: ok}; ];";
+        assert!(
+            diagnostics(src).is_empty(),
+            "unexpected diagnostics: {:?}",
+            diagnostics(src)
+        );
+    }
+
+    #[test]
+    fn transaction_with_no_tail_is_unit() {
+        // No tail expression in the body — value is Tuple {}. Passing
+        // it to write_line (which expects Text) is a T0004 mismatch.
+        let src = "oper main {} [ let u = transaction []; write_line{message: u}; ];";
+        assert!(
+            codes(src).contains(&"T0004"),
+            "expected T0004, got {:?}",
+            codes(src)
+        );
+    }
+
+    #[test]
+    fn oper_body_with_non_unit_tail_diagnoses_t0009() {
+        // A tail expression in an oper body that isn't Unit. Today
+        // all opers return Unit implicitly.
+        let src = "oper main {} [ \"oops\" ];";
+        assert!(
+            codes(src).contains(&"T0009"),
+            "expected T0009, got {:?}",
+            codes(src)
+        );
+    }
+
+    #[test]
+    fn inner_block_bindings_dont_leak() {
+        // `inner` is bound inside the transaction but not visible
+        // outside it.
+        let src = "oper main {} [ let _ = transaction [ let inner = \"x\"; ]; write_line{message: inner}; ];";
+        assert!(
+            codes(src).contains(&"T0001"),
+            "expected T0001, got {:?}",
+            codes(src)
+        );
     }
 
     #[test]

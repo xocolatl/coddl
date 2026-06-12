@@ -11,7 +11,7 @@ backend-agnostic node language, the LLVM-text-emission v1 strategy —
 see `ARCHITECTURE.md §4 "The two IRs"`. This document never duplicates
 that rationale.
 
-**Last sync:** `a255d1d`. Every commit that adds, removes, or changes
+**Last sync:** `78d007f`. Every commit that adds, removes, or changes
 a ProcIR data type, an instruction, an AST→IR correspondence, the
 `Codegen` trait, the builtin→extern map, or an `L####` code updates
 this file in the same commit; `tools/check-grammar.sh` enforces the
@@ -78,11 +78,18 @@ walk shape. Each `check_<x>` in `coddl-types::checker` has a sibling
 | `OperDecl`     | One `Function` with one `BasicBlock` (`block_0`) and `Terminator::Return(None)`. Heading params become `Function::params` typed via `ProcType`. |
 | `OperDecl` named `main` | As above, *plus* the body is wrapped with `Inst::Call("coddl_runtime_init")` at the top and `Inst::Call("coddl_runtime_shutdown")` at the bottom. Synthetic externs for both are registered through the same `seen_externs` dedup that handles the builtin → extern map. ARCHITECTURE.md §6 mandates this; the runtime stubs are no-ops today but wiring it in lowering means future runtime growth (DB pool, prepared-statement cache) lands without a codegen change. |
 | `Heading` / `Param` / `TypeRef` | Consumed into `Function::params`.                                                |
-| `Block`        | Inlined into the surrounding `Function`'s sole `BasicBlock` today; multi-block control-flow lands when `if` / `match` / `while` do. |
+| `Block`        | Inlined into the surrounding `Function`'s sole `BasicBlock` today; multi-block control-flow lands when `if` / `match` / `while` do. Returns the tail expression's `ValueId` if `Block::tail_expr()` is `Some`; otherwise a fresh placeholder. |
+| `Stmt::Let`    | Lowers the RHS expression and binds its `ValueId` in the current local scope. No `Inst` emitted — `let` is a binding, not a computation. |
 | `Stmt::ExprStmt` | `lower_expr` is called and its result discarded.                                           |
 | `Expr::Literal` | `Inst::Const` of the matching `ProcType`.                                                   |
 | `Expr::Call`   | Lowers each declared parameter's argument expression in source-declaration order, emits the synthetic extern `Function` on first reference, then `Inst::Call` to its `linkage_name`. |
-| `Expr::NameRef` | No-op today (parameter references compile, but the language has no consumers yet). Allocates a fresh `ValueId` so the surrounding machinery has somewhere to plug in. |
+| `Expr::NameRef` | Looks up the name in the local scope stack (innermost-first). Returns the bound `ValueId` so downstream consumers thread it through. |
+| `Expr::Transaction` | Pushes a local scope, walks the body via `Block`, pops the scope. The body's `ValueId` becomes the expression's value. Transparent today — no `Inst` for the `transaction` wrapper itself. Future runtime semantics slot in here as synthetic begin/commit/rollback calls. |
+
+Locals share the same `ValueId` namespace as computed values —
+there's no separate "variable" concept in ProcIR. A `let x = expr`
+just records "the name `x` refers to whatever `ValueId` lowering
+produced for `expr`."
 
 
 ## Builtin → extern map

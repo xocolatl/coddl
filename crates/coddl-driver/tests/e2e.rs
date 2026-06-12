@@ -12,8 +12,6 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-const HELLO_WORLD_REL: &str = "examples/hello-world/hello-world.cdl";
-
 fn workspace_root() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop();
@@ -21,8 +19,13 @@ fn workspace_root() -> PathBuf {
     p
 }
 
+/// `examples/<name>/<name>.cdl` is the on-disk convention.
+fn example_path(name: &str) -> PathBuf {
+    workspace_root().join(format!("examples/{name}/{name}.cdl"))
+}
+
 fn hello_world_path() -> PathBuf {
-    workspace_root().join(HELLO_WORLD_REL)
+    example_path("hello-world")
 }
 
 fn ensure_runtime_built() {
@@ -185,6 +188,73 @@ fn hello_world_byte_identical_across_backends() {
         "both backends produced unexpected stdout: {:?}",
         String::from_utf8_lossy(&llvm.stdout)
     );
+}
+
+// ── Transaction example ───────────────────────────────────────────────
+
+#[test]
+fn transaction_llvm_backend_prints_ok() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(example_path("transaction"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "transaction LLVM run failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"ok\n");
+}
+
+#[test]
+fn transaction_cranelift_backend_prints_ok() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(example_path("transaction"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "transaction Cranelift run failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"ok\n");
+}
+
+#[test]
+fn transaction_byte_identical_across_backends() {
+    ensure_runtime_built();
+    let llvm = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(example_path("transaction"))
+        .output()
+        .expect("spawn LLVM");
+    assert!(
+        llvm.status.success(),
+        "LLVM run failed: stderr=\n{}",
+        String::from_utf8_lossy(&llvm.stderr)
+    );
+    let cranelift = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(example_path("transaction"))
+        .output()
+        .expect("spawn Cranelift");
+    assert!(
+        cranelift.status.success(),
+        "Cranelift run failed: stderr=\n{}",
+        String::from_utf8_lossy(&cranelift.stderr)
+    );
+    assert_eq!(
+        llvm.stdout,
+        cranelift.stdout,
+        "transaction backends disagree:\n  LLVM:      {:?}\n  Cranelift: {:?}",
+        String::from_utf8_lossy(&llvm.stdout),
+        String::from_utf8_lossy(&cranelift.stdout)
+    );
+    assert_eq!(llvm.stdout, b"ok\n");
 }
 
 #[test]

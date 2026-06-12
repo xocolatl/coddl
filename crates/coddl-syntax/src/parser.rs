@@ -353,10 +353,11 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
-    /// `[ <stmt>; <stmt>; … ]` body. Each statement is parsed
-    /// individually; nested `[…]` inside a statement's expression is
-    /// handled by that expression's own recursion, not by depth
-    /// counting here.
+    /// `[ <stmt>; <stmt>; … <tail-expr>? ]` body. Statements are
+    /// terminated by `;`; the final item, if it lacks a trailing `;`,
+    /// is the block's tail expression and becomes the block's value.
+    /// Nested `[…]` inside a statement's expression is handled by
+    /// that expression's own recursion, not by depth counting here.
     fn parse_block(&mut self) {
         debug_assert!(self.at(SyntaxKind::L_BRACKET));
         self.start_node(SyntaxKind::BLOCK);
@@ -372,12 +373,43 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
-    /// One statement. Today only the expression-statement form
-    /// (`<expr>;`) is recognized; `let` / `mut` / `return` / etc.
-    /// arrive when their semantics are settled.
+    /// `let <name> = <expr>;` — a value binding visible to subsequent
+    /// statements in the same block. No `mut`, no type annotations,
+    /// no destructuring for now.
+    fn parse_let_stmt(&mut self) {
+        debug_assert!(self.at_keyword("let"));
+        self.start_node(SyntaxKind::LET_STMT);
+        self.bump(); // `let`
+
+        self.bump_trivia();
+        if !self.eat(SyntaxKind::IDENT) {
+            self.error("P0018", "expected binding name in `let`");
+        }
+        if !self.eat(SyntaxKind::EQ) {
+            self.error("P0018", "expected `=` in `let`");
+        }
+        let before = self.pos;
+        self.parse_expr();
+        if self.pos == before {
+            self.error("P0018", "expected expression in `let`");
+        }
+        if !self.eat(SyntaxKind::SEMICOLON) {
+            self.error("P0013", "expected `;` after `let`");
+        }
+        self.finish_node();
+    }
+
+    /// One statement, *or* the block's trailing tail expression. The
+    /// `let` form is recognized first; otherwise an expression is
+    /// parsed and either wrapped in `EXPR_STMT` (terminated by `;`)
+    /// or left as a bare child under `BLOCK` (the tail expression,
+    /// immediately followed by `]`).
     fn parse_stmt(&mut self) {
-        // Defensive: never enter at a block-closing or terminal token.
         if matches!(self.current(), SyntaxKind::R_BRACKET | SyntaxKind::EOF) {
+            return;
+        }
+        if self.at_keyword("let") {
+            self.parse_let_stmt();
             return;
         }
 
@@ -392,6 +424,13 @@ impl<'a> Parser<'a> {
             return;
         }
 
+        // Tail expression: no trailing `;`, immediately followed by
+        // the block's closing `]`. Leave the Expr bare under BLOCK.
+        if self.at(SyntaxKind::R_BRACKET) {
+            return;
+        }
+
+        // Expression statement: wrap in EXPR_STMT, expect `;`.
         self.start_node_at(cp, SyntaxKind::EXPR_STMT);
         if !self.eat(SyntaxKind::SEMICOLON) {
             self.error("P0013", "expected `;` after expression");
@@ -419,6 +458,10 @@ impl<'a> Parser<'a> {
     /// A primary expression — the atomic forms an expression can start
     /// with. Returns `true` if anything was consumed.
     fn parse_primary_expr(&mut self) -> bool {
+        if self.at_keyword("transaction") {
+            self.parse_transaction_expr();
+            return true;
+        }
         match self.current() {
             SyntaxKind::IDENT => {
                 self.bump_trivia();
@@ -443,6 +486,24 @@ impl<'a> Parser<'a> {
                 false
             }
         }
+    }
+
+    /// `transaction [ ... ]` — a block expression. The body parses
+    /// as a normal block (statements + optional tail expression);
+    /// `transaction` itself contributes no runtime semantics today.
+    fn parse_transaction_expr(&mut self) {
+        debug_assert!(self.at_keyword("transaction"));
+        self.bump_trivia();
+        self.start_node(SyntaxKind::TRANSACTION_EXPR);
+        self.bump(); // `transaction`
+
+        if !self.at(SyntaxKind::L_BRACKET) {
+            self.error("P0019", "expected `[` after `transaction`");
+            self.finish_node();
+            return;
+        }
+        self.parse_block();
+        self.finish_node();
     }
 
     /// `{ <named_arg>, … }` — the call-site argument list. Empty and
@@ -882,9 +943,27 @@ mod tests {
     }
 
     #[test]
-    fn missing_stmt_semicolon_diagnoses() {
+    fn expr_without_trailing_semicolon_is_tail_expression() {
+        // Under tail-expression semantics, an Expr immediately before
+        // `]` is the block's tail value — no `;` required, no P0013.
         let out = parse_str("oper f {} [ x ];");
-        assert!(out.diagnostics.iter().any(|d| d.code == "P0013"));
+        assert!(
+            !out.diagnostics.iter().any(|d| d.code == "P0013"),
+            "tail expression should not require `;`: {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn middle_stmt_without_semicolon_still_diagnoses_p0013() {
+        // An expression followed by another statement (not `]`) still
+        // needs `;`. This is the original P0013 trigger condition.
+        let out = parse_str("oper f {} [ x y; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0013"),
+            "expected P0013, got {:?}",
+            out.diagnostics
+        );
     }
 
     #[test]
@@ -903,6 +982,132 @@ mod tests {
     fn missing_arg_name_diagnoses() {
         let out = parse_str("oper f {} [ foo{: 1}; ];");
         assert!(out.diagnostics.iter().any(|d| d.code == "P0016"));
+    }
+
+    #[test]
+    fn let_stmt_parses_with_canonical_form() {
+        let out = parse_str("oper f {} [ let x = 1; ];");
+        assert!(
+            out.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            out.diagnostics
+        );
+        let oper = out
+            .tree
+            .children()
+            .find(|n| n.kind() == SyntaxKind::OPER_DECL)
+            .unwrap();
+        let body = oper
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BLOCK)
+            .unwrap();
+        let let_stmt = body
+            .children()
+            .find(|n| n.kind() == SyntaxKind::LET_STMT)
+            .expect("LET_STMT child");
+        // Inside the let: an IDENT (binding name) and a LITERAL (RHS).
+        let kinds: Vec<_> = let_stmt
+            .children_with_tokens()
+            .filter_map(|e| {
+                e.as_token()
+                    .map(|t| t.kind())
+                    .or_else(|| e.as_node().map(|n| n.kind()))
+            })
+            .collect();
+        assert!(kinds.contains(&SyntaxKind::IDENT), "no IDENT in {kinds:?}");
+        assert!(
+            kinds.contains(&SyntaxKind::LITERAL),
+            "no LITERAL in {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn let_stmt_missing_equals_diagnoses_p0018() {
+        let out = parse_str("oper f {} [ let x 1; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0018"),
+            "expected P0018, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn let_stmt_missing_name_diagnoses_p0018() {
+        let out = parse_str("oper f {} [ let = 1; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0018"),
+            "expected P0018, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn transaction_expr_parses_with_tail() {
+        let out = parse_str("oper f {} [ let x = transaction [ \"ok\" ]; ];");
+        assert!(
+            out.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            out.diagnostics
+        );
+        // The let's value is a TRANSACTION_EXPR whose body's tail is a
+        // LITERAL.
+        let oper = out
+            .tree
+            .children()
+            .find(|n| n.kind() == SyntaxKind::OPER_DECL)
+            .unwrap();
+        let body = oper
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BLOCK)
+            .unwrap();
+        let let_stmt = body
+            .children()
+            .find(|n| n.kind() == SyntaxKind::LET_STMT)
+            .unwrap();
+        let txn = let_stmt
+            .children()
+            .find(|n| n.kind() == SyntaxKind::TRANSACTION_EXPR)
+            .expect("TRANSACTION_EXPR child of LET_STMT");
+        let txn_body = txn
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BLOCK)
+            .unwrap();
+        // Tail expression is a direct LITERAL child of the inner BLOCK.
+        assert!(txn_body.children().any(|n| n.kind() == SyntaxKind::LITERAL));
+    }
+
+    #[test]
+    fn transaction_missing_bracket_diagnoses_p0019() {
+        let out = parse_str("oper f {} [ let x = transaction \"oops\"; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0019"),
+            "expected P0019, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn block_with_only_tail_expression_has_no_expr_stmt() {
+        let out = parse_str("oper f {} [ x ];");
+        assert!(
+            out.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            out.diagnostics
+        );
+        let oper = out
+            .tree
+            .children()
+            .find(|n| n.kind() == SyntaxKind::OPER_DECL)
+            .unwrap();
+        let body = oper
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BLOCK)
+            .unwrap();
+        assert!(
+            body.children().all(|n| n.kind() != SyntaxKind::EXPR_STMT),
+            "expected no EXPR_STMT"
+        );
+        assert!(body.children().any(|n| n.kind() == SyntaxKind::NAME_REF));
     }
 
     #[test]

@@ -1,77 +1,22 @@
 // transaction.cdl
 //
-// Explicit transaction control (OO Pre 4, 5): nested transactions
-// supported. Inside `begin transaction [ ... ] commit;`, every
-// statement boundary checks database constraints (RM Pre 23);
-// nested transactions implement on SAVEPOINT.
+// `transaction [ ... ]` is a block expression. Its body is an
+// ordered sequence of statements optionally followed by a tail
+// expression (an expression with no trailing `;`). The block's
+// value is the tail expression's value, or `Tuple {}` (unit) if
+// there's no tail.
 //
-// Depends on the schema in suppliers-and-parts.cdl.
-//
-// OPEN syntax questions:
-//   - `begin transaction [ ... ] commit;` — the transaction body is an
-//     ordered statement sequence in brackets per §3. The `commit` (or
-//     `rollback`) closes it. Alternative: `begin transaction; ... commit;`
-//     where the `begin`/`commit` are separate statements with no
-//     surrounding bracket. Using bracket form here because (a) it makes
-//     scope visible, (b) it makes nested transactions structural rather
-//     than ambient.
-//   - `rollback` as an inner statement that aborts the enclosing
-//     transaction. The outer scope still has to deal with the failure —
-//     using exceptions? a return value? Currently flagged.
-//   - `insert into <relvar> { tup }` — sugar for `<relvar> := <relvar>
-//     union Relation { tup }` (§5 mandatory-rule: singular forms desugar
-//     to relational assignment before SQL emission). Same caveats as in
-//     multi-assign.cdl.
-//   - Nested `begin transaction [...]` inside an outer one: a child
-//     savepoint. Inner commit is conditional on the parent's eventual
-//     outcome; inner rollback undoes only the child's work.
+// `transaction` today has no runtime semantics — it's a
+// structural block-expression form. When real transaction
+// semantics arrive, the runtime externs (begin / commit /
+// rollback) slot in around the same surface shape.
 
 program transaction_demo;
 
-oper add_supplier_with_parts {
-    s:          S#,
-    name:       Name,
-    status:     Status,
-    city:       City,
-    parts:      Sequence Tuple { p#: P#, qty: Qty },
-} -> Boolean
-[
-    begin transaction [
-        // Insert the supplier first. The sp_supplier_ref constraint
-        // is satisfied trivially because SP doesn't reference this
-        // new S# yet.
-        insert into S { s#: s, sname: name, status: status, city: city };
-
-        // Inner transaction for the shipments. If any part-shipment
-        // insert fails (e.g., sp_part_ref violation because P doesn't
-        // contain the part), the inner rollback aborts only the
-        // shipments; the supplier insert above stays.
-        begin transaction [
-            do i := 1 to count(parts) [
-                insert into SP {
-                    s#:  s,
-                    p#:  parts[i].p#,
-                    qty: parts[i].qty,
-                };
-            ];
-        ] commit;
-    ] commit;
-
-    return true;
-];
-
 oper main {}
 [
-    var ok: Boolean := add_supplier_with_parts {
-        s:      S#.s { val: "S6" },
-        name:   Name.n { val: "Acme" },
-        status: Status.s { val: 50 },
-        city:   City.c { val: "Madrid" },
-        parts:  [
-            { p#: P#.p { val: "P1" }, qty: Qty.q { val: 100 } },
-            { p#: P#.p { val: "P2" }, qty: Qty.q { val: 50 } },
-        ],
-    };
-
-    write_line { message: "added: {ok}" };
+    let ok = transaction [
+        "ok"
+    ];
+    write_line { message: ok };
 ];

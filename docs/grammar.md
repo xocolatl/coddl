@@ -9,10 +9,10 @@ braces, identifier case, reserved-words-none, Unicode glyph synonyms,
 literals, method-style calls). This document never duplicates that
 rationale — it points at it and gets on with the rules.
 
-**Last sync:** `cb0b5c7` (AST view types). Every commit that adds,
-removes, or changes a production, token, or diagnostic code updates
-this file in the same commit; `tools/check-grammar.sh` enforces it
-from the hygiene gate.
+**Last sync:** `78d007f`. Every commit that adds, removes, or changes
+a production, token, or diagnostic code updates this file in the
+same commit; `tools/check-grammar.sh` enforces it from the hygiene
+gate.
 
 
 ## Notation
@@ -205,12 +205,20 @@ function that implements it.
 <param>         ::= <identifier> ':' <type-ref> ;              -- parse_param
 <type-ref>      ::= <identifier> ;                             -- parse_type_ref
 
-<block>         ::= '[' { <stmt> } ']' ;                       -- parse_block
-<stmt>          ::= <expr> ';' ;                               -- parse_stmt (EXPR_STMT)
+<block>         ::= '[' { <stmt> } [ <expr> ] ']' ;            -- parse_block
+                    -- The optional trailing <expr> with no terminating
+                    -- ';' is the block's tail expression; its value is
+                    -- the block's value. Statements terminated by ';'
+                    -- have their results discarded.
+<stmt>          ::= <let-stmt>
+                  | <expr> ';' ;                               -- parse_stmt (LET_STMT or EXPR_STMT)
+<let-stmt>      ::= 'let' <identifier> '=' <expr> ';' ;        -- parse_let_stmt
 
 <expr>          ::= <primary-expr> { <arg-list> } ;            -- parse_expr
 <primary-expr>  ::= <name-ref>
-                  | <literal> ;                                -- parse_primary_expr
+                  | <literal>
+                  | <transaction-expr> ;                       -- parse_primary_expr
+<transaction-expr> ::= 'transaction' <block> ;                 -- parse_transaction_expr
 <name-ref>      ::= <identifier> ;
 <arg-list>      ::= '{' [ <named-arg> commalist ] '}' ;        -- parse_arg_list
 <named-arg>     ::= <identifier> ':' <expr> ;                  -- parse_named_arg
@@ -221,10 +229,11 @@ function that implements it.
                     ;                                          -- parse_unknown_item
 ```
 
-`program` and `oper` are **contextual keywords** — the parser
-identifies them by lexeme at specific syntactic positions; outside
-those positions they are regular identifiers. Coddl has no
-hard-reserved words. See `ARCHITECTURE.md §3 "Reserved words: none"`.
+`program`, `oper`, `let`, and `transaction` are **contextual
+keywords** — the parser identifies them by lexeme at specific
+syntactic positions; outside those positions they are regular
+identifiers. Coddl has no hard-reserved words. See
+`ARCHITECTURE.md §3 "Reserved words: none"`.
 
 ### Deliberately not yet in the grammar
 
@@ -240,15 +249,14 @@ the parser. Listed here so the omission is explicit, not implied:
   `union`, `minus`, `where`), comparison (`=`, `<>`, `<`, `>`, `<=`,
   `>=` polymorphic over scalars and relations), logical (`and`, `or`),
   arithmetic (`+`, `-`, `*`, `/`, `mod`).
-- **Statement forms** other than `<expr> ';'` — `let`, `mut`, `return`,
-  `insert`, `delete`, `update`.
+- **Statement forms** other than `<let-stmt>` and `<expr> ';'` —
+  `mut`, `return`, `insert`, `delete`, `update`.
 - **Type / relvar / constraint declarations** at the top level.
 - **Literals**: tuple `{ … }` and sequence `[ … ]` in expression
   position; relation literals `Relation { … }`.
 - **Field access** (`x.y`) and **indexing** (`s[i]`) in expression
   postfix position.
-- **Pattern matching**, **`if`/`else`**, **block-tail expressions**,
-  **anonymous opers**.
+- **Pattern matching**, **`if`/`else`**, **anonymous opers**.
 
 
 ## Parser diagnostics
@@ -276,6 +284,8 @@ enforces that.
 | P0015 | Expected `}` to close argument list                     |
 | P0016 | Expected argument name                                  |
 | P0017 | Expected `:` after argument name                        |
+| P0018 | `let` statement is malformed (missing name, `=`, or RHS)|
+| P0019 | `transaction` not followed by `[`                       |
 
 
 ## Lexer diagnostics

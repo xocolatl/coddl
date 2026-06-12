@@ -10,12 +10,12 @@
 //! callee, a malformed call) hit `unreachable!()`; tests cover the
 //! reachable ones. The `L####` namespace is reserved for the future.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use coddl_diagnostics::{Diagnostic, FileId, Severity};
 use coddl_syntax::ast::{
-    AstNode, Block, CallExpr, Expr, ExprStmt, Item, Literal, NamedArg, OperDecl, ProgramDecl, Root,
-    Stmt,
+    AstNode, Block, CallExpr, Expr, ExprStmt, Item, LetStmt, Literal, NamedArg, OperDecl,
+    ProgramDecl, Root, Stmt, TransactionExpr,
 };
 use coddl_syntax::SyntaxKind;
 use coddl_types::check;
@@ -80,6 +80,10 @@ struct Lowerer {
     next_value: u32,
     next_block: u32,
     insts: Vec<Inst>,
+    /// Stack of binding scopes. The outermost layer is the function's
+    /// parameter scope; each `transaction [...]` block pushes a new
+    /// layer; `let` statements insert into the topmost layer.
+    locals: Vec<HashMap<String, ValueId>>,
 }
 
 impl Lowerer {
@@ -91,7 +95,27 @@ impl Lowerer {
             next_value: 0,
             next_block: 0,
             insts: Vec::new(),
+            locals: vec![HashMap::new()],
         }
+    }
+
+    fn push_local_scope(&mut self) {
+        self.locals.push(HashMap::new());
+    }
+
+    fn pop_local_scope(&mut self) {
+        self.locals.pop();
+    }
+
+    fn bind_local(&mut self, name: String, v: ValueId) {
+        self.locals
+            .last_mut()
+            .expect("scope stack empty")
+            .insert(name, v);
+    }
+
+    fn lookup_local(&self, name: &str) -> Option<ValueId> {
+        self.locals.iter().rev().find_map(|l| l.get(name).copied())
     }
 
     fn fresh_value(&mut self) -> ValueId {
@@ -110,6 +134,8 @@ impl Lowerer {
         self.next_value = 0;
         self.next_block = 0;
         self.insts.clear();
+        self.locals.clear();
+        self.locals.push(HashMap::new());
     }
 
     fn lookup_extern(&self, surface: &str) -> Option<&'static BuiltinExtern> {
@@ -253,11 +279,34 @@ impl Lowerer {
         }
     }
 
-    fn lower_block(&mut self, block: &Block) {
+    /// Lower a block. Returns the block's value — the tail
+    /// expression's `ValueId` if there is one, otherwise a fresh
+    /// placeholder representing Unit (never consumed downstream).
+    fn lower_block(&mut self, block: &Block) -> ValueId {
         for stmt in block.statements() {
             match stmt {
+                Stmt::Let(l) => self.lower_let_stmt(&l),
                 Stmt::ExprStmt(e) => self.lower_expr_stmt(&e),
             }
+        }
+        match block.tail_expr() {
+            Some(expr) => self.lower_expr(&expr),
+            None => self.fresh_value(),
+        }
+    }
+
+    fn lower_let_stmt(&mut self, stmt: &LetStmt) {
+        // RHS expression always lowers first; the binding name then
+        // adopts its `ValueId`. Missing name (parser recovery) is
+        // dropped silently — the diagnostic-free invariant means
+        // we'd never reach lowering with one.
+        let value_expr = match stmt.value() {
+            Some(v) => v,
+            None => return,
+        };
+        let id = self.lower_expr(&value_expr);
+        if let Some(name_tok) = stmt.name() {
+            self.bind_local(name_tok.text().to_string(), id);
         }
     }
 
@@ -271,15 +320,35 @@ impl Lowerer {
         match expr {
             Expr::Literal(lit) => self.lower_literal(lit),
             Expr::Call(call) => self.lower_call(call),
-            Expr::NameRef(_) => {
-                // No value-level bindings yet — the typechecker accepts
-                // parameter references but no construct in the current
-                // language consumes the resulting value. When `let` /
-                // `mut` / argument forwarding land, this gains a real
-                // case.
+            Expr::Transaction(t) => self.lower_transaction_expr(t),
+            Expr::NameRef(n) => {
+                // First try a let-bound local; that's the only value
+                // source the surface language currently exposes.
+                if let Some(name_tok) = n.ident() {
+                    if let Some(v) = self.lookup_local(name_tok.text()) {
+                        return v;
+                    }
+                }
+                // Parameter references and any other unconsumed
+                // NameRef fall through to a placeholder. Today no
+                // such case reaches a downstream consumer.
                 self.fresh_value()
             }
         }
+    }
+
+    fn lower_transaction_expr(&mut self, txn: &TransactionExpr) -> ValueId {
+        // The transaction wrapper is transparent for now — push a
+        // scope, lower the body, pop. The body's value flows out.
+        // When real transaction semantics arrive, this is where
+        // synthetic begin/commit/rollback calls slot in.
+        self.push_local_scope();
+        let value = match txn.body() {
+            Some(b) => self.lower_block(&b),
+            None => self.fresh_value(),
+        };
+        self.pop_local_scope();
+        value
     }
 
     fn lower_literal(&mut self, lit: &Literal) -> ValueId {
@@ -547,6 +616,77 @@ mod tests {
             other => panic!("expected shutdown Call, got {other:?}"),
         }
         assert!(matches!(block.terminator, Terminator::Return(None)));
+    }
+
+    #[test]
+    fn let_binding_threaded_into_write_line_call() {
+        // The let-bound `msg` becomes the same ValueId the call site
+        // uses for `message`. The const + call instructions are the
+        // body's payload (sandwiched between init/shutdown).
+        let src = "oper main {} [ let msg = \"hi\"; write_line{message: msg}; ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let insts = &main.blocks[0].insts;
+        // Find the Const Text and the call to coddl_write_line.
+        let const_dst = insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::Const {
+                    dst,
+                    value: Const::Text(bytes),
+                    ..
+                } if bytes == b"hi" => Some(*dst),
+                _ => None,
+            })
+            .expect("Const Text \"hi\" present");
+        let call_arg = insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::Call { callee, args, .. } if callee == "coddl_write_line" => {
+                    Some(args.first().copied())
+                }
+                _ => None,
+            })
+            .expect("write_line call present")
+            .expect("write_line call has an arg");
+        assert_eq!(
+            call_arg, const_dst,
+            "let binding should thread its ValueId to the call site"
+        );
+    }
+
+    #[test]
+    fn transaction_tail_expression_value_flows_out() {
+        // `transaction [ "ok" ]` as the RHS of a let: the let's bound
+        // ValueId is the same one Const Text "ok" produces. The
+        // following write_line call references it.
+        let src = "oper main {} [ let ok = transaction [ \"ok\" ]; write_line{message: ok}; ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let insts = &main.blocks[0].insts;
+
+        let ok_const_dst = insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::Const {
+                    dst,
+                    value: Const::Text(bytes),
+                    ..
+                } if bytes == b"ok" => Some(*dst),
+                _ => None,
+            })
+            .expect("Const Text \"ok\" present");
+        let call_arg = insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::Call { callee, args, .. } if callee == "coddl_write_line" => {
+                    Some(args.first().copied())
+                }
+                _ => None,
+            })
+            .expect("write_line call present")
+            .expect("write_line call has an arg");
+        assert_eq!(call_arg, ok_const_dst);
     }
 
     #[test]
