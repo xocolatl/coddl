@@ -85,6 +85,10 @@
                     "match": "\\b(program|oper|relvar|type|possrep|constraint|var|key)\\b"
                 },
                 {
+                    "name": "keyword.declaration.binding.coddl",
+                    "match": "\\b(let|mut)\\b"
+                },
+                {
                     "name": "storage.modifier.coddl",
                     "match": "\\b(real|base|virtual|private|public)\\b"
                 },

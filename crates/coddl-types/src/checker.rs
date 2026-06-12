@@ -50,16 +50,41 @@ impl Scope {
     }
 }
 
-/// The output of one `check` pass: the parsed CST root and every
-/// diagnostic from the parser and the typechecker together. The
-/// typechecker doesn't filter parse errors — downstream tools see the
-/// full picture. The tree is always present (the parser's error
-/// recovery guarantees this); downstream passes lower the same tree
-/// without re-parsing.
+/// What kind of position a `TypeHint` decorates. The label prefix
+/// differs (`:` for a binding, `->` for an operator return) so
+/// downstream renderers can format consistently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HintKind {
+    /// `let x = expr;` — the hint goes after the binding name.
+    LetBinding,
+    /// `oper f { } [ ... ]` — the hint goes after the heading.
+    OperReturn,
+}
+
+/// One inferred-type hint surfaced by the typechecker.
+///
+/// `span` is the byte range where an editor would render the hint
+/// (e.g., immediately after the binding name or heading); `ty` is
+/// the inferred type; `kind` tells the renderer which prefix to use.
+#[derive(Clone, Debug)]
+pub struct TypeHint {
+    pub span: Span,
+    pub ty: Type,
+    pub kind: HintKind,
+}
+
+/// The output of one `check` pass: the parsed CST root, every
+/// diagnostic from the parser and the typechecker together, and a
+/// list of inferred-type hints for editor surfaces (inlay hints,
+/// hover). The typechecker doesn't filter parse errors — downstream
+/// tools see the full picture. The tree is always present (the
+/// parser's error recovery guarantees this); downstream passes lower
+/// the same tree without re-parsing.
 #[derive(Debug)]
 pub struct CheckOutput {
     pub tree: SyntaxNode,
     pub diagnostics: Vec<Diagnostic>,
+    pub hints: Vec<TypeHint>,
 }
 
 /// Tokenize, parse, and type-check `source`.
@@ -70,6 +95,7 @@ pub fn check(source: &str, file: FileId) -> CheckOutput {
         file,
         builtins: Builtins::new(),
         diagnostics: parse_out.diagnostics,
+        hints: Vec::new(),
     };
     if let Some(root) = Root::cast(parse_out.tree) {
         tc.check_root(&root);
@@ -77,6 +103,7 @@ pub fn check(source: &str, file: FileId) -> CheckOutput {
     CheckOutput {
         tree,
         diagnostics: tc.diagnostics,
+        hints: tc.hints,
     }
 }
 
@@ -84,6 +111,7 @@ struct TypeChecker {
     file: FileId,
     builtins: Builtins,
     diagnostics: Vec<Diagnostic>,
+    hints: Vec<TypeHint>,
 }
 
 impl TypeChecker {
@@ -155,9 +183,22 @@ impl TypeChecker {
         }
 
         // Resolve the declared return type, if any. Default = Unit.
+        // When absent, also surface the implicit return as an inlay
+        // hint right after the heading — that's where the user would
+        // have typed `-> Type`.
         let return_type = match decl.return_type().and_then(|tr| tr.name()) {
             Some(name_tok) => self.resolve_type_name(&name_tok),
-            None => Type::unit(),
+            None => {
+                if let Some(heading) = decl.heading() {
+                    let r = heading.syntax().text_range();
+                    self.hints.push(TypeHint {
+                        span: Span::new(self.file, r.end().into(), r.end().into()),
+                        ty: Type::unit(),
+                        kind: HintKind::OperReturn,
+                    });
+                }
+                Type::unit()
+            }
         };
 
         // Entry-point rules: `main` must take no parameters and must
@@ -247,7 +288,8 @@ impl TypeChecker {
         // If the binding carries an explicit annotation, the
         // annotation is authoritative: the RHS must conform, and
         // subsequent lookups see the declared type, not the inferred
-        // one.
+        // one. Otherwise the inferred type is bound *and* surfaced as
+        // an inlay hint — that's what the editor renders.
         let bound_ty = match stmt.type_ref().and_then(|tr| tr.name()) {
             Some(name_tok) => {
                 let declared = self.resolve_type_name(&name_tok);
@@ -266,7 +308,20 @@ impl TypeChecker {
                 }
                 declared
             }
-            None => rhs_ty,
+            None => {
+                if let Some(name_tok) = stmt.name() {
+                    // Render the hint immediately after the binding
+                    // name token — that's where the user would have
+                    // typed `: Type`.
+                    let r = name_tok.text_range();
+                    self.hints.push(TypeHint {
+                        span: Span::new(self.file, r.end().into(), r.end().into()),
+                        ty: rhs_ty.clone(),
+                        kind: HintKind::LetBinding,
+                    });
+                }
+                rhs_ty
+            }
         };
 
         if let Some(name_tok) = stmt.name() {
@@ -567,6 +622,78 @@ mod tests {
             "expected T0009, got {:?}",
             codes(src)
         );
+    }
+
+    #[test]
+    fn let_without_annotation_emits_type_hint() {
+        // The unannotated `let count = 42;` should surface a hint
+        // of type Integer, positioned at the end of `count`.
+        let src = "oper main {} [ let count = 42; ];";
+        let out = check(src, FileId(0));
+        assert!(
+            out.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            out.diagnostics
+        );
+        let hint = out
+            .hints
+            .iter()
+            .find(|h| matches!(h.ty, Type::Integer))
+            .expect("expected Integer hint for `count`");
+        // The hint span ends at the byte position right after `count`.
+        let count_end = src.find("count").unwrap() + "count".len();
+        assert_eq!(hint.span.start as usize, count_end);
+        assert_eq!(hint.span.end as usize, count_end);
+    }
+
+    #[test]
+    fn let_with_annotation_emits_no_let_hint() {
+        // When the user already wrote `: Text`, no binding hint to
+        // render. (The oper-return hint for `main`'s implicit
+        // `-> Tuple {}` still fires; we filter for the let kind.)
+        let src = "oper main {} [ let m: Text = \"hi\"; ];";
+        let out = check(src, FileId(0));
+        let let_hints: Vec<_> = out
+            .hints
+            .iter()
+            .filter(|h| h.kind == HintKind::LetBinding)
+            .collect();
+        assert!(
+            let_hints.is_empty(),
+            "expected no LetBinding hints, got {let_hints:?}"
+        );
+    }
+
+    #[test]
+    fn oper_without_return_clause_emits_return_hint() {
+        // `oper main {}` has no `-> Type` clause; the implicit return
+        // is Unit, so the editor should ghost `-> Tuple {}` right
+        // after the heading's `}`.
+        let src = "oper main {} [];";
+        let out = check(src, FileId(0));
+        let hint = out
+            .hints
+            .iter()
+            .find(|h| h.kind == HintKind::OperReturn)
+            .expect("expected an OperReturn hint");
+        assert!(matches!(hint.ty, Type::Tuple(ref v) if v.is_empty()));
+        // The hint span is right after the heading's closing `}`.
+        let after_heading = src.find("{}").unwrap() + "{}".len();
+        assert_eq!(hint.span.start as usize, after_heading);
+    }
+
+    #[test]
+    fn oper_with_explicit_return_clause_emits_no_return_hint() {
+        let src = "oper greet {} -> Text [ \"hi\" ]; oper main {} [];";
+        let out = check(src, FileId(0));
+        // The `greet` oper has an explicit clause, so no hint for it.
+        // `main` still gets one because its return is implicit.
+        let return_hints: Vec<_> = out
+            .hints
+            .iter()
+            .filter(|h| h.kind == HintKind::OperReturn)
+            .collect();
+        assert_eq!(return_hints.len(), 1, "got {return_hints:?}");
     }
 
     #[test]

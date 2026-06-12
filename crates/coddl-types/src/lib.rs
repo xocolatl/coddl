@@ -12,5 +12,5 @@ pub mod builtins;
 pub mod checker;
 pub mod ty;
 
-pub use checker::{check, CheckOutput};
+pub use checker::{check, CheckOutput, HintKind, TypeHint};
 pub use ty::Type;
