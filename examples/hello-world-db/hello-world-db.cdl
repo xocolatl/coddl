@@ -1,0 +1,46 @@
+// hello-world-db.cdl
+//
+// Hello world, persisted: the greeting is read from a SQLite-backed
+// base relvar instead of a string literal. First example to exercise
+// the four-file .cd-family layout (RM Pro 6 keeps storage out of D).
+//
+// The .cd source declares the *external schema* (TTM RM Pre 14,
+// application-side). A `public relvar` is the application's
+// perception of a base relvar in some database. The .cd never names
+// a file, a backend, a table, or a column — that all lives in the
+// three companions next to this file:
+//
+//   greetings.cddb         — database catalog (conceptual schema)
+//   hello-world-db.cdmap   — external → conceptual adapter
+//   greetings.cdstore      — conceptual → physical binding
+//
+// OPEN syntax questions:
+//   - Kind-before-name on relvar declarations: `public relvar X { ... }`,
+//     paralleling `base relvar` / `virtual relvar` in `.cddb` and
+//     `private relvar` for in-memory application relvars. (The
+//     existing `suppliers-and-parts.cdl` uses kind-AFTER-name —
+//     `relvar S real { ... }` — which is the older shape and should
+//     migrate to this one.)
+//   - `public` is the only storage-aware token in D source (RM Pro 6).
+//     The declared heading must match what `.cdmap` adapts to.
+//   - Reading a relvar by bare name is a `Relation H` expression.
+//     `Greetings where id = 1` restricts; `extract` collapses a
+//     single-tuple relation to the tuple. `g.message` is the field
+//     access on the tuple.
+//   - v1 SQLite backend is read-only: `:=` against a SQLite-backed
+//     public relvar is a codegen-time error until view-updating
+//     semantics land.
+
+program hello_world_db;
+
+public relvar Greetings {
+    id: Integer,
+    message: Text,
+}
+key { id };
+
+oper main {}
+[
+    let g = extract (Greetings where id = 1);
+    write_line { message: g.message };
+];

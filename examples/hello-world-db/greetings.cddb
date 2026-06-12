@@ -1,0 +1,33 @@
+// greetings.cddb
+//
+// The conceptual schema for the `greetings` database. Declares the
+// database-side relvars (TTM RM Pre 14 database-side: base + virtual),
+// database-wide constraints, and any database-private type
+// declarations. This is the truth about the database's logical shape,
+// independent of any consuming program's view of it.
+//
+// File naming: keyed on the *database* name (`greetings.cddb`), not
+// on any program. Multiple applications can share this catalog — each
+// through its own `.cdmap` adapter.
+//
+// OPEN syntax questions:
+//   - `database <Name>;` header — required, must be the first
+//     non-comment item.
+//   - `base relvar` for the database-side persistent kind (paralleling
+//     `virtual relvar` for views). Chosen over CoddLang's `real`:
+//     shorter, pairs naturally with `virtual`, and matches the
+//     "base table" terminology readers know from SQL.
+//   - Heading + key clause grammar identical to `.cd` relvars. The
+//     kind slot (`base` / `virtual` here, `private` / `public` in
+//     `.cd`) is what statically distinguishes database-side from
+//     application-side declarations (TTM RM Pre 13–14).
+//   - Database constraints, type declarations, and virtual relvars
+//     parse here too but aren't exercised by this hello-world.
+
+database greetings;
+
+base relvar Greetings {
+    id: Integer,
+    message: Text,
+}
+key { id };

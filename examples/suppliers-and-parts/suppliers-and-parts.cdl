@@ -36,14 +36,14 @@ type Weight { possrep w { val: Rational } where val > 0; };
 type City { possrep c { val: Text }; };
 type Status { possrep s { val: Integer } where val >= 0 and val <= 100; };
 
-relvar S real {
+base relvar S {
     sid: SID,
     sname: Name,
     status: Status,
     city: City,
 } key { sid };
 
-relvar P real {
+base relvar P {
     pid: PID,
     pname: Name,
     color: Color,
@@ -51,7 +51,7 @@ relvar P real {
     city: City,
 } key { pid };
 
-relvar SP real {
+base relvar SP {
     sid: SID,
     pid: PID,
     qty: Qty,
