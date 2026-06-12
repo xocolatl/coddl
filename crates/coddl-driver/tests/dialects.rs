@@ -101,22 +101,19 @@ fn coddl_parse_cdstore_round_trips_example() {
 }
 
 #[test]
-fn coddl_check_rejects_cddb_file() {
-    // Downstream passes are .cd-only today — `check` rejects dialect
-    // input with a clear error.
+fn coddl_check_accepts_cddb_file() {
+    // Phase 15: `coddl check` now typechecks `.cddb` — the example
+    // catalog has well-formed relvar declarations and should exit
+    // cleanly.
     let out = coddl()
         .args(["check"])
         .arg(companion_path("greetings.cddb"))
         .output()
         .expect("spawn coddl");
     assert!(
-        !out.status.success(),
-        "expected `coddl check <.cddb>` to fail"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("only accepts .cd files"),
-        "expected dialect-rejection message, got stderr:\n{stderr}"
+        out.status.success(),
+        "expected `coddl check <.cddb>` to succeed, got stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 

@@ -214,11 +214,12 @@ fn cmd_check(args: &[String]) -> ExitCode {
     let Some((source, kind)) = read_input(args, "check") else {
         return ExitCode::from(1);
     };
-    if let Err(code) = require_cd(kind, "check") {
-        return code;
-    }
 
-    let out = coddl_types::check(&source, FileId(0));
+    // `coddl check` accepts every dialect the typechecker understands.
+    // `.cd` and `.cddb` walk their relvar tables and report
+    // diagnostics; `.cdmap` and `.cdstore` are parse-only today (the
+    // plan layer is Phase 16) so check() just surfaces parse errors.
+    let out = coddl_types::check(&source, FileId(0), kind);
 
     if out.diagnostics.is_empty() {
         ExitCode::SUCCESS

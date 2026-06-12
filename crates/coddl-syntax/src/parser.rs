@@ -254,11 +254,25 @@ impl<'a> Parser<'a> {
     }
 
     /// Dispatch a single top-level item by its leading keyword.
+    ///
+    /// All four relvar kinds (public/private/base/virtual) parse here —
+    /// `.cd` legitimately accepts public/private; base/virtual parse so
+    /// the typechecker can emit T0014 (relvar kind not legal for this
+    /// dialect) on the resulting tree rather than producing a generic
+    /// P0001 parse error.
     fn parse_item(&mut self) {
         if self.at_keyword("program") {
             self.parse_program_decl();
         } else if self.at_keyword("database") {
             self.parse_database_binding();
+        } else if self.at_keyword("public") {
+            self.parse_public_relvar_decl();
+        } else if self.at_keyword("private") {
+            self.parse_private_relvar_decl();
+        } else if self.at_keyword("base") {
+            crate::parser_cddb::parse_base_relvar_decl(self);
+        } else if self.at_keyword("virtual") {
+            crate::parser_cddb::parse_virtual_relvar_decl(self);
         } else if self.at_keyword("oper") {
             self.parse_oper_decl();
         } else {
@@ -625,6 +639,61 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
+    /// `public relvar <Name> <heading> <key-clause>* ;` — an
+    /// application-side relvar exposed to the catalog. The kind
+    /// keyword is at the cursor when this is called.
+    pub(crate) fn parse_public_relvar_decl(&mut self) {
+        debug_assert!(self.at_keyword("public"));
+        self.parse_relvar_with_heading(SyntaxKind::PUBLIC_RELVAR_DECL);
+    }
+
+    /// `private relvar <Name> <heading> <key-clause>* ;` — an
+    /// application-side relvar internal to the program.
+    pub(crate) fn parse_private_relvar_decl(&mut self) {
+        debug_assert!(self.at_keyword("private"));
+        self.parse_relvar_with_heading(SyntaxKind::PRIVATE_RELVAR_DECL);
+    }
+
+    /// Shared shape: `<KIND> relvar <Name> <heading> <key-clause>* ;`.
+    /// Caller has already verified the cursor is at the kind keyword
+    /// (`public` or `private`); this routine bumps it and parses the
+    /// rest. Multi-key declarations (`key { a } key { b }`) parse —
+    /// the typechecker validates one key for v1 (per Phase 15 plan).
+    ///
+    /// Diagnostics: P0025 (no `relvar`), P0026 (no name), P0027 (no
+    /// `{` heading), P0028 (no `;`).
+    fn parse_relvar_with_heading(&mut self, cst_kind: SyntaxKind) {
+        self.bump_trivia();
+        self.start_node(cst_kind);
+        self.bump(); // kind keyword (`public` / `private`)
+
+        if !self.at_keyword("relvar") {
+            self.error("P0025", "expected `relvar` after relvar kind");
+        } else {
+            self.bump(); // `relvar`
+        }
+
+        if !self.eat(SyntaxKind::IDENT) {
+            self.error("P0026", "expected relvar name");
+        }
+
+        if self.at(SyntaxKind::L_BRACE) {
+            self.parse_heading();
+        } else {
+            self.error("P0027", "expected `{` to start relvar heading");
+        }
+
+        while self.at_keyword("key") {
+            self.parse_key_clause();
+        }
+
+        if !self.eat(SyntaxKind::SEMICOLON) {
+            self.error("P0028", "expected `;` after relvar declaration");
+        }
+
+        self.finish_node();
+    }
+
     /// `key { a, b, … }` — candidate-key clause on a relvar declaration.
     /// Shared between `.cddb` base relvars (today) and `.cd` public /
     /// private relvars (Phase 15). The leading `key` keyword has already
@@ -810,6 +879,70 @@ mod tests {
     fn database_binding_missing_semicolon_diagnoses_p0021() {
         let out = parse_str("database greetings");
         assert!(out.diagnostics.iter().any(|d| d.code == "P0021"));
+    }
+
+    #[test]
+    fn public_relvar_parses_minimum() {
+        let out = parse_str("public relvar X {};");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let kinds: Vec<_> = out.tree.children().map(|n| n.kind()).collect();
+        assert_eq!(kinds, vec![SyntaxKind::PUBLIC_RELVAR_DECL]);
+    }
+
+    #[test]
+    fn private_relvar_parses_full_form() {
+        let src = "private relvar X { a: Integer, b: Text } key { a };";
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let kinds: Vec<_> = out.tree.children().map(|n| n.kind()).collect();
+        assert_eq!(kinds, vec![SyntaxKind::PRIVATE_RELVAR_DECL]);
+    }
+
+    #[test]
+    fn public_relvar_supports_multi_key() {
+        let src = "public relvar X { a: Integer, b: Integer } key { a } key { b };";
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let relvar = out.tree.first_child().unwrap();
+        let keys: Vec<_> = relvar
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::KEY_CLAUSE)
+            .collect();
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn relvar_missing_relvar_keyword_diagnoses_p0025() {
+        let out = parse_str("public X {};");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0025"));
+    }
+
+    #[test]
+    fn relvar_missing_name_diagnoses_p0026() {
+        let out = parse_str("public relvar {};");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0026"));
+    }
+
+    #[test]
+    fn relvar_missing_heading_diagnoses_p0027() {
+        let out = parse_str("public relvar X;");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0027"));
+    }
+
+    #[test]
+    fn relvar_missing_semicolon_diagnoses_p0028() {
+        let out = parse_str("public relvar X {}");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0028"));
+    }
+
+    #[test]
+    fn base_relvar_parses_in_cd_dialect() {
+        // `.cd` accepts `base relvar` so the typechecker can emit T0014
+        // on the BASE_RELVAR_DECL node. Parser-side: zero diagnostics.
+        let out = parse_str("base relvar X { a: Integer };");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let kinds: Vec<_> = out.tree.children().map(|n| n.kind()).collect();
+        assert_eq!(kinds, vec![SyntaxKind::BASE_RELVAR_DECL]);
     }
 
     #[test]

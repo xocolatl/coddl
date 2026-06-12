@@ -57,28 +57,39 @@ fn parse_database_decl(p: &mut Parser) {
 }
 
 /// Dispatch a single `.cddb` catalog item by its leading keyword.
-/// Unknown items wrap in [`SyntaxKind::PARSE_ERROR`] and recover at the
-/// next top-level `;`.
+///
+/// All four relvar kinds parse here: `base`/`virtual` legitimately
+/// belong in `.cddb`; `public`/`private` parse so the typechecker can
+/// emit T0014 (relvar kind not legal for this dialect) on the
+/// resulting tree rather than producing a generic PB0004 parse error.
 fn parse_cddb_item(p: &mut Parser) {
     if p.at_keyword("base") {
         parse_base_relvar_decl(p);
     } else if p.at_keyword("virtual") {
         parse_virtual_relvar_decl(p);
+    } else if p.at_keyword("public") {
+        p.parse_public_relvar_decl();
+    } else if p.at_keyword("private") {
+        p.parse_private_relvar_decl();
     } else {
         p.bump_trivia();
         if p.current() == SyntaxKind::EOF {
             return;
         }
         p.start_node(SyntaxKind::PARSE_ERROR);
-        p.error("PB0004", "expected `base relvar` or `virtual relvar`");
+        p.error(
+            "PB0004",
+            "expected `base relvar`, `virtual relvar`, `public relvar`, or `private relvar`",
+        );
         p.skip_to_top_level_anchor();
         p.finish_node();
     }
 }
 
-/// `base relvar <Name> <heading> [<key-clause>];` — persistent catalog
-/// relvar.
-fn parse_base_relvar_decl(p: &mut Parser) {
+/// `base relvar <Name> <heading> <key-clause>* ;` — persistent catalog
+/// relvar. Multi-key declarations (`key {a} key {b}`) parse;
+/// typecheck only the first key for v1 (per Phase 15 plan).
+pub(crate) fn parse_base_relvar_decl(p: &mut Parser) {
     debug_assert!(p.at_keyword("base"));
     p.bump_trivia();
     p.start_node(SyntaxKind::BASE_RELVAR_DECL);
@@ -100,7 +111,7 @@ fn parse_base_relvar_decl(p: &mut Parser) {
         p.error("PB0007", "expected `{` to start relvar heading");
     }
 
-    if p.at_keyword("key") {
+    while p.at_keyword("key") {
         p.parse_key_clause();
     }
 
@@ -115,7 +126,7 @@ fn parse_base_relvar_decl(p: &mut Parser) {
 /// keyword + name + `=` and treats the RHS as an unknown body
 /// recovered at the next top-level `;`. The actual relational
 /// expression grammar lands with Phase 16.
-fn parse_virtual_relvar_decl(p: &mut Parser) {
+pub(crate) fn parse_virtual_relvar_decl(p: &mut Parser) {
     debug_assert!(p.at_keyword("virtual"));
     p.bump_trivia();
     p.start_node(SyntaxKind::VIRTUAL_RELVAR_DECL);

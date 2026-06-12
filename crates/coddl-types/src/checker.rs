@@ -11,14 +11,17 @@ use std::collections::{HashMap, HashSet};
 
 use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{
-    AstNode, Block, CallExpr, Expr, ExprStmt, Item, LetStmt, NamedArg, OperDecl, ProgramDecl, Root,
-    Stmt, TransactionExpr,
+    AstNode, Block, CallExpr, Expr, ExprStmt, Heading as AstHeading, Item, KeyClause, LetStmt,
+    NamedArg, OperDecl, PrivateRelvarDecl, ProgramDecl, PublicRelvarDecl, Root, Stmt,
+    TransactionExpr,
 };
+use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
 use coddl_syntax::{parse, FileKind, SyntaxKind};
 
 use crate::builtins::Builtins;
-use crate::ty::Type;
+use crate::relvars::{RelvarInfo, RelvarKind, RelvarTable};
+use crate::ty::{Heading, Type};
 
 /// A stack of binding scopes — the outermost layer is an operator's
 /// parameter scope; each `transaction [...]` block pushes a new layer;
@@ -74,47 +77,73 @@ pub struct TypeHint {
 }
 
 /// The output of one `check` pass: the parsed CST root, every
-/// diagnostic from the parser and the typechecker together, and a
-/// list of inferred-type hints for editor surfaces (inlay hints,
-/// hover). The typechecker doesn't filter parse errors — downstream
-/// tools see the full picture. The tree is always present (the
-/// parser's error recovery guarantees this); downstream passes lower
-/// the same tree without re-parsing.
+/// diagnostic from the parser and the typechecker together, the
+/// inferred-type hints for editor surfaces (inlay hints, hover), and
+/// the relvar table populated from this file's declarations. The
+/// typechecker doesn't filter parse errors — downstream tools see the
+/// full picture. The tree is always present (the parser's error
+/// recovery guarantees this); downstream passes lower the same tree
+/// without re-parsing.
 #[derive(Debug)]
 pub struct CheckOutput {
     pub tree: SyntaxNode,
     pub diagnostics: Vec<Diagnostic>,
     pub hints: Vec<TypeHint>,
+    /// All relvars declared in this file. For `.cd`: public + private
+    /// (and any base/virtual the user mistakenly placed in `.cd`,
+    /// which T0014 flags). For `.cddb`: base + virtual (similarly).
+    /// Empty for `.cdmap` / `.cdstore` — those don't declare relvars.
+    pub relvars: RelvarTable,
 }
 
-/// Tokenize, parse, and type-check `source` as a `.cd` document.
-/// Other dialects (`.cddb` / `.cdmap` / `.cdstore`) parse in Phase 14
-/// but don't typecheck yet — call `coddl_syntax::parse` directly with
-/// the desired [`FileKind`] for parse-only output.
-pub fn check(source: &str, file: FileId) -> CheckOutput {
-    let parse_out = parse(source, file, FileKind::Cd);
+/// Tokenize, parse, and type-check `source` in the supplied dialect.
+///
+/// For `.cd` and `.cddb`, the typechecker walks declarations and emits
+/// every applicable diagnostic. For `.cdmap` and `.cdstore`, the
+/// function is parse-only — the result carries the tree and parser
+/// diagnostics; the relvar table is empty.
+pub fn check(source: &str, file: FileId, file_kind: FileKind) -> CheckOutput {
+    let parse_out = parse(source, file, file_kind);
     let tree = parse_out.tree.clone();
     let mut tc = TypeChecker {
         file,
+        file_kind,
         builtins: Builtins::new(),
         diagnostics: parse_out.diagnostics,
         hints: Vec::new(),
+        relvars: RelvarTable::new(),
     };
-    if let Some(root) = Root::cast(parse_out.tree) {
-        tc.check_root(&root);
+    match file_kind {
+        FileKind::Cd => {
+            if let Some(root) = Root::cast(parse_out.tree) {
+                tc.check_root(&root);
+            }
+        }
+        FileKind::Cddb => {
+            if let Some(root) = CddbRoot::cast(parse_out.tree) {
+                tc.check_cddb_root(&root);
+            }
+        }
+        FileKind::Cdmap | FileKind::Cdstore => {
+            // Parse-only today; semantic validation lands with Phase 16
+            // (the plan layer) and Phase 21 (storage materialization).
+        }
     }
     CheckOutput {
         tree,
         diagnostics: tc.diagnostics,
         hints: tc.hints,
+        relvars: tc.relvars,
     }
 }
 
 struct TypeChecker {
     file: FileId,
+    file_kind: FileKind,
     builtins: Builtins,
     diagnostics: Vec<Diagnostic>,
     hints: Vec<TypeHint>,
+    relvars: RelvarTable,
 }
 
 impl TypeChecker {
@@ -138,6 +167,20 @@ impl TypeChecker {
     // ── Walks ────────────────────────────────────────────────────────
 
     fn check_root(&mut self, root: &Root) {
+        // Pre-pass: collect every relvar declaration into the table.
+        // This runs before any operator body is walked so that future
+        // phases (Phase 18+) can resolve relvar references in
+        // expressions against a complete table.
+        for item in root.items() {
+            match item {
+                Item::PublicRelvarDecl(d) => self.check_public_relvar_decl(&d),
+                Item::PrivateRelvarDecl(d) => self.check_private_relvar_decl(&d),
+                Item::BaseRelvarDecl(d) => self.check_base_relvar_decl(&d),
+                Item::VirtualRelvarDecl(d) => self.check_virtual_relvar_decl(&d),
+                _ => {}
+            }
+        }
+        // Main pass: walk operator bodies + label-only items.
         for item in root.items() {
             match item {
                 Item::ProgramDecl(p) => self.check_program_decl(&p),
@@ -147,6 +190,45 @@ impl TypeChecker {
                     // semantic constraints from the typechecker yet.
                 }
                 Item::OperDecl(o) => self.check_oper_decl(&o),
+                Item::PublicRelvarDecl(_)
+                | Item::PrivateRelvarDecl(_)
+                | Item::BaseRelvarDecl(_)
+                | Item::VirtualRelvarDecl(_) => {
+                    // Relvar items walked in the pre-pass above.
+                }
+            }
+        }
+    }
+
+    /// `.cddb` root walk. There are no operator bodies in `.cddb`, so
+    /// this is a one-pass collection of every relvar declaration into
+    /// the table. T0014 fires here if `public` / `private` appears
+    /// (those are `.cd`-only kinds).
+    fn check_cddb_root(&mut self, root: &CddbRoot) {
+        for item in root.items() {
+            match item {
+                CddbItem::BaseRelvar(d) => self.check_base_relvar_decl(&d),
+                CddbItem::VirtualRelvar(d) => self.check_virtual_relvar_decl(&d),
+            }
+        }
+        // Walk the raw tree for any PUBLIC/PRIVATE_RELVAR_DECL nodes
+        // that the `.cddb` parser produced — these mean the user typed
+        // a `.cd` kind keyword in a `.cddb` file. Insert them into the
+        // table too, so a later T0012 still fires on duplicates with
+        // the same name, but flag them with T0014.
+        for node in root.syntax().children() {
+            match node.kind() {
+                SyntaxKind::PUBLIC_RELVAR_DECL => {
+                    if let Some(d) = PublicRelvarDecl::cast(node) {
+                        self.check_public_relvar_decl(&d);
+                    }
+                }
+                SyntaxKind::PRIVATE_RELVAR_DECL => {
+                    if let Some(d) = PrivateRelvarDecl::cast(node) {
+                        self.check_private_relvar_decl(&d);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -154,6 +236,202 @@ impl TypeChecker {
     fn check_program_decl(&mut self, _decl: &ProgramDecl) {
         // The program name is a label today — no semantic constraints
         // beyond what the parser already checks.
+    }
+
+    // ── Relvar declarations ──────────────────────────────────────────
+
+    fn check_public_relvar_decl(&mut self, decl: &PublicRelvarDecl) {
+        self.collect_relvar(
+            RelvarKind::Public,
+            decl.name(),
+            decl.heading(),
+            decl.key_clauses().collect(),
+            decl.syntax(),
+        );
+    }
+
+    fn check_private_relvar_decl(&mut self, decl: &PrivateRelvarDecl) {
+        self.collect_relvar(
+            RelvarKind::Private,
+            decl.name(),
+            decl.heading(),
+            decl.key_clauses().collect(),
+            decl.syntax(),
+        );
+    }
+
+    fn check_base_relvar_decl(&mut self, decl: &BaseRelvarDecl) {
+        self.collect_relvar(
+            RelvarKind::Base,
+            decl.name(),
+            decl.heading(),
+            decl.key_clauses().collect(),
+            decl.syntax(),
+        );
+    }
+
+    fn check_virtual_relvar_decl(&mut self, decl: &VirtualRelvarDecl) {
+        // Virtual relvars carry no syntactic heading — their type is
+        // the type of their RHS expression, which doesn't typecheck
+        // until the relational algebra lands (Phase 19+). For now we
+        // still emit a T0014 if the kind is illegal for this dialect,
+        // and register a record with an empty heading so a duplicate
+        // name still flags T0012.
+        let name_tok = decl.name();
+        if !self.is_kind_legal_for_dialect(RelvarKind::Virtual) {
+            if let Some(t) = &name_tok {
+                self.emit_t0014(t, RelvarKind::Virtual);
+            }
+        }
+        let Some(name_tok) = name_tok else {
+            return;
+        };
+        let name = name_tok.text().to_string();
+        let info = RelvarInfo {
+            kind: RelvarKind::Virtual,
+            heading: Heading::empty(),
+            keys: Vec::new(),
+            span: self.token_span(&name_tok),
+        };
+        if let Err(prior) = self.relvars.try_insert(name.clone(), info) {
+            self.emit_t0012(&name_tok, &name, prior);
+        }
+    }
+
+    /// Shared collection routine for the three heading-bearing relvar
+    /// kinds (public, private, base). Resolves the heading, validates
+    /// each key clause against it, validates dialect legality, and
+    /// inserts into the table.
+    fn collect_relvar(
+        &mut self,
+        kind: RelvarKind,
+        name_tok: Option<SyntaxToken>,
+        heading_ast: Option<AstHeading>,
+        keys: Vec<KeyClause>,
+        _node: &SyntaxNode,
+    ) {
+        if !self.is_kind_legal_for_dialect(kind) {
+            if let Some(t) = &name_tok {
+                self.emit_t0014(t, kind);
+            }
+        }
+        let Some(name_tok) = name_tok else {
+            return;
+        };
+        let name = name_tok.text().to_string();
+
+        // Resolve the heading. Duplicate attribute names within the
+        // heading reuse T0007 (the same per-attribute uniqueness
+        // diagnostic that applies to `oper` headings).
+        let heading = match heading_ast {
+            Some(h) => self.resolve_heading(&h),
+            None => Heading::empty(),
+        };
+
+        // Walk every key clause; v1 typechecks every key's attributes
+        // (they're cheap to validate), even though downstream only
+        // uses the first key for indexing decisions.
+        let key_lists: Vec<Vec<String>> = keys
+            .iter()
+            .map(|k| self.validate_key_clause(k, &heading))
+            .collect();
+
+        let info = RelvarInfo {
+            kind,
+            heading,
+            keys: key_lists,
+            span: self.token_span(&name_tok),
+        };
+        if let Err(prior) = self.relvars.try_insert(name.clone(), info) {
+            self.emit_t0012(&name_tok, &name, prior);
+        }
+    }
+
+    /// True iff the given relvar kind is allowed in the current file's
+    /// dialect. `public`/`private` belong in `.cd`; `base`/`virtual`
+    /// belong in `.cddb`.
+    fn is_kind_legal_for_dialect(&self, kind: RelvarKind) -> bool {
+        match (self.file_kind, kind) {
+            (FileKind::Cd, RelvarKind::Public | RelvarKind::Private) => true,
+            (FileKind::Cddb, RelvarKind::Base | RelvarKind::Virtual) => true,
+            _ => false,
+        }
+    }
+
+    fn emit_t0012(&mut self, name_tok: &SyntaxToken, name: &str, _prior_span: Span) {
+        self.error(
+            self.token_span(name_tok),
+            "T0012",
+            format!("duplicate relvar `{name}`"),
+        );
+    }
+
+    fn emit_t0014(&mut self, name_tok: &SyntaxToken, kind: RelvarKind) {
+        let dialect = match self.file_kind {
+            FileKind::Cd => ".cd",
+            FileKind::Cddb => ".cddb",
+            FileKind::Cdmap => ".cdmap",
+            FileKind::Cdstore => ".cdstore",
+        };
+        self.error(
+            self.token_span(name_tok),
+            "T0014",
+            format!(
+                "`{kw}` relvar is not legal in {dialect}",
+                kw = kind.keyword(),
+            ),
+        );
+    }
+
+    /// Resolve a syntactic heading into a canonical [`Heading`]. Each
+    /// `param.type_ref()` resolves through `resolve_type_name` (T0005
+    /// on unknown names); duplicate attribute names emit T0007 — the
+    /// same diagnostic used by `oper` headings, since the rule is the
+    /// same: an attribute name appears at most once per heading.
+    fn resolve_heading(&mut self, heading: &AstHeading) -> Heading {
+        let mut fields: Vec<(String, Type)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for param in heading.params() {
+            let Some(name_tok) = param.name() else {
+                continue;
+            };
+            let name = name_tok.text().to_string();
+            if !seen.insert(name.clone()) {
+                self.error(
+                    self.token_span(&name_tok),
+                    "T0007",
+                    format!("duplicate parameter name `{name}`"),
+                );
+                continue;
+            }
+            let ty = match param.type_ref().and_then(|tr| tr.name()) {
+                Some(t) => self.resolve_type_name(&t),
+                None => Type::Unknown,
+            };
+            fields.push((name, ty));
+        }
+        Heading::new(fields)
+    }
+
+    /// Verify every attribute named in `key { ... }` actually appears
+    /// in `heading`. Emits T0013 against each offender. Returns the
+    /// list of attribute names in source order — even ones that
+    /// didn't validate, so downstream "candidate key" lookups see
+    /// exactly what the user wrote.
+    fn validate_key_clause(&mut self, key: &KeyClause, heading: &Heading) -> Vec<String> {
+        let mut attrs: Vec<String> = Vec::new();
+        for tok in key.attrs() {
+            let name = tok.text().to_string();
+            if heading.lookup(&name).is_none() {
+                self.error(
+                    self.token_span(&tok),
+                    "T0013",
+                    format!("key attribute `{name}` is not in the heading"),
+                );
+            }
+            attrs.push(name);
+        }
+        attrs
     }
 
     fn check_oper_decl(&mut self, decl: &OperDecl) {
@@ -503,11 +781,19 @@ mod tests {
     use super::*;
 
     fn diagnostics(src: &str) -> Vec<Diagnostic> {
-        check(src, FileId(0)).diagnostics
+        check(src, FileId(0), FileKind::Cd).diagnostics
     }
 
     fn codes(src: &str) -> Vec<&'static str> {
         diagnostics(src).into_iter().map(|d| d.code).collect()
+    }
+
+    fn diagnostics_cddb(src: &str) -> Vec<Diagnostic> {
+        check(src, FileId(0), FileKind::Cddb).diagnostics
+    }
+
+    fn codes_cddb(src: &str) -> Vec<&'static str> {
+        diagnostics_cddb(src).into_iter().map(|d| d.code).collect()
     }
 
     const HELLO_WORLD: &str = "program hello_world;\n\
@@ -637,7 +923,7 @@ mod tests {
         // The unannotated `let count = 42;` should surface a hint
         // of type Integer, positioned at the end of `count`.
         let src = "oper main {} [ let count = 42; ];";
-        let out = check(src, FileId(0));
+        let out = check(src, FileId(0), FileKind::Cd);
         assert!(
             out.diagnostics.is_empty(),
             "unexpected diagnostics: {:?}",
@@ -660,7 +946,7 @@ mod tests {
         // render. (The oper-return hint for `main`'s implicit
         // `-> Tuple {}` still fires; we filter for the let kind.)
         let src = "oper main {} [ let m: Text = \"hi\"; ];";
-        let out = check(src, FileId(0));
+        let out = check(src, FileId(0), FileKind::Cd);
         let let_hints: Vec<_> = out
             .hints
             .iter()
@@ -678,13 +964,13 @@ mod tests {
         // is Unit, so the editor should ghost `-> Tuple {}` right
         // after the heading's `}`.
         let src = "oper main {} [];";
-        let out = check(src, FileId(0));
+        let out = check(src, FileId(0), FileKind::Cd);
         let hint = out
             .hints
             .iter()
             .find(|h| h.kind == HintKind::OperReturn)
             .expect("expected an OperReturn hint");
-        assert!(matches!(hint.ty, Type::Tuple(ref v) if v.is_empty()));
+        assert!(matches!(hint.ty, Type::Tuple(ref h) if h.is_empty()));
         // The hint span is right after the heading's closing `}`.
         let after_heading = src.find("{}").unwrap() + "{}".len();
         assert_eq!(hint.span.start as usize, after_heading);
@@ -693,7 +979,7 @@ mod tests {
     #[test]
     fn oper_with_explicit_return_clause_emits_no_return_hint() {
         let src = "oper greet {} -> Text [ \"hi\" ]; oper main {} [];";
-        let out = check(src, FileId(0));
+        let out = check(src, FileId(0), FileKind::Cd);
         // The `greet` oper has an explicit clause, so no hint for it.
         // `main` still gets one because its return is implicit.
         let return_hints: Vec<_> = out
@@ -813,16 +1099,159 @@ mod tests {
         assert!(codes(src).contains(&"T0001"));
     }
 
+    // ── Relvar declaration tests ─────────────────────────────────────
+
+    #[test]
+    fn public_relvar_typechecks_cleanly() {
+        let src = "public relvar Greetings { id: Integer, message: Text } key { id };";
+        let out = check(src, FileId(0), FileKind::Cd);
+        assert!(
+            out.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            out.diagnostics
+        );
+        let info = out.relvars.get("Greetings").expect("relvar registered");
+        assert_eq!(info.kind, RelvarKind::Public);
+        assert_eq!(info.heading.len(), 2);
+        // Canonical (sorted) order: id < message.
+        assert_eq!(info.heading.attrs()[0].0, "id");
+        assert_eq!(info.heading.attrs()[1].0, "message");
+        assert_eq!(info.keys, vec![vec!["id".to_string()]]);
+    }
+
+    #[test]
+    fn private_relvar_typechecks_cleanly() {
+        let src = "private relvar Local { a: Integer } key { a };";
+        let out = check(src, FileId(0), FileKind::Cd);
+        assert!(
+            out.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            out.diagnostics
+        );
+        let info = out.relvars.get("Local").expect("relvar registered");
+        assert_eq!(info.kind, RelvarKind::Private);
+    }
+
+    #[test]
+    fn base_relvar_in_cddb_typechecks_cleanly() {
+        let src = "database d;\nbase relvar X { a: Integer } key { a };\n";
+        let out = check(src, FileId(0), FileKind::Cddb);
+        assert!(
+            out.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            out.diagnostics
+        );
+        let info = out.relvars.get("X").expect("relvar registered");
+        assert_eq!(info.kind, RelvarKind::Base);
+    }
+
+    #[test]
+    fn virtual_relvar_registers_with_empty_heading() {
+        let src = "database d;\nvirtual relvar V = X where p;\nbase relvar X { a: Integer };\n";
+        let out = check(src, FileId(0), FileKind::Cddb);
+        let info = out.relvars.get("V").expect("virtual registered");
+        assert_eq!(info.kind, RelvarKind::Virtual);
+        assert!(info.heading.is_empty());
+    }
+
+    #[test]
+    fn duplicate_relvar_diagnoses_t0012() {
+        let src = "public relvar X { a: Integer } key { a };\n\
+                   public relvar X { b: Text } key { b };";
+        let cs = codes(src);
+        assert!(cs.contains(&"T0012"), "expected T0012, got {cs:?}");
+    }
+
+    #[test]
+    fn duplicate_relvar_across_dialects_in_cd_diagnoses_t0012() {
+        // `base relvar X` in `.cd` is illegal (T0014), but the table
+        // still registers X so a duplicate `public relvar X` flags T0012
+        // alongside the dialect error.
+        let src = "base relvar X { a: Integer };\n\
+                   public relvar X { a: Integer } key { a };";
+        let cs = codes(src);
+        assert!(cs.contains(&"T0012"), "expected T0012, got {cs:?}");
+        assert!(cs.contains(&"T0014"), "expected T0014, got {cs:?}");
+    }
+
+    #[test]
+    fn key_attr_not_in_heading_diagnoses_t0013() {
+        let src = "public relvar X { id: Integer } key { missing };";
+        let cs = codes(src);
+        assert!(cs.contains(&"T0013"), "expected T0013, got {cs:?}");
+    }
+
+    #[test]
+    fn base_kind_in_cd_diagnoses_t0014() {
+        let src = "base relvar X { a: Integer } key { a };";
+        let cs = codes(src);
+        assert!(cs.contains(&"T0014"), "expected T0014, got {cs:?}");
+    }
+
+    #[test]
+    fn virtual_kind_in_cd_diagnoses_t0014() {
+        let src = "virtual relvar V = X;";
+        let cs = codes(src);
+        assert!(cs.contains(&"T0014"), "expected T0014, got {cs:?}");
+    }
+
+    #[test]
+    fn public_kind_in_cddb_diagnoses_t0014() {
+        let src = "database d;\npublic relvar X { a: Integer } key { a };";
+        let cs = codes_cddb(src);
+        assert!(cs.contains(&"T0014"), "expected T0014, got {cs:?}");
+    }
+
+    #[test]
+    fn private_kind_in_cddb_diagnoses_t0014() {
+        let src = "database d;\nprivate relvar X { a: Integer } key { a };";
+        let cs = codes_cddb(src);
+        assert!(cs.contains(&"T0014"), "expected T0014, got {cs:?}");
+    }
+
+    #[test]
+    fn relvar_heading_canonicalizes_attribute_order() {
+        let src = "public relvar X { z: Integer, a: Text } key { a };";
+        let out = check(src, FileId(0), FileKind::Cd);
+        let info = out.relvars.get("X").unwrap();
+        // Sorted by name: a < z.
+        assert_eq!(info.heading.attrs()[0].0, "a");
+        assert_eq!(info.heading.attrs()[1].0, "z");
+    }
+
+    #[test]
+    fn multi_key_relvar_typechecks() {
+        let src = "public relvar SP { sid: Integer, pid: Integer, qty: Integer } \
+                   key { sid, pid } key { qty };";
+        let out = check(src, FileId(0), FileKind::Cd);
+        assert!(
+            out.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            out.diagnostics
+        );
+        let info = out.relvars.get("SP").unwrap();
+        assert_eq!(info.keys.len(), 2);
+        assert_eq!(info.keys[0], vec!["sid".to_string(), "pid".to_string()]);
+        assert_eq!(info.keys[1], vec!["qty".to_string()]);
+    }
+
+    #[test]
+    fn relvar_with_unknown_attribute_type_diagnoses_t0005() {
+        let src = "public relvar X { id: NotAType } key { id };";
+        let cs = codes(src);
+        assert!(cs.contains(&"T0005"), "expected T0005, got {cs:?}");
+    }
+
     #[test]
     fn check_output_exposes_tree() {
         // Clean program — the tree is the parsed Root.
-        let ok = check(HELLO_WORLD, FileId(0));
+        let ok = check(HELLO_WORLD, FileId(0), FileKind::Cd);
         assert_eq!(ok.tree.kind(), SyntaxKind::ROOT);
 
         // Even with errors the tree is still surfaced, so downstream
         // passes can decide what to do with the diagnostic-bearing
         // input without re-parsing.
-        let bad = check("oper main {} []", FileId(0));
+        let bad = check("oper main {} []", FileId(0), FileKind::Cd);
         assert_eq!(bad.tree.kind(), SyntaxKind::ROOT);
         assert!(!bad.diagnostics.is_empty());
     }

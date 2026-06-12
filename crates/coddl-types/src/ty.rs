@@ -1,20 +1,93 @@
 //! Type representation.
 //!
 //! A flat enum covering the eight built-in scalar types, the structural
-//! `Tuple H` type generator, and an `Unknown` sentinel used during
-//! error recovery. `Relation H` and `Sequence T` join the enum when
-//! their parsing and semantics arrive.
+//! `Tuple H` and `Relation H` type generators (sharing a [`Heading`]),
+//! and an `Unknown` sentinel used during error recovery. `Sequence T`
+//! joins the enum when its parsing and semantics arrive.
 
 use std::fmt;
 
+/// A canonical (name-sorted) heading: the structural shape shared by
+/// `Tuple H` and `Relation H`. The constructor enforces the sort
+/// invariant so equality reduces to a slice comparison and a lookup
+/// reduces to a binary search.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Heading(Vec<(String, Type)>);
+
+impl Heading {
+    /// Build a heading from `(name, type)` pairs. The fields are
+    /// sorted by name in place — calls with the same set of
+    /// attributes produce equal `Heading`s regardless of source order.
+    pub fn new(mut fields: Vec<(String, Type)>) -> Self {
+        fields.sort_by(|a, b| a.0.cmp(&b.0));
+        Self(fields)
+    }
+
+    /// The empty heading. Backs the unit type `Tuple {}`.
+    pub fn empty() -> Self {
+        Self(Vec::new())
+    }
+
+    /// All attribute pairs in canonical (name-sorted) order.
+    pub fn attrs(&self) -> &[(String, Type)] {
+        &self.0
+    }
+
+    /// Number of attributes in the heading.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// True iff the heading has zero attributes.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Look up an attribute's type by name. Returns `None` if the
+    /// heading has no attribute with that name. O(log n) via the
+    /// canonical sort.
+    pub fn lookup(&self, name: &str) -> Option<&Type> {
+        self.0
+            .binary_search_by(|(n, _)| n.as_str().cmp(name))
+            .ok()
+            .map(|i| &self.0[i].1)
+    }
+
+    /// True iff `self` is structurally assignable to `other` — every
+    /// attribute name matches and the corresponding types are
+    /// individually assignable. `Unknown` types in the field set
+    /// participate as wildcards, like at the top level.
+    pub fn assignable_to(&self, other: &Heading) -> bool {
+        if self.0.len() != other.0.len() {
+            return false;
+        }
+        self.0
+            .iter()
+            .zip(other.0.iter())
+            .all(|((an, at), (bn, bt))| an == bn && at.assignable_to(bt))
+    }
+}
+
+impl fmt::Display for Heading {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("{")?;
+        for (i, (name, ty)) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{name}: {ty}")?;
+        }
+        f.write_str("}")
+    }
+}
+
 /// A Coddl type as the typechecker reasons about it.
 ///
-/// Equality is structural: two `Tuple`s are equal when their attribute
-/// sets coincide (the constructor stores them sorted by name to make
-/// this cheap). `Unknown` is a sentinel that compares equal to anything
-/// so a single failure doesn't cascade into a hundred unrelated
-/// downstream errors.
-#[derive(Clone, Debug)]
+/// Derived equality is structural and exact — two `Tuple`s are equal
+/// only when their headings literally coincide; two `Unknown`s compare
+/// equal. For typechecker comparisons that should treat `Unknown` as
+/// a wildcard, use [`Type::assignable_to`] instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Type {
     Integer,
     Rational,
@@ -24,10 +97,11 @@ pub enum Type {
     Binary,
     Byte,
     Boolean,
-    /// Structural tuple. Attribute pairs are stored sorted by name for
-    /// canonical equality. The empty `Tuple` is the unit type
-    /// (`Tuple {}`).
-    Tuple(Vec<(String, Type)>),
+    /// Structural tuple: a value whose shape is its heading. The empty
+    /// `Tuple` is the unit type (`Tuple {}`).
+    Tuple(Heading),
+    /// Structural relation: a set of tuples all sharing one heading.
+    Relation(Heading),
     /// Used wherever a type couldn't be resolved (unknown type name,
     /// unresolved callee, etc.). Compares equal to anything so the
     /// checker can keep walking without piling errors on top of
@@ -39,12 +113,16 @@ impl Type {
     /// The unit type `Tuple {}` — the implicit return type of every
     /// `oper` declared without an explicit return clause.
     pub fn unit() -> Self {
-        Type::Tuple(Vec::new())
+        Type::Tuple(Heading::empty())
     }
 
     /// Resolve a type-name lexeme to its built-in `Type`, or `None`
     /// for an unknown name. The typechecker calls this on every
     /// `TypeRef` and emits T0005 when it returns `None`.
+    ///
+    /// `Tuple` and `Relation` are type *generators* (they take a
+    /// heading) so they do not appear as bare names; they are
+    /// constructed by the typechecker from their syntactic form.
     pub fn from_builtin_name(name: &str) -> Option<Type> {
         Some(match name {
             "Integer" => Type::Integer,
@@ -73,12 +151,8 @@ impl Type {
             | (Type::Binary, Type::Binary)
             | (Type::Byte, Type::Byte)
             | (Type::Boolean, Type::Boolean) => true,
-            (Type::Tuple(a), Type::Tuple(b)) => {
-                a.len() == b.len()
-                    && a.iter()
-                        .zip(b.iter())
-                        .all(|((an, at), (bn, bt))| an == bn && at.assignable_to(bt))
-            }
+            (Type::Tuple(a), Type::Tuple(b)) => a.assignable_to(b),
+            (Type::Relation(a), Type::Relation(b)) => a.assignable_to(b),
             _ => false,
         }
     }
@@ -95,16 +169,8 @@ impl fmt::Display for Type {
             Type::Binary => f.write_str("Binary"),
             Type::Byte => f.write_str("Byte"),
             Type::Boolean => f.write_str("Boolean"),
-            Type::Tuple(fields) => {
-                f.write_str("Tuple {")?;
-                for (i, (name, ty)) in fields.iter().enumerate() {
-                    if i > 0 {
-                        f.write_str(", ")?;
-                    }
-                    write!(f, "{name}: {ty}")?;
-                }
-                f.write_str("}")
-            }
+            Type::Tuple(h) => write!(f, "Tuple {h}"),
+            Type::Relation(h) => write!(f, "Relation {h}"),
             Type::Unknown => f.write_str("<unknown>"),
         }
     }
@@ -117,7 +183,7 @@ mod tests {
     #[test]
     fn unit_is_empty_tuple() {
         let u = Type::unit();
-        assert!(matches!(u, Type::Tuple(ref v) if v.is_empty()));
+        assert!(matches!(u, Type::Tuple(ref h) if h.is_empty()));
         assert_eq!(format!("{u}"), "Tuple {}");
     }
 
@@ -154,14 +220,72 @@ mod tests {
 
     #[test]
     fn assignable_tuples_match_structurally() {
-        let a = Type::Tuple(vec![("x".into(), Type::Integer)]);
-        let b = Type::Tuple(vec![("x".into(), Type::Integer)]);
+        let a = Type::Tuple(Heading::new(vec![("x".into(), Type::Integer)]));
+        let b = Type::Tuple(Heading::new(vec![("x".into(), Type::Integer)]));
         assert!(a.assignable_to(&b));
 
-        let c = Type::Tuple(vec![("y".into(), Type::Integer)]);
+        let c = Type::Tuple(Heading::new(vec![("y".into(), Type::Integer)]));
         assert!(!a.assignable_to(&c));
 
-        let d = Type::Tuple(vec![("x".into(), Type::Integer), ("y".into(), Type::Text)]);
+        let d = Type::Tuple(Heading::new(vec![
+            ("x".into(), Type::Integer),
+            ("y".into(), Type::Text),
+        ]));
         assert!(!a.assignable_to(&d));
+    }
+
+    #[test]
+    fn heading_canonicalizes_field_order() {
+        // The constructor sorts by name, so source-order variations
+        // produce equal headings.
+        let h1 = Heading::new(vec![
+            ("b".into(), Type::Text),
+            ("a".into(), Type::Integer),
+        ]);
+        let h2 = Heading::new(vec![
+            ("a".into(), Type::Integer),
+            ("b".into(), Type::Text),
+        ]);
+        assert_eq!(h1, h2);
+        assert_eq!(h1.attrs()[0].0, "a");
+        assert_eq!(h1.attrs()[1].0, "b");
+    }
+
+    #[test]
+    fn heading_lookup_finds_attribute() {
+        let h = Heading::new(vec![
+            ("x".into(), Type::Integer),
+            ("y".into(), Type::Text),
+        ]);
+        assert!(matches!(h.lookup("x"), Some(Type::Integer)));
+        assert!(matches!(h.lookup("y"), Some(Type::Text)));
+        assert!(h.lookup("z").is_none());
+    }
+
+    #[test]
+    fn relation_assignable_compares_headings() {
+        let r1 = Type::Relation(Heading::new(vec![("id".into(), Type::Integer)]));
+        let r2 = Type::Relation(Heading::new(vec![("id".into(), Type::Integer)]));
+        let r3 = Type::Relation(Heading::new(vec![("id".into(), Type::Text)]));
+        assert!(r1.assignable_to(&r2));
+        assert!(!r1.assignable_to(&r3));
+    }
+
+    #[test]
+    fn relation_and_tuple_are_distinct_types() {
+        let h = Heading::new(vec![("x".into(), Type::Integer)]);
+        let t = Type::Tuple(h.clone());
+        let r = Type::Relation(h);
+        assert!(!t.assignable_to(&r));
+        assert!(!r.assignable_to(&t));
+    }
+
+    #[test]
+    fn relation_display_uses_canonical_form() {
+        let r = Type::Relation(Heading::new(vec![
+            ("message".into(), Type::Text),
+            ("id".into(), Type::Integer),
+        ]));
+        assert_eq!(format!("{r}"), "Relation {id: Integer, message: Text}");
     }
 }

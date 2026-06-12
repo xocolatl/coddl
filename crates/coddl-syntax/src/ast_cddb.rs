@@ -85,9 +85,10 @@ impl BaseRelvarDecl {
         ast::child(&self.syntax)
     }
 
-    /// The optional `key { … }` clause.
-    pub fn key_clause(&self) -> Option<KeyClause> {
-        ast::child(&self.syntax)
+    /// All candidate-key clauses in source order. Multi-key parses;
+    /// the typechecker validates the first one for v1 (per Phase 15).
+    pub fn key_clauses(&self) -> impl Iterator<Item = KeyClause> + '_ {
+        self.syntax.children().filter_map(KeyClause::cast)
     }
 }
 
@@ -139,8 +140,38 @@ mod tests {
         assert_eq!(decl.name().expect("name").text(), "Greetings");
         let heading = decl.heading().expect("heading");
         assert_eq!(heading.params().count(), 2);
-        let key = decl.key_clause().expect("key");
-        assert!(key.attrs().any(|t| t.text() == "id"));
+        let keys: Vec<_> = decl.key_clauses().collect();
+        assert_eq!(keys.len(), 1);
+        assert!(keys[0].attrs().any(|t| t.text() == "id"));
+    }
+
+    #[test]
+    fn base_relvar_supports_multi_key() {
+        let src = "database d;\n\
+                   base relvar X { a: Integer, b: Integer } key { a } key { b };\n";
+        let root = ast(src);
+        let CddbItem::BaseRelvar(decl) = root.items().next().unwrap() else {
+            panic!("expected base relvar");
+        };
+        assert_eq!(decl.key_clauses().count(), 2);
+    }
+
+    #[test]
+    fn public_relvar_in_cddb_dialect_parses() {
+        // `.cddb` parses public/private so the typechecker can emit
+        // T0014; here we just confirm the tree shape.
+        let src = "database d;\npublic relvar X { a: Integer } key { a };\n";
+        let out = parse(src, FileId(0), FileKind::Cddb);
+        assert!(
+            out.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            out.diagnostics
+        );
+        let kinds: Vec<_> = out.tree.children().map(|n| n.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec![SyntaxKind::DATABASE_DECL, SyntaxKind::PUBLIC_RELVAR_DECL]
+        );
     }
 
     #[test]

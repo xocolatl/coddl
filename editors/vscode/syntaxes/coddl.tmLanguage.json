@@ -82,7 +82,7 @@
             "patterns": [
                 {
                     "name": "keyword.declaration.coddl",
-                    "match": "\\b(program|oper|relvar|type|possrep|constraint|var|key)\\b"
+                    "match": "\\b(program|database|oper|relvar|type|possrep|constraint|var|key)\\b"
                 },
                 {
                     "name": "keyword.declaration.binding.coddl",

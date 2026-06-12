@@ -37,12 +37,17 @@ catalog state) and virtual relvars (views).
 
 <cddb-item>            ::= <base-relvar-decl>
                          | <virtual-relvar-decl>
+                         | <public-relvar-decl>
+                         | <private-relvar-decl>
                          | <unknown-item> ;
 
 <base-relvar-decl>     ::= 'base' 'relvar' <identifier>
                            <heading>
-                           [ <key-clause> ]
+                           { <key-clause> }
                            ';' ;                                        -- parse_base_relvar_decl
+                           -- Multi-key declarations (`key {a} key {b}`)
+                           -- parse; the typechecker stores each key
+                           -- and uses the first for v1.
 
 <virtual-relvar-decl>  ::= 'virtual' 'relvar' <identifier>
                            '=' <unknown-body> ';' ;                     -- parse_virtual_relvar_decl
@@ -51,6 +56,12 @@ catalog state) and virtual relvars (views).
                            -- recovered at the next top-level `;`. The
                            -- actual relational-expression grammar
                            -- lands in Phase 16.
+
+-- `public relvar` and `private relvar` parse here via the shared
+-- `parse_public_relvar_decl` / `parse_private_relvar_decl` (see
+-- docs/grammar.md); the typechecker emits T0014 because those
+-- kinds belong in `.cd`. This is parser symmetry with the `.cd`
+-- side, which similarly accepts `base` / `virtual`.
 ```
 
 The shared `<heading>`, `<key-clause>`, and `<unknown-item>`

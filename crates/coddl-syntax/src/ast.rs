@@ -84,10 +84,20 @@ impl Root {
 }
 
 /// Top-level item variants.
+///
+/// In `.cd` source, `public` / `private` are the legal relvar kinds;
+/// `base` / `virtual` also parse so the typechecker can emit T0014 on
+/// the resulting tree. The AST view exposes every kind uniformly so a
+/// pass walking `.cd` items doesn't need a separate parser-vs-checker
+/// vocabulary.
 #[derive(Debug, Clone)]
 pub enum Item {
     ProgramDecl(ProgramDecl),
     DatabaseBinding(DatabaseBinding),
+    PublicRelvarDecl(PublicRelvarDecl),
+    PrivateRelvarDecl(PrivateRelvarDecl),
+    BaseRelvarDecl(crate::ast_cddb::BaseRelvarDecl),
+    VirtualRelvarDecl(crate::ast_cddb::VirtualRelvarDecl),
     OperDecl(OperDecl),
 }
 
@@ -96,6 +106,18 @@ impl Item {
         Some(match syntax.kind() {
             SyntaxKind::PROGRAM_DECL => Item::ProgramDecl(ProgramDecl { syntax }),
             SyntaxKind::DATABASE_BINDING => Item::DatabaseBinding(DatabaseBinding { syntax }),
+            SyntaxKind::PUBLIC_RELVAR_DECL => {
+                Item::PublicRelvarDecl(PublicRelvarDecl::cast(syntax)?)
+            }
+            SyntaxKind::PRIVATE_RELVAR_DECL => {
+                Item::PrivateRelvarDecl(PrivateRelvarDecl::cast(syntax)?)
+            }
+            SyntaxKind::BASE_RELVAR_DECL => {
+                Item::BaseRelvarDecl(crate::ast_cddb::BaseRelvarDecl::cast(syntax)?)
+            }
+            SyntaxKind::VIRTUAL_RELVAR_DECL => {
+                Item::VirtualRelvarDecl(crate::ast_cddb::VirtualRelvarDecl::cast(syntax)?)
+            }
             SyntaxKind::OPER_DECL => Item::OperDecl(OperDecl { syntax }),
             _ => return None,
         })
@@ -105,6 +127,10 @@ impl Item {
         match self {
             Item::ProgramDecl(d) => d.syntax(),
             Item::DatabaseBinding(d) => d.syntax(),
+            Item::PublicRelvarDecl(d) => d.syntax(),
+            Item::PrivateRelvarDecl(d) => d.syntax(),
+            Item::BaseRelvarDecl(d) => d.syntax(),
+            Item::VirtualRelvarDecl(d) => d.syntax(),
             Item::OperDecl(d) => d.syntax(),
         }
     }
@@ -132,6 +158,49 @@ impl DatabaseBinding {
     /// the first IDENT slot; the name is the second.
     pub fn name(&self) -> Option<SyntaxToken> {
         nth_token(&self.syntax, SyntaxKind::IDENT, 1)
+    }
+}
+
+// ── PublicRelvarDecl / PrivateRelvarDecl ─────────────────────────────────
+
+ast_node!(pub PublicRelvarDecl, PUBLIC_RELVAR_DECL);
+
+impl PublicRelvarDecl {
+    /// The declared relvar name. Keywords `public` and `relvar` occupy
+    /// the first two IDENT slots; the name is the third.
+    pub fn name(&self) -> Option<SyntaxToken> {
+        nth_token(&self.syntax, SyntaxKind::IDENT, 2)
+    }
+
+    /// The relvar's heading (`{ a: T, b: U, … }`).
+    pub fn heading(&self) -> Option<Heading> {
+        child(&self.syntax)
+    }
+
+    /// All candidate-key clauses in source order. Multi-key parses;
+    /// the typechecker validates the first one for v1.
+    pub fn key_clauses(&self) -> impl Iterator<Item = KeyClause> + '_ {
+        children(&self.syntax)
+    }
+}
+
+ast_node!(pub PrivateRelvarDecl, PRIVATE_RELVAR_DECL);
+
+impl PrivateRelvarDecl {
+    /// The declared relvar name. Keywords `private` and `relvar`
+    /// occupy the first two IDENT slots; the name is the third.
+    pub fn name(&self) -> Option<SyntaxToken> {
+        nth_token(&self.syntax, SyntaxKind::IDENT, 2)
+    }
+
+    /// The relvar's heading (`{ a: T, b: U, … }`).
+    pub fn heading(&self) -> Option<Heading> {
+        child(&self.syntax)
+    }
+
+    /// All candidate-key clauses in source order.
+    pub fn key_clauses(&self) -> impl Iterator<Item = KeyClause> + '_ {
+        children(&self.syntax)
     }
 }
 
@@ -443,10 +512,54 @@ mod tests {
             .map(|i| match i {
                 Item::ProgramDecl(_) => "program",
                 Item::DatabaseBinding(_) => "database",
+                Item::PublicRelvarDecl(_) => "public_relvar",
+                Item::PrivateRelvarDecl(_) => "private_relvar",
+                Item::BaseRelvarDecl(_) => "base_relvar",
+                Item::VirtualRelvarDecl(_) => "virtual_relvar",
                 Item::OperDecl(_) => "oper",
             })
             .collect();
         assert_eq!(kinds, vec!["program", "database", "oper"]);
+    }
+
+    #[test]
+    fn public_relvar_walks_to_name_heading_keys() {
+        let src = "public relvar Greetings { id: Integer, message: Text } key { id };";
+        let root = ast(src);
+        let Item::PublicRelvarDecl(decl) = root.items().next().unwrap() else {
+            panic!("expected PublicRelvarDecl");
+        };
+        assert_eq!(decl.name().unwrap().text(), "Greetings");
+        let heading = decl.heading().unwrap();
+        assert_eq!(heading.params().count(), 2);
+        let keys: Vec<_> = decl.key_clauses().collect();
+        assert_eq!(keys.len(), 1);
+        assert!(keys[0].attrs().any(|t| t.text() == "id"));
+    }
+
+    #[test]
+    fn private_relvar_with_multi_key() {
+        let src = "private relvar P { a: Integer, b: Integer } key { a } key { b };";
+        let root = ast(src);
+        let Item::PrivateRelvarDecl(decl) = root.items().next().unwrap() else {
+            panic!("expected PrivateRelvarDecl");
+        };
+        assert_eq!(decl.name().unwrap().text(), "P");
+        let keys: Vec<_> = decl.key_clauses().collect();
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn base_relvar_in_cd_dialect_appears_as_base_item() {
+        // `.cd` parses base/virtual so the typechecker can emit T0014;
+        // here we verify the AST surface routes the resulting node to
+        // `Item::BaseRelvarDecl`.
+        let src = "base relvar Greetings { id: Integer } key { id };";
+        let root = ast(src);
+        assert!(matches!(
+            root.items().next().unwrap(),
+            Item::BaseRelvarDecl(_)
+        ));
     }
 
     #[test]

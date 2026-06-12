@@ -72,8 +72,12 @@ pub enum SyntaxKind {
     OPER_DECL,
     /// `type <name> = …;` (sum type, type alias, possrep-scalar type).
     TYPE_DECL,
-    /// `relvar <kind> <name> <heading> [ key { … } ];`.
-    RELVAR_DECL,
+    /// `public relvar <Name> <heading> { <key-clause> };` —
+    /// application-side relvar exposed to the catalog. `.cd` dialect.
+    PUBLIC_RELVAR_DECL,
+    /// `private relvar <Name> <heading> { <key-clause> };` —
+    /// application-side relvar internal to the program. `.cd` dialect.
+    PRIVATE_RELVAR_DECL,
     /// `constraint <name>: <expr>;`.
     CONSTRAINT_DECL,
 
@@ -311,6 +315,8 @@ mod tests {
             SyntaxKind::BLOCK,
             SyntaxKind::CALL_EXPR,
             SyntaxKind::KEY_CLAUSE,
+            SyntaxKind::PUBLIC_RELVAR_DECL,
+            SyntaxKind::PRIVATE_RELVAR_DECL,
             SyntaxKind::DATABASE_BINDING,
             SyntaxKind::CDDB_ROOT,
             SyntaxKind::DATABASE_DECL,

@@ -195,6 +195,8 @@ function that implements it.
 <root>          ::= { <item> } ;                              -- parse_root
 <item>          ::= <program-decl>
                   | <database-binding>
+                  | <public-relvar-decl>
+                  | <private-relvar-decl>
                   | <oper-decl>
                   | <unknown-item> ;                          -- parse_item
 
@@ -205,6 +207,26 @@ function that implements it.
                        -- discovers <name>.cddb and <name>.cdstore from
                        -- the declared name. Absent → program uses no
                        -- public relvars.
+
+<public-relvar-decl>  ::= 'public' <relvar-with-heading> ;        -- parse_public_relvar_decl
+                          -- Application-side relvar exposed to the catalog.
+
+<private-relvar-decl> ::= 'private' <relvar-with-heading> ;       -- parse_private_relvar_decl
+                          -- Application-side relvar internal to the program.
+
+<relvar-with-heading> ::= 'relvar' <identifier>
+                          <heading>
+                          { <key-clause> }
+                          ';' ;                                -- parse_relvar_with_heading
+                          -- Shared tail of the `public` / `private`
+                          -- relvar productions. The kind keyword has
+                          -- been consumed at the dispatch site.
+
+-- `base relvar` and `virtual relvar` in `.cd` source parse via the
+-- corresponding `parse_base_relvar_decl` / `parse_virtual_relvar_decl`
+-- shared with the `.cddb` parser; the typechecker emits T0014 because
+-- those kinds belong in `.cddb`. See docs/cddb-grammar.md for those
+-- productions.
 
 <oper-decl>     ::= 'oper' <identifier> <heading>
                     [ <return-clause> ]
@@ -217,8 +239,12 @@ function that implements it.
 
 <key-clause>    ::= 'key' '{' [ <identifier> commalist ] '}' ; -- parse_key_clause
                     -- Candidate-key clause on a relvar declaration.
-                    -- Shared between `.cd` application relvars (Phase 15)
-                    -- and `.cddb` database relvars (today).
+                    -- Shared between `.cd` application relvars
+                    -- (`public` / `private`) and `.cddb` database
+                    -- relvars (`base`). Multi-key declarations
+                    -- (`key {a} key {b}`) parse; the typechecker
+                    -- validates each key's attributes against the
+                    -- heading, and downstream uses the first.
 
 <block>         ::= '[' { <stmt> } [ <expr> ] ']' ;            -- parse_block
                     -- The optional trailing <expr> with no terminating
@@ -308,6 +334,10 @@ enforces that.
 | P0022 | Expected `{` to start key clause                        |
 | P0023 | Expected key attribute name                             |
 | P0024 | Expected `}` to close key clause                        |
+| P0025 | Expected `relvar` after relvar kind                     |
+| P0026 | Expected relvar name                                    |
+| P0027 | Expected `{` to start relvar heading                    |
+| P0028 | Expected `;` after relvar declaration                   |
 
 Note: missing-type-after-`:` (let annotation) and missing-type-
 after-`->` (operator return clause) both surface as `P0011`

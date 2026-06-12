@@ -62,7 +62,7 @@ mod tests {
         assert_eq!(sig.params.len(), 1);
         assert_eq!(sig.params[0].0, "message");
         assert!(matches!(sig.params[0].1, Type::Text));
-        assert!(matches!(sig.return_type, Type::Tuple(ref v) if v.is_empty()));
+        assert!(matches!(sig.return_type, Type::Tuple(ref h) if h.is_empty()));
     }
 
     #[test]

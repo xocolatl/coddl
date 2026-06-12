@@ -5,22 +5,19 @@
 // referential integrity via subset constraint, and a query oper that
 // combines `where`, projection, and `join`.
 //
-// OPEN syntax questions surfaced here:
-//   - relvar decl: `relvar Name <kind> { attr: Type, ... } key { ... };`
-//     where <kind> is one of `real`/`base`/`virtual`/`private`/`public`.
-//     Using `real` here (database relvar backed by storage).
-//   - multiple candidate keys: `key { ... } key { ... };` (each `key` clause
-//     is one declared key) vs `keys { {...}, {...} };` (list of keys).
-//     Using repeated `key { ... }` since each is one set.
+// Settled in Phase 15:
+//   - relvar decl: `<kind> relvar <Name> { attr: Type, ... } key { ... };`
+//     where <kind> is `public`/`private` in `.cd` and `base`/`virtual`
+//     in `.cddb`. Kind always before the name.
+//   - multiple candidate keys: repeated `key { ... } key { ... };`,
+//     each clause is one declared key (`SP` uses both forms).
+//   - `where` (infix, scope-injecting), `join` (infix), `<=` (polymorphic
+//     subset over relations) — settled per ARCHITECTURE.md §3.
+//
+// OPEN syntax questions surfaced here, deferred to later phases:
 //   - projection: `R { a, b }` — naked attribute names in `{}` (no values).
 //     A degenerate case of the named-set form. Tutorial D writes the same.
 //     Alternative: `project { rel: R, attrs: { a, b } }` (verbose canonical).
-//   - relational restriction: settled — `where` is infix per §3 with
-//     scope injection (predicate identifiers resolve against the left
-//     operand's heading). `R where p`, no braces, lowest precedence.
-//   - join: settled — infix per §3 "Surface syntax". `R join S`.
-//   - subset (⊆) for inclusion constraint: settled — `<=` polymorphic
-//     over relations (subset/superset). No separate `subset` keyword.
 //   - operator with relation-typed return: heading specified inline in
 //     the return-type clause. `-> Relation { pid: PID, ... }` parses as
 //     a type generator application.
@@ -36,14 +33,14 @@ type Weight { possrep w { val: Rational } where val > 0; };
 type City { possrep c { val: Text }; };
 type Status { possrep s { val: Integer } where val >= 0 and val <= 100; };
 
-base relvar S {
+public relvar S {
     sid: SID,
     sname: Name,
     status: Status,
     city: City,
 } key { sid };
 
-base relvar P {
+public relvar P {
     pid: PID,
     pname: Name,
     color: Color,
@@ -51,7 +48,7 @@ base relvar P {
     city: City,
 } key { pid };
 
-base relvar SP {
+public relvar SP {
     sid: SID,
     pid: PID,
     qty: Qty,

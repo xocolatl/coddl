@@ -51,8 +51,11 @@ pub struct LowerOutput {
 }
 
 /// Tokenize, parse, type-check, and lower `source` to ProcIR.
+/// Lowering is `.cd`-only — `.cddb`, `.cdmap`, and `.cdstore` describe
+/// storage shape that the typechecker and the (Phase 16) plan layer
+/// consume; they have no procedural lowering.
 pub fn lower(source: &str, file: FileId) -> LowerOutput {
-    let check_out = check(source, file);
+    let check_out = check(source, file, coddl_syntax::FileKind::Cd);
     let has_errors = check_out
         .diagnostics
         .iter()
@@ -186,6 +189,15 @@ impl Lowerer {
                 Item::DatabaseBinding(_) => {
                     // The binding is a parse-time label today; runtime
                     // wiring lands with Phase 21's SQLite materialization.
+                }
+                Item::PublicRelvarDecl(_)
+                | Item::PrivateRelvarDecl(_)
+                | Item::BaseRelvarDecl(_)
+                | Item::VirtualRelvarDecl(_) => {
+                    // Relvar declarations don't lower yet — they
+                    // describe storage shape that the typechecker
+                    // collects into the relvar table (Phase 15).
+                    // Storage init lands in Phase 21.
                 }
                 Item::OperDecl(o) => {
                     let func = self.lower_oper_decl(&o);

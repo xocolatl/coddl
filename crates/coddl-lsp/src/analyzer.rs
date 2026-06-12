@@ -124,8 +124,8 @@ impl Analyzer {
         let source_for_blocking = source.clone();
         let snap_arc = tokio::task::spawn_blocking(move || {
             let (diagnostics, hints) = match kind {
-                FileKind::Cd => {
-                    let check = coddl_types::check(&source_for_blocking, FileId(0));
+                FileKind::Cd | FileKind::Cddb => {
+                    let check = coddl_types::check(&source_for_blocking, FileId(0), kind);
                     (check.diagnostics, check.hints)
                 }
                 other => {

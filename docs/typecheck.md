@@ -32,25 +32,59 @@ is `Unknown`.
 | `Binary`      | Opaque byte blob.                                        |
 | `Byte`        | Single octet (0–255).                                    |
 | `Boolean`     | `true` or `false`.                                       |
-| `Tuple H`     | Structural tuple with attribute set `H` (sorted by name). |
+| `Tuple H`     | Structural tuple over heading `H`.                       |
+| `Relation H`  | Structural relation over heading `H`.                    |
 | `Unknown`     | Sentinel used during error recovery; equals anything.    |
 
 `Tuple` with an empty attribute set (`Tuple {}`) is the **unit type** —
 the implicit return of every `oper` declared without an explicit
 return clause.
 
+### `Heading`
+
+`Heading` is the structural shape shared by `Tuple H` and `Relation
+H`. The constructor `Heading::new(fields)` sorts the attribute pairs
+by name, so two headings declared with the same set in different
+source orders compare equal; attribute lookup is a binary search.
+This is what `RM Pro 1` (no ordinal position on attributes) buys
+the typechecker.
+
 ### Deliberately not yet typed
 
 The following are deferred until the relevant productions arrive:
 
-- **`Relation H`** and **`Sequence T`** — type generators referenced in
-  `ARCHITECTURE.md §7` but not yet a `Type` enum variant. They land
-  alongside `parse_type_ref` learning to parse generator applications.
+- **`Sequence T`** — type generator referenced in
+  `ARCHITECTURE.md §7` but not yet a `Type` enum variant. Lands with
+  the `LOAD ARRAY ... ORDER (...)` iteration form.
 - **User-defined scalar types** via `possrep` — the typechecker has
   no notion of user types yet; every type-name lookup either resolves
   to a built-in or yields `T0005`.
 - **Function types** — `oper` signatures are stored in the built-in
   registry as `OperSig`, not as a first-class `Type` value.
+
+
+## Relvar table
+
+The typechecker's pre-pass populates a `RelvarTable` from every
+declared relvar in the file: `public` / `private` in `.cd`, `base` /
+`virtual` in `.cddb`. Each entry carries the relvar's kind, canonical
+`Heading`, candidate keys (in source order; each inner `Vec<String>`
+is one key's attribute names), and the span of the declaration's
+name token for downstream "declared here" notes.
+
+The table is exposed via `CheckOutput::relvars` so Phase 16's plan
+layer can cross-validate `.cd` against `.cddb` and Phase 18+ can
+expose entries to operator-body name resolution.
+
+Key validation: every attribute named in `key { … }` must appear in
+the heading; offenders emit `T0013`. Multi-key declarations (`key {a}
+key {b}`) parse and each key validates independently — downstream
+uses the first key for v1 (the typechecker stores them all).
+
+Dialect legality: `public` / `private` are `.cd`-only; `base` /
+`virtual` are `.cddb`-only. The parser of either dialect accepts all
+four kinds so the typechecker can emit `T0014` at the name token
+rather than producing a generic parse error.
 
 
 ## Built-in operator registry
@@ -72,8 +106,23 @@ The typechecker walks the AST exposed by `coddl-syntax`. Walk methods
 are named to mirror the parser's productions in `docs/grammar.md`:
 each `parse_<x>` has a corresponding `check_<x>`.
 
-- **`check_root`** — iterates the file's top-level items and dispatches
-  each to `check_program_decl` or `check_oper_decl`.
+- **`check_root`** — two-pass over `.cd` items. The pre-pass collects
+  every relvar declaration into the `RelvarTable` (via
+  `check_public_relvar_decl` / `check_private_relvar_decl` /
+  `check_base_relvar_decl` / `check_virtual_relvar_decl`); the main
+  pass walks `check_program_decl` and `check_oper_decl`. The
+  separation lets Phase 18+ resolve relvar references in operator
+  bodies against a complete table.
+- **`check_cddb_root`** — single pre-pass over `.cddb` items
+  collecting every relvar declaration into the table. T0014 fires
+  on `public` / `private` declarations (those belong in `.cd`).
+- **`check_public_relvar_decl` / `check_private_relvar_decl` /
+  `check_base_relvar_decl` / `check_virtual_relvar_decl`** — each
+  resolves the heading into a canonical `Heading`, validates each
+  candidate key's attributes (`T0013`), and inserts a `RelvarInfo`
+  into the table (`T0012` on duplicate name). All four delegate
+  dialect-legality checking to `is_kind_legal_for_dialect`, which
+  emits `T0014` on a kind not legal in the current file's dialect.
 - **`check_program_decl`** — no-op today; the program name is a label
   the runtime may use later. No semantic constraints yet.
 - **`check_oper_decl`** — resolves the heading into a parameter
@@ -146,3 +195,6 @@ check script enforces that.
 | T0009 | Operator body's result type doesn't match its declared return |
 | T0010 | `let` binding's declared type doesn't match the RHS       |
 | T0011 | `main` must return `Tuple {}` (the unit type)            |
+| T0012 | Duplicate relvar — name already declared in this file    |
+| T0013 | Key attribute is not in the relvar's heading             |
+| T0014 | Relvar kind is not legal for this dialect (`public`/`private` in `.cddb`, `base`/`virtual` in `.cd`) |
