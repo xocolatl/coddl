@@ -243,8 +243,10 @@ version = "0.0.0"
 dependencies = [
  "coddl-diagnostics",
  "coddl-fmt",
+ "coddl-plan",
  "coddl-syntax",
  "coddl-types",
+ "tempfile",
  "tokio",
  "tower-lsp",
 ]

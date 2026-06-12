@@ -29,18 +29,56 @@ impl CoddlLsp {
     /// Compute the snapshot for `uri` and push its diagnostics to
     /// the client. Used by `did_open` and `did_change` to surface
     /// errors as the user types.
+    ///
+    /// Merges two diagnostic sources: per-document parse/typecheck
+    /// diagnostics from `analyzer.snapshot`, and per-project plan
+    /// diagnostics from `analyzer.project_snapshot` routed to this
+    /// URI's `FileId`. Standalone documents (no project) see only
+    /// per-document diagnostics, preserving Phase 13 behavior.
     async fn publish_diagnostics_for(&self, uri: &Url) {
         let Some(snap) = self.analyzer.snapshot(uri).await else {
             return;
         };
-        let diagnostics: Vec<_> = snap
+        let mut diagnostics: Vec<_> = snap
             .diagnostics
             .iter()
             .map(|d| lsp_convert::diagnostic(d, &snap.line_index))
             .collect();
+
+        // Merge per-project plan diagnostics for this URI's role.
+        if let Some(project) = self.analyzer.project_for(uri).await {
+            if let Some(psnap) = self.analyzer.project_snapshot(&project.cd_path).await {
+                let fid = self.analyzer.file_id_for(&project, uri).await;
+                if let Some(fid) = fid {
+                    if let Some(plan_diags) = psnap.diagnostics_by_file.get(&fid) {
+                        let line_index = psnap.line_indices.get(&fid).unwrap_or(&snap.line_index);
+                        for d in plan_diags {
+                            diagnostics.push(lsp_convert::diagnostic(d, line_index));
+                        }
+                    }
+                }
+            }
+        }
+
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, Some(snap.version))
             .await;
+    }
+
+    /// Republish diagnostics for every open project member that
+    /// shares a project with `uri`. Called after `did_change` so an
+    /// edit to `.cddb` refreshes the `.cd` buffer's plan squiggles.
+    async fn republish_project_members(&self, uri: &Url) {
+        let Some(project) = self.analyzer.project_for(uri).await else {
+            return;
+        };
+        let members = self.analyzer.project_members(&project).await;
+        for member_uri in members {
+            if &member_uri == uri {
+                continue; // already published above
+            }
+            self.publish_diagnostics_for(&member_uri).await;
+        }
     }
 }
 
@@ -85,6 +123,10 @@ impl LanguageServer for CoddlLsp {
             )
             .await;
         self.publish_diagnostics_for(&uri).await;
+        // A new member may have attached to a project; refresh
+        // diagnostics for the other members so their plan squiggles
+        // reflect this file's presence.
+        self.republish_project_members(&uri).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -101,6 +143,10 @@ impl LanguageServer for CoddlLsp {
             )
             .await;
         self.publish_diagnostics_for(&uri).await;
+        // Plan diagnostics for sibling members may have moved; fan
+        // out an updated publish so e.g. editing greetings.cddb
+        // refreshes hello-world-db.cd's squiggles.
+        self.republish_project_members(&uri).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {

@@ -11,7 +11,8 @@
 //! `.cdmap` files are out of scope this phase; non-identity adapters
 //! land in a later phase.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{AstNode, DatabaseBinding, Root};
@@ -35,9 +36,26 @@ pub use plan::{BackendKind, Plan, PlanOutput, ResolvedPublicRelvar, WritePolicy}
 /// The function does file I/O via [`std::fs::read_to_string`] but
 /// mutates nothing outside its return value.
 pub fn discover_and_validate(cd_path: &Path) -> PlanOutput {
+    discover_and_validate_with_overrides(cd_path, &HashMap::new())
+}
+
+/// Same as [`discover_and_validate`], but consults `overrides` before
+/// touching the filesystem.
+///
+/// The LSP (Phase 17) uses this to feed unsaved buffer content into
+/// the plan layer: each entry in `overrides` maps a canonicalized
+/// path to the in-memory source the editor is showing. Paths not in
+/// the map fall through to `std::fs::read_to_string`. The override
+/// keys must exactly match the paths the plan layer constructs
+/// (`<cd_path>`, `<dir>/<db>.cddb`, `<dir>/<db>.cdstore`) — there's
+/// no path-normalization step beyond what the caller already did.
+pub fn discover_and_validate_with_overrides(
+    cd_path: &Path,
+    overrides: &HashMap<PathBuf, String>,
+) -> PlanOutput {
     let mut diags: Vec<Diagnostic> = Vec::new();
 
-    let cd_source = match std::fs::read_to_string(cd_path) {
+    let cd_source = match read_source_or_override(cd_path, overrides) {
         Ok(s) => s,
         Err(err) => {
             diags.push(plain_error(
@@ -107,7 +125,7 @@ pub fn discover_and_validate(cd_path: &Path) -> PlanOutput {
     let cddb_path = parent.join(format!("{database_name}.cddb"));
     let cdstore_path = parent.join(format!("{database_name}.cdstore"));
 
-    let cddb_source = match std::fs::read_to_string(&cddb_path) {
+    let cddb_source = match read_source_or_override(&cddb_path, overrides) {
         Ok(s) => Some(s),
         Err(_) => {
             diags.push(plain_error(
@@ -117,7 +135,7 @@ pub fn discover_and_validate(cd_path: &Path) -> PlanOutput {
             None
         }
     };
-    let cdstore_source = match std::fs::read_to_string(&cdstore_path) {
+    let cdstore_source = match read_source_or_override(&cdstore_path, overrides) {
         Ok(s) => Some(s),
         Err(_) => {
             diags.push(plain_error(
@@ -404,6 +422,19 @@ fn plain_error(code: &'static str, message: String) -> Diagnostic {
     Diagnostic::error(Span::new(FileId(0), 0, 0), code, message)
 }
 
+/// Read `path`'s source: from `overrides` if present (in-memory
+/// buffer wins), else from disk. The override map keys must match
+/// the paths the plan layer constructs verbatim.
+fn read_source_or_override(
+    path: &Path,
+    overrides: &HashMap<PathBuf, String>,
+) -> std::io::Result<String> {
+    if let Some(s) = overrides.get(path) {
+        return Ok(s.clone());
+    }
+    std::fs::read_to_string(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,6 +648,45 @@ relvar Greetings: table \"greetings\" {
         assert!(codes(&out.diagnostics).contains(&"PL0011"));
         let plan = out.plan.unwrap();
         assert_eq!(plan.backend_kind, BackendKind::Other("postgres".to_string()));
+    }
+
+    #[test]
+    fn overrides_with_empty_map_matches_disk_only_behavior() {
+        let (dir, cd) = write_project(CD_HELLO, Some(CDDB_GREETINGS), Some(CDSTORE_GREETINGS));
+        let baseline = discover_and_validate(&cd);
+        let with_empty =
+            discover_and_validate_with_overrides(&cd, &HashMap::new());
+        // Same PL-code set (the per-file T-code diagnostics carry
+        // identical spans / messages too, but we don't assert on
+        // those here — codes are the contract).
+        let base_codes: Vec<_> = codes(&baseline.diagnostics);
+        let over_codes: Vec<_> = codes(&with_empty.diagnostics);
+        assert_eq!(base_codes, over_codes);
+        let _ = dir; // keep tempdir alive
+    }
+
+    #[test]
+    fn override_for_cddb_wins_over_disk() {
+        let (dir, cd) = write_project(CD_HELLO, Some(CDDB_GREETINGS), Some(CDSTORE_GREETINGS));
+
+        // First confirm the disk version validates clean.
+        let clean = discover_and_validate(&cd);
+        assert!(
+            !codes(&clean.diagnostics).iter().any(|c| c.starts_with("PL")),
+            "baseline should be clean"
+        );
+
+        // Inject an in-memory CDDB whose heading mismatches the .cd.
+        // Disk file still has the matching shape, so we know the
+        // PL0007 came from the override and not from disk.
+        let bad_cddb = "\
+database greetings;
+base relvar Greetings { id: Integer, message: Boolean } key { id };
+";
+        let mut overrides = HashMap::new();
+        overrides.insert(dir.path().join("greetings.cddb"), bad_cddb.to_string());
+        let out = discover_and_validate_with_overrides(&cd, &overrides);
+        assert!(codes(&out.diagnostics).contains(&"PL0007"));
     }
 
     #[test]
