@@ -10,7 +10,7 @@ For *why* the type system is shaped this way, see
 unit type). This document never duplicates that rationale — it points
 at it and gets on with the rules.
 
-**Last sync:** `78d007f`. Every commit that adds, removes, or changes a
+**Last sync:** `1830ac1`. Every commit that adds, removes, or changes a
 `T####` code, a built-in operator, or a typechecker walk method
 updates this file in the same commit; `tools/check-grammar.sh`
 enforces it from the hygiene gate.
@@ -76,12 +76,16 @@ each `parse_<x>` has a corresponding `check_<x>`.
   each to `check_program_decl` or `check_oper_decl`.
 - **`check_program_decl`** — no-op today; the program name is a label
   the runtime may use later. No semantic constraints yet.
-- **`check_oper_decl`** — resolves the heading into a parameter scope
-  (rejecting duplicate names with `T0007`), then checks the body
-  against that scope. If the operator's name is `main`, its heading
-  must be empty (`T0006`). All operators implicitly return `Tuple {}`
-  today; if `check_block` reports a body type that isn't `Tuple {}`,
-  the mismatch is `T0009`.
+- **`check_oper_decl`** — resolves the heading into a parameter
+  scope (rejecting duplicate names with `T0007`), resolves the
+  declared return type from the optional `-> <type-ref>` clause
+  (defaulting to `Tuple {}`), then checks the body against the
+  scope. If the operator's name is `main`, its heading must be
+  empty (`T0006`) and its declared return must be `Tuple {}`
+  (`T0011`) — the runtime always exits with `i32 0`, so a declared
+  non-Unit return on `main` would lie about what the program
+  produces. The body's result type from `check_block` must match
+  the declared return; otherwise `T0009`.
 - **`resolve_type_name`** — maps a `TypeRef`'s identifier to a built-in
   `Type`. Unknown names produce `T0005` and resolve to `Type::Unknown`.
 - **`check_block`** — walks statements (let bindings update the
@@ -92,9 +96,12 @@ each `parse_<x>` has a corresponding `check_<x>`.
   `transaction [...]` block pushes a layer on entry and pops on
   exit. Lookups walk innermost-first so inner bindings shadow
   outer ones.
-- **`check_let_stmt`** — infers the RHS expression's type and
-  inserts the binding into the scope's top layer. Shadowing is
-  silently allowed.
+- **`check_let_stmt`** — infers the RHS expression's type. If the
+  binding carries an explicit `: <type-ref>` annotation, the
+  declared type is authoritative: the RHS must conform (or `T0010`
+  fires), and subsequent NameRef lookups see the *declared* type,
+  not the inferred one. Without an annotation, the inferred type
+  is bound. Shadowing is silently allowed.
 - **`check_expr_stmt`** — calls `check_expr` on the embedded expression
   and discards the result.
 - **`check_expr`** — returns the expression's `Type`. Dispatches on
@@ -137,3 +144,5 @@ check script enforces that.
 | T0007 | Duplicate parameter name in heading                      |
 | T0008 | Duplicate argument name in call site                     |
 | T0009 | Operator body's result type doesn't match its declared return |
+| T0010 | `let` binding's declared type doesn't match the RHS       |
+| T0011 | `main` must return `Tuple {}` (the unit type)            |

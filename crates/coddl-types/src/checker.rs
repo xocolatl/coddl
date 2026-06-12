@@ -154,23 +154,44 @@ impl TypeChecker {
             }
         }
 
-        // Entry-point rule: `main` must take no parameters.
+        // Resolve the declared return type, if any. Default = Unit.
+        let return_type = match decl.return_type().and_then(|tr| tr.name()) {
+            Some(name_tok) => self.resolve_type_name(&name_tok),
+            None => Type::unit(),
+        };
+
+        // Entry-point rules: `main` must take no parameters and must
+        // return Unit. The runtime always exits with `i32 0`; a
+        // declared non-Unit return would lie about what `main`
+        // produces. When real exit-code semantics arrive, T0011
+        // relaxes.
         if let Some(name_tok) = decl.name() {
-            if name_tok.text() == "main" && param_count > 0 {
-                self.error(
-                    self.token_span(&name_tok),
-                    "T0006",
-                    "`main` must take zero parameters",
-                );
+            if name_tok.text() == "main" {
+                if param_count > 0 {
+                    self.error(
+                        self.token_span(&name_tok),
+                        "T0006",
+                        "`main` must take zero parameters",
+                    );
+                }
+                if !return_type.assignable_to(&Type::unit()) {
+                    let span = decl
+                        .return_type()
+                        .map(|tr| self.node_span(tr.syntax()))
+                        .unwrap_or_else(|| self.token_span(&name_tok));
+                    self.error(
+                        span,
+                        "T0011",
+                        format!("`main` must return {}, got {}", Type::unit(), return_type),
+                    );
+                }
             }
         }
 
-        // All operators implicitly return `Tuple {}` today; an
-        // explicit return type is a future-phase concern. Anything
-        // else the body produces is a type error.
+        // The body's result type must match the declared return.
         if let Some(body) = decl.body() {
             let body_ty = self.check_block(&body, &mut scope);
-            if !body_ty.assignable_to(&Type::unit()) {
+            if !body_ty.assignable_to(&return_type) {
                 let span = body
                     .tail_expr()
                     .map(|e| self.node_span(e.syntax()))
@@ -178,10 +199,7 @@ impl TypeChecker {
                 self.error(
                     span,
                     "T0009",
-                    format!(
-                        "operator body produces {body_ty}, but operator returns {}",
-                        Type::unit()
-                    ),
+                    format!("operator body produces {body_ty}, but operator returns {return_type}"),
                 );
             }
         }
@@ -218,15 +236,41 @@ impl TypeChecker {
     }
 
     fn check_let_stmt(&mut self, stmt: &LetStmt, scope: &mut Scope) {
-        // Infer the RHS type and bind. Missing name or value here
-        // means the parser already reported the recovery; we still
-        // walk what's parseable to keep diagnostics flowing.
-        let ty = match stmt.value() {
+        // Infer the RHS type. Missing name or value here means the
+        // parser already reported the recovery; we still walk what's
+        // parseable to keep diagnostics flowing.
+        let rhs_ty = match stmt.value() {
             Some(v) => self.check_expr(&v, scope),
             None => Type::Unknown,
         };
+
+        // If the binding carries an explicit annotation, the
+        // annotation is authoritative: the RHS must conform, and
+        // subsequent lookups see the declared type, not the inferred
+        // one.
+        let bound_ty = match stmt.type_ref().and_then(|tr| tr.name()) {
+            Some(name_tok) => {
+                let declared = self.resolve_type_name(&name_tok);
+                if !rhs_ty.assignable_to(&declared) {
+                    let span = stmt
+                        .value()
+                        .map(|v| self.node_span(v.syntax()))
+                        .unwrap_or_else(|| self.node_span(stmt.syntax()));
+                    self.error(
+                        span,
+                        "T0010",
+                        format!(
+                            "let binding declared {declared}, but expression produces {rhs_ty}"
+                        ),
+                    );
+                }
+                declared
+            }
+            None => rhs_ty,
+        };
+
         if let Some(name_tok) = stmt.name() {
-            scope.insert(name_tok.text().to_string(), ty);
+            scope.insert(name_tok.text().to_string(), bound_ty);
         }
     }
 
@@ -521,6 +565,72 @@ mod tests {
         assert!(
             codes(src).contains(&"T0009"),
             "expected T0009, got {:?}",
+            codes(src)
+        );
+    }
+
+    #[test]
+    fn let_annotation_accepted_when_matching() {
+        let src = "oper main {} [ let m: Text = \"ok\"; write_line{message: m}; ];";
+        assert!(
+            diagnostics(src).is_empty(),
+            "unexpected diagnostics: {:?}",
+            diagnostics(src)
+        );
+    }
+
+    #[test]
+    fn let_annotation_must_match_rhs_diagnoses_t0010() {
+        let src = "oper main {} [ let x: Integer = \"hi\"; ];";
+        assert!(
+            codes(src).contains(&"T0010"),
+            "expected T0010, got {:?}",
+            codes(src)
+        );
+    }
+
+    #[test]
+    fn let_annotation_authoritative_for_later_uses() {
+        // Annotation declares Integer but RHS is Text — that's T0010.
+        // Subsequent use as Text in write_line is also a mismatch
+        // because the binding's type is the *declared* Integer, not
+        // the inferred Text. So we should see both T0010 (annotation
+        // vs RHS) and T0004 (call-site type mismatch).
+        let src = "oper main {} [ let x: Integer = 1; write_line{message: x}; ];";
+        let cs = codes(src);
+        assert!(
+            cs.contains(&"T0004"),
+            "expected T0004 from passing Integer where Text is needed, got {cs:?}"
+        );
+    }
+
+    #[test]
+    fn oper_return_type_enforced_against_tail() {
+        // Declared Text, body returns Unit (no tail) — T0009.
+        let src = "oper greet {} -> Text [];";
+        assert!(
+            codes(src).contains(&"T0009"),
+            "expected T0009, got {:?}",
+            codes(src)
+        );
+    }
+
+    #[test]
+    fn oper_with_matching_return_type_checks_clean() {
+        let src = "oper greet {} -> Text [ \"hi\" ]; oper main {} [];";
+        assert!(
+            diagnostics(src).is_empty(),
+            "unexpected diagnostics: {:?}",
+            diagnostics(src)
+        );
+    }
+
+    #[test]
+    fn main_with_non_unit_return_diagnoses_t0011() {
+        let src = "oper main {} -> Integer [ 1 ];";
+        assert!(
+            codes(src).contains(&"T0011"),
+            "expected T0011, got {:?}",
             codes(src)
         );
     }

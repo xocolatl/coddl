@@ -279,6 +279,12 @@ impl<'a> Parser<'a> {
             self.error("P0005", "expected `{` to start parameter heading");
         }
 
+        // Optional `-> <type-ref>` return clause between heading and
+        // body. Absent → implicit `Tuple {}` (unit) return.
+        if self.at(SyntaxKind::ARROW) {
+            self.parse_return_clause();
+        }
+
         if self.at(SyntaxKind::L_BRACKET) {
             self.parse_block();
         } else {
@@ -353,6 +359,17 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
+    /// `-> <type-ref>` — the optional return-type clause on an `oper`
+    /// declaration. Absent → the operator implicitly returns
+    /// `Tuple {}` (unit).
+    fn parse_return_clause(&mut self) {
+        debug_assert!(self.at(SyntaxKind::ARROW));
+        self.start_node(SyntaxKind::RETURN_CLAUSE);
+        self.bump(); // `->`
+        self.parse_type_ref();
+        self.finish_node();
+    }
+
     /// `[ <stmt>; <stmt>; … <tail-expr>? ]` body. Statements are
     /// terminated by `;`; the final item, if it lacks a trailing `;`,
     /// is the block's tail expression and becomes the block's value.
@@ -373,9 +390,10 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
-    /// `let <name> = <expr>;` — a value binding visible to subsequent
-    /// statements in the same block. No `mut`, no type annotations,
-    /// no destructuring for now.
+    /// `let <name> [: <type-ref>] = <expr>;` — a value binding visible
+    /// to subsequent statements in the same block. Type annotation is
+    /// optional; when absent, the binding's type is inferred from the
+    /// RHS. No `mut`, no destructuring for now.
     fn parse_let_stmt(&mut self) {
         debug_assert!(self.at_keyword("let"));
         self.start_node(SyntaxKind::LET_STMT);
@@ -384,6 +402,10 @@ impl<'a> Parser<'a> {
         self.bump_trivia();
         if !self.eat(SyntaxKind::IDENT) {
             self.error("P0018", "expected binding name in `let`");
+        }
+        // Optional `: <type-ref>` annotation between the name and `=`.
+        if self.eat(SyntaxKind::COLON) {
+            self.parse_type_ref();
         }
         if !self.eat(SyntaxKind::EQ) {
             self.error("P0018", "expected `=` in `let`");
@@ -1108,6 +1130,89 @@ mod tests {
             "expected no EXPR_STMT"
         );
         assert!(body.children().any(|n| n.kind() == SyntaxKind::NAME_REF));
+    }
+
+    #[test]
+    fn let_stmt_with_annotation_parses() {
+        let out = parse_str("oper f {} [ let x: Integer = 1; ];");
+        assert!(
+            out.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            out.diagnostics
+        );
+        // The let now has a TYPE_REF child between the name and the
+        // RHS literal.
+        let let_stmt = find_first(&out.tree, SyntaxKind::LET_STMT);
+        let kinds: Vec<_> = let_stmt.children().map(|c| c.kind()).collect();
+        assert!(
+            kinds.contains(&SyntaxKind::TYPE_REF),
+            "no TYPE_REF in {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&SyntaxKind::LITERAL),
+            "no LITERAL in {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn let_stmt_with_annotation_missing_type_diagnoses_p0011() {
+        let out = parse_str("oper f {} [ let x: = 1; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0011"),
+            "expected P0011, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn oper_decl_with_return_type_parses() {
+        let out = parse_str("oper f {} -> Text [ \"hi\" ];");
+        assert!(
+            out.diagnostics.is_empty(),
+            "diagnostics: {:?}",
+            out.diagnostics
+        );
+        let oper = find_first(&out.tree, SyntaxKind::OPER_DECL);
+        let kinds: Vec<_> = oper.children().map(|c| c.kind()).collect();
+        assert!(
+            kinds.contains(&SyntaxKind::RETURN_CLAUSE),
+            "no RETURN_CLAUSE in {kinds:?}"
+        );
+        let return_clause = oper
+            .children()
+            .find(|n| n.kind() == SyntaxKind::RETURN_CLAUSE)
+            .unwrap();
+        assert!(
+            return_clause
+                .children()
+                .any(|n| n.kind() == SyntaxKind::TYPE_REF),
+            "RETURN_CLAUSE missing TYPE_REF"
+        );
+    }
+
+    #[test]
+    fn oper_decl_return_type_missing_after_arrow_diagnoses_p0011() {
+        let out = parse_str("oper f {} -> [ \"hi\" ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0011"),
+            "expected P0011, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    fn find_first(root: &crate::cst::SyntaxNode, kind: SyntaxKind) -> crate::cst::SyntaxNode {
+        fn descend(n: &crate::cst::SyntaxNode, kind: SyntaxKind) -> Option<crate::cst::SyntaxNode> {
+            if n.kind() == kind {
+                return Some(n.clone());
+            }
+            for c in n.children() {
+                if let Some(found) = descend(&c, kind) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        descend(root, kind).expect("kind not found")
     }
 
     #[test]

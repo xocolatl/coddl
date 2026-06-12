@@ -40,6 +40,7 @@ pub enum SyntaxKind {
     COLON,
     DOT,
     ASSIGN,
+    ARROW,
 
     EQ,
     NOT_EQ,
@@ -84,6 +85,8 @@ pub enum SyntaxKind {
     /// A type expression (a `NAME_REF`, or a type-generator application
     /// like `Sequence T`, or `Tuple H` / `Relation H`).
     TYPE_REF,
+    /// `-> <type-ref>` — the return-type clause on an `oper` decl.
+    RETURN_CLAUSE,
 
     /// `[ … ]` ordered statement sequence used as an operator body or
     /// other block body.
@@ -170,6 +173,7 @@ impl From<TokenKind> for SyntaxKind {
             TokenKind::Colon => SyntaxKind::COLON,
             TokenKind::Dot => SyntaxKind::DOT,
             TokenKind::Assign => SyntaxKind::ASSIGN,
+            TokenKind::Arrow => SyntaxKind::ARROW,
 
             TokenKind::Eq => SyntaxKind::EQ,
             TokenKind::NotEq => SyntaxKind::NOT_EQ,

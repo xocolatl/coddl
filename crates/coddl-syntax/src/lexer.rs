@@ -151,7 +151,7 @@ impl<'a> Lexer<'a> {
             ',' => self.lex_single(TokenKind::Comma, start),
             '.' => self.lex_single(TokenKind::Dot, start),
             '+' => self.lex_single(TokenKind::Plus, start),
-            '-' => self.lex_single(TokenKind::Minus, start),
+            '-' => self.lex_minus(start),
             '*' => self.lex_single(TokenKind::Star, start),
             '=' => self.lex_single(TokenKind::Eq, start),
 
@@ -197,6 +197,16 @@ impl<'a> Lexer<'a> {
             self.emit(TokenKind::Assign, start);
         } else {
             self.emit(TokenKind::Colon, start);
+        }
+    }
+
+    fn lex_minus(&mut self, start: usize) {
+        self.bump(); // '-'
+        if self.peek() == Some('>') {
+            self.bump();
+            self.emit(TokenKind::Arrow, start);
+        } else {
+            self.emit(TokenKind::Minus, start);
         }
     }
 
@@ -704,6 +714,16 @@ mod tests {
     fn assign_vs_colon() {
         assert_eq!(lex_kinds(":="), vec![TokenKind::Assign, TokenKind::Eof]);
         assert_eq!(lex_kinds(":"), vec![TokenKind::Colon, TokenKind::Eof]);
+    }
+
+    #[test]
+    fn arrow_vs_minus() {
+        assert_eq!(lex_kinds("->"), vec![TokenKind::Arrow, TokenKind::Eof]);
+        assert_eq!(lex_kinds("-"), vec![TokenKind::Minus, TokenKind::Eof]);
+        assert_eq!(
+            lex_kinds("- >"),
+            vec![TokenKind::Minus, TokenKind::Gt, TokenKind::Eof]
+        );
     }
 
     #[test]

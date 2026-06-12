@@ -231,6 +231,16 @@ impl Lowerer {
 
         let is_main = name == "main";
 
+        // Resolve the declared return type. Default = Unit. Main is
+        // treated as Unit at the IR level (the backends special-case
+        // `ret i32 0`); the typechecker rejects a declared non-Unit
+        // return on `main` with T0011, so this assignment is safe.
+        let declared_return = decl
+            .return_type()
+            .and_then(|tr| tr.name())
+            .map(|t| proc_type_from_builtin_name(t.text()))
+            .unwrap_or(ProcType::Unit);
+
         let block_id = self.fresh_block();
 
         // The compiled program's startup must call the runtime before
@@ -249,9 +259,7 @@ impl Lowerer {
             });
         }
 
-        if let Some(body) = decl.body() {
-            self.lower_block(&body);
-        }
+        let body_value = decl.body().map(|body| self.lower_block(&body));
 
         if is_main {
             self.ensure_runtime_extern("coddl_runtime_shutdown");
@@ -264,17 +272,30 @@ impl Lowerer {
             });
         }
 
+        // Non-main opers with a non-Unit declared return carry their
+        // body's tail-expression value out via `Return(Some(v))`.
+        // Main + Unit-returning opers use `Return(None)`; the backend
+        // special-cases main as `ret i32 0`.
+        let terminator = if !is_main && !matches!(declared_return, ProcType::Unit) {
+            match body_value {
+                Some(v) => Terminator::Return(Some(v)),
+                None => Terminator::Return(None),
+            }
+        } else {
+            Terminator::Return(None)
+        };
+
         let block = BasicBlock {
             id: block_id,
             insts: std::mem::take(&mut self.insts),
-            terminator: Terminator::Return(None),
+            terminator,
         };
 
         Function {
             name,
             linkage_name,
             params,
-            return_type: ProcType::Unit,
+            return_type: declared_return,
             blocks: vec![block],
         }
     }
@@ -768,6 +789,34 @@ mod tests {
             })
             .unwrap();
         assert_eq!(call, "coddl_write_line");
+    }
+
+    #[test]
+    fn non_main_oper_with_return_type_emits_typed_return() {
+        // Integer chosen because both backends already handle scalar
+        // returns. Text returns are blocked on the C ABI return-pair
+        // codegen — a future phase.
+        let src = "oper compute {} -> Integer [ 42 ]; oper main {} [];";
+        let m = lower_ok(src);
+        let compute = m.functions.iter().find(|f| f.name == "compute").unwrap();
+        assert_eq!(compute.return_type, ProcType::Integer);
+        assert_eq!(compute.blocks.len(), 1);
+        match &compute.blocks[0].terminator {
+            Terminator::Return(Some(_)) => {}
+            other => panic!("expected Return(Some(_)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oper_without_explicit_return_stays_unit() {
+        let src = "oper noop {} [];";
+        let m = lower_ok(src);
+        let noop = m.functions.iter().find(|f| f.name == "noop").unwrap();
+        assert_eq!(noop.return_type, ProcType::Unit);
+        assert!(matches!(
+            noop.blocks[0].terminator,
+            Terminator::Return(None)
+        ));
     }
 
     #[test]

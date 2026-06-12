@@ -131,11 +131,20 @@ impl OperDecl {
         child(&self.syntax)
     }
 
+    /// The declared return type, if the operator carries an explicit
+    /// `-> <type-ref>` clause. Absent → implicit `Tuple {}` return.
+    pub fn return_type(&self) -> Option<TypeRef> {
+        let clause: ReturnClause = child(&self.syntax)?;
+        child(&clause.syntax)
+    }
+
     /// The body `[ … ]`.
     pub fn body(&self) -> Option<Block> {
         child(&self.syntax)
     }
 }
+
+ast_node!(pub ReturnClause, RETURN_CLAUSE);
 
 // ── Heading + Param ──────────────────────────────────────────────────────
 
@@ -226,6 +235,12 @@ impl LetStmt {
         // Skip the `let` IDENT (contextual keyword); the binding name
         // is the second IDENT child token.
         nth_token(&self.syntax, SyntaxKind::IDENT, 1)
+    }
+
+    /// The optional type annotation: the `TypeRef` child between the
+    /// binding name and the `=`. Absent → type inferred from RHS.
+    pub fn type_ref(&self) -> Option<TypeRef> {
+        child(&self.syntax)
     }
 
     /// The right-hand-side expression.

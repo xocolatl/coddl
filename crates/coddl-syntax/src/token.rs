@@ -77,6 +77,8 @@ pub enum TokenKind {
     Dot,
     /// `:=`
     Assign,
+    /// `->`  — operator return-type clause, future infix arrow.
+    Arrow,
 
     // ── comparison ───────────────────────────────────────────────────────
     /// `=`

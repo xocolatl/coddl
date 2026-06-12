@@ -9,7 +9,7 @@ braces, identifier case, reserved-words-none, Unicode glyph synonyms,
 literals, method-style calls). This document never duplicates that
 rationale — it points at it and gets on with the rules.
 
-**Last sync:** `78d007f`. Every commit that adds, removes, or changes
+**Last sync:** `1830ac1`. Every commit that adds, removes, or changes
 a production, token, or diagnostic code updates this file in the
 same commit; `tools/check-grammar.sh` enforces it from the hygiene
 gate.
@@ -140,6 +140,7 @@ Unterminated `'…` or `"…` emits **E0005** and **E0003** respectively.
 | `Colon`       | `:`                                             |
 | `Dot`         | `.`                                             |
 | `Assign`      | `:=`                                            |
+| `Arrow`       | `->`                                            |
 | `Eq`          | `=`                                             |
 | `NotEq`       | `<>`, `≠`                                       |
 | `Lt`          | `<`, `⊂`                                        |
@@ -199,7 +200,9 @@ function that implements it.
 <program-decl>  ::= 'program' <identifier> ';' ;              -- parse_program_decl
 
 <oper-decl>     ::= 'oper' <identifier> <heading>
+                    [ <return-clause> ]
                     <block> ';' ;                              -- parse_oper_decl
+<return-clause> ::= '->' <type-ref> ;                          -- parse_return_clause
 
 <heading>       ::= '{' [ <param> commalist ] '}' ;            -- parse_heading
 <param>         ::= <identifier> ':' <type-ref> ;              -- parse_param
@@ -212,7 +215,8 @@ function that implements it.
                     -- have their results discarded.
 <stmt>          ::= <let-stmt>
                   | <expr> ';' ;                               -- parse_stmt (LET_STMT or EXPR_STMT)
-<let-stmt>      ::= 'let' <identifier> '=' <expr> ';' ;        -- parse_let_stmt
+<let-stmt>      ::= 'let' <identifier> [ ':' <type-ref> ]
+                    '=' <expr> ';' ;                           -- parse_let_stmt
 
 <expr>          ::= <primary-expr> { <arg-list> } ;            -- parse_expr
 <primary-expr>  ::= <name-ref>
@@ -240,9 +244,10 @@ identifiers. Coddl has no hard-reserved words. See
 The following are decided in `ARCHITECTURE.md` but not yet wired into
 the parser. Listed here so the omission is explicit, not implied:
 
-- **Return-type clause** on `<oper-decl>`. The punctuation choice
-  (`:` vs `->`) is open. An `oper` without a return clause implicitly
-  returns `Tuple {}` (the unit type).
+- **Tuple/Relation/Sequence as a `<type-ref>`**. Today only built-in
+  scalar names resolve as type references; type-generator
+  applications (`Tuple H`, `Relation H`, `Sequence T`) land alongside
+  user-defined types.
 - **Type generators** in `<type-ref>` — `Tuple H`, `Relation H`,
   `Sequence T`.
 - **Infix operators** — relational (`join`, `times`, `intersect`,
@@ -286,6 +291,12 @@ enforces that.
 | P0017 | Expected `:` after argument name                        |
 | P0018 | `let` statement is malformed (missing name, `=`, or RHS)|
 | P0019 | `transaction` not followed by `[`                       |
+
+Note: missing-type-after-`:` (let annotation) and missing-type-
+after-`->` (operator return clause) both surface as `P0011`
+("expected type name") via `parse_type_ref` — the diagnostic
+message is identical and adding distinct codes would dedupe to the
+same message.
 
 
 ## Lexer diagnostics
