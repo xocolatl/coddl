@@ -141,6 +141,52 @@ fn coddl_compile_cranelift_produces_runnable_binary() {
     assert_eq!(run.stdout, b"Hello, world!\n");
 }
 
+/// The cross-backend equivalence invariant: for any source program,
+/// both backends produce byte-identical stdout. This is the
+/// validation discipline documented in `docs/validation.md` —
+/// adding a new example program means adding a parameterized assert
+/// pair here.
+#[test]
+fn hello_world_byte_identical_across_backends() {
+    ensure_runtime_built();
+
+    let llvm = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(hello_world_path())
+        .output()
+        .expect("spawn coddl run --backend=llvm");
+    assert!(
+        llvm.status.success(),
+        "LLVM run failed: stderr=\n{}",
+        String::from_utf8_lossy(&llvm.stderr)
+    );
+
+    let cranelift = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(hello_world_path())
+        .output()
+        .expect("spawn coddl run --backend=cranelift");
+    assert!(
+        cranelift.status.success(),
+        "Cranelift run failed: stderr=\n{}",
+        String::from_utf8_lossy(&cranelift.stderr)
+    );
+
+    assert_eq!(
+        llvm.stdout,
+        cranelift.stdout,
+        "backends disagree:\n  LLVM:      {:?}\n  Cranelift: {:?}",
+        String::from_utf8_lossy(&llvm.stdout),
+        String::from_utf8_lossy(&cranelift.stdout)
+    );
+    assert_eq!(
+        llvm.stdout,
+        b"Hello, world!\n",
+        "both backends produced unexpected stdout: {:?}",
+        String::from_utf8_lossy(&llvm.stdout)
+    );
+}
+
 #[test]
 fn coddl_run_unknown_backend_fails_clearly() {
     // No `ensure_runtime_built()` needed — we never get to linking.
