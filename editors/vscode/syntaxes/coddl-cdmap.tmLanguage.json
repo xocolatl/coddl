@@ -1,0 +1,62 @@
+{
+    "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+    "name": "Coddl Map",
+    "scopeName": "source.coddl.cdmap",
+    "fileTypes": ["cdmap"],
+    "patterns": [
+        { "include": "#comments" },
+        { "include": "#keywords" },
+        { "include": "#operators" },
+        { "include": "#identifiers" }
+    ],
+    "repository": {
+        "comments": {
+            "patterns": [
+                { "name": "comment.line.double-slash.coddl", "match": "//.*$" },
+                { "include": "#block_comment" }
+            ]
+        },
+        "block_comment": {
+            "name": "comment.block.coddl",
+            "begin": "/\\*",
+            "end": "\\*/",
+            "patterns": [{ "include": "#block_comment" }]
+        },
+        "keywords": {
+            "patterns": [
+                {
+                    "name": "keyword.declaration.coddl",
+                    "match": "\\b(map)\\b"
+                },
+                {
+                    "name": "keyword.other.coddl",
+                    "match": "\\b(to|project|rename|as)\\b"
+                }
+            ]
+        },
+        "operators": {
+            "patterns": [
+                {
+                    "name": "keyword.operator.assignment.coddl",
+                    "match": "="
+                },
+                {
+                    "name": "punctuation.separator.coddl",
+                    "match": "[,;:]"
+                }
+            ]
+        },
+        "identifiers": {
+            "patterns": [
+                {
+                    "name": "entity.name.type.coddl",
+                    "match": "\\b[A-Z][A-Za-z0-9_]*[#]?\\b"
+                },
+                {
+                    "name": "variable.other.coddl",
+                    "match": "\\b[a-z_][A-Za-z0-9_#]*\\b"
+                }
+            ]
+        }
+    }
+}

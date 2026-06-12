@@ -21,15 +21,15 @@ pub trait AstNode: Sized {
 
 // ── Internal helpers (used by the typed accessors below) ─────────────────
 
-fn child<C: AstNode>(syntax: &SyntaxNode) -> Option<C> {
+pub(crate) fn child<C: AstNode>(syntax: &SyntaxNode) -> Option<C> {
     syntax.children().find_map(C::cast)
 }
 
-fn children<C: AstNode>(syntax: &SyntaxNode) -> impl Iterator<Item = C> {
+pub(crate) fn children<C: AstNode>(syntax: &SyntaxNode) -> impl Iterator<Item = C> {
     syntax.children().filter_map(C::cast)
 }
 
-fn nth_token(syntax: &SyntaxNode, kind: SyntaxKind, n: usize) -> Option<SyntaxToken> {
+pub(crate) fn nth_token(syntax: &SyntaxNode, kind: SyntaxKind, n: usize) -> Option<SyntaxToken> {
     syntax
         .children_with_tokens()
         .filter_map(|el| el.into_token())
@@ -37,7 +37,7 @@ fn nth_token(syntax: &SyntaxNode, kind: SyntaxKind, n: usize) -> Option<SyntaxTo
         .nth(n)
 }
 
-fn first_token_of_kind(syntax: &SyntaxNode, kind: SyntaxKind) -> Option<SyntaxToken> {
+pub(crate) fn first_token_of_kind(syntax: &SyntaxNode, kind: SyntaxKind) -> Option<SyntaxToken> {
     nth_token(syntax, kind, 0)
 }
 
@@ -45,20 +45,26 @@ fn first_token_of_kind(syntax: &SyntaxNode, kind: SyntaxKind) -> Option<SyntaxTo
 
 /// Define a plain newtype around a single [`SyntaxKind`] node. Generates
 /// the struct, the [`AstNode`] impl, and a public constructor.
+///
+/// Exported with `#[macro_export]` for crate-internal use by the
+/// dialect AST modules (`ast_cddb`, `ast_cdmap`, `ast_cdstore`); the
+/// macro is not part of the stable public API.
+#[macro_export]
+#[doc(hidden)]
 macro_rules! ast_node {
     ($vis:vis $name:ident, $kind:ident) => {
         #[derive(Debug, Clone)]
         $vis struct $name {
-            syntax: SyntaxNode,
+            syntax: $crate::SyntaxNode,
         }
-        impl AstNode for $name {
-            fn can_cast(kind: SyntaxKind) -> bool {
-                kind == SyntaxKind::$kind
+        impl $crate::ast::AstNode for $name {
+            fn can_cast(kind: $crate::SyntaxKind) -> bool {
+                kind == $crate::SyntaxKind::$kind
             }
-            fn cast(syntax: SyntaxNode) -> Option<Self> {
+            fn cast(syntax: $crate::SyntaxNode) -> Option<Self> {
                 Self::can_cast(syntax.kind()).then_some(Self { syntax })
             }
-            fn syntax(&self) -> &SyntaxNode {
+            fn syntax(&self) -> &$crate::SyntaxNode {
                 &self.syntax
             }
         }
@@ -168,6 +174,26 @@ impl Param {
     /// The parameter's type expression.
     pub fn type_ref(&self) -> Option<TypeRef> {
         child(&self.syntax)
+    }
+}
+
+// ── KeyClause ────────────────────────────────────────────────────────────
+
+ast_node!(pub KeyClause, KEY_CLAUSE);
+
+impl KeyClause {
+    /// The candidate-key attribute names in source order. The leading
+    /// `key` keyword token is skipped; only attribute IDENTs (the ones
+    /// between the braces) are returned.
+    pub fn attrs(&self) -> impl Iterator<Item = SyntaxToken> + '_ {
+        // Tokens in source order: `key`, `{`, attr, `,`, attr, …, `}`.
+        // Skip the first IDENT (the `key` keyword); the remaining IDENT
+        // tokens inside the braces are the attribute names.
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .filter(|t| t.kind() == SyntaxKind::IDENT)
+            .skip(1)
     }
 }
 
@@ -380,11 +406,12 @@ impl NamedArg {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_kind::FileKind;
     use crate::parse;
     use coddl_diagnostics::FileId;
 
     fn ast(src: &str) -> Root {
-        let out = parse(src, FileId(0));
+        let out = parse(src, FileId(0), FileKind::Cd);
         assert!(
             out.diagnostics.is_empty(),
             "diagnostics: {:?}",

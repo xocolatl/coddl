@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use coddl_diagnostics::{Diagnostic, FileId, Severity};
-use coddl_syntax::{SyntaxElement, SyntaxNode};
+use coddl_syntax::{FileKind, SyntaxElement, SyntaxNode};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -49,7 +49,12 @@ fn main() -> ExitCode {
     }
 }
 
-fn read_input(args: &[String], cmd: &str) -> Option<String> {
+/// Read source from `args` (stdin or a file path) and decide which
+/// dialect it belongs to. Stdin and unrecognized extensions default to
+/// [`FileKind::Cd`]; the caller can choose to reject this with
+/// [`require_cd`] when the downstream pipeline doesn't yet support
+/// dialect input.
+fn read_input(args: &[String], cmd: &str) -> Option<(String, FileKind)> {
     match args.first().map(String::as_str) {
         Some("-") | None => {
             let mut buf = String::new();
@@ -57,10 +62,13 @@ fn read_input(args: &[String], cmd: &str) -> Option<String> {
                 eprintln!("coddl {cmd}: read stdin: {err}");
                 return None;
             }
-            Some(buf)
+            Some((buf, FileKind::Cd))
         }
         Some(path) => match std::fs::read_to_string(path) {
-            Ok(s) => Some(s),
+            Ok(s) => {
+                let kind = FileKind::from_path(Path::new(path)).unwrap_or(FileKind::Cd);
+                Some((s, kind))
+            }
             Err(err) => {
                 eprintln!("coddl {cmd}: read {path}: {err}");
                 None
@@ -69,11 +77,29 @@ fn read_input(args: &[String], cmd: &str) -> Option<String> {
     }
 }
 
+/// Reject input that isn't `.cdl`. Used by every subcommand whose
+/// downstream pipeline (typecheck / lower / emit / compile / run /
+/// fmt) is `.cdl`-only today; the dialect-aware pipeline lands in
+/// later phases.
+fn require_cd(kind: FileKind, cmd: &str) -> Result<(), ExitCode> {
+    if kind == FileKind::Cd {
+        Ok(())
+    } else {
+        eprintln!(
+            "coddl {cmd}: only accepts .cdl files today; \
+             .{ext} pipeline support lands in later phases",
+            ext = kind.extension(),
+        );
+        Err(ExitCode::from(2))
+    }
+}
+
 fn cmd_lex(args: &[String]) -> ExitCode {
-    let Some(source) = read_input(args, "lex") else {
+    let Some((source, _kind)) = read_input(args, "lex") else {
         return ExitCode::from(1);
     };
 
+    // The lexer is dialect-agnostic — no FileKind plumbing needed.
     let out = coddl_syntax::lex(&source, FileId(0));
 
     let stdout = io::stdout();
@@ -128,11 +154,11 @@ impl std::fmt::Display for DisplayLexeme<'_> {
 }
 
 fn cmd_parse(args: &[String]) -> ExitCode {
-    let Some(source) = read_input(args, "parse") else {
+    let Some((source, kind)) = read_input(args, "parse") else {
         return ExitCode::from(1);
     };
 
-    let out = coddl_syntax::parse(&source, FileId(0));
+    let out = coddl_syntax::parse(&source, FileId(0), kind);
 
     let stdout = io::stdout();
     let mut w = stdout.lock();
@@ -185,9 +211,12 @@ fn dump_node(w: &mut impl Write, node: &SyntaxNode, source: &str, indent: usize)
 }
 
 fn cmd_check(args: &[String]) -> ExitCode {
-    let Some(source) = read_input(args, "check") else {
+    let Some((source, kind)) = read_input(args, "check") else {
         return ExitCode::from(1);
     };
+    if let Err(code) = require_cd(kind, "check") {
+        return code;
+    }
 
     let out = coddl_types::check(&source, FileId(0));
 
@@ -205,9 +234,12 @@ fn cmd_check(args: &[String]) -> ExitCode {
 }
 
 fn cmd_lower(args: &[String]) -> ExitCode {
-    let Some(source) = read_input(args, "lower") else {
+    let Some((source, kind)) = read_input(args, "lower") else {
         return ExitCode::from(1);
     };
+    if let Err(code) = require_cd(kind, "lower") {
+        return code;
+    }
 
     let out = coddl_procir::lower(&source, FileId(0));
 
@@ -231,9 +263,12 @@ fn cmd_lower(args: &[String]) -> ExitCode {
 }
 
 fn cmd_emit_llvm(args: &[String]) -> ExitCode {
-    let Some(source) = read_input(args, "emit-llvm") else {
+    let Some((source, kind)) = read_input(args, "emit-llvm") else {
         return ExitCode::from(1);
     };
+    if let Err(code) = require_cd(kind, "emit-llvm") {
+        return code;
+    }
 
     let lower_out = coddl_procir::lower(&source, FileId(0));
     for d in &lower_out.diagnostics {
@@ -287,9 +322,12 @@ fn cmd_emit_obj(args: &[String]) -> ExitCode {
         }
     }
 
-    let Some(source) = read_input(&positional, "emit-obj") else {
+    let Some((source, kind)) = read_input(&positional, "emit-obj") else {
         return ExitCode::from(1);
     };
+    if let Err(code) = require_cd(kind, "emit-obj") {
+        return code;
+    }
 
     let lower_out = coddl_procir::lower(&source, FileId(0));
     for d in &lower_out.diagnostics {
@@ -475,9 +513,12 @@ fn cmd_compile(args: &[String]) -> ExitCode {
     };
     let backend = parsed.backend.unwrap_or(Backend::Llvm);
 
-    let Some(source) = read_input(&parsed.positional, "compile") else {
+    let Some((source, kind)) = read_input(&parsed.positional, "compile") else {
         return ExitCode::from(1);
     };
+    if let Err(code) = require_cd(kind, "compile") {
+        return code;
+    }
     let Some(module) = lower_or_bail(&source) else {
         return ExitCode::from(1);
     };
@@ -539,9 +580,12 @@ fn cmd_run(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let Some(source) = read_input(&parsed.positional, "run") else {
+    let Some((source, kind)) = read_input(&parsed.positional, "run") else {
         return ExitCode::from(1);
     };
+    if let Err(code) = require_cd(kind, "run") {
+        return code;
+    }
     let Some(module) = lower_or_bail(&source) else {
         return ExitCode::from(1);
     };
@@ -581,9 +625,12 @@ fn cmd_run(args: &[String]) -> ExitCode {
 }
 
 fn cmd_fmt(args: &[String]) -> ExitCode {
-    let Some(source) = read_input(args, "fmt") else {
+    let Some((source, kind)) = read_input(args, "fmt") else {
         return ExitCode::from(1);
     };
+    if let Err(code) = require_cd(kind, "fmt") {
+        return code;
+    }
 
     let opts = coddl_fmt::FormatOptions::default();
     let out = coddl_fmt::format(&source, &opts);

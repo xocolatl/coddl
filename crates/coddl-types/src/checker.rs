@@ -15,7 +15,7 @@ use coddl_syntax::ast::{
     Stmt, TransactionExpr,
 };
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
-use coddl_syntax::{parse, SyntaxKind};
+use coddl_syntax::{parse, FileKind, SyntaxKind};
 
 use crate::builtins::Builtins;
 use crate::ty::Type;
@@ -87,9 +87,12 @@ pub struct CheckOutput {
     pub hints: Vec<TypeHint>,
 }
 
-/// Tokenize, parse, and type-check `source`.
+/// Tokenize, parse, and type-check `source` as a `.cdl` document.
+/// Other dialects (`.cddb` / `.cdmap` / `.cdstore`) parse in Phase 14
+/// but don't typecheck yet — call `coddl_syntax::parse` directly with
+/// the desired [`FileKind`] for parse-only output.
 pub fn check(source: &str, file: FileId) -> CheckOutput {
-    let parse_out = parse(source, file);
+    let parse_out = parse(source, file, FileKind::Cd);
     let tree = parse_out.tree.clone();
     let mut tc = TypeChecker {
         file,

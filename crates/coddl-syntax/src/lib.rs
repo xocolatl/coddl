@@ -13,13 +13,21 @@
 //! raised.
 
 pub mod ast;
+pub mod ast_cddb;
+pub mod ast_cdmap;
+pub mod ast_cdstore;
 pub mod cst;
+pub mod file_kind;
 pub mod lexer;
 pub mod parser;
+pub mod parser_cddb;
+pub mod parser_cdmap;
+pub mod parser_cdstore;
 pub mod syntax_kind;
 pub mod token;
 
 pub use cst::{CoddlLanguage, CstBuilder, SyntaxElement, SyntaxNode, SyntaxToken};
+pub use file_kind::FileKind;
 pub use lexer::{lex, LexOutput};
 pub use parser::parse;
 pub use syntax_kind::SyntaxKind;

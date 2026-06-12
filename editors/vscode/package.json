@@ -13,7 +13,10 @@
     ],
     "main": "./out/extension.js",
     "activationEvents": [
-        "onLanguage:coddl"
+        "onLanguage:coddl",
+        "onLanguage:coddl-cddb",
+        "onLanguage:coddl-cdmap",
+        "onLanguage:coddl-cdstore"
     ],
     "contributes": {
         "languages": [
@@ -22,6 +25,24 @@
                 "aliases": ["Coddl", "coddl"],
                 "extensions": [".cdl"],
                 "configuration": "./language-configuration.json"
+            },
+            {
+                "id": "coddl-cddb",
+                "aliases": ["Coddl Catalog", "coddl-cddb"],
+                "extensions": [".cddb"],
+                "configuration": "./language-configuration.json"
+            },
+            {
+                "id": "coddl-cdmap",
+                "aliases": ["Coddl Map", "coddl-cdmap"],
+                "extensions": [".cdmap"],
+                "configuration": "./language-configuration.json"
+            },
+            {
+                "id": "coddl-cdstore",
+                "aliases": ["Coddl Store", "coddl-cdstore"],
+                "extensions": [".cdstore"],
+                "configuration": "./language-configuration.json"
             }
         ],
         "grammars": [
@@ -29,6 +50,21 @@
                 "language": "coddl",
                 "scopeName": "source.coddl",
                 "path": "./syntaxes/coddl.tmLanguage.json"
+            },
+            {
+                "language": "coddl-cddb",
+                "scopeName": "source.coddl.cddb",
+                "path": "./syntaxes/coddl-cddb.tmLanguage.json"
+            },
+            {
+                "language": "coddl-cdmap",
+                "scopeName": "source.coddl.cdmap",
+                "path": "./syntaxes/coddl-cdmap.tmLanguage.json"
+            },
+            {
+                "language": "coddl-cdstore",
+                "scopeName": "source.coddl.cdstore",
+                "path": "./syntaxes/coddl-cdstore.tmLanguage.json"
             }
         ],
         "configuration": {

@@ -25,9 +25,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     };
 
     const clientOptions: LanguageClientOptions = {
-        documentSelector: [{ scheme: 'file', language: 'coddl' }],
+        documentSelector: [
+            { scheme: 'file', language: 'coddl' },
+            { scheme: 'file', language: 'coddl-cddb' },
+            { scheme: 'file', language: 'coddl-cdmap' },
+            { scheme: 'file', language: 'coddl-cdstore' },
+        ],
         synchronize: {
-            fileEvents: vscode.workspace.createFileSystemWatcher('**/*.cdl'),
+            fileEvents: vscode.workspace.createFileSystemWatcher(
+                '**/*.{cdl,cddb,cdmap,cdstore}',
+            ),
         },
     };
 

@@ -5,14 +5,20 @@
 # procir crates.
 #
 # Two invariants:
-#   1. Every `fn parse_<name>` in parser.rs (outside #[cfg(test)] code)
-#      has a `<name>` rule (kebab-case) defined in docs/grammar.md.
-#   2. Every `"E####"` / `"P####"` / `"T####"` / `"L####"` diagnostic
-#      code emitted anywhere in crates/coddl-syntax/src/,
-#      crates/coddl-types/src/, or crates/coddl-procir/src/ appears in
-#      some docs/*.md file. Which file owns which code prefix is
-#      documentation discipline; the script only enforces that every
-#      emitted code is documented somewhere.
+#   1. Every `fn parse_<name>` in any parser*.rs (outside #[cfg(test)]
+#      code) has a `<name>` rule (kebab-case) defined in some
+#      docs/*-grammar.md or docs/grammar.md file. Which doc file owns
+#      which rule is documentation discipline (the .cd parser writes to
+#      grammar.md; dialect parsers write to their per-dialect docs);
+#      the script only enforces that every parser function has a rule
+#      *somewhere* under docs/.
+#   2. Every `"E####"` / `"P####"` / `"T####"` / `"L####"` / `"PB####"`
+#      / `"PM####"` / `"PS####"` diagnostic code emitted anywhere in
+#      crates/coddl-syntax/src/, crates/coddl-types/src/, or
+#      crates/coddl-procir/src/ appears in some docs/*.md file. Which
+#      file owns which code prefix is documentation discipline; the
+#      script only enforces that every emitted code is documented
+#      somewhere.
 #
 # Exits 0 if both invariants hold, 1 with a summary of what's missing
 # otherwise. POSIX shell only — no Python, no Rust.
@@ -20,36 +26,42 @@
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-GRAMMAR="$ROOT/docs/grammar.md"
-PARSER="$ROOT/crates/coddl-syntax/src/parser.rs"
 
-if [ ! -f "$GRAMMAR" ]; then
-    echo "check-grammar: docs/grammar.md not found at $GRAMMAR" >&2
+# All parser source files (one per dialect, plus the .cd parser).
+parser_files=$(
+    find "$ROOT/crates/coddl-syntax/src" \
+        -maxdepth 1 -name 'parser*.rs' -type f 2>/dev/null
+)
+if [ -z "$parser_files" ]; then
+    echo "check-grammar: no parser source found under crates/coddl-syntax/src" >&2
     exit 1
 fi
-if [ ! -f "$PARSER" ]; then
-    echo "check-grammar: parser source not found at $PARSER" >&2
+
+# All grammar docs (the main .cd grammar plus per-dialect grammars).
+grammar_docs=$(
+    find "$ROOT/docs" -maxdepth 1 -name '*grammar.md' -type f 2>/dev/null
+)
+if [ -z "$grammar_docs" ]; then
+    echo "check-grammar: no grammar docs found under docs/" >&2
     exit 1
 fi
 
 failed=0
 
-# 1. parse_<name> functions outside the test module.
-#
-# Strip everything from the first `#[cfg(test)]` onward; what remains
-# is parser source proper. Then collect `fn parse_<name>` symbols and
-# verify each has a corresponding kebab-case `<name>` rule defined in
-# the grammar doc.
+# 1. parse_<name> functions outside the test module across every parser
+# source file. Each must have a corresponding kebab-case <name> rule in
+# at least one of the grammar docs.
 parser_fns=$(
-    sed '/^#\[cfg(test)\]/,$d' "$PARSER" \
-        | grep -oE 'fn parse_[a-z_]+' \
-        | sed 's/^fn parse_//' \
-        | sort -u
+    for p in $parser_files; do
+        sed '/^#\[cfg(test)\]/,$d' "$p" \
+            | grep -oE 'fn parse_[a-z_]+' \
+            | sed 's/^fn parse_//'
+    done | sort -u
 )
 
 for fn in $parser_fns; do
     rule=$(printf '%s' "$fn" | tr '_' '-')
-    if ! grep -qE "<$rule>" "$GRAMMAR"; then
+    if ! grep -lqE "<$rule>" $grammar_docs 2>/dev/null; then
         echo "check-grammar: missing grammar rule <$rule>  (parser fn: parse_$fn)" >&2
         failed=1
     fi
@@ -57,8 +69,10 @@ done
 
 # 2. Diagnostic codes.
 #
-# Harvest every `"X####"` literal across the syntax and types crates;
-# verify each appears in some docs/*.md.
+# Harvest every `"X####"` literal across the syntax, types, and procir
+# crates; verify each appears in some docs/*.md. Recognized prefixes:
+# E (lexer), P (.cd parser), T (typechecker), L (lower),
+# PB (.cddb parser), PM (.cdmap parser), PS (.cdstore parser).
 code_sources=$(
     find "$ROOT/crates/coddl-syntax/src" \
          "$ROOT/crates/coddl-types/src" \
@@ -66,7 +80,7 @@ code_sources=$(
         -name '*.rs' -type f 2>/dev/null
 )
 codes=$(
-    grep -hoE '"[EPTL][0-9]{4}"' $code_sources 2>/dev/null \
+    grep -hoE '"(P[BMS]|[EPTL])[0-9]{4}"' $code_sources 2>/dev/null \
         | tr -d '"' \
         | sort -u
 )

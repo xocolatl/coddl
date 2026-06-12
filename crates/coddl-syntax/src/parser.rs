@@ -27,27 +27,36 @@
 use coddl_diagnostics::{Diagnostic, FileId, Span};
 
 use crate::cst::CstBuilder;
-use crate::lexer::lex;
+use crate::file_kind::FileKind;
+use crate::lexer::{lex, LexOutput};
 use crate::syntax_kind::SyntaxKind;
 use crate::token::{Token, TokenKind};
 use crate::ParseOutput;
 
-/// Tokenize and parse a source buffer.
-pub fn parse(source: &str, file: FileId) -> ParseOutput {
+/// Tokenize and parse a source buffer in the given dialect.
+///
+/// `FileKind` discriminates which root production runs:
+///
+/// - [`FileKind::Cd`]      → application source (`program`, `oper`, …)
+/// - [`FileKind::Cddb`]    → database catalog (`database`, `base relvar`)
+/// - [`FileKind::Cdmap`]   → external→conceptual adapter (`map`, identity)
+/// - [`FileKind::Cdstore`] → conceptual→physical binding (`store for`, …)
+///
+/// The lexer is shared across all kinds (Coddl has no reserved words);
+/// only the parser dispatch differs.
+pub fn parse(source: &str, file: FileId, kind: FileKind) -> ParseOutput {
     let lex_out = lex(source, file);
-    let mut p = Parser {
-        source,
-        file,
-        tokens: lex_out.tokens,
-        pos: 0,
-        builder: CstBuilder::new(source),
-        diagnostics: lex_out.diagnostics,
-    };
-    p.parse_root();
+    let mut p = Parser::new(source, file, lex_out);
+    match kind {
+        FileKind::Cd => p.parse_root(),
+        FileKind::Cddb => crate::parser_cddb::parse_cddb_root(&mut p),
+        FileKind::Cdmap => crate::parser_cdmap::parse_cdmap_root(&mut p),
+        FileKind::Cdstore => crate::parser_cdstore::parse_cdstore_root(&mut p),
+    }
     p.finish()
 }
 
-struct Parser<'a> {
+pub(crate) struct Parser<'a> {
     source: &'a str,
     file: FileId,
     tokens: Vec<Token>,
@@ -60,10 +69,22 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
+    /// Build a parser over a freshly lexed token stream.
+    pub(crate) fn new(source: &'a str, file: FileId, lex_out: LexOutput) -> Self {
+        Self {
+            source,
+            file,
+            tokens: lex_out.tokens,
+            pos: 0,
+            builder: CstBuilder::new(source),
+            diagnostics: lex_out.diagnostics,
+        }
+    }
+
     // ── Cursor primitives ────────────────────────────────────────────
 
     /// Peek the kind of the next non-trivia token, or [`SyntaxKind::EOF`].
-    fn current(&self) -> SyntaxKind {
+    pub(crate) fn current(&self) -> SyntaxKind {
         let mut i = self.pos;
         while i < self.tokens.len() && self.tokens[i].kind.is_trivia() {
             i += 1;
@@ -77,7 +98,7 @@ impl<'a> Parser<'a> {
 
     /// Source span of the next non-trivia token (or a zero-length span
     /// at end of input).
-    fn current_span(&self) -> Span {
+    pub(crate) fn current_span(&self) -> Span {
         let mut i = self.pos;
         while i < self.tokens.len() && self.tokens[i].kind.is_trivia() {
             i += 1;
@@ -91,14 +112,14 @@ impl<'a> Parser<'a> {
     }
 
     /// True iff the next non-trivia token has the given kind.
-    fn at(&self, kind: SyntaxKind) -> bool {
+    pub(crate) fn at(&self, kind: SyntaxKind) -> bool {
         self.current() == kind
     }
 
     /// True iff the next non-trivia token is an identifier whose lexeme
     /// is `lexeme`. Used for contextual keyword recognition (Coddl has
     /// no reserved words; every keyword is contextual).
-    fn at_keyword(&self, lexeme: &str) -> bool {
+    pub(crate) fn at_keyword(&self, lexeme: &str) -> bool {
         if !self.at(SyntaxKind::IDENT) {
             return false;
         }
@@ -111,7 +132,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Emit every trivia token at the cursor into the current node.
-    fn bump_trivia(&mut self) {
+    pub(crate) fn bump_trivia(&mut self) {
         while self.pos < self.tokens.len() && self.tokens[self.pos].kind.is_trivia() {
             let tok = self.tokens[self.pos];
             let range = tok.span.start as usize..tok.span.end as usize;
@@ -122,7 +143,7 @@ impl<'a> Parser<'a> {
 
     /// Emit any pending trivia and then the next non-trivia token. The
     /// synthetic EOF token is recognized and not emitted.
-    fn bump(&mut self) {
+    pub(crate) fn bump(&mut self) {
         self.bump_trivia();
         if self.pos < self.tokens.len() {
             let tok = self.tokens[self.pos];
@@ -135,7 +156,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Bump if the cursor is at `kind`. Returns true on consumption.
-    fn eat(&mut self, kind: SyntaxKind) -> bool {
+    pub(crate) fn eat(&mut self, kind: SyntaxKind) -> bool {
         if self.at(kind) {
             self.bump();
             true
@@ -144,28 +165,28 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn start_node(&mut self, kind: SyntaxKind) {
+    pub(crate) fn start_node(&mut self, kind: SyntaxKind) {
         self.builder.start_node(kind);
     }
 
-    fn checkpoint(&self) -> crate::cst::Checkpoint {
+    pub(crate) fn checkpoint(&self) -> crate::cst::Checkpoint {
         self.builder.checkpoint()
     }
 
-    fn start_node_at(&mut self, cp: crate::cst::Checkpoint, kind: SyntaxKind) {
+    pub(crate) fn start_node_at(&mut self, cp: crate::cst::Checkpoint, kind: SyntaxKind) {
         self.builder.start_node_at(cp, kind);
     }
 
-    fn finish_node(&mut self) {
+    pub(crate) fn finish_node(&mut self) {
         self.builder.finish_node();
     }
 
-    fn error(&mut self, code: &'static str, message: impl Into<String>) {
+    pub(crate) fn error(&mut self, code: &'static str, message: impl Into<String>) {
         self.diagnostics
             .push(Diagnostic::error(self.current_span(), code, message));
     }
 
-    fn finish(self) -> ParseOutput {
+    pub(crate) fn finish(self) -> ParseOutput {
         ParseOutput {
             tree: self.builder.finish(),
             diagnostics: self.diagnostics,
@@ -177,7 +198,7 @@ impl<'a> Parser<'a> {
     /// Consume tokens until the cursor reaches a top-level recovery
     /// anchor: a `;` at bracket depth zero, or end of input. Used when
     /// an item production can't proceed.
-    fn skip_to_top_level_anchor(&mut self) {
+    pub(crate) fn skip_to_top_level_anchor(&mut self) {
         let mut brace: i32 = 0;
         let mut bracket: i32 = 0;
         let mut paren: i32 = 0;
@@ -219,9 +240,10 @@ impl<'a> Parser<'a> {
 
     // ── Productions ──────────────────────────────────────────────────
 
-    /// Entry point. Wraps every top-level item in a [`SyntaxKind::ROOT`]
-    /// node and flushes any trivia at the head or tail of the file.
-    fn parse_root(&mut self) {
+    /// Entry point for `.cdl` source. Wraps every top-level item in a
+    /// [`SyntaxKind::ROOT`] node and flushes any trivia at the head or
+    /// tail of the file.
+    pub(crate) fn parse_root(&mut self) {
         self.start_node(SyntaxKind::ROOT);
         self.bump_trivia();
         while self.current() != SyntaxKind::EOF {
@@ -300,8 +322,9 @@ impl<'a> Parser<'a> {
 
     /// `{ <param>, … }` — the structural type used both as an operator's
     /// parameter list and as a `Tuple H` heading. Empty `{}` is valid;
-    /// trailing comma is accepted.
-    fn parse_heading(&mut self) {
+    /// trailing comma is accepted. Shared with `.cddb` relvar
+    /// declarations.
+    pub(crate) fn parse_heading(&mut self) {
         debug_assert!(self.at(SyntaxKind::L_BRACE));
         self.start_node(SyntaxKind::HEADING);
         self.bump(); // {
@@ -350,7 +373,7 @@ impl<'a> Parser<'a> {
     /// A type expression. Today only a single identifier is recognized;
     /// `Tuple H`, `Relation H`, `Sequence T`, and qualified names land
     /// alongside the rest of expression parsing.
-    fn parse_type_ref(&mut self) {
+    pub(crate) fn parse_type_ref(&mut self) {
         self.bump_trivia();
         self.start_node(SyntaxKind::TYPE_REF);
         if !self.eat(SyntaxKind::IDENT) {
@@ -579,6 +602,52 @@ impl<'a> Parser<'a> {
         self.skip_to_top_level_anchor();
         self.finish_node();
     }
+
+    /// `key { a, b, … }` — candidate-key clause on a relvar declaration.
+    /// Shared between `.cddb` base relvars (today) and `.cdl` public /
+    /// private relvars (Phase 15). The leading `key` keyword has already
+    /// been seen at the dispatch site.
+    ///
+    /// Diagnostics: P0022 (no `{`), P0023 (no attribute name), P0024
+    /// (no `}`).
+    pub(crate) fn parse_key_clause(&mut self) {
+        debug_assert!(self.at_keyword("key"));
+        self.bump_trivia();
+        self.start_node(SyntaxKind::KEY_CLAUSE);
+        self.bump(); // `key`
+
+        if !self.eat(SyntaxKind::L_BRACE) {
+            self.error("P0022", "expected `{` to start key clause");
+            self.finish_node();
+            return;
+        }
+
+        if self.eat(SyntaxKind::R_BRACE) {
+            self.finish_node();
+            return;
+        }
+
+        loop {
+            self.bump_trivia();
+            if !self.eat(SyntaxKind::IDENT) {
+                self.error("P0023", "expected key attribute name");
+                break;
+            }
+            if !self.eat(SyntaxKind::COMMA) {
+                break;
+            }
+            // Trailing comma ok.
+            if self.at(SyntaxKind::R_BRACE) {
+                break;
+            }
+        }
+
+        if !self.eat(SyntaxKind::R_BRACE) {
+            self.error("P0024", "expected `}` to close key clause");
+        }
+
+        self.finish_node();
+    }
 }
 
 #[cfg(test)]
@@ -586,7 +655,7 @@ mod tests {
     use super::*;
 
     fn parse_str(src: &str) -> ParseOutput {
-        parse(src, FileId(0))
+        parse(src, FileId(0), FileKind::Cd)
     }
 
     fn kinds(out: &ParseOutput) -> Vec<SyntaxKind> {

@@ -128,6 +128,55 @@ pub enum SyntaxKind {
     ARG_LIST,
     NAMED_ARG,
 
+    /// `key { a, b, … }` candidate-key clause on a relvar declaration.
+    /// Shared between `.cdl` application relvars and `.cddb` database
+    /// relvars.
+    KEY_CLAUSE,
+
+    // ── `.cddb` dialect — database catalog ───────────────────────────
+    /// Root of a parsed `.cddb` document.
+    CDDB_ROOT,
+    /// `database <Name>;` — required first item of every `.cddb`.
+    DATABASE_DECL,
+    /// `base relvar <Name> <heading> [<key-clause>];` — persistent
+    /// catalog relvar.
+    BASE_RELVAR_DECL,
+    /// `virtual relvar <Name> = <relexpr>;` — catalog view. v1 parses
+    /// keyword + name + `=` and treats the RHS as an unknown body.
+    VIRTUAL_RELVAR_DECL,
+
+    // ── `.cdmap` dialect — external → conceptual adapter ─────────────
+    /// Root of a parsed `.cdmap` document.
+    CDMAP_ROOT,
+    /// `map <program> to <database>;` — required first item.
+    CDMAP_HEADER,
+    /// `<app-name> = <catalog-name>;` — identity mapping entry. Future:
+    /// `... project { … } rename { … }` chains via the clauses below.
+    CDMAP_ENTRY,
+    /// `project { a, b, … }` clause on a map entry. Reserved for
+    /// Phase 16; parsed as an unknown body today.
+    CDMAP_PROJECT_CLAUSE,
+    /// `rename { db_attr: app_attr, … }` clause on a map entry.
+    /// Reserved for Phase 16; parsed as an unknown body today.
+    CDMAP_RENAME_CLAUSE,
+
+    // ── `.cdstore` dialect — conceptual → physical binding ───────────
+    /// Root of a parsed `.cdstore` document.
+    CDSTORE_ROOT,
+    /// `store for <database>;` — required first item.
+    CDSTORE_HEADER,
+    /// `backend <kind> { <field>, … };` — exactly one per file.
+    BACKEND_DECL,
+    /// `relvar <Name>: table "<sql>" { columns: { … } };` — binds a
+    /// base catalog relvar to a physical table and column set.
+    RELVAR_BINDING,
+    /// `<name>: <value>` field inside a backend block, columns block,
+    /// or relvar-binding body. Value grammar is narrow: a string
+    /// literal, an identifier, or an `env(...)` call.
+    CDSTORE_FIELD,
+    /// `columns: { <name>: "<col>", … }` block inside a relvar binding.
+    COLUMNS_BLOCK,
+
     /// A range of source whose intended structure couldn't be
     /// recovered. The parser still wraps the tokens so the tree stays
     /// well-formed and downstream passes can keep going.
@@ -254,6 +303,22 @@ mod tests {
             SyntaxKind::HEADING,
             SyntaxKind::BLOCK,
             SyntaxKind::CALL_EXPR,
+            SyntaxKind::KEY_CLAUSE,
+            SyntaxKind::CDDB_ROOT,
+            SyntaxKind::DATABASE_DECL,
+            SyntaxKind::BASE_RELVAR_DECL,
+            SyntaxKind::VIRTUAL_RELVAR_DECL,
+            SyntaxKind::CDMAP_ROOT,
+            SyntaxKind::CDMAP_HEADER,
+            SyntaxKind::CDMAP_ENTRY,
+            SyntaxKind::CDMAP_PROJECT_CLAUSE,
+            SyntaxKind::CDMAP_RENAME_CLAUSE,
+            SyntaxKind::CDSTORE_ROOT,
+            SyntaxKind::CDSTORE_HEADER,
+            SyntaxKind::BACKEND_DECL,
+            SyntaxKind::RELVAR_BINDING,
+            SyntaxKind::CDSTORE_FIELD,
+            SyntaxKind::COLUMNS_BLOCK,
             SyntaxKind::PARSE_ERROR,
         ] {
             assert!(!sk.is_token(), "{sk:?} should be a node kind");

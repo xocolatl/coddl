@@ -208,6 +208,11 @@ function that implements it.
 <param>         ::= <identifier> ':' <type-ref> ;              -- parse_param
 <type-ref>      ::= <identifier> ;                             -- parse_type_ref
 
+<key-clause>    ::= 'key' '{' [ <identifier> commalist ] '}' ; -- parse_key_clause
+                    -- Candidate-key clause on a relvar declaration.
+                    -- Shared between `.cdl` application relvars (Phase 15)
+                    -- and `.cddb` database relvars (today).
+
 <block>         ::= '[' { <stmt> } [ <expr> ] ']' ;            -- parse_block
                     -- The optional trailing <expr> with no terminating
                     -- ';' is the block's tail expression; its value is
@@ -291,6 +296,9 @@ enforces that.
 | P0017 | Expected `:` after argument name                        |
 | P0018 | `let` statement is malformed (missing name, `=`, or RHS)|
 | P0019 | `transaction` not followed by `[`                       |
+| P0022 | Expected `{` to start key clause                        |
+| P0023 | Expected key attribute name                             |
+| P0024 | Expected `}` to close key clause                        |
 
 Note: missing-type-after-`:` (let annotation) and missing-type-
 after-`->` (operator return clause) both surface as `P0011`
