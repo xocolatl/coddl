@@ -95,6 +95,7 @@ pub fn discover_and_validate_with_overrides(
                 cddb_relvars: RelvarTable::new(),
                 backend_kind: BackendKind::Unknown,
                 resolved: Vec::new(),
+                db_file_default: None,
             }),
             diagnostics: diags,
         };
@@ -116,6 +117,7 @@ pub fn discover_and_validate_with_overrides(
                 cddb_relvars: RelvarTable::new(),
                 backend_kind: BackendKind::Unknown,
                 resolved: Vec::new(),
+                db_file_default: None,
             }),
             diagnostics: diags,
         };
@@ -209,6 +211,15 @@ pub fn discover_and_validate_with_overrides(
         .and_then(|r| r.backend())
         .map(|b| classify_backend(&b, &mut diags))
         .unwrap_or(BackendKind::Unknown);
+    let db_file_default = if matches!(backend_kind, BackendKind::Sqlite) {
+        cdstore_root
+            .as_ref()
+            .and_then(|r| r.backend())
+            .and_then(|b| extract_file_directive(&b))
+            .map(|raw| canonicalize_against(&cdstore_path, &raw))
+    } else {
+        None
+    };
 
     // Per-public-relvar resolution: identity match, heading
     // equivalence, store-binding lookup, column coverage.
@@ -282,8 +293,48 @@ pub fn discover_and_validate_with_overrides(
             cddb_relvars,
             backend_kind,
             resolved,
+            db_file_default,
         }),
         diagnostics: diags,
+    }
+}
+
+/// Pull the `file: "..."` directive out of a `BackendDecl`. Returns the
+/// raw (still-relative) lexeme; the caller canonicalizes against the
+/// `.cdstore`'s parent directory.
+fn extract_file_directive(decl: &BackendDecl) -> Option<String> {
+    for field in decl.fields() {
+        let name = field.name().map(|t| t.text().to_string()).unwrap_or_default();
+        if name != "file" {
+            continue;
+        }
+        return match field.value() {
+            Some(CdstoreValue::String(t)) => Some(unquote(t.text())),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// Resolve `raw` against the `.cdstore`'s parent directory and try to
+/// canonicalize. Falls back to the path-joined form when canonicalize
+/// fails (e.g., the file doesn't exist yet — the user may seed the DB
+/// after build but before run). Always returns an absolute lexical
+/// path so the binary is relocatable via `CODDL_<DB>_FILE` override.
+fn canonicalize_against(cdstore_path: &Path, raw: &str) -> String {
+    let raw_path = Path::new(raw);
+    let absolute = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        let parent = cdstore_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        parent.join(raw_path)
+    };
+    match absolute.canonicalize() {
+        Ok(p) => p.display().to_string(),
+        Err(_) => absolute.display().to_string(),
     }
 }
 

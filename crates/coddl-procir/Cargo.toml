@@ -11,3 +11,4 @@ description = "Procedural SSA IR — backend-agnostic (ARCHITECTURE.md §4)."
 coddl-diagnostics.workspace = true
 coddl-syntax.workspace = true
 coddl-types.workspace = true
+coddl-plan.workspace = true

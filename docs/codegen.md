@@ -276,6 +276,85 @@ backend has no special-case for them). Read-only data section
 contains every string literal in the module.
 
 
+## Public-relvar emission (Phase 22)
+
+When a `Module` has any `public_relvars` entries (populated by
+`coddl_procir::lower_with_plan` from the Phase 16 plan), both backends
+emit one **slot global** per relvar plus the string-constant payloads
+the runtime materializer reads.
+
+### LLVM
+
+Per relvar:
+
+| Global                          | LLVM type                          | Purpose                                                            |
+|---------------------------------|------------------------------------|--------------------------------------------------------------------|
+| `@<Name>_slot`                  | `ptr` (null-initialized)           | Writable slot holding the materialized RC payload.                 |
+| `@<Name>.relvar_name`           | `[N x i8]` (private constant)      | UTF-8 bytes of the relvar name (`"Greetings"`).                   |
+| `@<Name>.env_name`              | `[N x i8]`                         | UTF-8 bytes of `CODDL_<DBUPPER>_FILE`.                            |
+| `@<Name>.default_path`          | `[N x i8]`                         | UTF-8 bytes of the canonical absolute SQLite path.                 |
+| `@<Name>.table_name`            | `[N x i8]`                         | UTF-8 bytes of the SQL table name.                                 |
+| `@<Name>.col<i>.name`           | `[N x i8]`                         | UTF-8 bytes of one column's SQL name.                              |
+| `@<Name>.col_ptrs`              | `[K x ptr]` (private constant)     | Pointers to the per-column name constants, in heading order.      |
+| `@<Name>.col_lens`              | `[K x i64]` (private constant)     | Per-column name byte lengths, in heading order.                    |
+
+Plus per-module extern declarations once any public relvar exists:
+
+```llvm
+declare i32 @coddl_sqlite_relvar_init(ptr, i64, ptr, i64, ptr, i64, ptr, ptr, i32, ptr, ptr)
+declare ptr @coddl_resolve_op_field(ptr, i64, ptr, i64, ptr)
+```
+
+`Inst::RelvarSlotInit` lowers to: alloca an i64 length slot →
+`call @coddl_resolve_op_field` for the env override → load the
+resolved length → `call @coddl_sqlite_relvar_init` with the full
+(name, path, table, columns, descriptor, slot) bundle.
+
+`Inst::RelvarRead` lowers to a single `load ptr` from the slot global
+plus a `coddl_rc_retain` call (the consumer holds its own count).
+
+`Inst::RelvarSlotRelease` lowers to a load from the slot global plus
+a `coddl_rc_release` call (the lowerer emits one per relvar in main's
+epilogue).
+
+Transaction externs (`coddl_begin_tx` / `coddl_commit_tx` /
+`coddl_rollback_tx`) are NOT declared by this path. The lowerer
+registers them through the standard extern Function table (signature
+`() -> Integer`); `emit_extern` writes a `declare i64 @coddl_..._tx()`
+line. The runtime's actual signature is `() -> i32` (CoddlStatus); the
+return-value mismatch is tolerated because nothing reads it (same
+trick `coddl_runtime_init` / `coddl_runtime_shutdown` rely on).
+
+### Cranelift
+
+Per relvar, equivalent shape via `Module::declare_data` /
+`define_data`:
+
+| `DataId`                      | `Linkage`                  | Alignment   | Purpose                                                  |
+|-------------------------------|----------------------------|-------------|----------------------------------------------------------|
+| `<Name>_slot`                 | `Local` + writable         | `ptr_bytes` | Materialized RC payload.                                 |
+| `<Name>.relvar_name`          | `Local` (read-only)        | 1           | Bytes.                                                   |
+| `<Name>.env_name`             | `Local` (read-only)        | 1           | Bytes.                                                   |
+| `<Name>.default_path`         | `Local` (read-only)        | 1           | Bytes.                                                   |
+| `<Name>.table_name`           | `Local` (read-only)        | 1           | Bytes.                                                   |
+| `<Name>.col<i>.name`          | `Local` (read-only)        | 1           | Bytes.                                                   |
+| `<Name>.col_ptrs`             | `Local` (read-only)        | `ptr_bytes` | Per-column name pointers, relocated via `write_data_addr`. |
+| `<Name>.col_lens`             | `Local` (read-only)        | 8           | Per-column name lengths, host-endian i64s.                |
+
+Pointer/length array alignment is load-bearing: the runtime's
+`*const *const u8` / `*const usize` indexed loads require natural
+alignment. Heading descriptors and attr arrays are also aligned to
+`ptr_bytes` for the same reason.
+
+`Inst::RelvarSlotInit` allocates an explicit-slot stack i64 for the
+resolver's `out_len`, materializes pointers for each data symbol via
+`func_addr` / `symbol_value`, and calls the runtime extern in one
+shot.
+
+`Inst::RelvarRead` and `Inst::RelvarSlotRelease` mirror the LLVM
+side: load from the slot's `DataId` + retain or release.
+
+
 ## End-to-end pipeline
 
 Each backend has an `e2e.rs` integration test that exercises the

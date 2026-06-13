@@ -86,6 +86,9 @@ impl Codegen for CraneliftBackend {
         if !module.headings.is_empty() {
             declare_runtime_rc_externs(&mut obj, &mut funcs)?;
         }
+        if !module.public_relvars.is_empty() {
+            declare_runtime_relvar_externs(&mut obj, &mut funcs)?;
+        }
 
         // Per-module heading descriptors. One DataId block per unique
         // heading; each carries its attribute array and the
@@ -101,6 +104,18 @@ impl Codegen for CraneliftBackend {
             heading_desc_ids.push(desc_id);
         }
 
+        // Per-public-relvar data: slot global + name / env / path /
+        // table / column strings + pointer-and-length arrays. Each
+        // RelvarSlotInit / RelvarRead / RelvarSlotRelease looks up by
+        // surface name.
+        let mut relvar_data: HashMap<String, RelvarDataIds> = HashMap::new();
+        let db_name = module.db_name.clone().unwrap_or_default();
+        let db_default = module.db_path_default.clone().unwrap_or_default();
+        for relvar in &module.public_relvars {
+            let ids = emit_public_relvar_data(&mut obj, relvar, &db_name, &db_default, ptr_bytes)?;
+            relvar_data.insert(relvar.name.clone(), ids);
+        }
+
         // Define every non-extern function.
         let mut next_data: u32 = 0;
         for func in module.functions.iter().filter(|f| !f.is_extern()) {
@@ -112,6 +127,7 @@ impl Codegen for CraneliftBackend {
                 &funcs,
                 &layouts,
                 &heading_desc_ids,
+                &relvar_data,
                 &mut next_data,
             )?;
         }
@@ -193,6 +209,201 @@ fn declare_runtime_rc_externs(
     Ok(())
 }
 
+/// Phase 22 runtime externs: SQLite materialization, transaction
+/// brackets, and the env-var resolver. Mirrors the LLVM backend's
+/// `emit_runtime_relvar_externs`.
+fn declare_runtime_relvar_externs(
+    obj: &mut ObjectModule,
+    funcs: &mut HashMap<String, FuncId>,
+) -> Result<(), CraneliftEmitError> {
+    let ptr_ty = obj.target_config().pointer_type();
+    // coddl_sqlite_relvar_init(
+    //   relvar_name: ptr, relvar_name_len: i64,
+    //   db_path: ptr, db_path_len: i64,
+    //   table: ptr, table_len: i64,
+    //   columns: ptr, column_lens: ptr, column_count: i32,
+    //   desc: ptr, slot: ptr) -> i32
+    {
+        let mut sig = obj.make_signature();
+        for _ in 0..3 {
+            sig.params.push(AbiParam::new(ptr_ty));
+            sig.params.push(AbiParam::new(types::I64));
+        }
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I32));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.returns.push(AbiParam::new(types::I32));
+        let id = obj
+            .declare_function("coddl_sqlite_relvar_init", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_sqlite_relvar_init".into(), id);
+    }
+    // Transaction externs (begin/commit/rollback) are not declared
+    // here. The lowerer registers them through its `ensure_runtime_extern`
+    // path so they go through the same Inst::Call → Function-table
+    // route as `coddl_runtime_init` / `coddl_runtime_shutdown`. The
+    // Function table records their signature as `() -> Integer` —
+    // wider than the runtime's actual `CoddlStatus` (i32) but harmless
+    // because nothing reads the result. Pre-declaring them here too
+    // would conflict with the lowerer's declaration.
+    // coddl_resolve_op_field(env_name: ptr, env_len: i64,
+    //                       default: ptr, default_len: i64,
+    //                       out_len: ptr) -> ptr
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.returns.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_resolve_op_field", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_resolve_op_field".into(), id);
+    }
+    Ok(())
+}
+
+/// Per-public-relvar DataIds and string lengths. The three new Inst
+/// arms (`RelvarSlotInit`, `RelvarSlotRelease`, `RelvarRead`) look up
+/// by surface name and reach these symbols via
+/// `ObjectModule::declare_data_in_func`.
+struct RelvarDataIds {
+    slot: DataId,
+    relvar_name: DataId,
+    relvar_name_len: i64,
+    env_name: DataId,
+    env_name_len: i64,
+    default_path: DataId,
+    default_path_len: i64,
+    table_name: DataId,
+    table_name_len: i64,
+    col_ptrs: DataId,
+    col_lens: DataId,
+    col_count: i32,
+}
+
+/// Emit every data symbol one public relvar needs:
+/// - `<name>_slot` — writable pointer slot (initialized null).
+/// - `<name>.relvar_name` / `<name>.env_name` / `<name>.default_path`
+///   / `<name>.table_name` — UTF-8 byte arrays.
+/// - `<name>.col<i>.name` — per-column UTF-8 byte arrays.
+/// - `<name>.col_ptrs` — pointer-per-column array; each pointer
+///   relocates to its respective name.
+/// - `<name>.col_lens` — i64-per-column length array.
+fn emit_public_relvar_data(
+    obj: &mut ObjectModule,
+    relvar: &coddl_procir::PublicRelvarBinding,
+    db_name: &str,
+    db_default: &str,
+    ptr_bytes: usize,
+) -> Result<RelvarDataIds, CraneliftEmitError> {
+    let name = &relvar.name;
+    let env_name = format!("CODDL_{}_FILE", db_name.to_ascii_uppercase());
+
+    // Writable slot — pointer-sized, zero-initialized. `Linkage::Local`
+    // + `writable=true`. Aligned to the pointer size so the runtime's
+    // `*mut *mut u8` write into it is well-defined.
+    let slot = obj
+        .declare_data(&format!("{name}_slot"), Linkage::Local, true, false)
+        .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+    let mut slot_dd = DataDescription::new();
+    slot_dd.set_align(ptr_bytes as u64);
+    slot_dd.define(vec![0u8; ptr_bytes].into_boxed_slice());
+    obj.define_data(slot, &slot_dd)
+        .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+
+    let relvar_name_bytes = name.as_bytes();
+    let relvar_name = declare_byte_constant(obj, &format!("{name}.relvar_name"), relvar_name_bytes)?;
+    let env_name_bytes = env_name.as_bytes();
+    let env_id = declare_byte_constant(obj, &format!("{name}.env_name"), env_name_bytes)?;
+    let default_bytes = db_default.as_bytes();
+    let default_id = declare_byte_constant(obj, &format!("{name}.default_path"), default_bytes)?;
+    let table_bytes = relvar.table_name.as_bytes();
+    let table_id = declare_byte_constant(obj, &format!("{name}.table_name"), table_bytes)?;
+
+    // Per-column name byte arrays.
+    let mut col_ids: Vec<DataId> = Vec::with_capacity(relvar.columns.len());
+    for (i, (_, col)) in relvar.columns.iter().enumerate() {
+        let id = declare_byte_constant(obj, &format!("{name}.col{i}.name"), col.as_bytes())?;
+        col_ids.push(id);
+    }
+    // Pointer-per-column array. Aligned to ptr_bytes so the runtime's
+    // `*const *const u8` indexed loads succeed.
+    let col_ptrs = obj
+        .declare_data(&format!("{name}.col_ptrs"), Linkage::Local, false, false)
+        .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+    let ptrs_bytes_len = ptr_bytes * relvar.columns.len();
+    let mut ptrs_dd = DataDescription::new();
+    ptrs_dd.set_align(ptr_bytes as u64);
+    ptrs_dd.define(vec![0u8; ptrs_bytes_len].into_boxed_slice());
+    for (i, &cid) in col_ids.iter().enumerate() {
+        let gv = obj.declare_data_in_data(cid, &mut ptrs_dd);
+        ptrs_dd.write_data_addr((i * ptr_bytes) as u32, gv, 0);
+    }
+    obj.define_data(col_ptrs, &ptrs_dd)
+        .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+
+    // i64-per-column length array. Aligned to 8 so the runtime's
+    // `*const usize` indexed loads succeed.
+    let col_lens = obj
+        .declare_data(&format!("{name}.col_lens"), Linkage::Local, false, false)
+        .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+    let lens_bytes_len = 8 * relvar.columns.len();
+    let mut lens_dd = DataDescription::new();
+    lens_dd.set_align(8);
+    let mut lens_bytes = vec![0u8; lens_bytes_len];
+    for (i, (_, col)) in relvar.columns.iter().enumerate() {
+        let n = col.as_bytes().len() as u64;
+        let off = i * 8;
+        lens_bytes[off..off + 8].copy_from_slice(&n.to_ne_bytes());
+    }
+    lens_dd.define(lens_bytes.into_boxed_slice());
+    obj.define_data(col_lens, &lens_dd)
+        .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+
+    Ok(RelvarDataIds {
+        slot,
+        relvar_name,
+        relvar_name_len: relvar_name_bytes.len() as i64,
+        env_name: env_id,
+        env_name_len: env_name_bytes.len() as i64,
+        default_path: default_id,
+        default_path_len: default_bytes.len() as i64,
+        table_name: table_id,
+        table_name_len: table_bytes.len() as i64,
+        col_ptrs,
+        col_lens,
+        col_count: relvar.columns.len() as i32,
+    })
+}
+
+/// Declare + define a Local byte-array data symbol. Helper for the
+/// per-relvar string payloads.
+fn declare_byte_constant(
+    obj: &mut ObjectModule,
+    sym: &str,
+    bytes: &[u8],
+) -> Result<DataId, CraneliftEmitError> {
+    let id = obj
+        .declare_data(sym, Linkage::Local, false, false)
+        .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+    let mut dd = DataDescription::new();
+    if bytes.is_empty() {
+        // DataDescription rejects zero-length payloads; emit a single
+        // zero byte and the runtime treats len == 0 as empty.
+        dd.define(vec![0u8].into_boxed_slice());
+    } else {
+        dd.define(bytes.to_vec().into_boxed_slice());
+    }
+    obj.define_data(id, &dd)
+        .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+    Ok(id)
+}
+
 /// Emit the per-heading descriptor data: per-attribute name bytes,
 /// the attribute array, and the descriptor struct itself. Layout
 /// matches `coddl_runtime::CoddlHeadingDesc` / `CoddlAttrDesc`.
@@ -236,6 +447,7 @@ fn emit_heading_descriptor(
         .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
     let attrs_bytes_len = attr_stride * layout.attrs.len();
     let mut attrs_dd = DataDescription::new();
+    attrs_dd.set_align(ptr_bytes as u64);
     attrs_dd.define(vec![0u8; attrs_bytes_len].into_boxed_slice());
     // Relocate the name pointer field of each entry to its
     // corresponding name DataId.
@@ -262,6 +474,7 @@ fn emit_heading_descriptor(
         .declare_data(&desc_sym, Linkage::Local, false, false)
         .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
     let mut desc_dd = DataDescription::new();
+    desc_dd.set_align(ptr_bytes as u64);
     desc_dd.define(vec![0u8; desc_size].into_boxed_slice());
     attrs_write_u32(&mut desc_dd, 0, layout.attrs.len() as u32);
     attrs_write_u32(&mut desc_dd, 4, layout.record_size);
@@ -428,6 +641,7 @@ fn emit_function(
     funcs: &HashMap<String, FuncId>,
     heading_layouts: &[RecordLayout],
     heading_desc_ids: &[DataId],
+    relvar_data: &HashMap<String, RelvarDataIds>,
     next_data: &mut u32,
 ) -> Result<(), CraneliftEmitError> {
     let mut ctx = obj.make_context();
@@ -490,6 +704,7 @@ fn emit_function(
             funcs,
             heading_layouts,
             heading_desc_ids,
+            relvar_data,
             &mut values,
             next_data,
             is_main,
@@ -512,6 +727,7 @@ fn emit_block(
     funcs: &HashMap<String, FuncId>,
     heading_layouts: &[RecordLayout],
     heading_desc_ids: &[DataId],
+    relvar_data: &HashMap<String, RelvarDataIds>,
     values: &mut HashMap<ValueId, ValueRepr>,
     next_data: &mut u32,
     is_main: bool,
@@ -524,6 +740,7 @@ fn emit_block(
             funcs,
             heading_layouts,
             heading_desc_ids,
+            relvar_data,
             values,
             next_data,
         )?;
@@ -539,6 +756,7 @@ fn emit_inst(
     funcs: &HashMap<String, FuncId>,
     heading_layouts: &[RecordLayout],
     heading_desc_ids: &[DataId],
+    relvar_data: &HashMap<String, RelvarDataIds>,
     values: &mut HashMap<ValueId, ValueRepr>,
     next_data: &mut u32,
 ) -> Result<(), CraneliftEmitError> {
@@ -909,6 +1127,116 @@ fn emit_inst(
                 fields.push((attr.name.clone(), repr));
             }
             values.insert(*dst, ValueRepr::Tuple { fields });
+            Ok(())
+        }
+        Inst::RelvarSlotInit { name, heading_id } => {
+            let ids = relvar_data.get(name).ok_or_else(|| {
+                CraneliftEmitError::UnsupportedInst(format!(
+                    "RelvarSlotInit references unknown relvar `{name}`"
+                ))
+            })?;
+            let ptr_ty = obj.target_config().pointer_type();
+            // 1. Resolve the env-var override → path (ptr, len).
+            //    `coddl_resolve_op_field` writes len into an alloca'd
+            //    i64 slot we set up first.
+            let slot_len = builder.create_sized_stack_slot(
+                cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    8,
+                    3,
+                ),
+            );
+            let len_addr = builder.ins().stack_addr(ptr_ty, slot_len, 0);
+            let resolve_id = funcs["coddl_resolve_op_field"];
+            let resolve_local = obj.declare_func_in_func(resolve_id, builder.func);
+            let env_gv = obj.declare_data_in_func(ids.env_name, builder.func);
+            let env_addr = builder.ins().symbol_value(ptr_ty, env_gv);
+            let env_len = builder.ins().iconst(types::I64, ids.env_name_len);
+            let default_gv = obj.declare_data_in_func(ids.default_path, builder.func);
+            let default_addr = builder.ins().symbol_value(ptr_ty, default_gv);
+            let default_len = builder.ins().iconst(types::I64, ids.default_path_len);
+            let call = builder.ins().call(
+                resolve_local,
+                &[env_addr, env_len, default_addr, default_len, len_addr],
+            );
+            let resolved_ptr = builder.inst_results(call)[0];
+            let resolved_len =
+                builder.ins().load(types::I64, MemFlags::trusted(), len_addr, 0);
+
+            // 2. Call coddl_sqlite_relvar_init.
+            let relvar_name_gv = obj.declare_data_in_func(ids.relvar_name, builder.func);
+            let relvar_name_addr = builder.ins().symbol_value(ptr_ty, relvar_name_gv);
+            let relvar_name_len = builder.ins().iconst(types::I64, ids.relvar_name_len);
+            let table_gv = obj.declare_data_in_func(ids.table_name, builder.func);
+            let table_addr = builder.ins().symbol_value(ptr_ty, table_gv);
+            let table_len = builder.ins().iconst(types::I64, ids.table_name_len);
+            let col_ptrs_gv = obj.declare_data_in_func(ids.col_ptrs, builder.func);
+            let col_ptrs_addr = builder.ins().symbol_value(ptr_ty, col_ptrs_gv);
+            let col_lens_gv = obj.declare_data_in_func(ids.col_lens, builder.func);
+            let col_lens_addr = builder.ins().symbol_value(ptr_ty, col_lens_gv);
+            let col_count_val = builder.ins().iconst(types::I32, ids.col_count as i64);
+            let desc_id = heading_desc_ids[heading_id.0 as usize];
+            let desc_gv = obj.declare_data_in_func(desc_id, builder.func);
+            let desc_val = builder.ins().symbol_value(ptr_ty, desc_gv);
+            let slot_gv = obj.declare_data_in_func(ids.slot, builder.func);
+            let slot_addr = builder.ins().symbol_value(ptr_ty, slot_gv);
+            let init_id = funcs["coddl_sqlite_relvar_init"];
+            let init_local = obj.declare_func_in_func(init_id, builder.func);
+            builder.ins().call(
+                init_local,
+                &[
+                    relvar_name_addr,
+                    relvar_name_len,
+                    resolved_ptr,
+                    resolved_len,
+                    table_addr,
+                    table_len,
+                    col_ptrs_addr,
+                    col_lens_addr,
+                    col_count_val,
+                    desc_val,
+                    slot_addr,
+                ],
+            );
+            Ok(())
+        }
+        Inst::RelvarSlotRelease { name } => {
+            let ids = relvar_data.get(name).ok_or_else(|| {
+                CraneliftEmitError::UnsupportedInst(format!(
+                    "RelvarSlotRelease references unknown relvar `{name}`"
+                ))
+            })?;
+            let ptr_ty = obj.target_config().pointer_type();
+            let slot_gv = obj.declare_data_in_func(ids.slot, builder.func);
+            let slot_addr = builder.ins().symbol_value(ptr_ty, slot_gv);
+            let payload = builder
+                .ins()
+                .load(ptr_ty, MemFlags::trusted(), slot_addr, 0);
+            let release_id = funcs["coddl_rc_release"];
+            let release_local = obj.declare_func_in_func(release_id, builder.func);
+            builder.ins().call(release_local, &[payload]);
+            Ok(())
+        }
+        Inst::RelvarRead {
+            dst,
+            name,
+            heading_id: _,
+        } => {
+            let ids = relvar_data.get(name).ok_or_else(|| {
+                CraneliftEmitError::UnsupportedInst(format!(
+                    "RelvarRead references unknown relvar `{name}`"
+                ))
+            })?;
+            let ptr_ty = obj.target_config().pointer_type();
+            let slot_gv = obj.declare_data_in_func(ids.slot, builder.func);
+            let slot_addr = builder.ins().symbol_value(ptr_ty, slot_gv);
+            let payload = builder
+                .ins()
+                .load(ptr_ty, MemFlags::trusted(), slot_addr, 0);
+            let retain_id = funcs["coddl_rc_retain"];
+            let retain_local = obj.declare_func_in_func(retain_id, builder.func);
+            builder.ins().call(retain_local, &[payload]);
+            values.insert(*dst, ValueRepr::Scalar(payload));
             Ok(())
         }
     }

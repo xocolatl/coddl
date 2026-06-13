@@ -232,6 +232,41 @@ each `parse_<x>` has a corresponding `check_<x>`.
   a non-relation operand. Other unary ops slot in here.
 
 
+## Transaction-scoped public-relvar access (Phase 22)
+
+TTM OO Pre 4 forbids autocommit: every database access happens inside
+an explicit transaction. The typechecker enforces this at every public-
+relvar reference site.
+
+- The `TypeChecker` carries a `transaction_depth: usize` counter.
+  `check_transaction_expr` bumps it before the body, decrements after.
+- `check_oper_decl` seeds the operator-body scope with every public
+  relvar in the per-file `RelvarTable` as `Type::Relation(heading)`,
+  and parallel-tracks them in a `public_relvars: HashSet<String>`.
+- A `NameRef` that resolves to a public relvar AND finds
+  `transaction_depth == 0` fires `T0025`. The diagnostic anchors on
+  the name token.
+- Private relvars are not in the set — RM Pre 14 calls them local
+  program state, not database state, so the rule doesn't apply.
+
+## Transaction purity (Phase 22)
+
+Transactions must be replayable on serialization conflict. Anything
+that touches the outside world (stdout, stderr, the network, a file
+that isn't the materialized SQLite payload) is unsafe inside.
+
+- `Builtins::OperSig` carries a `Purity` field (`Pure | SideEffecting`).
+- Existing side-effecting builtins: `write_line`, `write_relation`.
+  All future builtins default to `Pure` in the registry and must
+  opt in to `SideEffecting` explicitly — adding a printing operator
+  is a forcing function on the conformance check.
+- `check_call`: when `transaction_depth > 0` and the resolved callee
+  is `SideEffecting`, emit `T0026` at the callee token.
+- The rule applies recursively through nested `transaction [...]`
+  blocks (they only ever increase depth) and will extend to user-
+  defined `oper`s once those callees carry a derived purity flag.
+
+
 ## Typecheck diagnostics
 
 Every diagnostic the typechecker emits has a stable `T####` code.
@@ -264,3 +299,5 @@ check script enforces that.
 | T0022 | Captured identifier in `where` predicate not yet supported |
 | T0023 | `where` left operand is not a relation                    |
 | T0024 | `extract` operand is not a relation                       |
+| T0025 | Public relvar referenced outside any `transaction [...]`  |
+| T0026 | Side-effecting operator called inside `transaction [...]` |

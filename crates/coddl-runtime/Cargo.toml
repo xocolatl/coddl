@@ -21,3 +21,9 @@ coddl-execlocal.workspace = true
 coddl-sqlemit.workspace = true
 coddl-backend-sqlite = { workspace = true, optional = true }
 coddl-backend-postgres = { workspace = true, optional = true }
+# SQLite is the only v1 backend; `bundled` builds libsqlite3 from
+# source so the compiled binary needs no system sqlite3.
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

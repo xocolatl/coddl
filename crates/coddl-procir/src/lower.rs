@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use coddl_diagnostics::{Diagnostic, FileId, Severity, Span};
+use coddl_plan::Plan;
 use coddl_syntax::ast::{
     AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, Expr, ExprStmt, FieldAccess, Item,
     LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, RelationLit, Root, Stmt,
@@ -22,8 +23,8 @@ use coddl_syntax::SyntaxKind;
 use coddl_types::{check, Heading, Type};
 
 use crate::ir::{
-    BasicBlock, BlockId, Const, Function, HeadingId, Inst, Module, ProcType, ScalarOp, Terminator,
-    ValueId,
+    BasicBlock, BlockId, Const, Function, HeadingId, Inst, Module, ProcType, PublicRelvarBinding,
+    ScalarOp, Terminator, ValueId,
 };
 
 /// Surface name → C-ABI linkage name for each runtime extern. The
@@ -57,6 +58,18 @@ pub struct LowerOutput {
 /// storage shape that the typechecker and the (Phase 16) plan layer
 /// consume; they have no procedural lowering.
 pub fn lower(source: &str, file: FileId) -> LowerOutput {
+    lower_with_plan(source, file, None)
+}
+
+/// Plan-aware lowering. The optional [`Plan`] carries the resolved
+/// public relvars (with table names + column orderings + the canonical
+/// SQLite path baked at compile time); the lowerer turns each entry
+/// into one `Module::public_relvars` slot, emits `RelvarSlotInit` /
+/// `RelvarSlotRelease` in `main`'s prologue/epilogue, and resolves
+/// bare-name references against the relvar set. When `plan` is `None`,
+/// behavior matches the legacy `lower()` path: no relvar slots, no
+/// SQLite, no transaction externs.
+pub fn lower_with_plan(source: &str, file: FileId, plan: Option<&Plan>) -> LowerOutput {
     let check_out = check(source, file, coddl_syntax::FileKind::Cd);
     let has_errors = check_out
         .diagnostics
@@ -70,6 +83,9 @@ pub fn lower(source: &str, file: FileId) -> LowerOutput {
     }
     let root = Root::cast(check_out.tree).expect("parser always returns a Root");
     let mut lowerer = Lowerer::new(file);
+    if let Some(plan) = plan {
+        lowerer.absorb_plan(plan);
+    }
     let module = lowerer.lower_root(&root);
     // Merge in any diagnostics the lowerer itself emitted (e.g.
     // T0022 for captures in `where` predicates). If the lowerer
@@ -125,6 +141,23 @@ struct Lowerer {
     /// detect captures (Phase 20 deferral, T0022). `None` outside any
     /// predicate body.
     outer_locals_for_capture: Option<Vec<HashMap<String, (ValueId, ProcType)>>>,
+    /// Plan-derived public-relvar metadata, keyed by surface name. Each
+    /// entry carries the heading id (interned at plan-absorption time)
+    /// plus the table / columns / db info the backend needs at slot-
+    /// init emission. Empty when the program declares no public
+    /// relvars (or no plan was supplied).
+    public_relvars: HashMap<String, PublicRelvarBinding>,
+    /// Source-declaration order of public-relvar names. The lowerer
+    /// emits `RelvarSlotInit` / `RelvarSlotRelease` in this order so
+    /// the slot-global emission matches across both backends and
+    /// per-run.
+    public_relvar_order: Vec<String>,
+    /// Database name from the `database <name>;` binding. Mirrors
+    /// `Module::db_name`.
+    db_name: Option<String>,
+    /// Canonical absolute SQLite path baked at compile time. Mirrors
+    /// `Module::db_path_default`.
+    db_path_default: Option<String>,
 }
 
 impl Lowerer {
@@ -144,6 +177,31 @@ impl Lowerer {
             locals: vec![HashMap::new()],
             value_types: HashMap::new(),
             outer_locals_for_capture: None,
+            public_relvars: HashMap::new(),
+            public_relvar_order: Vec::new(),
+            db_name: None,
+            db_path_default: None,
+        }
+    }
+
+    /// Walk the plan's `resolved` list, intern each relvar's heading,
+    /// and build the per-relvar `PublicRelvarBinding` the IR carries on
+    /// `Module::public_relvars`. Also stash `db_name` /
+    /// `db_path_default` so the codegen layer can emit the
+    /// env-var-resolved path lookup at slot init.
+    fn absorb_plan(&mut self, plan: &Plan) {
+        self.db_name = plan.database_name.clone();
+        self.db_path_default = plan.db_file_default.clone();
+        for r in &plan.resolved {
+            let heading_id = self.intern_heading(&r.heading);
+            let binding = PublicRelvarBinding {
+                name: r.app_name.clone(),
+                heading_id,
+                table_name: r.table_name.clone(),
+                columns: r.columns.clone(),
+            };
+            self.public_relvar_order.push(r.app_name.clone());
+            self.public_relvars.insert(r.app_name.clone(), binding);
         }
     }
 
@@ -317,10 +375,23 @@ impl Lowerer {
                 }
             }
         }
+        let public_relvars: Vec<PublicRelvarBinding> = self
+            .public_relvar_order
+            .iter()
+            .map(|name| {
+                self.public_relvars
+                    .get(name)
+                    .cloned()
+                    .expect("public_relvar_order names live in public_relvars")
+            })
+            .collect();
         Module {
             program_name: std::mem::take(&mut self.program_name),
             functions: std::mem::take(&mut self.functions),
             headings: std::mem::take(&mut self.headings),
+            public_relvars,
+            db_path_default: self.db_path_default.take(),
+            db_name: self.db_name.take(),
         }
     }
 
@@ -387,6 +458,26 @@ impl Lowerer {
                 args: Vec::new(),
                 return_type: ProcType::Integer,
             });
+            // Materialize each public relvar from SQLite before the
+            // body runs. Backends turn each `RelvarSlotInit` into a
+            // call to `coddl_sqlite_relvar_init` with the static
+            // table / columns / descriptor / env-var resolver args
+            // built from the per-relvar binding on Module. The extern
+            // is declared on the backend side by the per-module relvar
+            // declarator; no need to register it through the
+            // lowerer's Function table (doing so would conflict with
+            // the backend's correctly-typed declaration).
+            for relvar_name in self.public_relvar_order.clone() {
+                let binding = self
+                    .public_relvars
+                    .get(&relvar_name)
+                    .expect("ordered name binds in public_relvars")
+                    .clone();
+                self.insts.push(Inst::RelvarSlotInit {
+                    name: relvar_name,
+                    heading_id: binding.heading_id,
+                });
+            }
         }
 
         let body_value = decl.body().map(|body| self.lower_block(&body));
@@ -398,6 +489,14 @@ impl Lowerer {
         self.release_top_scope_heap_locals();
 
         if is_main {
+            // Release each public-relvar slot before runtime shutdown.
+            // The runtime's own `coddl_runtime_shutdown` mirrors this
+            // for any slot still alive (defense in depth), but emitting
+            // the per-relvar release here keeps the ProcIR explicit
+            // about ownership and matches the slot-init shape above.
+            for relvar_name in self.public_relvar_order.clone() {
+                self.insts.push(Inst::RelvarSlotRelease { name: relvar_name });
+            }
             self.ensure_runtime_extern("coddl_runtime_shutdown");
             let dst = self.fresh_value();
             self.record_type(dst, ProcType::Integer);
@@ -560,6 +659,22 @@ impl Lowerer {
             let name = name_tok.text();
             if let Some((v, _ty)) = self.lookup_local(name) {
                 return v;
+            }
+            // Public relvar reference: emit a slot load + retain. The
+            // typechecker has already enforced this only happens inside
+            // a `transaction [...]` (T0025); the consumer (`where` /
+            // `extract` / `write_relation`) is responsible for releasing
+            // the temporary via the same fresh-source detection Phase 21
+            // installed for extract.
+            if let Some(binding) = self.public_relvars.get(name).cloned() {
+                let dst = self.fresh_value();
+                self.record_type(dst, ProcType::Relation(binding.heading_id));
+                self.insts.push(Inst::RelvarRead {
+                    dst,
+                    name: binding.name,
+                    heading_id: binding.heading_id,
+                });
+                return dst;
             }
             if let Some(outer) = &self.outer_locals_for_capture {
                 let captured = outer.iter().rev().any(|l| l.contains_key(name));
@@ -725,6 +840,19 @@ impl Lowerer {
             predicate_linkage: pred_name,
             heading_id,
         });
+        // If the where's source isn't owned by any local (e.g. it's a
+        // fresh `RelvarRead` chained directly into `where`), release
+        // the temporary now that the predicate has finished reading it.
+        // Same pattern Phase 21 installed for `extract`'s source —
+        // generalised so chains like `RelvarRead → where → extract`
+        // stay balanced without manual let-binding.
+        let src_owned = self
+            .locals
+            .iter()
+            .any(|layer| layer.values().any(|(vid, _)| *vid == src));
+        if !src_owned {
+            self.insts.push(Inst::Release { src });
+        }
         dst
     }
 
@@ -808,15 +936,20 @@ impl Lowerer {
     }
 
     fn lower_transaction_expr(&mut self, txn: &TransactionExpr) -> ValueId {
-        // The transaction wrapper is transparent for now — push a
-        // scope, lower the body, pop. The body's value flows out.
-        // When real transaction semantics arrive, this is where
-        // synthetic begin/commit/rollback calls slot in.
+        // Wrap the body in synthetic begin/commit calls. The runtime
+        // externs are no-ops in v1 (all public-relvar reads are served
+        // from the materialized in-memory slot) but the shape is
+        // load-bearing for the conformance rule: T0025 forces every
+        // public-relvar access to be inside a transaction, and the
+        // bracket pair is where real BEGIN/COMMIT discipline will
+        // land when write-through arrives.
         self.push_local_scope();
+        self.emit_tx_call("coddl_begin_tx");
         let value = match txn.body() {
             Some(b) => self.lower_block(&b),
             None => self.fresh_value(),
         };
+        self.emit_tx_call("coddl_commit_tx");
         // Release every heap-typed local in this transaction scope
         // before popping. The body's tail value (if heap-typed) is
         // not currently a use case Phase 19 exercises — relations
@@ -824,6 +957,21 @@ impl Lowerer {
         self.release_top_scope_heap_locals();
         self.pop_local_scope();
         value
+    }
+
+    /// Emit a synthetic `Inst::Call` to a transaction runtime extern.
+    /// The dst is allocated and typed `Integer` (`CoddlStatus`) but
+    /// never consumed — the no-op runtime always returns Ok in v1.
+    fn emit_tx_call(&mut self, linkage: &'static str) {
+        self.ensure_runtime_extern(linkage);
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Integer);
+        self.insts.push(Inst::Call {
+            dst: Some(dst),
+            callee: linkage.to_string(),
+            args: Vec::new(),
+            return_type: ProcType::Integer,
+        });
     }
 
     /// Lower a `Relation { <tuple-lit>, … }` literal. Each nested

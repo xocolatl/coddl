@@ -99,6 +99,16 @@ struct Emitter {
     /// `emit_module` so `Inst::RelationLit` can look up the
     /// heading's layout by id without recomputing.
     heading_layouts: Vec<coddl_procir::RecordLayout>,
+    /// Per-module public-relvar lookup: surface name → column count.
+    /// The three new Inst arms (RelvarSlotInit / RelvarSlotRelease /
+    /// RelvarRead) reference this to size the column-pointer / column-
+    /// length arrays passed to `coddl_sqlite_relvar_init`.
+    public_relvar_columns: HashMap<String, usize>,
+    /// Symbol → payload byte length for every `private constant [N x i8]`
+    /// we emit. `lower_relvar_slot_init` reads these to pass the
+    /// right (ptr, len) pair to `coddl_resolve_op_field` and
+    /// `coddl_sqlite_relvar_init`.
+    byte_const_lens: HashMap<String, usize>,
 }
 
 impl Emitter {
@@ -118,7 +128,13 @@ impl Emitter {
         if !module.headings.is_empty() {
             self.emit_runtime_rc_externs();
         }
-        if module.functions.iter().any(Function::is_extern) || !module.headings.is_empty() {
+        if !module.public_relvars.is_empty() {
+            self.emit_runtime_relvar_externs();
+        }
+        if module.functions.iter().any(Function::is_extern)
+            || !module.headings.is_empty()
+            || !module.public_relvars.is_empty()
+        {
             writeln!(self.body).unwrap();
         }
 
@@ -136,6 +152,21 @@ impl Emitter {
             self.emit_heading_descriptor(HeadingId(i as u32), heading)?;
         }
         if !module.headings.is_empty() {
+            writeln!(self.body).unwrap();
+        }
+
+        // Per-public-relvar globals: the slot pointer + string
+        // constants the runtime resolver needs (relvar name, env-var
+        // name, default path, table name, per-column names + a column-
+        // pointer / column-length array). All `Linkage::Local`-style
+        // private constants; the slot starts as `null` and is written
+        // by `coddl_sqlite_relvar_init` in `main`'s prologue.
+        for relvar in &module.public_relvars {
+            self.emit_public_relvar_globals(relvar, module)?;
+            self.public_relvar_columns
+                .insert(relvar.name.clone(), relvar.columns.len());
+        }
+        if !module.public_relvars.is_empty() {
             writeln!(self.body).unwrap();
         }
 
@@ -178,6 +209,93 @@ impl Emitter {
             "declare ptr @coddl_extract_check_cardinality(ptr, ptr)"
         )
         .unwrap();
+    }
+
+    /// Declare the Phase 22 runtime externs the public-relvar
+    /// machinery uses. Always emitted when the module has any public
+    /// relvar; never otherwise. Transaction externs aren't included
+    /// here — the lowerer registers `coddl_begin_tx` / `coddl_commit_tx`
+    /// / `coddl_rollback_tx` through its Function table so they reach
+    /// `emit_extern` like `coddl_runtime_init` does. Adding them here
+    /// too would emit a conflicting `declare`.
+    fn emit_runtime_relvar_externs(&mut self) {
+        // (relvar_name, relvar_name_len, db_path, db_path_len,
+        //  table, table_len, columns, column_lens, column_count,
+        //  desc, slot) -> i32
+        writeln!(
+            self.body,
+            "declare i32 @coddl_sqlite_relvar_init(ptr, i64, ptr, i64, ptr, i64, ptr, ptr, i32, ptr, ptr)"
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "declare ptr @coddl_resolve_op_field(ptr, i64, ptr, i64, ptr)"
+        )
+        .unwrap();
+    }
+
+    /// Emit the per-relvar slot + companion string constants the
+    /// materializer needs. Layout choices follow the runtime's C ABI:
+    /// each column name is its own private constant; the column-pointer
+    /// and column-length arrays index those.
+    fn emit_public_relvar_globals(
+        &mut self,
+        relvar: &coddl_procir::PublicRelvarBinding,
+        module: &Module,
+    ) -> Result<(), LlvmEmitError> {
+        let name = &relvar.name;
+        let db_name = module.db_name.as_deref().unwrap_or("");
+        let default_path = module.db_path_default.as_deref().unwrap_or("");
+        let env_name = format!("CODDL_{}_FILE", db_name.to_ascii_uppercase());
+
+        // Slot global — initialized to null; written by the runtime
+        // at startup. The lowerer emits `RelvarRead` against this
+        // global.
+        writeln!(
+            self.globals,
+            "@{name}_slot = private unnamed_addr global ptr null",
+        )
+        .unwrap();
+
+        // String constants for relvar name, env name, default path,
+        // table name. UTF-8 byte arrays — runtime takes (ptr, len)
+        // and never relies on null termination.
+        self.emit_byte_constant(&format!("@{name}.relvar_name"), name.as_bytes());
+        self.emit_byte_constant(&format!("@{name}.env_name"), env_name.as_bytes());
+        self.emit_byte_constant(&format!("@{name}.default_path"), default_path.as_bytes());
+        self.emit_byte_constant(&format!("@{name}.table_name"), relvar.table_name.as_bytes());
+        for (i, (_, col)) in relvar.columns.iter().enumerate() {
+            self.emit_byte_constant(&format!("@{name}.col{i}.name"), col.as_bytes());
+        }
+        // Pointer array (one ptr per column) and length array (one
+        // i64 per column).
+        write!(
+            self.globals,
+            "@{name}.col_ptrs = private unnamed_addr constant [{} x ptr] [",
+            relvar.columns.len()
+        )
+        .unwrap();
+        for (i, _) in relvar.columns.iter().enumerate() {
+            if i > 0 {
+                self.globals.push_str(", ");
+            }
+            write!(self.globals, "ptr @{name}.col{i}.name").unwrap();
+        }
+        writeln!(self.globals, "]").unwrap();
+        write!(
+            self.globals,
+            "@{name}.col_lens = private unnamed_addr constant [{} x i64] [",
+            relvar.columns.len()
+        )
+        .unwrap();
+        for (i, (_, col)) in relvar.columns.iter().enumerate() {
+            if i > 0 {
+                self.globals.push_str(", ");
+            }
+            write!(self.globals, "i64 {}", col.as_bytes().len()).unwrap();
+        }
+        writeln!(self.globals, "]").unwrap();
+        Ok(())
     }
 
     /// Emit the three globals that describe one heading: a per-attr
@@ -515,7 +633,125 @@ impl Emitter {
                 src,
                 heading_id,
             } => self.lower_extract_inst(*dst, src, *heading_id),
+            Inst::RelvarSlotInit { name, heading_id } => {
+                self.lower_relvar_slot_init(name, *heading_id)
+            }
+            Inst::RelvarSlotRelease { name } => self.lower_relvar_slot_release(name),
+            Inst::RelvarRead {
+                dst,
+                name,
+                heading_id,
+            } => self.lower_relvar_read(*dst, name, *heading_id),
         }
+    }
+
+    /// Emit the materialization call for one public relvar. Resolves
+    /// `CODDL_<DB>_FILE` via `coddl_resolve_op_field` first, then calls
+    /// `coddl_sqlite_relvar_init` with the (name, env-resolved path,
+    /// table, column arrays, descriptor, slot) bundle.
+    fn lower_relvar_slot_init(
+        &mut self,
+        name: &str,
+        heading_id: HeadingId,
+    ) -> Result<(), LlvmEmitError> {
+        let col_count = *self
+            .public_relvar_columns
+            .get(name)
+            .ok_or_else(|| {
+                LlvmEmitError::UnsupportedInst(format!(
+                    "RelvarSlotInit references unknown relvar `{name}`"
+                ))
+            })?;
+        let env_name_len = format!("CODDL_{}_FILE", name.to_ascii_uppercase());
+        let _ = env_name_len; // length lookup unused — env_name was already stored as a global byte
+        // Resolve the env-var override first; the runtime returns
+        // (ptr, len_out) — len_out is written into a stack slot we
+        // alloca right here.
+        let resolved_len_slot = format!("%v_{name}_resolve_len");
+        writeln!(
+            self.body,
+            "    {resolved_len_slot} = alloca i64, align 8"
+        )
+        .unwrap();
+        let resolved_ptr = format!("%v_{name}_resolved");
+        writeln!(
+            self.body,
+            "    {resolved_ptr} = call ptr @coddl_resolve_op_field(ptr @{name}.env_name, i64 {env_len}, ptr @{name}.default_path, i64 {def_len}, ptr {resolved_len_slot})",
+            env_len = self.const_byte_len(&format!("@{name}.env_name")),
+            def_len = self.const_byte_len(&format!("@{name}.default_path")),
+        )
+        .unwrap();
+        let resolved_len = format!("%v_{name}_resolved_len");
+        writeln!(
+            self.body,
+            "    {resolved_len} = load i64, ptr {resolved_len_slot}"
+        )
+        .unwrap();
+        // Materialize. The runtime stores the RC pointer in the slot
+        // and registers it for shutdown release.
+        let status = format!("%v_{name}_init_status");
+        writeln!(
+            self.body,
+            "    {status} = call i32 @coddl_sqlite_relvar_init(ptr @{name}.relvar_name, i64 {relvar_len}, ptr {resolved_ptr}, i64 {resolved_len}, ptr @{name}.table_name, i64 {table_len}, ptr @{name}.col_ptrs, ptr @{name}.col_lens, i32 {col_count}, ptr @.heading.{hid}, ptr @{name}_slot)",
+            relvar_len = self.const_byte_len(&format!("@{name}.relvar_name")),
+            table_len = self.const_byte_len(&format!("@{name}.table_name")),
+            hid = heading_id.0,
+        )
+        .unwrap();
+        Ok(())
+    }
+
+    fn lower_relvar_slot_release(&mut self, name: &str) -> Result<(), LlvmEmitError> {
+        let v = format!("%v_{name}_release_load");
+        writeln!(self.body, "    {v} = load ptr, ptr @{name}_slot").unwrap();
+        writeln!(self.body, "    call void @coddl_rc_release(ptr {v})").unwrap();
+        Ok(())
+    }
+
+    fn lower_relvar_read(
+        &mut self,
+        dst: ValueId,
+        name: &str,
+        heading_id: HeadingId,
+    ) -> Result<(), LlvmEmitError> {
+        let _ = heading_id; // descriptor lookup not needed at read site
+        let dst_name = format!("%v{}", dst.0);
+        writeln!(self.body, "    {dst_name} = load ptr, ptr @{name}_slot").unwrap();
+        writeln!(self.body, "    call void @coddl_rc_retain(ptr {dst_name})").unwrap();
+        self.values.insert(
+            dst,
+            ValueRepr::Scalar {
+                ty: "ptr".to_string(),
+                op: dst_name,
+            },
+        );
+        Ok(())
+    }
+
+    /// Look up a public byte-constant global's payload length. Each
+    /// `emit_byte_constant` writes a `private unnamed_addr constant
+    /// [N x i8]` whose `N` we remember in `byte_const_lens`.
+    fn const_byte_len(&self, sym: &str) -> usize {
+        *self
+            .byte_const_lens
+            .get(sym)
+            .expect("byte constant length tracked at emit time")
+    }
+
+    /// Emit a `private unnamed_addr constant [N x i8] c"..."` global
+    /// and record its byte length. Used for the per-relvar string
+    /// payloads `coddl_sqlite_relvar_init` reads. Empty payloads are
+    /// emitted as a zero-length array so the linker has a definite
+    /// symbol — the runtime treats len == 0 the same as a null body.
+    fn emit_byte_constant(&mut self, sym: &str, bytes: &[u8]) {
+        writeln!(
+            self.globals,
+            "{sym} = private unnamed_addr constant [{n} x i8] c\"{escaped}\"",
+            n = bytes.len(),
+            escaped = escape_ir_bytes(bytes),
+        )
+        .unwrap();
+        self.byte_const_lens.insert(sym.to_string(), bytes.len());
     }
 
     /// Emit a comparison or logical op on scalar SSA values. Result

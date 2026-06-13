@@ -25,6 +25,19 @@ pub enum ParamKind {
     AnyRelation,
 }
 
+/// Whether an operator is safe to call inside a `transaction [...]`.
+///
+/// Transactions must be replayable on serialization conflict, so any
+/// callee that touches the outside world is forbidden inside one. The
+/// registry marks each builtin explicitly; new builtins default to
+/// `Pure` and must opt in to `SideEffecting`, so adding a printing
+/// operator is a forcing function on the conformance check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Purity {
+    Pure,
+    SideEffecting,
+}
+
 /// One built-in operator's declared signature.
 ///
 /// `params` is the operator's heading, in source order; the typechecker
@@ -33,6 +46,7 @@ pub enum ParamKind {
 pub struct OperSig {
     pub params: Vec<(&'static str, ParamKind)>,
     pub return_type: Type,
+    pub purity: Purity,
 }
 
 /// Registry of every built-in operator known to the typechecker.
@@ -49,6 +63,7 @@ impl Builtins {
             OperSig {
                 params: vec![("message", ParamKind::Concrete(Type::Text))],
                 return_type: Type::unit(),
+                purity: Purity::SideEffecting,
             },
         );
         // `write_relation { rel: Relation H }` — polymorphic; the
@@ -58,6 +73,7 @@ impl Builtins {
             OperSig {
                 params: vec![("rel", ParamKind::AnyRelation)],
                 return_type: Type::unit(),
+                purity: Purity::SideEffecting,
             },
         );
         Self { opers }
@@ -95,6 +111,7 @@ mod tests {
         assert_eq!(sig.params[0].0, "message");
         assert!(matches!(sig.params[0].1, ParamKind::Concrete(Type::Text)));
         assert!(matches!(sig.return_type, Type::Tuple(ref h) if h.is_empty()));
+        assert_eq!(sig.purity, Purity::SideEffecting);
     }
 
     #[test]
@@ -105,6 +122,7 @@ mod tests {
         assert_eq!(sig.params[0].0, "rel");
         assert!(matches!(sig.params[0].1, ParamKind::AnyRelation));
         assert!(matches!(sig.return_type, Type::Tuple(ref h) if h.is_empty()));
+        assert_eq!(sig.purity, Purity::SideEffecting);
     }
 
     #[test]

@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 pub mod rc;
 pub mod relation;
+pub mod sqlite;
 
 pub use rc::{
     coddl_rc_alloc, coddl_rc_release, coddl_rc_retain, live_allocations, CoddlKind, CoddlRcHeader,
@@ -29,6 +30,10 @@ pub use rc::{
 pub use relation::{
     coddl_extract_check_cardinality, coddl_relation_seal, coddl_relation_where,
     coddl_write_relation, CoddlAttrDesc, CoddlAttrKind, CoddlHeadingDesc,
+};
+pub use sqlite::{
+    coddl_begin_tx, coddl_commit_tx, coddl_resolve_op_field, coddl_rollback_tx,
+    coddl_sqlite_relvar_init,
 };
 
 /// FFI error codes. `0` is success; any nonzero value is a failure whose
@@ -82,6 +87,12 @@ pub unsafe extern "C" fn coddl_runtime_init() -> CoddlStatus {
 /// Must be the last runtime call from the compiled program.
 #[no_mangle]
 pub unsafe extern "C" fn coddl_runtime_shutdown() -> CoddlStatus {
+    // Defense in depth: codegen emits one `coddl_rc_release` per
+    // public-relvar slot before this call, but the runtime walks its
+    // own slot table too so a missed release doesn't leak the SQLite
+    // connection. Connections are dropped here, closing every open
+    // handle.
+    sqlite::shutdown_storage();
     INITIALIZED.store(0, Ordering::SeqCst);
     CoddlStatus::Ok
 }

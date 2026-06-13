@@ -113,6 +113,8 @@ pub fn check(source: &str, file: FileId, file_kind: FileKind) -> CheckOutput {
         diagnostics: parse_out.diagnostics,
         hints: Vec::new(),
         relvars: RelvarTable::new(),
+        transaction_depth: 0,
+        public_relvars: HashSet::new(),
     };
     match file_kind {
         FileKind::Cd => {
@@ -145,6 +147,16 @@ struct TypeChecker {
     diagnostics: Vec<Diagnostic>,
     hints: Vec<TypeHint>,
     relvars: RelvarTable,
+    /// How many `transaction [...]` blocks the current walk is nested
+    /// inside. Bumped by `check_transaction_expr` around its body. Used
+    /// to gate T0025 (public-relvar reference outside any transaction)
+    /// and T0026 (side-effecting call inside one).
+    transaction_depth: usize,
+    /// Names that resolve to public relvars in this file, populated at
+    /// `check_oper_decl` entry from the `RelvarTable`. A `NameRef` whose
+    /// lexeme is in this set produces a `Type::Relation(H)` and — if
+    /// `transaction_depth == 0` — fires T0025.
+    public_relvars: HashSet<String>,
 }
 
 impl TypeChecker {
@@ -439,6 +451,22 @@ impl TypeChecker {
         let mut scope = Scope::default();
         scope.push(); // operator parameter layer
 
+        // Seed the scope with every public relvar in this file. A bare
+        // `Greetings` in expression position then resolves to
+        // `Type::Relation(H)` via the standard scope-lookup path. The
+        // parallel `public_relvars` set records which names are
+        // relvars so NameRef can apply the T0025 transaction-scope
+        // rule (RM Pre 14 / OO Pre 4: every public-relvar access lives
+        // inside a `transaction [...]`).
+        self.public_relvars.clear();
+        for (name, info) in self.relvars.iter() {
+            if matches!(info.kind, RelvarKind::Public) {
+                let ty = Type::Relation(info.heading.clone());
+                scope.insert(name.to_string(), ty);
+                self.public_relvars.insert(name.to_string());
+            }
+        }
+
         // Resolve declared parameters into the parameter layer.
         // Duplicate names are rejected here so the body sees a
         // well-formed scope.
@@ -630,6 +658,21 @@ impl TypeChecker {
                 };
                 let name = ident.text();
                 if let Some(ty) = scope.lookup(name) {
+                    // A public-relvar reference is allowed only inside
+                    // a `transaction [...]` block — that's where the
+                    // runtime can safely begin/commit (or replay on
+                    // serialization failure). RM Pre 14 + OO Pre 4 in
+                    // combination: D forbids autocommit; the typechecker
+                    // makes the wrap explicit at every access site.
+                    if self.public_relvars.contains(name) && self.transaction_depth == 0 {
+                        self.error(
+                            self.token_span(&ident),
+                            "T0025",
+                            format!(
+                                "public relvar `{name}` referenced outside any `transaction [...]` block"
+                            ),
+                        );
+                    }
                     return ty.clone();
                 }
                 self.error(
@@ -956,12 +999,17 @@ impl TypeChecker {
     fn check_transaction_expr(&mut self, txn: &TransactionExpr, scope: &mut Scope) -> Type {
         // `transaction [ ... ]` is a block expression; its value is
         // the body block's value. The scope push gates inner
-        // bindings from leaking out.
+        // bindings from leaking out. The depth bump lets NameRef and
+        // check_call enforce T0025 / T0026 — transactions must be
+        // replayable, so public-relvar access is allowed and side
+        // effects are forbidden inside them.
         scope.push();
+        self.transaction_depth += 1;
         let ty = match txn.body() {
             Some(b) => self.check_block(&b, scope),
             None => Type::unit(),
         };
+        self.transaction_depth -= 1;
         scope.pop();
         ty
     }
@@ -990,6 +1038,22 @@ impl TypeChecker {
             );
             return Type::Unknown;
         };
+
+        // Transactions must be pure so the runtime can replay them on
+        // serialization conflict. Side-effecting builtins (write_line,
+        // write_relation) are blocked here; the surface rule extends to
+        // user-defined opers once they carry a derived purity flag.
+        if self.transaction_depth > 0
+            && matches!(sig.purity, crate::builtins::Purity::SideEffecting)
+        {
+            self.error(
+                self.token_span(&callee_name_tok),
+                "T0026",
+                format!(
+                    "side-effecting operator `{callee_name}` called inside `transaction [...]` (transactions must be pure)"
+                ),
+            );
+        }
 
         // Walk the actual argument list against the declared parameters.
         let mut seen: HashSet<String> = HashSet::new();
@@ -1775,5 +1839,96 @@ mod tests {
     fn extract_on_non_relation_diagnoses_t0024() {
         let src = "oper main {} [ let t = extract 42; ];";
         assert!(codes(src).contains(&"T0024"));
+    }
+
+    // ── public relvars + transaction scope (Phase 22) ────────────────
+
+    const HELLO_DB_PRELUDE: &str = "program p; \
+                                    database greetings; \
+                                    public relvar Greetings { id: Integer, message: Text } \
+                                    key { id }; ";
+
+    #[test]
+    fn public_relvar_inside_transaction_checks_clean() {
+        let src = format!(
+            "{}oper main {{}} [ \
+             let g = transaction [ extract (Greetings where id = 1) ]; \
+             write_line {{ message: g.message }}; \
+             ];",
+            HELLO_DB_PRELUDE
+        );
+        let diags = diagnostics(&src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn public_relvar_outside_transaction_diagnoses_t0025() {
+        let src = format!(
+            "{}oper main {{}} [ \
+             let g = extract (Greetings where id = 1); \
+             write_line {{ message: g.message }}; \
+             ];",
+            HELLO_DB_PRELUDE
+        );
+        assert!(
+            codes(&src).contains(&"T0025"),
+            "expected T0025, got {:?}",
+            codes(&src)
+        );
+    }
+
+    #[test]
+    fn private_relvar_outside_transaction_does_not_fire_t0025() {
+        // private relvars are local program state per RM Pre 14;
+        // they aren't database-backed and so don't need a transaction.
+        let src = "program p; \
+                   private relvar Local { id: Integer } key { id }; \
+                   oper main {} [];";
+        assert!(
+            !codes(src).contains(&"T0025"),
+            "T0025 should not fire on private relvars: {:?}",
+            codes(src)
+        );
+    }
+
+    #[test]
+    fn write_line_inside_transaction_diagnoses_t0026() {
+        // `write_line` is SideEffecting; calling it inside a
+        // transaction breaks replay safety.
+        let src = "oper main {} [ \
+                   transaction [ write_line { message: \"x\" } ]; \
+                   ];";
+        assert!(
+            codes(src).contains(&"T0026"),
+            "expected T0026, got {:?}",
+            codes(src)
+        );
+    }
+
+    #[test]
+    fn write_line_outside_transaction_no_t0026() {
+        let src = "oper main {} [ write_line { message: \"x\" }; ];";
+        assert!(
+            !codes(src).contains(&"T0026"),
+            "T0026 should not fire outside transactions: {:?}",
+            codes(src)
+        );
+    }
+
+    #[test]
+    fn pure_ops_inside_transaction_no_t0026() {
+        // Pure ops (extract / where / relation lit / scalar ops) are
+        // all fine inside a transaction.
+        let src = format!(
+            "{}oper main {{}} [ \
+             let g = transaction [ extract (Greetings where id = 1) ]; \
+             ];",
+            HELLO_DB_PRELUDE
+        );
+        assert!(
+            !codes(&src).contains(&"T0026"),
+            "T0026 should not fire on pure ops: {:?}",
+            codes(&src)
+        );
     }
 }

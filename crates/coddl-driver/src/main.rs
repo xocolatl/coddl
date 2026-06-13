@@ -328,8 +328,8 @@ fn cmd_lower(args: &[String]) -> ExitCode {
     if let Err(code) = require_cd(kind, "lower") {
         return code;
     }
-
-    let out = coddl_procir::lower(&source, FileId(0));
+    let plan = discover_plan_for_input(args);
+    let out = coddl_procir::lower_with_plan(&source, FileId(0), plan.as_ref());
 
     if let Some(module) = &out.module {
         let stdout = io::stdout();
@@ -358,7 +358,8 @@ fn cmd_emit_llvm(args: &[String]) -> ExitCode {
         return code;
     }
 
-    let lower_out = coddl_procir::lower(&source, FileId(0));
+    let plan = discover_plan_for_input(args);
+    let lower_out = coddl_procir::lower_with_plan(&source, FileId(0), plan.as_ref());
     for d in &lower_out.diagnostics {
         eprintln!(
             "{}: {} [{}] at {}..{}",
@@ -417,7 +418,8 @@ fn cmd_emit_obj(args: &[String]) -> ExitCode {
         return code;
     }
 
-    let lower_out = coddl_procir::lower(&source, FileId(0));
+    let plan = discover_plan_for_input(&positional);
+    let lower_out = coddl_procir::lower_with_plan(&source, FileId(0), plan.as_ref());
     for d in &lower_out.diagnostics {
         eprintln!(
             "{}: {} [{}] at {}..{}",
@@ -539,10 +541,58 @@ fn print_diagnostics(diagnostics: &[Diagnostic]) {
     }
 }
 
+/// Discover the Phase 16 plan for a `.cd` file input, if the first
+/// positional argument names one. Stdin and other non-path inputs
+/// return `None`. Plan diagnostics print to stderr; the caller can
+/// still decide whether to bail.
+fn discover_plan_for_input(positional: &[String]) -> Option<coddl_plan::Plan> {
+    let cd_path = positional
+        .first()
+        .filter(|s| s.as_str() != "-")
+        .map(PathBuf::from)?;
+    let out = coddl_plan::discover_and_validate(&cd_path);
+    for d in &out.diagnostics {
+        eprintln!(
+            "{}: {} [{}] at {}..{}",
+            d.severity, d.message, d.code, d.span.start, d.span.end
+        );
+    }
+    if out
+        .diagnostics
+        .iter()
+        .any(|d| d.severity == Severity::Error)
+    {
+        return None;
+    }
+    out.plan
+}
+
 /// Lower `source` to ProcIR. Returns `None` if any error diagnostic
 /// was emitted; diagnostics print to stderr unconditionally.
-fn lower_or_bail(source: &str) -> Option<coddl_procir::Module> {
-    let out = coddl_procir::lower(source, FileId(0));
+///
+/// When `cd_path` is `Some` (`.cd` input came from a file path, not
+/// stdin), the driver first runs Phase 16 plan discovery against the
+/// companion `.cddb` / `.cdstore`. Plan diagnostics flow through the
+/// same channel; on success, the resolved `Plan` is passed to
+/// `lower_with_plan` so public-relvar references resolve and `main`
+/// gets per-relvar init/release wrapping. Stdin and standalone (no
+/// public relvars) inputs go through the legacy plan-less path.
+fn lower_or_bail(source: &str, cd_path: Option<&Path>) -> Option<coddl_procir::Module> {
+    let plan = if let Some(path) = cd_path {
+        let plan_out = coddl_plan::discover_and_validate(path);
+        print_diagnostics(&plan_out.diagnostics);
+        if plan_out
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Severity::Error)
+        {
+            return None;
+        }
+        plan_out.plan
+    } else {
+        None
+    };
+    let out = coddl_procir::lower_with_plan(source, FileId(0), plan.as_ref());
     print_diagnostics(&out.diagnostics);
     if out
         .diagnostics
@@ -607,7 +657,12 @@ fn cmd_compile(args: &[String]) -> ExitCode {
     if let Err(code) = require_cd(kind, "compile") {
         return code;
     }
-    let Some(module) = lower_or_bail(&source) else {
+    let cd_path = parsed
+        .positional
+        .first()
+        .filter(|s| s.as_str() != "-")
+        .map(PathBuf::from);
+    let Some(module) = lower_or_bail(&source, cd_path.as_deref()) else {
         return ExitCode::from(1);
     };
 
@@ -674,7 +729,12 @@ fn cmd_run(args: &[String]) -> ExitCode {
     if let Err(code) = require_cd(kind, "run") {
         return code;
     }
-    let Some(module) = lower_or_bail(&source) else {
+    let cd_path = parsed
+        .positional
+        .first()
+        .filter(|s| s.as_str() != "-")
+        .map(PathBuf::from);
+    let Some(module) = lower_or_bail(&source, cd_path.as_deref()) else {
         return ExitCode::from(1);
     };
 

@@ -31,6 +31,14 @@ pub struct Plan {
     /// One entry per public relvar in `.cd` that resolved end-to-end
     /// through the chain.
     pub resolved: Vec<ResolvedPublicRelvar>,
+    /// Default database file path baked into the binary at compile time.
+    /// Comes from the `.cdstore`'s `backend sqlite { file: "..."; }`
+    /// directive, canonicalized against the `.cdstore`'s parent directory
+    /// when relative. `None` for non-SQLite backends, when the directive
+    /// is absent, or when the program has no public relvars. The runtime
+    /// resolver applies `CODDL_<DBNAME>_FILE` env override before falling
+    /// back to this default.
+    pub db_file_default: Option<String>,
 }
 
 /// One public relvar's full resolution: from the application-side

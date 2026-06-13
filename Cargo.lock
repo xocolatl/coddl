@@ -266,6 +266,7 @@ name = "coddl-procir"
 version = "0.0.0"
 dependencies = [
  "coddl-diagnostics",
+ "coddl-plan",
  "coddl-syntax",
  "coddl-types",
 ]
@@ -287,6 +288,8 @@ dependencies = [
  "coddl-diagnostics",
  "coddl-execlocal",
  "coddl-sqlemit",
+ "rusqlite",
+ "tempfile",
 ]
 
 [[package]]

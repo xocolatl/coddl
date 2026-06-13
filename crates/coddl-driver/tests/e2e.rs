@@ -668,6 +668,167 @@ fn extract_aborts_on_multi_tuples() {
     );
 }
 
+// ── Phase 22: hello-world-db (public relvar + SQLite) ────────────────
+
+/// Build (or refresh) the `examples/hello-world-db/greetings.sqlite`
+/// fixture via the shipped seed script. The script is idempotent: it
+/// removes any existing `.sqlite` file before re-seeding. Required
+/// because the file is gitignored. Guarded against concurrent
+/// invocation so the parallel test scheduler doesn't race on the
+/// `rm -f` + `sqlite3 ...` sequence.
+fn ensure_hello_world_db_seeded() {
+    use std::sync::OnceLock;
+    static SEEDED: OnceLock<()> = OnceLock::new();
+    SEEDED.get_or_init(|| {
+        let script = workspace_root().join("examples/hello-world-db/seed-db.sh");
+        assert!(
+            script.exists(),
+            "seed script missing at {}",
+            script.display()
+        );
+        let status = Command::new("sh")
+            .arg(&script)
+            .status()
+            .expect("invoke seed-db.sh");
+        assert!(status.success(), "seed-db.sh failed");
+    });
+}
+
+#[test]
+fn hello_world_db_llvm_backend_prints_message() {
+    ensure_runtime_built();
+    ensure_hello_world_db_seeded();
+    let cd = example_path("hello-world-db");
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=llvm {:?} failed: stderr=\n{}",
+        cd,
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(out.stdout, b"hello world\n");
+}
+
+#[test]
+fn hello_world_db_cranelift_backend_prints_message() {
+    ensure_runtime_built();
+    ensure_hello_world_db_seeded();
+    let cd = example_path("hello-world-db");
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=cranelift {:?} failed: stderr=\n{}",
+        cd,
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(out.stdout, b"hello world\n");
+}
+
+#[test]
+fn hello_world_db_byte_identical_across_backends() {
+    ensure_runtime_built();
+    ensure_hello_world_db_seeded();
+    let cd = example_path("hello-world-db");
+    let llvm = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl (llvm)");
+    let cl = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl (cranelift)");
+    assert!(llvm.status.success(), "llvm run failed");
+    assert!(cl.status.success(), "cranelift run failed");
+    assert_eq!(
+        llvm.stdout, cl.stdout,
+        "byte equality violated:\n  llvm={:?}\n  cranelift={:?}",
+        String::from_utf8_lossy(&llvm.stdout),
+        String::from_utf8_lossy(&cl.stdout)
+    );
+}
+
+#[test]
+fn hello_world_db_env_var_override_picks_alternate_path() {
+    ensure_runtime_built();
+    ensure_hello_world_db_seeded();
+    // Re-seed a parallel fixture with a different message; point the
+    // env override at it; assert the override path actually flows
+    // through to materialization. Same `.cd` source; different DB →
+    // different stdout.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let alt = tmp.path().join("alt.sqlite");
+    let alt_str = alt.display().to_string();
+    let status = Command::new("sh")
+        .args(["-c"])
+        .arg(format!(
+            "sqlite3 '{alt_str}' \"CREATE TABLE greetings (id INTEGER PRIMARY KEY, message TEXT NOT NULL); INSERT INTO greetings (id, message) VALUES (1, 'override hello');\""
+        ))
+        .status()
+        .expect("invoke sqlite3");
+    assert!(status.success(), "alt SQLite seed failed");
+
+    let cd = example_path("hello-world-db");
+    let out = coddl()
+        .env("CODDL_GREETINGS_FILE", &alt)
+        .args(["run", "--backend=llvm"])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run with override failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"override hello\n");
+}
+
+#[test]
+fn public_relvar_outside_transaction_diagnoses_t0025() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cd_path = tmp.path().join("bad.cd");
+    let cddb_path = tmp.path().join("greetings.cddb");
+    let cdstore_path = tmp.path().join("greetings.cdstore");
+    std::fs::write(
+        &cd_path,
+        "program bad; database greetings; \
+         public relvar Greetings { id: Integer, message: Text } key { id }; \
+         oper main {} [ let g = extract (Greetings where id = 1); ];",
+    )
+    .expect("write cd");
+    std::fs::write(
+        &cddb_path,
+        "database greetings; base relvar Greetings { id: Integer, message: Text } key { id };",
+    )
+    .expect("write cddb");
+    std::fs::write(
+        &cdstore_path,
+        "store for greetings; backend sqlite { file: \"x.sqlite\" }; \
+         relvar Greetings: table \"g\" { columns: { id: \"id\", message: \"message\" } };",
+    )
+    .expect("write cdstore");
+    let out = coddl()
+        .args(["check"])
+        .arg(&cd_path)
+        .output()
+        .expect("spawn coddl");
+    assert!(!out.status.success(), "expected check to fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("T0025"),
+        "stderr didn't carry T0025: {stderr}"
+    );
+}
+
 #[test]
 fn coddl_run_unknown_backend_fails_clearly() {
     // No `ensure_runtime_built()` needed — we never get to linking.

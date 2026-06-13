@@ -25,6 +25,23 @@ pub struct Module {
     /// by their index into this vector. Stable across iterations
     /// (push-only — never reorder once an id is handed out).
     pub headings: Vec<Heading>,
+    /// Plan-resolved public relvars referenced by this program, in
+    /// source declaration order. Each entry drives codegen of one
+    /// static slot global + one runtime materialization call in
+    /// `main`'s prologue and one release in its epilogue. Empty when
+    /// the source has no public relvars (or no plan was supplied).
+    pub public_relvars: Vec<PublicRelvarBinding>,
+    /// Default SQLite database path baked into the binary at compile
+    /// time — canonicalised, absolute. `None` when the program declares
+    /// no public relvars. Runtime resolution applies an env-var
+    /// override before falling back to this default (see
+    /// `coddl_resolve_op_field`).
+    pub db_path_default: Option<String>,
+    /// Database name from the `database <name>;` binding in the `.cd`
+    /// source. Used by the runtime resolver to build the env-var key
+    /// (`CODDL_<DB_UPPER>_FILE`). `None` when the program declares
+    /// no public relvars.
+    pub db_name: Option<String>,
 }
 
 impl Module {
@@ -46,6 +63,28 @@ impl Module {
 /// lifetime; rendered as `heading_<n>` in IR text.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct HeadingId(pub u32);
+
+/// One public-relvar entry on a `Module`. The codegen layer turns each
+/// entry into one slot global + one materialization call + one release;
+/// the runtime materializer reads `table_name` + `columns` to prepare
+/// the right SELECT against the SQLite catalog. Column order is
+/// heading-canonical (attribute-name sorted), matching the
+/// per-attribute byte layout `record_layout` produces.
+#[derive(Clone, Debug)]
+pub struct PublicRelvarBinding {
+    /// Application-side name (e.g. `Greetings`).
+    pub name: String,
+    /// Heading id into `Module::headings`; identifies which static
+    /// descriptor backs the materialization payload.
+    pub heading_id: HeadingId,
+    /// Physical SQLite table name from the `.cdstore` binding.
+    pub table_name: String,
+    /// Physical column names, paired with the application-side
+    /// attribute names. In heading-canonical order. The
+    /// app-name / col-name split lets future `.cdstore` rename clauses
+    /// land without a schema change here.
+    pub columns: Vec<(String, String)>,
+}
 
 /// A function — either a defined one (non-empty `blocks`) or an extern
 /// declaration (`blocks.is_empty()`).
@@ -199,6 +238,33 @@ pub enum Inst {
     Extract {
         dst: ValueId,
         src: ValueId,
+        heading_id: HeadingId,
+    },
+    /// Materialize one public relvar from SQLite at program start and
+    /// stash the resulting RC pointer in its slot global. Emitted once
+    /// per public relvar in `main`'s prologue, after
+    /// `coddl_runtime_init` and before the body. The static
+    /// `(table_name, columns, db_name, default_path, descriptor)`
+    /// fields live on the corresponding `Module::public_relvars`
+    /// entry; backends look up by `name`. Lowers to a single call to
+    /// `coddl_sqlite_relvar_init`.
+    RelvarSlotInit {
+        name: String,
+        heading_id: HeadingId,
+    },
+    /// Release the RC pointer in the named relvar's slot. Emitted once
+    /// per public relvar in `main`'s epilogue, before
+    /// `coddl_runtime_shutdown`. Backends load the slot's pointer +
+    /// call `coddl_rc_release`.
+    RelvarSlotRelease { name: String },
+    /// Read a public relvar's currently-materialized value into a new
+    /// SSA value. Backends emit `load ptr from @<name>_slot` + a
+    /// `coddl_rc_retain` so the consumer holds its own refcount; the
+    /// lowerer's existing temp-source release logic frees it if the
+    /// consumer doesn't bind it.
+    RelvarRead {
+        dst: ValueId,
+        name: String,
         heading_id: HeadingId,
     },
 }
@@ -410,6 +476,15 @@ impl fmt::Display for Inst {
                 src,
                 heading_id,
             } => write!(f, "{dst} = extract {src} heading_{}", heading_id.0),
+            Inst::RelvarSlotInit { name, heading_id } => {
+                write!(f, "relvar_slot_init {name} heading_{}", heading_id.0)
+            }
+            Inst::RelvarSlotRelease { name } => write!(f, "relvar_slot_release {name}"),
+            Inst::RelvarRead {
+                dst,
+                name,
+                heading_id,
+            } => write!(f, "{dst} = relvar_read {name} heading_{}", heading_id.0),
         }
     }
 }
@@ -492,6 +567,16 @@ impl fmt::Display for Module {
         if !self.headings.is_empty() {
             writeln!(f)?;
         }
+        for r in &self.public_relvars {
+            writeln!(
+                f,
+                "  public_relvar {} : heading_{} table \"{}\"",
+                r.name, r.heading_id.0, r.table_name
+            )?;
+        }
+        if !self.public_relvars.is_empty() {
+            writeln!(f)?;
+        }
         for func in &self.functions {
             writeln!(f, "{func}")?;
         }
@@ -545,6 +630,9 @@ mod tests {
             program_name: "hello_world".to_string(),
             functions: vec![extern_write_line()],
             headings: Vec::new(),
+            public_relvars: Vec::new(),
+            db_path_default: None,
+            db_name: None,
         };
         let text = format!("{m}");
         assert!(text.starts_with("module hello_world {"));
@@ -558,6 +646,9 @@ mod tests {
             program_name: "hello_world".to_string(),
             functions: vec![extern_write_line(), defined_main()],
             headings: Vec::new(),
+            public_relvars: Vec::new(),
+            db_path_default: None,
+            db_name: None,
         };
         let text = format!("{m}");
         assert!(text.contains("block_0:"), "no block label in:\n{text}");
