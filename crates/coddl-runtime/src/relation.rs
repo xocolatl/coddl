@@ -227,6 +227,64 @@ unsafe fn print_cell<W: Write>(w: &mut W, attr: &CoddlAttrDesc, record: &[u8]) {
 /// Called only by `coddl_rc_release` when refcount reaches zero. The
 /// header must already have been read; the payload block is freed
 /// after this returns.
+/// Restrict a relation by a predicate. Returns a fresh RC-managed
+/// relation (rc=1) containing the source rows for which
+/// `pred_fn(record_ptr)` is non-zero. `src` is left unchanged.
+///
+/// The output is allocated at worst-case size (`record_size * length`)
+/// then trimmed via the header's `length` field. Filter preserves
+/// the sealed order, so no re-seal is needed.
+///
+/// # Safety
+/// `src` must point to a payload returned by `coddl_rc_alloc` whose
+/// kind is `Relation` and whose header carries the same descriptor
+/// as `desc`. `pred_fn` must be safe to call across the FFI boundary
+/// with arbitrary record pointers from the source payload.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_relation_where(
+    src: *const u8,
+    desc: *const CoddlHeadingDesc,
+    pred_fn: extern "C" fn(*const u8) -> i8,
+) -> *mut u8 {
+    if src.is_null() || desc.is_null() {
+        return std::ptr::null_mut();
+    }
+    let header = src.sub(HEADER_SIZE) as *const CoddlRcHeader;
+    let record_size = (*desc).record_size as usize;
+    let count = (*header).length as usize;
+
+    // Allocate worst-case output.
+    let payload_size = record_size * count;
+    let out = crate::rc::coddl_rc_alloc(
+        payload_size,
+        count as u32,
+        crate::rc::CoddlKind::Relation as u32,
+        desc,
+    );
+    if out.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    // Loop, evaluate, conditional-copy.
+    let mut written: usize = 0;
+    for i in 0..count {
+        let record_ptr = src.add(i * record_size);
+        let keep = (pred_fn)(record_ptr) != 0;
+        if keep {
+            let dst_slot = out.add(written * record_size);
+            std::ptr::copy_nonoverlapping(record_ptr, dst_slot, record_size);
+            written += 1;
+        }
+    }
+
+    // Trim the output's length. Restriction preserves the input's
+    // sorted/deduped order, so no re-seal is needed.
+    let out_header = out.sub(HEADER_SIZE) as *mut CoddlRcHeader;
+    (*out_header).length = written as u32;
+
+    out
+}
+
 pub(crate) unsafe fn drop_relation_payload(_payload: *mut u8, _header: &CoddlRcHeader) {
     // Phase 19: no heap cells to release. Future phases iterate
     // `header.length` records, look at the descriptor's per-attr
@@ -279,6 +337,55 @@ mod tests {
             assert_eq!(std::ptr::read(slot(0)), 1);
             assert_eq!(std::ptr::read(slot(1)), 2);
             coddl_rc_release(payload);
+        }
+    }
+
+    /// Predicate function used by `where_keeps_matching_records`.
+    /// Returns 1 iff the i64 at offset 0 is `2`.
+    extern "C" fn equals_two(record: *const u8) -> i8 {
+        unsafe {
+            let v = *(record as *const i64);
+            if v == 2 {
+                1
+            } else {
+                0
+            }
+        }
+    }
+
+    #[test]
+    fn where_keeps_matching_records() {
+        let attrs = [CoddlAttrDesc {
+            name: b"a".as_ptr(),
+            name_len: 1,
+            kind: CoddlAttrKind::Integer as u32,
+            offset: 0,
+        }];
+        let desc = CoddlHeadingDesc {
+            attr_count: 1,
+            record_size: 8,
+            attrs: attrs.as_ptr(),
+        };
+        unsafe {
+            // Build source: { {a:1}, {a:2}, {a:3} } (pre-sealed).
+            let src = coddl_rc_alloc(
+                3 * 8,
+                3,
+                CoddlKind::Relation as u32,
+                &desc as *const CoddlHeadingDesc,
+            );
+            std::ptr::write(src.add(0) as *mut i64, 1);
+            std::ptr::write(src.add(8) as *mut i64, 2);
+            std::ptr::write(src.add(16) as *mut i64, 3);
+
+            let filtered = coddl_relation_where(src, &desc, equals_two);
+            assert!(!filtered.is_null());
+            let header = filtered.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*header).length, 1);
+            assert_eq!(std::ptr::read(filtered as *const i64), 2);
+
+            coddl_rc_release(filtered);
+            coddl_rc_release(src);
         }
     }
 

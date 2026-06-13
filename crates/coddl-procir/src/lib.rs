@@ -16,8 +16,8 @@ pub mod lower;
 
 pub use codegen::Codegen;
 pub use ir::{
-    BasicBlock, BlockId, Const, Function, Heading, HeadingId, Inst, Module, ProcType, Terminator,
-    Type, ValueId,
+    BasicBlock, BlockId, Const, Function, Heading, HeadingId, Inst, Module, ProcType, ScalarOp,
+    Terminator, Type, ValueId,
 };
 pub use layout::{cell_kind, cell_width, kind_tag, record_layout, AttrLayout, RecordLayout};
 pub use lower::{lower, LowerOutput};

@@ -11,9 +11,9 @@ use std::collections::{HashMap, HashSet};
 
 use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{
-    AstNode, Block, CallExpr, Expr, ExprStmt, FieldAccess, Heading as AstHeading, Item, KeyClause,
-    LetStmt, NamedArg, OperDecl, PrivateRelvarDecl, ProgramDecl, PublicRelvarDecl, RelationLit,
-    Root, Stmt, TransactionExpr, TupleLit,
+    AstNode, BinaryExpr, BinaryOp, Block, CallExpr, Expr, ExprStmt, FieldAccess,
+    Heading as AstHeading, Item, KeyClause, LetStmt, NamedArg, OperDecl, PrivateRelvarDecl,
+    ProgramDecl, PublicRelvarDecl, RelationLit, Root, Stmt, TransactionExpr, TupleLit,
 };
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
@@ -651,6 +651,8 @@ impl TypeChecker {
             Expr::TupleLit(t) => self.check_tuple_lit(t, scope),
             Expr::RelationLit(r) => self.check_relation_lit(r, scope),
             Expr::FieldAccess(f) => self.check_field_access(f, scope),
+            Expr::BoolLit(_) => Type::Boolean,
+            Expr::Binary(b) => self.check_binary_expr(b, scope),
         }
     }
 
@@ -766,6 +768,153 @@ impl TypeChecker {
                 Type::Unknown
             }
         }
+    }
+
+    /// Walk a binary infix expression. Dispatches on the parsed
+    /// `BinaryOp`. Comparison and logical ops are scalar with Boolean
+    /// result. The `Where` op is relational: lhs must be `Relation H`,
+    /// rhs is a predicate typechecked in a scope augmented with the
+    /// heading's attributes, and the result is `Relation H`.
+    fn check_binary_expr(&mut self, bin: &BinaryExpr, scope: &mut Scope) -> Type {
+        let op = match bin.op_kind() {
+            Some(op) => op,
+            None => return Type::Unknown,
+        };
+        match op {
+            BinaryOp::Where => self.check_where_binary(bin, scope),
+            BinaryOp::And | BinaryOp::Or => self.check_logical_op(bin, op, scope),
+            BinaryOp::Eq | BinaryOp::NotEq => self.check_equality_op(bin, op, scope),
+            BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => {
+                self.check_ordering_op(bin, op, scope)
+            }
+        }
+    }
+
+    /// `R where pred` — restriction. Lhs must be relational; rhs
+    /// typechecks with the operand's heading attributes injected
+    /// into a fresh scope layer.
+    fn check_where_binary(&mut self, bin: &BinaryExpr, scope: &mut Scope) -> Type {
+        let lhs_ty = match bin.lhs() {
+            Some(e) => self.check_expr(&e, scope),
+            None => return Type::Unknown,
+        };
+        let heading = match &lhs_ty {
+            Type::Relation(h) => h.clone(),
+            Type::Unknown => return Type::Unknown,
+            other => {
+                let span = bin
+                    .lhs()
+                    .map(|e| self.node_span(e.syntax()))
+                    .unwrap_or_else(|| self.node_span(bin.syntax()));
+                self.error(
+                    span,
+                    "T0023",
+                    format!("`where` expects a Relation on the left, got {other}"),
+                );
+                return Type::Unknown;
+            }
+        };
+        // Inject heading attributes as bindings in a fresh scope
+        // layer. `Scope::lookup` walks innermost-first so heading
+        // attributes shadow any outer locals with the same name.
+        scope.push();
+        for (name, ty) in heading.attrs() {
+            scope.insert(name.clone(), ty.clone());
+        }
+        let rhs_ty = match bin.rhs() {
+            Some(e) => self.check_expr(&e, scope),
+            None => Type::Unknown,
+        };
+        scope.pop();
+        // Predicate must be Boolean (or Unknown for error recovery).
+        if !matches!(rhs_ty, Type::Boolean | Type::Unknown) {
+            let span = bin
+                .rhs()
+                .map(|e| self.node_span(e.syntax()))
+                .unwrap_or_else(|| self.node_span(bin.syntax()));
+            self.error(
+                span,
+                "T0020",
+                format!("`where` predicate must be Boolean, got {rhs_ty}"),
+            );
+        }
+        Type::Relation(heading)
+    }
+
+    /// `lhs and rhs` / `lhs or rhs` — both operands must be Boolean,
+    /// result is Boolean.
+    fn check_logical_op(&mut self, bin: &BinaryExpr, op: BinaryOp, scope: &mut Scope) -> Type {
+        let lhs_ty = match bin.lhs() {
+            Some(e) => self.check_expr(&e, scope),
+            None => Type::Unknown,
+        };
+        let rhs_ty = match bin.rhs() {
+            Some(e) => self.check_expr(&e, scope),
+            None => Type::Unknown,
+        };
+        for (operand_ty, side) in [(&lhs_ty, "left"), (&rhs_ty, "right")] {
+            if !matches!(operand_ty, Type::Boolean | Type::Unknown) {
+                let opname = op_display(op);
+                let target = if side == "left" { bin.lhs() } else { bin.rhs() };
+                let span = target
+                    .map(|e| self.node_span(e.syntax()))
+                    .unwrap_or_else(|| self.node_span(bin.syntax()));
+                self.error(
+                    span,
+                    "T0021",
+                    format!("`{opname}` expects Boolean on the {side}, got {operand_ty}"),
+                );
+            }
+        }
+        Type::Boolean
+    }
+
+    /// `lhs = rhs` / `lhs <> rhs` — operands must share a scalar type
+    /// (Integer or Boolean for v1). Result is Boolean.
+    fn check_equality_op(&mut self, bin: &BinaryExpr, op: BinaryOp, scope: &mut Scope) -> Type {
+        let lhs_ty = match bin.lhs() {
+            Some(e) => self.check_expr(&e, scope),
+            None => Type::Unknown,
+        };
+        let rhs_ty = match bin.rhs() {
+            Some(e) => self.check_expr(&e, scope),
+            None => Type::Unknown,
+        };
+        let supported = |t: &Type| matches!(t, Type::Integer | Type::Boolean | Type::Unknown);
+        if !supported(&lhs_ty) || !supported(&rhs_ty) || !lhs_ty.assignable_to(&rhs_ty) {
+            let opname = op_display(op);
+            self.error(
+                self.node_span(bin.syntax()),
+                "T0021",
+                format!(
+                    "`{opname}` operands must share a scalar type (Integer or Boolean); got {lhs_ty} vs {rhs_ty}"
+                ),
+            );
+        }
+        Type::Boolean
+    }
+
+    /// `lhs < rhs` / `lhs > rhs` / `lhs <= rhs` / `lhs >= rhs` —
+    /// operands must both be Integer (Phase 20). Result is Boolean.
+    fn check_ordering_op(&mut self, bin: &BinaryExpr, op: BinaryOp, scope: &mut Scope) -> Type {
+        let lhs_ty = match bin.lhs() {
+            Some(e) => self.check_expr(&e, scope),
+            None => Type::Unknown,
+        };
+        let rhs_ty = match bin.rhs() {
+            Some(e) => self.check_expr(&e, scope),
+            None => Type::Unknown,
+        };
+        let supported = |t: &Type| matches!(t, Type::Integer | Type::Unknown);
+        if !supported(&lhs_ty) || !supported(&rhs_ty) {
+            let opname = op_display(op);
+            self.error(
+                self.node_span(bin.syntax()),
+                "T0021",
+                format!("`{opname}` requires Integer operands; got {lhs_ty} vs {rhs_ty}"),
+            );
+        }
+        Type::Boolean
     }
 
     fn check_transaction_expr(&mut self, txn: &TransactionExpr, scope: &mut Scope) -> Type {
@@ -907,6 +1056,22 @@ impl TypeChecker {
                 );
             }
         }
+    }
+}
+
+/// Human-readable form of a binary operator, used in T0020/T0021
+/// diagnostic messages. Surfaces the same lexeme the user typed.
+fn op_display(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Eq => "=",
+        BinaryOp::NotEq => "<>",
+        BinaryOp::Lt => "<",
+        BinaryOp::Gt => ">",
+        BinaryOp::LtEq => "<=",
+        BinaryOp::GtEq => ">=",
+        BinaryOp::And => "and",
+        BinaryOp::Or => "or",
+        BinaryOp::Where => "where",
     }
 }
 
@@ -1476,5 +1641,71 @@ mod tests {
                    let r = Relation { {a: 1}, {a: \"x\"} }; \
                    ];";
         assert!(codes(src).contains(&"T0019"));
+    }
+
+    // ── Binary infix + where (Phase 20) ──────────────────────────────
+
+    #[test]
+    fn comparison_returns_boolean() {
+        // Use the result as a Boolean argument to `write_relation`'s
+        // polymorphic param — no, that wants a Relation. Easier:
+        // assign to a let and the typechecker's hint surfaces the
+        // inferred type as Boolean; for now just confirm no diags.
+        let src = "oper main {} [ let b = 1 = 2; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn where_on_relation_filter_checks_clean() {
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1}, {a: 2} }; \
+                   let s = r where a = 2; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn where_non_boolean_predicate_diagnoses_t0020() {
+        // Predicate is `1` (Integer) — not Boolean. T0020 fires.
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1} }; \
+                   let s = r where 1; \
+                   ];";
+        assert!(codes(src).contains(&"T0020"));
+    }
+
+    #[test]
+    fn scalar_op_type_mismatch_diagnoses_t0021() {
+        // `1 = \"x\"` mixes Integer with Text — T0021 fires.
+        let src = "oper main {} [ let b = 1 = \"x\"; ];";
+        assert!(codes(src).contains(&"T0021"));
+    }
+
+    #[test]
+    fn where_non_relation_lhs_diagnoses_t0023() {
+        let src = "oper main {} [ let s = 1 where true; ];";
+        assert!(codes(src).contains(&"T0023"));
+    }
+
+    #[test]
+    fn where_heading_attrs_shadow_outer_locals() {
+        // Outer `a` is Text; the predicate's `a` must resolve to the
+        // heading's Integer attribute, so the comparison `a = 2`
+        // (Integer = Integer) typechecks cleanly.
+        let src = "oper main {} [ \
+                   let a = \"outer\"; \
+                   let r = Relation { {a: 1}, {a: 2} }; \
+                   let s = r where a = 2; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn and_or_on_non_boolean_diagnoses_t0021() {
+        let src = "oper main {} [ let b = 1 and 2; ];";
+        assert!(codes(src).contains(&"T0021"));
     }
 }

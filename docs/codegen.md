@@ -110,6 +110,35 @@ whenever `Module::headings` is non-empty (an empty headings table
 means no relation-shaped instructions exist and no rc/seal/write
 symbol gets referenced).
 
+### Predicate helpers + `where` (Phase 20)
+
+Each `where`-site lowers to a fresh helper Function in
+`Module::functions`, named `__coddl_where_<n>`. The helper's signature
+is `fn(*const u8) -> i8` (Boolean return at the C ABI; LLVM widens
+i1 → i8 at the return site, Cranelift uses I8 natively). Body:
+per-attribute `AttrLoad` at entry + the user's predicate lowered to
+`ScalarOp` chains + `Return(Some(value))`. The runtime extern
+`coddl_relation_where(src, desc, pred_fn) -> ptr` is declared
+alongside the other rc externs whenever the module has any heading
+interned.
+
+Backends seed parameter SSA values at function entry. The lowerer's
+convention: the first N fresh ValueIds in a function are the function's
+N declared params (in source order). LLVM inserts directly into
+`self.values` keyed on the SSA name produced by `push_param_decl`;
+Cranelift calls `builder.append_block_params_for_function_params` on
+the entry block and binds each block param to the corresponding
+ValueId. For Text/Binary params, two consecutive ABI slots combine
+into one `ValueRepr::Text { ptr, len }`.
+
+The `Boolean` ABI:
+
+- **LLVM**: `llvm_value_type(Boolean) = "i1"` (the SSA repr).
+  `llvm_return_type(Boolean) = "i8"` (the C ABI repr). The return
+  emission widens via `zext i1 → i8` before the `ret`.
+- **Cranelift**: `cranelift_value_type(Boolean) = I8` both as SSA and
+  ABI — no conversion needed.
+
 
 ## The `main` special case
 

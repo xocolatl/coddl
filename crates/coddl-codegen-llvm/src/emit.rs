@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 
 use coddl_procir::{
     record_layout, BasicBlock, Codegen, Const, Function, HeadingId, Inst, Module, ProcType,
-    Terminator, Type, ValueId,
+    ScalarOp, Terminator, Type, ValueId,
 };
 
 use crate::error::LlvmEmitError;
@@ -167,6 +167,9 @@ impl Emitter {
         writeln!(self.body, "declare void @coddl_rc_release(ptr)").unwrap();
         writeln!(self.body, "declare void @coddl_relation_seal(ptr, ptr)").unwrap();
         writeln!(self.body, "declare void @coddl_write_relation(ptr, ptr)").unwrap();
+        // Phase 20 `where`: takes (src, desc, pred_fn) and returns
+        // a fresh relation pointer (rc=1).
+        writeln!(self.body, "declare ptr @coddl_relation_where(ptr, ptr, ptr)").unwrap();
     }
 
     /// Emit the three globals that describe one heading: a per-attr
@@ -288,6 +291,43 @@ impl Emitter {
         }
         self.values.clear();
 
+        // Seed `self.values` with the function's parameters. The
+        // lowerer's convention is that the first N fresh ValueIds in
+        // each function map 1:1 to the function's params (in the
+        // declared order). Phase 20's predicate helpers exercise this
+        // — record_ptr is param 0, allocated as ValueId(0) in
+        // `lower_where_expr`. The seeding matches the SSA names
+        // `push_param_decl` writes into the signature.
+        for (i, (pname, pty)) in func.params.iter().enumerate() {
+            let vid = ValueId(i as u32);
+            match pty {
+                ProcType::Text | ProcType::Binary => {
+                    self.values.insert(
+                        vid,
+                        ValueRepr::Text {
+                            ptr_op: format!("%{pname}.ptr"),
+                            len_op: format!("%{pname}.len"),
+                        },
+                    );
+                }
+                ProcType::Tuple(_) => {
+                    return Err(LlvmEmitError::UnsupportedInst(
+                        "Tuple-typed parameters not yet supported in defined functions".into(),
+                    ));
+                }
+                other => {
+                    let ty = llvm_value_type(other).to_string();
+                    self.values.insert(
+                        vid,
+                        ValueRepr::Scalar {
+                            ty,
+                            op: format!("%{pname}"),
+                        },
+                    );
+                }
+            }
+        }
+
         writeln!(
             self.body,
             "define {ret_ty} @{linkage}({args}) {{",
@@ -297,19 +337,24 @@ impl Emitter {
         .unwrap();
 
         for block in &func.blocks {
-            self.emit_block(block, is_main)?;
+            self.emit_block(block, is_main, &func.return_type)?;
         }
 
         writeln!(self.body, "}}").unwrap();
         Ok(())
     }
 
-    fn emit_block(&mut self, block: &BasicBlock, is_main: bool) -> Result<(), LlvmEmitError> {
+    fn emit_block(
+        &mut self,
+        block: &BasicBlock,
+        is_main: bool,
+        return_type: &ProcType,
+    ) -> Result<(), LlvmEmitError> {
         writeln!(self.body, "{}:", block.id).unwrap();
         for inst in &block.insts {
             self.emit_inst(inst)?;
         }
-        self.emit_terminator(&block.terminator, is_main)?;
+        self.emit_terminator(&block.terminator, is_main, return_type)?;
         Ok(())
     }
 
@@ -333,6 +378,23 @@ impl Emitter {
                     ValueRepr::Scalar {
                         ty: "i64".to_string(),
                         op: format!("{n}"),
+                    },
+                );
+                Ok(())
+            }
+            Inst::Const {
+                dst,
+                value: Const::Boolean(b),
+                ty: ProcType::Boolean,
+            } => {
+                // Boolean SSA is `i1` in LLVM. Widening to i8 at the
+                // C-ABI boundary happens at return sites (predicate
+                // functions).
+                self.values.insert(
+                    *dst,
+                    ValueRepr::Scalar {
+                        ty: "i1".to_string(),
+                        op: (if *b { "1" } else { "0" }).to_string(),
                     },
                 );
                 Ok(())
@@ -421,7 +483,168 @@ impl Emitter {
                 .unwrap();
                 Ok(())
             }
+            Inst::ScalarOp {
+                dst,
+                op,
+                operand_type,
+                lhs,
+                rhs,
+            } => self.lower_scalar_op(*dst, *op, operand_type, lhs, rhs),
+            Inst::AttrLoad {
+                dst,
+                src,
+                offset,
+                attr_type,
+            } => self.lower_attr_load(*dst, src, *offset, attr_type),
+            Inst::Where {
+                dst,
+                src,
+                predicate_linkage,
+                heading_id,
+            } => self.lower_where_inst(*dst, src, predicate_linkage, *heading_id),
         }
+    }
+
+    /// Emit a comparison or logical op on scalar SSA values. Result
+    /// type is always `i1`.
+    fn lower_scalar_op(
+        &mut self,
+        dst: ValueId,
+        op: ScalarOp,
+        operand_type: &ProcType,
+        lhs: &ValueId,
+        rhs: &ValueId,
+    ) -> Result<(), LlvmEmitError> {
+        let lhs_op = self.scalar_op(lhs)?;
+        let rhs_op = self.scalar_op(rhs)?;
+        let dst_name = format!("%v{}", dst.0);
+        let operand_ty = llvm_value_type(operand_type);
+        match op {
+            ScalarOp::And | ScalarOp::Or => {
+                let instr = if matches!(op, ScalarOp::And) { "and" } else { "or" };
+                writeln!(
+                    self.body,
+                    "    {dst_name} = {instr} i1 {lhs_op}, {rhs_op}"
+                )
+                .unwrap();
+            }
+            _ => {
+                let pred = match op {
+                    ScalarOp::Eq => "eq",
+                    ScalarOp::NotEq => "ne",
+                    ScalarOp::Lt => "slt",
+                    ScalarOp::Gt => "sgt",
+                    ScalarOp::LtEq => "sle",
+                    ScalarOp::GtEq => "sge",
+                    ScalarOp::And | ScalarOp::Or => unreachable!(),
+                };
+                writeln!(
+                    self.body,
+                    "    {dst_name} = icmp {pred} {operand_ty} {lhs_op}, {rhs_op}"
+                )
+                .unwrap();
+            }
+        }
+        self.values.insert(
+            dst,
+            ValueRepr::Scalar {
+                ty: "i1".to_string(),
+                op: dst_name,
+            },
+        );
+        Ok(())
+    }
+
+    /// Read one attribute from a record pointer at the static byte
+    /// offset. Phase 20 cells are Integer/Boolean (i64 in memory) and
+    /// Text (a 16-byte `(ptr, len)` pair). Boolean cells round-trip
+    /// through `i64 → trunc i1` so the SSA value type matches
+    /// `llvm_value_type(Boolean)`.
+    fn lower_attr_load(
+        &mut self,
+        dst: ValueId,
+        src: &ValueId,
+        offset: u32,
+        attr_type: &ProcType,
+    ) -> Result<(), LlvmEmitError> {
+        let src_op = self.scalar_op(src)?;
+        match attr_type {
+            ProcType::Integer => {
+                let slot = self.gep_byte(&src_op, offset as usize);
+                let name = format!("%v{}", dst.0);
+                writeln!(self.body, "    {name} = load i64, ptr {slot}").unwrap();
+                self.values.insert(
+                    dst,
+                    ValueRepr::Scalar {
+                        ty: "i64".to_string(),
+                        op: name,
+                    },
+                );
+                Ok(())
+            }
+            ProcType::Boolean => {
+                let slot = self.gep_byte(&src_op, offset as usize);
+                // The relation cell encodes Boolean as i64; pull the
+                // raw 64-bit slot and truncate to i1.
+                let raw = format!("%v{}.raw", dst.0);
+                writeln!(self.body, "    {raw} = load i64, ptr {slot}").unwrap();
+                let name = format!("%v{}", dst.0);
+                writeln!(self.body, "    {name} = trunc i64 {raw} to i1").unwrap();
+                self.values.insert(
+                    dst,
+                    ValueRepr::Scalar {
+                        ty: "i1".to_string(),
+                        op: name,
+                    },
+                );
+                Ok(())
+            }
+            ProcType::Text => {
+                let ptr_slot = self.gep_byte(&src_op, offset as usize);
+                let len_slot = self.gep_byte(&src_op, offset as usize + 8);
+                let ptr_name = format!("%v{}.ptr", dst.0);
+                let len_name = format!("%v{}.len", dst.0);
+                writeln!(self.body, "    {ptr_name} = load ptr, ptr {ptr_slot}").unwrap();
+                writeln!(self.body, "    {len_name} = load i64, ptr {len_slot}").unwrap();
+                self.values.insert(
+                    dst,
+                    ValueRepr::Text {
+                        ptr_op: ptr_name,
+                        len_op: len_name,
+                    },
+                );
+                Ok(())
+            }
+            other => Err(LlvmEmitError::UnsupportedInst(format!(
+                "AttrLoad of type {other:?} not yet supported"
+            ))),
+        }
+    }
+
+    /// Emit `call ptr @coddl_relation_where(src, &desc, &pred)`.
+    fn lower_where_inst(
+        &mut self,
+        dst: ValueId,
+        src: &ValueId,
+        predicate_linkage: &str,
+        heading_id: HeadingId,
+    ) -> Result<(), LlvmEmitError> {
+        let src_op = self.scalar_op(src)?;
+        let name = format!("%v{}", dst.0);
+        writeln!(
+            self.body,
+            "    {name} = call ptr @coddl_relation_where(ptr {src_op}, ptr @.heading.{}, ptr @{predicate_linkage})",
+            heading_id.0,
+        )
+        .unwrap();
+        self.values.insert(
+            dst,
+            ValueRepr::Scalar {
+                ty: "ptr".to_string(),
+                op: name,
+            },
+        );
+        Ok(())
     }
 
     /// Read out a `Scalar { ty: ptr, op }` for an RC-managed pointer
@@ -636,7 +859,12 @@ impl Emitter {
         Ok(())
     }
 
-    fn emit_terminator(&mut self, term: &Terminator, is_main: bool) -> Result<(), LlvmEmitError> {
+    fn emit_terminator(
+        &mut self,
+        term: &Terminator,
+        is_main: bool,
+        return_type: &ProcType,
+    ) -> Result<(), LlvmEmitError> {
         match term {
             Terminator::Return(None) if is_main => {
                 writeln!(self.body, "    ret i32 0").unwrap();
@@ -654,7 +882,21 @@ impl Emitter {
                     .clone();
                 match repr {
                     ValueRepr::Scalar { ty, op } => {
-                        writeln!(self.body, "    ret {ty} {op}").unwrap();
+                        // Predicate functions declare `i8` at the C
+                        // ABI for Boolean returns, but the SSA value
+                        // type is `i1`. Insert a `zext` so the IR
+                        // type-checks.
+                        if matches!(return_type, ProcType::Boolean) && ty == "i1" {
+                            let widened = format!("{op}.b");
+                            writeln!(
+                                self.body,
+                                "    {widened} = zext i1 {op} to i8"
+                            )
+                            .unwrap();
+                            writeln!(self.body, "    ret i8 {widened}").unwrap();
+                        } else {
+                            writeln!(self.body, "    ret {ty} {op}").unwrap();
+                        }
                     }
                     ValueRepr::Text { .. } => {
                         return Err(LlvmEmitError::UnsupportedInst(
@@ -682,6 +924,10 @@ fn llvm_return_type(ty: &ProcType) -> String {
     match ty {
         ProcType::Unit => "void".to_string(),
         ProcType::Tuple(h) if h.is_empty() => "void".to_string(),
+        // Booleans cross the C ABI as `i8` (matches Rust's `bool`
+        // repr); inside an LLVM function the SSA is `i1` and gets
+        // zext'd at the return site.
+        ProcType::Boolean => "i8".to_string(),
         other => llvm_value_type(other).to_string(),
     }
 }

@@ -27,7 +27,8 @@ pub use rc::{
     HEADER_SIZE, IMMORTAL_RC,
 };
 pub use relation::{
-    coddl_relation_seal, coddl_write_relation, CoddlAttrDesc, CoddlAttrKind, CoddlHeadingDesc,
+    coddl_relation_seal, coddl_relation_where, coddl_write_relation, CoddlAttrDesc, CoddlAttrKind,
+    CoddlHeadingDesc,
 };
 
 /// FFI error codes. `0` is success; any nonzero value is a failure whose

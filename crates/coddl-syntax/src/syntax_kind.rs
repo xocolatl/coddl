@@ -125,6 +125,9 @@ pub enum SyntaxKind {
     TUPLE_LIT,
     RELATION_LIT,
     SEQUENCE_LIT,
+    /// `true` / `false` — Boolean literal. Wraps the contextual-keyword
+    /// IDENT token; the typechecker reads `.text()` to pick the value.
+    BOOL_LITERAL,
 
     /// `{ name: value, name: value, … }` named-argument list at a call
     /// site. Distinguished from `HEADING` (types) and `TUPLE_LIT`

@@ -519,21 +519,33 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
-    /// An expression. Parses a primary, then chains postfix forms:
-    /// brace-delimited call (`<expr>{ … }`) and dot-prefixed field
-    /// access (`<expr>.<name>`). The loop iterates so chained postfix
-    /// (`f{}.x`, `t.a.b`, etc.) works uniformly.
+    /// An expression. Driven by a precedence-climbing Pratt walker:
+    /// primary → postfix loop (call, field access) → infix loop
+    /// (comparison, logical, `where`). Postfix binds tighter than
+    /// every infix operator; among infix operators, the precedence
+    /// ladder from lowest to highest is `where`(0) < `or`(1) < `and`(2)
+    /// < comparison(3). All Phase-20 infix operators are
+    /// left-associative.
     fn parse_expr(&mut self) {
+        self.parse_expr_prec(0);
+    }
+
+    /// Parse an expression, only consuming operators whose precedence
+    /// is `>= min_prec`. The caller picks `min_prec` to control how
+    /// far an operator's right operand is allowed to extend.
+    fn parse_expr_prec(&mut self, min_prec: u8) {
         // Flush any leading trivia into the parent node before the
         // checkpoint — otherwise a retroactive `start_node_at(cp, …)`
-        // for CALL_EXPR / FIELD_ACCESS would wrap the trivia inside the
-        // expression.
+        // for CALL_EXPR / FIELD_ACCESS / BINARY_EXPR would wrap the
+        // trivia inside the expression.
         self.bump_trivia();
         let cp = self.checkpoint();
         if !self.parse_primary_expr() {
             return;
         }
 
+        // Postfix loop — these bind tighter than any infix op and
+        // are independent of precedence.
         loop {
             match self.current() {
                 SyntaxKind::L_BRACE => {
@@ -553,6 +565,44 @@ impl<'a> Parser<'a> {
                 _ => break,
             }
         }
+
+        // Infix loop. Peek the next operator; if its precedence is
+        // below `min_prec`, return and let the caller handle it.
+        // Otherwise wrap the lhs in a BINARY_EXPR, bump the operator
+        // token (or keyword IDENT), and recurse for the rhs at
+        // `prec + 1` (left-associative).
+        while let Some(prec) = self.peek_infix_prec() {
+            if prec < min_prec {
+                break;
+            }
+            self.start_node_at(cp, SyntaxKind::BINARY_EXPR);
+            self.bump_trivia();
+            self.bump(); // operator token or keyword IDENT
+            // Missing-rhs (e.g. `1 = ;`) surfaces as P0014 from the
+            // inner `parse_primary_expr` — no dedicated code needed.
+            self.parse_expr_prec(prec + 1);
+            self.finish_node();
+        }
+    }
+
+    /// Peek the next infix operator's precedence. Returns `None` if
+    /// the cursor isn't on a recognized infix operator. Operators
+    /// recognized by token kind: `=`, `<>`, `<`, `>`, `<=`, `>=` (all
+    /// at prec 3). Operators recognized by contextual-keyword IDENT:
+    /// `and` (2), `or` (1), `where` (0).
+    fn peek_infix_prec(&self) -> Option<u8> {
+        match self.current() {
+            SyntaxKind::EQ
+            | SyntaxKind::NOT_EQ
+            | SyntaxKind::LT
+            | SyntaxKind::GT
+            | SyntaxKind::LT_EQ
+            | SyntaxKind::GT_EQ => Some(3),
+            SyntaxKind::IDENT if self.at_keyword("and") => Some(2),
+            SyntaxKind::IDENT if self.at_keyword("or") => Some(1),
+            SyntaxKind::IDENT if self.at_keyword("where") => Some(0),
+            _ => None,
+        }
     }
 
     /// A primary expression — the atomic forms an expression can start
@@ -564,6 +614,16 @@ impl<'a> Parser<'a> {
         }
         if self.at_keyword("Relation") {
             self.parse_relation_lit();
+            return true;
+        }
+        // `true` / `false` — contextual-keyword Boolean literal.
+        // Recognized before the generic IDENT branch so the AST gets
+        // a distinct `BOOL_LITERAL` node rather than a NAME_REF.
+        if self.at_keyword("true") || self.at_keyword("false") {
+            self.bump_trivia();
+            self.start_node(SyntaxKind::BOOL_LITERAL);
+            self.bump(); // IDENT
+            self.finish_node();
             return true;
         }
         match self.current() {
@@ -1743,6 +1803,118 @@ mod tests {
             "expected P0033, got {:?}",
             out.diagnostics
         );
+    }
+
+    // ── Infix operators + bool literals + `where` (Phase 20) ────────
+
+    #[test]
+    fn true_false_parse_as_bool_literals() {
+        let out = parse_str("oper f {} [ let t = true; let g = false; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let bools: Vec<_> = out
+            .tree
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::BOOL_LITERAL)
+            .collect();
+        assert_eq!(bools.len(), 2);
+        assert_eq!(bools[0].text(), "true");
+        assert_eq!(bools[1].text(), "false");
+    }
+
+    #[test]
+    fn binary_eq_wraps_two_operands_in_binary_expr() {
+        let out = parse_str("oper f {} [ let b = 1 = 2; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let bin = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("BINARY_EXPR in tree");
+        assert_eq!(bin.text().to_string().trim(), "1 = 2");
+    }
+
+    #[test]
+    fn and_binds_tighter_than_or_and_looser_than_comparison() {
+        // `a = 1 and b = 2 or c = 3` →
+        //   ((a = 1) and (b = 2)) or (c = 3)
+        let out = parse_str("oper f {} [ let b = 1 = 1 and 2 = 2 or 3 = 3; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        // The outermost BINARY_EXPR should be `or`; check by walking
+        // from the LET_STMT's value-side expression.
+        let let_stmt = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::LET_STMT)
+            .unwrap();
+        let outer_bin = let_stmt
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("LET_STMT's value is a BINARY_EXPR");
+        // Outer op is `or` — the rhs is the lone `3 = 3`.
+        let outer_text = outer_bin.text().to_string();
+        assert!(outer_text.contains(" or "), "expected `or` at top: {outer_text}");
+        // Inner-most lhs of `or` should be the `and` chain.
+        let inner_bin = outer_bin
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("inner BINARY_EXPR (the `and` chain)");
+        let inner_text = inner_bin.text().to_string();
+        assert!(
+            inner_text.contains(" and "),
+            "expected `and` one level in: {inner_text}"
+        );
+    }
+
+    #[test]
+    fn where_is_lowest_precedence() {
+        // `R where a = 1` parses as `WHERE(R, EQ(a, 1))` — the rhs of
+        // `where` captures the full `a = 1` comparison without parens.
+        let out = parse_str("oper f {} [ let s = R where a = 1; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let let_stmt = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::LET_STMT)
+            .unwrap();
+        let outer = let_stmt
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("outer BINARY_EXPR");
+        let outer_text = outer.text().to_string();
+        assert!(outer_text.contains(" where "), "outer = {outer_text}");
+        // rhs of `where` is the `a = 1` BINARY_EXPR.
+        let inner = outer
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("inner BINARY_EXPR (the `a = 1` comparison)");
+        assert_eq!(inner.text().to_string().trim(), "a = 1");
+    }
+
+    #[test]
+    fn missing_rhs_after_operator_diagnoses_p0014() {
+        // `1 = ;` — the rhs's `parse_primary_expr` sees `;`, emits
+        // P0014 "expected expression". A dedicated P0034 was
+        // considered but deduped per the same logic as Phase 11's
+        // P0011-vs-P0020/P0021 dedup.
+        let out = parse_str("oper f {} [ let b = 1 = ; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0014"),
+            "expected P0014, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn comparison_operators_all_parse() {
+        for op in &["=", "<>", "<", ">", "<=", ">="] {
+            let src = format!("oper f {{}} [ let b = 1 {op} 2; ];");
+            let out = parse_str(&src);
+            assert!(
+                out.diagnostics.is_empty(),
+                "operator `{op}` failed: {:?}",
+                out.diagnostics
+            );
+        }
     }
 
     fn find_first(root: &crate::cst::SyntaxNode, kind: SyntaxKind) -> crate::cst::SyntaxNode {

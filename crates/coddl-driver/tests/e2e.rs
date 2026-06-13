@@ -442,6 +442,93 @@ fn relation_lit_byte_identical_across_backends() {
     assert_eq!(llvm.stdout, b"{a: 1}\n{a: 2}\n");
 }
 
+// ── `where` restriction (Phase 20) ────────────────────────────────────
+
+const WHERE_FILTER_SRC: &str = "\
+program where_filter;
+oper main {} [
+    let r = Relation { {a: 1}, {a: 2}, {a: 3} };
+    write_relation { rel: r where a = 2 };
+];
+";
+
+fn write_where_filter(tmp: &tempfile::TempDir) -> PathBuf {
+    let src_path = tmp.path().join("where-filter.cd");
+    std::fs::write(&src_path, WHERE_FILTER_SRC).expect("write where-filter.cd");
+    src_path
+}
+
+#[test]
+fn where_llvm_backend_filters_to_single_match() {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = write_where_filter(&tmp);
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(&src)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "where-filter LLVM run failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"{a: 2}\n");
+}
+
+#[test]
+fn where_cranelift_backend_filters_to_single_match() {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = write_where_filter(&tmp);
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(&src)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "where-filter Cranelift run failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"{a: 2}\n");
+}
+
+#[test]
+fn where_byte_identical_across_backends() {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = write_where_filter(&tmp);
+    let llvm = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(&src)
+        .output()
+        .expect("spawn LLVM");
+    assert!(
+        llvm.status.success(),
+        "LLVM run failed: stderr=\n{}",
+        String::from_utf8_lossy(&llvm.stderr)
+    );
+    let cranelift = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(&src)
+        .output()
+        .expect("spawn Cranelift");
+    assert!(
+        cranelift.status.success(),
+        "Cranelift run failed: stderr=\n{}",
+        String::from_utf8_lossy(&cranelift.stderr)
+    );
+    assert_eq!(
+        llvm.stdout,
+        cranelift.stdout,
+        "where-filter backends disagree:\n  LLVM:      {:?}\n  Cranelift: {:?}",
+        String::from_utf8_lossy(&llvm.stdout),
+        String::from_utf8_lossy(&cranelift.stdout)
+    );
+    assert_eq!(llvm.stdout, b"{a: 2}\n");
+}
+
 #[test]
 fn coddl_run_unknown_backend_fails_clearly() {
     // No `ensure_runtime_built()` needed — we never get to linking.

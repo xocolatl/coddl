@@ -256,15 +256,31 @@ function that implements it.
 <let-stmt>      ::= 'let' <identifier> [ ':' <type-ref> ]
                     '=' <expr> ';' ;                           -- parse_let_stmt
 
-<expr>          ::= <primary-expr> { <postfix> } ;            -- parse_expr
+<expr>          ::= <expr-prec> ;                            -- parse_expr
+<expr-prec>     ::= <primary-expr> { <postfix> } { <infix-op> <expr-prec> } ;
+                                                               -- parse_expr_prec
+                    -- Pratt precedence ladder; left-associative.
+                    -- min_prec drives which operators may be
+                    -- consumed; the parser recurses with `prec + 1`
+                    -- for each rhs.
+<infix-op>      ::= 'where'                                    -- prec 0
+                  | 'or'                                       -- prec 1
+                  | 'and'                                      -- prec 2
+                  | '=' | '<>' | '<' | '>' | '<=' | '>=' ;     -- prec 3
+                    -- `where`, `and`, `or` are contextual
+                    -- keywords; the symbolic forms are token kinds
+                    -- already lexed (Eq, Lt, Gt, LtEq, GtEq,
+                    -- NotEq).
 <postfix>       ::= <arg-list>                                 -- call: CALL_EXPR
                   | <field-access-tail> ;                      -- field access: FIELD_ACCESS
 <field-access-tail> ::= '.' <identifier> ;
 <primary-expr>  ::= <name-ref>
                   | <literal>
+                  | <bool-lit>
                   | <transaction-expr>
                   | <tuple-lit>
                   | <relation-lit> ;                           -- parse_primary_expr
+<bool-lit>      ::= 'true' | 'false' ;                         -- BOOL_LITERAL
 <transaction-expr> ::= 'transaction' <block> ;                 -- parse_transaction_expr
 <name-ref>      ::= <identifier> ;
 <arg-list>      ::= '{' [ <named-arg> commalist ] '}' ;        -- parse_arg_list
@@ -314,8 +330,12 @@ the parser. Listed here so the omission is explicit, not implied:
 - **Type / relvar / constraint declarations** at the top level.
 - **Literals**: sequence `[ … ]` in expression position. (Tuple
   `{ … }` literals and dot-prefix field access landed in Phase 18.
-  Relation literals `Relation { … }` landed in Phase 19.)
+  Relation literals `Relation { … }` landed in Phase 19. Boolean
+  literals `true` / `false` and infix `=`, `<>`, `<`, `>`, `<=`,
+  `>=`, `and`, `or`, `where` landed in Phase 20.)
 - **Indexing** (`s[i]`) in expression postfix position.
+- **Arithmetic** (`+`, `-`, `*`, `/`, `mod`). Reserved precedence
+  slot above comparison; not yet parsed.
 - **Pattern matching**, **`if`/`else`**, **anonymous opers**.
 
 

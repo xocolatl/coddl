@@ -165,6 +165,8 @@ each `parse_<x>` has a corresponding `check_<x>`.
   - `TupleLit` is `check_tuple_lit`.
   - `RelationLit` is `check_relation_lit`.
   - `FieldAccess` is `check_field_access`.
+  - `BoolLit` types as `Boolean`.
+  - `Binary` is `check_binary_expr`.
 - **`check_transaction_expr`** — pushes a scope layer, walks the
   body with `check_block`, pops the layer, and returns the body's
   result type.
@@ -203,6 +205,26 @@ each `parse_<x>` has a corresponding `check_<x>`.
   args emit `T0004`. The per-call-site heading is carried through
   the lowerer's `value_types` map and into the backend via
   `Inst::WriteRelation`'s `heading_id` field.
+- **`check_binary_expr`** — dispatches on the parsed `BinaryOp`:
+  - **Comparison (`=`, `<>`)**: operands must share a scalar type
+    (Integer or Boolean for v1). Result is `Boolean`. T0021 on
+    mismatch.
+  - **Ordering (`<`, `>`, `<=`, `>=`)**: both operands must be
+    Integer. Result is `Boolean`. T0021 otherwise.
+  - **Logical (`and`, `or`)**: both operands must be Boolean.
+    Result is `Boolean`. T0021 otherwise.
+  - **`where`**: lhs must be `Relation H` (T0023 if not). A fresh
+    scope layer is pushed with the heading's attributes as
+    bindings, then the rhs (predicate) is checked; the predicate
+    must be `Boolean` (T0020 otherwise). The scope is popped after
+    the predicate. Result is `Relation H` (lhs's type unchanged).
+- **Capture deferral (T0022)** — Phase 20 deferred capture support
+  for `where` predicates. The typechecker's scope lookup walks
+  innermost-first so an outer let binding would technically
+  resolve; the **lowerer** detects this case (NameRef misses in
+  the predicate's heading-scope but hits the saved enclosing
+  scope) and emits T0022. Future phase will lift this restriction
+  via a user_data pointer threaded through `coddl_relation_where`.
 
 
 ## Typecheck diagnostics
@@ -232,3 +254,7 @@ check script enforces that.
 | T0017 | Unknown field name in tuple field access                 |
 | T0018 | Empty relation literal — no inference context for heading |
 | T0019 | Tuple heading mismatch in relation literal                |
+| T0020 | `where` predicate must be Boolean                         |
+| T0021 | Scalar operator operand type mismatch                     |
+| T0022 | Captured identifier in `where` predicate not yet supported |
+| T0023 | `where` left operand is not a relation                    |

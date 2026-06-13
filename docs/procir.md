@@ -30,7 +30,7 @@ A ProcIR `Module` is one compilation unit. Field-by-field:
 | `BasicBlock`   | `id: BlockId`, `insts: Vec<Inst>`, `terminator: Terminator` |
 | `BlockId`      | `u32`                                                   |
 | `ValueId`      | `u32` — SSA value name, rendered `%n`                   |
-| `Const`        | `Integer(i64)`, `Text(Vec<u8>)`, `Unit`                 |
+| `Const`        | `Integer(i64)`, `Text(Vec<u8>)`, `Boolean(bool)`, `Unit` |
 | `ProcType`     | `Integer`, `Rational`, `Approximate`, `Text`, `Character`, `Binary`, `Byte`, `Boolean`, `Unit`, `Pointer`, `Tuple(Heading)`, `Relation(HeadingId)` |
 
 Key invariants the lowering pass and the backends both rely on:
@@ -75,6 +75,9 @@ Key invariants the lowering pass and the backends both rely on:
 | `Retain`             | `src: ValueId` (relation pointer)                                         | —                     | Increment the refcount of `src`. Backend lowers to `call coddl_rc_retain`. Emitted by the lowerer when a `let` RHS is a `NameRef` to an already-bound heap value. |
 | `Release`            | `src: ValueId` (relation pointer)                                         | —                     | Decrement the refcount of `src`; the drop walker runs on the runtime side when the count reaches zero. Backend lowers to `call coddl_rc_release`. Emitted at scope-exit for every heap-typed local. |
 | `WriteRelation`      | `rel: ValueId`, `heading_id: HeadingId`                                    | —                     | Print the relation in canonical-heading order (one tuple per line). Backend lowers to `call coddl_write_relation(rel, &@.heading.<id>)`. The polymorphic `write_relation` surface builtin lowers to this instead of a generic `Inst::Call` so backends don't need to special-case the per-call descriptor lookup. |
+| `ScalarOp`           | `op: ScalarOp`, `operand_type: ProcType`, `lhs: ValueId`, `rhs: ValueId`  | `dst: ValueId`        | Scalar comparison or Boolean op. `ScalarOp` is `Eq` / `NotEq` / `Lt` / `Gt` / `LtEq` / `GtEq` / `And` / `Or`. Result is always `Boolean`. Backends lower to native `icmp` / `and` / `or`. |
+| `AttrLoad`           | `src: ValueId` (record pointer), `offset: u32`, `attr_type: ProcType`     | `dst: ValueId`        | Read one attribute from a record pointer at the given byte offset. Used inside predicate helper functions. Backends emit `getelementptr i8 + load`. Width inferred from `attr_type`. |
+| `Where`              | `src: ValueId` (relation), `predicate_linkage: String`, `heading_id: HeadingId` | `dst: ValueId`   | Restrict `src` by the named predicate. Backends emit `call coddl_relation_where(src, &descriptor, &predicate_fn)`. Result is a fresh `Relation` (rc=1). |
 
 ## Terminator table
 
@@ -109,6 +112,10 @@ walk shape. Each `check_<x>` in `coddl-types::checker` has a sibling
 | `Expr::RelationLit` | Lowers each nested `TupleLit`, interns the first tuple's `Heading` into `Module::headings` (getting a `HeadingId`), then emits `Inst::RelationLit { dst, tuples, heading_id }`. `dst` is recorded as `ProcType::Relation(heading_id)` so downstream uses (field reads, write_relation calls, scope-exit releases) can route through `value_types`. |
 | Surface `write_relation { rel: r }` | Special-cased in `lower_call`. The `rel` argument is lowered the usual way; its tracked `ProcType::Relation(id)` gives the heading id directly. The lowerer emits `Inst::WriteRelation { rel, heading_id }` rather than going through the generic `Inst::Call` path. |
 | RC discipline | The lowerer emits `Inst::Retain` when a `let` RHS is a `NameRef` resolving to an existing heap-typed binding (so both bindings hold a count). At scope-exit (transaction exit, function epilogue) it emits `Inst::Release` for every heap-typed local. Fresh `Inst::RelationLit` results start at rc=1 and don't need a retain on their first bind. |
+| `Expr::BoolLit` | `Inst::Const { value: Const::Boolean(b), ty: Boolean }`. |
+| `Expr::Binary` (scalar) | Lowers lhs and rhs, then emits `Inst::ScalarOp { dst, op, operand_type, lhs, rhs }`. The `operand_type` is the lhs's tracked `ProcType` (which equals rhs's per typecheck). Result is `Boolean`. |
+| `Expr::Binary` (Where) | Synthesizes a per-site predicate Function named `__coddl_where_<n>`. The function takes a single `record_ptr: Pointer` param; its body pre-emits `Inst::AttrLoad` for each heading attribute (binding each by name in a fresh scope), then lowers the user predicate against that scope, then returns the Boolean ValueId. The enclosing function emits `Inst::Where { dst, src, predicate_linkage, heading_id }`. Capture detection: the predicate lowerer holds a snapshot of the enclosing function's `locals` in `outer_locals_for_capture`; a NameRef miss in the predicate scope that hits the snapshot emits T0022 and the lowerer returns no module. |
+| Parameters → ValueIds | The lowerer's convention: the first N fresh ValueIds in a function map 1:1 to the function's params in source-declared order. Backends seed their per-function value maps at entry — LLVM via direct `self.values` insertion against the param SSA name (`%record_ptr`); Cranelift via `builder.append_block_params_for_function_params` on the entry block. |
 
 Locals share the same `ValueId` namespace as computed values —
 there's no separate "variable" concept in ProcIR. A `let x = expr`

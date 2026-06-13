@@ -12,16 +12,18 @@
 
 use std::collections::{HashMap, HashSet};
 
-use coddl_diagnostics::{Diagnostic, FileId, Severity};
+use coddl_diagnostics::{Diagnostic, FileId, Severity, Span};
 use coddl_syntax::ast::{
-    AstNode, Block, CallExpr, Expr, ExprStmt, FieldAccess, Item, LetStmt, Literal, NamedArg,
-    OperDecl, ProgramDecl, RelationLit, Root, Stmt, TransactionExpr, TupleLit,
+    AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, Expr, ExprStmt, FieldAccess, Item,
+    LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, RelationLit, Root, Stmt,
+    TransactionExpr, TupleLit,
 };
 use coddl_syntax::SyntaxKind;
 use coddl_types::{check, Heading, Type};
 
 use crate::ir::{
-    BasicBlock, BlockId, Const, Function, HeadingId, Inst, Module, ProcType, Terminator, ValueId,
+    BasicBlock, BlockId, Const, Function, HeadingId, Inst, Module, ProcType, ScalarOp, Terminator,
+    ValueId,
 };
 
 /// Surface name → C-ABI linkage name for each runtime extern. The
@@ -67,11 +69,18 @@ pub fn lower(source: &str, file: FileId) -> LowerOutput {
         };
     }
     let root = Root::cast(check_out.tree).expect("parser always returns a Root");
-    let mut lowerer = Lowerer::new();
+    let mut lowerer = Lowerer::new(file);
     let module = lowerer.lower_root(&root);
+    // Merge in any diagnostics the lowerer itself emitted (e.g.
+    // T0022 for captures in `where` predicates). If the lowerer
+    // emitted error-severity diagnostics, the IR is unsafe to
+    // codegen — return no module.
+    let mut diagnostics = check_out.diagnostics;
+    diagnostics.extend(lowerer.diagnostics);
+    let lower_errored = diagnostics.iter().any(|d| d.severity == Severity::Error);
     LowerOutput {
-        module: Some(module),
-        diagnostics: check_out.diagnostics,
+        module: if lower_errored { None } else { Some(module) },
+        diagnostics,
     }
 }
 
@@ -85,6 +94,15 @@ struct Lowerer {
     /// reference these by id. Order is push-only (id == index).
     headings: Vec<Heading>,
     heading_ids: HashMap<Heading, HeadingId>,
+    /// Source file for diagnostic spans the lowerer itself emits
+    /// (e.g. T0022 captures).
+    file: FileId,
+    /// Lowering-time diagnostics. Merged into `LowerOutput::diagnostics`
+    /// at the end of `lower()`.
+    diagnostics: Vec<Diagnostic>,
+    /// Counter for synthesized predicate function names
+    /// (`__coddl_where_<n>`). Per-module; never reset.
+    next_where: u32,
     // Per-function state, reset on each `lower_oper_decl`.
     next_value: u32,
     next_block: u32,
@@ -102,22 +120,39 @@ struct Lowerer {
     /// a let-bound tuple, where the heading lives in the source
     /// `ValueId`'s `ProcType::Tuple`).
     value_types: HashMap<ValueId, ProcType>,
+    /// When lowering a `where`-predicate body, this holds a snapshot
+    /// of the enclosing function's `locals` so the NameRef walk can
+    /// detect captures (Phase 20 deferral, T0022). `None` outside any
+    /// predicate body.
+    outer_locals_for_capture: Option<Vec<HashMap<String, (ValueId, ProcType)>>>,
 }
 
 impl Lowerer {
-    fn new() -> Self {
+    fn new(file: FileId) -> Self {
         Self {
             program_name: String::new(),
             functions: Vec::new(),
             seen_externs: HashSet::new(),
             headings: Vec::new(),
             heading_ids: HashMap::new(),
+            file,
+            diagnostics: Vec::new(),
+            next_where: 0,
             next_value: 0,
             next_block: 0,
             insts: Vec::new(),
             locals: vec![HashMap::new()],
             value_types: HashMap::new(),
+            outer_locals_for_capture: None,
         }
+    }
+
+    /// Compute a `Span` for an AST node — used when the lowerer emits
+    /// a diagnostic against a specific subtree (e.g. T0022 against
+    /// the offending `NameRef`).
+    fn node_span(&self, node: &coddl_syntax::cst::SyntaxNode) -> Span {
+        let r = node.text_range();
+        Span::new(self.file, r.start().into(), r.end().into())
     }
 
     /// Intern a heading: return its existing `HeadingId` or push a new
@@ -461,23 +496,190 @@ impl Lowerer {
             Expr::TupleLit(t) => self.lower_tuple_lit(t),
             Expr::RelationLit(r) => self.lower_relation_lit(r),
             Expr::FieldAccess(f) => self.lower_field_access(f),
-            Expr::NameRef(n) => {
-                // First try a let-bound local; that's the only value
-                // source the surface language currently exposes.
-                if let Some(name_tok) = n.ident() {
-                    if let Some((v, _ty)) = self.lookup_local(name_tok.text()) {
-                        return v;
-                    }
+            Expr::BoolLit(b) => self.lower_bool_lit(b),
+            Expr::Binary(b) => self.lower_binary_expr(b),
+            Expr::NameRef(n) => self.lower_name_ref(n),
+        }
+    }
+
+    /// Resolve a `NameRef`. The active `locals` scope is consulted
+    /// first. When inside a `where` predicate
+    /// (`outer_locals_for_capture` is `Some`), a miss in the active
+    /// scope checks the saved outer scope; a hit there is a capture,
+    /// which Phase 20 deferred (T0022). Names that resolve nowhere
+    /// fall through to a Unit placeholder ValueId — diagnostic-free
+    /// input doesn't reach this branch in practice.
+    fn lower_name_ref(&mut self, n: &NameRef) -> ValueId {
+        if let Some(name_tok) = n.ident() {
+            let name = name_tok.text();
+            if let Some((v, _ty)) = self.lookup_local(name) {
+                return v;
+            }
+            if let Some(outer) = &self.outer_locals_for_capture {
+                let captured = outer.iter().rev().any(|l| l.contains_key(name));
+                if captured {
+                    self.diagnostics.push(Diagnostic::error(
+                        self.node_span(n.syntax()),
+                        "T0022",
+                        format!(
+                            "identifier `{name}` is captured from an outer scope; \
+                             `where`-predicate captures are not yet supported"
+                        ),
+                    ));
                 }
-                // Parameter references and any other unconsumed
-                // NameRef fall through to a placeholder. Today no
-                // such case reaches a downstream consumer; record
-                // Unit so `value_type` stays total.
-                let v = self.fresh_value();
-                self.record_type(v, ProcType::Unit);
-                v
             }
         }
+        let v = self.fresh_value();
+        self.record_type(v, ProcType::Unit);
+        v
+    }
+
+    fn lower_bool_lit(&mut self, b: &BoolLit) -> ValueId {
+        let value = b.value().unwrap_or(false);
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Boolean);
+        self.insts.push(Inst::Const {
+            dst,
+            value: Const::Boolean(value),
+            ty: ProcType::Boolean,
+        });
+        dst
+    }
+
+    /// Lower a binary infix expression. Dispatches on the parsed
+    /// op kind. `Where` is the relational case (synthesizes a
+    /// predicate helper Function); everything else is a scalar
+    /// `Inst::ScalarOp`.
+    fn lower_binary_expr(&mut self, bin: &BinaryExpr) -> ValueId {
+        let op = bin.op_kind().expect("typechecked binary expr has an op");
+        if matches!(op, BinaryOp::Where) {
+            return self.lower_where_expr(bin);
+        }
+        let scalar_op = match op {
+            BinaryOp::Eq => ScalarOp::Eq,
+            BinaryOp::NotEq => ScalarOp::NotEq,
+            BinaryOp::Lt => ScalarOp::Lt,
+            BinaryOp::Gt => ScalarOp::Gt,
+            BinaryOp::LtEq => ScalarOp::LtEq,
+            BinaryOp::GtEq => ScalarOp::GtEq,
+            BinaryOp::And => ScalarOp::And,
+            BinaryOp::Or => ScalarOp::Or,
+            BinaryOp::Where => unreachable!("handled above"),
+        };
+        let lhs = bin
+            .lhs()
+            .map(|e| self.lower_expr(&e))
+            .unwrap_or_else(|| self.fresh_value());
+        let rhs = bin
+            .rhs()
+            .map(|e| self.lower_expr(&e))
+            .unwrap_or_else(|| self.fresh_value());
+        let operand_type = self.value_type(lhs);
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Boolean);
+        self.insts.push(Inst::ScalarOp {
+            dst,
+            op: scalar_op,
+            operand_type,
+            lhs,
+            rhs,
+        });
+        dst
+    }
+
+    /// Lower `R where pred`: synthesize a helper function
+    /// `__coddl_where_<n>` that takes a record pointer and returns
+    /// Boolean, populate its body by lowering the predicate against
+    /// a scope whose only entries are the heading's attributes
+    /// (pre-loaded via `Inst::AttrLoad`), then emit `Inst::Where` in
+    /// the enclosing function.
+    fn lower_where_expr(&mut self, bin: &BinaryExpr) -> ValueId {
+        // 1. Lower the relation operand in the enclosing function's
+        //    scope.
+        let src = bin
+            .lhs()
+            .map(|e| self.lower_expr(&e))
+            .expect("typechecked where has a relation lhs");
+        let heading_id = match self.value_type(src) {
+            ProcType::Relation(id) => id,
+            other => unreachable!("where on non-relation `{other}` survived typecheck"),
+        };
+        let heading = self.headings[heading_id.0 as usize].clone();
+        let layout = crate::layout::record_layout(&heading);
+
+        // 2. Mint a fresh predicate function name.
+        let pred_name = format!("__coddl_where_{}", self.next_where);
+        self.next_where += 1;
+
+        // 3. Snapshot the enclosing function's per-function state,
+        //    install a fresh state for the predicate, and stash the
+        //    outer locals on `outer_locals_for_capture` so the
+        //    predicate's NameRef walk can detect captures.
+        let saved_next_value = std::mem::replace(&mut self.next_value, 0);
+        let saved_next_block = std::mem::replace(&mut self.next_block, 0);
+        let saved_insts = std::mem::take(&mut self.insts);
+        let saved_locals = std::mem::replace(&mut self.locals, vec![HashMap::new()]);
+        let saved_value_types = std::mem::take(&mut self.value_types);
+        self.outer_locals_for_capture = Some(saved_locals.clone());
+
+        // 4. Build the predicate body. The function has a single
+        //    parameter `record_ptr: Pointer`. Pre-emit `AttrLoad` for
+        //    each heading attribute at function entry; bind each in
+        //    the predicate scope under its source-level name.
+        let block_id = self.fresh_block();
+        let record_ptr = self.fresh_value();
+        self.record_type(record_ptr, ProcType::Pointer);
+        for attr in &layout.attrs {
+            let attr_type = proc_type_from_kind(attr.kind);
+            let dst = self.fresh_value();
+            self.record_type(dst, attr_type.clone());
+            self.insts.push(Inst::AttrLoad {
+                dst,
+                src: record_ptr,
+                offset: attr.offset,
+                attr_type: attr_type.clone(),
+            });
+            self.bind_local(attr.name.clone(), dst, attr_type);
+        }
+
+        // 5. Lower the predicate body.
+        let pred_value = bin
+            .rhs()
+            .map(|e| self.lower_expr(&e))
+            .expect("typechecked where has a predicate rhs");
+
+        // 6. Close the predicate function.
+        let block = BasicBlock {
+            id: block_id,
+            insts: std::mem::take(&mut self.insts),
+            terminator: Terminator::Return(Some(pred_value)),
+        };
+        self.functions.push(Function {
+            name: pred_name.clone(),
+            linkage_name: pred_name.clone(),
+            params: vec![("record_ptr".to_string(), ProcType::Pointer)],
+            return_type: ProcType::Boolean,
+            blocks: vec![block],
+        });
+
+        // 7. Restore the enclosing function's state.
+        self.next_value = saved_next_value;
+        self.next_block = saved_next_block;
+        self.insts = saved_insts;
+        self.locals = saved_locals;
+        self.value_types = saved_value_types;
+        self.outer_locals_for_capture = None;
+
+        // 8. Emit Inst::Where in the enclosing function.
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Relation(heading_id));
+        self.insts.push(Inst::Where {
+            dst,
+            src,
+            predicate_linkage: pred_name,
+            heading_id,
+        });
+        dst
     }
 
     /// Lower a `{a: e1, b: e2, …}` tuple literal. Each field's
@@ -724,6 +926,20 @@ impl Lowerer {
         let v = self.fresh_value();
         self.record_type(v, ProcType::Unit);
         v
+    }
+}
+
+/// Convert a `record_layout` attribute kind tag to its machine-level
+/// `ProcType`. Mirrors the runtime's `CoddlAttrKind`. Used by the
+/// predicate-function synthesis to type the per-attribute `AttrLoad`
+/// SSA values.
+fn proc_type_from_kind(kind: u32) -> ProcType {
+    use crate::layout::kind_tag;
+    match kind {
+        k if k == kind_tag::INTEGER => ProcType::Integer,
+        k if k == kind_tag::BOOLEAN => ProcType::Boolean,
+        k if k == kind_tag::TEXT => ProcType::Text,
+        other => unreachable!("unsupported attr kind {other} in predicate"),
     }
 }
 
@@ -1268,5 +1484,59 @@ mod tests {
         assert_eq!(names, vec!["a", "z"]);
         let attr_names: Vec<&str> = heading.attrs().iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(attr_names, vec!["a", "z"]);
+    }
+
+    // ── Where + predicate synthesis (Phase 20) ───────────────────────
+
+    #[test]
+    fn where_synthesizes_predicate_function_and_emits_inst_where() {
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1}, {a: 2} }; \
+                   let s = r where a = 2; \
+                   ];";
+        let m = lower_ok(src);
+        // Predicate helper function exists.
+        let pred = m
+            .functions
+            .iter()
+            .find(|f| f.name.starts_with("__coddl_where_"))
+            .expect("synthesized predicate function");
+        assert_eq!(pred.params.len(), 1);
+        assert_eq!(pred.return_type, ProcType::Boolean);
+        // Predicate body contains an AttrLoad + ScalarOp.
+        let pred_insts = &pred.blocks[0].insts;
+        assert!(
+            pred_insts.iter().any(|i| matches!(i, Inst::AttrLoad { .. })),
+            "predicate should AttrLoad heading attrs"
+        );
+        assert!(
+            pred_insts.iter().any(|i| matches!(i, Inst::ScalarOp { .. })),
+            "predicate body should ScalarOp"
+        );
+        // Main contains an Inst::Where.
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let main_insts = &main.blocks[0].insts;
+        assert!(
+            main_insts.iter().any(|i| matches!(i, Inst::Where { .. })),
+            "main should emit Inst::Where"
+        );
+    }
+
+    #[test]
+    fn capture_in_where_predicate_diagnoses_t0022() {
+        // `n` is bound in the enclosing scope, not in the heading. The
+        // lowerer must emit T0022 because Phase 20 deferred captures.
+        let src = "oper main {} [ \
+                   let n = 5; \
+                   let r = Relation { {a: 1}, {a: 2} }; \
+                   let s = r where a = n; \
+                   ];";
+        let out = lower(src, FileId(0));
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "T0022"),
+            "expected T0022, got {:?}",
+            out.diagnostics
+        );
+        assert!(out.module.is_none(), "module should be None on T0022");
     }
 }

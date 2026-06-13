@@ -17,7 +17,7 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use coddl_procir::{
     record_layout, BasicBlock, Codegen, Const, Function, HeadingId, Inst, Module, ProcType,
-    RecordLayout, Terminator, Type, ValueId,
+    RecordLayout, ScalarOp, Terminator, Type, ValueId,
 };
 
 use crate::error::CraneliftEmitError;
@@ -166,6 +166,18 @@ fn declare_runtime_rc_externs(
             .declare_function(name, Linkage::Import, &sig)
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert(name.into(), id);
+    }
+    // coddl_relation_where(src: ptr, desc: ptr, pred_fn: ptr) -> ptr
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.returns.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_relation_where", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_relation_where".into(), id);
     }
     Ok(())
 }
@@ -425,6 +437,38 @@ fn emit_function(
 
     // Walk each ProcIR block.
     let mut values: HashMap<ValueId, ValueRepr> = HashMap::new();
+
+    // Seed the entry block's params from the function signature. The
+    // lowerer's convention is that the first N fresh ValueIds map
+    // 1:1 to the declared params in source order. For Text params,
+    // each contributes two consecutive ABI slots (ptr, len) which
+    // combine into one `ValueRepr::Text`.
+    if let Some(entry_proc_block) = func.blocks.first() {
+        let entry_cl = block_map[&entry_proc_block.id];
+        builder.append_block_params_for_function_params(entry_cl);
+        let bps: Vec<CrValue> = builder.block_params(entry_cl).to_vec();
+        let mut idx = 0usize;
+        for (i, (_pname, pty)) in func.params.iter().enumerate() {
+            let vid = ValueId(i as u32);
+            match pty {
+                ProcType::Text | ProcType::Binary => {
+                    let ptr = bps[idx];
+                    let len = bps[idx + 1];
+                    values.insert(vid, ValueRepr::Text { ptr, len });
+                    idx += 2;
+                }
+                ProcType::Tuple(_) => {
+                    return Err(CraneliftEmitError::UnsupportedInst(
+                        "Tuple-typed parameters not yet supported in defined functions".into(),
+                    ));
+                }
+                _ => {
+                    values.insert(vid, ValueRepr::Scalar(bps[idx]));
+                    idx += 1;
+                }
+            }
+        }
+    }
     for procir_block in &func.blocks {
         let cl_block = block_map[&procir_block.id];
         builder.switch_to_block(cl_block);
@@ -515,6 +559,16 @@ fn emit_inst(
             ty: ProcType::Integer,
         } => {
             let v = builder.ins().iconst(types::I64, *n);
+            values.insert(*dst, ValueRepr::Scalar(v));
+            Ok(())
+        }
+        Inst::Const {
+            dst,
+            value: Const::Boolean(b),
+            ty: ProcType::Boolean,
+        } => {
+            // Cranelift Booleans are I8; iconst is the simplest path.
+            let v = builder.ins().iconst(types::I8, if *b { 1 } else { 0 });
             values.insert(*dst, ValueRepr::Scalar(v));
             Ok(())
         }
@@ -688,6 +742,109 @@ fn emit_inst(
             let id = funcs["coddl_write_relation"];
             let local = obj.declare_func_in_func(id, builder.func);
             builder.ins().call(local, &[v, desc_val]);
+            Ok(())
+        }
+        Inst::ScalarOp {
+            dst,
+            op,
+            operand_type,
+            lhs,
+            rhs,
+        } => {
+            let lhs_v = scalar_value(values, lhs)?;
+            let rhs_v = scalar_value(values, rhs)?;
+            let result = match op {
+                ScalarOp::And => builder.ins().band(lhs_v, rhs_v),
+                ScalarOp::Or => builder.ins().bor(lhs_v, rhs_v),
+                _ => {
+                    use cranelift_codegen::ir::condcodes::IntCC;
+                    let cc = match op {
+                        ScalarOp::Eq => IntCC::Equal,
+                        ScalarOp::NotEq => IntCC::NotEqual,
+                        ScalarOp::Lt => IntCC::SignedLessThan,
+                        ScalarOp::Gt => IntCC::SignedGreaterThan,
+                        ScalarOp::LtEq => IntCC::SignedLessThanOrEqual,
+                        ScalarOp::GtEq => IntCC::SignedGreaterThanOrEqual,
+                        _ => unreachable!(),
+                    };
+                    let cmp = builder.ins().icmp(cc, lhs_v, rhs_v);
+                    // Cranelift `icmp` returns an I8 already on the
+                    // boolean lane; ensure it matches the
+                    // `cranelift_value_type(Boolean) = I8`
+                    // expectation by avoiding unnecessary
+                    // conversions. (As of Cranelift's current API the
+                    // result is already i8-equivalent.)
+                    let _ = operand_type; // kept for backend symmetry
+                    cmp
+                }
+            };
+            values.insert(*dst, ValueRepr::Scalar(result));
+            Ok(())
+        }
+        Inst::AttrLoad {
+            dst,
+            src,
+            offset,
+            attr_type,
+        } => {
+            let src_v = scalar_value(values, src)?;
+            let flags = MemFlags::trusted();
+            match attr_type {
+                ProcType::Integer => {
+                    let v =
+                        builder.ins().load(types::I64, flags, src_v, *offset as i32);
+                    values.insert(*dst, ValueRepr::Scalar(v));
+                    Ok(())
+                }
+                ProcType::Boolean => {
+                    // Record cell stores Boolean as 8 bytes; reduce to
+                    // the I8 boolean SSA repr.
+                    let raw =
+                        builder.ins().load(types::I64, flags, src_v, *offset as i32);
+                    let v = builder.ins().ireduce(types::I8, raw);
+                    values.insert(*dst, ValueRepr::Scalar(v));
+                    Ok(())
+                }
+                ProcType::Text => {
+                    let ptr_ty = obj.target_config().pointer_type();
+                    let ptr = builder.ins().load(ptr_ty, flags, src_v, *offset as i32);
+                    let len = builder
+                        .ins()
+                        .load(types::I64, flags, src_v, *offset as i32 + 8);
+                    values.insert(*dst, ValueRepr::Text { ptr, len });
+                    Ok(())
+                }
+                other => Err(CraneliftEmitError::UnsupportedInst(format!(
+                    "AttrLoad of type {other:?} not yet supported"
+                ))),
+            }
+        }
+        Inst::Where {
+            dst,
+            src,
+            predicate_linkage,
+            heading_id,
+        } => {
+            let src_v = scalar_value(values, src)?;
+            let desc_id = heading_desc_ids[heading_id.0 as usize];
+            let desc_gv = obj.declare_data_in_func(desc_id, builder.func);
+            let ptr_ty = obj.target_config().pointer_type();
+            let desc_val = builder.ins().symbol_value(ptr_ty, desc_gv);
+            let pred_id = *funcs.get(predicate_linkage).ok_or_else(|| {
+                CraneliftEmitError::UnsupportedInst(format!(
+                    "unresolved predicate {predicate_linkage}"
+                ))
+            })?;
+            let pred_ref = obj.declare_func_in_func(pred_id, builder.func);
+            let pred_addr = builder.ins().func_addr(ptr_ty, pred_ref);
+            let where_id = funcs["coddl_relation_where"];
+            let where_local = obj.declare_func_in_func(where_id, builder.func);
+            let call =
+                builder
+                    .ins()
+                    .call(where_local, &[src_v, desc_val, pred_addr]);
+            let result = builder.inst_results(call)[0];
+            values.insert(*dst, ValueRepr::Scalar(result));
             Ok(())
         }
     }

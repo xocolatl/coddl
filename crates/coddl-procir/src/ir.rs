@@ -154,6 +154,54 @@ pub enum Inst {
         rel: ValueId,
         heading_id: HeadingId,
     },
+    /// Scalar binary operator — comparison or Boolean logical. Result
+    /// is always `ProcType::Boolean`. `operand_type` is the operand
+    /// types (which match per the typechecker) so backends pick the
+    /// right native compare op.
+    ScalarOp {
+        dst: ValueId,
+        op: ScalarOp,
+        operand_type: ProcType,
+        lhs: ValueId,
+        rhs: ValueId,
+    },
+    /// Load one attribute from a record pointer at the static byte
+    /// offset. Used inside predicate helper functions to read the
+    /// row's attributes. `attr_type` is the attribute's machine-level
+    /// type (Integer, Boolean, Text). Backends emit a byte-offset
+    /// `getelementptr` + `load`.
+    AttrLoad {
+        dst: ValueId,
+        src: ValueId,
+        offset: u32,
+        attr_type: ProcType,
+    },
+    /// Restrict a relation by a predicate. `predicate_linkage` is the
+    /// linkage name of a synthesized helper function with C ABI
+    /// `fn(*const u8) -> i8` (non-zero = keep). Backends emit a call
+    /// to `coddl_relation_where(src, &descriptor, &predicate)`.
+    /// `heading_id` indexes the same per-module heading table the
+    /// other relation ops use.
+    Where {
+        dst: ValueId,
+        src: ValueId,
+        predicate_linkage: String,
+        heading_id: HeadingId,
+    },
+}
+
+/// Scalar binary operator kinds. Lowered by both backends to native
+/// `icmp` / `and` / `or` ops; result is always Boolean.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ScalarOp {
+    Eq,
+    NotEq,
+    Lt,
+    Gt,
+    LtEq,
+    GtEq,
+    And,
+    Or,
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +217,8 @@ pub enum Const {
     Integer(i64),
     /// String literal payload as UTF-8 bytes (escapes already decoded).
     Text(Vec<u8>),
+    /// `true` / `false` — Boolean literal value.
+    Boolean(bool),
     /// The `Tuple {}` value — produced where the source had `{}` or
     /// an implicit unit return.
     Unit,
@@ -256,6 +306,7 @@ impl fmt::Display for Const {
                 }
                 f.write_str("\"")
             }
+            Const::Boolean(b) => f.write_str(if *b { "true" } else { "false" }),
             Const::Unit => f.write_str("{}"),
         }
     }
@@ -318,7 +369,45 @@ impl fmt::Display for Inst {
             Inst::WriteRelation { rel, heading_id } => {
                 write!(f, "write_relation {rel} heading_{}", heading_id.0)
             }
+            Inst::ScalarOp {
+                dst,
+                op,
+                operand_type: _,
+                lhs,
+                rhs,
+            } => write!(f, "{dst} = scalar_op {op} {lhs} {rhs}"),
+            Inst::AttrLoad {
+                dst,
+                src,
+                offset,
+                attr_type,
+            } => write!(f, "{dst} = attr_load {src}+{offset} : {attr_type}"),
+            Inst::Where {
+                dst,
+                src,
+                predicate_linkage,
+                heading_id,
+            } => write!(
+                f,
+                "{dst} = where {src} by {predicate_linkage} heading_{}",
+                heading_id.0
+            ),
         }
+    }
+}
+
+impl fmt::Display for ScalarOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            ScalarOp::Eq => "eq",
+            ScalarOp::NotEq => "ne",
+            ScalarOp::Lt => "lt",
+            ScalarOp::Gt => "gt",
+            ScalarOp::LtEq => "le",
+            ScalarOp::GtEq => "ge",
+            ScalarOp::And => "and",
+            ScalarOp::Or => "or",
+        })
     }
 }
 

@@ -374,7 +374,8 @@ impl ExprStmt {
 /// Expression variants. The set will grow as the parser does; for now
 /// the kinds recognized are name references, literals, brace-call
 /// expressions, `transaction` block expressions, tuple literals,
-/// relation literals, and dot-prefixed field access.
+/// relation literals, dot-prefixed field access, Boolean literals,
+/// and binary (infix) expressions.
 #[derive(Debug, Clone)]
 pub enum Expr {
     NameRef(NameRef),
@@ -384,6 +385,8 @@ pub enum Expr {
     TupleLit(TupleLit),
     RelationLit(RelationLit),
     FieldAccess(FieldAccess),
+    BoolLit(BoolLit),
+    Binary(BinaryExpr),
 }
 
 impl Expr {
@@ -396,6 +399,8 @@ impl Expr {
             SyntaxKind::TUPLE_LIT => Expr::TupleLit(TupleLit { syntax }),
             SyntaxKind::RELATION_LIT => Expr::RelationLit(RelationLit { syntax }),
             SyntaxKind::FIELD_ACCESS => Expr::FieldAccess(FieldAccess { syntax }),
+            SyntaxKind::BOOL_LITERAL => Expr::BoolLit(BoolLit { syntax }),
+            SyntaxKind::BINARY_EXPR => Expr::Binary(BinaryExpr { syntax }),
             _ => return None,
         })
     }
@@ -409,6 +414,8 @@ impl Expr {
             Expr::TupleLit(t) => t.syntax(),
             Expr::RelationLit(r) => r.syntax(),
             Expr::FieldAccess(f) => f.syntax(),
+            Expr::BoolLit(b) => b.syntax(),
+            Expr::Binary(b) => b.syntax(),
         }
     }
 }
@@ -517,6 +524,111 @@ impl RelationLit {
     /// An empty relation literal yields zero elements.
     pub fn tuples(&self) -> impl Iterator<Item = TupleLit> + '_ {
         children(&self.syntax)
+    }
+}
+
+// ── Boolean literals + binary expressions (Phase 20) ─────────────────
+
+// `true` / `false` Boolean literal. Wraps the contextual-keyword IDENT
+// token. (Doc comment must be a `//` block here — `ast_node!` is a
+// macro and rustdoc can't carry an outer doc comment through the
+// macro invocation.)
+ast_node!(pub BoolLit, BOOL_LITERAL);
+
+impl BoolLit {
+    /// The literal's value. `None` is a parse-recovery edge case.
+    pub fn value(&self) -> Option<bool> {
+        let tok = self
+            .syntax
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .find(|t| t.kind() == SyntaxKind::IDENT)?;
+        match tok.text() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        }
+    }
+}
+
+/// Binary infix operator kinds — `=`, `<>`, `<`, `>`, `<=`, `>=`,
+/// `and`, `or`, `where`. The `where` form's operands are
+/// (relation, predicate) rather than two scalars; the typechecker
+/// dispatches on this enum to apply the right operand-type rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOp {
+    Eq,
+    NotEq,
+    Lt,
+    Gt,
+    LtEq,
+    GtEq,
+    And,
+    Or,
+    Where,
+}
+
+ast_node!(pub BinaryExpr, BINARY_EXPR);
+
+impl BinaryExpr {
+    /// Left operand (first `Expr` child in source order).
+    pub fn lhs(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// Right operand (second `Expr` child).
+    pub fn rhs(&self) -> Option<Expr> {
+        self.syntax.children().filter_map(Expr::cast).nth(1)
+    }
+
+    /// The operator token between the operands. For symbolic ops
+    /// (`=`, `<`, `>`, `<=`, `>=`, `<>`) the token's kind identifies
+    /// the operator; for keyword ops (`and`, `or`, `where`) it's an
+    /// IDENT whose text picks the variant.
+    pub fn op_token(&self) -> Option<SyntaxToken> {
+        // Walk the direct children-with-tokens; the operator is the
+        // first token between two Expr nodes that's either a symbolic
+        // operator kind or an `and`/`or`/`where` IDENT.
+        for el in self.syntax.children_with_tokens() {
+            if let Some(tok) = el.into_token() {
+                match tok.kind() {
+                    SyntaxKind::EQ
+                    | SyntaxKind::NOT_EQ
+                    | SyntaxKind::LT
+                    | SyntaxKind::GT
+                    | SyntaxKind::LT_EQ
+                    | SyntaxKind::GT_EQ => return Some(tok),
+                    SyntaxKind::IDENT
+                        if matches!(tok.text(), "and" | "or" | "where") =>
+                    {
+                        return Some(tok);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve the operator token to a `BinaryOp` variant. `None` is a
+    /// parse-recovery edge case (no operator token between operands).
+    pub fn op_kind(&self) -> Option<BinaryOp> {
+        let tok = self.op_token()?;
+        Some(match tok.kind() {
+            SyntaxKind::EQ => BinaryOp::Eq,
+            SyntaxKind::NOT_EQ => BinaryOp::NotEq,
+            SyntaxKind::LT => BinaryOp::Lt,
+            SyntaxKind::GT => BinaryOp::Gt,
+            SyntaxKind::LT_EQ => BinaryOp::LtEq,
+            SyntaxKind::GT_EQ => BinaryOp::GtEq,
+            SyntaxKind::IDENT => match tok.text() {
+                "and" => BinaryOp::And,
+                "or" => BinaryOp::Or,
+                "where" => BinaryOp::Where,
+                _ => return None,
+            },
+            _ => return None,
+        })
     }
 }
 
@@ -843,5 +955,68 @@ mod tests {
             .unwrap();
         let rel = RelationLit::cast(rel_node).unwrap();
         assert_eq!(rel.tuples().count(), 0);
+    }
+
+    // ── BoolLit + BinaryExpr (Phase 20) ──────────────────────────────
+
+    #[test]
+    fn bool_literals_resolve_to_true_false() {
+        let root = ast("oper f {} [ let t = true; let g = false; ];");
+        let lits: Vec<BoolLit> = root
+            .syntax()
+            .descendants()
+            .filter_map(BoolLit::cast)
+            .collect();
+        assert_eq!(lits.len(), 2);
+        assert_eq!(lits[0].value(), Some(true));
+        assert_eq!(lits[1].value(), Some(false));
+    }
+
+    #[test]
+    fn binary_expr_op_kinds_round_trip() {
+        let cases = [
+            ("1 = 2", BinaryOp::Eq),
+            ("1 <> 2", BinaryOp::NotEq),
+            ("1 < 2", BinaryOp::Lt),
+            ("1 > 2", BinaryOp::Gt),
+            ("1 <= 2", BinaryOp::LtEq),
+            ("1 >= 2", BinaryOp::GtEq),
+            ("true and false", BinaryOp::And),
+            ("true or false", BinaryOp::Or),
+        ];
+        for (rhs, expected) in cases {
+            let src = format!("oper f {{}} [ let b = {rhs}; ];");
+            let root = ast(&src);
+            let bin = root
+                .syntax()
+                .descendants()
+                .find_map(BinaryExpr::cast)
+                .unwrap_or_else(|| panic!("no BinaryExpr for `{rhs}`"));
+            assert_eq!(bin.op_kind(), Some(expected), "for `{rhs}`");
+        }
+    }
+
+    #[test]
+    fn where_binary_expr_has_relation_lhs_and_predicate_rhs() {
+        // Use a NameRef `R` on the lhs to keep the test focused on
+        // the BinaryExpr shape. (The typechecker will reject `R` as
+        // unresolved, but the parse tree is what we're checking.)
+        let root = ast("oper f {} [ let s = R where a = 1; ];");
+        let outer = root
+            .syntax()
+            .descendants()
+            .find_map(BinaryExpr::cast)
+            .expect("outer BinaryExpr");
+        assert_eq!(outer.op_kind(), Some(BinaryOp::Where));
+        match outer.lhs() {
+            Some(Expr::NameRef(_)) => {}
+            other => panic!("expected NameRef lhs, got {other:?}"),
+        }
+        match outer.rhs() {
+            Some(Expr::Binary(inner)) => {
+                assert_eq!(inner.op_kind(), Some(BinaryOp::Eq));
+            }
+            other => panic!("expected Binary rhs, got {other:?}"),
+        }
     }
 }

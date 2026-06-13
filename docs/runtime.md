@@ -44,6 +44,7 @@ calling convention works for both heap-managed and immortal values.
 | `coddl_rc_release`         | `(ptr) -> ()`                                       | Decrement `rc`. On zero: dispatch the drop walker by `kind`, then free the entire block (`header + payload`).            |
 | `coddl_relation_seal`      | `(payload, desc) -> ()`                             | Sort the relation's records by byte-wise comparison, then adjacent-dedup in place; updates the header's `length`.        |
 | `coddl_write_relation`     | `(payload, desc) -> ()`                             | Print the relation, one tuple per line, in canonical heading order. Empty relation writes zero bytes.                    |
+| `coddl_relation_where`     | `(src, desc, pred_fn) -> ptr`                       | Restrict `src` by `pred_fn(record_ptr) != 0`. Returns a fresh RC-managed relation (rc=1) holding the matching rows in the input's original order. Worst-case alloc; header `length` trimmed to the actual count. No re-seal — filter preserves the input's sealed (sorted/dedup'd) order. |
 
 The lowerer and both backends agree on the same set of symbol names
 and signatures; the `BUILTIN_EXTERNS` table in `coddl-procir::lower`
