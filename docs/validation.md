@@ -9,7 +9,7 @@ For the per-backend codegen rules that make the equivalence possible
 runtime extern surface), see `docs/codegen.md`. For the driver flow
 that exercises both backends in one process, see `docs/driver.md`.
 
-**Last sync:** `dae8068`. Every commit that adds an example program,
+**Last sync:** `c815e64`. Every commit that adds an example program,
 changes the validation matrix, or alters how cross-backend
 equivalence is enforced updates this file in the same commit.
 
@@ -55,17 +55,60 @@ two backends, runtime) is enough to prove the invariant holds. The
 size of the suite grows with the language; the discipline doesn't
 change.
 
+### Canonical examples
+
+| Program          | Files                                                                          | Surface covered                                                                                                                                  |
+|------------------|--------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------|
+| `hello-world`    | `examples/hello-world/hello-world.cd`                                          | Single-file program: lex → parse → typecheck → lower → both backends → link → `coddl_write_line`. The seed example (Phase 9).                    |
+| `hello-world-db` | `examples/hello-world-db/{hello-world-db.cd, greetings.cddb, greetings.cdstore}` + locally-seeded `greetings.sqlite` | Four-file `.cd` family: Phase 16 plan discovery, public-relvar materialization from SQLite at startup, `transaction [...]` brackets, `extract (R where p)` reading one row, field access on the extracted tuple. Adds Phase 22's storage path to the equivalence proof. |
+
+Each canonical example contributes the three e2e tests in
+`crates/coddl-driver/tests/e2e.rs`. The hello-world-db trio also has
+two adjacent driver tests (env-var override flow + a T0025 negative
+path) that prove ancillary properties but aren't part of the
+strict cross-backend matrix.
+
 
 ## Adding a new example
 
 1. Drop the program at `examples/<name>/<name>.cd`.
-2. In `crates/coddl-driver/tests/e2e.rs`, add the three test
+2. If the program declares one or more `public relvar`s, walk the
+   companion-file checklist below before wiring tests.
+3. In `crates/coddl-driver/tests/e2e.rs`, add the three test
    functions following the hello-world pattern.
-3. Run `cargo test --workspace`. Both per-backend tests must pass;
+4. Run `cargo test --workspace`. Both per-backend tests must pass;
    the cross-backend test must too.
-4. If they pass independently but disagree on stdout, that's a
+5. If they pass independently but disagree on stdout, that's a
    real bug. Don't paper over with `assert!(matches!(...))` —
    chase the divergence in ProcIR or the offending backend.
+
+### Companion-file checklist (public-relvar programs)
+
+A `.cd` that declares any `public relvar` must ship with the
+companions Phase 16's plan discovery expects, plus a seed script the
+test harness can invoke. Without these, plan discovery fails before
+codegen runs and the test never reaches the per-backend assertion.
+
+- [ ] `examples/<name>/<name>.cd` with `program <name>;`,
+      `database <db>;`, and the `public relvar` declarations.
+- [ ] `examples/<name>/<db>.cddb` — catalog-side conceptual schema
+      (`base relvar <Name> { ... } key { ... };` per public relvar).
+      Headings must match (PL0007 otherwise).
+- [ ] `examples/<name>/<db>.cdstore` — physical binding
+      (`store for <db>;`, `backend sqlite { file: "<db>.sqlite" };`,
+      one `relvar <Name>: table "<sql>" { columns: { ... } };` per
+      public relvar). Column coverage is enforced by PL0009 / PL0010.
+- [ ] `examples/<name>/seed-db.sh` — idempotent shell script that
+      rebuilds the fixture SQLite from scratch (`rm -f <db>.sqlite`
+      then `sqlite3 <db>.sqlite <<SQL ... SQL`). The script is the
+      source of truth for what's in the database.
+- [ ] `examples/<name>/.gitignore` listing `<db>.sqlite` — the
+      fixture is locally generated, never committed.
+- [ ] In the e2e tests: gate every test entry behind a
+      `OnceLock`-guarded helper that runs the seed script once per
+      test process (the parallel test scheduler will otherwise race
+      on `rm -f` + `sqlite3 ...`). Follow the
+      `ensure_hello_world_db_seeded` pattern.
 
 The five-part hygiene gate (fmt, build, clippy, tests,
 check-grammar) gates every commit; nothing about validation
@@ -79,10 +122,13 @@ shortcuts it.
   but typically slower to execute than LLVM's optimized output. The
   `coddl run` / `coddl compile` default-backend split (Cranelift for
   iteration, LLVM for delivery) acknowledges this.
-- **Behavior under panic / signal.** The assertion is on a normal
-  termination's stdout. Behavior on a runtime panic, a process
-  signal, or a runtime extern returning a nonzero status is not yet
-  validated. Those land when the language grows panic semantics.
+- **Behavior under panic / signal.** The cross-backend assertion is
+  on normal termination's stdout. Phase 21's `extract` cardinality
+  abort and Phase 22's materialization-error abort have per-backend
+  assertions (`!status.success()` + stderr substring match) but the
+  byte-equality contract doesn't extend to abort paths. Process
+  signals and runtime externs returning a nonzero status are not yet
+  validated cross-backend.
 - **Optimization-level invariance.** No flags toggle optimization
   yet. When `-O` lands, the matrix grows to assert equivalence at
   each level — codegen bugs often surface only at higher tiers.

@@ -48,7 +48,7 @@ key { id };
 oper main {}
 [
     let g = transaction [
-        extract (Greetings where id = 2)
+        extract (Greetings where id = 1)
     ];
     write_line { message: g.message };
 ];
