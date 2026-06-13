@@ -15,13 +15,13 @@ use std::collections::{HashMap, HashSet};
 use coddl_diagnostics::{Diagnostic, FileId, Severity};
 use coddl_syntax::ast::{
     AstNode, Block, CallExpr, Expr, ExprStmt, FieldAccess, Item, LetStmt, Literal, NamedArg,
-    OperDecl, ProgramDecl, Root, Stmt, TransactionExpr, TupleLit,
+    OperDecl, ProgramDecl, RelationLit, Root, Stmt, TransactionExpr, TupleLit,
 };
 use coddl_syntax::SyntaxKind;
 use coddl_types::{check, Heading, Type};
 
 use crate::ir::{
-    BasicBlock, BlockId, Const, Function, Inst, Module, ProcType, Terminator, ValueId,
+    BasicBlock, BlockId, Const, Function, HeadingId, Inst, Module, ProcType, Terminator, ValueId,
 };
 
 /// Surface name → C-ABI linkage name for each runtime extern. The
@@ -79,6 +79,12 @@ struct Lowerer {
     program_name: String,
     functions: Vec<Function>,
     seen_externs: HashSet<&'static str>,
+    /// Per-module interner: maps each unique `Heading` to a
+    /// `HeadingId`. Phase 19 backends emit one static descriptor per
+    /// entry; `ProcType::Relation(HeadingId)` and `Inst::RelationLit`
+    /// reference these by id. Order is push-only (id == index).
+    headings: Vec<Heading>,
+    heading_ids: HashMap<Heading, HeadingId>,
     // Per-function state, reset on each `lower_oper_decl`.
     next_value: u32,
     next_block: u32,
@@ -104,12 +110,27 @@ impl Lowerer {
             program_name: String::new(),
             functions: Vec::new(),
             seen_externs: HashSet::new(),
+            headings: Vec::new(),
+            heading_ids: HashMap::new(),
             next_value: 0,
             next_block: 0,
             insts: Vec::new(),
             locals: vec![HashMap::new()],
             value_types: HashMap::new(),
         }
+    }
+
+    /// Intern a heading: return its existing `HeadingId` or push a new
+    /// one. Stable order; backends iterate `Module::headings` in this
+    /// order when emitting descriptors.
+    fn intern_heading(&mut self, h: &Heading) -> HeadingId {
+        if let Some(id) = self.heading_ids.get(h) {
+            return *id;
+        }
+        let id = HeadingId(self.headings.len() as u32);
+        self.headings.push(h.clone());
+        self.heading_ids.insert(h.clone(), id);
+        id
     }
 
     fn push_local_scope(&mut self) {
@@ -170,6 +191,31 @@ impl Lowerer {
     /// stays in sync without per-call-site duplication.
     fn record_type(&mut self, v: ValueId, ty: ProcType) {
         self.value_types.insert(v, ty);
+    }
+
+    /// True iff `ty` describes a heap-managed value that needs RC
+    /// retain/release. Phase 19: relations only. Future phases add
+    /// sequences and possibly text owners.
+    fn is_heap_managed(ty: &ProcType) -> bool {
+        matches!(ty, ProcType::Relation(_))
+    }
+
+    /// Emit `Inst::Release` for every heap-managed binding in the
+    /// topmost local scope, in unspecified (HashMap) order. Called
+    /// before popping a scope (transaction exit) and at function
+    /// epilogue, before any terminator or runtime-shutdown call.
+    fn release_top_scope_heap_locals(&mut self) {
+        let releases: Vec<ValueId> = self
+            .locals
+            .last()
+            .expect("scope stack empty")
+            .values()
+            .filter(|(_, ty)| Self::is_heap_managed(ty))
+            .map(|(v, _)| *v)
+            .collect();
+        for v in releases {
+            self.insts.push(Inst::Release { src: v });
+        }
     }
 
     fn lookup_extern(&self, surface: &str) -> Option<&'static BuiltinExtern> {
@@ -239,6 +285,7 @@ impl Lowerer {
         Module {
             program_name: std::mem::take(&mut self.program_name),
             functions: std::mem::take(&mut self.functions),
+            headings: std::mem::take(&mut self.headings),
         }
     }
 
@@ -309,6 +356,12 @@ impl Lowerer {
 
         let body_value = decl.body().map(|body| self.lower_block(&body));
 
+        // Release every heap-typed function-scope local before either
+        // the runtime-shutdown call (main) or the terminator (others).
+        // Phase 19 doesn't yet return heap values from functions, so
+        // we can release everything in the function scope here.
+        self.release_top_scope_heap_locals();
+
         if is_main {
             self.ensure_runtime_extern("coddl_runtime_shutdown");
             let dst = self.fresh_value();
@@ -378,8 +431,17 @@ impl Lowerer {
             Some(v) => v,
             None => return,
         };
+        // If the RHS is a NameRef to an existing heap-typed binding,
+        // the new let creates a second owner of the same value —
+        // emit a retain so the refcount reflects both bindings. Pure
+        // `RelationLit` RHS produces a fresh allocation already at
+        // rc=1, so no retain is needed for that path.
+        let rhs_is_existing_name = matches!(value_expr, Expr::NameRef(_));
         let id = self.lower_expr(&value_expr);
         let ty = self.value_type(id);
+        if rhs_is_existing_name && Self::is_heap_managed(&ty) {
+            self.insts.push(Inst::Retain { src: id });
+        }
         if let Some(name_tok) = stmt.name() {
             self.bind_local(name_tok.text().to_string(), id, ty);
         }
@@ -397,6 +459,7 @@ impl Lowerer {
             Expr::Call(call) => self.lower_call(call),
             Expr::Transaction(t) => self.lower_transaction_expr(t),
             Expr::TupleLit(t) => self.lower_tuple_lit(t),
+            Expr::RelationLit(r) => self.lower_relation_lit(r),
             Expr::FieldAccess(f) => self.lower_field_access(f),
             Expr::NameRef(n) => {
                 // First try a let-bound local; that's the only value
@@ -506,8 +569,50 @@ impl Lowerer {
             Some(b) => self.lower_block(&b),
             None => self.fresh_value(),
         };
+        // Release every heap-typed local in this transaction scope
+        // before popping. The body's tail value (if heap-typed) is
+        // not currently a use case Phase 19 exercises — relations
+        // don't yet escape transactions as return values.
+        self.release_top_scope_heap_locals();
         self.pop_local_scope();
         value
+    }
+
+    /// Lower a `Relation { <tuple-lit>, … }` literal. Each nested
+    /// `TupleLit` lowers to its Phase-18 `Inst::TupleLit`; the
+    /// resulting `ValueId`s become operands of an
+    /// `Inst::RelationLit { dst, tuples, heading_id }`. The heading
+    /// is the first tuple's; we intern it so backends emit at most
+    /// one static descriptor per unique heading. Empty literals are
+    /// kept out by the typechecker (T0018); reaching here with zero
+    /// tuples is an internal bug.
+    fn lower_relation_lit(&mut self, rel: &RelationLit) -> ValueId {
+        let tuples: Vec<TupleLit> = rel.tuples().collect();
+        assert!(
+            !tuples.is_empty(),
+            "empty relation literal survived typecheck (T0018)"
+        );
+        let mut tuple_values: Vec<ValueId> = Vec::with_capacity(tuples.len());
+        let mut heading: Option<Heading> = None;
+        for tup in &tuples {
+            let v = self.lower_tuple_lit(tup);
+            tuple_values.push(v);
+            if heading.is_none() {
+                if let ProcType::Tuple(h) = self.value_type(v) {
+                    heading = Some(h);
+                }
+            }
+        }
+        let heading = heading.expect("typechecked tuple has a heading");
+        let heading_id = self.intern_heading(&heading);
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Relation(heading_id));
+        self.insts.push(Inst::RelationLit {
+            dst,
+            tuples: tuple_values,
+            heading_id,
+        });
+        dst
     }
 
     fn lower_literal(&mut self, lit: &Literal) -> ValueId {
@@ -539,6 +644,15 @@ impl Lowerer {
             _ => None,
         };
         let surface = callee_name.expect("typechecked call has a NameRef callee");
+
+        // Polymorphic-Relation builtins are lowered to specialized
+        // ProcIR ops carrying their argument's `HeadingId`. The
+        // backends look the descriptor up in `Module::headings` to
+        // emit the per-call-site descriptor pointer.
+        if surface == "write_relation" {
+            return self.lower_write_relation_call(call);
+        }
+
         let ext = self
             .lookup_extern(&surface)
             .unwrap_or_else(|| unreachable!("unknown callee `{surface}` survived typecheck"));
@@ -585,13 +699,42 @@ impl Lowerer {
             v
         })
     }
+
+    /// Lower `write_relation { rel: <expr> }` to `Inst::WriteRelation`.
+    /// The `rel` argument's static type is `ProcType::Relation(id)`;
+    /// we pull the id off via `value_type` and embed it in the
+    /// instruction so the backend doesn't need value-type tracking.
+    /// `write_relation` returns Unit; the surrounding expression
+    /// machinery gets a placeholder ValueId.
+    fn lower_write_relation_call(&mut self, call: &CallExpr) -> ValueId {
+        let arg_list = call.args().expect("typechecked call has an arg list");
+        let rel_arg = arg_list
+            .args()
+            .find(|a| a.name().map(|t| t.text().to_string()).as_deref() == Some("rel"))
+            .expect("typechecked write_relation has a `rel` arg");
+        let rel_expr = rel_arg.value().expect("rel arg has a value expression");
+        let rel = self.lower_expr(&rel_expr);
+        let heading_id = match self.value_type(rel) {
+            ProcType::Relation(id) => id,
+            other => unreachable!(
+                "write_relation got non-relation arg type `{other}` past typecheck"
+            ),
+        };
+        self.insts.push(Inst::WriteRelation { rel, heading_id });
+        let v = self.fresh_value();
+        self.record_type(v, ProcType::Unit);
+        v
+    }
 }
 
 /// Convert a surface `Type` (as it appears in a `Heading`) to its
 /// machine-level `ProcType`. The mapping is total over the types the
-/// typechecker can produce for a tuple field. Diagnostic-free input
-/// never reaches `Type::Unknown` here; `Type::Relation` lands when
-/// Phase 19 wires relation values into tuple cells.
+/// Convert a surface `Type` (as it appears in a `Heading`) to its
+/// machine-level `ProcType`. Pure on scalar / tuple cases. The
+/// `Relation` case is handled by `Lowerer::proc_type_from_type`
+/// (which needs the heading interner); the free function below is
+/// the simple total mapping for non-relation cells. Phase 19's tuple
+/// cells don't yet carry relations, so this path is fine.
 fn proc_type_from_type(ty: &Type) -> ProcType {
     match ty {
         Type::Integer => ProcType::Integer,
@@ -603,16 +746,22 @@ fn proc_type_from_type(ty: &Type) -> ProcType {
         Type::Byte => ProcType::Byte,
         Type::Boolean => ProcType::Boolean,
         Type::Tuple(h) => ProcType::Tuple(h.clone()),
-        Type::Relation(_) => ProcType::Pointer,
+        Type::Relation(_) => {
+            unreachable!(
+                "Type::Relation inside a non-relation context — use Lowerer::proc_type_from_type"
+            )
+        }
         Type::Unknown => unreachable!("Type::Unknown survived typecheck"),
     }
 }
 
 /// Recover a surface `Type` for a `ProcType` we previously derived
-/// from one. The mapping is exact for scalar/tuple cases — the only
-/// information loss happens at `Relation` cells (which become
-/// `Pointer` in ProcType). Phase 18's lowering only carries scalar
-/// and tuple cells, so this round-trip is exact today.
+/// from one. Used by tuple-literal lowering to round-trip
+/// per-field types through `Heading::new`. The mapping is exact for
+/// scalar and tuple cells; relation cells need the lowerer's
+/// heading table to recover the surface heading, so this free
+/// function rejects them — Phase 19's tuple-literal walk doesn't
+/// yet need to thread `ProcType::Relation` back through `Type`.
 fn type_from_proc(pt: &ProcType) -> Type {
     match pt {
         ProcType::Integer => Type::Integer,
@@ -626,7 +775,12 @@ fn type_from_proc(pt: &ProcType) -> Type {
         ProcType::Unit => Type::unit(),
         ProcType::Tuple(h) => Type::Tuple(h.clone()),
         ProcType::Pointer => {
-            unreachable!("Pointer ProcType in a tuple field — not reachable in Phase 18")
+            unreachable!("Pointer ProcType in a tuple field — not reachable in Phase 19")
+        }
+        ProcType::Relation(_) => {
+            unreachable!(
+                "ProcType::Relation in a tuple cell — needs heading interner; not reachable in Phase 19"
+            )
         }
     }
 }

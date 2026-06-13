@@ -12,8 +12,8 @@ use std::collections::{HashMap, HashSet};
 use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{
     AstNode, Block, CallExpr, Expr, ExprStmt, FieldAccess, Heading as AstHeading, Item, KeyClause,
-    LetStmt, NamedArg, OperDecl, PrivateRelvarDecl, ProgramDecl, PublicRelvarDecl, Root, Stmt,
-    TransactionExpr, TupleLit,
+    LetStmt, NamedArg, OperDecl, PrivateRelvarDecl, ProgramDecl, PublicRelvarDecl, RelationLit,
+    Root, Stmt, TransactionExpr, TupleLit,
 };
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
@@ -649,6 +649,7 @@ impl TypeChecker {
             Expr::Call(call) => self.check_call(call, scope),
             Expr::Transaction(t) => self.check_transaction_expr(t, scope),
             Expr::TupleLit(t) => self.check_tuple_lit(t, scope),
+            Expr::RelationLit(r) => self.check_relation_lit(r, scope),
             Expr::FieldAccess(f) => self.check_field_access(f, scope),
         }
     }
@@ -681,6 +682,48 @@ impl TypeChecker {
             fields.push((name, ty));
         }
         Type::Tuple(Heading::new(fields))
+    }
+
+    /// Walk a `Relation { <tuple-lit>, <tuple-lit>, … }` literal. The
+    /// first tuple establishes the heading; subsequent tuples must
+    /// have the same `(name, type)` set. An empty `Relation {}` emits
+    /// T0018 (no inference context for the heading). A heading
+    /// mismatch emits T0019 on the offending tuple; the typechecker
+    /// keeps the first tuple's heading so downstream checks see a
+    /// stable type.
+    fn check_relation_lit(&mut self, rel: &RelationLit, scope: &mut Scope) -> Type {
+        let tuples: Vec<TupleLit> = rel.tuples().collect();
+        if tuples.is_empty() {
+            self.error(
+                self.node_span(rel.syntax()),
+                "T0018",
+                "empty relation literal requires at least one tuple",
+            );
+            return Type::Unknown;
+        }
+        let first_heading = match self.check_tuple_lit(&tuples[0], scope) {
+            Type::Tuple(h) => h,
+            // The tuple typecheck only ever returns Tuple or Unknown
+            // (on internal recovery); fall through with Unknown so we
+            // don't cascade.
+            _ => return Type::Unknown,
+        };
+        for tuple in &tuples[1..] {
+            let h = match self.check_tuple_lit(tuple, scope) {
+                Type::Tuple(h) => h,
+                _ => continue,
+            };
+            if !h.assignable_to(&first_heading) {
+                self.error(
+                    self.node_span(tuple.syntax()),
+                    "T0019",
+                    format!(
+                        "tuple heading {h} differs from relation's first tuple {first_heading}"
+                    ),
+                );
+            }
+        }
+        Type::Relation(first_heading)
     }
 
     /// Walk `<expr>.<field>`. The base must be of type `Tuple H`; the
@@ -817,7 +860,7 @@ impl TypeChecker {
             .params
             .iter()
             .find(|(p, _)| *p == name)
-            .map(|(_, t)| t.clone());
+            .map(|(_, k)| k.clone());
 
         let arg_ty = match arg.value() {
             Some(v) => self.check_expr(&v, scope),
@@ -825,7 +868,7 @@ impl TypeChecker {
         };
 
         match declared {
-            Some(expected) => {
+            Some(crate::builtins::ParamKind::Concrete(expected)) => {
                 provided.insert(name.clone());
                 if !arg_ty.assignable_to(&expected) {
                     let span = arg
@@ -836,6 +879,23 @@ impl TypeChecker {
                         span,
                         "T0004",
                         format!("argument `{name}` expected {expected}, got {arg_ty}"),
+                    );
+                }
+            }
+            Some(crate::builtins::ParamKind::AnyRelation) => {
+                provided.insert(name.clone());
+                // Accept any `Relation H` regardless of heading.
+                // `Type::Unknown` (error recovery) also slips through
+                // so we don't pile errors on top of upstream failures.
+                if !matches!(arg_ty, Type::Relation(_) | Type::Unknown) {
+                    let span = arg
+                        .value()
+                        .map(|v| self.node_span(v.syntax()))
+                        .unwrap_or_else(|| self.node_span(arg.syntax()));
+                    self.error(
+                        span,
+                        "T0004",
+                        format!("argument `{name}` expected a Relation, got {arg_ty}"),
                     );
                 }
             }
@@ -1381,5 +1441,40 @@ mod tests {
                    write_line{message: t.a}; \
                    ];";
         assert!(codes(src).contains(&"T0004"));
+    }
+
+    // ── Relation literals (Phase 19) ─────────────────────────────────
+
+    #[test]
+    fn relation_lit_with_uniform_tuples_checks_clean() {
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1}, {a: 2}, {a: 3} }; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn empty_relation_lit_diagnoses_t0018() {
+        let src = "oper main {} [ let r = Relation {}; ];";
+        assert!(codes(src).contains(&"T0018"));
+    }
+
+    #[test]
+    fn relation_lit_heading_mismatch_diagnoses_t0019() {
+        // First tuple has only `a`; second has `a` + `b`.
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1}, {a: 2, b: \"x\"} }; \
+                   ];";
+        assert!(codes(src).contains(&"T0019"));
+    }
+
+    #[test]
+    fn relation_lit_attr_type_mismatch_diagnoses_t0019() {
+        // Same attribute name but different type — heading mismatch.
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1}, {a: \"x\"} }; \
+                   ];";
+        assert!(codes(src).contains(&"T0019"));
     }
 }

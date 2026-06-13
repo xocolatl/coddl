@@ -11,7 +11,7 @@ use std::fmt;
 /// `Tuple H` and `Relation H`. The constructor enforces the sort
 /// invariant so equality reduces to a slice comparison and a lookup
 /// reduces to a binary search.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Heading(Vec<(String, Type)>);
 
 impl Heading {
@@ -87,7 +87,7 @@ impl fmt::Display for Heading {
 /// only when their headings literally coincide; two `Unknown`s compare
 /// equal. For typechecker comparisons that should treat `Unknown` as
 /// a wildcard, use [`Type::assignable_to`] instead.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Type {
     Integer,
     Rational,

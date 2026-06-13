@@ -24,13 +24,14 @@ A ProcIR `Module` is one compilation unit. Field-by-field:
 
 | Type           | Fields                                                  |
 |----------------|---------------------------------------------------------|
-| `Module`       | `program_name: String`, `functions: Vec<Function>`      |
+| `Module`       | `program_name: String`, `functions: Vec<Function>`, `headings: Vec<Heading>` |
+| `HeadingId`    | `u32` index into `Module::headings`; rendered `heading_<n>` |
 | `Function`     | `name: String`, `linkage_name: String`, `params: Vec<(String, ProcType)>`, `return_type: ProcType`, `blocks: Vec<BasicBlock>` |
 | `BasicBlock`   | `id: BlockId`, `insts: Vec<Inst>`, `terminator: Terminator` |
 | `BlockId`      | `u32`                                                   |
 | `ValueId`      | `u32` — SSA value name, rendered `%n`                   |
 | `Const`        | `Integer(i64)`, `Text(Vec<u8>)`, `Unit`                 |
-| `ProcType`     | `Integer`, `Rational`, `Approximate`, `Text`, `Character`, `Binary`, `Byte`, `Boolean`, `Unit`, `Pointer`, `Tuple(Heading)` |
+| `ProcType`     | `Integer`, `Rational`, `Approximate`, `Text`, `Character`, `Binary`, `Byte`, `Boolean`, `Unit`, `Pointer`, `Tuple(Heading)`, `Relation(HeadingId)` |
 
 Key invariants the lowering pass and the backends both rely on:
 
@@ -46,11 +47,20 @@ Key invariants the lowering pass and the backends both rely on:
 - **`ProcType` is the machine-level type, not the surface type.**
   `ProcType::Tuple(Heading)` carries the typechecker's `Heading`
   directly; at ABI boundaries it flattens per-attribute in canonical
-  heading order (nested tuples recursively). `Relation` and
-  `Sequence` become runtime handles (`Pointer`). Every built-in
-  scalar gets a variant from day one so backends can pattern-match
-  exhaustively. `ProcType` is `Clone`, not `Copy` — the `Tuple`
-  variant is heap-backed.
+  heading order (nested tuples recursively). `ProcType::Relation`
+  is a single pointer at the ABI level (the RC-managed payload),
+  with the heading living in static data and reached via the
+  per-module descriptor table. `Sequence` becomes a runtime handle
+  (`Pointer`). Every built-in scalar gets a variant from day one so
+  backends can pattern-match exhaustively. `ProcType` is `Clone`,
+  not `Copy` — the `Tuple` variant is heap-backed.
+- **`Module::headings` is the per-module heading interner.** The
+  lowerer interns each unique `Heading` it touches into this
+  vector; `ProcType::Relation(HeadingId)` and the four new
+  relation-shaped instructions reference headings by their index.
+  Each backend emits one static descriptor per entry — see
+  `docs/codegen.md` for the C-struct layout the backends produce
+  and `docs/runtime.md` for the runtime's view of the same data.
 
 
 ## Instruction table
@@ -61,6 +71,10 @@ Key invariants the lowering pass and the backends both rely on:
 | `Call`               | `callee: String` (linkage name), `args: Vec<ValueId>`, `return_type`      | `dst: Option<ValueId>` | Call the named function. `dst` is `None` iff `return_type == Unit`.       |
 | `TupleLit`           | `fields: Vec<(String, ValueId)>` (canonical-order), `heading: Heading`    | `dst: ValueId`        | Bundle the fields into a tuple value typed `Tuple(heading)`. No runtime op — the value is a compile-time grouping over the field SSA values; backends carry it as a `ValueRepr::Tuple` and flatten at ABI boundaries. |
 | `TupleField`         | `src: ValueId` (tuple), `field_name: String`, `field_type: ProcType`      | `dst: ValueId`        | Project one attribute out of `src`. Pure compile-time projection in backends — `dst` binds the field's existing `ValueRepr`. |
+| `RelationLit`        | `tuples: Vec<ValueId>` (each typed `Tuple(h)`), `heading_id: HeadingId`   | `dst: ValueId`        | Allocate a fresh RC-managed payload (rc=1), copy each tuple's flattened bytes into the canonical-layout record buffer at the right offsets, then call `coddl_relation_seal` (sort + adjacent-dedup). `dst` carries `ProcType::Relation(heading_id)`. |
+| `Retain`             | `src: ValueId` (relation pointer)                                         | —                     | Increment the refcount of `src`. Backend lowers to `call coddl_rc_retain`. Emitted by the lowerer when a `let` RHS is a `NameRef` to an already-bound heap value. |
+| `Release`            | `src: ValueId` (relation pointer)                                         | —                     | Decrement the refcount of `src`; the drop walker runs on the runtime side when the count reaches zero. Backend lowers to `call coddl_rc_release`. Emitted at scope-exit for every heap-typed local. |
+| `WriteRelation`      | `rel: ValueId`, `heading_id: HeadingId`                                    | —                     | Print the relation in canonical-heading order (one tuple per line). Backend lowers to `call coddl_write_relation(rel, &@.heading.<id>)`. The polymorphic `write_relation` surface builtin lowers to this instead of a generic `Inst::Call` so backends don't need to special-case the per-call descriptor lookup. |
 
 ## Terminator table
 
@@ -92,6 +106,9 @@ walk shape. Each `check_<x>` in `coddl-types::checker` has a sibling
 | `Expr::Transaction` | Pushes a local scope, walks the body via `Block`, pops the scope. The body's `ValueId` becomes the expression's value. Transparent today — no `Inst` for the `transaction` wrapper itself. Future runtime semantics slot in here as synthetic begin/commit/rollback calls. |
 | `Expr::TupleLit` | Lowers each field's value expression, sorts the `(name, ValueId, ProcType)` triples into canonical (name-sorted) heading order, then emits `Inst::TupleLit { fields, heading }`. The heading is built from the per-field static types — which the typechecker already enforces. Empty `{}` lowers to `Inst::TupleLit` with empty fields + empty heading. |
 | `Expr::FieldAccess` | Lowers the base expression, asserts its `ProcType` is `Tuple(H)` (a typechecker invariant — `T0016` blocks non-tuple bases), looks up the field's `Type` in `H`, converts to `ProcType` via the same scalar/tuple recursion the lowerer uses for parameters, then emits `Inst::TupleField`. |
+| `Expr::RelationLit` | Lowers each nested `TupleLit`, interns the first tuple's `Heading` into `Module::headings` (getting a `HeadingId`), then emits `Inst::RelationLit { dst, tuples, heading_id }`. `dst` is recorded as `ProcType::Relation(heading_id)` so downstream uses (field reads, write_relation calls, scope-exit releases) can route through `value_types`. |
+| Surface `write_relation { rel: r }` | Special-cased in `lower_call`. The `rel` argument is lowered the usual way; its tracked `ProcType::Relation(id)` gives the heading id directly. The lowerer emits `Inst::WriteRelation { rel, heading_id }` rather than going through the generic `Inst::Call` path. |
+| RC discipline | The lowerer emits `Inst::Retain` when a `let` RHS is a `NameRef` resolving to an existing heap-typed binding (so both bindings hold a count). At scope-exit (transaction exit, function epilogue) it emits `Inst::Release` for every heap-typed local. Fresh `Inst::RelationLit` results start at rc=1 and don't need a retain on their first bind. |
 
 Locals share the same `ValueId` namespace as computed values —
 there's no separate "variable" concept in ProcIR. A `let x = expr`

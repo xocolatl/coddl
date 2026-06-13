@@ -9,14 +9,15 @@
 
 use std::collections::HashMap;
 
-use cranelift_codegen::ir::{types, AbiParam, InstBuilder, Value as CrValue};
+use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, Value as CrValue};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_module::{DataDescription, FuncId, Linkage, Module as ClModule};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module as ClModule};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use coddl_procir::{
-    BasicBlock, Codegen, Const, Function, Inst, Module, ProcType, Terminator, Type, ValueId,
+    record_layout, BasicBlock, Codegen, Const, Function, HeadingId, Inst, Module, ProcType,
+    RecordLayout, Terminator, Type, ValueId,
 };
 
 use crate::error::CraneliftEmitError;
@@ -77,17 +78,192 @@ impl Codegen for CraneliftBackend {
             funcs.insert(func.linkage_name.clone(), id);
         }
 
+        // Declare runtime RC + relation externs whenever the module
+        // touches any relation-shaped instruction. The headings table
+        // being non-empty is the trigger: an empty table means no
+        // RelationLit ever interned a heading, so no rc/seal/write
+        // symbol will be referenced from emitted code.
+        if !module.headings.is_empty() {
+            declare_runtime_rc_externs(&mut obj, &mut funcs)?;
+        }
+
+        // Per-module heading descriptors. One DataId block per unique
+        // heading; each carries its attribute array and the
+        // descriptor struct itself. Layouts are cached so the
+        // instruction walk can look them up without recomputing.
+        let mut layouts: Vec<RecordLayout> = Vec::with_capacity(module.headings.len());
+        let mut heading_desc_ids: Vec<DataId> = Vec::with_capacity(module.headings.len());
+        let ptr_bytes = obj.target_config().pointer_bytes() as usize;
+        for (i, heading) in module.headings.iter().enumerate() {
+            let layout = record_layout(heading);
+            let desc_id = emit_heading_descriptor(&mut obj, HeadingId(i as u32), &layout, ptr_bytes)?;
+            layouts.push(layout);
+            heading_desc_ids.push(desc_id);
+        }
+
         // Define every non-extern function.
         let mut next_data: u32 = 0;
         for func in module.functions.iter().filter(|f| !f.is_extern()) {
             let funcid = funcs[&func.linkage_name];
-            emit_function(&mut obj, func, funcid, &funcs, &mut next_data)?;
+            emit_function(
+                &mut obj,
+                func,
+                funcid,
+                &funcs,
+                &layouts,
+                &heading_desc_ids,
+                &mut next_data,
+            )?;
         }
 
         let product = obj.finish();
         product
             .emit()
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))
+    }
+}
+
+/// Declare the runtime RC + relation extern symbols. Mirrors the
+/// LLVM backend's `emit_runtime_rc_externs`. Linkage is `Import`
+/// since these resolve to the staticlib at link time.
+fn declare_runtime_rc_externs(
+    obj: &mut ObjectModule,
+    funcs: &mut HashMap<String, FuncId>,
+) -> Result<(), CraneliftEmitError> {
+    let ptr_ty = obj.target_config().pointer_type();
+
+    // coddl_rc_alloc(payload_size: i64, length: i32, kind: i32,
+    //                desc: ptr) -> ptr
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I32));
+        sig.params.push(AbiParam::new(types::I32));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.returns.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_rc_alloc", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_rc_alloc".into(), id);
+    }
+    // coddl_rc_retain(ptr) -> ()
+    // coddl_rc_release(ptr) -> ()
+    for name in ["coddl_rc_retain", "coddl_rc_release"] {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function(name, Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert(name.into(), id);
+    }
+    // coddl_relation_seal(ptr, ptr) -> ()
+    // coddl_write_relation(ptr, ptr) -> ()
+    for name in ["coddl_relation_seal", "coddl_write_relation"] {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function(name, Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert(name.into(), id);
+    }
+    Ok(())
+}
+
+/// Emit the per-heading descriptor data: per-attribute name bytes,
+/// the attribute array, and the descriptor struct itself. Layout
+/// matches `coddl_runtime::CoddlHeadingDesc` / `CoddlAttrDesc`.
+///
+/// CoddlAttrDesc bytes (24 on 64-bit, 16 on 32-bit):
+///   ptr name            (ptr_bytes)
+///   u32 name_len        (4)
+///   u32 kind            (4)
+///   u32 offset          (4)
+///   u32 _pad            (4 on 64-bit for natural alignment)
+/// CoddlHeadingDesc bytes (16 on 64-bit, 12 on 32-bit):
+///   u32 attr_count      (4)
+///   u32 record_size     (4)
+///   ptr attrs           (ptr_bytes)
+fn emit_heading_descriptor(
+    obj: &mut ObjectModule,
+    id: HeadingId,
+    layout: &RecordLayout,
+    ptr_bytes: usize,
+) -> Result<DataId, CraneliftEmitError> {
+    // Per-attribute name byte arrays.
+    let mut name_ids: Vec<DataId> = Vec::with_capacity(layout.attrs.len());
+    for (i, attr) in layout.attrs.iter().enumerate() {
+        let sym = format!(".attrname.{}.{}", id.0, i);
+        let nid = obj
+            .declare_data(&sym, Linkage::Local, false, false)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        let mut dd = DataDescription::new();
+        dd.define(attr.name.as_bytes().to_vec().into_boxed_slice());
+        obj.define_data(nid, &dd)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        name_ids.push(nid);
+    }
+
+    // Attribute array. We compute element stride to match the host's
+    // natural alignment for the struct (ptr_bytes-aligned).
+    let attr_stride = if ptr_bytes == 8 { 24 } else { 16 };
+    let attrs_sym = format!(".attrs.{}", id.0);
+    let attrs_id = obj
+        .declare_data(&attrs_sym, Linkage::Local, false, false)
+        .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+    let attrs_bytes_len = attr_stride * layout.attrs.len();
+    let mut attrs_dd = DataDescription::new();
+    attrs_dd.define(vec![0u8; attrs_bytes_len].into_boxed_slice());
+    // Relocate the name pointer field of each entry to its
+    // corresponding name DataId.
+    for (i, _attr) in layout.attrs.iter().enumerate() {
+        let name_gv = obj.declare_data_in_data(name_ids[i], &mut attrs_dd);
+        let offset_in_attrs = (i * attr_stride) as u32;
+        attrs_dd.write_data_addr(offset_in_attrs, name_gv, 0);
+        // Fill the u32 fields directly into the byte buffer.
+        let name_bytes_len = layout.attrs[i].name.as_bytes().len() as u32;
+        let kind = layout.attrs[i].kind;
+        let off = layout.attrs[i].offset;
+        // Offsets relative to attr base: ptr_bytes, ptr_bytes+4, ptr_bytes+8.
+        attrs_write_u32(&mut attrs_dd, offset_in_attrs as usize + ptr_bytes, name_bytes_len);
+        attrs_write_u32(&mut attrs_dd, offset_in_attrs as usize + ptr_bytes + 4, kind);
+        attrs_write_u32(&mut attrs_dd, offset_in_attrs as usize + ptr_bytes + 8, off);
+    }
+    obj.define_data(attrs_id, &attrs_dd)
+        .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+
+    // The descriptor struct itself.
+    let desc_size = 8 + ptr_bytes; // u32 attr_count, u32 record_size, ptr attrs
+    let desc_sym = format!(".heading.{}", id.0);
+    let desc_id = obj
+        .declare_data(&desc_sym, Linkage::Local, false, false)
+        .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+    let mut desc_dd = DataDescription::new();
+    desc_dd.define(vec![0u8; desc_size].into_boxed_slice());
+    attrs_write_u32(&mut desc_dd, 0, layout.attrs.len() as u32);
+    attrs_write_u32(&mut desc_dd, 4, layout.record_size);
+    let attrs_gv = obj.declare_data_in_data(attrs_id, &mut desc_dd);
+    desc_dd.write_data_addr(8, attrs_gv, 0);
+    obj.define_data(desc_id, &desc_dd)
+        .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+
+    Ok(desc_id)
+}
+
+/// Patch four bytes of `dd`'s data buffer with `val` (host-endian).
+/// `DataDescription` exposes its initialized bytes as a mutable slice
+/// via `init` after a `define`, but we mutate the slice directly via
+/// `set_segment_section` semantics: easier path is to keep a local
+/// vector and re-define, but that resets pointer relocations. Pull
+/// off the slice via unsafe reach into private fields is not on the
+/// table — instead we keep a parallel pre-computed bytes buffer that
+/// we re-define. Caller uses this only before any relocation writes;
+/// for the descriptor data above we order operations so relocations
+/// happen after the u32 fills.
+fn attrs_write_u32(dd: &mut DataDescription, offset: usize, val: u32) {
+    if let cranelift_module::Init::Bytes { ref mut contents } = dd.init {
+        let bytes = val.to_ne_bytes();
+        contents[offset..offset + 4].copy_from_slice(&bytes);
     }
 }
 
@@ -161,6 +337,7 @@ fn cranelift_value_type(
         ProcType::Byte => types::I8,
         ProcType::Boolean => types::I8,
         ProcType::Unit => types::I8, // unused; caller filters Unit out
+        ProcType::Relation(_) => ptr_ty,
         ProcType::Tuple(_) => unreachable!(
             "Tuple ProcType must be flattened at ABI boundaries; bare Tuple seen in scalar context"
         ),
@@ -226,6 +403,8 @@ fn emit_function(
     func: &Function,
     funcid: FuncId,
     funcs: &HashMap<String, FuncId>,
+    heading_layouts: &[RecordLayout],
+    heading_desc_ids: &[DataId],
     next_data: &mut u32,
 ) -> Result<(), CraneliftEmitError> {
     let mut ctx = obj.make_context();
@@ -254,6 +433,8 @@ fn emit_function(
             &mut builder,
             procir_block,
             funcs,
+            heading_layouts,
+            heading_desc_ids,
             &mut values,
             next_data,
             is_main,
@@ -274,12 +455,23 @@ fn emit_block(
     builder: &mut FunctionBuilder<'_>,
     block: &BasicBlock,
     funcs: &HashMap<String, FuncId>,
+    heading_layouts: &[RecordLayout],
+    heading_desc_ids: &[DataId],
     values: &mut HashMap<ValueId, ValueRepr>,
     next_data: &mut u32,
     is_main: bool,
 ) -> Result<(), CraneliftEmitError> {
     for inst in &block.insts {
-        emit_inst(obj, builder, inst, funcs, values, next_data)?;
+        emit_inst(
+            obj,
+            builder,
+            inst,
+            funcs,
+            heading_layouts,
+            heading_desc_ids,
+            values,
+            next_data,
+        )?;
     }
     emit_terminator(builder, &block.terminator, values, is_main)?;
     Ok(())
@@ -290,6 +482,8 @@ fn emit_inst(
     builder: &mut FunctionBuilder<'_>,
     inst: &Inst,
     funcs: &HashMap<String, FuncId>,
+    heading_layouts: &[RecordLayout],
+    heading_desc_ids: &[DataId],
     values: &mut HashMap<ValueId, ValueRepr>,
     next_data: &mut u32,
 ) -> Result<(), CraneliftEmitError> {
@@ -400,6 +594,143 @@ fn emit_inst(
             values.insert(*dst, field_repr);
             Ok(())
         }
+        Inst::RelationLit {
+            dst,
+            tuples,
+            heading_id,
+        } => {
+            let _ = next_data; // descriptors are pre-emitted
+            let layout = heading_layouts.get(heading_id.0 as usize).ok_or_else(|| {
+                CraneliftEmitError::UnsupportedInst(format!(
+                    "unknown heading_id {} in RelationLit",
+                    heading_id.0
+                ))
+            })?;
+            let desc_id = heading_desc_ids[heading_id.0 as usize];
+            let desc_gv = obj.declare_data_in_func(desc_id, builder.func);
+            let ptr_ty = obj.target_config().pointer_type();
+            let desc_val = builder.ins().symbol_value(ptr_ty, desc_gv);
+
+            // call coddl_rc_alloc(payload_size, count, kind=0, desc).
+            let alloc_id = funcs["coddl_rc_alloc"];
+            let alloc_local = obj.declare_func_in_func(alloc_id, builder.func);
+            let count = tuples.len() as i64;
+            let payload_size = (layout.record_size as i64) * count;
+            let size_val = builder.ins().iconst(types::I64, payload_size);
+            let count_val = builder.ins().iconst(types::I32, count);
+            let kind_val = builder.ins().iconst(types::I32, 0); // CoddlKind::Relation
+            let call = builder.ins().call(
+                alloc_local,
+                &[size_val, count_val, kind_val, desc_val],
+            );
+            let payload = builder.inst_results(call)[0];
+
+            // Store each tuple into its record slot.
+            for (record_idx, tuple_vid) in tuples.iter().enumerate() {
+                let tuple_repr = values.get(tuple_vid).cloned().ok_or_else(|| {
+                    CraneliftEmitError::UnsupportedInst(format!(
+                        "undefined tuple value {tuple_vid:?} in RelationLit"
+                    ))
+                })?;
+                let fields = match &tuple_repr {
+                    ValueRepr::Tuple { fields } => fields.clone(),
+                    other => {
+                        return Err(CraneliftEmitError::UnsupportedInst(format!(
+                            "RelationLit operand is not a Tuple: {other:?}"
+                        )));
+                    }
+                };
+                for attr in &layout.attrs {
+                    let field_repr = fields
+                        .iter()
+                        .find(|(n, _)| n == &attr.name)
+                        .map(|(_, r)| r.clone())
+                        .ok_or_else(|| {
+                            CraneliftEmitError::UnsupportedInst(format!(
+                                "tuple missing attribute `{}` for relation layout",
+                                attr.name
+                            ))
+                        })?;
+                    let byte_offset =
+                        record_idx as i32 * layout.record_size as i32 + attr.offset as i32;
+                    store_attr(builder, payload, byte_offset, &field_repr)?;
+                }
+            }
+
+            // call coddl_relation_seal(payload, desc).
+            let seal_id = funcs["coddl_relation_seal"];
+            let seal_local = obj.declare_func_in_func(seal_id, builder.func);
+            builder.ins().call(seal_local, &[payload, desc_val]);
+
+            values.insert(*dst, ValueRepr::Scalar(payload));
+            Ok(())
+        }
+        Inst::Retain { src } => {
+            let v = scalar_value(values, src)?;
+            let id = funcs["coddl_rc_retain"];
+            let local = obj.declare_func_in_func(id, builder.func);
+            builder.ins().call(local, &[v]);
+            Ok(())
+        }
+        Inst::Release { src } => {
+            let v = scalar_value(values, src)?;
+            let id = funcs["coddl_rc_release"];
+            let local = obj.declare_func_in_func(id, builder.func);
+            builder.ins().call(local, &[v]);
+            Ok(())
+        }
+        Inst::WriteRelation { rel, heading_id } => {
+            let v = scalar_value(values, rel)?;
+            let desc_id = heading_desc_ids[heading_id.0 as usize];
+            let desc_gv = obj.declare_data_in_func(desc_id, builder.func);
+            let ptr_ty = obj.target_config().pointer_type();
+            let desc_val = builder.ins().symbol_value(ptr_ty, desc_gv);
+            let id = funcs["coddl_write_relation"];
+            let local = obj.declare_func_in_func(id, builder.func);
+            builder.ins().call(local, &[v, desc_val]);
+            Ok(())
+        }
+    }
+}
+
+/// Extract a `Scalar(v)` from the values map for an RC-managed
+/// pointer. Used by Retain / Release / WriteRelation.
+fn scalar_value(
+    values: &HashMap<ValueId, ValueRepr>,
+    v: &ValueId,
+) -> Result<CrValue, CraneliftEmitError> {
+    match values.get(v) {
+        Some(ValueRepr::Scalar(val)) => Ok(*val),
+        _ => Err(CraneliftEmitError::UnsupportedInst(format!(
+            "expected scalar pointer at {v:?}"
+        ))),
+    }
+}
+
+/// Store one attribute's flattened operands into the relation's
+/// payload at `byte_offset` (relative to `payload`'s base).
+fn store_attr(
+    builder: &mut FunctionBuilder<'_>,
+    payload: CrValue,
+    byte_offset: i32,
+    repr: &ValueRepr,
+) -> Result<(), CraneliftEmitError> {
+    let flags = MemFlags::trusted();
+    match repr {
+        ValueRepr::Scalar(v) => {
+            // Phase 19 supports Integer / Boolean (both 8-byte) as
+            // relation cells. Future widths land here.
+            builder.ins().store(flags, *v, payload, byte_offset);
+            Ok(())
+        }
+        ValueRepr::Text { ptr, len } => {
+            builder.ins().store(flags, *ptr, payload, byte_offset);
+            builder.ins().store(flags, *len, payload, byte_offset + 8);
+            Ok(())
+        }
+        ValueRepr::Tuple { .. } => Err(CraneliftEmitError::UnsupportedInst(
+            "nested Tuple cells not yet supported in relation records".into(),
+        )),
     }
 }
 

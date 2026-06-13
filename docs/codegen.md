@@ -38,6 +38,7 @@ and a length — even though ProcIR sees them as one logical `ValueId`.
 | `Unit`        | _(no operand)_        | `void` (return only) | _(omitted from params and returns)_   |
 | `Pointer`     | `void*`               | `ptr`                | pointer type from target_config       |
 | `Tuple(H)`    | _(flatten per attribute in canonical heading order)_ | _(flatten recursively into leaf scalars)_ | _(flatten recursively into leaf scalars)_ |
+| `Relation(id)`| `void*` (RC payload pointer) | `ptr`                | pointer type from target_config       |
 
 `Rational` and `Approximate` aren't exercised by hello-world; the
 mappings are placeholders that compile-clean exhaustive matches in
@@ -63,6 +64,51 @@ Tuples are pure compile-time grouping in both backends: each
 op. The work happens at ABI boundaries, where the recursive
 `push_param_types` / `push_call_operands` helpers walk the
 `ValueRepr::Tuple` tree and emit one leaf operand per attribute.
+
+### Per-module heading descriptors (Phase 19)
+
+Each backend emits one static descriptor per unique `Heading` in
+`Module::headings`. The descriptor is what the runtime's printer and
+drop walker read to interpret a `Relation` payload. The C struct
+layouts (matched by both backends and by `coddl-runtime`):
+
+```c
+struct CoddlAttrDesc {
+    const uint8_t* name;       // pointer to name bytes (not null-terminated)
+    uint32_t       name_len;
+    uint32_t       kind;       // 0 = Integer, 1 = Boolean, 2 = Text
+    uint32_t       offset;     // byte offset within a record
+    // 4 bytes of natural trailing padding on 64-bit hosts
+};
+struct CoddlHeadingDesc {
+    uint32_t                attr_count;
+    uint32_t                record_size;  // bytes per record
+    const CoddlAttrDesc*    attrs;
+};
+```
+
+LLVM: each descriptor is three private unnamed-address constants —
+`@.attrname.<id>.<i>` (one per attribute), `@.attrs.<id>` (the
+attribute array), and `@.heading.<id>` (the descriptor struct).
+Cranelift: each descriptor is three `DataId`s declared with
+`Linkage::Local`, populated via `DataDescription::define` for the
+raw bytes and `write_data_addr` for the pointer relocations.
+
+The `Inst::RelationLit` lowering, in both backends, has the same
+three-step shape:
+
+1. `call ptr @coddl_rc_alloc(i64 record_size * count, i32 count,
+                              i32 kind=0, ptr @.heading.<id>)`
+2. For each tuple, in source order: GEP to the i-th record + the
+   attribute's offset, store the field's flattened operands
+   (one i64 store for Integer/Boolean; two stores for Text).
+3. `call void @coddl_relation_seal(ptr payload, ptr @.heading.<id>)`.
+
+`Inst::Retain`, `Inst::Release`, and `Inst::WriteRelation` are each a
+single runtime call. The runtime entry points are declared as imports
+whenever `Module::headings` is non-empty (an empty headings table
+means no relation-shaped instructions exist and no rc/seal/write
+symbol gets referenced).
 
 
 ## The `main` special case

@@ -163,6 +163,7 @@ each `parse_<x>` has a corresponding `check_<x>`.
   - `Call` is `check_call`.
   - `Transaction` is `check_transaction_expr`.
   - `TupleLit` is `check_tuple_lit`.
+  - `RelationLit` is `check_relation_lit`.
   - `FieldAccess` is `check_field_access`.
 - **`check_transaction_expr`** — pushes a scope layer, walks the
   body with `check_block`, pops the layer, and returns the body's
@@ -188,6 +189,20 @@ each `parse_<x>` has a corresponding `check_<x>`.
   `Type::Unknown`. Otherwise consults `Heading::lookup` for the
   field name; on miss emits `T0017` and returns `Type::Unknown`; on
   hit returns the attribute's type.
+- **`check_relation_lit`** — walks each nested tuple via
+  `check_tuple_lit`. Empty `Relation {}` emits `T0018` (no
+  inference context for the heading) and returns `Type::Unknown`.
+  The first tuple's heading establishes the relation's heading;
+  every subsequent tuple must match (per `Heading::assignable_to`);
+  mismatches emit `T0019` on the offending tuple without cascading
+  the failure. Returns `Type::Relation(h0)`.
+- **`write_relation` polymorphism** — the built-in's `rel`
+  parameter has `ParamKind::AnyRelation` rather than a concrete
+  type. `check_named_arg` special-cases this kind: any
+  `Type::Relation(_)` matches regardless of heading; non-relation
+  args emit `T0004`. The per-call-site heading is carried through
+  the lowerer's `value_types` map and into the backend via
+  `Inst::WriteRelation`'s `heading_id` field.
 
 
 ## Typecheck diagnostics
@@ -215,3 +230,5 @@ check script enforces that.
 | T0015 | Duplicate field name in tuple literal                    |
 | T0016 | Field access on a value whose type isn't a tuple         |
 | T0017 | Unknown field name in tuple field access                 |
+| T0018 | Empty relation literal — no inference context for heading |
+| T0019 | Tuple heading mismatch in relation literal                |

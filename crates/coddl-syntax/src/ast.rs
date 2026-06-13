@@ -373,8 +373,8 @@ impl ExprStmt {
 
 /// Expression variants. The set will grow as the parser does; for now
 /// the kinds recognized are name references, literals, brace-call
-/// expressions, `transaction` block expressions, tuple literals, and
-/// dot-prefixed field access.
+/// expressions, `transaction` block expressions, tuple literals,
+/// relation literals, and dot-prefixed field access.
 #[derive(Debug, Clone)]
 pub enum Expr {
     NameRef(NameRef),
@@ -382,6 +382,7 @@ pub enum Expr {
     Call(CallExpr),
     Transaction(TransactionExpr),
     TupleLit(TupleLit),
+    RelationLit(RelationLit),
     FieldAccess(FieldAccess),
 }
 
@@ -393,6 +394,7 @@ impl Expr {
             SyntaxKind::CALL_EXPR => Expr::Call(CallExpr { syntax }),
             SyntaxKind::TRANSACTION_EXPR => Expr::Transaction(TransactionExpr { syntax }),
             SyntaxKind::TUPLE_LIT => Expr::TupleLit(TupleLit { syntax }),
+            SyntaxKind::RELATION_LIT => Expr::RelationLit(RelationLit { syntax }),
             SyntaxKind::FIELD_ACCESS => Expr::FieldAccess(FieldAccess { syntax }),
             _ => return None,
         })
@@ -405,6 +407,7 @@ impl Expr {
             Expr::Call(c) => c.syntax(),
             Expr::Transaction(t) => t.syntax(),
             Expr::TupleLit(t) => t.syntax(),
+            Expr::RelationLit(r) => r.syntax(),
             Expr::FieldAccess(f) => f.syntax(),
         }
     }
@@ -503,6 +506,16 @@ impl TupleLit {
     /// `NamedArg` view with call-site arguments — same `name: value`
     /// shape, different parent node.
     pub fn fields(&self) -> impl Iterator<Item = NamedArg> + '_ {
+        children(&self.syntax)
+    }
+}
+
+ast_node!(pub RelationLit, RELATION_LIT);
+
+impl RelationLit {
+    /// All tuples in source order. Each is a nested `TUPLE_LIT` child.
+    /// An empty relation literal yields zero elements.
+    pub fn tuples(&self) -> impl Iterator<Item = TupleLit> + '_ {
         children(&self.syntax)
     }
 }
@@ -803,5 +816,32 @@ mod tests {
             panic!("expected nested FieldAccess");
         };
         assert_eq!(inner.field().unwrap().text(), "a");
+    }
+
+    #[test]
+    fn relation_lit_tuples_iterate() {
+        let root = ast("oper f {} [ let r = Relation { {a: 1}, {a: 2} }; ];");
+        let rel_node = root
+            .syntax()
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::RELATION_LIT)
+            .unwrap();
+        let rel = RelationLit::cast(rel_node).unwrap();
+        let tuples: Vec<TupleLit> = rel.tuples().collect();
+        assert_eq!(tuples.len(), 2);
+        assert_eq!(tuples[0].fields().count(), 1);
+        assert_eq!(tuples[0].fields().next().unwrap().name().unwrap().text(), "a");
+    }
+
+    #[test]
+    fn empty_relation_lit_has_no_tuples() {
+        let root = ast("oper f {} [ let r = Relation {}; ];");
+        let rel_node = root
+            .syntax()
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::RELATION_LIT)
+            .unwrap();
+        let rel = RelationLit::cast(rel_node).unwrap();
+        assert_eq!(rel.tuples().count(), 0);
     }
 }

@@ -19,6 +19,17 @@
 use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+pub mod rc;
+pub mod relation;
+
+pub use rc::{
+    coddl_rc_alloc, coddl_rc_release, coddl_rc_retain, live_allocations, CoddlKind, CoddlRcHeader,
+    HEADER_SIZE, IMMORTAL_RC,
+};
+pub use relation::{
+    coddl_relation_seal, coddl_write_relation, CoddlAttrDesc, CoddlAttrKind, CoddlHeadingDesc,
+};
+
 /// FFI error codes. `0` is success; any nonzero value is a failure whose
 /// human-readable message is available via [`coddl_last_error_message`]
 /// (thread-local). Codes are stable identifiers — never renumber.

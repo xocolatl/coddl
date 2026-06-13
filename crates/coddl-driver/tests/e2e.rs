@@ -349,6 +349,99 @@ fn tuple_let_byte_identical_across_backends() {
     assert_eq!(llvm.stdout, b"hi\n");
 }
 
+// ── Relation literals (Phase 19) ──────────────────────────────────────
+
+/// Phase 19 e2e program. Source order is `{a: 2}, {a: 1}, {a: 1}`;
+/// `coddl_relation_seal` must sort ascending and adjacent-dedup, so
+/// stdout is `{a: 1}\n{a: 2}\n`. The duplicate-elimination
+/// requirement (RM Pro 3) is part of what's being validated; the
+/// seal-then-print pipeline must produce a deterministic, total
+/// order so cross-backend byte equality works.
+const RELATION_LIT_SRC: &str = "\
+program relation_lit;
+oper main {} [
+    let r = Relation { {a: 2}, {a: 1}, {a: 1} };
+    write_relation { rel: r };
+];
+";
+
+fn write_relation_lit(tmp: &tempfile::TempDir) -> PathBuf {
+    let src_path = tmp.path().join("relation-lit.cd");
+    std::fs::write(&src_path, RELATION_LIT_SRC).expect("write relation-lit.cd");
+    src_path
+}
+
+#[test]
+fn relation_lit_llvm_backend_prints_seal_order() {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = write_relation_lit(&tmp);
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(&src)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "relation-lit LLVM run failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"{a: 1}\n{a: 2}\n");
+}
+
+#[test]
+fn relation_lit_cranelift_backend_prints_seal_order() {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = write_relation_lit(&tmp);
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(&src)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "relation-lit Cranelift run failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"{a: 1}\n{a: 2}\n");
+}
+
+#[test]
+fn relation_lit_byte_identical_across_backends() {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = write_relation_lit(&tmp);
+    let llvm = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(&src)
+        .output()
+        .expect("spawn LLVM");
+    assert!(
+        llvm.status.success(),
+        "LLVM run failed: stderr=\n{}",
+        String::from_utf8_lossy(&llvm.stderr)
+    );
+    let cranelift = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(&src)
+        .output()
+        .expect("spawn Cranelift");
+    assert!(
+        cranelift.status.success(),
+        "Cranelift run failed: stderr=\n{}",
+        String::from_utf8_lossy(&cranelift.stderr)
+    );
+    assert_eq!(
+        llvm.stdout,
+        cranelift.stdout,
+        "relation-lit backends disagree:\n  LLVM:      {:?}\n  Cranelift: {:?}",
+        String::from_utf8_lossy(&llvm.stdout),
+        String::from_utf8_lossy(&cranelift.stdout)
+    );
+    assert_eq!(llvm.stdout, b"{a: 1}\n{a: 2}\n");
+}
+
 #[test]
 fn coddl_run_unknown_backend_fails_clearly() {
     // No `ensure_runtime_built()` needed — we never get to linking.

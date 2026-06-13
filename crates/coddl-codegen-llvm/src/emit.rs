@@ -11,7 +11,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use coddl_procir::{
-    BasicBlock, Codegen, Const, Function, Inst, Module, ProcType, Terminator, Type, ValueId,
+    record_layout, BasicBlock, Codegen, Const, Function, HeadingId, Inst, Module, ProcType,
+    Terminator, Type, ValueId,
 };
 
 use crate::error::LlvmEmitError;
@@ -94,6 +95,10 @@ struct Emitter {
     values: HashMap<ValueId, ValueRepr>,
     /// Counter for unique string-constant names (`@.str.0`, …).
     next_str: u32,
+    /// Per-module record layout cache. Populated once in
+    /// `emit_module` so `Inst::RelationLit` can look up the
+    /// heading's layout by id without recomputing.
+    heading_layouts: Vec<coddl_procir::RecordLayout>,
 }
 
 impl Emitter {
@@ -104,7 +109,33 @@ impl Emitter {
         for func in module.functions.iter().filter(|f| f.is_extern()) {
             self.emit_extern(func)?;
         }
-        if module.functions.iter().any(Function::is_extern) {
+        // If the module touches any relation-shaped instruction we
+        // need the runtime extern declarations even when no user
+        // surface call references them directly. Declare them
+        // unconditionally if the headings table is non-empty —
+        // empty == no relations were ever interned, so no rc/seal/
+        // write_relation symbol will be referenced.
+        if !module.headings.is_empty() {
+            self.emit_runtime_rc_externs();
+        }
+        if module.functions.iter().any(Function::is_extern) || !module.headings.is_empty() {
+            writeln!(self.body).unwrap();
+        }
+
+        // Per-module heading descriptors. One block per unique
+        // `Heading` in `Module::headings`. Each block has three
+        // globals: per-attr name strings, the attribute array, and
+        // the descriptor struct itself. Cache the layouts so
+        // `Inst::RelationLit` can look them up by id later.
+        self.heading_layouts = module
+            .headings
+            .iter()
+            .map(|h| record_layout(h))
+            .collect();
+        for (i, heading) in module.headings.iter().enumerate() {
+            self.emit_heading_descriptor(HeadingId(i as u32), heading)?;
+        }
+        if !module.headings.is_empty() {
             writeln!(self.body).unwrap();
         }
 
@@ -117,6 +148,86 @@ impl Emitter {
             self.emit_function(func)?;
         }
 
+        Ok(())
+    }
+
+    /// Declare the runtime symbols that `Inst::RelationLit`,
+    /// `Inst::Retain`, `Inst::Release`, and `Inst::WriteRelation`
+    /// call directly. The compiler injects these regardless of
+    /// whether the user wrote `write_relation` — the relation
+    /// machinery (alloc/seal) is always needed once a `RELATION_LIT`
+    /// is present.
+    fn emit_runtime_rc_externs(&mut self) {
+        writeln!(
+            self.body,
+            "declare ptr @coddl_rc_alloc(i64, i32, i32, ptr)"
+        )
+        .unwrap();
+        writeln!(self.body, "declare void @coddl_rc_retain(ptr)").unwrap();
+        writeln!(self.body, "declare void @coddl_rc_release(ptr)").unwrap();
+        writeln!(self.body, "declare void @coddl_relation_seal(ptr, ptr)").unwrap();
+        writeln!(self.body, "declare void @coddl_write_relation(ptr, ptr)").unwrap();
+    }
+
+    /// Emit the three globals that describe one heading: a per-attr
+    /// name string each (`@.attrname.<id>.<i>`), the attribute array
+    /// (`@.attrs.<id>`), and the descriptor struct (`@.heading.<id>`).
+    /// Layout matches `coddl_runtime::CoddlHeadingDesc` /
+    /// `CoddlAttrDesc`.
+    fn emit_heading_descriptor(
+        &mut self,
+        id: HeadingId,
+        heading: &coddl_procir::Heading,
+    ) -> Result<(), LlvmEmitError> {
+        let layout = record_layout(heading);
+        // Per-attribute name strings.
+        for (i, attr) in layout.attrs.iter().enumerate() {
+            let name_bytes = attr.name.as_bytes();
+            writeln!(
+                self.globals,
+                "@.attrname.{}.{} = private unnamed_addr constant [{} x i8] c\"{}\"",
+                id.0,
+                i,
+                name_bytes.len(),
+                escape_ir_bytes(name_bytes),
+            )
+            .unwrap();
+        }
+        // Attribute array. Each element matches `CoddlAttrDesc`:
+        // { ptr, i32, i32, i32 } — name, name_len, kind, offset.
+        // Natural padding on the host adds 4 bytes after the last
+        // i32; LLVM struct layout matches.
+        write!(
+            self.globals,
+            "@.attrs.{} = private unnamed_addr constant [{} x {{ ptr, i32, i32, i32 }}] [",
+            id.0,
+            layout.attrs.len()
+        )
+        .unwrap();
+        for (i, attr) in layout.attrs.iter().enumerate() {
+            if i > 0 {
+                self.globals.push_str(", ");
+            }
+            let name_len = attr.name.as_bytes().len();
+            write!(
+                self.globals,
+                "{{ ptr, i32, i32, i32 }} {{ ptr @.attrname.{}.{}, i32 {}, i32 {}, i32 {} }}",
+                id.0, i, name_len, attr.kind, attr.offset,
+            )
+            .unwrap();
+        }
+        writeln!(self.globals, "]").unwrap();
+        // The descriptor struct. Matches `CoddlHeadingDesc`:
+        // { i32 attr_count, i32 record_size, ptr attrs }.
+        writeln!(
+            self.globals,
+            "@.heading.{} = private unnamed_addr constant {{ i32, i32, ptr }} {{ i32 {}, i32 {}, ptr @.attrs.{} }}",
+            id.0,
+            layout.attrs.len(),
+            layout.record_size,
+            id.0,
+        )
+        .unwrap();
         Ok(())
     }
 
@@ -285,7 +396,181 @@ impl Emitter {
                 self.values.insert(*dst, field_repr);
                 Ok(())
             }
+            Inst::RelationLit {
+                dst,
+                tuples,
+                heading_id,
+            } => self.lower_relation_lit(*dst, tuples, *heading_id),
+            Inst::Retain { src } => {
+                let op = self.scalar_op(src)?;
+                writeln!(self.body, "    call void @coddl_rc_retain(ptr {op})").unwrap();
+                Ok(())
+            }
+            Inst::Release { src } => {
+                let op = self.scalar_op(src)?;
+                writeln!(self.body, "    call void @coddl_rc_release(ptr {op})").unwrap();
+                Ok(())
+            }
+            Inst::WriteRelation { rel, heading_id } => {
+                let op = self.scalar_op(rel)?;
+                writeln!(
+                    self.body,
+                    "    call void @coddl_write_relation(ptr {op}, ptr @.heading.{})",
+                    heading_id.0,
+                )
+                .unwrap();
+                Ok(())
+            }
         }
+    }
+
+    /// Read out a `Scalar { ty: ptr, op }` for an RC-managed pointer
+    /// value. Used by Retain / Release / WriteRelation, all of which
+    /// take the relation pointer as their first operand.
+    fn scalar_op(&self, v: &ValueId) -> Result<String, LlvmEmitError> {
+        let repr = self
+            .values
+            .get(v)
+            .ok_or_else(|| LlvmEmitError::UnsupportedInst(format!("undefined value {v:?}")))?;
+        match repr {
+            ValueRepr::Scalar { op, .. } => Ok(op.clone()),
+            other => Err(LlvmEmitError::UnsupportedInst(format!(
+                "expected scalar pointer, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Lower `Inst::RelationLit` to a sequence of LLVM ops:
+    ///
+    /// 1. `call ptr @coddl_rc_alloc(record_size * count, count,
+    ///                              kind=0, @.heading.<id>)`
+    /// 2. For each tuple, in source order: compute the i-th record's
+    ///    address (`getelementptr`) and store each attribute's
+    ///    flattened operands at the right offset.
+    /// 3. `call void @coddl_relation_seal(ptr, @.heading.<id>)`.
+    ///
+    /// The destination `ValueRepr` is the relation pointer as a
+    /// `Scalar { ty: "ptr", op: "%vN" }`.
+    fn lower_relation_lit(
+        &mut self,
+        dst: ValueId,
+        tuples: &[ValueId],
+        heading_id: HeadingId,
+    ) -> Result<(), LlvmEmitError> {
+        let layout = self
+            .heading_layouts
+            .get(heading_id.0 as usize)
+            .ok_or_else(|| {
+                LlvmEmitError::UnsupportedInst(format!(
+                    "unknown heading_id {} in RelationLit",
+                    heading_id.0
+                ))
+            })?
+            .clone();
+        let count = tuples.len();
+        let record_size = layout.record_size as usize;
+        let payload_bytes = record_size * count;
+        let dst_name = format!("%v{}", dst.0);
+        // 1. Allocate.
+        writeln!(
+            self.body,
+            "    {dst_name} = call ptr @coddl_rc_alloc(i64 {payload_bytes}, i32 {count}, i32 0, ptr @.heading.{})",
+            heading_id.0,
+        )
+        .unwrap();
+        // 2. Write each record's bytes. For each tuple's field, get
+        //    the ValueRepr (already flattened) and store into the
+        //    correct (record + attribute) byte offset.
+        for (record_idx, tuple_vid) in tuples.iter().enumerate() {
+            let tuple_repr = self.values.get(tuple_vid).cloned().ok_or_else(|| {
+                LlvmEmitError::UnsupportedInst(format!(
+                    "undefined tuple value {tuple_vid:?} in RelationLit"
+                ))
+            })?;
+            let tuple_fields = match &tuple_repr {
+                ValueRepr::Tuple { fields } => fields,
+                other => {
+                    return Err(LlvmEmitError::UnsupportedInst(format!(
+                        "RelationLit operand is not a Tuple: {other:?}"
+                    )));
+                }
+            };
+            for attr in &layout.attrs {
+                let field_repr = tuple_fields
+                    .iter()
+                    .find(|(n, _)| n == &attr.name)
+                    .map(|(_, r)| r)
+                    .ok_or_else(|| {
+                        LlvmEmitError::UnsupportedInst(format!(
+                            "tuple missing attribute `{}` for relation layout",
+                            attr.name
+                        ))
+                    })?;
+                let byte_offset = record_idx * record_size + attr.offset as usize;
+                self.emit_attr_store(&dst_name, byte_offset, field_repr)?;
+            }
+        }
+        // 3. Seal.
+        writeln!(
+            self.body,
+            "    call void @coddl_relation_seal(ptr {dst_name}, ptr @.heading.{})",
+            heading_id.0,
+        )
+        .unwrap();
+        // 4. Record the dst's ValueRepr.
+        self.values.insert(
+            dst,
+            ValueRepr::Scalar {
+                ty: "ptr".to_string(),
+                op: dst_name,
+            },
+        );
+        Ok(())
+    }
+
+    /// Store one attribute's flattened operands into the relation's
+    /// payload at `byte_offset`. Integer/Boolean: one i64 store.
+    /// Text: two stores (ptr, i64) at byte_offset and byte_offset+8.
+    fn emit_attr_store(
+        &mut self,
+        base: &str,
+        byte_offset: usize,
+        repr: &ValueRepr,
+    ) -> Result<(), LlvmEmitError> {
+        match repr {
+            ValueRepr::Scalar { ty, op } if ty == "i64" => {
+                let slot = self.gep_byte(base, byte_offset);
+                writeln!(self.body, "    store i64 {op}, ptr {slot}").unwrap();
+                Ok(())
+            }
+            ValueRepr::Scalar { ty, .. } => Err(LlvmEmitError::UnsupportedInst(format!(
+                "scalar of type `{ty}` not yet stored into relation cell"
+            ))),
+            ValueRepr::Text { ptr_op, len_op } => {
+                let slot_ptr = self.gep_byte(base, byte_offset);
+                let slot_len = self.gep_byte(base, byte_offset + 8);
+                writeln!(self.body, "    store ptr {ptr_op}, ptr {slot_ptr}").unwrap();
+                writeln!(self.body, "    store i64 {len_op}, ptr {slot_len}").unwrap();
+                Ok(())
+            }
+            ValueRepr::Tuple { .. } => Err(LlvmEmitError::UnsupportedInst(
+                "nested Tuple cells not yet supported in relation records".into(),
+            )),
+        }
+    }
+
+    /// Emit a `getelementptr` for `base + byte_offset` and return the
+    /// fresh SSA name holding the resulting pointer. Used inside
+    /// `Inst::RelationLit` to compute per-attribute slot addresses.
+    fn gep_byte(&mut self, base: &str, byte_offset: usize) -> String {
+        let name = format!("%gep.{}", self.next_str);
+        self.next_str += 1;
+        writeln!(
+            self.body,
+            "    {name} = getelementptr inbounds i8, ptr {base}, i64 {byte_offset}",
+        )
+        .unwrap();
+        name
     }
 
     fn lower_const_text(&mut self, dst: ValueId, bytes: &[u8]) {
@@ -413,6 +698,9 @@ fn llvm_value_type(ty: &ProcType) -> &'static str {
         ProcType::Boolean => "i1",
         ProcType::Unit => "void",
         ProcType::Pointer => "ptr",
+        // Relations cross the ABI as a single payload pointer; the
+        // heading lives in static data, reached via the descriptor.
+        ProcType::Relation(_) => "ptr",
         // Non-flattened tuple uses are limited to multi-attribute
         // returns, which need return-pair codegen and aren't on Phase
         // 18's path. Empty tuples lower to `void` via

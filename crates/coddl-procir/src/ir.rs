@@ -19,7 +19,33 @@ pub struct Module {
     /// From `program <name>;`. Empty if the source had no program decl.
     pub program_name: String,
     pub functions: Vec<Function>,
+    /// Per-module heading interner. Backends emit one static
+    /// descriptor (`@.heading.<id>`) per entry; `ProcType::Relation`
+    /// and the new relation-shaped instructions reference headings
+    /// by their index into this vector. Stable across iterations
+    /// (push-only — never reorder once an id is handed out).
+    pub headings: Vec<Heading>,
 }
+
+impl Module {
+    /// Intern a heading: return the existing `HeadingId` if equal, or
+    /// push a new one and return its id. Linear scan; the table is
+    /// small in practice (one entry per unique heading the user
+    /// program names).
+    pub fn intern_heading(&mut self, h: &Heading) -> HeadingId {
+        if let Some(i) = self.headings.iter().position(|existing| existing == h) {
+            return HeadingId(i as u32);
+        }
+        let id = HeadingId(self.headings.len() as u32);
+        self.headings.push(h.clone());
+        id
+    }
+}
+
+/// Index into a `Module::headings` vector. Stable for the module's
+/// lifetime; rendered as `heading_<n>` in IR text.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct HeadingId(pub u32);
 
 /// A function — either a defined one (non-empty `blocks`) or an extern
 /// declaration (`blocks.is_empty()`).
@@ -97,6 +123,37 @@ pub enum Inst {
         field_name: String,
         field_type: ProcType,
     },
+    /// Build a relation value from its tuple operands. Each `tuples[i]`
+    /// is a `ValueId` typed `ProcType::Tuple(h)` where `h` matches the
+    /// heading at `heading_id`. Lowering allocates an RC payload,
+    /// writes each tuple's flattened bytes into the record buffer,
+    /// then calls `coddl_relation_seal` (sort + adjacent dedup). The
+    /// resulting `dst` carries `ProcType::Relation(heading_id)`.
+    RelationLit {
+        dst: ValueId,
+        tuples: Vec<ValueId>,
+        heading_id: HeadingId,
+    },
+    /// Increment the refcount of `src`. Emitted by the lowerer when a
+    /// heap-typed value is bound to a `let` whose RHS is a `NameRef`
+    /// to an already-bound source (so both bindings hold a count).
+    /// Backends lower to a single `coddl_rc_retain` call.
+    Retain { src: ValueId },
+    /// Decrement the refcount of `src`. Emitted by the lowerer at
+    /// scope-exit points for every heap-typed local. Backends lower
+    /// to a single `coddl_rc_release` call.
+    Release { src: ValueId },
+    /// Print a relation. Polymorphic over heading via the `heading_id`
+    /// — the lowerer carries it from the argument value's
+    /// `ProcType::Relation(_)` static type. Backends lower to
+    /// `call coddl_write_relation(rel_ptr, &heading_descriptor)`. The
+    /// `write_relation` builtin's surface call lowers to this instead
+    /// of a generic `Inst::Call` so the backend doesn't have to
+    /// special-case the descriptor lookup in its `Inst::Call` path.
+    WriteRelation {
+        rel: ValueId,
+        heading_id: HeadingId,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -118,12 +175,15 @@ pub enum Const {
 }
 
 /// Machine-level type. Not the surface `Type` from `coddl-types` —
-/// `Relation` and `Sequence` become runtime handles (`Pointer`).
-/// `Tuple(H)` carries the same heading the typechecker reasoned about;
-/// at ABI boundaries each attribute flattens into its component
-/// scalar operands (nested tuples recursively). Every built-in scalar
-/// gets a variant from day one so backends can pattern-match
-/// exhaustively.
+/// `Sequence` becomes a runtime handle (`Pointer`). `Tuple(H)`
+/// carries the same heading the typechecker reasoned about; at ABI
+/// boundaries each attribute flattens into its component scalar
+/// operands (nested tuples recursively). `Relation(HeadingId)`
+/// carries a per-module heading interner id; the value is a single
+/// pointer at the ABI level (the RC-managed payload), with the
+/// heading living in static data and reached via the descriptor.
+/// Every built-in scalar gets a variant from day one so backends
+/// can pattern-match exhaustively.
 ///
 /// Not `Copy` — the `Tuple` variant carries a heap-backed heading.
 /// Clone is cheap relative to typical compile-time data sizes; runtime
@@ -141,6 +201,7 @@ pub enum ProcType {
     Unit,
     Pointer,
     Tuple(Heading),
+    Relation(HeadingId),
 }
 
 // ── Display ──────────────────────────────────────────────────────────
@@ -171,6 +232,7 @@ impl fmt::Display for ProcType {
             ProcType::Unit => f.write_str("Unit"),
             ProcType::Pointer => f.write_str("Pointer"),
             ProcType::Tuple(h) => write!(f, "Tuple {h}"),
+            ProcType::Relation(id) => write!(f, "Relation heading_{}", id.0),
         }
     }
 }
@@ -237,6 +299,25 @@ impl fmt::Display for Inst {
                 field_name,
                 ..
             } => write!(f, "{dst} = field {src}.{field_name}"),
+            Inst::RelationLit {
+                dst,
+                tuples,
+                heading_id,
+            } => {
+                write!(f, "{dst} = relation_lit heading_{} {{", heading_id.0)?;
+                for (i, v) in tuples.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{v}")?;
+                }
+                f.write_str("}")
+            }
+            Inst::Retain { src } => write!(f, "retain {src}"),
+            Inst::Release { src } => write!(f, "release {src}"),
+            Inst::WriteRelation { rel, heading_id } => {
+                write!(f, "write_relation {rel} heading_{}", heading_id.0)
+            }
         }
     }
 }
@@ -298,6 +379,12 @@ impl fmt::Display for Function {
 impl fmt::Display for Module {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "module {} {{", self.program_name)?;
+        for (i, h) in self.headings.iter().enumerate() {
+            writeln!(f, "  heading_{i} = {h}")?;
+        }
+        if !self.headings.is_empty() {
+            writeln!(f)?;
+        }
         for func in &self.functions {
             writeln!(f, "{func}")?;
         }
@@ -350,6 +437,7 @@ mod tests {
         let m = Module {
             program_name: "hello_world".to_string(),
             functions: vec![extern_write_line()],
+            headings: Vec::new(),
         };
         let text = format!("{m}");
         assert!(text.starts_with("module hello_world {"));
@@ -362,6 +450,7 @@ mod tests {
         let m = Module {
             program_name: "hello_world".to_string(),
             functions: vec![extern_write_line(), defined_main()],
+            headings: Vec::new(),
         };
         let text = format!("{m}");
         assert!(text.contains("block_0:"), "no block label in:\n{text}");
@@ -393,6 +482,7 @@ mod tests {
             ProcType::Unit,
             ProcType::Pointer,
             ProcType::Tuple(Heading::empty()),
+            ProcType::Relation(HeadingId(0)),
         ] {
             let s = ty.to_string();
             assert!(!s.is_empty());

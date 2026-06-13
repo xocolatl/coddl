@@ -562,6 +562,10 @@ impl<'a> Parser<'a> {
             self.parse_transaction_expr();
             return true;
         }
+        if self.at_keyword("Relation") {
+            self.parse_relation_lit();
+            return true;
+        }
         match self.current() {
             SyntaxKind::IDENT => {
                 self.bump_trivia();
@@ -620,6 +624,55 @@ impl<'a> Parser<'a> {
 
         if !self.eat(SyntaxKind::R_BRACE) {
             self.error("P0029", "expected `}` to close tuple literal");
+        }
+        self.finish_node();
+    }
+
+    /// `Relation { <tuple-lit>, <tuple-lit>, … }` in expression
+    /// position. The body is a comma-separated list of tuple literals
+    /// (each of which is itself `{ name: value, … }`). Empty
+    /// `Relation {}` parses cleanly here; the typechecker emits T0018
+    /// since there's no inference context for the heading.
+    fn parse_relation_lit(&mut self) {
+        debug_assert!(self.at_keyword("Relation"));
+        self.bump_trivia();
+        self.start_node(SyntaxKind::RELATION_LIT);
+        self.bump(); // `Relation`
+
+        if !self.at(SyntaxKind::L_BRACE) {
+            self.error("P0031", "expected `{` after `Relation`");
+            self.finish_node();
+            return;
+        }
+        self.bump(); // {
+
+        if self.eat(SyntaxKind::R_BRACE) {
+            self.finish_node();
+            return;
+        }
+
+        loop {
+            if self.at(SyntaxKind::L_BRACE) {
+                self.parse_tuple_lit();
+            } else {
+                self.error(
+                    "P0032",
+                    "expected `{` to start tuple in relation literal",
+                );
+                break;
+            }
+            if !self.eat(SyntaxKind::COMMA) {
+                break;
+            }
+            // Trailing comma: `Relation { {a:1}, }` is the same as
+            // `Relation { {a:1} }`.
+            if self.at(SyntaxKind::R_BRACE) {
+                break;
+            }
+        }
+
+        if !self.eat(SyntaxKind::R_BRACE) {
+            self.error("P0033", "expected `}` to close relation literal");
         }
         self.finish_node();
     }
@@ -1607,6 +1660,87 @@ mod tests {
         assert!(
             out.diagnostics.iter().any(|d| d.code == "P0030"),
             "expected P0030, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    // ── Relation literals (Phase 19) ─────────────────────────────────
+
+    #[test]
+    fn empty_relation_literal_parses() {
+        let out = parse_str("oper f {} [ let r = Relation {}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let rel = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::RELATION_LIT)
+            .expect("RELATION_LIT in tree");
+        let tuples: Vec<_> = rel
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::TUPLE_LIT)
+            .collect();
+        assert_eq!(tuples.len(), 0);
+        assert_eq!(rel.text(), "Relation {}");
+    }
+
+    #[test]
+    fn relation_literal_with_tuples_parses() {
+        let out = parse_str("oper f {} [ let r = Relation { {a: 1}, {a: 2} }; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let rel = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::RELATION_LIT)
+            .expect("RELATION_LIT in tree");
+        let tuples: Vec<_> = rel
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::TUPLE_LIT)
+            .collect();
+        assert_eq!(tuples.len(), 2);
+    }
+
+    #[test]
+    fn relation_literal_trailing_comma_parses() {
+        let out = parse_str("oper f {} [ let r = Relation { {a: 1}, {a: 2}, }; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let rel = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::RELATION_LIT)
+            .expect("RELATION_LIT in tree");
+        let tuples: Vec<_> = rel
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::TUPLE_LIT)
+            .collect();
+        assert_eq!(tuples.len(), 2);
+    }
+
+    #[test]
+    fn relation_literal_missing_lbrace_diagnoses_p0031() {
+        let out = parse_str("oper f {} [ let r = Relation ; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0031"),
+            "expected P0031, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn relation_literal_non_tuple_element_diagnoses_p0032() {
+        let out = parse_str("oper f {} [ let r = Relation { 42 }; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0032"),
+            "expected P0032, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn unterminated_relation_literal_diagnoses_p0033() {
+        let out = parse_str("oper f {} [ let r = Relation { {a: 1} ; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0033"),
+            "expected P0033, got {:?}",
             out.diagnostics
         );
     }

@@ -263,7 +263,8 @@ function that implements it.
 <primary-expr>  ::= <name-ref>
                   | <literal>
                   | <transaction-expr>
-                  | <tuple-lit> ;                              -- parse_primary_expr
+                  | <tuple-lit>
+                  | <relation-lit> ;                           -- parse_primary_expr
 <transaction-expr> ::= 'transaction' <block> ;                 -- parse_transaction_expr
 <name-ref>      ::= <identifier> ;
 <arg-list>      ::= '{' [ <named-arg> commalist ] '}' ;        -- parse_arg_list
@@ -273,6 +274,13 @@ function that implements it.
                     -- kind (TUPLE_LIT vs ARG_LIST) distinguishes a
                     -- tuple value from a call-site argument list.
                     -- Empty '{}' is the unit value, type Tuple {}.
+<relation-lit>  ::= 'Relation' '{' [ <tuple-lit> commalist ] '}' ;  -- parse_relation_lit
+                    -- 'Relation' is a contextual keyword; recognized
+                    -- by name in primary-expr position. The body is
+                    -- a comma-separated list of tuple literals,
+                    -- trailing comma allowed. Empty `Relation {}`
+                    -- parses cleanly but typechecks as T0018 (no
+                    -- inference context for the heading).
 
 <unknown-item>  ::= -- error recovery: any tokens until the next
                     -- top-level ';' at bracket-depth zero or EOF.
@@ -304,9 +312,9 @@ the parser. Listed here so the omission is explicit, not implied:
 - **Statement forms** other than `<let-stmt>` and `<expr> ';'` —
   `mut`, `return`, `insert`, `delete`, `update`.
 - **Type / relvar / constraint declarations** at the top level.
-- **Literals**: sequence `[ … ]` in expression position; relation
-  literals `Relation { … }`. (Tuple `{ … }` literals and dot-prefix
-  field access landed in Phase 18.)
+- **Literals**: sequence `[ … ]` in expression position. (Tuple
+  `{ … }` literals and dot-prefix field access landed in Phase 18.
+  Relation literals `Relation { … }` landed in Phase 19.)
 - **Indexing** (`s[i]`) in expression postfix position.
 - **Pattern matching**, **`if`/`else`**, **anonymous opers**.
 
@@ -349,6 +357,9 @@ enforces that.
 | P0028 | Expected `;` after relvar declaration                   |
 | P0029 | Expected `}` to close tuple literal                     |
 | P0030 | Expected field name after `.`                           |
+| P0031 | Expected `{` after `Relation`                           |
+| P0032 | Expected `{` to start a tuple in a relation literal     |
+| P0033 | Expected `}` to close relation literal                  |
 
 Note: missing-type-after-`:` (let annotation) and missing-type-
 after-`->` (operator return clause) both surface as `P0011`
