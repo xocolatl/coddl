@@ -285,6 +285,37 @@ pub unsafe extern "C" fn coddl_relation_where(
     out
 }
 
+/// Cardinality-checked collapse from a relation to a tuple (the TTM
+/// RM Pre 10 primitive). Returns the single record's payload
+/// pointer if the relation has exactly one row; otherwise writes a
+/// diagnostic to stderr and `std::process::abort()`s. The caller
+/// reads each attribute via the descriptor before releasing the
+/// source relation.
+///
+/// # Safety
+/// `src` must point to a payload returned by `coddl_rc_alloc` whose
+/// kind is `Relation`. `desc` must outlive this call (typically a
+/// read-only data symbol the codegen emitted).
+#[no_mangle]
+pub unsafe extern "C" fn coddl_extract_check_cardinality(
+    src: *const u8,
+    desc: *const CoddlHeadingDesc,
+) -> *const u8 {
+    if src.is_null() || desc.is_null() {
+        eprintln!("coddl: extract: null relation or descriptor");
+        std::process::abort();
+    }
+    let header = src.sub(HEADER_SIZE) as *const CoddlRcHeader;
+    let length = (*header).length;
+    if length != 1 {
+        eprintln!("coddl: extract: expected exactly 1 tuple, got {length}");
+        std::process::abort();
+    }
+    // The first record sits at the payload pointer's base — the
+    // payload already starts at record 0.
+    src
+}
+
 pub(crate) unsafe fn drop_relation_payload(_payload: *mut u8, _header: &CoddlRcHeader) {
     // Phase 19: no heap cells to release. Future phases iterate
     // `header.length` records, look at the descriptor's per-attr
@@ -386,6 +417,37 @@ mod tests {
 
             coddl_rc_release(filtered);
             coddl_rc_release(src);
+        }
+    }
+
+    #[test]
+    fn extract_success_returns_input_pointer() {
+        // Single-row relation: extract returns the same pointer it
+        // got. Abort paths can't be tested in-process; the e2e suite
+        // covers them.
+        let attrs = [CoddlAttrDesc {
+            name: b"a".as_ptr(),
+            name_len: 1,
+            kind: CoddlAttrKind::Integer as u32,
+            offset: 0,
+        }];
+        let desc = CoddlHeadingDesc {
+            attr_count: 1,
+            record_size: 8,
+            attrs: attrs.as_ptr(),
+        };
+        unsafe {
+            let payload = coddl_rc_alloc(
+                8,
+                1,
+                CoddlKind::Relation as u32,
+                &desc as *const CoddlHeadingDesc,
+            );
+            std::ptr::write(payload as *mut i64, 42);
+            let record_ptr = coddl_extract_check_cardinality(payload, &desc);
+            assert_eq!(record_ptr, payload);
+            assert_eq!(std::ptr::read(record_ptr as *const i64), 42);
+            coddl_rc_release(payload);
         }
     }
 

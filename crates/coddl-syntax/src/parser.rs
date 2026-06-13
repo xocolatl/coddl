@@ -616,6 +616,15 @@ impl<'a> Parser<'a> {
             self.parse_relation_lit();
             return true;
         }
+        // `extract <expr>` — prefix-position unary form. Recognized
+        // before the generic IDENT branch so the AST gets a
+        // distinct `UNARY_EXPR` node. The operand parses at full
+        // expression precedence so `extract R where p` reads as
+        // `extract (R where p)` without parens.
+        if self.at_keyword("extract") {
+            self.parse_extract_expr();
+            return true;
+        }
         // `true` / `false` — contextual-keyword Boolean literal.
         // Recognized before the generic IDENT branch so the AST gets
         // a distinct `BOOL_LITERAL` node rather than a NAME_REF.
@@ -647,6 +656,21 @@ impl<'a> Parser<'a> {
             }
             SyntaxKind::L_BRACE => {
                 self.parse_tuple_lit();
+                true
+            }
+            SyntaxKind::L_PAREN => {
+                // Parenthesized expression — pure grouping. Wraps in
+                // a PAREN_EXPR node; the AST view transparently
+                // unwraps it so the typechecker/lowerer never see
+                // the wrapper.
+                self.bump_trivia();
+                self.start_node(SyntaxKind::PAREN_EXPR);
+                self.bump(); // `(`
+                self.parse_expr_prec(0);
+                if !self.eat(SyntaxKind::R_PAREN) {
+                    self.error("P0035", "expected `)` to close parenthesized expression");
+                }
+                self.finish_node();
                 true
             }
             _ => {
@@ -734,6 +758,24 @@ impl<'a> Parser<'a> {
         if !self.eat(SyntaxKind::R_BRACE) {
             self.error("P0033", "expected `}` to close relation literal");
         }
+        self.finish_node();
+    }
+
+    /// `extract <expr>` — the TTM RM Pre 10 primitive: collapse a
+    /// single-row relation to a tuple. Parsed as a `UNARY_EXPR`
+    /// containing one operand (typechecked to be a relation). The
+    /// operand parses at full expression precedence so `extract R
+    /// where p` reads as `extract (R where p)` — the canonical
+    /// idiom.
+    fn parse_extract_expr(&mut self) {
+        debug_assert!(self.at_keyword("extract"));
+        self.bump_trivia();
+        self.start_node(SyntaxKind::UNARY_EXPR);
+        self.bump(); // `extract`
+        // Operand parses at the lowest precedence so `where`, `and`,
+        // `or`, comparisons all bind inside. Missing operand surfaces
+        // as P0014 from the inner `parse_primary_expr`.
+        self.parse_expr_prec(0);
         self.finish_node();
     }
 
@@ -1915,6 +1957,58 @@ mod tests {
                 out.diagnostics
             );
         }
+    }
+
+    // ── extract (Phase 21) ───────────────────────────────────────────
+
+    #[test]
+    fn extract_parses_as_unary_expr() {
+        let out = parse_str("oper f {} [ let t = extract R; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let ue = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::UNARY_EXPR)
+            .expect("UNARY_EXPR in tree");
+        // Operand is a NAME_REF for `R`.
+        let operand = ue
+            .children()
+            .find(|n| n.kind() == SyntaxKind::NAME_REF)
+            .expect("operand NAME_REF");
+        assert_eq!(operand.text(), "R");
+    }
+
+    #[test]
+    fn extract_binds_loosely_so_where_lives_inside() {
+        // `extract R where a = 1` should parse as
+        //   UNARY_EXPR(extract, BINARY_EXPR(R, where, BINARY_EXPR(a, =, 1)))
+        let out = parse_str("oper f {} [ let t = extract R where a = 1; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let ue = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::UNARY_EXPR)
+            .expect("UNARY_EXPR in tree");
+        // The unary's operand is a BINARY_EXPR (the `where`).
+        let inner = ue
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("operand BINARY_EXPR (the where)");
+        let inner_text = inner.text().to_string();
+        assert!(
+            inner_text.contains(" where "),
+            "expected `where` inside extract's operand: {inner_text}"
+        );
+    }
+
+    #[test]
+    fn extract_with_no_operand_diagnoses_p0014() {
+        let out = parse_str("oper f {} [ let t = extract; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0014"),
+            "expected P0014, got {:?}",
+            out.diagnostics
+        );
     }
 
     fn find_first(root: &crate::cst::SyntaxNode, kind: SyntaxKind) -> crate::cst::SyntaxNode {

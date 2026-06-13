@@ -179,6 +179,17 @@ fn declare_runtime_rc_externs(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert("coddl_relation_where".into(), id);
     }
+    // coddl_extract_check_cardinality(src: ptr, desc: ptr) -> ptr
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.returns.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_extract_check_cardinality", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_extract_check_cardinality".into(), id);
+    }
     Ok(())
 }
 
@@ -847,6 +858,71 @@ fn emit_inst(
             values.insert(*dst, ValueRepr::Scalar(result));
             Ok(())
         }
+        Inst::Extract {
+            dst,
+            src,
+            heading_id,
+        } => {
+            let src_v = scalar_value(values, src)?;
+            let layout = &heading_layouts[heading_id.0 as usize];
+            let desc_id = heading_desc_ids[heading_id.0 as usize];
+            let desc_gv = obj.declare_data_in_func(desc_id, builder.func);
+            let ptr_ty = obj.target_config().pointer_type();
+            let desc_val = builder.ins().symbol_value(ptr_ty, desc_gv);
+            // Call the cardinality-check extern; it returns the
+            // record pointer (or aborts).
+            let extract_id = funcs["coddl_extract_check_cardinality"];
+            let extract_local = obj.declare_func_in_func(extract_id, builder.func);
+            let call = builder.ins().call(extract_local, &[src_v, desc_val]);
+            let record_ptr = builder.inst_results(call)[0];
+            // Read each attribute from the record pointer; bundle
+            // into a ValueRepr::Tuple.
+            let flags = MemFlags::trusted();
+            let mut fields: Vec<(String, ValueRepr)> = Vec::with_capacity(layout.attrs.len());
+            for attr in &layout.attrs {
+                let attr_type = proc_type_from_kind_cl(attr.kind);
+                let offset = attr.offset as i32;
+                let repr = match attr_type {
+                    ProcType::Integer => {
+                        let v = builder.ins().load(types::I64, flags, record_ptr, offset);
+                        ValueRepr::Scalar(v)
+                    }
+                    ProcType::Boolean => {
+                        let raw =
+                            builder.ins().load(types::I64, flags, record_ptr, offset);
+                        let v = builder.ins().ireduce(types::I8, raw);
+                        ValueRepr::Scalar(v)
+                    }
+                    ProcType::Text => {
+                        let ptr = builder.ins().load(ptr_ty, flags, record_ptr, offset);
+                        let len = builder
+                            .ins()
+                            .load(types::I64, flags, record_ptr, offset + 8);
+                        ValueRepr::Text { ptr, len }
+                    }
+                    other => {
+                        return Err(CraneliftEmitError::UnsupportedInst(format!(
+                            "Extract attribute of type {other:?} not yet supported"
+                        )));
+                    }
+                };
+                fields.push((attr.name.clone(), repr));
+            }
+            values.insert(*dst, ValueRepr::Tuple { fields });
+            Ok(())
+        }
+    }
+}
+
+/// Map a `record_layout` attribute kind to its `ProcType`. Same
+/// shape as the LLVM backend's `proc_type_from_kind_llvm`.
+fn proc_type_from_kind_cl(kind: u32) -> ProcType {
+    use coddl_procir::kind_tag;
+    match kind {
+        k if k == kind_tag::INTEGER => ProcType::Integer,
+        k if k == kind_tag::BOOLEAN => ProcType::Boolean,
+        k if k == kind_tag::TEXT => ProcType::Text,
+        other => unreachable!("unsupported attr kind {other} in Extract"),
     }
 }
 

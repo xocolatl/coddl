@@ -529,6 +529,145 @@ fn where_byte_identical_across_backends() {
     assert_eq!(llvm.stdout, b"{a: 2}\n");
 }
 
+// ── extract (Phase 21) ────────────────────────────────────────────────
+
+const EXTRACT_SRC: &str = "\
+program extract_test;
+oper main {} [
+    let r = Relation { {a: 1, b: \"hi\"}, {a: 2, b: \"ho\"} };
+    let t = extract (r where a = 2);
+    write_line { message: t.b };
+];
+";
+
+fn write_extract_src(tmp: &tempfile::TempDir) -> PathBuf {
+    let p = tmp.path().join("extract.cd");
+    std::fs::write(&p, EXTRACT_SRC).expect("write extract.cd");
+    p
+}
+
+#[test]
+fn extract_llvm_backend_prints_field() {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = write_extract_src(&tmp);
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(&src)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "extract LLVM run failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"ho\n");
+}
+
+#[test]
+fn extract_cranelift_backend_prints_field() {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = write_extract_src(&tmp);
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(&src)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "extract Cranelift run failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"ho\n");
+}
+
+#[test]
+fn extract_byte_identical_across_backends() {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = write_extract_src(&tmp);
+    let llvm = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(&src)
+        .output()
+        .expect("spawn LLVM");
+    assert!(llvm.status.success());
+    let cranelift = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(&src)
+        .output()
+        .expect("spawn Cranelift");
+    assert!(cranelift.status.success());
+    assert_eq!(llvm.stdout, cranelift.stdout);
+    assert_eq!(llvm.stdout, b"ho\n");
+}
+
+/// `extract` of a zero-row relation aborts (cardinality != 1).
+const EXTRACT_ZERO_SRC: &str = "\
+program extract_zero;
+oper main {} [
+    let r = Relation { {a: 1} };
+    let t = extract (r where a = 99);
+    write_line { message: \"unreachable\" };
+];
+";
+
+#[test]
+fn extract_aborts_on_zero_tuples() {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let p = tmp.path().join("extract-zero.cd");
+    std::fs::write(&p, EXTRACT_ZERO_SRC).expect("write");
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(&p)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        !out.status.success(),
+        "expected abort on zero-tuple extract, got success with stdout={:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("extract") && stderr.contains("expected exactly 1"),
+        "stderr didn't carry the extract diagnostic: {stderr}"
+    );
+}
+
+/// `extract` of a multi-row relation aborts.
+const EXTRACT_MULTI_SRC: &str = "\
+program extract_multi;
+oper main {} [
+    let r = Relation { {a: 1}, {a: 2} };
+    let t = extract r;
+    write_line { message: \"unreachable\" };
+];
+";
+
+#[test]
+fn extract_aborts_on_multi_tuples() {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let p = tmp.path().join("extract-multi.cd");
+    std::fs::write(&p, EXTRACT_MULTI_SRC).expect("write");
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(&p)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        !out.status.success(),
+        "expected abort on multi-tuple extract"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("extract") && stderr.contains("expected exactly 1"),
+        "stderr didn't carry the extract diagnostic: {stderr}"
+    );
+}
+
 #[test]
 fn coddl_run_unknown_backend_fails_clearly() {
     // No `ensure_runtime_built()` needed — we never get to linking.

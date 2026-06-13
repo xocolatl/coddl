@@ -167,6 +167,7 @@ each `parse_<x>` has a corresponding `check_<x>`.
   - `FieldAccess` is `check_field_access`.
   - `BoolLit` types as `Boolean`.
   - `Binary` is `check_binary_expr`.
+  - `Unary` is `check_unary_expr`.
 - **`check_transaction_expr`** — pushes a scope layer, walks the
   body with `check_block`, pops the layer, and returns the body's
   result type.
@@ -225,6 +226,10 @@ each `parse_<x>` has a corresponding `check_<x>`.
   the predicate's heading-scope but hits the saved enclosing
   scope) and emits T0022. Future phase will lift this restriction
   via a user_data pointer threaded through `coddl_relation_where`.
+- **`check_unary_expr`** — dispatches on the parsed `UnaryOp`.
+  Phase 21 ships `Extract` only. The operand must be
+  `Type::Relation(H)`; the result is `Type::Tuple(H)`. T0024 on
+  a non-relation operand. Other unary ops slot in here.
 
 
 ## Typecheck diagnostics
@@ -258,3 +263,4 @@ check script enforces that.
 | T0021 | Scalar operator operand type mismatch                     |
 | T0022 | Captured identifier in `where` predicate not yet supported |
 | T0023 | `where` left operand is not a relation                    |
+| T0024 | `extract` operand is not a relation                       |

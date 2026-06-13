@@ -139,6 +139,31 @@ The `Boolean` ABI:
 - **Cranelift**: `cranelift_value_type(Boolean) = I8` both as SSA and
   ABI — no conversion needed.
 
+### `Inst::Extract` (Phase 21)
+
+`Inst::Extract { dst, src, heading_id }` lowers in three steps in
+each backend:
+
+1. **Cardinality check** — call the runtime extern
+   `coddl_extract_check_cardinality(src, &descriptor)`. The extern
+   returns a `*const u8` pointing at the (single) record's bytes,
+   or aborts the process if cardinality ≠ 1.
+2. **Per-attribute reads** — for each entry in
+   `record_layout(heading)`, GEP `record_ptr + attr.offset` and
+   load the cell. Integer/Boolean cells encode as i64 in memory
+   (Boolean truncates to i1 in LLVM / I8 in Cranelift). Text cells
+   read as `(ptr, len)` pairs from offsets `offset` and
+   `offset + 8`.
+3. **Bundle as a tuple** — combine the per-attribute `ValueRepr`s
+   into a `ValueRepr::Tuple { fields }` and insert under `dst`.
+   Downstream `Inst::TupleField` reads work unchanged from Phase
+   18.
+
+No LLVM op or Cranelift `builder.ins()` emission happens for the
+"build the tuple" step — it's pure compile-time grouping, the
+same as `Inst::TupleLit`. The runtime call is the only emitted
+side effect; the rest is value-map bookkeeping.
+
 
 ## The `main` special case
 

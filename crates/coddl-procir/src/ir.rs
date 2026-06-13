@@ -188,6 +188,19 @@ pub enum Inst {
         predicate_linkage: String,
         heading_id: HeadingId,
     },
+    /// Collapse a single-row relation to a tuple (TTM RM Pre 10).
+    /// Backends emit a call to `coddl_extract_check_cardinality(src,
+    /// &descriptor)` which aborts if cardinality ≠ 1, then read each
+    /// attribute from the returned record pointer into per-field
+    /// scalar values, bundling them into a `ValueRepr::Tuple` for
+    /// `dst`. `dst` carries `ProcType::Tuple(heading)` where the
+    /// heading lives in the per-module heading table at
+    /// `heading_id`.
+    Extract {
+        dst: ValueId,
+        src: ValueId,
+        heading_id: HeadingId,
+    },
 }
 
 /// Scalar binary operator kinds. Lowered by both backends to native
@@ -392,6 +405,11 @@ impl fmt::Display for Inst {
                 "{dst} = where {src} by {predicate_linkage} heading_{}",
                 heading_id.0
             ),
+            Inst::Extract {
+                dst,
+                src,
+                heading_id,
+            } => write!(f, "{dst} = extract {src} heading_{}", heading_id.0),
         }
     }
 }

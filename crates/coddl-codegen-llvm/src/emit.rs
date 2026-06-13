@@ -170,6 +170,14 @@ impl Emitter {
         // Phase 20 `where`: takes (src, desc, pred_fn) and returns
         // a fresh relation pointer (rc=1).
         writeln!(self.body, "declare ptr @coddl_relation_where(ptr, ptr, ptr)").unwrap();
+        // Phase 21 `extract`: takes (src, desc) and returns a record
+        // pointer (the relation's payload, which IS the first record
+        // when length==1). Aborts on length != 1.
+        writeln!(
+            self.body,
+            "declare ptr @coddl_extract_check_cardinality(ptr, ptr)"
+        )
+        .unwrap();
     }
 
     /// Emit the three globals that describe one heading: a per-attr
@@ -502,6 +510,11 @@ impl Emitter {
                 predicate_linkage,
                 heading_id,
             } => self.lower_where_inst(*dst, src, predicate_linkage, *heading_id),
+            Inst::Extract {
+                dst,
+                src,
+                heading_id,
+            } => self.lower_extract_inst(*dst, src, *heading_id),
         }
     }
 
@@ -645,6 +658,107 @@ impl Emitter {
             },
         );
         Ok(())
+    }
+
+    /// Emit `Inst::Extract`. Calls the cardinality-checking runtime
+    /// extern (which aborts on cardinality != 1), then reads each
+    /// heading attribute from the returned record pointer via the
+    /// same byte-offset GEP+load shape `Inst::AttrLoad` uses. The
+    /// resulting per-field SSA values bundle into a
+    /// `ValueRepr::Tuple` so downstream field-access machinery
+    /// (Phase 18) reads from this tuple directly.
+    fn lower_extract_inst(
+        &mut self,
+        dst: ValueId,
+        src: &ValueId,
+        heading_id: HeadingId,
+    ) -> Result<(), LlvmEmitError> {
+        let src_op = self.scalar_op(src)?;
+        let layout = self
+            .heading_layouts
+            .get(heading_id.0 as usize)
+            .ok_or_else(|| {
+                LlvmEmitError::UnsupportedInst(format!(
+                    "unknown heading_id {} in Extract",
+                    heading_id.0
+                ))
+            })?
+            .clone();
+        // Call the cardinality check + record-ptr extern.
+        let record_ptr = format!("%v{}.rec", dst.0);
+        writeln!(
+            self.body,
+            "    {record_ptr} = call ptr @coddl_extract_check_cardinality(ptr {src_op}, ptr @.heading.{})",
+            heading_id.0,
+        )
+        .unwrap();
+        // For each attribute, read the value into a fresh SSA
+        // ValueRepr; bundle into a Tuple.
+        let mut fields: Vec<(String, ValueRepr)> = Vec::with_capacity(layout.attrs.len());
+        for (i, attr) in layout.attrs.iter().enumerate() {
+            let attr_type = proc_type_from_kind_llvm(attr.kind);
+            let repr = self.read_attr_repr(
+                &record_ptr,
+                attr.offset as usize,
+                &attr_type,
+                &format!("v{}.f{i}", dst.0),
+            )?;
+            fields.push((attr.name.clone(), repr));
+        }
+        self.values.insert(dst, ValueRepr::Tuple { fields });
+        Ok(())
+    }
+
+    /// Read one attribute from a record pointer (in the relation's
+    /// payload) at the static byte offset, returning the
+    /// `ValueRepr` for the field. Mirrors `lower_attr_load`'s logic
+    /// but produces a `ValueRepr` directly instead of inserting into
+    /// `self.values` — used by `Inst::Extract` to build the tuple
+    /// without minting separate per-field ValueIds.
+    fn read_attr_repr(
+        &mut self,
+        base: &str,
+        byte_offset: usize,
+        attr_type: &ProcType,
+        name_hint: &str,
+    ) -> Result<ValueRepr, LlvmEmitError> {
+        match attr_type {
+            ProcType::Integer => {
+                let slot = self.gep_byte(base, byte_offset);
+                let name = format!("%{name_hint}");
+                writeln!(self.body, "    {name} = load i64, ptr {slot}").unwrap();
+                Ok(ValueRepr::Scalar {
+                    ty: "i64".to_string(),
+                    op: name,
+                })
+            }
+            ProcType::Boolean => {
+                let slot = self.gep_byte(base, byte_offset);
+                let raw = format!("%{name_hint}.raw");
+                writeln!(self.body, "    {raw} = load i64, ptr {slot}").unwrap();
+                let name = format!("%{name_hint}");
+                writeln!(self.body, "    {name} = trunc i64 {raw} to i1").unwrap();
+                Ok(ValueRepr::Scalar {
+                    ty: "i1".to_string(),
+                    op: name,
+                })
+            }
+            ProcType::Text => {
+                let ptr_slot = self.gep_byte(base, byte_offset);
+                let len_slot = self.gep_byte(base, byte_offset + 8);
+                let ptr_name = format!("%{name_hint}.ptr");
+                let len_name = format!("%{name_hint}.len");
+                writeln!(self.body, "    {ptr_name} = load ptr, ptr {ptr_slot}").unwrap();
+                writeln!(self.body, "    {len_name} = load i64, ptr {len_slot}").unwrap();
+                Ok(ValueRepr::Text {
+                    ptr_op: ptr_name,
+                    len_op: len_name,
+                })
+            }
+            other => Err(LlvmEmitError::UnsupportedInst(format!(
+                "Extract attribute of type {other:?} not yet supported"
+            ))),
+        }
     }
 
     /// Read out a `Scalar { ty: ptr, op }` for an RC-managed pointer
@@ -919,6 +1033,20 @@ impl Emitter {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+/// Map a `record_layout` attribute kind (numeric tag) to its
+/// `ProcType`. Mirrors `coddl_procir::layout::kind_tag` constants;
+/// kept here so the LLVM backend doesn't have to depend on the
+/// internal `coddl_procir::lower` helper.
+fn proc_type_from_kind_llvm(kind: u32) -> ProcType {
+    use coddl_procir::kind_tag;
+    match kind {
+        k if k == kind_tag::INTEGER => ProcType::Integer,
+        k if k == kind_tag::BOOLEAN => ProcType::Boolean,
+        k if k == kind_tag::TEXT => ProcType::Text,
+        other => unreachable!("unsupported attr kind {other} in Extract"),
+    }
+}
 
 fn llvm_return_type(ty: &ProcType) -> String {
     match ty {

@@ -13,7 +13,8 @@ use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{
     AstNode, BinaryExpr, BinaryOp, Block, CallExpr, Expr, ExprStmt, FieldAccess,
     Heading as AstHeading, Item, KeyClause, LetStmt, NamedArg, OperDecl, PrivateRelvarDecl,
-    ProgramDecl, PublicRelvarDecl, RelationLit, Root, Stmt, TransactionExpr, TupleLit,
+    ProgramDecl, PublicRelvarDecl, RelationLit, Root, Stmt, TransactionExpr, TupleLit, UnaryExpr,
+    UnaryOp,
 };
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
@@ -653,6 +654,41 @@ impl TypeChecker {
             Expr::FieldAccess(f) => self.check_field_access(f, scope),
             Expr::BoolLit(_) => Type::Boolean,
             Expr::Binary(b) => self.check_binary_expr(b, scope),
+            Expr::Unary(u) => self.check_unary_expr(u, scope),
+        }
+    }
+
+    /// Walk a unary prefix expression. Dispatches on `UnaryOp`.
+    /// Phase 21's only operator is `Extract`: operand must be
+    /// `Relation H`; result is `Tuple H`. T0024 on mismatch.
+    fn check_unary_expr(&mut self, ue: &UnaryExpr, scope: &mut Scope) -> Type {
+        let op = match ue.op_kind() {
+            Some(op) => op,
+            None => return Type::Unknown,
+        };
+        match op {
+            UnaryOp::Extract => {
+                let operand_ty = match ue.operand() {
+                    Some(e) => self.check_expr(&e, scope),
+                    None => return Type::Unknown,
+                };
+                match operand_ty {
+                    Type::Relation(h) => Type::Tuple(h),
+                    Type::Unknown => Type::Unknown,
+                    other => {
+                        let span = ue
+                            .operand()
+                            .map(|e| self.node_span(e.syntax()))
+                            .unwrap_or_else(|| self.node_span(ue.syntax()));
+                        self.error(
+                            span,
+                            "T0024",
+                            format!("`extract` expects a Relation, got {other}"),
+                        );
+                        Type::Unknown
+                    }
+                }
+            }
         }
     }
 
@@ -1707,5 +1743,37 @@ mod tests {
     fn and_or_on_non_boolean_diagnoses_t0021() {
         let src = "oper main {} [ let b = 1 and 2; ];";
         assert!(codes(src).contains(&"T0021"));
+    }
+
+    // ── extract (Phase 21) ───────────────────────────────────────────
+
+    #[test]
+    fn extract_on_relation_checks_clean() {
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1}, {a: 2} }; \
+                   let t = extract (r where a = 2); \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn extract_field_access_threads_into_call() {
+        // `extract (r where a = 2).b` should typecheck if the tuple
+        // has a `b` attribute. Use it in a write_line call to exercise
+        // the whole pipeline.
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1, b: \"hi\"}, {a: 2, b: \"ho\"} }; \
+                   let t = extract (r where a = 2); \
+                   write_line { message: t.b }; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn extract_on_non_relation_diagnoses_t0024() {
+        let src = "oper main {} [ let t = extract 42; ];";
+        assert!(codes(src).contains(&"T0024"));
     }
 }

@@ -279,8 +279,21 @@ function that implements it.
                   | <bool-lit>
                   | <transaction-expr>
                   | <tuple-lit>
-                  | <relation-lit> ;                           -- parse_primary_expr
+                  | <relation-lit>
+                  | <extract-expr>
+                  | <paren-expr> ;                             -- parse_primary_expr
 <bool-lit>      ::= 'true' | 'false' ;                         -- BOOL_LITERAL
+<extract-expr>  ::= 'extract' <expr-prec> ;                    -- parse_extract_expr
+                    -- TTM RM Pre 10 cardinality-checked
+                    -- relation-to-tuple primitive. Wraps in
+                    -- UNARY_EXPR. The operand parses at the
+                    -- lowest precedence so `extract R where p`
+                    -- reads as `extract (R where p)` without
+                    -- parens.
+<paren-expr>    ::= '(' <expr-prec> ')' ;                       -- PAREN_EXPR
+                    -- Transparent grouping; AST view unwraps to
+                    -- the inner expression so the typechecker /
+                    -- lowerer never see the wrapper.
 <transaction-expr> ::= 'transaction' <block> ;                 -- parse_transaction_expr
 <name-ref>      ::= <identifier> ;
 <arg-list>      ::= '{' [ <named-arg> commalist ] '}' ;        -- parse_arg_list
@@ -380,6 +393,7 @@ enforces that.
 | P0031 | Expected `{` after `Relation`                           |
 | P0032 | Expected `{` to start a tuple in a relation literal     |
 | P0033 | Expected `}` to close relation literal                  |
+| P0035 | Expected `)` to close parenthesized expression          |
 
 Note: missing-type-after-`:` (let annotation) and missing-type-
 after-`->` (operator return clause) both surface as `P0011`

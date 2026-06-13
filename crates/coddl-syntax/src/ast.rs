@@ -375,7 +375,7 @@ impl ExprStmt {
 /// the kinds recognized are name references, literals, brace-call
 /// expressions, `transaction` block expressions, tuple literals,
 /// relation literals, dot-prefixed field access, Boolean literals,
-/// and binary (infix) expressions.
+/// binary (infix) expressions, and unary (prefix) expressions.
 #[derive(Debug, Clone)]
 pub enum Expr {
     NameRef(NameRef),
@@ -387,6 +387,7 @@ pub enum Expr {
     FieldAccess(FieldAccess),
     BoolLit(BoolLit),
     Binary(BinaryExpr),
+    Unary(UnaryExpr),
 }
 
 impl Expr {
@@ -401,6 +402,11 @@ impl Expr {
             SyntaxKind::FIELD_ACCESS => Expr::FieldAccess(FieldAccess { syntax }),
             SyntaxKind::BOOL_LITERAL => Expr::BoolLit(BoolLit { syntax }),
             SyntaxKind::BINARY_EXPR => Expr::Binary(BinaryExpr { syntax }),
+            SyntaxKind::UNARY_EXPR => Expr::Unary(UnaryExpr { syntax }),
+            // Parenthesized expressions are transparent — recurse to
+            // the inner `Expr` so the typechecker / lowerer never see
+            // the wrapper. Used purely for precedence grouping.
+            SyntaxKind::PAREN_EXPR => return syntax.children().find_map(Expr::cast),
             _ => return None,
         })
     }
@@ -416,6 +422,7 @@ impl Expr {
             Expr::FieldAccess(f) => f.syntax(),
             Expr::BoolLit(b) => b.syntax(),
             Expr::Binary(b) => b.syntax(),
+            Expr::Unary(u) => u.syntax(),
         }
     }
 }
@@ -627,6 +634,47 @@ impl BinaryExpr {
                 "where" => BinaryOp::Where,
                 _ => return None,
             },
+            _ => return None,
+        })
+    }
+}
+
+/// Unary prefix operator kinds. Phase 21 ships `Extract` only —
+/// future unary ops (`not`, unary `-`) slot in here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    /// `extract <relexpr>` — TTM RM Pre 10 cardinality-checked
+    /// relation-to-tuple primitive.
+    Extract,
+}
+
+ast_node!(pub UnaryExpr, UNARY_EXPR);
+
+impl UnaryExpr {
+    /// The operand expression — the single `Expr` child.
+    pub fn operand(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// The operator's keyword token. Phase 21's only unary op is
+    /// `extract`, recognized via its IDENT lexeme.
+    pub fn op_token(&self) -> Option<SyntaxToken> {
+        for el in self.syntax.children_with_tokens() {
+            if let Some(tok) = el.into_token() {
+                if tok.kind() == SyntaxKind::IDENT && matches!(tok.text(), "extract") {
+                    return Some(tok);
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve the operator token to a `UnaryOp`. `None` is a
+    /// parse-recovery edge case (no recognized prefix token).
+    pub fn op_kind(&self) -> Option<UnaryOp> {
+        let tok = self.op_token()?;
+        Some(match tok.text() {
+            "extract" => UnaryOp::Extract,
             _ => return None,
         })
     }
@@ -1017,6 +1065,23 @@ mod tests {
                 assert_eq!(inner.op_kind(), Some(BinaryOp::Eq));
             }
             other => panic!("expected Binary rhs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_unary_expr_carries_extract_op_kind() {
+        let root = ast("oper f {} [ let t = extract R; ];");
+        let ue = root
+            .syntax()
+            .descendants()
+            .find_map(UnaryExpr::cast)
+            .expect("UnaryExpr in tree");
+        assert_eq!(ue.op_kind(), Some(UnaryOp::Extract));
+        match ue.operand() {
+            Some(Expr::NameRef(n)) => {
+                assert_eq!(n.ident().unwrap().text(), "R");
+            }
+            other => panic!("expected NameRef operand, got {other:?}"),
         }
     }
 }

@@ -16,7 +16,7 @@ use coddl_diagnostics::{Diagnostic, FileId, Severity, Span};
 use coddl_syntax::ast::{
     AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, Expr, ExprStmt, FieldAccess, Item,
     LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, RelationLit, Root, Stmt,
-    TransactionExpr, TupleLit,
+    TransactionExpr, TupleLit, UnaryExpr, UnaryOp,
 };
 use coddl_syntax::SyntaxKind;
 use coddl_types::{check, Heading, Type};
@@ -498,7 +498,53 @@ impl Lowerer {
             Expr::FieldAccess(f) => self.lower_field_access(f),
             Expr::BoolLit(b) => self.lower_bool_lit(b),
             Expr::Binary(b) => self.lower_binary_expr(b),
+            Expr::Unary(u) => self.lower_unary_expr(u),
             Expr::NameRef(n) => self.lower_name_ref(n),
+        }
+    }
+
+    /// Lower a unary prefix expression. Phase 21 handles `Extract`:
+    /// emit `Inst::Extract` with the source's heading id. If the
+    /// source isn't bound to any local (i.e., it's a temporary —
+    /// e.g., a freshly-allocated `R where p`), emit `Inst::Release`
+    /// after extract so the heap payload is freed.
+    fn lower_unary_expr(&mut self, ue: &UnaryExpr) -> ValueId {
+        let op = ue.op_kind().expect("typechecked unary expr has an op");
+        match op {
+            UnaryOp::Extract => {
+                let operand_expr = ue
+                    .operand()
+                    .expect("typechecked extract has an operand");
+                let src = self.lower_expr(&operand_expr);
+                let heading_id = match self.value_type(src) {
+                    ProcType::Relation(id) => id,
+                    other => unreachable!(
+                        "extract on non-relation `{other}` survived typecheck"
+                    ),
+                };
+                let heading = self.headings[heading_id.0 as usize].clone();
+                let dst = self.fresh_value();
+                self.record_type(dst, ProcType::Tuple(heading));
+                self.insts.push(Inst::Extract {
+                    dst,
+                    src,
+                    heading_id,
+                });
+                // If the source ValueId isn't owned by any local, it's
+                // a temporary — release its heap payload now that
+                // extract has copied its content into scalar fields.
+                // Bound sources (e.g., `extract r` where `r` is a let
+                // binding) stay live; releasing here would
+                // double-free at the next use.
+                let is_owned = self
+                    .locals
+                    .iter()
+                    .any(|layer| layer.values().any(|(vid, _)| *vid == src));
+                if !is_owned {
+                    self.insts.push(Inst::Release { src });
+                }
+                dst
+            }
         }
     }
 
@@ -1538,5 +1584,69 @@ mod tests {
             out.diagnostics
         );
         assert!(out.module.is_none(), "module should be None on T0022");
+    }
+
+    // ── extract (Phase 21) ───────────────────────────────────────────
+
+    #[test]
+    fn extract_on_temporary_emits_inst_then_release() {
+        // The `r where a = 2` is a fresh allocation — extract should
+        // emit Inst::Extract followed by Inst::Release(src).
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1}, {a: 2} }; \
+                   let t = extract (r where a = 2); \
+                   ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let insts = &main.blocks[0].insts;
+        let extract_idx = insts
+            .iter()
+            .position(|i| matches!(i, Inst::Extract { .. }))
+            .expect("Inst::Extract emitted");
+        // The next instruction must be a Release of the extract's
+        // source (the temporary from the `where`).
+        let extract_src = match &insts[extract_idx] {
+            Inst::Extract { src, .. } => *src,
+            _ => unreachable!(),
+        };
+        let next = &insts[extract_idx + 1];
+        match next {
+            Inst::Release { src } => assert_eq!(*src, extract_src),
+            other => panic!("expected Release after Extract, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_on_let_bound_does_not_release_source() {
+        // When the source is a let-bound name, the scope owns the
+        // refcount — extract should NOT emit an immediate Release
+        // (that would double-free at scope exit).
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1} }; \
+                   let t = extract r; \
+                   ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let insts = &main.blocks[0].insts;
+        let extract_idx = insts
+            .iter()
+            .position(|i| matches!(i, Inst::Extract { .. }))
+            .unwrap();
+        let extract_src = match &insts[extract_idx] {
+            Inst::Extract { src, .. } => *src,
+            _ => unreachable!(),
+        };
+        // No Release of `extract_src` should appear between the
+        // Extract and the function epilogue's scope-exit release.
+        // There IS exactly one Release of `r`'s ValueId — but it
+        // sits at the function epilogue (after the second
+        // RelationLit's let-stmt finishes), not immediately after
+        // the Extract. Verify there's exactly one Release for the
+        // source.
+        let count = insts
+            .iter()
+            .filter(|i| matches!(i, Inst::Release { src } if *src == extract_src))
+            .count();
+        assert_eq!(count, 1, "let-bound source should see exactly one Release (at scope exit)");
     }
 }

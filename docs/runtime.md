@@ -45,6 +45,7 @@ calling convention works for both heap-managed and immortal values.
 | `coddl_relation_seal`      | `(payload, desc) -> ()`                             | Sort the relation's records by byte-wise comparison, then adjacent-dedup in place; updates the header's `length`.        |
 | `coddl_write_relation`     | `(payload, desc) -> ()`                             | Print the relation, one tuple per line, in canonical heading order. Empty relation writes zero bytes.                    |
 | `coddl_relation_where`     | `(src, desc, pred_fn) -> ptr`                       | Restrict `src` by `pred_fn(record_ptr) != 0`. Returns a fresh RC-managed relation (rc=1) holding the matching rows in the input's original order. Worst-case alloc; header `length` trimmed to the actual count. No re-seal — filter preserves the input's sealed (sorted/dedup'd) order. |
+| `coddl_extract_check_cardinality` | `(src, desc) -> ptr`                          | TTM RM Pre 10 cardinality check: if `src`'s header `length` is exactly 1, returns a pointer to the single record's bytes (which equals `src` itself, since records start at the payload base). Otherwise writes `"coddl: extract: expected exactly 1 tuple, got N"` to stderr and calls `std::process::abort()`. The caller reads each attribute via the descriptor before releasing the source — the lowering's "Extract then Release" order guarantees the buffer is live during attribute reads. |
 
 The lowerer and both backends agree on the same set of symbol names
 and signatures; the `BUILTIN_EXTERNS` table in `coddl-procir::lower`
