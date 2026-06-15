@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "extern \"C\" runtime linked into compiled Coddl binaries (ARCHITECTURE.md §6)."
+description = "extern \"C\" runtime linked into compiled Coddl binaries. See docs/runtime.md."
 
 [lib]
 crate-type = ["staticlib", "rlib"]

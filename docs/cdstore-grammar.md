@@ -5,9 +5,8 @@ the conceptual → physical binding file. A `.cdstore` file declares
 which backend a database runs on (SQLite, Postgres, …) and how each
 base catalog relvar maps to a physical table and column set.
 
-For the overall four-file architecture, see `ARCHITECTURE.md` and
-`.local/phases.md` (Phase 14). Lexical productions are shared with
-`.cd` — see `docs/grammar.md`.
+For the overall four-file architecture, see [plan.md](plan.md).
+Lexical productions are shared with `.cd` — see [grammar.md](grammar.md).
 
 **Last sync:** unreleased — Phase 14.
 

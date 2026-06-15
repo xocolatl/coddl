@@ -1,15 +1,119 @@
-# Coddl runtime
+# Runtime — `libcoddl_runtime`
 
-This document is the authoritative spec for `libcoddl_runtime` —
-the C-ABI staticlib that Coddl binaries link against. It pins the
-RC contract, the per-heading descriptor layout, the seal discipline,
-and the canonical printer format. See `ARCHITECTURE.md §6` for the
-broader runtime responsibilities; this document is the Phase 19+
-data layer.
+A Rust crate exposing `extern "C"` entry points, built as a `staticlib` by default (`cdylib` later if plugin loading lands — see [workspace.md](workspace.md)). Compiled Coddl binaries link against it directly: no managed runtime, no garbage collector, no startup overhead beyond the program's own.
 
-For the IR shapes that drive these calls, see `docs/procir.md`. For
-the per-backend emission of descriptors, see `docs/codegen.md`'s
-"Per-module heading descriptors" section.
+This doc has two parts: **architecture** (what the runtime hosts, the execution model, the FFI discipline — the *why*) and the **data layer spec** (RC contract, descriptors, seal, canonical printer — the *what*, exact bytes and signatures). For the IR shapes that drive these calls, see [procir.md](procir.md); for the per-backend emission of descriptors, see [codegen.md](codegen.md) "Per-module heading descriptors."
+
+## Responsibilities
+
+- Own the DB connection pool.
+- Cache prepared statements by `plan_id` (compiler assigns at codegen time).
+- Marshal LLVM-side value structs ↔ backend parameter binders. `#[repr(C)]` Rust structs match the layout LLVM emits exactly; no marshaling cost beyond field reads, no FFI shim allocation. A single source-of-truth description (see [risks.md](risks.md) risk #8) generates both the LLVM struct text and the Rust `#[repr(C)]` declaration so they can't drift.
+- Provide a row iterator the LLVM-emitted code can drive (cursor handle + `coddl_next` returning a tagged-union row).
+- Host the **relational runtime library** (called from compiled code), the **runtime RelIR interpreter** (for dynamic plans — see "Reaching the engines" below), and `coddl-sqlemit` as a library (so runtime-built plans lower to SQL through the same code path the compiler uses).
+- Map errors to a single error code + thread-local message.
+
+LLVM IR calls these exports as plain C functions. The runtime is where SQLite vs Postgres lives at runtime — the compiled program is backend-agnostic if we're disciplined about not leaking dialect-specific values through the ABI.
+
+## Two execution engines
+
+The runtime hosts two execution engines side-by-side:
+
+- **SQL backend** — runs any subplan rooted in relvars. Subplans become SQL strings via [`coddl-sqlemit`](sqlemit.md) (at compile time for static plans, loaded as a library at runtime for dynamic ones).
+- **In-process runtime library** — compiled relational primitives (`coddl_relation_where`, `coddl_relation_join`, `coddl_relation_project`, …) operating over materialized relations. Tight specialized loops; volcano-style where it pays off (hash joins, sort-merge). Tests and the REPL exercise the same primitives the compiled binary does.
+
+The RelIR optimizer draws the cut between them as close to the leaves as possible: push everything that touches a relvar into SQL, do the rest in-process. See [relir.md](relir.md) "The cut: SQL vs in-process."
+
+## Reaching the engines: compile-time lowering vs. runtime interpretation
+
+Two pathways feed the engines, depending on whether the plan shape is known at compile time:
+
+1. **Statically-known plans** (the common case). Per the cut decision:
+   - SQL-rooted subtree → `coddl-sqlemit` produces SQL + a baked `plan_id`; ProcIR holds the call site as `query(plan_id, params)`.
+   - In-process subtree → `coddl-execlocal` produces a ProcIR call sequence into the runtime library, which LLVM then specializes per heading.
+
+2. **Plans built at runtime.** Relation-polymorphic operators that can't be monomorphized, or query shapes that depend on a relation passed in at runtime. The runtime hosts both `coddl-sqlemit` (as a library) and a small RelIR interpreter that walks the plan and calls the same runtime-library primitives. Slower than the static path — no LLVM specialization — but unavoidable for genuinely dynamic composition. Specialize at compile time whenever the type system permits (monomorphize on heading like Rust generics); fall back to the runtime planner/interpreter otherwise.
+
+`coddl-execlocal` and the runtime interpreter are **two consumers of the same RelIR**, separated by when they run — compile-time lowering vs. runtime walking. Both end up calling the same runtime-library primitives.
+
+## Lazy semantics
+
+**Relations are lazy.** Scalars are strict. A relation expression is a thunk: it doesn't run at construction, only when something needs its tuples — iteration via `load`, being shipped into another query, being assigned to a relvar, being compared with `=`, being passed to a user-defined operator that consumes it. There is **no `force` keyword** in Coddl; each use re-evaluates the expression against current relvar state. (Laziness is one of the sanctioned design freedoms in [conformance.md](conformance.md) — TTM doesn't address evaluation strategy.) Equality is by value (heading + tuple set), so two relations built by different routes that yield the same tuples are equal regardless of evaluation history (RM Pre 8).
+
+Because relations are first-class, the calling convention has to be uniform: any function that takes a relation must accept a value it can read, re-query, and pass onward. The runtime may memoize a handle's result when it can prove the source relvars haven't changed since the previous use, but that's an optimization invisible to the user.
+
+## Relation values at runtime
+
+A first-class relation is one of three things, behind a single `Relation` handle:
+
+1. **Plan-backed** — a `plan_id` plus its already-bound parameters. The default. Each use re-evaluates against current relvar state. The runtime may memoize the result when source-relvar invalidation is provably absent, but that's an optimization, not a semantic guarantee.
+2. **Materialized** — a runtime-owned buffer of tuples (arena-allocated, or a backend temp table for large ones — see [risks.md](risks.md) risk #1). Used when tuples are already in memory: relation literals (`Relation { tup1, tup2 }`), results of in-process evaluation, in-memory inputs being shipped back into SQL via temp table.
+3. **Cursor** — a live result set being drained. Compiler-only optimization for `load ... order (...)` flows where the sequence is consumed once and never escapes — lets the runtime stream rows from the backend into the sequence slot-by-slot instead of buffering them all.
+
+## Plan registration
+
+- Each compile-time query becomes a `plan_id` with a SQL template and parameter signature.
+- Codegen registers all static plans at process start: `coddl_register_plan(id, sql, param_types, result_heading)`.
+- At call sites, ProcIR computes parameters (including any `TempRelRef`s built from in-memory relations), calls `coddl_query(plan_id, params) -> Relation`, and either iterates, materializes, or hands the handle onward.
+- Dynamic plans (relation-polymorphic, runtime-shaped) register later — the runtime interpreter assigns plan IDs the first time it lowers a previously-unseen plan shape and caches by shape from then on.
+
+## Iteration: the `load` primitive
+
+There is no tuple-at-a-time access to relvars or relations (RM Pro 7). The only iteration primitive is `load`, which forces the relation, imposes an order, and writes the tuples into a local sequence:
+
+```
+var A: Sequence Tuple { S#: S#, QTY: QTY };
+load A from ( SP where P# = P#('P1') ) { S#, QTY } order ( asc S# );
+do i := 1 to count(A) [
+    -- process A[i]
+];
+```
+
+`A` here has type `Sequence Tuple { S#: S#, QTY: QTY }` — an ordered list of tuples. `load` populates the sequence from a relation with a given order; the counted `do` loop walks it by position.
+
+`load` is the syntactic and semantic gate between the set-oriented and procedural worlds: it forces the relation, imposes an order (the order is part of the operation, not a property of the relation), and writes the tuples into a local sequence. This is the *only* sanctioned path; the compiler rejects any other attempt to step through tuples one at a time.
+
+The reverse direction — `load <relvar target> from <sequence var ref>` — assigns the (set-valued) projection of the sequence's tuples back into a relvar. Useful for round-tripping procedurally-built sequences into relational form.
+
+## Multiple assignment
+
+`A1, A2, …, An ;` is a single statement with the semantics of RM Pre 21 (see [conformance.md](conformance.md)):
+
+1. Expand all syntactic shorthands (INSERT/UPDATE/DELETE/`THE_C` pseudovariable) into `target := expr` form.
+2. Fold duplicate targets by rewriting `Vq := Xq` as `Vq := WITH Xp AS Vq : Xq` and dropping the earlier assignment. Repeat.
+3. Evaluate every RHS expression. Capture results.
+4. Apply all assignments to their targets atomically.
+5. Check every applicable database constraint at the end of the whole MA (not between assignments).
+
+ProcIR therefore has a `multi_assign` primitive, not just a sequence of individual assigns. The runtime evaluates all RHSs first (against the pre-MA database state), then commits the writes in one logical step, then runs constraint checks.
+
+## Transactions
+
+`BEGIN TRANSACTION` / `COMMIT` / `ROLLBACK` are explicit (OO Pre 4). Nested transactions are supported (OO Pre 5): a nested `BEGIN` starts a child; child `COMMIT` is conditional on the parent; child `ROLLBACK` undoes only the child's work. The SQL backend uses `SAVEPOINT` for child transactions, but the runtime tracks the parent/child relationship explicitly because SQL `SAVEPOINT` doesn't model true nesting.
+
+A relation handle captured before a write within the same transaction **re-evaluates on use** and so sees post-write state — the consequence of the lazy semantics above. If the user wants to freeze the pre-write tuples, they `load` the relation into a sequence (or assign it to a private relvar) before the write. This avoids any pre-image / copy-on-write machinery in the runtime.
+
+## Performance posture
+
+The runtime is on the hot path for every relation operation that crosses the SQL/in-process boundary. Allocate per-query with a bump arena; free at query completion (a typed arena per heading is the natural unit). Avoid `Box<dyn Trait>` on tuple values; specialize over heading or use a fixed-size value layout. Pull row buffers from prepared statements directly into Coddl tuple memory where the dialect permits — zero-copy is the default, copy only when alignment or lifetime forces it. Abort-on-panic (`panic = "abort"`) for release builds: smaller stack-unwinding tables and a single failure mode at the FFI boundary.
+
+## FFI boundary discipline
+
+Values crossing into LLVM-emitted code are `#[repr(C)]` or primitive. No Rust enums-with-payload across the boundary unless tagged-C-style. No `Vec`/`String` raw pointers without an explicit owner declaration. The discipline is enforced by a single layout-description module in the runtime crate, mirrored from there into LLVM codegen.
+
+## Portability — backends as features
+
+SQL backends are Cargo features on the runtime crate (`sqlite`, `postgres`). `wasm32-*` builds drop these — the C dependencies of `rusqlite`/`postgres` don't link to `wasm32-unknown-unknown` — and either run with only the in-process runtime library (materialized relations, no DB) or proxy SQL through wasm host imports if a wasmtime/JS host is in play. Same crate split, different feature set at build time. See [workspace.md](workspace.md) for the build configuration.
+
+## Why Rust over plain C for the runtime
+
+A C `libcoddl_runtime` would be ~50–300 KB smaller as a `staticlib`; nothing else recommends it for our case. The two non-trivial runtime jobs — the runtime RelIR interpreter and the RelIR→SQL emitter — are tree walks over sum types, which Rust enums + pattern matching handle naturally and C reinvents painfully. The SQL emitter is the same crate the compiler uses; a C runtime would either duplicate it (two versions to keep in lockstep forever — against [long-term planning](principles.md)) or call into a Rust crate (a Rust runtime with extra steps). Connection pooling and prepared-statement caching are markedly less code against `rusqlite`/`postgres` than against `sqlite3.h`/`libpq-fe.h`. Where binary size or non-Rust embedding ever does matter, the hot value-marshaling layer can drop to `#![no_std]` Rust or a small C TU without touching the interpreter or emitter — picking Rust now doesn't lock out a leaner future.
+
+---
+
+# Data layer spec
+
+The remainder of this doc pins the exact bytes and signatures the runtime exposes today — the RC contract, the per-heading descriptor layout, the seal discipline, the canonical printer format. Phase 19+ shipping reality.
 
 ## RC contract
 

@@ -1,16 +1,65 @@
-# Storage — public relvars, SQLite materialization, transactions
+# Storage abstraction
 
-Phase 22 brings public relvars to life: the four-file `.cd` / `.cddb` /
-`.cdstore` chain (validated by Phase 16's plan layer) now drives a
-runtime materialization pass at program startup, public-relvar
-references resolve to in-memory `Relation H` values, and
-`transaction [...]` becomes load-bearing with the TTM OO Pre 4
-conformance check.
+Coddl talks to persistent storage through a pair of Rust traits — `Backend` (pure, SQL-emitting half) and `Conn` (effectful, connection half) — so that the rest of the compiler stays backend-agnostic. SQLite is v1 (read-only public relvars hydrated at startup, no-op transactions); Postgres lands later.
 
-This document is the spec for the storage path; sibling specs:
-`docs/typecheck.md` for the surface rules, `docs/procir.md` for the
-IR shape, `docs/codegen.md` for backend emission, `docs/runtime.md` for
-the C ABI.
+This doc covers the **abstraction** (the traits, the design rationale, the `database` declaration) and the **concrete v1 SQLite implementation** (Phase 22: public relvars, materialization, transaction stubs). For the SQL emission rules that govern *what* the backend sees, see [sqlemit.md](sqlemit.md). For the broader runtime architecture (the SQL engine plus the in-process runtime library) see [runtime.md](runtime.md). For the surface typing rules around public relvars, see [typecheck.md](typecheck.md); for the IR shape, [procir.md](procir.md); for the per-backend emission, [codegen.md](codegen.md).
+
+## Why an abstraction at all
+
+RM Pro 6 forbids internal-level constructs in `D` source. A Coddl program does not name a `.sqlite` file, a `pg_hba.conf`, a `JDBC URL`, or a column type. The mapping from a `public relvar` in source to a physical table in some database lives in companion files (`.cddb` for the catalog, `.cdstore` for the physical binding — see [plan.md](plan.md)). The source code names the **database** (a logical handle) by binding `database <name>;`; everything else is the plan layer's job.
+
+The `Backend` / `Conn` split exists for the same reason the IR split exists (see [principles.md](principles.md) "Long-term planning"): the boundary is *semantic* (pure dialect emission vs. effectful connection) rather than expedient. Adding Postgres later doesn't require touching the compiler — only adding a second `impl Backend`.
+
+## The traits
+
+```rust
+trait Backend {
+    type Conn: Conn;
+    fn dialect(&self) -> Dialect;
+    fn emit_select(&self, plan: &RelPlan) -> SqlString;
+    fn emit_ddl(&self, schema: &Schema) -> Vec<SqlString>;
+    fn type_map(&self) -> &TypeMap;                       // CoddlType ↔ SQL type
+    fn open(&self, dsn: &Dsn) -> Result<Self::Conn>;
+}
+
+trait Conn {
+    fn prepare(&mut self, sql: &SqlString) -> Result<StmtId>;
+    fn bind_and_step<'a>(&'a mut self, id: StmtId, params: &[Value]) -> Result<RowIter<'a>>;
+    fn materialize_temp(&mut self, heading: &Heading, rows: &[Tuple]) -> Result<TempRelRef>;
+}
+```
+
+Crates: `coddl-backend-sqlite`, `coddl-backend-postgres`. Selection is a Cargo feature on the runtime crate; the LLVM-emitted binary links against exactly one runtime that wraps the chosen `Conn`. If passing backends around as values gets clumsy with the associated-type trait, switch to a `dyn`-friendly `BackendOps` record-of-fn-pointers — the per-call dispatch cost is negligible against query latency. Decide once the second backend lands. Cargo features also gate SQL backends out of `wasm32-*` builds where the C dependencies of `rusqlite` / `postgres` don't link (see [workspace.md](workspace.md), [runtime.md](runtime.md) "Portability").
+
+`materialize_temp` is the boundary primitive for sending in-memory relations back into SQL — see [sqlemit.md](sqlemit.md) "Sending in-memory relations back into SQL" for the per-backend strategy.
+
+## The `database` declaration
+
+Every Coddl program with public relvars must declare which database it binds to:
+
+```
+program hello_world_db;
+database greetings;
+
+public relvar Greetings { id: Integer, message: Text }
+key { id };
+```
+
+`database <name>;` introduces a logical handle that the plan layer resolves against companion `.cddb` (catalog) and `.cdstore` (physical binding) files. The Coddl source contains no file path, no connection string, no dialect — RM Pro 6.
+
+At runtime, operational fields are resolved through environment overrides keyed by the database name: `CODDL_<DBNAME>_FILE` for the SQLite path on the example above, expanded uppercase from `database greetings;` → `CODDL_GREETINGS_FILE`. The baked default (from the `.cdstore`) wins when the env var isn't set. See "Path resolution" below.
+
+## SQL emission, by reference
+
+The `Backend::emit_select(plan) -> SqlString` method is where RelIR becomes SQL. The rules that emission must follow — `SELECT DISTINCT` on every projection, never `NULL`, always explicit columns, etc. — are correctness requirements imposed by TTM and live in [sqlemit.md](sqlemit.md). This doc deliberately doesn't repeat them; if you're writing or auditing a new backend, the emission table in `sqlemit.md` is the contract.
+
+Keep SQL emission to a **portable subset** (CTEs, window functions, standard joins) and isolate dialect divergence behind backend methods. Golden-file tests per backend (`tests/golden/`) lock down `RelIR plan → expected SQL` per dialect; the [validation matrix](validation.md) confirms that the *results* match across backends regardless of textual differences.
+
+---
+
+# v1: SQLite implementation (Phase 22)
+
+The rest of this doc pins the current SQLite-backed pipeline. Phase 22 brings public relvars to life: the four-file `.cd` / `.cddb` / `.cdstore` chain (validated by Phase 16's plan layer) drives a runtime materialization pass at program startup, public-relvar references resolve to in-memory `Relation H` values, and `transaction [...]` becomes load-bearing with the TTM OO Pre 4 conformance check.
 
 ## Discovery → plan → runtime
 

@@ -6,8 +6,7 @@ database catalog source family member. A `.cddb` file declares the
 independent of any consuming application's view.
 
 For the overall four-file architecture (`.cd` / `.cddb` / `.cdmap` /
-`.cdstore`), see `ARCHITECTURE.md` and the higher-level discussion in
-`.local/phases.md` (Phase 14). Lexical productions, comments,
+`.cdstore`), see [plan.md](plan.md). Lexical productions, comments,
 whitespace, identifiers, literals, and punctuation are **shared with
 `.cd`** — see `docs/grammar.md`. This document covers only the
 syntactic productions specific to `.cddb`.

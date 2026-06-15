@@ -4,7 +4,7 @@
 //! rather than depending on `llvm-sys`/`inkwell` (version-coupling churn,
 //! and we don't need programmatic IR introspection). The same emitter
 //! covers native targets and `wasm32-*` via the target triple.
-//! See ARCHITECTURE.md §1, §4.
+//! See `docs/codegen.md` and `docs/procir.md`.
 
 pub mod emit;
 pub mod error;

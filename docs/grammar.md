@@ -1,18 +1,167 @@
-# Coddl grammar
+# Grammar — surface syntax
 
-This document is the authoritative spec for Coddl's surface syntax —
-the precise form of the language the parser currently accepts.
+The authoritative spec for Coddl's surface syntax — the precise form of the language the parser currently accepts, plus the design rationale behind every choice that doesn't immediately follow from TTM (see [conformance.md](conformance.md)).
 
-For *why* the rules look the way they do, see `ARCHITECTURE.md §3
-"Conformance to the Third Manifesto"` (surface syntax, brackets vs
-braces, identifier case, reserved-words-none, Unicode glyph synonyms,
-literals, method-style calls). This document never duplicates that
-rationale — it points at it and gets on with the rules.
+This doc has two parts: **rationale** (the design decisions — why prefix-named-args, why no reserved words, why brackets-vs-braces, etc.) and the **productions** (the EBNF the parser implements, lexical and syntactic).
 
-**Last sync:** `1830ac1`. Every commit that adds, removes, or changes
-a production, token, or diagnostic code updates this file in the
-same commit; `tools/check-grammar.sh` enforces it from the hygiene
-gate.
+**Last sync:** `1830ac1`. Every commit that adds, removes, or changes a production, token, or diagnostic code updates this file in the same commit; `tools/check-grammar.sh` enforces it from the hygiene gate.
+
+---
+
+# Design rationale
+
+## Uniform named-argument prefix style
+
+Tutorial D's own authors observe (ch. 5, "A Remark on Syntax", pp. 127–128) that Tutorial D's operator syntax "is not very consistent" — mixed prefix/infix, positional matching that "violates the spirit, if not the letter, of RM Proscription 1." They sketch a uniform style they prefer but stop short of adopting: prefix for everything, argument matching by name, braces for argument bundles:
+
+```
+CARTESIAN { Y 2.5, X 5.0 }     -- not CARTESIAN ( 5.0, 2.5 )
+JOIN      { left R, right S }  -- name the slots
+```
+
+**Coddl takes this as its default, with one variation: a colon between name and value.** The authors' examples above are space-separated; Coddl uses `name: value`. So the same examples in Coddl are:
+
+```
+cartesian { Y: 2.5, X: 5.0 }
+R join S                              -- join is infix, see below
+```
+
+Reason for the colon: it makes the name/value boundary unambiguous when values are themselves identifiers or call expressions (`{ left: R, right: S join T }` reads clearly; `{ left R, right S join T }` requires the reader to know `R`/`S`/`T` aren't named-arg names). The colon also matches the way the same shape is written when `{ ... }` appears in a value position as a tuple literal (`{x: 1, y: 2}`), so one separator works in both roles.
+
+Three operator-shape categories, with deliberate exceptions:
+
+### Infix for binary operators (symbolic *and* textual)
+
+- **Symbolic**: `=`, `<>`, `<`, `>`, `<=`, `>=`, `+`, `-`, `*`, `/`. The comparison operators `<=` and `>=` are polymorphic: scalar comparison on scalars (as ever); **subset** and **superset** on relations (`R <= S` iff every tuple in `R` appears in `S`; `S >= R` iff `R <= S`). `<` and `>` give strict subset / superset analogously. Identical headings are required for the relation overload — checked at compile time. There's no separate `subset` keyword; `<=` covers it.
+- **Textual relational**: `join`, `times`, `intersect`, `union`, `minus`, `where`.
+- **Textual logical**: `and`, `or`. (Both `Boolean × Boolean → Boolean`. `or` < `and` < `not` < comparison on the precedence ladder; final ordering deferred to the parser phase.)
+- **Textual arithmetic**: `mod`. (`Integer × Integer → Integer`. Binds at multiplicative precedence, alongside `*` and `/`. Defined only for `Integer` in v1 — extending to `Rational`/`Approximate` needs a separate semantic decision.)
+
+Reason: the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-unfriendly names, and the textual binary ops all have natural infix readings from math and SQL. No-reserved-words still holds — `join` is recognized contextually in expression position; it remains a valid identifier elsewhere.
+
+**`times` and `intersect` are typed aliases of `join`.** Both lower to the same `AND` node in Algebra A (see [relir.md](relir.md) — `AND` generalizes TIMES and INTERSECT). The aliases exist for intent-signaling and compile-time enforcement: `times` requires the two heading sets to be **disjoint** (otherwise the user meant `join`, not a cartesian product, and the type checker catches the slip); `intersect` requires the two heading sets to be **identical**. Both checks are static, both are zero-cost at runtime.
+
+**`union` and `minus` require identical headings.** `union` lowers to A-core `OR` (heading-agnostic relational union, restricted at the type level to matching headings since Coddl has no nulls). `minus` lowers to `AND NOT` (set difference is `R join (NOT S)` when headings match). Both checks are static; mismatched-heading attempts are rejected at compile time with a diagnostic.
+
+**`where` (restriction) is also infix and special-cased in two ways.** The right operand is a *predicate*, not another relation, and that has two consequences:
+
+- **Scope injection.** Identifiers in the predicate resolve against the left operand's heading first, the enclosing scope second. `SP where s# = supplier` reads as: `s#` is the `SP` attribute; `supplier` is a parameter from the enclosing `oper`. The parser and typechecker inject the left operand's heading into the predicate's name-resolution scope automatically. This is the first construct with a non-uniform scoping rule; every later construct that takes a predicate (`extend`, `summarize`'s aggregate expressions, possrep constraints) reuses the same machinery.
+- **Precedence.** `where` binds looser than `=`, `<`, `+`, `and`, `or` — the predicate is expected to be a full scalar expression. `R where x = 1 and y > 0` parses as `R where ((x = 1) and (y > 0))` without parentheses. Practically `where` sits at the bottom of the infix precedence ladder, alongside `union`/`minus`. Full precedence table lands when the parser does — exact order is deferred until then.
+
+### Parenthesized positional for monadic operators
+
+`count(R)`, `sin(x)`, `is_*(...)`, `not(p)`. Single argument, name-free, conventional shape.
+
+### Named-prefix with braces for everything else
+
+N-ary or structured operands: selectors, `oper` calls in general, `extend`, `summarize`, `rename`, `group`, `ungroup`, `wrap`, `unwrap`. These all have meaningful name slots that would be lost in a positional form.
+
+This eliminates the relational-algebra/scalar-op syntactic distinction the authors regret, and matches RM Pro 1 (no ordinal-position semantics) at the surface where it's easiest to enforce.
+
+## Brackets vs braces encode ordering
+
+A consistent two-character distinction across the entire surface syntax:
+
+- **`{ ... }` (curly braces) — unordered.** A set-like collection where position is meaningless. Used for named-argument lists, `Tuple` and `Relation` literals, heading declarations, and parameter lists in `oper` declarations. Reordering the contents preserves meaning.
+- **`[ ... ]` (square brackets) — ordered.** A sequence where position is semantically significant. Used for `Sequence T` literals (`[1, 2, 3]`, `[tup1, tup2, tup3]`), operator bodies (statements run in order), `load` ordering specs, and any other context where the reader's expectation is "this is a sequence." Reordering changes meaning.
+- **`( ... )` (parentheses)** — kept for expression grouping and for the small set of monadic operators that retain parenthesized positional form (`count`, `sin`, `is_*`).
+
+This maps directly onto TTM: tuples, relations, and headings have no ordinal position semantics (RM Pro 1); they get `{ ... }`. Procedural code is sequential by nature; it gets `[ ... ]`. The punctuation tells the reader which kind of collection they're looking at without having to recall any context.
+
+## Identifier case
+
+Coddl is case-sensitive: `foo` and `Foo` are distinct identifiers. The language uses three case styles, applied consistently to built-ins and recommended for user code:
+
+- **lowercase / snake_case** — keywords (`program`, `oper`, `where`, `join`, `load`, `if`, `then`, `else`, …), built-in operators (`and`, `or`, `not`, `count`, `sum`, `extend`, …), built-in constants (`true`, `false`, `reltrue`, `relfalse`), and user-named operators, variables, attributes, and parameters.
+- **PascalCase** — type names, both built-in (`Integer`, `Rational`, `Text`, `Character`, `Boolean`, `Tuple`, `Relation`, `Sequence`) and user-defined (`Customer`, `OrderLine`, `EmailAddress`); and relvar names by convention (`Customer`, `Suppliers`, `OrderLines`).
+
+User code is not *required* to follow PascalCase for types and relvars — that's convention, not language. The language only enforces case sensitivity (so `customer` and `Customer` are different identifiers) and the canonical case of built-in identifiers (the `Integer` built-in is `Integer`, never `integer` or `INTEGER`).
+
+## Identifier shape
+
+- **Lexical class**: Unicode UAX #31 — `XID_Start` for the first character, `XID_Continue` for subsequent. The lexer NFKC-normalizes identifiers before comparison so visually equivalent character sequences denote the same identifier (e.g. `é` precomposed = `e` + combining acute).
+- **Leading single underscore** (`_foo`) marks an identifier the developer is OK with being unused — the typechecker won't warn about unused locals or parameters whose name starts with `_`. Same convention as Rust.
+- **Bare `_`** is the wildcard / "don't care" pattern. Reserved as a single-character form for (planned) pattern matching's catch-all branch.
+- **Leading `__` (double underscore) is reserved for compiler-internal use** and rejected from user identifiers. This gives the desugarer, optimizer, and runtime a private namespace (`__plan_42`, `__tmp_join_lhs`, `__coddl_runtime_call`) that cannot ever shadow user code. snake_case with internal underscores (`foo_bar`, `write_line`, `_unused`) is unaffected — the rule is purely a leading-prefix check.
+
+## Reserved words: none
+
+Coddl has no hard-reserved identifiers. At the lexer level there is no `KEYWORD` token type — every alphanumeric/underscore/`#` token is an `IDENT`. The parser recognizes specific identifiers as keywords in specific syntactic positions (`program` at the start of a file, `oper` at a statement boundary, PascalCase identifiers in type position resolving against the type table, the built-in constants `true` / `false` / `reltrue` / `relfalse` in expression position, etc.).
+
+This is a deliberate ergonomic choice for a relational language whose users will model real domains with attribute names like `name`, `type`, `from`, `to`, `order`, `value`, `with`, `by`, `and`. Hard-reserving any of those is a tax we don't want to pay. The cost is the prefix-only constraint on textual operators noted above — `and`, `or`, `not` are recognized in expression position contextually, not as reserved tokens.
+
+The TextMate grammar still pattern-highlights these words at the lexical level (highlighting is a UX hint, not a lex check); the [LSP](lsp.md)'s semantic tokens correct mis-highlightings later where a user has used such a word as an identifier.
+
+## Unicode operator glyphs
+
+A small set of single-codepoint mathematical glyphs lex as **exact synonyms** for their ASCII / keyword counterparts. The lexer emits the same token either way; grammar productions name only the ASCII form, but `R ⋈ S` and `R join S` are interchangeable in source.
+
+| ASCII | Glyph(s) | Codepoint(s) |
+|---|---|---|
+| `join` | `⋈` | U+22C8 |
+| `union` | `∪` | U+222A |
+| `intersect` | `∩` | U+2229 |
+| `minus` | `∖` | U+2216 SET MINUS (**not** U+005C reverse solidus — that's the string-escape character) |
+| `<=` | `≤`, `⊆` | U+2264, U+2286 |
+| `>=` | `≥`, `⊇` | U+2265, U+2287 |
+| `<` | `⊂` | U+2282 (relational strict-subset reading; scalar `<` keeps its ASCII form) |
+| `>` | `⊃` | U+2283 |
+| `<>` | `≠` | U+2260 |
+
+Deliberately **not** in the synonym set: Greek letters (`π σ ρ γ` — too easily mistaken for ordinary identifiers in non-math source), Boolean truth-value glyphs (`⊤ ⊥`), and the empty-set glyph (`∅`). The [formatter](fmt.md) normalizes to one canonical form per `format.edition`.
+
+## Literals
+
+- **Text** literals: double-quoted, e.g. `"hello, world"`. Standard escape sequences `\n`, `\r`, `\t`, `\"`, `\\`, and `\u{HHHHHH}` for a Unicode codepoint (1–6 hex digits, value ≤ U+10FFFF, outside the UTF-16 surrogate range D800–DFFF). Multi-line is permitted — raw newlines are kept as-is.
+- **Character** literals: single-quoted, exactly one codepoint, e.g. `'a'`, `'\n'`, `'\u{1F600}'`. The lexer rejects empty `''` and multi-codepoint `'ab'` at the lexical level. Escape syntax matches Text.
+- **Boolean** literals: `true`, `false`.
+- **Numeric** literals — three lexical shapes, one per numeric type:
+    - `42`, `0xff`, `0b1010`, `0o17`, `0d99` → **`Integer`** (base prefixes are case-insensitive; `0d` is the explicit-decimal prefix).
+    - `42.0`, `3.14` → **`Rational`** (digits-dot-digits; both sides need at least one digit; no `42.` or `.5`).
+    - `42e0`, `4.2e1`, `1e-9` → **`Approximate`** (exponent required; mantissa integer- *or* rational-shaped).
+
+  Underscores between digits are decoration and stripped before conversion: `1_000_000`, `0xff_ff_ff`. The exponent marker `e` and the hex digits `a`–`f` are case-insensitive; the formatter normalizes to lowercase. The three-shape split is unambiguous: the lexer picks one of `Integer`/`Rational`/`Approximate` from the literal's *form* alone, without inference.
+
+## Comments
+
+- **Line comments** start with `//` and run to the end of the line.
+- **Block comments** are delimited by `/*` and `*/` and **nest**. `/* outer /* inner */ still outer */` is one well-formed comment; the lexer counts depth on each `/*` and `*/`. The motivation is purely ergonomic — commenting out a region that already contains a block comment Just Works.
+
+The lexer treats both kinds as trivia and attaches them to the CST per [fmt.md](fmt.md) so the formatter can preserve them. The choice of `//` over the `--` from Tutorial D / SQL is a deliberate move away from the SQL pedigree — `--` collides with the binary minus and "negative literal" patterns under enough lookahead pressure that committing to it would constrain unrelated grammar choices.
+
+## Method-style call syntax (UFCS via `self`)
+
+Any `oper` whose heading contains a parameter literally named `self` can be invoked as a method on that parameter's value:
+
+```
+oper to_codepoints { self: Text } : Sequence Character [
+    /* ... */
+];
+
+let chars = textvar.to_codepoints {};
+// same as:
+let chars = to_codepoints { self: textvar };
+```
+
+Pure sugar — the surface form `x.f { ... }` desugars to `f { self: x, ... }` at parse time. Both spellings are accepted; the CST records the original so the formatter can preserve it.
+
+`self` is a convention, not a reserved word. The method-call sugar fires only for headings whose parameter is literally named `self`; the slot's *position* in the heading is irrelevant (headings are unordered). There is no separate "method" declaration — methods are ordinary `oper`s with this one parameter-name convention.
+
+**Dispatch is by static type of the receiver.** If two opers named `to_codepoints` exist with different `self` parameter types (`{ self: Text }` and `{ self: Bytes }`, say), the typechecker picks the one whose `self` type matches the receiver. Static overloading on `self` only — other parameters don't participate.
+
+**Method call vs possrep accessor:**
+- `x.possrep_name` (no braces) is the possrep accessor — returns the possrep view of `x`.
+- `x.method_name { ... }` (with braces, including empty `{}`) is a method call.
+
+The braces are the parser's disambiguation: `x.method` (no braces) is *always* an accessor; `x.method {}` is *always* a method call, even with zero arguments.
+
+This mirrors UFCS in D / Nim and Rust's method syntax — but without an `impl` block: methods are just opers with a `self` parameter.
+
+---
+
+# Productions
+
+The rest of this doc is the EBNF the parser implements.
 
 
 ## Notation
@@ -320,13 +469,14 @@ function that implements it.
 `program`, `oper`, `let`, and `transaction` are **contextual
 keywords** — the parser identifies them by lexeme at specific
 syntactic positions; outside those positions they are regular
-identifiers. Coddl has no hard-reserved words. See
-`ARCHITECTURE.md §3 "Reserved words: none"`.
+identifiers. Coddl has no hard-reserved words — see the "Reserved
+words: none" section above.
 
 ### Deliberately not yet in the grammar
 
-The following are decided in `ARCHITECTURE.md` but not yet wired into
-the parser. Listed here so the omission is explicit, not implied:
+The following are decided design intent (see the rationale section
+above) but not yet wired into the parser. Listed here so the omission
+is explicit, not implied:
 
 - **Tuple/Relation/Sequence as a `<type-ref>`**. Today only built-in
   scalar names resolve as type references; type-generator

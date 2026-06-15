@@ -444,7 +444,7 @@ impl Lowerer {
         let block_id = self.fresh_block();
 
         // The compiled program's startup must call the runtime before
-        // touching any other extern (ARCHITECTURE.md §6). Today the
+        // touching any other extern (docs/runtime.md). Today the
         // stubs are no-ops, but wiring it now means future runtime
         // work — DB connection pool, prepared-statement cache,
         // arena setup — slots in without a codegen change.
@@ -1316,7 +1316,7 @@ mod tests {
     fn hello_world_lowers_to_four_functions() {
         // `main` plus three runtime externs: write_line for the user
         // call, init + shutdown for the auto-wrapped startup
-        // housekeeping ARCHITECTURE.md §6 requires.
+        // housekeeping docs/runtime.md requires.
         let m = lower_ok(HELLO_WORLD);
         let names: Vec<_> = m.functions.iter().map(|f| f.name.as_str()).collect();
         for needed in [

@@ -2,7 +2,9 @@
 //!
 //! SSA blocks with typed values plus relation-aware ops: `query`, `load`,
 //! `assign_relvar`, `multi_assign`, `begin_tx` / `commit_tx` / `rollback_tx`.
-//! See ARCHITECTURE.md §4.
+//! See `docs/procir.md` — and note that the relation-aware ops are *call
+//! sites* for runtime ABI entry points, not algebra primitives. The
+//! algebra lives in `coddl-relir` (see `docs/relir.md`).
 //!
 //! The IR carries no LLVM-specific intrinsic names, metadata, or calling
 //! conventions at the node level — per-backend specifics live in the

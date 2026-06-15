@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "Relational IR — Algebra A core + sugar layer (ARCHITECTURE.md §4)."
+description = "Relational IR — Algebra A core + sugar layer. See docs/relir.md."
 
 [dependencies]
 coddl-diagnostics.workspace = true

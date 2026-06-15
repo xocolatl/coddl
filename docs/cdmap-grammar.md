@@ -7,9 +7,8 @@ database's catalog relvars (declared in a `.cddb`) through a chain of
 project / rename clauses. Today's parser accepts identity mappings
 only; richer chains land in Phase 16.
 
-For the overall four-file architecture, see `ARCHITECTURE.md` and
-`.local/phases.md` (Phase 14). Lexical productions are shared with
-`.cd` — see `docs/grammar.md`.
+For the overall four-file architecture, see [plan.md](plan.md).
+Lexical productions are shared with `.cd` — see [grammar.md](grammar.md).
 
 **Last sync:** unreleased — Phase 14.
 
@@ -52,8 +51,8 @@ assignment (`:=`) is reserved for `.cd`'s relvar mutation operator.
 
 ## Deliberately not yet in the grammar
 
-The following are decided in `ARCHITECTURE.md` but not yet wired into
-the `.cdmap` parser. Listed here so the omission is explicit:
+The following are decided design intent but not yet wired into the
+`.cdmap` parser. Listed here so the omission is explicit:
 
 - **Project chain**: `<cdmap-entry>` may eventually be
   `<identifier> '=' <identifier> 'project' '{' …  '}' ';'`.

@@ -1,14 +1,16 @@
 //! `libcoddl_runtime` — the C-ABI runtime linked into compiled Coddl
-//! binaries. See ARCHITECTURE.md §6.
+//! binaries. See `docs/runtime.md`.
 //!
 //! Built as a `staticlib` so user binaries don't take a dynamic-linker
 //! hit; also as an `rlib` so workspace crates can use the Rust API in
 //! tests. Responsibilities: connection pool, prepared-statement cache,
 //! row iteration, value marshaling across the FFI seam, the in-process
-//! RelIR executor (via `coddl-execlocal`), and the RelIR→SQL emitter
-//! (via `coddl-sqlemit` — the same crate the compiler uses).
+//! runtime library of relational primitives (called from compiled
+//! code), the runtime RelIR interpreter (for dynamic plans), and
+//! `coddl-sqlemit` as a library (so runtime-built plans lower to SQL
+//! through the same code path the compiler uses).
 //!
-//! ## FFI discipline (§6, §10 risk #8)
+//! ## FFI discipline (see `docs/runtime.md`, `docs/risks.md` risk #8)
 //!
 //! Values crossing into LLVM-emitted code MUST be `#[repr(C)]` or
 //! primitive. No `Vec`/`String` raw pointers without an explicit owner
@@ -59,7 +61,7 @@ pub struct PlanId(pub u32);
 
 /// Opaque handle to a runtime-managed `Relation` value. May be plan-backed
 /// (re-evaluates on use), materialized (in-memory buffer), or cursor-backed
-/// (one-shot stream). See ARCHITECTURE.md §9.
+/// (one-shot stream). See `docs/runtime.md` "Relation values at runtime".
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RelationHandle(pub u32);

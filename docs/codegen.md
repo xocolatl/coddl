@@ -1,20 +1,22 @@
-# Coddl codegen
+# Codegen — ProcIR → native code
 
-This document is the authoritative spec for what the two backends —
-`coddl-codegen-llvm` and `coddl-codegen-cranelift` — emit. It pins
-the C ABI for each `ProcType`, the per-backend translation of each
-`Inst` and `Terminator`, the surface → linkage convention for `main`,
-and the artifact shape each backend produces.
+The authoritative spec for what the two backends — `coddl-codegen-llvm` and `coddl-codegen-cranelift` — emit. It pins the C ABI for each `ProcType`, the per-backend translation of each `Inst` and `Terminator`, the surface → linkage convention for `main`, and the artifact shape each backend produces.
 
-For *why* the IR has the two-backend split (and the rationale for
-LLVM IR text emission vs. `llvm-sys`), see
-`ARCHITECTURE.md §1 "Host language"` and `§4 "The two IRs"`. For the
-ProcIR shape both backends walk, see `docs/procir.md`.
+## Why two backends, and why text emission for LLVM
 
-**Last sync:** `e2dda44`. Every commit that adds, removes, or changes
-a `ProcType` ABI mapping, an instruction translation, a backend error
-variant, or the surface→linkage convention updates this file in the
-same commit.
+ProcIR is shaped for SSA codegen in general, not LLVM specifically (see [procir.md](procir.md) "Backend-agnostic by design"). The two backends serve different deployment shapes:
+
+- **LLVM IR text (`coddl-codegen-llvm`, v1)** — emit text, shell out to `llc`/`clang`. We deliberately avoid `llvm-sys`/`inkwell`: version-coupling churn, build complexity, and we don't need programmatic IR introspection in the foreseeable plan. Text emission is fast and forward-compatible — when LLVM bumps its IR, we update text generation, not a binding crate. The same emitter covers native targets (x86-64, aarch64) *and* `wasm32-*` via the target triple — WASM-via-LLVM is essentially free at the codegen layer.
+- **Cranelift (`coddl-codegen-cranelift`)** — REPL JIT for fast query iteration, and toolchain-free AOT for deployments that don't want `clang` in the image. Both IRs are SSA with the same value-model surface; the lowering is largely a different printer over the same ProcIR walk.
+- **Direct WASM via `wasm-encoder`** (planned, lower priority) — for browser/wasmtime targets that don't want LLVM at all in the build.
+
+This is the long-term-planning principle in action (see [principles.md](principles.md)): the IR boundary doesn't move when a backend is added.
+
+For the broader runtime portability story — how SQL backends get gated out of `wasm32-*` builds — see [runtime.md](runtime.md) "Portability" and [workspace.md](workspace.md).
+
+For the ProcIR shape both backends walk, see [procir.md](procir.md).
+
+**Last sync:** `e2dda44`. Every commit that adds, removes, or changes a `ProcType` ABI mapping, an instruction translation, a backend error variant, or the surface→linkage convention updates this file in the same commit.
 
 
 ## C ABI for ProcTypes

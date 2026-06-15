@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "In-process RelIR executor over materialized relations (ARCHITECTURE.md §9)."
+description = "Compile-time RelIR → ProcIR lowering for in-process subtrees. See docs/relir.md, docs/runtime.md."
 
 [dependencies]
 coddl-relir.workspace = true

@@ -1,19 +1,89 @@
-# Coddl typechecker
+# Type system + typechecker
 
-This document is the authoritative spec for what the typechecker
-currently enforces: the `Type` representation, the built-in operator
-registry, every walk function, and every `T####` diagnostic code.
+Coddl's type system follows TTM's RM Pre 1–10 (see [conformance.md](conformance.md)): scalars are named, finite sets of values disjoint from every other scalar type; `Tuple H` and `Relation H` are type generators with structural identity by heading; there are no nulls and no implicit coercion. This doc covers the design rationale, then the authoritative spec of what `coddl-types` enforces today: the `Type` representation, the built-in operator registry, every walk function, and every `T####` diagnostic code.
 
-For *why* the type system is shaped this way, see
-`ARCHITECTURE.md §7 "Type system"` (possreps, selectors, `Tuple`/
-`Relation`/`Sequence` generators, scalar built-ins, the `Tuple {}`
-unit type). This document never duplicates that rationale — it points
-at it and gets on with the rules.
+## Scalar types
 
-**Last sync:** `1830ac1`. Every commit that adds, removes, or changes a
-`T####` code, a built-in operator, or a typechecker walk method
-updates this file in the same commit; `tools/check-grammar.sh`
-enforces it from the hygiene gate.
+A scalar type is a named, finite set of values disjoint from every other scalar type. Each user-defined scalar type carries one or more **possible representations** (possreps) — abstract representations made up of named, typed components — and a (possibly trivial) `CONSTRAINT` predicate that defines which possrep tuples denote real values of the type (RM Pre 4–5).
+
+For every possrep `PR` of type `T` the system synthesizes:
+
+- A **selector** of declared type `T`, one parameter per component (selector name = possrep name). Every value of `T` must be producible by an all-literal selector invocation.
+- A **`THE_C` accessor** per component `C`: read-only in source position; pseudovariable in target position (`THE_C(V) := x` is sugar for `V := PR(…, x in slot C, …)`).
+
+**Type constraints** (the `possrep`'s `constraint` predicate) are checked at every selector invocation — that's the sole choke point because values of `T` can only be constructed via the selector. Type-constraint violations are run-time errors; argument-type mismatches are compile-time.
+
+### Built-in scalar types (v1)
+
+`Integer`, `Rational`, `Approximate`, `Text`, `Character`, `Binary`, `Byte`, `Boolean`. PascalCase per [grammar.md](grammar.md) "Identifier case". Everything else — `Date`, `Timestamp`, `Uuid`, fixed-width numerics, decimal, currency — is a user-defined scalar type with one or more declared possreps. Coddl ships a small standard library of these definitions but they aren't built into the language. Each built-in has fixed mappings to (a) LLVM type via [procir.md](procir.md), (b) SQLite affinity + `CHECK` constraints where needed via [storage.md](storage.md), (c) Postgres type; user-defined scalars get their mappings via possrep components.
+
+### Three numeric types
+
+`Integer`, `Rational`, `Approximate` — with **no implicit conversion** between them. `Integer` is mathematically unbounded (a bignum at runtime); `Rational` is exact rational arithmetic (also potentially unbounded); `Approximate` is bounded-precision floating-point (maps to f64). The literal shapes (see [grammar.md](grammar.md) "Literals") pick one without inference: `42` is `Integer`, `42.0` is `Rational`, `42e0` is `Approximate`. Code that needs Approximate-cost arithmetic on integer values writes `42e0`, not `42`. Users who need a bounded fast integer (e.g. `Int32`, `Int64`) define it as a user-defined possrep-constrained scalar over `Integer` — though see [risks.md](risks.md) risk #9 for the open question of whether to add bounded built-ins.
+
+### `Text` and `Character` are separate types
+
+`Text` is an opaque character string — you cannot index into it (`t[2]` is a type error), cannot ask its length in code points without explicit conversion, and cannot pattern-match on its internal representation. `Character` is a single Unicode code point. A planned standard-library function (TBD spelling) converts `Text` to `Sequence Character` and back; that's the only sanctioned route between the two.
+
+The split matches Rust's `String` / `char` distinction and TTM's Appendix-A "scalar is atomic" rule (`Text`'s opacity is what lets the backend store it as `TEXT` / `VARCHAR` / a hash, depending on workload, without leaking implementation through indexing). Coddl deliberately departs from TTM's `CHARACTER` (a.k.a. `CHAR`) shorthand-for-string convention — see TTM ch. 6 p. 134 — because Coddl needs the names for two distinct types.
+
+`Binary` and `Byte` mirror the same opacity split. `Binary` is an opaque byte blob (`b[2]` is a type error). `Byte` is a single octet (0–255). The planned conversion functions are `oper to_bytes { self: Binary } : Sequence Byte` and `oper from_bytes { bytes: Sequence Byte } : Binary`, paralleling `to_codepoints` / `from_codepoints` on `Text`.
+
+### No implicit coercion; static operator overloading
+
+Distinct named scalar types are disjoint; `Integer` and `Rational` cannot be silently mixed. Equality `=` is type-monomorphic per RM Pre 8 ("indistinguishable for all operators on T").
+
+**Static operator overloading is permitted.** A few comparison operators resolve to distinct underlying operators depending on the operand type family — most notably, `<=` and `>=` are scalar comparison on scalars and **subset** / **superset** on relations (`<` and `>` give strict subset / superset). The same identifier names two operators; the type checker picks which based on operand types at compile time. RM Pre 8 monomorphism is preserved because each underlying operator is type-monomorphic; the surface `<=` is just a shared spelling, the same way `+` can be spelled by `Integer` addition and `Rational` addition without violating RM Pre 8.
+
+### No nulls
+
+The type system has no nullable-attribute facility. Missing information is a database-design problem the user solves through **vertical decomposition** — splitting the relvar so the absence of a fact is the absence of a tuple in a side relvar (the canonical TTM answer; ch. 7, RM Pro 4). A user-defined sum-type scalar (`Optional` with `Some` / `None` possreps) is permitted by the type system but not the recommended approach. The SQL backend never sees a request to emit a NULL — see [sqlemit.md](sqlemit.md).
+
+## Type generators
+
+- `Tuple { a: T, b: U, … }` and `Relation { a: T, b: U, … }` are type generators producing structurally-identified types: `Tuple H1 = Tuple H2` iff `H1 = H2` as sets of `{name: type}` pairs. Same for `Relation`. Attribute order is immaterial. Both generators may take zero attributes (`reltrue` and `relfalse` are the only inhabitants of `Relation {}` — see the naming note below).
+- **`Tuple {}` is the unit type** — the type of a tuple with no attributes. It has exactly one value, written `{}` (the empty tuple literal). This is Coddl's analogue of Rust's `()`, Swift's `Void`, or the unit type in ML. An `oper` declared without an explicit return clause implicitly returns `Tuple {}`. The two spellings `Tuple {}` and the value `{}` are unambiguous in context — one appears in type position, the other in expression position.
+- `Sequence T` is the ordered counterpart — a finite ordered list of values of element type `T`, duplicates allowed, position significant. It's the procedural-side companion to `Relation`: where `Relation H` is an unordered set of tuples (RM Pro 1, 3), `Sequence Tuple H` is an ordered list of tuples (the canonical iteration form — see [runtime.md](runtime.md) "load"). The element type `T` may be any type — primitives (`Sequence Integer`), tuples (`Sequence Tuple H` — the typical case), or even relations (`Sequence Relation H`).
+- Headings may include relation-valued and tuple-valued attributes (nesting permitted; RM Pre 6–7).
+- A **relvar** is a named variable of some `Relation H` type. Per RM Pre 14, every relvar has at least one declared candidate key (RM Pre 15), possibly the empty key (which forces cardinality ≤ 1). Coddl classifies relvars by lifetime and provenance, with one of the following kinds at declaration time:
+  - **database relvars** (visible only in `.cddb` catalogs — see [plan.md](plan.md)): `real` / `base` (backed by storage), or `virtual` (a view).
+  - **application relvars** (declared in `.cd` source): `private` (in-memory, lifetime of the program), or `public` (the program's view onto a slice of the database — see [storage.md](storage.md)).
+
+  The same four-kind classification appears in Tutorial D (ch. 5 p. 105) because the underlying distinctions are real ones, not because we're copying it.
+
+### Naming note: `reltrue` and `relfalse`
+
+The two inhabitants of the type `Relation {}` (the nullary relation type — relation with empty heading) are called `reltrue` (cardinality 1, containing the empty tuple) and `relfalse` (cardinality 0, the empty relation). TTM and Tutorial D call them `TABLE_DEE` and `TABLE_DUM`, opaque even to readers who know TTM. Coddl renames them after their semantic role: `reltrue` is the multiplicative identity of the join semiring and behaves like boolean true under projection-away-of-everything; `relfalse` is the zero of the same semiring.
+
+In terms of the type generators, the literal forms decode as:
+
+- `relfalse` ≡ `Relation {}` (an empty relation literal — no tuples).
+- `reltrue` ≡ `Relation { Tuple {} }` ≡ `Relation { {} }` (a relation literal containing the one and only empty tuple).
+
+The `Relation { … }` syntax is contextual: in **type** position it's the type generator with a heading; in **value** position it's a relation literal whose body is a comma-list of tuple-valued expressions. The empty form `Relation {}` is the value form. The empty tuple `{}` may also be written `Tuple {}` in expression position — the `Tuple` constructor and the bare braced literal are equivalent for tuple values.
+
+## Relations are fully first-class
+
+Relations can be bound to variables, passed to and returned from operators, stored in tuples, nested inside other relations, used as function arguments and results everywhere a scalar can — subject to the lazy-evaluation semantics in [runtime.md](runtime.md). The calling convention treats them uniformly.
+
+## Type inference and constraint inference
+
+Type inference for relational expressions is mandatory and mechanical from operator semantics (RM Pre 18): every RelIR node's heading is the heading of its operands transformed by its operator. The optimizer further runs:
+
+- **FD propagation** for candidate-key inference (VSS 3) — best-effort.
+- **Constraint propagation** (RM Pre 23): predicates known to hold on operands propagate through restrict, project, join, extend, etc. Used for view-constraint checking and as optimizer hints.
+
+## Where constraints can live
+
+Integrity constraints attach only to **database relvars** (real, virtual). Coddl does not support constraints on application relvars (private or public), tuple variables, or scalar variables — there's "no logical reason why it should not," as TTM acknowledges (ch. 5 p. 106), but the cost in implementation complexity outweighs the payoff for the use cases we've identified so far. Revisit if a concrete need surfaces.
+
+---
+
+# Implementation spec
+
+The rest of this doc pins what `coddl-types` enforces today.
+
+**Last sync:** `1830ac1`. Every commit that adds, removes, or changes a `T####` code, a built-in operator, or a typechecker walk method updates this file in the same commit; `tools/check-grammar.sh` enforces it from the hygiene gate.
 
 
 ## Type representation
@@ -53,8 +123,8 @@ the typechecker.
 
 The following are deferred until the relevant productions arrive:
 
-- **`Sequence T`** — type generator referenced in
-  `ARCHITECTURE.md §7` but not yet a `Type` enum variant. Lands with
+- **`Sequence T`** — type generator described in the "Type generators"
+  section above but not yet a `Type` enum variant. Lands with
   the `LOAD ARRAY ... ORDER (...)` iteration form.
 - **User-defined scalar types** via `possrep` — the typechecker has
   no notion of user types yet; every type-name lookup either resolves

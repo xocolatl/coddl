@@ -1,20 +1,46 @@
-# Coddl project plan
+# Plan layer — `.cd` / `.cddb` / `.cdmap` / `.cdstore`
 
-This document is the authoritative spec for the project-plan layer:
-how the compiler walks from a `.cd` entry point to its companion
-`.cddb` / `.cdstore` files, what it validates at every hand-off, and
-the shape of the `Plan` data structure that downstream phases
-(Phase 21 SQLite materialization, code generation) consume.
+The plan layer is the bridge between Coddl source (which never names a file path, a connection string, or a dialect — RM Pro 6) and the physical storage the runtime opens. This doc covers the four-file separation, the `database <name>;` binding, and the spec for `coddl-plan`: how the compiler walks from a `.cd` entry point to its companions, what it validates at every hand-off, and the shape of the `Plan` data structure that downstream code generation and runtime materialization consume.
 
-For *why* the layer exists, see `ARCHITECTURE.md §5 "Storage
-abstraction"` (the `.cd` / `.cddb` / `.cdstore` separation, RM Pro 6
-keeping physical layout out of D). This document never duplicates
-that rationale — it points at it and gets on with the rules.
+## The four-file separation (RM Pro 6)
 
-**Last sync:** Phase 16. Every commit that adds, removes, or changes a
-PL-code or validation invariant in `crates/coddl-plan/` updates this
-file in the same commit; `tools/check-grammar.sh` enforces the
-diagnostic table from the hygiene gate.
+TTM's RM Pro 6 forbids internal-level constructs in `D` source. A Coddl program does not name a `.sqlite` file, a `pg_hba.conf`, a `JDBC URL`, or a column type. It names a **database** (a logical handle) by binding `database <name>;`; everything operational lives in companion files keyed by that name:
+
+- **`.cd`** — the program. Public relvar declarations name the *external schema* (the program's view onto the catalog). Bare references to public relvars read like ordinary variables. No file paths anywhere.
+- **`<db>.cddb`** — the database catalog. Conceptual schema: `base relvar`s, `virtual relvar`s (views), constraints. Multiple `.cd` programs can target the same `.cddb`.
+- **`<db>.cdstore`** — the conceptual-to-physical binding. Backend kind (`sqlite` for v1; see [risks.md](risks.md)), file path (or DSN), per-table column-to-attribute mapping. Operational fields (file paths, credentials) can be overridden by environment variables at runtime — see [storage.md](storage.md) "Path resolution."
+- **`<db>.cdmap`** *(planned, not v1)* — non-identity adapters: project / rename / virtual-relvar sources where the external `.cd` view differs from the catalog `.cddb` shape. v1 supports identity-only mapping; `.cdmap` lands in a later phase.
+
+The separation is one of the long-term-planning bills paid up front (see [principles.md](principles.md)). The same `.cd` program could be re-bound to a different `.cdstore` (SQLite for dev, Postgres for prod) without touching source. The `.cddb` and `.cdstore` separation lets the operational config evolve independently of the conceptual schema.
+
+## The `database <name>;` declaration
+
+Every Coddl `.cd` source with public relvars must declare which database it binds to:
+
+```
+program hello_world_db;
+database greetings;
+
+public relvar Greetings {
+    id: Integer,
+    message: Text,
+}
+key { id };
+```
+
+`database greetings;` introduces the logical handle. The plan layer then expects `greetings.cddb` and `greetings.cdstore` to exist in the same directory as the `.cd` file. The names line up by convention: file basename equals binding name.
+
+Runtime operational overrides key off the binding name uppercased: `CODDL_GREETINGS_FILE` overrides the SQLite path for the `greetings` database in this example. See [storage.md](storage.md) for the full operational-field resolver.
+
+A `.cd` source with **no** public relvars doesn't need a `database` binding — it's a standalone program. The plan layer detects this and returns an empty `Plan`; downstream phases handle the no-database case (no slot initialization, no transaction externs to wire).
+
+---
+
+# Implementation spec
+
+The rest of this doc pins what `coddl-plan` enforces today.
+
+**Last sync:** Phase 16. Every commit that adds, removes, or changes a PL-code or validation invariant in `crates/coddl-plan/` updates this file in the same commit; `tools/check-grammar.sh` enforces the diagnostic table from the hygiene gate.
 
 
 ## Discovery

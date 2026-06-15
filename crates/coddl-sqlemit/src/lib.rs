@@ -2,13 +2,13 @@
 //!
 //! The traits in this crate are implemented by `coddl-backend-sqlite`
 //! and `coddl-backend-postgres`. SQL emission follows the mandatory
-//! rules table in ARCHITECTURE.md §5 — `SELECT DISTINCT` everywhere,
+//! rules table in `docs/sqlemit.md` — `SELECT DISTINCT` everywhere,
 //! never `NULL`/`NULLABLE`/`IS NULL`/outer joins, explicit `BEGIN`/`COMMIT`,
 //! enumerate columns in deterministic order, etc.
 //!
 //! This crate is shared between the compiler and the runtime — the SQL
 //! emitter must be callable from a `staticlib` linked into user binaries
-//! (for plans built at runtime; ARCHITECTURE.md §9).
+//! (for plans built at runtime; see `docs/runtime.md` "Reaching the engines").
 
 use std::fmt;
 
@@ -44,8 +44,8 @@ pub struct SqlString {
 pub struct StmtId(pub u32);
 
 /// Identifier for a backend-side temp relation that an in-memory relation
-/// was shipped into (see ARCHITECTURE.md §5 / §9 "relations flowing back
-/// into SQL").
+/// was shipped into (see `docs/sqlemit.md` "Sending in-memory relations
+/// back into SQL").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TempRelRef(pub u32);
 

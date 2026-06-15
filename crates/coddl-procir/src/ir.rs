@@ -6,8 +6,7 @@
 //! each `BasicBlock` is a list of `Inst` plus a `Terminator`. Every
 //! instruction defines at most one SSA value.
 //!
-//! See `docs/procir.md` for the spec and `ARCHITECTURE.md §4` for the
-//! design rationale.
+//! See `docs/procir.md` for the spec and design rationale.
 
 use std::fmt;
 

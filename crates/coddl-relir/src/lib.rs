@@ -1,5 +1,5 @@
 //! Relational IR — Algebra A core with a sugar layer that desugars
-//! during lowering (ARCHITECTURE.md §4).
+//! during lowering. See `docs/relir.md`.
 //!
 //! Core operators: AND (natural join), OR, NOT, REMOVE, RENAME, TCLOSE.
 //! Sugar: Project, Restrict (WHERE), Join, Union, Minus, Intersect,

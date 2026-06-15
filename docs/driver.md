@@ -1,18 +1,10 @@
-# Coddl driver
+# Driver — the `coddl` CLI
 
-This document is the authoritative spec for the `coddl` command-line
-driver: every subcommand, every flag, every exit code, and the
-runtime-staticlib discovery rule the compiled-binary subcommands
-depend on.
+The authoritative spec for the `coddl` command-line driver: every subcommand, every flag, every exit code, and the runtime-staticlib discovery rule the compiled-binary subcommands depend on.
 
-For *why* the runtime is a `staticlib` and how it's structured, see
-`ARCHITECTURE.md §6 "Runtime"`. For per-backend artifact rules, see
-`docs/codegen.md`. This document never duplicates that detail — it
-points at it and gets on with the user-visible surface.
+The driver is the user's first contact with Coddl. It calls into the frontend crates ([grammar.md](grammar.md), [typecheck.md](typecheck.md)) for `lex` / `parse` / `check`, into the plan layer ([plan.md](plan.md)) when a `.cd` declares public relvars, into [codegen.md](codegen.md) for emission, and links against the runtime [staticlib](runtime.md). Frontend diagnostics are routed through `coddl-diagnostics` (see [lsp.md](lsp.md)) so terminal output and LSP output share one source.
 
-**Last sync:** `c42493a`. Every commit that adds, removes, or changes
-a subcommand, a flag, an exit code, or the runtime-discovery rule
-updates this file in the same commit.
+**Last sync:** `c42493a`. Every commit that adds, removes, or changes a subcommand, a flag, an exit code, or the runtime-discovery rule updates this file in the same commit.
 
 
 ## Subcommand reference
@@ -49,7 +41,7 @@ staticlib via `clang` (LLVM) or `cc` (Cranelift).
 | `-o <path>`                 | `compile` only    | `<basename>` of input in CWD            |
 
 **Default backend rationale.** `run` defaults to Cranelift because
-its REPL-JIT framing in `ARCHITECTURE.md §4` is fast iteration —
+its REPL-JIT framing (see [procir.md](procir.md) "Backend-agnostic by design") is fast iteration —
 codegen completes faster than LLVM's text-and-`clang` path, which
 matters when the user is running a program for the first time and
 just wants output. `compile` defaults to LLVM because it's the v1

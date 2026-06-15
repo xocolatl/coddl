@@ -12,7 +12,7 @@
 //   - multiple candidate keys: repeated `key { ... } key { ... };`,
 //     each clause is one declared key (`SP` uses both forms).
 //   - `where` (infix, scope-injecting), `join` (infix), `<=` (polymorphic
-//     subset over relations) — settled per ARCHITECTURE.md §3.
+//     subset over relations) — settled per docs/grammar.md.
 //
 // OPEN syntax questions surfaced here, deferred to later phases:
 //   - projection: `R { a, b }` — naked attribute names in `{}` (no values).

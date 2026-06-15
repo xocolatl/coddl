@@ -1,15 +1,38 @@
-# Coddl ProcIR
+# ProcIR — procedural SSA IR
 
-This document is the authoritative spec for the procedural SSA IR that
-`coddl-procir` produces: the data types, every instruction, the
-AST→ProcIR correspondences, the `Codegen` trait the backends
-implement, and the (currently empty) `L####` diagnostic-code table.
+ProcIR is Coddl's procedural intermediate representation: SSA blocks with typed values, ready for LLVM (today) or Cranelift / wasm-encoder (planned — see [codegen.md](codegen.md)).
 
-For *why* the IR is shaped this way — the two-IR split (RelIR for
-relational expressions, ProcIR for everything else), the
-backend-agnostic node language, the LLVM-text-emission v1 strategy —
-see `ARCHITECTURE.md §4 "The two IRs"`. This document never duplicates
-that rationale.
+This doc is the authoritative spec for what `coddl-procir` produces: data types, every instruction, the AST→ProcIR correspondences, the `Codegen` trait the backends implement, and the (currently empty) `L####` diagnostic-code table.
+
+## ProcIR has no relational algebra
+
+`Relation H` is an opaque type carried in SSA values, and everything you can *do* with one is a call into the [runtime](runtime.md) library. The relation-shaped instructions in the table below — `Where`, `Extract`, `RelvarRead`, `RelvarSlotInit`, `RelvarSlotRelease`, `RelationLit`, `WriteRelation` — are **named call sites for runtime ABI entry points**, not algebra primitives ProcIR reasons about. They get dedicated opcodes for readability, type-checking, and verifier convenience, but semantically they're calls.
+
+This matters because:
+
+- The algebra lives in [RelIR](relir.md) (Algebra A core + sugar). ProcIR is the procedural target after the SQL/in-process cut is drawn.
+- A SQL-rooted RelIR subtree compiles to one ProcIR call: `query(plan_id, params)` with a [`coddl-sqlemit`](sqlemit.md)-baked SQL string.
+- An in-process RelIR subtree compiles (via `coddl-execlocal`) to a sequence of ProcIR calls into the runtime library — `coddl_relation_where`, `coddl_relation_join`, `coddl_relation_project`, etc. `coddl-execlocal` emits these as generic call instructions; the named opcodes here are essentially sugar that happens to predate `coddl-execlocal` landing.
+- Adding a new relational primitive doesn't require a new ProcIR opcode. Add a runtime function + a RelIR node + an execlocal lowering rule; ProcIR sees another call.
+
+ProcIR's surface area grows when the *procedural* language grows new needs (closures, exceptions, async), not when the relational algebra grows.
+
+## What ProcIR needs that's relation-adjacent (but not algebra)
+
+Two things give ProcIR enough vocabulary to *talk about* relations without reasoning about them:
+
+1. **A relation type** (`ProcType::Relation(heading_id)`) — so SSA values can be typed as relations and the verifier can check that you're passing a relation handle to a runtime function that expects one. This is *representation*, not algebra.
+2. **A per-module heading-descriptor table** — static data the runtime needs to interpret a relation payload (record size, attribute offsets, types). Each backend emits one descriptor per `Module::headings` entry; see [codegen.md](codegen.md) for the C-struct layout the backends produce and [runtime.md](runtime.md) for the runtime's view of the same data.
+
+## Backend-agnostic by design
+
+ProcIR is shaped for SSA codegen in general, not LLVM specifically — a long-term-planning concession (see [principles.md](principles.md)) that costs little now and preserves room to add backends without rewriting the IR. The IR carries no LLVM-specific intrinsic names, metadata, or calling conventions at the node level; per-backend specifics live in the codegen crate.
+
+- **LLVM IR text (v1).** Emit text, shell out to `llc`/`clang`. The same emitter covers native targets (x86-64, aarch64) *and* `wasm32-*` via the target triple — WASM-via-LLVM is essentially free at the codegen layer. See [codegen.md](codegen.md).
+- **Cranelift (planned).** Both IRs are SSA with the same value-model surface; the lowering is largely a different printer over the same ProcIR walk. Use cases: REPL JIT for fast query iteration, and toolchain-free AOT for deployments that don't want `clang` in the image.
+- **Direct WASM via `wasm-encoder` (optional).** Worth keeping the door open for browser/wasmtime targets that don't want LLVM at all in the build. Lower priority than Cranelift; revisit when the use case lands.
+
+Runtime portability is the harder half — see [runtime.md](runtime.md) and [workspace.md](workspace.md) (Cargo features) for how the SQL backends get gated out of `wasm32-*` builds.
 
 **Last sync:** `1830ac1`. Every commit that adds, removes, or changes
 a ProcIR data type, an instruction, an AST→IR correspondence, the
@@ -103,7 +126,7 @@ walk shape. Each `check_<x>` in `coddl-types::checker` has a sibling
 | `Root`         | `Module { program_name, functions }`. Iterates items in source order.                        |
 | `ProgramDecl`  | Sets `Module::program_name`. No instruction emitted.                                         |
 | `OperDecl`     | One `Function` with one `BasicBlock` (`block_0`). `Function::return_type` reflects the declared `-> <type>` clause (default `ProcType::Unit`). Heading params become `Function::params` typed via `ProcType`. Non-`main` opers with a non-Unit declared return capture the body's tail-expression `ValueId` and emit `Terminator::Return(Some(v))`; otherwise the terminator is `Return(None)`. |
-| `OperDecl` named `main` | As above, *plus* the body is wrapped with `Inst::Call("coddl_runtime_init")` at the top and `Inst::Call("coddl_runtime_shutdown")` at the bottom. Synthetic externs for both are registered through the same `seen_externs` dedup that handles the builtin → extern map. ARCHITECTURE.md §6 mandates this; the runtime stubs are no-ops today but wiring it in lowering means future runtime growth (DB pool, prepared-statement cache) lands without a codegen change. When the plan supplies any public relvars, the lowerer also injects one `Inst::RelvarSlotInit { name, heading_id }` per relvar right after `coddl_runtime_init`, and one matching `Inst::RelvarSlotRelease { name }` right before `coddl_runtime_shutdown`. Backends turn these into the runtime materialization + RC-release calls. |
+| `OperDecl` named `main` | As above, *plus* the body is wrapped with `Inst::Call("coddl_runtime_init")` at the top and `Inst::Call("coddl_runtime_shutdown")` at the bottom. Synthetic externs for both are registered through the same `seen_externs` dedup that handles the builtin → extern map. The runtime contract (see [runtime.md](runtime.md)) mandates this; the runtime stubs are no-ops today but wiring it in lowering means future runtime growth (DB pool, prepared-statement cache) lands without a codegen change. When the plan supplies any public relvars, the lowerer also injects one `Inst::RelvarSlotInit { name, heading_id }` per relvar right after `coddl_runtime_init`, and one matching `Inst::RelvarSlotRelease { name }` right before `coddl_runtime_shutdown`. Backends turn these into the runtime materialization + RC-release calls. |
 | `Heading` / `Param` / `TypeRef` | Consumed into `Function::params`.                                                |
 | `Block`        | Inlined into the surrounding `Function`'s sole `BasicBlock` today; multi-block control-flow lands when `if` / `match` / `while` do. Returns the tail expression's `ValueId` if `Block::tail_expr()` is `Some`; otherwise a fresh placeholder. |
 | `Stmt::Let`    | Lowers the RHS expression and binds its `ValueId` in the current local scope. No `Inst` emitted — `let` is a binding, not a computation. |
