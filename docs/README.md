@@ -50,6 +50,8 @@ source.cd → AST → Typed AST
 
 RelIR sits **above** ProcIR; it's where the relational algebra lives and where the SQL/in-process cut is drawn. Each RelIR subtree is consumed by exactly one of two crates — `coddl-sqlemit` for SQL-rooted subtrees, `coddl-execlocal` for in-process subtrees — both of which emit into ProcIR. ProcIR is procedural SSA; it knows nothing about algebra. See [relir.md](relir.md) and [procir.md](procir.md) for the full story.
 
+The diagram above stops at codegen. For the **full target architecture** — including the runtime engines and exactly what triggers a SQL call to SQLite/Postgres (a relvar-rooted relation being *forced*) — see [architecture.dot](architecture.dot) (rendered: [architecture.svg](architecture.svg)). Regenerate the SVG with `dot -Tsvg docs/architecture.dot -o docs/architecture.svg`.
+
 Every frontend pass also returns a `Vec<Diagnostic>` alongside its (possibly partial) output — the CLI driver renders them to the terminal; `coddl-lsp` serializes them as `PublishDiagnostics`. The pipeline above is the happy path; on the unhappy path, partial results and diagnostics flow back together rather than the pipeline halting. See [lsp.md](lsp.md).
 
 ## Where to look

@@ -1,0 +1,110 @@
+// Coddl architecture — TARGET design (not current stub state).
+//
+// Shows the full pipeline, the RelIR<->ProcIR seam, and (bold red) the path a
+// relvar-rooted relation takes when it is forced and a SQL call fires.
+//
+// The two never nest: ProcIR has no relational algebra (docs/procir.md),
+// RelIR is the algebra (docs/relir.md). They meet only at the lowering seam —
+// the RelIR optimizer's output is stitched into the ProcIR spine as call sites.
+//
+// Render:  dot -Tsvg docs/architecture.dot -o docs/architecture.svg
+//          dot -Tpng docs/architecture.dot -o docs/architecture.png
+//
+// See: docs/relir.md, docs/procir.md, docs/runtime.md, docs/sqlemit.md,
+//      docs/storage.md, docs/codegen.md.
+
+digraph coddl {
+  rankdir=TB;
+  compound=true;
+  node  [shape=box, style=rounded, fontname="Helvetica", fontsize=11];
+  edge  [fontname="Helvetica", fontsize=9];
+
+  /* ============================ COMPILE TIME ============================ */
+  subgraph cluster_compile {
+    label="COMPILE TIME";  style=dashed; color=gray40; fontsize=13;
+
+    src   [label=".cd / .cddb / .cdmap / .cdstore", shape=note, style=filled, fillcolor="#eeeeee"];
+    synt  [label="coddl-syntax\nlexer + parser → CST (+ AST view)"];
+    typ   [label="coddl-types\ntypecheck: headings, possreps,\nno-nulls / no-dups, candidate keys"];
+    plan  [label="coddl-plan\nproject model, public-relvar bindings,\nbackend selection"];
+    lower [label="lowering pass", shape=hexagon, style=filled, fillcolor="#fff3cd"];
+
+    /* --- the algebra --- */
+    subgraph cluster_relir {
+      label="coddl-relir  (Algebra A core + sugar)"; color="#2b6cb0"; fontcolor="#2b6cb0";
+      relir [label="RelIR tree\nAND OR NOT REMOVE RENAME TCLOSE\n+ heading / FD / constraint / storage-origin"];
+      opt   [label="optimizer: draws THE CUT\n(per-subtree storage-origin)", shape=hexagon, style=filled, fillcolor="#bee3f8"];
+      relir -> opt;
+    }
+
+    sqlemit_ct [label="coddl-sqlemit\nRelIR subtree → SQL string + plan_id", style=filled, fillcolor="#fed7d7"];
+    execlocal  [label="coddl-execlocal\nRelIR subtree → runtime-lib calls"];
+    matb       [label="MaterializeAtBoundary\n(mixed-origin subtree)", shape=box, style="rounded,dashed"];
+
+    procir [label="coddl-procir  (procedural SSA)\nNO algebra; opaque Relation handles + plan_ids",
+            style=filled, fillcolor="#e9d8fd"];
+    cg     [label="coddl-codegen-{llvm | cranelift | wasm}"];
+    bin    [label="native / wasm binary", shape=component];
+
+    src -> synt -> typ -> plan -> lower;
+    lower -> relir  [label="relational expressions"];
+    lower -> procir [label="procedural code\n(oper bodies, do-loops, scalars)"];
+
+    opt -> sqlemit_ct [label="SQL-rooted\n(every leaf = relvar)"];
+    opt -> execlocal  [label="in-process-rooted\n(literal / private relvar)"];
+    opt -> matb       [label="mixed"];
+    matb -> sqlemit_ct [style=dashed];
+    matb -> execlocal  [style=dashed];
+
+    sqlemit_ct -> procir [label="query(plan_id, params)\nONE call site"];
+    execlocal  -> procir [label="coddl_relation_* call seq"];
+    procir -> cg -> bin;
+  }
+
+  /* ============================== RUN TIME ============================== */
+  subgraph cluster_runtime {
+    label="RUN TIME — libcoddl_runtime (staticlib, extern \"C\")";
+    style=dashed; color=gray40; fontsize=13;
+
+    prog  [label="running program\n(compiled ProcIR spine)", style=filled, fillcolor="#e9d8fd"];
+
+    q     [label="coddl_query(plan_id, params)\n→ Relation handle", style=filled, fillcolor="#fed7d7"];
+    psc   [label="prepared-statement cache\n(keyed by plan_id)", style=filled, fillcolor="#fed7d7"];
+    sqlbk [label="SQL backend engine\nBackend / Conn trait", style=filled, fillcolor="#fed7d7"];
+    sqlite   [label="coddl-backend-sqlite\n(rusqlite)"];
+    postgres [label="coddl-backend-postgres\n(postgres)"];
+
+    inproc [label="in-process runtime library\ncoddl_relation_where/join/project…"];
+    interp [label="runtime RelIR interpreter\n(dynamic / relation-polymorphic plans)"];
+    sqlemit_rt [label="coddl-sqlemit (as a library)", style=filled, fillcolor="#fed7d7"];
+    rc     [label="RC data layer + per-query arenas\ntuple / relation values, cursors"];
+
+    /* THE TRIGGER PATH (bold red) */
+    prog -> q     [label="① FORCE a relvar-rooted relation\nload · = · ship · assign · extract",
+                   color=red, penwidth=2.2, fontcolor=red];
+    q    -> psc   [label="② lookup", color=red, penwidth=2.2];
+    psc  -> sqlbk [label="③ bind params + execute", color=red, penwidth=2.2];
+    sqlbk -> sqlite;
+    sqlbk -> postgres;
+    sqlite   -> rc [label="④ rows → tuples (zero-copy cursor)", color=red, penwidth=2.2];
+    postgres -> rc [color=red, penwidth=2.2];
+    rc -> prog [label="⑤ Relation handle / next() rows", style=dashed];
+
+    /* writes + transactions */
+    prog -> sqlbk [label="assign to PUBLIC relvar →\nINSERT/UPDATE/DELETE;\nBEGIN/COMMIT/ROLLBACK", color="#b7791f"];
+
+    /* in-process force (no SQL) */
+    prog -> inproc [label="force of literal/\nprivate-relvar-rooted relation"];
+    inproc -> rc;
+
+    /* dynamic pathway */
+    prog -> interp [label="runtime-shaped plan\n(RelIR survives as data)"];
+    interp -> sqlemit_rt -> psc;
+    interp -> inproc;
+  }
+
+  /* ---- cross-phase links ---- */
+  bin   -> prog  [label="loaded & linked", lhead=cluster_runtime, style=bold];
+  relir -> interp [label="same RelIR, consumed at RUNTIME\n(execlocal & interp = 2 consumers)",
+                   style=dashed, color="#2b6cb0", fontcolor="#2b6cb0", constraint=false];
+}
