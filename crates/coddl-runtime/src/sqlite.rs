@@ -346,7 +346,7 @@ fn ensure_connection(path: &str) -> () {
     if guard.contains_key(path) {
         return;
     }
-    let conn = match Connection::open_with_flags(
+    let mut conn = match Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ) {
@@ -356,7 +356,21 @@ fn ensure_connection(path: &str) -> () {
             std::process::abort();
         }
     };
+    // Audit every statement executed on this connection. Installed here — on
+    // every connection the runtime mints, before it's cached — so one hook
+    // captures every query path with no per-call-site plumbing. The legacy
+    // `trace` callback delivers the *expanded* SQL (bound values inlined):
+    // handy for self-audit, but it can leak PII/secrets from filter values.
+    conn.trace(Some(audit_sqlite_trace));
     guard.insert(path.to_string(), conn);
+}
+
+/// `rusqlite` trace callback. It is a bare `fn` (not a closure — it cannot
+/// capture state), so it reaches the backend-agnostic audit sink through the
+/// process globals in [`crate::audit`]. Forwards every executed statement
+/// with the `sqlite` label.
+fn audit_sqlite_trace(sql: &str) {
+    crate::audit::record("sqlite", sql);
 }
 
 /// Begin a transaction. v1 is a no-op: the materialized in-memory

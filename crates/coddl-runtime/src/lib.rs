@@ -21,6 +21,7 @@
 use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+mod audit;
 pub mod rc;
 pub mod relation;
 pub mod sqlite;
