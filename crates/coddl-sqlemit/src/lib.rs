@@ -53,7 +53,7 @@ pub struct PlanId(pub u64);
 #[derive(Clone, Debug)]
 pub struct SqlQuery {
     pub sql: SqlString,
-    pub params: Vec<Literal>,
+    pub params: Vec<Value>,
     pub result_heading: Heading,
     pub plan_id: PlanId,
 }
@@ -68,15 +68,40 @@ pub struct StmtId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TempRelRef(pub u32);
 
-/// Opaque shapes still used only by the effectful `Conn`/`Backend`
-/// signatures; they gain real definitions when the backend is wired up.
+/// Opaque shapes still used only by the not-yet-implemented DDL / temp-table
+/// paths; they gain real definitions when those land.
 pub struct Schema;
 pub struct TypeMap;
 pub struct Tuple;
-pub struct Value;
-pub struct Dsn;
-pub struct RowIter<'a> {
-    _phantom: std::marker::PhantomData<&'a ()>,
+
+/// A scalar value crossing the storage boundary — a bind parameter or a
+/// result cell. The storage layer owns this type rather than reusing the
+/// relational IR's `Literal`, so the backend crates never depend on
+/// `coddl-relir` (see `docs/principles.md` "Toward self-hosting").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Value {
+    Integer(i64),
+    Text(String),
+    Boolean(bool),
+}
+
+impl From<Literal> for Value {
+    fn from(lit: Literal) -> Self {
+        match lit {
+            Literal::Integer(n) => Value::Integer(n),
+            Literal::Text(s) => Value::Text(s),
+            Literal::Boolean(b) => Value::Boolean(b),
+        }
+    }
+}
+
+/// One result row: its cells in SELECT-list (heading-canonical) order.
+pub type Row = Vec<Value>;
+
+/// A connection target. For SQLite this is a database file path.
+#[derive(Clone, Debug)]
+pub struct Dsn {
+    pub path: String,
 }
 
 #[derive(Debug)]
@@ -137,7 +162,7 @@ pub fn emit_select(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
     );
 
     // WHERE = the conjunction of the collected attribute-equals-literal tests.
-    let mut params: Vec<Literal> = Vec::new();
+    let mut params: Vec<Value> = Vec::new();
     if !preds.is_empty() {
         let mut conjuncts = Vec::with_capacity(preds.len());
         for pred in &preds {
@@ -148,7 +173,7 @@ pub fn emit_select(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
                         Dialect::Postgres => format!("${}", params.len() + 1),
                     };
                     conjuncts.push(format!("{} = {placeholder}", quote_ident(column_for(columns, attr)?)));
-                    params.push(value.clone());
+                    params.push(Value::from(value.clone()));
                 }
             }
         }
@@ -229,17 +254,32 @@ pub trait Backend {
         emit_select(expr, self.dialect())
     }
 
-    fn emit_ddl(&self, schema: &Schema) -> Vec<SqlString>;
-    fn type_map(&self) -> &TypeMap;
     fn open(&self, dsn: &Dsn) -> Result<Self::Conn>;
+
+    /// DDL emission and the type map serve write/schema paths not yet wired;
+    /// only the read path exists today.
+    fn emit_ddl(&self, _schema: &Schema) -> Vec<SqlString> {
+        unimplemented!("emit_ddl is not implemented yet")
+    }
+    fn type_map(&self) -> &TypeMap {
+        unimplemented!("type_map is not implemented yet")
+    }
 }
 
 /// Conn = effectful side: own a live connection, prepare/cache statements,
 /// step rows, ship in-memory relations to temp tables.
 pub trait Conn {
     fn prepare(&mut self, sql: &SqlString) -> Result<StmtId>;
-    fn bind_and_step<'a>(&'a mut self, id: StmtId, params: &[Value]) -> Result<RowIter<'a>>;
-    fn materialize_temp(&mut self, heading: &Heading, rows: &[Tuple]) -> Result<TempRelRef>;
+
+    /// Bind positional params and step every row eagerly into owned cells.
+    /// (v1 reads are small and the runtime materializes anyway, so a streaming
+    /// cursor isn't worth the borrow gymnastics yet.)
+    fn bind_and_step(&mut self, id: StmtId, params: &[Value]) -> Result<Vec<Row>>;
+
+    /// Shipping in-memory relations into a backend temp table is not yet wired.
+    fn materialize_temp(&mut self, _heading: &Heading, _rows: &[Tuple]) -> Result<TempRelRef> {
+        unimplemented!("materialize_temp is not implemented yet")
+    }
 }
 
 #[cfg(test)]
@@ -285,7 +325,7 @@ mod tests {
             r#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = ?"#
         );
         assert_eq!(q.sql.param_count, 1);
-        assert_eq!(q.params, vec![Literal::Integer(1)]);
+        assert_eq!(q.params, vec![Value::Integer(1)]);
         assert_eq!(q.result_heading, greetings_heading());
     }
 
