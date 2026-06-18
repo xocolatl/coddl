@@ -109,6 +109,10 @@ struct Emitter {
     /// right (ptr, len) pair to `coddl_resolve_op_field` and
     /// `coddl_sqlite_relvar_init`.
     byte_const_lens: HashMap<String, usize>,
+    /// Per-module pushed-plan metadata: plan id → (param count, result
+    /// heading id). `Inst::RegisterPlan` reads these to call
+    /// `coddl_register_plan` with the right bind count and descriptor.
+    plan_meta: HashMap<u32, (u32, u32)>,
 }
 
 impl Emitter {
@@ -130,6 +134,9 @@ impl Emitter {
         }
         if !module.public_relvars.is_empty() {
             self.emit_runtime_relvar_externs();
+        }
+        if !module.plans.is_empty() {
+            self.emit_runtime_plan_externs();
         }
         if module.functions.iter().any(Function::is_extern)
             || !module.headings.is_empty()
@@ -168,6 +175,12 @@ impl Emitter {
         }
         if !module.public_relvars.is_empty() {
             writeln!(self.body).unwrap();
+        }
+
+        // Per-plan globals (SQL text + db name) and the database-level
+        // resolver strings used by `RegisterPlan` / `RegisterDatabase`.
+        if !module.plans.is_empty() {
+            self.emit_plan_globals(module);
         }
 
         let mut first_defined = true;
@@ -232,6 +245,42 @@ impl Emitter {
             "declare ptr @coddl_resolve_op_field(ptr, i64, ptr, i64, ptr)"
         )
         .unwrap();
+    }
+
+    /// Declare the SQL-pushdown runtime externs: database/plan registration
+    /// (program prologue) and `coddl_query` (the lazy force point). Emitted
+    /// only when the module pushed at least one plan.
+    fn emit_runtime_plan_externs(&mut self) {
+        writeln!(
+            self.body,
+            "declare i32 @coddl_register_database(ptr, i64, ptr, i64)"
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "declare i32 @coddl_register_plan(i32, ptr, i64, ptr, i64, i32, ptr)"
+        )
+        .unwrap();
+        writeln!(self.body, "declare ptr @coddl_query(i32, ptr, i64)").unwrap();
+    }
+
+    /// Emit the static byte constants the pushdown prologue references: the
+    /// database name + its env-var key + baked default path (shared by every
+    /// plan), and per-plan the SQL text and database name. Also records each
+    /// plan's bind count + result heading id in `plan_meta`.
+    fn emit_plan_globals(&mut self, module: &Module) {
+        let db_name = module.db_name.as_deref().unwrap_or("");
+        let default_path = module.db_path_default.as_deref().unwrap_or("");
+        let env_name = format!("CODDL_{}_FILE", db_name.to_ascii_uppercase());
+        self.emit_byte_constant("@.db.name", db_name.as_bytes());
+        self.emit_byte_constant("@.db.env_name", env_name.as_bytes());
+        self.emit_byte_constant("@.db.default_path", default_path.as_bytes());
+        for p in &module.plans {
+            self.emit_byte_constant(&format!("@.plan.{}.sql", p.plan_id), p.sql.as_bytes());
+            self.emit_byte_constant(&format!("@.plan.{}.db_name", p.plan_id), p.db_name.as_bytes());
+            self.plan_meta
+                .insert(p.plan_id, (p.param_count, p.result_heading_id.0));
+        }
     }
 
     /// Emit the per-relvar slot + companion string constants the
@@ -642,6 +691,138 @@ impl Emitter {
                 name,
                 heading_id,
             } => self.lower_relvar_read(*dst, name, *heading_id),
+            Inst::RegisterDatabase => self.lower_register_database(),
+            Inst::RegisterPlan { plan_id } => self.lower_register_plan(*plan_id),
+            Inst::Query {
+                dst,
+                plan_id,
+                params,
+                heading_id,
+            } => self.lower_query(*dst, *plan_id, params, *heading_id),
+        }
+    }
+
+    /// Resolve the database file (env override → baked default) and register
+    /// the logical database so `coddl_query` can find its connection path.
+    fn lower_register_database(&mut self) -> Result<(), LlvmEmitError> {
+        let len_slot = "%v_db_resolve_len";
+        writeln!(self.body, "    {len_slot} = alloca i64, align 8").unwrap();
+        let resolved = "%v_db_resolved";
+        writeln!(
+            self.body,
+            "    {resolved} = call ptr @coddl_resolve_op_field(ptr @.db.env_name, i64 {env_len}, ptr @.db.default_path, i64 {def_len}, ptr {len_slot})",
+            env_len = self.const_byte_len("@.db.env_name"),
+            def_len = self.const_byte_len("@.db.default_path"),
+        )
+        .unwrap();
+        let resolved_len = "%v_db_resolved_len";
+        writeln!(self.body, "    {resolved_len} = load i64, ptr {len_slot}").unwrap();
+        writeln!(
+            self.body,
+            "    call i32 @coddl_register_database(ptr @.db.name, i64 {name_len}, ptr {resolved}, i64 {resolved_len})",
+            name_len = self.const_byte_len("@.db.name"),
+        )
+        .unwrap();
+        Ok(())
+    }
+
+    /// Register one baked plan: SQL text + database name + bind count + the
+    /// result heading descriptor, keyed by the dense plan id.
+    fn lower_register_plan(&mut self, plan_id: u32) -> Result<(), LlvmEmitError> {
+        let (param_count, result_heading_id) = *self.plan_meta.get(&plan_id).ok_or_else(|| {
+            LlvmEmitError::UnsupportedInst(format!("RegisterPlan references unknown plan {plan_id}"))
+        })?;
+        writeln!(
+            self.body,
+            "    call i32 @coddl_register_plan(i32 {plan_id}, ptr @.plan.{plan_id}.db_name, i64 {db_len}, ptr @.plan.{plan_id}.sql, i64 {sql_len}, i32 {param_count}, ptr @.heading.{hid})",
+            db_len = self.const_byte_len(&format!("@.plan.{plan_id}.db_name")),
+            sql_len = self.const_byte_len(&format!("@.plan.{plan_id}.sql")),
+            hid = result_heading_id,
+        )
+        .unwrap();
+        Ok(())
+    }
+
+    /// Execute a registered plan: build the `CoddlParam` array on the stack,
+    /// call `coddl_query`, and bind the returned relation pointer to `dst`.
+    fn lower_query(
+        &mut self,
+        dst: ValueId,
+        plan_id: u32,
+        params: &[(ValueId, ProcType)],
+        _heading_id: HeadingId,
+    ) -> Result<(), LlvmEmitError> {
+        let n = params.len();
+        let dst_name = format!("%v{}", dst.0);
+        let params_arg = if n == 0 {
+            "ptr null".to_string()
+        } else {
+            // `CoddlParam` is `{ i64 i, ptr, i64 len, i32 kind }` (32-byte
+            // stride; the runtime owns this layout).
+            let arr = format!("%qparams.{}", self.next_str);
+            self.next_str += 1;
+            writeln!(
+                self.body,
+                "    {arr} = alloca [{n} x {{ i64, ptr, i64, i32 }}], align 8"
+            )
+            .unwrap();
+            for (i, (vid, ty)) in params.iter().enumerate() {
+                let base = i * 32;
+                let kind = kind_tag_for(ty)?;
+                match ty {
+                    ProcType::Integer => {
+                        let op = self.scalar_op(vid)?;
+                        let slot = self.gep_byte(&arr, base);
+                        writeln!(self.body, "    store i64 {op}, ptr {slot}").unwrap();
+                    }
+                    ProcType::Boolean => {
+                        let op = self.scalar_op(vid)?;
+                        let z = format!("%qb.{}", self.next_str);
+                        self.next_str += 1;
+                        writeln!(self.body, "    {z} = zext i1 {op} to i64").unwrap();
+                        let slot = self.gep_byte(&arr, base);
+                        writeln!(self.body, "    store i64 {z}, ptr {slot}").unwrap();
+                    }
+                    ProcType::Text => {
+                        let (ptr_op, len_op) = self.text_ops(vid)?;
+                        let ptr_slot = self.gep_byte(&arr, base + 8);
+                        let len_slot = self.gep_byte(&arr, base + 16);
+                        writeln!(self.body, "    store ptr {ptr_op}, ptr {ptr_slot}").unwrap();
+                        writeln!(self.body, "    store i64 {len_op}, ptr {len_slot}").unwrap();
+                    }
+                    other => {
+                        return Err(LlvmEmitError::UnsupportedInst(format!(
+                            "query bind param of type {other:?} not supported"
+                        )));
+                    }
+                }
+                let kind_slot = self.gep_byte(&arr, base + 24);
+                writeln!(self.body, "    store i32 {kind}, ptr {kind_slot}").unwrap();
+            }
+            format!("ptr {arr}")
+        };
+        writeln!(
+            self.body,
+            "    {dst_name} = call ptr @coddl_query(i32 {plan_id}, {params_arg}, i64 {n})"
+        )
+        .unwrap();
+        self.values.insert(
+            dst,
+            ValueRepr::Scalar {
+                ty: "ptr".to_string(),
+                op: dst_name,
+            },
+        );
+        Ok(())
+    }
+
+    /// Read the `(ptr, len)` operand pair for a `Text`-typed SSA value.
+    fn text_ops(&self, v: &ValueId) -> Result<(String, String), LlvmEmitError> {
+        match self.values.get(v) {
+            Some(ValueRepr::Text { ptr_op, len_op }) => Ok((ptr_op.clone(), len_op.clone())),
+            other => Err(LlvmEmitError::UnsupportedInst(format!(
+                "expected Text value, got {other:?}"
+            ))),
         }
     }
 
@@ -1281,6 +1462,19 @@ fn proc_type_from_kind_llvm(kind: u32) -> ProcType {
         k if k == kind_tag::BOOLEAN => ProcType::Boolean,
         k if k == kind_tag::TEXT => ProcType::Text,
         other => unreachable!("unsupported attr kind {other} in Extract"),
+    }
+}
+
+/// Map a scalar `ProcType` to its `CoddlAttrKind` tag for a `CoddlParam`.
+fn kind_tag_for(ty: &ProcType) -> Result<u32, LlvmEmitError> {
+    use coddl_procir::kind_tag;
+    match ty {
+        ProcType::Integer => Ok(kind_tag::INTEGER),
+        ProcType::Boolean => Ok(kind_tag::BOOLEAN),
+        ProcType::Text => Ok(kind_tag::TEXT),
+        other => Err(LlvmEmitError::UnsupportedInst(format!(
+            "query param of type {other:?} has no CoddlParam kind"
+        ))),
     }
 }
 

@@ -12,3 +12,5 @@ coddl-diagnostics.workspace = true
 coddl-syntax.workspace = true
 coddl-types.workspace = true
 coddl-plan.workspace = true
+coddl-relir.workspace = true
+coddl-sqlemit.workspace = true

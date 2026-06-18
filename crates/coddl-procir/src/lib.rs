@@ -12,13 +12,14 @@
 //! `coddl-codegen-wasm`).
 
 pub mod codegen;
+mod cut;
 pub mod ir;
 pub mod layout;
 pub mod lower;
 
 pub use codegen::Codegen;
 pub use ir::{
-    BasicBlock, BlockId, Const, Function, Heading, HeadingId, Inst, Module, ProcType,
+    BasicBlock, BlockId, Const, Function, Heading, HeadingId, Inst, Module, PlanEntry, ProcType,
     PublicRelvarBinding, ScalarOp, Terminator, Type, ValueId,
 };
 pub use layout::{cell_kind, cell_width, kind_tag, record_layout, AttrLayout, RecordLayout};

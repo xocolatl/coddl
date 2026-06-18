@@ -22,9 +22,12 @@ use coddl_syntax::ast::{
 use coddl_syntax::SyntaxKind;
 use coddl_types::{check, Heading, Type};
 
+use coddl_relir::{Literal as RelLiteral, Predicate, RelExpr};
+use coddl_sqlemit::{Dialect, SqlQuery, Value};
+
 use crate::ir::{
-    BasicBlock, BlockId, Const, Function, HeadingId, Inst, Module, ProcType, PublicRelvarBinding,
-    ScalarOp, Terminator, ValueId,
+    BasicBlock, BlockId, Const, Function, HeadingId, Inst, Module, PlanEntry, ProcType,
+    PublicRelvarBinding, ScalarOp, Terminator, ValueId,
 };
 
 /// Surface name → C-ABI linkage name for each runtime extern. The
@@ -158,6 +161,23 @@ struct Lowerer {
     /// Canonical absolute SQLite path baked at compile time. Mirrors
     /// `Module::db_path_default`.
     db_path_default: Option<String>,
+    /// SQL dialect to bake pushed queries for, derived from the plan's
+    /// backend. `Some` only when the backend is one the cut can push to
+    /// (SQLite today); `None` disables pushdown so every relvar read takes
+    /// the legacy in-process materialize path.
+    dialect: Option<Dialect>,
+    /// Baked query plans, in assignment order. Drained onto `Module::plans`.
+    plans: Vec<PlanEntry>,
+    /// Maps the storage layer's text-stable plan id (`coddl_sqlemit::PlanId`,
+    /// a 64-bit text hash) to the dense per-module `u32` id, so an identical
+    /// query baked twice registers (and executes against) one plan.
+    plan_ids: HashMap<u64, u32>,
+    /// Next dense plan id to hand out.
+    next_plan_id: u32,
+    /// Public relvars referenced via the legacy `RelvarRead` path (i.e. not
+    /// pushed to SQL). Slot init/release in `main` is emitted only for these;
+    /// fully-pushed (or unreferenced) relvars get no startup materialization.
+    legacy_used_relvars: HashSet<String>,
 }
 
 impl Lowerer {
@@ -181,6 +201,11 @@ impl Lowerer {
             public_relvar_order: Vec::new(),
             db_name: None,
             db_path_default: None,
+            dialect: None,
+            plans: Vec::new(),
+            plan_ids: HashMap::new(),
+            next_plan_id: 0,
+            legacy_used_relvars: HashSet::new(),
         }
     }
 
@@ -192,6 +217,12 @@ impl Lowerer {
     fn absorb_plan(&mut self, plan: &Plan) {
         self.db_name = plan.database_name.clone();
         self.db_path_default = plan.db_file_default.clone();
+        // Only backends the cut can emit SQL for enable pushdown; others
+        // leave `dialect` `None` and fall through to the legacy path.
+        self.dialect = match plan.backend_kind {
+            coddl_plan::BackendKind::Sqlite => Some(Dialect::SQLite),
+            coddl_plan::BackendKind::Other(_) | coddl_plan::BackendKind::Unknown => None,
+        };
         for r in &plan.resolved {
             let heading_id = self.intern_heading(&r.heading);
             let binding = PublicRelvarBinding {
@@ -375,6 +406,11 @@ impl Lowerer {
                 }
             }
         }
+        // Now that every function is lowered (so `plans` and
+        // `legacy_used_relvars` are final), patch `main`'s prologue:
+        // register the database + pushed plans, and emit slot init/release
+        // only for relvars still read in-process.
+        self.finalize_main_prologue();
         let public_relvars: Vec<PublicRelvarBinding> = self
             .public_relvar_order
             .iter()
@@ -392,6 +428,64 @@ impl Lowerer {
             public_relvars,
             db_path_default: self.db_path_default.take(),
             db_name: self.db_name.take(),
+            plans: std::mem::take(&mut self.plans),
+        }
+    }
+
+    /// Insert `main`'s prologue registration and slot init/release after
+    /// the body is fully lowered. Runs once in `lower_root`. The database
+    /// and plan registrations go right after `coddl_runtime_init`; slot
+    /// init/release cover only relvars referenced via the legacy path.
+    fn finalize_main_prologue(&mut self) {
+        // Build the insts from immutable reads of `self` before taking the
+        // mutable borrow on `self.functions`.
+        let mut prologue: Vec<Inst> = Vec::new();
+        if !self.plans.is_empty() {
+            prologue.push(Inst::RegisterDatabase);
+            for p in &self.plans {
+                prologue.push(Inst::RegisterPlan { plan_id: p.plan_id });
+            }
+        }
+        for name in &self.public_relvar_order {
+            if self.legacy_used_relvars.contains(name) {
+                let heading_id = self.public_relvars[name].heading_id;
+                prologue.push(Inst::RelvarSlotInit {
+                    name: name.clone(),
+                    heading_id,
+                });
+            }
+        }
+        let releases: Vec<Inst> = self
+            .public_relvar_order
+            .iter()
+            .filter(|n| self.legacy_used_relvars.contains(*n))
+            .map(|n| Inst::RelvarSlotRelease { name: n.clone() })
+            .collect();
+        if prologue.is_empty() && releases.is_empty() {
+            return;
+        }
+
+        let main = match self.functions.iter_mut().find(|f| f.name == "main") {
+            Some(f) => f,
+            None => return,
+        };
+        let block = match main.blocks.first_mut() {
+            Some(b) => b,
+            None => return,
+        };
+        let at = block
+            .insts
+            .iter()
+            .position(|i| matches!(i, Inst::Call { callee, .. } if callee == "coddl_runtime_init"))
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        block.insts.splice(at..at, prologue);
+        if !releases.is_empty() {
+            if let Some(sp) = block.insts.iter().position(
+                |i| matches!(i, Inst::Call { callee, .. } if callee == "coddl_runtime_shutdown"),
+            ) {
+                block.insts.splice(sp..sp, releases);
+            }
         }
     }
 
@@ -458,26 +552,11 @@ impl Lowerer {
                 args: Vec::new(),
                 return_type: ProcType::Integer,
             });
-            // Materialize each public relvar from SQLite before the
-            // body runs. Backends turn each `RelvarSlotInit` into a
-            // call to `coddl_sqlite_relvar_init` with the static
-            // table / columns / descriptor / env-var resolver args
-            // built from the per-relvar binding on Module. The extern
-            // is declared on the backend side by the per-module relvar
-            // declarator; no need to register it through the
-            // lowerer's Function table (doing so would conflict with
-            // the backend's correctly-typed declaration).
-            for relvar_name in self.public_relvar_order.clone() {
-                let binding = self
-                    .public_relvars
-                    .get(&relvar_name)
-                    .expect("ordered name binds in public_relvars")
-                    .clone();
-                self.insts.push(Inst::RelvarSlotInit {
-                    name: relvar_name,
-                    heading_id: binding.heading_id,
-                });
-            }
+            // Database / plan registration and per-relvar slot init are
+            // emitted into the prologue by `finalize_main_prologue` once the
+            // body is lowered — only then is it known which relvars were
+            // pushed to SQL (served by `coddl_query`) versus read in-process
+            // (materialized via `coddl_sqlite_relvar_init`).
         }
 
         let body_value = decl.body().map(|body| self.lower_block(&body));
@@ -489,14 +568,10 @@ impl Lowerer {
         self.release_top_scope_heap_locals();
 
         if is_main {
-            // Release each public-relvar slot before runtime shutdown.
-            // The runtime's own `coddl_runtime_shutdown` mirrors this
-            // for any slot still alive (defense in depth), but emitting
-            // the per-relvar release here keeps the ProcIR explicit
-            // about ownership and matches the slot-init shape above.
-            for relvar_name in self.public_relvar_order.clone() {
-                self.insts.push(Inst::RelvarSlotRelease { name: relvar_name });
-            }
+            // Per-relvar slot releases are inserted before this shutdown
+            // call by `finalize_main_prologue`, mirroring the slot inits it
+            // emits. The runtime's own `coddl_runtime_shutdown` also frees
+            // any slot still alive (defense in depth).
             self.ensure_runtime_extern("coddl_runtime_shutdown");
             let dst = self.fresh_value();
             self.record_type(dst, ProcType::Integer);
@@ -588,6 +663,13 @@ impl Lowerer {
     }
 
     fn lower_expr(&mut self, expr: &Expr) -> ValueId {
+        // Try the SQL pushdown cut first: a relvar-rooted relational subtree
+        // becomes one `Inst::Query` fired lazily at this force point. On a
+        // miss (not pushable, or no pushable backend) fall through to the
+        // legacy in-process lowering below.
+        if let Some(v) = self.try_lower_pushed(expr) {
+            return v;
+        }
         match expr {
             Expr::Literal(lit) => self.lower_literal(lit),
             Expr::Call(call) => self.lower_call(call),
@@ -600,6 +682,148 @@ impl Lowerer {
             Expr::Unary(u) => self.lower_unary_expr(u),
             Expr::NameRef(n) => self.lower_name_ref(n),
         }
+    }
+
+    /// If `expr` is a relvar-rooted relational subtree the cut can push,
+    /// bake its SQL into `Module::plans` and emit an `Inst::Query`, returning
+    /// its result value. Otherwise return `None` so the caller lowers `expr`
+    /// via the legacy in-process path. No-op when pushdown is disabled
+    /// (`dialect` is `None`).
+    fn try_lower_pushed(&mut self, expr: &Expr) -> Option<ValueId> {
+        let dialect = self.dialect?;
+        let rel = self.build_rel_expr(expr)?;
+        let query = crate::cut::try_push(&rel, dialect)?;
+        Some(self.emit_query(query))
+    }
+
+    /// Build a `coddl-relir` expression from a relational AST subtree, or
+    /// `None` if the shape isn't one the cut handles (v1: a public-relvar
+    /// leaf, optionally restricted by a single `attr = literal`). A `NameRef`
+    /// shadowed by a local is not a relvar read, so it returns `None`.
+    fn build_rel_expr(&self, expr: &Expr) -> Option<RelExpr> {
+        match expr {
+            Expr::NameRef(n) => {
+                let name = n.ident()?;
+                let name = name.text();
+                if self.lookup_local(name).is_some() {
+                    return None;
+                }
+                let binding = self.public_relvars.get(name)?;
+                Some(RelExpr::RelvarRef {
+                    name: binding.name.clone(),
+                    database: self.db_name.clone().unwrap_or_default(),
+                    heading: self.headings[binding.heading_id.0 as usize].clone(),
+                    table_name: binding.table_name.clone(),
+                    columns: binding.columns.clone(),
+                })
+            }
+            Expr::Binary(b) => {
+                if !matches!(b.op_kind(), Some(BinaryOp::Where)) {
+                    return None;
+                }
+                let input = self.build_rel_expr(&b.lhs()?)?;
+                let pred = self.build_predicate(&b.rhs()?, &input.heading())?;
+                Some(RelExpr::Restrict {
+                    input: Box::new(input),
+                    pred,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Recognize a single `attr = literal` (or `literal = attr`) restriction
+    /// predicate over `heading`. Anything else (conjunctions, attr-vs-attr,
+    /// non-literal operands, comparisons other than `=`) returns `None` so
+    /// the restriction falls back to the in-process `where` path.
+    fn build_predicate(&self, expr: &Expr, heading: &Heading) -> Option<Predicate> {
+        let b = match expr {
+            Expr::Binary(b) => b,
+            _ => return None,
+        };
+        if !matches!(b.op_kind(), Some(BinaryOp::Eq)) {
+            return None;
+        }
+        let lhs = b.lhs()?;
+        let rhs = b.rhs()?;
+        let (attr, lit_expr) = match (attr_ref_name(&lhs), attr_ref_name(&rhs)) {
+            (Some(a), None) => (a, rhs),
+            (None, Some(a)) => (a, lhs),
+            // attr-vs-attr or literal-vs-literal: not a pushable AttrEq.
+            _ => return None,
+        };
+        heading.lookup(&attr)?;
+        let value = self.literal_value(&lit_expr)?;
+        Some(Predicate::AttrEq { attr, value })
+    }
+
+    /// Convert a literal AST node to a RelIR `Literal`, or `None` for forms
+    /// the pushdown doesn't bind yet (rationals, characters, non-UTF-8 text).
+    fn literal_value(&self, expr: &Expr) -> Option<RelLiteral> {
+        match expr {
+            Expr::Literal(lit) => {
+                let token = lit.token()?;
+                match token.kind() {
+                    SyntaxKind::INTEGER_LIT => {
+                        Some(RelLiteral::Integer(parse_integer_literal(token.text())))
+                    }
+                    SyntaxKind::STRING_LIT => {
+                        let bytes = decode_string_literal(token.text());
+                        String::from_utf8(bytes).ok().map(RelLiteral::Text)
+                    }
+                    _ => None,
+                }
+            }
+            Expr::BoolLit(b) => b.value().map(RelLiteral::Boolean),
+            _ => None,
+        }
+    }
+
+    /// Lower a baked `SqlQuery` to an `Inst::Query`: dedup the plan by its
+    /// text-stable id, emit one `Inst::Const` per bind value, and return the
+    /// SSA value holding the (relation) result.
+    fn emit_query(&mut self, query: SqlQuery) -> ValueId {
+        let result_heading_id = self.intern_heading(&query.result_heading);
+        let plan_id = if let Some(id) = self.plan_ids.get(&query.plan_id.0) {
+            *id
+        } else {
+            let id = self.next_plan_id;
+            self.next_plan_id += 1;
+            self.plans.push(PlanEntry {
+                plan_id: id,
+                db_name: self.db_name.clone().unwrap_or_default(),
+                sql: query.sql.text.clone(),
+                param_count: query.sql.param_count,
+                result_heading_id,
+            });
+            self.plan_ids.insert(query.plan_id.0, id);
+            id
+        };
+        let mut params: Vec<(ValueId, ProcType)> = Vec::with_capacity(query.params.len());
+        for v in &query.params {
+            let (value, ty) = match v {
+                Value::Integer(n) => (Const::Integer(*n), ProcType::Integer),
+                Value::Text(s) => (Const::Text(s.clone().into_bytes()), ProcType::Text),
+                Value::Boolean(b) => (Const::Boolean(*b), ProcType::Boolean),
+            };
+            let dst = self.fresh_value();
+            self.record_type(dst, ty.clone());
+            self.insts.push(Inst::Const {
+                dst,
+                value,
+                ty: ty.clone(),
+            });
+            params.push((dst, ty));
+        }
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Relation(result_heading_id));
+        self.insts.push(Inst::Query {
+            dst,
+            plan_id,
+            params,
+            heading_id: result_heading_id,
+        });
+        dst
     }
 
     /// Lower a unary prefix expression. Phase 21 handles `Extract`:
@@ -667,6 +891,9 @@ impl Lowerer {
             // the temporary via the same fresh-source detection Phase 21
             // installed for extract.
             if let Some(binding) = self.public_relvars.get(name).cloned() {
+                // Reaching here means the cut didn't push this relvar read, so
+                // it stays in-process — mark it so `main` materializes its slot.
+                self.legacy_used_relvars.insert(binding.name.clone());
                 let dst = self.fresh_value();
                 self.record_type(dst, ProcType::Relation(binding.heading_id));
                 self.insts.push(Inst::RelvarRead {
@@ -1123,6 +1350,15 @@ impl Lowerer {
     }
 }
 
+/// The attribute name if `expr` is a bare `NameRef`, else `None`. Used by
+/// predicate recognition to tell `attr = literal` from `literal = attr`.
+fn attr_ref_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::NameRef(n) => n.ident().map(|t| t.text().to_string()),
+        _ => None,
+    }
+}
+
 /// Convert a `record_layout` attribute kind tag to its machine-level
 /// `ProcType`. Mirrors the runtime's `CoddlAttrKind`. Used by the
 /// predicate-function synthesis to type the per-attribute `AttrLoad`
@@ -1328,6 +1564,159 @@ mod tests {
             assert!(names.contains(&needed), "expected {needed} in {names:?}");
         }
         assert_eq!(m.functions.len(), 4);
+    }
+
+    // ── SQL pushdown ──────────────────────────────────────────────────
+
+    const HELLO_WORLD_DB: &str = "\
+program hello_world_db;\n\
+database greetings;\n\
+\n\
+public relvar Greetings {\n\
+    id: Integer,\n\
+    message: Text,\n\
+}\n\
+key { id };\n\
+\n\
+oper main {}\n\
+[\n\
+    let g = transaction [\n\
+        extract (Greetings where id = 1)\n\
+    ];\n\
+    write_line { message: g.message };\n\
+];\n";
+
+    fn greetings_plan() -> Plan {
+        use coddl_plan::{BackendKind, ResolvedPublicRelvar, WritePolicy};
+        use coddl_types::RelvarTable;
+        Plan {
+            program_name: "hello_world_db".to_string(),
+            database_name: Some("greetings".to_string()),
+            cd_relvars: RelvarTable::default(),
+            cddb_relvars: RelvarTable::default(),
+            backend_kind: BackendKind::Sqlite,
+            resolved: vec![ResolvedPublicRelvar {
+                app_name: "Greetings".to_string(),
+                catalog_name: "Greetings".to_string(),
+                heading: Heading::new(vec![
+                    ("id".to_string(), Type::Integer),
+                    ("message".to_string(), Type::Text),
+                ]),
+                table_name: "greetings".to_string(),
+                columns: vec![
+                    ("id".to_string(), "id".to_string()),
+                    ("message".to_string(), "message".to_string()),
+                ],
+                write_policy: WritePolicy::ReadOnly,
+            }],
+            db_file_default: Some("/tmp/greetings.sqlite".to_string()),
+        }
+    }
+
+    fn lower_ok_with_plan(src: &str, plan: &Plan) -> Module {
+        let out = lower_with_plan(src, FileId(0), Some(plan));
+        assert!(
+            out.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            out.diagnostics
+        );
+        out.module.expect("module should be produced on clean check")
+    }
+
+    #[test]
+    fn relvar_where_lowers_to_one_query_with_no_slot_init() {
+        let m = lower_ok_with_plan(HELLO_WORLD_DB, &greetings_plan());
+        let main = m.functions.iter().find(|f| f.name == "main").expect("main");
+        let insts = &main.blocks[0].insts;
+
+        let queries = insts
+            .iter()
+            .filter(|i| matches!(i, Inst::Query { .. }))
+            .count();
+        assert_eq!(queries, 1, "expected exactly one Inst::Query in:\n{m}");
+
+        // The pushed subtree replaces the legacy materialize + filter path.
+        assert!(
+            !insts.iter().any(|i| matches!(i, Inst::RelvarSlotInit { .. })),
+            "startup slot init should be suppressed in:\n{m}"
+        );
+        assert!(
+            !insts
+                .iter()
+                .any(|i| matches!(i, Inst::RelvarSlotRelease { .. })),
+            "slot release should be suppressed in:\n{m}"
+        );
+        assert!(
+            !insts.iter().any(|i| matches!(i, Inst::Where { .. })),
+            "where should be pushed to SQL, not run in-process"
+        );
+        assert!(
+            !insts.iter().any(|i| matches!(i, Inst::RelvarRead { .. })),
+            "relvar read should be served by the query"
+        );
+        assert!(
+            !m.functions
+                .iter()
+                .any(|f| f.name.starts_with("__coddl_where_")),
+            "no predicate helper should be synthesized for a pushed where"
+        );
+
+        // Exactly one baked plan, with the expected SQL and bind count.
+        assert_eq!(m.plans.len(), 1);
+        assert_eq!(
+            m.plans[0].sql,
+            r#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = ?"#
+        );
+        assert_eq!(m.plans[0].param_count, 1);
+        assert_eq!(m.plans[0].db_name, "greetings");
+
+        // The prologue registers the database and the plan.
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::RegisterDatabase)),
+            "prologue should register the database in:\n{m}"
+        );
+        assert_eq!(
+            insts
+                .iter()
+                .filter(|i| matches!(i, Inst::RegisterPlan { .. }))
+                .count(),
+            1,
+            "prologue should register exactly one plan"
+        );
+    }
+
+    #[test]
+    fn materialized_where_still_lowers_in_process_with_pushdown_enabled() {
+        // A relation-literal `where` is Materialized, not relvar-rooted, so
+        // even with a SQLite backend (pushdown on) it stays in-process.
+        use coddl_plan::BackendKind;
+        use coddl_types::RelvarTable;
+        let plan = Plan {
+            program_name: "rel_lit".to_string(),
+            database_name: None,
+            cd_relvars: RelvarTable::default(),
+            cddb_relvars: RelvarTable::default(),
+            backend_kind: BackendKind::Sqlite,
+            resolved: vec![],
+            db_file_default: None,
+        };
+        let src = "program rel_lit;\n\
+                   oper main {}\n\
+                   [\n\
+                       write_relation { rel: Relation { {a: 1}, {a: 2} } where a = 2 };\n\
+                   ];\n";
+        let m = lower_ok_with_plan(src, &plan);
+        let main = m.functions.iter().find(|f| f.name == "main").expect("main");
+        let insts = &main.blocks[0].insts;
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::Where { .. })),
+            "materialized where should stay in-process in:\n{m}"
+        );
+        assert!(
+            !insts.iter().any(|i| matches!(i, Inst::Query { .. })),
+            "a relation literal must not be pushed to SQL"
+        );
+        assert!(m.plans.is_empty(), "no plans for a materialized where");
     }
 
     #[test]

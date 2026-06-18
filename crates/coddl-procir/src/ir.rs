@@ -41,6 +41,12 @@ pub struct Module {
     /// (`CODDL_<DB_UPPER>_FILE`). `None` when the program declares
     /// no public relvars.
     pub db_name: Option<String>,
+    /// Static query plans baked from relvar-rooted relational subtrees the
+    /// optimizer pushed to the backend. Each entry drives one
+    /// `coddl_register_plan` call in `main`'s prologue (via
+    /// `Inst::RegisterPlan`); `Inst::Query` references an entry by its
+    /// `plan_id`. Empty when nothing was pushed.
+    pub plans: Vec<PlanEntry>,
 }
 
 impl Module {
@@ -83,6 +89,31 @@ pub struct PublicRelvarBinding {
     /// app-name / col-name split lets future `.cdstore` rename clauses
     /// land without a schema change here.
     pub columns: Vec<(String, String)>,
+}
+
+/// One baked query plan on a `Module`. Codegen turns each entry into a
+/// `coddl_register_plan` call in `main`'s prologue: the SQL text and the
+/// logical database name become static byte constants, the result heading
+/// reuses the module's heading descriptor at `result_heading_id`, and
+/// `param_count` tells the runtime how many `CoddlParam`s a matching
+/// `Inst::Query` supplies. `plan_id` is a dense per-module id (its own
+/// namespace — not the storage layer's text-hash id).
+#[derive(Clone, Debug)]
+pub struct PlanEntry {
+    /// Dense per-module plan id. Referenced by `Inst::Query` and
+    /// `Inst::RegisterPlan`, and passed to `coddl_register_plan` /
+    /// `coddl_query` at runtime.
+    pub plan_id: u32,
+    /// Logical database the plan runs against (the `database <name>;`
+    /// handle). Resolved to a connection path through the runtime's
+    /// database registry.
+    pub db_name: String,
+    /// The baked SQL text, ready to prepare (`?` placeholders for SQLite).
+    pub sql: String,
+    /// Number of bind parameters the SQL expects.
+    pub param_count: u32,
+    /// Heading id (into `Module::headings`) of the rows the plan returns.
+    pub result_heading_id: HeadingId,
 }
 
 /// A function — either a defined one (non-empty `blocks`) or an extern
@@ -264,6 +295,32 @@ pub enum Inst {
     RelvarRead {
         dst: ValueId,
         name: String,
+        heading_id: HeadingId,
+    },
+    /// Register the logical database so the runtime can resolve its
+    /// connection path. Emitted once in `main`'s prologue when the program
+    /// has at least one pushed plan, after `coddl_runtime_init`. Backends
+    /// resolve the path via `coddl_resolve_op_field` (env override then the
+    /// baked default) and call `coddl_register_database`, reading the name
+    /// and default path from `Module::db_name` / `Module::db_path_default`.
+    RegisterDatabase,
+    /// Register one baked query plan with the runtime. Emitted once per
+    /// `Module::plans` entry in `main`'s prologue, after `RegisterDatabase`.
+    /// Backends look the entry up by `plan_id` and call `coddl_register_plan`
+    /// with its SQL text, database name, param count, and the result heading
+    /// descriptor.
+    RegisterPlan { plan_id: u32 },
+    /// Execute a registered plan with the given bind parameters and bind the
+    /// returned sealed relation to `dst`. Fire-on-call: the prepared
+    /// statement runs at this point (the force site), lazily. Each param
+    /// pairs the bind SSA value with its scalar `ProcType` so backends pick
+    /// the right `CoddlParam` kind and field. `dst` carries
+    /// `ProcType::Relation(heading_id)` — the plan's result heading. Backends
+    /// build a `CoddlParam` array and call `coddl_query`.
+    Query {
+        dst: ValueId,
+        plan_id: u32,
+        params: Vec<(ValueId, ProcType)>,
         heading_id: HeadingId,
     },
 }
@@ -484,6 +541,23 @@ impl fmt::Display for Inst {
                 name,
                 heading_id,
             } => write!(f, "{dst} = relvar_read {name} heading_{}", heading_id.0),
+            Inst::RegisterDatabase => f.write_str("register_database"),
+            Inst::RegisterPlan { plan_id } => write!(f, "register_plan plan_{plan_id}"),
+            Inst::Query {
+                dst,
+                plan_id,
+                params,
+                heading_id,
+            } => {
+                write!(f, "{dst} = query plan_{plan_id} heading_{} (", heading_id.0)?;
+                for (i, (v, _ty)) in params.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{v}")?;
+                }
+                f.write_str(")")
+            }
         }
     }
 }
@@ -576,6 +650,16 @@ impl fmt::Display for Module {
         if !self.public_relvars.is_empty() {
             writeln!(f)?;
         }
+        for p in &self.plans {
+            writeln!(
+                f,
+                "  plan plan_{} db \"{}\" heading_{} params {} sql \"{}\"",
+                p.plan_id, p.db_name, p.result_heading_id.0, p.param_count, p.sql
+            )?;
+        }
+        if !self.plans.is_empty() {
+            writeln!(f)?;
+        }
         for func in &self.functions {
             writeln!(f, "{func}")?;
         }
@@ -632,6 +716,7 @@ mod tests {
             public_relvars: Vec::new(),
             db_path_default: None,
             db_name: None,
+            plans: Vec::new(),
         };
         let text = format!("{m}");
         assert!(text.starts_with("module hello_world {"));
@@ -648,6 +733,7 @@ mod tests {
             public_relvars: Vec::new(),
             db_path_default: None,
             db_name: None,
+            plans: Vec::new(),
         };
         let text = format!("{m}");
         assert!(text.contains("block_0:"), "no block label in:\n{text}");

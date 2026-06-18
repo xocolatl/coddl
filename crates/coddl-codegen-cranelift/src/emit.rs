@@ -16,8 +16,8 @@ use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module as ClMod
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use coddl_procir::{
-    record_layout, BasicBlock, Codegen, Const, Function, HeadingId, Inst, Module, ProcType,
-    RecordLayout, ScalarOp, Terminator, Type, ValueId,
+    record_layout, BasicBlock, Codegen, Const, Function, HeadingId, Inst, Module, PlanEntry,
+    ProcType, RecordLayout, ScalarOp, Terminator, Type, ValueId,
 };
 
 use crate::error::CraneliftEmitError;
@@ -89,6 +89,9 @@ impl Codegen for CraneliftBackend {
         if !module.public_relvars.is_empty() {
             declare_runtime_relvar_externs(&mut obj, &mut funcs)?;
         }
+        if !module.plans.is_empty() {
+            declare_runtime_plan_externs(&mut obj, &mut funcs)?;
+        }
 
         // Per-module heading descriptors. One DataId block per unique
         // heading; each carries its attribute array and the
@@ -116,6 +119,17 @@ impl Codegen for CraneliftBackend {
             relvar_data.insert(relvar.name.clone(), ids);
         }
 
+        // Per-plan + database data symbols for the pushdown prologue.
+        let db_data: Option<DbDataIds> = if module.plans.is_empty() {
+            None
+        } else {
+            Some(emit_db_data(&mut obj, &db_name, &db_default)?)
+        };
+        let mut plan_data: HashMap<u32, PlanDataIds> = HashMap::new();
+        for p in &module.plans {
+            plan_data.insert(p.plan_id, emit_plan_data(&mut obj, p)?);
+        }
+
         // Define every non-extern function.
         let mut next_data: u32 = 0;
         for func in module.functions.iter().filter(|f| !f.is_extern()) {
@@ -128,6 +142,8 @@ impl Codegen for CraneliftBackend {
                 &layouts,
                 &heading_desc_ids,
                 &relvar_data,
+                &plan_data,
+                db_data.as_ref(),
                 &mut next_data,
             )?;
         }
@@ -265,6 +281,121 @@ fn declare_runtime_relvar_externs(
         funcs.insert("coddl_resolve_op_field".into(), id);
     }
     Ok(())
+}
+
+/// SQL-pushdown runtime externs: database/plan registration (program
+/// prologue) and `coddl_query` (the lazy force point). Mirrors the LLVM
+/// backend's `emit_runtime_plan_externs`.
+fn declare_runtime_plan_externs(
+    obj: &mut ObjectModule,
+    funcs: &mut HashMap<String, FuncId>,
+) -> Result<(), CraneliftEmitError> {
+    let ptr_ty = obj.target_config().pointer_type();
+    // coddl_register_database(name: ptr, name_len: i64, path: ptr,
+    //                         path_len: i64) -> i32
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I32));
+        let id = obj
+            .declare_function("coddl_register_database", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_register_database".into(), id);
+    }
+    // coddl_register_plan(plan_id: i32, db_name: ptr, db_name_len: i64,
+    //                     sql: ptr, sql_len: i64, param_count: i32,
+    //                     desc: ptr) -> i32
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(types::I32));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I32));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.returns.push(AbiParam::new(types::I32));
+        let id = obj
+            .declare_function("coddl_register_plan", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_register_plan".into(), id);
+    }
+    // coddl_query(plan_id: i32, params: ptr, n: i64) -> ptr
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(types::I32));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_query", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_query".into(), id);
+    }
+    Ok(())
+}
+
+/// Database-level data symbols shared by every plan: the database name,
+/// its `CODDL_<DB>_FILE` env-var key, and the baked default path.
+struct DbDataIds {
+    name: DataId,
+    name_len: i64,
+    env_name: DataId,
+    env_name_len: i64,
+    default_path: DataId,
+    default_path_len: i64,
+}
+
+/// Per-plan data symbols: the SQL text and the logical database name.
+struct PlanDataIds {
+    db_name: DataId,
+    db_name_len: i64,
+    sql: DataId,
+    sql_len: i64,
+    param_count: i32,
+    /// Index into the module's `heading_desc_ids` for the result heading.
+    result_heading_id: usize,
+}
+
+/// Emit the database-level byte constants for `RegisterDatabase`.
+fn emit_db_data(
+    obj: &mut ObjectModule,
+    db_name: &str,
+    db_default: &str,
+) -> Result<DbDataIds, CraneliftEmitError> {
+    let env_name = format!("CODDL_{}_FILE", db_name.to_ascii_uppercase());
+    let name = declare_byte_constant(obj, ".db.name", db_name.as_bytes())?;
+    let env = declare_byte_constant(obj, ".db.env_name", env_name.as_bytes())?;
+    let default = declare_byte_constant(obj, ".db.default_path", db_default.as_bytes())?;
+    Ok(DbDataIds {
+        name,
+        name_len: db_name.len() as i64,
+        env_name: env,
+        env_name_len: env_name.len() as i64,
+        default_path: default,
+        default_path_len: db_default.len() as i64,
+    })
+}
+
+/// Emit one plan's SQL + db-name byte constants.
+fn emit_plan_data(
+    obj: &mut ObjectModule,
+    p: &PlanEntry,
+) -> Result<PlanDataIds, CraneliftEmitError> {
+    let sql = declare_byte_constant(obj, &format!(".plan.{}.sql", p.plan_id), p.sql.as_bytes())?;
+    let dbn =
+        declare_byte_constant(obj, &format!(".plan.{}.db_name", p.plan_id), p.db_name.as_bytes())?;
+    Ok(PlanDataIds {
+        db_name: dbn,
+        db_name_len: p.db_name.len() as i64,
+        sql,
+        sql_len: p.sql.len() as i64,
+        param_count: p.param_count as i32,
+        result_heading_id: p.result_heading_id.0 as usize,
+    })
 }
 
 /// Per-public-relvar DataIds and string lengths. The three new Inst
@@ -634,6 +765,7 @@ impl ValueRepr {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_function(
     obj: &mut ObjectModule,
     func: &Function,
@@ -642,6 +774,8 @@ fn emit_function(
     heading_layouts: &[RecordLayout],
     heading_desc_ids: &[DataId],
     relvar_data: &HashMap<String, RelvarDataIds>,
+    plan_data: &HashMap<u32, PlanDataIds>,
+    db_data: Option<&DbDataIds>,
     next_data: &mut u32,
 ) -> Result<(), CraneliftEmitError> {
     let mut ctx = obj.make_context();
@@ -705,6 +839,8 @@ fn emit_function(
             heading_layouts,
             heading_desc_ids,
             relvar_data,
+            plan_data,
+            db_data,
             &mut values,
             next_data,
             is_main,
@@ -720,6 +856,7 @@ fn emit_function(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_block(
     obj: &mut ObjectModule,
     builder: &mut FunctionBuilder<'_>,
@@ -728,6 +865,8 @@ fn emit_block(
     heading_layouts: &[RecordLayout],
     heading_desc_ids: &[DataId],
     relvar_data: &HashMap<String, RelvarDataIds>,
+    plan_data: &HashMap<u32, PlanDataIds>,
+    db_data: Option<&DbDataIds>,
     values: &mut HashMap<ValueId, ValueRepr>,
     next_data: &mut u32,
     is_main: bool,
@@ -741,6 +880,8 @@ fn emit_block(
             heading_layouts,
             heading_desc_ids,
             relvar_data,
+            plan_data,
+            db_data,
             values,
             next_data,
         )?;
@@ -749,6 +890,7 @@ fn emit_block(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_inst(
     obj: &mut ObjectModule,
     builder: &mut FunctionBuilder<'_>,
@@ -757,6 +899,8 @@ fn emit_inst(
     heading_layouts: &[RecordLayout],
     heading_desc_ids: &[DataId],
     relvar_data: &HashMap<String, RelvarDataIds>,
+    plan_data: &HashMap<u32, PlanDataIds>,
+    db_data: Option<&DbDataIds>,
     values: &mut HashMap<ValueId, ValueRepr>,
     next_data: &mut u32,
 ) -> Result<(), CraneliftEmitError> {
@@ -1239,6 +1383,140 @@ fn emit_inst(
             values.insert(*dst, ValueRepr::Scalar(payload));
             Ok(())
         }
+        Inst::RegisterDatabase => {
+            let db = db_data.ok_or_else(|| {
+                CraneliftEmitError::UnsupportedInst(
+                    "RegisterDatabase with no database data".into(),
+                )
+            })?;
+            let ptr_ty = obj.target_config().pointer_type();
+            // Resolve the env override → path; len is written into a stack slot.
+            let len_slot = builder.create_sized_stack_slot(
+                cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    8,
+                    3,
+                ),
+            );
+            let len_addr = builder.ins().stack_addr(ptr_ty, len_slot, 0);
+            let resolve_local =
+                obj.declare_func_in_func(funcs["coddl_resolve_op_field"], builder.func);
+            let env_gv = obj.declare_data_in_func(db.env_name, builder.func);
+            let env_addr = builder.ins().symbol_value(ptr_ty, env_gv);
+            let env_len = builder.ins().iconst(types::I64, db.env_name_len);
+            let default_gv = obj.declare_data_in_func(db.default_path, builder.func);
+            let default_addr = builder.ins().symbol_value(ptr_ty, default_gv);
+            let default_len = builder.ins().iconst(types::I64, db.default_path_len);
+            let call = builder.ins().call(
+                resolve_local,
+                &[env_addr, env_len, default_addr, default_len, len_addr],
+            );
+            let resolved_ptr = builder.inst_results(call)[0];
+            let resolved_len = builder.ins().load(types::I64, MemFlags::trusted(), len_addr, 0);
+            // Register the database.
+            let name_gv = obj.declare_data_in_func(db.name, builder.func);
+            let name_addr = builder.ins().symbol_value(ptr_ty, name_gv);
+            let name_len = builder.ins().iconst(types::I64, db.name_len);
+            let reg_local =
+                obj.declare_func_in_func(funcs["coddl_register_database"], builder.func);
+            builder
+                .ins()
+                .call(reg_local, &[name_addr, name_len, resolved_ptr, resolved_len]);
+            Ok(())
+        }
+        Inst::RegisterPlan { plan_id } => {
+            let p = plan_data.get(plan_id).ok_or_else(|| {
+                CraneliftEmitError::UnsupportedInst(format!(
+                    "RegisterPlan references unknown plan {plan_id}"
+                ))
+            })?;
+            let ptr_ty = obj.target_config().pointer_type();
+            let plan_id_v = builder.ins().iconst(types::I32, *plan_id as i64);
+            let dbname_gv = obj.declare_data_in_func(p.db_name, builder.func);
+            let dbname_addr = builder.ins().symbol_value(ptr_ty, dbname_gv);
+            let dbname_len = builder.ins().iconst(types::I64, p.db_name_len);
+            let sql_gv = obj.declare_data_in_func(p.sql, builder.func);
+            let sql_addr = builder.ins().symbol_value(ptr_ty, sql_gv);
+            let sql_len = builder.ins().iconst(types::I64, p.sql_len);
+            let pcount = builder.ins().iconst(types::I32, p.param_count as i64);
+            let desc_id = heading_desc_ids[p.result_heading_id];
+            let desc_gv = obj.declare_data_in_func(desc_id, builder.func);
+            let desc_addr = builder.ins().symbol_value(ptr_ty, desc_gv);
+            let reg_local =
+                obj.declare_func_in_func(funcs["coddl_register_plan"], builder.func);
+            builder.ins().call(
+                reg_local,
+                &[
+                    plan_id_v,
+                    dbname_addr,
+                    dbname_len,
+                    sql_addr,
+                    sql_len,
+                    pcount,
+                    desc_addr,
+                ],
+            );
+            Ok(())
+        }
+        Inst::Query {
+            dst,
+            plan_id,
+            params,
+            heading_id: _,
+        } => {
+            let ptr_ty = obj.target_config().pointer_type();
+            let n = params.len();
+            // Build the CoddlParam array on the stack:
+            // `{ i64 i, ptr, i64 len, i32 kind }`, 32-byte stride.
+            let params_arg = if n == 0 {
+                builder.ins().iconst(ptr_ty, 0)
+            } else {
+                let slot = builder.create_sized_stack_slot(
+                    cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                        (n * 32) as u32,
+                        3,
+                    ),
+                );
+                for (i, (vid, ty)) in params.iter().enumerate() {
+                    let base = (i * 32) as i32;
+                    let kind = kind_tag_for_cl(ty)?;
+                    match ty {
+                        ProcType::Integer => {
+                            let v = scalar_value(values, vid)?;
+                            builder.ins().stack_store(v, slot, base);
+                        }
+                        ProcType::Boolean => {
+                            let v = scalar_value(values, vid)?; // I8
+                            let ext = builder.ins().uextend(types::I64, v);
+                            builder.ins().stack_store(ext, slot, base);
+                        }
+                        ProcType::Text => {
+                            let (ptr, len) = text_value(values, vid)?;
+                            builder.ins().stack_store(ptr, slot, base + 8);
+                            builder.ins().stack_store(len, slot, base + 16);
+                        }
+                        other => {
+                            return Err(CraneliftEmitError::UnsupportedInst(format!(
+                                "query bind param of type {other:?} not supported"
+                            )));
+                        }
+                    }
+                    let kind_v = builder.ins().iconst(types::I32, kind as i64);
+                    builder.ins().stack_store(kind_v, slot, base + 24);
+                }
+                builder.ins().stack_addr(ptr_ty, slot, 0)
+            };
+            let plan_id_v = builder.ins().iconst(types::I32, *plan_id as i64);
+            let n_v = builder.ins().iconst(types::I64, n as i64);
+            let query_local = obj.declare_func_in_func(funcs["coddl_query"], builder.func);
+            let call = builder
+                .ins()
+                .call(query_local, &[plan_id_v, params_arg, n_v]);
+            let result = builder.inst_results(call)[0];
+            values.insert(*dst, ValueRepr::Scalar(result));
+            Ok(())
+        }
     }
 }
 
@@ -1264,6 +1542,33 @@ fn scalar_value(
         Some(ValueRepr::Scalar(val)) => Ok(*val),
         _ => Err(CraneliftEmitError::UnsupportedInst(format!(
             "expected scalar pointer at {v:?}"
+        ))),
+    }
+}
+
+/// Extract the `(ptr, len)` pair of a `Text`-typed SSA value. Used when
+/// binding a Text query parameter into a `CoddlParam`.
+fn text_value(
+    values: &HashMap<ValueId, ValueRepr>,
+    v: &ValueId,
+) -> Result<(CrValue, CrValue), CraneliftEmitError> {
+    match values.get(v) {
+        Some(ValueRepr::Text { ptr, len }) => Ok((*ptr, *len)),
+        _ => Err(CraneliftEmitError::UnsupportedInst(format!(
+            "expected Text value at {v:?}"
+        ))),
+    }
+}
+
+/// Map a scalar `ProcType` to its `CoddlAttrKind` tag for a `CoddlParam`.
+fn kind_tag_for_cl(ty: &ProcType) -> Result<u32, CraneliftEmitError> {
+    use coddl_procir::kind_tag;
+    match ty {
+        ProcType::Integer => Ok(kind_tag::INTEGER),
+        ProcType::Boolean => Ok(kind_tag::BOOLEAN),
+        ProcType::Text => Ok(kind_tag::TEXT),
+        other => Err(CraneliftEmitError::UnsupportedInst(format!(
+            "query param of type {other:?} has no CoddlParam kind"
         ))),
     }
 }
