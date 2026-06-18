@@ -52,9 +52,11 @@ A first-class relation is one of three things, behind a single `Relation` handle
 
 ## Plan registration
 
-- Each compile-time query becomes a `plan_id` with a SQL template and parameter signature.
-- Codegen registers all static plans at process start: `coddl_register_plan(id, sql, param_types, result_heading)`.
-- At call sites, ProcIR computes parameters (including any `TempRelRef`s built from in-memory relations), calls `coddl_query(plan_id, params) -> Relation`, and either iterates, materializes, or hands the handle onward.
+- Each compile-time query becomes a `plan_id` (a dense `u32` codegen assigns — its own namespace, *not* `coddl_sqlemit::PlanId`, which is a 64-bit text hash) carrying a baked SQL string, a bind-parameter count, and a result heading.
+- The program prologue registers each logical database once, then each static plan:
+  - `coddl_register_database(name, path)` — binds a `database <name>;` handle to its resolved connection path (codegen resolves the path via `coddl_resolve_op_field` first). By TTM a database binds exactly one backend and is the scope of a transaction, so the entry is 1:1 with a connection; `coddl_begin_tx`/`coddl_commit_tx` reuse it when write-through lands.
+  - `coddl_register_plan(plan_id, db_name, sql, param_count, result_desc)` — the plan references its database by name. No separate parameter-type table: bind parameters self-describe via `CoddlParam.kind` at the call site.
+- At the force point, codegen calls `coddl_query(plan_id, params, n) -> *Relation`: it resolves the plan's database, fires the prepared statement (cached by SQL text per connection) on a pool connection — so the audit `trace` hook captures it — marshals the rows into a sealed RC relation, and returns the pointer (the same shape `coddl_relation_where` returns; consumed by `coddl_extract_check_cardinality`). It aborts on any hard error (unknown plan/database, parameter mismatch, prepare/step failure, NULL cell); the `*Relation` return has no status channel. (`TempRelRef`s built from in-memory relations join the parameter list once temp-table shipping lands.)
 - Dynamic plans (relation-polymorphic, runtime-shaped) register later — the runtime interpreter assigns plan IDs the first time it lowers a previously-unseen plan shape and caches by shape from then on.
 
 ## Iteration: the `load` primitive

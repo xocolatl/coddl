@@ -35,8 +35,8 @@ pub use relation::{
     coddl_write_relation, CoddlAttrDesc, CoddlAttrKind, CoddlHeadingDesc,
 };
 pub use sqlite::{
-    coddl_begin_tx, coddl_commit_tx, coddl_resolve_op_field, coddl_rollback_tx,
-    coddl_sqlite_relvar_init,
+    coddl_begin_tx, coddl_commit_tx, coddl_query, coddl_register_database, coddl_register_plan,
+    coddl_resolve_op_field, coddl_rollback_tx, coddl_sqlite_relvar_init, CoddlParam,
 };
 
 /// FFI error codes. `0` is success; any nonzero value is a failure whose

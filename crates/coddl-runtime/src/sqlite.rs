@@ -28,11 +28,11 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::Mutex;
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{params_from_iter, Connection, OpenFlags};
 
 use crate::rc::{coddl_rc_alloc, CoddlKind};
-use crate::relation::{coddl_relation_seal, CoddlAttrKind, CoddlHeadingDesc};
-use crate::CoddlStatus;
+use crate::relation::{coddl_relation_seal, CoddlAttrDesc, CoddlAttrKind, CoddlHeadingDesc};
+use crate::{CoddlStatus, PlanId};
 
 /// One open SQLite connection per resolved database path, opened
 /// lazily on first relvar materialization. Closed at runtime shutdown.
@@ -54,6 +54,62 @@ fn relvar_slots() -> &'static Mutex<HashMap<String, usize>> {
     static SLOTS: std::sync::OnceLock<Mutex<HashMap<String, usize>>> =
         std::sync::OnceLock::new();
     SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// One registered logical database. By TTM a database binds exactly one
+/// backend and is the scope of a transaction, so this is 1:1 with a
+/// connection. v1 carries only the resolved file path; `backend_kind` /
+/// credentials slot in here when a second backend or write-through lands.
+/// Long-term the live `Connection` folds into this entry; today the entry
+/// resolves a name to a path and the existing path-keyed [`db_connections`]
+/// pool still owns the connection, so the legacy materialization path is
+/// untouched.
+struct DbEntry {
+    path: String,
+}
+
+/// Logical-database registry, keyed by the `database <name>;` handle (e.g.
+/// `greetings`). Populated in the program prologue by
+/// [`coddl_register_database`]; read by [`coddl_query`] to find the
+/// connection a plan runs against.
+fn database_registry() -> &'static Mutex<HashMap<String, DbEntry>> {
+    static DBS: std::sync::OnceLock<Mutex<HashMap<String, DbEntry>>> = std::sync::OnceLock::new();
+    DBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// One registered query plan: the SQL text codegen baked from RelIR, the
+/// logical database it targets, the number of bind parameters, and a pointer
+/// to the result heading descriptor (stored as `usize` so the map stays
+/// `Send + Sync` — the descriptor is a codegen-emitted static, valid for the
+/// program's life, same discipline as [`relvar_slots`]).
+struct PlanEntry {
+    db_name: String,
+    sql: String,
+    param_count: u32,
+    desc: usize,
+}
+
+/// Plan registry, keyed by the codegen-assigned [`PlanId`] (a dense `u32`,
+/// its own namespace — **not** `coddl_sqlemit::PlanId`, which is a 64-bit
+/// text hash). Populated by [`coddl_register_plan`]; read by [`coddl_query`].
+fn plan_registry() -> &'static Mutex<HashMap<u32, PlanEntry>> {
+    static PLANS: std::sync::OnceLock<Mutex<HashMap<u32, PlanEntry>>> = std::sync::OnceLock::new();
+    PLANS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A bind parameter crossing the FFI boundary into [`coddl_query`].
+///
+/// `#[repr(C)]`, fields ordered so there is no interior padding hole (the
+/// `u32` tag is last). This layout is the single source of truth the codegen
+/// layer mirrors when it builds the parameter array. `kind` is a
+/// [`CoddlAttrKind`] discriminant: `Integer`/`Boolean` carry their value in
+/// `i` (Boolean as 0/1), `Text` carries `(ptr, len)`. Any other kind aborts.
+#[repr(C)]
+pub struct CoddlParam {
+    pub i: i64,
+    pub ptr: *const u8,
+    pub len: usize,
+    pub kind: u32,
 }
 
 /// Resolve an operational field's value: env var if set, else the
@@ -172,19 +228,20 @@ pub unsafe extern "C" fn coddl_sqlite_relvar_init(
     let table_quoted = format!("\"{}\"", table.replace('"', "\"\""));
     let sql = format!("SELECT {select_cols} FROM {table_quoted}");
 
-    // Marshal rows.
+    // Marshal rows. The row-stepping loop and the alloc/seal finalize are
+    // shared verbatim with `coddl_query` via [`marshal_rows`] /
+    // [`finalize_relation`] so the canonical record layout and NULL-rejection
+    // (RM Pro 4) live in exactly one place. `ctx` parameterizes the abort
+    // messages so this path keeps its byte-identical relvar-named diagnostics.
     let attrs = std::slice::from_raw_parts((*desc).attrs, (*desc).attr_count as usize);
     let record_size = (*desc).record_size as usize;
+    let ctx = MarshalCtx {
+        site: "sqlite_relvar_init",
+        step_subject: format!("relvar `{relvar}`"),
+        of_subject: format!("`{relvar}`"),
+    };
 
-    // Two passes: first count rows so the allocation is right-sized;
-    // then marshal cells. SQLite's preparedstatement returns rows
-    // streamingly so we accumulate into a Vec on the first pass too —
-    // counting via `SELECT count(*)` would race with the SELECT under
-    // concurrent writers. For v1 (read-only), one pass into a
-    // `Vec<row_bytes>` and then memcpy into the RC payload is the
-    // simplest correct shape.
-    let mut row_buffers: Vec<Vec<u8>> = Vec::new();
-    {
+    let row_buffers: Vec<Vec<u8>> = {
         let conn_guard = db_connections().lock().expect("conn map poisoned");
         let conn = conn_guard
             .get(path)
@@ -207,81 +264,143 @@ pub unsafe extern "C" fn coddl_sqlite_relvar_init(
                 std::process::abort();
             }
         };
-        loop {
-            let row = match rows.next() {
-                Ok(Some(r)) => r,
-                Ok(None) => break,
-                Err(err) => {
-                    eprintln!(
-                        "coddl: sqlite_relvar_init: row step failed for relvar `{relvar}`: {err}"
-                    );
-                    std::process::abort();
-                }
-            };
-            let mut buf = vec![0u8; record_size];
-            for (i, attr) in attrs.iter().enumerate() {
-                let kind = attr.kind;
-                let offset = attr.offset as usize;
-                if kind == CoddlAttrKind::Integer as u32 {
-                    let v: i64 = match row.get(i) {
-                        Ok(v) => v,
-                        Err(err) => {
-                            let attr_name = read_attr_name(attr);
-                            eprintln!(
-                                "coddl: sqlite_relvar_init: column `{attr_name}` of \
-                                 `{relvar}` is not Integer (or is NULL): {err}"
-                            );
-                            std::process::abort();
-                        }
-                    };
-                    let bytes = v.to_ne_bytes();
-                    buf[offset..offset + 8].copy_from_slice(&bytes);
-                } else if kind == CoddlAttrKind::Boolean as u32 {
-                    let v: bool = match row.get(i) {
-                        Ok(v) => v,
-                        Err(err) => {
-                            let attr_name = read_attr_name(attr);
-                            eprintln!(
-                                "coddl: sqlite_relvar_init: column `{attr_name}` of \
-                                 `{relvar}` is not Boolean (or is NULL): {err}"
-                            );
-                            std::process::abort();
-                        }
-                    };
-                    let n: i64 = if v { 1 } else { 0 };
-                    buf[offset..offset + 8].copy_from_slice(&n.to_ne_bytes());
-                } else if kind == CoddlAttrKind::Text as u32 {
-                    let s: String = match row.get(i) {
-                        Ok(s) => s,
-                        Err(err) => {
-                            let attr_name = read_attr_name(attr);
-                            eprintln!(
-                                "coddl: sqlite_relvar_init: column `{attr_name}` of \
-                                 `{relvar}` is not Text (or is NULL): {err}"
-                            );
-                            std::process::abort();
-                        }
-                    };
-                    let stored = intern_string(s);
-                    let ptr = stored.as_ptr() as usize;
-                    let len = stored.len();
-                    buf[offset..offset + 8].copy_from_slice(&ptr.to_ne_bytes());
-                    buf[offset + 8..offset + 16].copy_from_slice(&len.to_ne_bytes());
-                } else {
-                    let attr_name = read_attr_name(attr);
-                    eprintln!(
-                        "coddl: sqlite_relvar_init: unsupported attr kind {kind} for \
-                         column `{attr_name}` of `{relvar}`"
-                    );
-                    std::process::abort();
-                }
-            }
-            row_buffers.push(buf);
-        }
-    }
+        marshal_rows(&mut rows, attrs, record_size, &ctx)
+    };
 
     let _ = conn_payload;
 
+    let payload = finalize_relation(&row_buffers, record_size, desc, &ctx);
+
+    *slot = payload;
+    relvar_slots()
+        .lock()
+        .expect("slot map poisoned")
+        .insert(relvar.to_string(), payload as usize);
+    CoddlStatus::Ok
+}
+
+/// Abort-message context for [`marshal_rows`] / [`finalize_relation`]. Lets
+/// the shared marshalling name its source differently per caller: the legacy
+/// relvar path keeps its byte-identical "relvar `X`" diagnostics, while the
+/// query path names the plan.
+struct MarshalCtx {
+    /// Call-site label in the `coddl: <site>: ...` message prefix.
+    site: &'static str,
+    /// Subject in "...failed for {step_subject}" (row-step / allocation).
+    step_subject: String,
+    /// Subject in "column `X` of {of_subject}" (per-cell decode).
+    of_subject: String,
+}
+
+/// Step every row of `rows` and decode its cells into fixed-stride record
+/// buffers, driven by the result heading's per-attribute kind. Shared by
+/// `coddl_sqlite_relvar_init` and [`coddl_query`] so the canonical record
+/// layout lives in one place. Aborts on a row-step error, a per-cell type
+/// mismatch, a NULL cell (RM Pro 4 — D has no nulls), or an unsupported kind;
+/// these are schema/codegen bugs, not recoverable conditions.
+///
+/// # Safety
+/// `rows` must be a live cursor over a statement whose SELECT list lines up
+/// positionally with `attrs` (heading-canonical order); each record is exactly
+/// `record_size` bytes. Interned Text bytes live for the program's lifetime.
+unsafe fn marshal_rows(
+    rows: &mut rusqlite::Rows,
+    attrs: &[CoddlAttrDesc],
+    record_size: usize,
+    ctx: &MarshalCtx,
+) -> Vec<Vec<u8>> {
+    let mut row_buffers: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let row = match rows.next() {
+            Ok(Some(r)) => r,
+            Ok(None) => break,
+            Err(err) => {
+                eprintln!(
+                    "coddl: {}: row step failed for {}: {err}",
+                    ctx.site, ctx.step_subject
+                );
+                std::process::abort();
+            }
+        };
+        let mut buf = vec![0u8; record_size];
+        for (i, attr) in attrs.iter().enumerate() {
+            let kind = attr.kind;
+            let offset = attr.offset as usize;
+            if kind == CoddlAttrKind::Integer as u32 {
+                let v: i64 = match row.get(i) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let attr_name = read_attr_name(attr);
+                        eprintln!(
+                            "coddl: {}: column `{attr_name}` of {} is not Integer (or is NULL): {err}",
+                            ctx.site, ctx.of_subject
+                        );
+                        std::process::abort();
+                    }
+                };
+                buf[offset..offset + 8].copy_from_slice(&v.to_ne_bytes());
+            } else if kind == CoddlAttrKind::Boolean as u32 {
+                let v: bool = match row.get(i) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let attr_name = read_attr_name(attr);
+                        eprintln!(
+                            "coddl: {}: column `{attr_name}` of {} is not Boolean (or is NULL): {err}",
+                            ctx.site, ctx.of_subject
+                        );
+                        std::process::abort();
+                    }
+                };
+                let n: i64 = if v { 1 } else { 0 };
+                buf[offset..offset + 8].copy_from_slice(&n.to_ne_bytes());
+            } else if kind == CoddlAttrKind::Text as u32 {
+                let s: String = match row.get(i) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        let attr_name = read_attr_name(attr);
+                        eprintln!(
+                            "coddl: {}: column `{attr_name}` of {} is not Text (or is NULL): {err}",
+                            ctx.site, ctx.of_subject
+                        );
+                        std::process::abort();
+                    }
+                };
+                let stored = intern_string(s);
+                let ptr = stored.as_ptr() as usize;
+                let len = stored.len();
+                buf[offset..offset + 8].copy_from_slice(&ptr.to_ne_bytes());
+                buf[offset + 8..offset + 16].copy_from_slice(&len.to_ne_bytes());
+            } else {
+                let attr_name = read_attr_name(attr);
+                eprintln!(
+                    "coddl: {}: unsupported attr kind {kind} for column `{attr_name}` of {}",
+                    ctx.site, ctx.of_subject
+                );
+                std::process::abort();
+            }
+        }
+        row_buffers.push(buf);
+    }
+    row_buffers
+}
+
+/// Allocate an RC relation, copy the marshalled record buffers in, and seal it
+/// (sort + adjacent-dedup into canonical order). Seal is required even after
+/// `SELECT DISTINCT`: DISTINCT removes duplicates but not the byte-canonical
+/// ordering the printer / `=` / `extract` rely on. Returns the payload pointer
+/// (rc=1, kind=Relation). The caller decides whether to stash it in a relvar
+/// slot (init) or return it as a transient handle (query). Aborts on
+/// allocation failure.
+///
+/// # Safety
+/// `desc` must outlive the returned relation (a codegen-emitted static); each
+/// buffer in `row_buffers` must be exactly `record_size` bytes.
+unsafe fn finalize_relation(
+    row_buffers: &[Vec<u8>],
+    record_size: usize,
+    desc: *const CoddlHeadingDesc,
+    ctx: &MarshalCtx,
+) -> *mut u8 {
     let row_count = row_buffers.len();
     let payload_size = record_size.saturating_mul(row_count);
     let payload = coddl_rc_alloc(
@@ -292,8 +411,8 @@ pub unsafe extern "C" fn coddl_sqlite_relvar_init(
     );
     if payload.is_null() {
         eprintln!(
-            "coddl: sqlite_relvar_init: allocation failed for relvar `{relvar}` \
-             ({row_count} rows × {record_size} bytes)"
+            "coddl: {}: allocation failed for {} ({row_count} rows × {record_size} bytes)",
+            ctx.site, ctx.step_subject
         );
         std::process::abort();
     }
@@ -303,13 +422,7 @@ pub unsafe extern "C" fn coddl_sqlite_relvar_init(
         dest[start..start + record_size].copy_from_slice(row);
     }
     coddl_relation_seal(payload, desc);
-
-    *slot = payload;
-    relvar_slots()
-        .lock()
-        .expect("slot map poisoned")
-        .insert(relvar.to_string(), payload as usize);
-    CoddlStatus::Ok
+    payload
 }
 
 /// Read an attribute name from its descriptor entry. Bytes are not
@@ -395,6 +508,236 @@ pub unsafe extern "C" fn coddl_rollback_tx() -> CoddlStatus {
     CoddlStatus::Ok
 }
 
+/// Register a logical database: bind a `database <name>;` handle to its
+/// resolved connection path. Called once per database in the program prologue,
+/// after codegen has resolved the path via [`coddl_resolve_op_field`]. A repeat
+/// registration overwrites (idempotent — the resolved path is stable). By TTM
+/// a database binds exactly one backend, so this entry is 1:1 with a connection.
+///
+/// # Safety
+/// Both (ptr, len) pairs must describe valid UTF-8 for their lengths.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_register_database(
+    name: *const u8,
+    name_len: usize,
+    path: *const u8,
+    path_len: usize,
+) -> CoddlStatus {
+    let name = bytes_to_str("database name", name, name_len);
+    let path = bytes_to_str("database path", path, path_len);
+    database_registry()
+        .lock()
+        .expect("database registry poisoned")
+        .insert(
+            name.to_string(),
+            DbEntry {
+                path: path.to_string(),
+            },
+        );
+    CoddlStatus::Ok
+}
+
+/// Register a static query plan: the SQL codegen baked from a relvar-rooted
+/// RelIR subtree, the logical database it runs against, its bind-parameter
+/// count, and the result heading descriptor. Called once per plan in the
+/// program prologue. Aborts on a null descriptor or a duplicate `plan_id`
+/// (static plan ids are unique by construction — a collision is a codegen bug).
+///
+/// # Safety
+/// `result_desc` must point to a heading descriptor that lives for the
+/// program's lifetime (a codegen-emitted static). The (ptr, len) pairs must
+/// describe valid UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_register_plan(
+    plan_id: PlanId,
+    db_name: *const u8,
+    db_name_len: usize,
+    sql: *const u8,
+    sql_len: usize,
+    param_count: u32,
+    result_desc: *const CoddlHeadingDesc,
+) -> CoddlStatus {
+    if result_desc.is_null() {
+        eprintln!(
+            "coddl: register_plan: null result descriptor for plan {}",
+            plan_id.0
+        );
+        std::process::abort();
+    }
+    let db_name = bytes_to_str("plan database name", db_name, db_name_len);
+    let sql = bytes_to_str("plan SQL", sql, sql_len);
+    let mut registry = plan_registry().lock().expect("plan registry poisoned");
+    if registry.contains_key(&plan_id.0) {
+        eprintln!(
+            "coddl: register_plan: plan_id {} already registered",
+            plan_id.0
+        );
+        std::process::abort();
+    }
+    registry.insert(
+        plan_id.0,
+        PlanEntry {
+            db_name: db_name.to_string(),
+            sql: sql.to_string(),
+            param_count,
+            desc: result_desc as usize,
+        },
+    );
+    CoddlStatus::Ok
+}
+
+/// Execute a registered plan with the given bind parameters and return a fresh
+/// sealed RC `Relation` (rc=1) — the same payload shape [`coddl_relation_where`]
+/// returns and [`coddl_extract_check_cardinality`] consumes. Fire-on-call: the
+/// statement runs now, lazily, at the force point. The result is a transient
+/// handle the caller releases via `coddl_rc_release` (it is *not* a relvar slot).
+///
+/// Runs on a connection minted by [`ensure_connection`], so the audit `trace`
+/// hook captures the statement. Aborts on any hard error (unknown plan
+/// or database, parameter-count or kind mismatch, prepare/step failure, NULL
+/// cell) — these are codegen/schema bugs, and the `*Relation` return type has
+/// no status channel.
+///
+/// # Safety
+/// `plan_id` must have been registered by [`coddl_register_plan`]. `params`
+/// must point to `n` valid [`CoddlParam`] values (or be null when `n == 0`).
+#[no_mangle]
+pub unsafe extern "C" fn coddl_query(
+    plan_id: PlanId,
+    params: *const CoddlParam,
+    n: usize,
+) -> *mut u8 {
+    // Look up the plan; clone what we need and drop the registry lock before
+    // taking any other lock (no lock-order coupling).
+    let (db_name, sql, param_count, desc_addr) = {
+        let registry = plan_registry().lock().expect("plan registry poisoned");
+        match registry.get(&plan_id.0) {
+            Some(entry) => (
+                entry.db_name.clone(),
+                entry.sql.clone(),
+                entry.param_count,
+                entry.desc,
+            ),
+            None => {
+                eprintln!("coddl: query: no plan registered for plan_id {}", plan_id.0);
+                std::process::abort();
+            }
+        }
+    };
+    let desc = desc_addr as *const CoddlHeadingDesc;
+
+    if n != param_count as usize {
+        eprintln!(
+            "coddl: query: plan {} expects {param_count} param(s), got {n}",
+            plan_id.0
+        );
+        std::process::abort();
+    }
+
+    // Resolve the plan's logical database to its connection path.
+    let path = {
+        let registry = database_registry()
+            .lock()
+            .expect("database registry poisoned");
+        match registry.get(&db_name) {
+            Some(entry) => entry.path.clone(),
+            None => {
+                eprintln!(
+                    "coddl: query: plan {} references unregistered database `{db_name}`",
+                    plan_id.0
+                );
+                std::process::abort();
+            }
+        }
+    };
+
+    // Open (or reuse) the connection. This locks the pool internally, so it
+    // must run *before* we re-lock it below — the Mutex is not reentrant.
+    ensure_connection(&path);
+
+    // Bind parameters: CoddlParam -> owned rusqlite Value. Text bytes are
+    // copied, so nothing borrows the caller's array past this point.
+    let param_slice: &[CoddlParam] = if params.is_null() || n == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(params, n)
+    };
+    let bindings: Vec<rusqlite::types::Value> = param_slice
+        .iter()
+        .map(|p| param_to_sqlite(p, plan_id.0))
+        .collect();
+
+    let attrs = std::slice::from_raw_parts((*desc).attrs, (*desc).attr_count as usize);
+    let record_size = (*desc).record_size as usize;
+    let ctx = MarshalCtx {
+        site: "query",
+        step_subject: format!("plan {}", plan_id.0),
+        of_subject: format!("plan {}", plan_id.0),
+    };
+
+    // Fire the prepared statement and marshal its rows under one pool guard.
+    // `prepare_cached` keys by SQL text per connection, so repeat queries of
+    // the same plan reuse the compiled statement. The CachedStatement / Rows /
+    // &Connection / guard are all frame-local and drop at the block's end.
+    let row_buffers = {
+        let conn_guard = db_connections().lock().expect("conn map poisoned");
+        let conn = conn_guard
+            .get(&path)
+            .expect("connection inserted by ensure_connection");
+        let mut stmt = match conn.prepare_cached(&sql) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("coddl: query: prepare failed for plan {}: {err}", plan_id.0);
+                std::process::abort();
+            }
+        };
+        let mut rows = match stmt.query(params_from_iter(bindings.iter())) {
+            Ok(r) => r,
+            Err(err) => {
+                eprintln!(
+                    "coddl: query: execution failed for plan {}: {err}",
+                    plan_id.0
+                );
+                std::process::abort();
+            }
+        };
+        marshal_rows(&mut rows, attrs, record_size, &ctx)
+    };
+
+    finalize_relation(&row_buffers, record_size, desc, &ctx)
+}
+
+/// Lower one [`CoddlParam`] to an owned rusqlite bind value. Boolean binds as
+/// the 0/1 integer SQLite stores it as; Text copies its bytes so the bound
+/// value owns them. Aborts on an unsupported kind or non-UTF-8 Text.
+///
+/// # Safety
+/// For a Text param, `(ptr, len)` must describe valid bytes for the call.
+unsafe fn param_to_sqlite(p: &CoddlParam, plan_id: u32) -> rusqlite::types::Value {
+    use rusqlite::types::Value;
+    if p.kind == CoddlAttrKind::Integer as u32 || p.kind == CoddlAttrKind::Boolean as u32 {
+        Value::Integer(p.i)
+    } else if p.kind == CoddlAttrKind::Text as u32 {
+        if p.ptr.is_null() {
+            return Value::Text(String::new());
+        }
+        let slice = std::slice::from_raw_parts(p.ptr, p.len);
+        match std::str::from_utf8(slice) {
+            Ok(s) => Value::Text(s.to_string()),
+            Err(err) => {
+                eprintln!("coddl: query: plan {plan_id}: invalid UTF-8 in Text parameter: {err}");
+                std::process::abort();
+            }
+        }
+    } else {
+        eprintln!(
+            "coddl: query: plan {plan_id}: unsupported parameter kind {}",
+            p.kind
+        );
+        std::process::abort();
+    }
+}
+
 /// Close every open SQLite connection. Called from
 /// `coddl_runtime_shutdown` as the last act of the program.
 ///
@@ -405,6 +748,14 @@ pub unsafe extern "C" fn coddl_rollback_tx() -> CoddlStatus {
 pub unsafe fn shutdown_storage() {
     let mut slots = relvar_slots().lock().expect("slot map poisoned");
     slots.clear();
+    plan_registry()
+        .lock()
+        .expect("plan registry poisoned")
+        .clear();
+    database_registry()
+        .lock()
+        .expect("database registry poisoned")
+        .clear();
     let mut conns = db_connections().lock().expect("conn map poisoned");
     conns.clear(); // drops every Connection (closes the SQLite handles)
 }
@@ -413,6 +764,56 @@ pub unsafe fn shutdown_storage() {
 mod tests {
     use super::*;
     use std::ptr;
+
+    /// Serialize tests that touch the process-global connection pool / plan /
+    /// database registries, so one test's `shutdown_storage()` can't clear
+    /// another's state mid-run. Poison-tolerant so a panicking test doesn't
+    /// wedge the rest.
+    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The `{id: Integer, message: Text}` heading in canonical order. Names are
+    /// `'static` byte literals, so the returned descriptors stay valid after the
+    /// array moves to the caller (who binds it and takes `.as_ptr()`).
+    fn greetings_attrs() -> [CoddlAttrDesc; 2] {
+        [
+            CoddlAttrDesc {
+                name: b"id".as_ptr(),
+                name_len: 2,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 0,
+            },
+            CoddlAttrDesc {
+                name: b"message".as_ptr(),
+                name_len: 7,
+                kind: CoddlAttrKind::Text as u32,
+                offset: 8,
+            },
+        ]
+    }
+
+    /// Seed a temp `.sqlite` with a two-row `greetings` table. Two rows let the
+    /// query tests prove the `WHERE` filter ran: a missing/ignored predicate
+    /// would return both rows. Returns the tempfile (keep it alive) and its path.
+    fn seed_two_row_greetings() -> (tempfile::NamedTempFile, String) {
+        use rusqlite::params;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path_str = tmp.path().to_string_lossy().to_string();
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute(
+            "CREATE TABLE greetings (id INTEGER PRIMARY KEY, message TEXT NOT NULL)",
+            params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO greetings (id, message) VALUES (1, 'hello world'), (2, 'goodbye')",
+            params![],
+        )
+        .unwrap();
+        (tmp, path_str)
+    }
 
     #[test]
     fn resolve_op_field_returns_default_on_miss() {
@@ -469,6 +870,8 @@ mod tests {
         // and check the RC header.
         use crate::rc::CoddlRcHeader;
         use rusqlite::params;
+
+        let _g = test_guard();
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.path().to_path_buf();
@@ -548,5 +951,169 @@ mod tests {
         // Release via the runtime shutdown path so we exercise the
         // slot-cleanup hook too.
         unsafe { shutdown_storage() };
+    }
+
+    #[test]
+    fn register_then_query_filters_to_one_row() {
+        use crate::rc::{coddl_rc_release, CoddlRcHeader};
+
+        let _g = test_guard();
+        let (_tmp, path_str) = seed_two_row_greetings();
+        let attrs = greetings_attrs();
+        let desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 24,
+            attrs: attrs.as_ptr(),
+        };
+        let db = b"greetings";
+        let sql = br#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = ?"#;
+
+        unsafe {
+            assert_eq!(
+                coddl_register_database(db.as_ptr(), db.len(), path_str.as_ptr(), path_str.len()),
+                CoddlStatus::Ok
+            );
+            assert_eq!(
+                coddl_register_plan(
+                    PlanId(0),
+                    db.as_ptr(),
+                    db.len(),
+                    sql.as_ptr(),
+                    sql.len(),
+                    1,
+                    &desc,
+                ),
+                CoddlStatus::Ok
+            );
+
+            let param = CoddlParam {
+                i: 1,
+                ptr: ptr::null(),
+                len: 0,
+                kind: CoddlAttrKind::Integer as u32,
+            };
+            let rel = coddl_query(PlanId(0), &param, 1);
+            assert!(!rel.is_null());
+
+            // One row back — the WHERE filtered out id=2 — sealed RC relation.
+            let header = &*(rel.sub(crate::rc::HEADER_SIZE) as *const CoddlRcHeader);
+            assert_eq!(header.length, 1);
+            assert_eq!(header.rc, 1);
+            assert_eq!(header.kind, CoddlKind::Relation as u32);
+
+            // Record: id (i64) at offset 0, message (ptr, len) at offsets 8/16.
+            let id = ptr::read(rel as *const i64);
+            assert_eq!(id, 1);
+            let msg_ptr = usize::from_ne_bytes(
+                std::slice::from_raw_parts(rel.add(8), 8).try_into().unwrap(),
+            ) as *const u8;
+            let msg_len = usize::from_ne_bytes(
+                std::slice::from_raw_parts(rel.add(16), 8).try_into().unwrap(),
+            );
+            let msg = std::str::from_utf8(std::slice::from_raw_parts(msg_ptr, msg_len)).unwrap();
+            assert_eq!(msg, "hello world");
+
+            coddl_rc_release(rel);
+            shutdown_storage();
+        }
+    }
+
+    #[test]
+    fn query_empty_result_is_zero_length() {
+        use crate::rc::{coddl_rc_release, CoddlRcHeader};
+
+        let _g = test_guard();
+        let (_tmp, path_str) = seed_two_row_greetings();
+        let attrs = greetings_attrs();
+        let desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 24,
+            attrs: attrs.as_ptr(),
+        };
+        let db = b"greetings";
+        let sql = br#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = ?"#;
+
+        unsafe {
+            coddl_register_database(db.as_ptr(), db.len(), path_str.as_ptr(), path_str.len());
+            coddl_register_plan(
+                PlanId(0),
+                db.as_ptr(),
+                db.len(),
+                sql.as_ptr(),
+                sql.len(),
+                1,
+                &desc,
+            );
+
+            // No row has id = 99 → an empty (length-0) relation, not an abort.
+            let param = CoddlParam {
+                i: 99,
+                ptr: ptr::null(),
+                len: 0,
+                kind: CoddlAttrKind::Integer as u32,
+            };
+            let rel = coddl_query(PlanId(0), &param, 1);
+            assert!(!rel.is_null());
+            let header = &*(rel.sub(crate::rc::HEADER_SIZE) as *const CoddlRcHeader);
+            assert_eq!(header.length, 0);
+
+            coddl_rc_release(rel);
+            shutdown_storage();
+        }
+    }
+
+    #[test]
+    fn query_reuses_prepared_statement() {
+        use crate::rc::{coddl_rc_release, CoddlRcHeader};
+
+        let _g = test_guard();
+        let (_tmp, path_str) = seed_two_row_greetings();
+        let attrs = greetings_attrs();
+        let desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 24,
+            attrs: attrs.as_ptr(),
+        };
+        let db = b"greetings";
+        let sql = br#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = ?"#;
+
+        unsafe {
+            coddl_register_database(db.as_ptr(), db.len(), path_str.as_ptr(), path_str.len());
+            coddl_register_plan(
+                PlanId(0),
+                db.as_ptr(),
+                db.len(),
+                sql.as_ptr(),
+                sql.len(),
+                1,
+                &desc,
+            );
+
+            // Two queries through the same plan hit rusqlite's prepared-statement
+            // cache on the second call; both must return the right single row.
+            let p1 = CoddlParam {
+                i: 1,
+                ptr: ptr::null(),
+                len: 0,
+                kind: CoddlAttrKind::Integer as u32,
+            };
+            let r1 = coddl_query(PlanId(0), &p1, 1);
+            assert_eq!((*(r1.sub(crate::rc::HEADER_SIZE) as *const CoddlRcHeader)).length, 1);
+            assert_eq!(ptr::read(r1 as *const i64), 1);
+            coddl_rc_release(r1);
+
+            let p2 = CoddlParam {
+                i: 2,
+                ptr: ptr::null(),
+                len: 0,
+                kind: CoddlAttrKind::Integer as u32,
+            };
+            let r2 = coddl_query(PlanId(0), &p2, 1);
+            assert_eq!((*(r2.sub(crate::rc::HEADER_SIZE) as *const CoddlRcHeader)).length, 1);
+            assert_eq!(ptr::read(r2 as *const i64), 2);
+            coddl_rc_release(r2);
+
+            shutdown_storage();
+        }
     }
 }

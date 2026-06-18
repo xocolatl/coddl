@@ -80,3 +80,9 @@ A recent docs audit flagged several questions worth tracking here once they hard
 - **`oper` declaration surface**: used in examples and method-call sugar, but the production isn't fully spelled out in [grammar.md](grammar.md) yet.
 
 These are tracked here so they don't slip out of view. Move them into properly-scoped risks (with decide-before triggers) when one of them becomes a near-term concern.
+
+## 12. RC dealloc size vs. sealed length
+
+`coddl_rc_alloc` sizes a relation payload to its pre-seal row count, but `coddl_rc_release` recomputes the dealloc `Layout` from the header's `length` field — which `coddl_relation_seal` *shrinks* when it dedups. So any path that allocates N rows, seals down to M < N, then releases, frees a block allocated for N rows with a `Layout` for M — a size-mismatched `dealloc` (UB on most allocators). Present today in `coddl_sqlite_relvar_init` and `coddl_relation_where` (both worst-case alloc then trim); `coddl_query` inherits the same `finalize_relation` shape. `SELECT DISTINCT` makes shrinkage unlikely on the pushed path (rows arrive unique), so it isn't reliably triggered — but it's a real latent fault, not a theoretical one.
+
+**Decide before** the data layer is considered production-hardened (and certainly before any non-`DISTINCT` or duplicate-producing path ships): either store the *allocated* row count in the header separately from the logical `length` (and free against the allocated count), or seal into a right-sized buffer before the RC alloc. Until then, every relation-producing path must keep the allocation's true row count recoverable at release time.
