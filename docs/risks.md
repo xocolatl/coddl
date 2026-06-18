@@ -62,7 +62,15 @@ TTM's `INTEGER` (Coddl's `Integer`) is mathematically unbounded; shipping it as 
 
 **Decide before** user-defined possrep machinery ships: keep `Integer` unbounded and lean on user-defined `Int32`/`Int64`, or add bounded built-ins at the cost of one more documented type. The performance principle leans toward bounded built-ins; the conformance principle leans toward keeping the TTM-derived name unbounded.
 
-## 10. Decisions surfaced by the audit but not yet on this list
+## 10. Non-SQL backends: generalizing `Backend::emit_select`
+
+The storage abstraction (see [storage.md](storage.md)) hard-codes SQL: `Backend::emit_select(plan) -> SqlString` plus the `Dialect` enum assume every backend consumes SQL text. SQLite and Postgres fit; MongoDB (aggregation pipelines), Neo4j (Cypher), and other non-relational stores don't — and even with a generalized emitter, only their fixed-schema, null-free subset maps to a relvar (RM Pro 4). A flat source like CSV has no query engine at all: it can only feed the in-process engine as a materialized relation (no pushdown), which is the eager-hydration cost the SQL path exists to avoid.
+
+The expensive-to-retrofit layer is already protected: RelIR is backend-agnostic — a leaf is rooted in a *logical database*, and `StorageOrigin` is a pushable-or-not flag carrying no backend kind or dialect (see [relir.md](relir.md)). A future non-SQL backend is therefore a backend-layer change, not an IR rewrite; the one remaining SQL-ism is the single `emit_select -> SqlString` signature, cheap to change while few `Backend` impls exist.
+
+**Decide at the second backend** (Postgres), or whenever a non-SQL backend first becomes a goal — whichever comes first. Don't generalize the return type before then: with no working backend yet there is no concrete second example to design the abstraction against, and abstracting on imagined requirements reliably yields the wrong shape. Until then the SQL assumption stays localized in [`coddl-sqlemit`](sqlemit.md), the backend crates, and the runtime's prepared-statement path; the IR and the cut stay agnostic.
+
+## 11. Decisions surfaced by the audit but not yet on this list
 
 A recent docs audit flagged several questions worth tracking here once they harden into real risks rather than open questions:
 
