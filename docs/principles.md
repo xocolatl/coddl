@@ -23,3 +23,15 @@ Algebra A core operators (see [relir.md](relir.md)); operators-as-relations; no 
 Tutorial D is the Manifesto's reference D, useful as a study aid and prior-art benchmark, not a spec Coddl follows. Where TTM prescribes behavior, Coddl conforms. Where TTM is silent, Coddl picks the answer aligned with the four principles above — convergence with Tutorial D's specific choice is incidental, not a goal.
 
 The sanctioned design freedoms (host language, surface syntax, evaluation strategy, IR choice) are enumerated in [conformance.md](conformance.md) and bounded there.
+
+## Toward self-hosting (long-term)
+
+A standing aspiration: reimplement as much of Coddl *in Coddl* as possible — ideally all the way down. "80% self-hosted" is already a win.
+
+The fault line follows what each layer *is*. The relational/logic layers — `coddl-types`, `coddl-relir`, the emission *logic* of `coddl-sqlemit`, type/constraint analysis — port naturally, because a compiler's data (AST, IR, symbol tables) is just relvars of nodes and edges (the "compilers as databases" lineage). The bottom — `coddl-runtime` (refcounts, C ABI), the codegen crates (LLVM text emission), `coddl-backend-sqlite` (the rusqlite FFI wrapper) — needs pointers and raw memory the surface language deliberately forbids. To reach those too, Coddl may eventually grow an `unsafe`-equivalent (marked blocks permitting pointers and raw operations); that would be a **new sanctioned design freedom** — it conflicts with today's "no pointer/box type" and "no recursive type definitions" rules (see [memory.md](memory.md)) and must be added to [conformance.md](conformance.md) explicitly, not slipped in.
+
+This goal steers boundaries *now*, even though no layer is self-hosted in v1:
+
+- **Dependencies must not cross the future seam backwards.** A layer that will stay Rust (the FFI bottom) must not depend on a layer destined to become Coddl (the relational middle). Example: `coddl-backend-sqlite` gets its own storage `Value` type rather than reusing `coddl-relir`'s `Literal`, so the permanent-Rust backend stays decoupled from the will-become-Coddl IR.
+- **Elegant Rust in every layer; clean interfaces between them.** Self-hosting *adds* the boundary discipline above — it does not lower the bar for internals. Each layer still gets the best Rust we can write: it has to be excellent in its own right, and clean code is the clearest spec for the eventual Coddl port (you translate good code, you don't untangle bad).
+- **RelIR's eventual shape is relations, not a Rust enum tree** — keep that in view when extending it.
