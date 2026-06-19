@@ -230,6 +230,7 @@ impl Lowerer {
                 heading_id,
                 table_name: r.table_name.clone(),
                 columns: r.columns.clone(),
+                keys: r.keys.clone(),
             };
             self.public_relvar_order.push(r.app_name.clone());
             self.public_relvars.insert(r.app_name.clone(), binding);
@@ -768,6 +769,7 @@ impl Lowerer {
                     heading: self.headings[binding.heading_id.0 as usize].clone(),
                     table_name: binding.table_name.clone(),
                     columns: binding.columns.clone(),
+                    keys: binding.keys.clone(),
                 })
             }
             Expr::Binary(b) => {
@@ -1672,6 +1674,7 @@ oper main {}\n\
                     ("id".to_string(), "id".to_string()),
                     ("message".to_string(), "message".to_string()),
                 ],
+                keys: vec![vec!["id".to_string()]],
                 write_policy: WritePolicy::ReadOnly,
             }],
             db_file_default: Some("/tmp/greetings.sqlite".to_string()),
@@ -1730,7 +1733,8 @@ oper main {}\n\
         assert_eq!(m.plans.len(), 1);
         assert_eq!(
             m.plans[0].sql,
-            r#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = ?"#
+            // No DISTINCT: the full heading keeps key `id`, so already a set.
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?"#
         );
         assert_eq!(m.plans[0].param_count, 1);
         assert_eq!(m.plans[0].db_name, "greetings");
@@ -1798,7 +1802,8 @@ oper main {}\n\
         assert_eq!(m.plans.len(), 1);
         assert_eq!(
             m.plans[0].sql,
-            r#"SELECT DISTINCT "message" FROM "greetings" WHERE "id" = ?"#
+            // No DISTINCT: `where id = 1` on the key bounds cardinality to ≤ 1.
+            r#"SELECT "message" FROM "greetings" WHERE "id" = ?"#
         );
         assert_eq!(m.plans[0].param_count, 1);
     }

@@ -39,6 +39,7 @@ mod tests {
                 ("id".to_string(), "id".to_string()),
                 ("message".to_string(), "message".to_string()),
             ],
+            keys: vec![vec!["id".to_string()]],
         }
     }
 
@@ -54,7 +55,8 @@ mod tests {
         let q = try_push(&expr, Dialect::SQLite).expect("relvar-rooted subtree pushes");
         assert_eq!(
             q.sql.text,
-            r#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = ?"#
+            // Full heading keeps key `id` → already a set → no DISTINCT.
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?"#
         );
         assert_eq!(q.sql.param_count, 1);
     }

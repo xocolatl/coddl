@@ -45,6 +45,11 @@ pub enum RelExpr {
         /// Attribute→column mapping in heading-canonical (sorted) order:
         /// `(attribute_name, sql_column_name)`.
         columns: Vec<(String, String)>,
+        /// The relvar's declared candidate keys — one inner `Vec` per key,
+        /// each the key's attribute-name set. Used to prove a result is
+        /// already duplicate-free so an emitted `SELECT` can drop `DISTINCT`
+        /// (see [`RelExpr::needs_distinct`]).
+        keys: Vec<Vec<String>>,
     },
     /// Restrict by a predicate (surface `where`). Heading-preserving.
     ///
@@ -117,6 +122,60 @@ impl RelExpr {
             RelExpr::Project { input, .. } => input.origin(),
         }
     }
+
+    /// The candidate keys whose attributes all survive into this expression's
+    /// heading. A surviving key guarantees row-uniqueness on the (possibly
+    /// projected) heading, so the emitted `SELECT` need not be `DISTINCT`.
+    ///
+    /// `RelvarRef` yields its declared keys; `Restrict` preserves them
+    /// (filtering a set is a set); `Project` keeps only keys whose attributes
+    /// are all retained.
+    pub fn surviving_keys(&self) -> Vec<Vec<String>> {
+        match self {
+            RelExpr::RelvarRef { keys, .. } => keys.clone(),
+            RelExpr::Restrict { input, .. } => input.surviving_keys(),
+            RelExpr::Project { input, keep } => input
+                .surviving_keys()
+                .into_iter()
+                .filter(|k| k.iter().all(|a| keep.contains(a)))
+                .collect(),
+        }
+    }
+
+    /// True when the expression provably has at most one tuple — so any
+    /// projection of it is duplicate-free regardless of which attributes
+    /// survive.
+    ///
+    /// A `Restrict` that pins every attribute of some candidate key to a
+    /// constant bounds cardinality to ≤ 1. v1 restrictions are a single
+    /// `AttrEq`, so this holds iff the pinned attribute is itself a candidate
+    /// key of the input.
+    pub fn card_le_one(&self) -> bool {
+        match self {
+            RelExpr::RelvarRef { .. } => false,
+            RelExpr::Restrict { input, pred } => {
+                input.card_le_one() || {
+                    let Predicate::AttrEq { attr, .. } = pred;
+                    input
+                        .surviving_keys()
+                        .iter()
+                        .any(|k| k.len() == 1 && &k[0] == attr)
+                }
+            }
+            RelExpr::Project { input, .. } => input.card_le_one(),
+        }
+    }
+
+    /// Whether the emitted `SELECT` must be `DISTINCT` to honor RM Pro 3.
+    ///
+    /// It need not be when the result is *provably* already a set: the input
+    /// has ≤ 1 tuple, or a candidate key survives into the heading (no two
+    /// distinct rows can collide on the kept columns). Otherwise a projection
+    /// may collapse distinct rows into duplicates and `DISTINCT` is required.
+    /// Conservative: an unknown/keyless leaf keeps `DISTINCT`.
+    pub fn needs_distinct(&self) -> bool {
+        !(self.card_le_one() || !self.surviving_keys().is_empty())
+    }
 }
 
 #[cfg(test)]
@@ -140,6 +199,7 @@ mod tests {
                 ("id".to_string(), "id".to_string()),
                 ("message".to_string(), "message".to_string()),
             ],
+            keys: vec![vec!["id".to_string()]],
         }
     }
 
@@ -195,5 +255,63 @@ mod tests {
             Heading::new(vec![("message".to_string(), Type::Text)])
         );
         assert_eq!(r.origin(), StorageOrigin::RelvarRooted);
+    }
+
+    // ── DISTINCT-elision analyses ─────────────────────────────────────
+
+    #[test]
+    fn bare_relvar_keeps_its_key_so_no_distinct() {
+        let r = greetings();
+        assert_eq!(r.surviving_keys(), vec![vec!["id".to_string()]]);
+        assert!(!r.card_le_one());
+        assert!(!r.needs_distinct(), "a full relvar read keeps its key");
+    }
+
+    #[test]
+    fn key_equality_restriction_bounds_cardinality() {
+        // Greetings where id = 1 — id is the key, so ≤ 1 tuple.
+        let r = RelExpr::Restrict {
+            input: Box::new(greetings()),
+            pred: id_eq_1(),
+        };
+        assert!(r.card_le_one());
+        assert!(!r.needs_distinct());
+    }
+
+    #[test]
+    fn projection_keeping_the_key_needs_no_distinct() {
+        let r = RelExpr::Project {
+            input: Box::new(greetings()),
+            keep: vec!["id".to_string()],
+        };
+        assert_eq!(r.surviving_keys(), vec![vec!["id".to_string()]]);
+        assert!(!r.needs_distinct());
+    }
+
+    #[test]
+    fn projection_dropping_key_unbounded_needs_distinct() {
+        // Greetings project {message} — key gone, cardinality unbounded.
+        let r = RelExpr::Project {
+            input: Box::new(greetings()),
+            keep: vec!["message".to_string()],
+        };
+        assert!(r.surviving_keys().is_empty());
+        assert!(!r.card_le_one());
+        assert!(r.needs_distinct(), "dropping the key may create duplicates");
+    }
+
+    #[test]
+    fn projection_dropping_key_but_card_bounded_needs_no_distinct() {
+        // (Greetings where id = 1) project {message} — key gone but ≤ 1 tuple.
+        let r = RelExpr::Project {
+            input: Box::new(RelExpr::Restrict {
+                input: Box::new(greetings()),
+                pred: id_eq_1(),
+            }),
+            keep: vec!["message".to_string()],
+        };
+        assert!(r.surviving_keys().is_empty());
+        assert!(r.card_le_one());
+        assert!(!r.needs_distinct());
     }
 }

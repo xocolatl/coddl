@@ -89,6 +89,10 @@ pub struct PublicRelvarBinding {
     /// app-name / col-name split lets future `.cdstore` rename clauses
     /// land without a schema change here.
     pub columns: Vec<(String, String)>,
+    /// Declared candidate keys (one inner `Vec` per key). Threaded to
+    /// `RelExpr::RelvarRef` so the SQL emitter can elide a redundant
+    /// `DISTINCT`.
+    pub keys: Vec<Vec<String>>,
 }
 
 /// One baked query plan on a `Module`. Codegen turns each entry into a

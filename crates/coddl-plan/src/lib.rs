@@ -279,6 +279,8 @@ pub fn discover_and_validate_with_overrides(
             heading: catalog.heading.clone(),
             table_name,
             columns,
+            // The catalog is the truth about the database's keys.
+            keys: catalog.keys.clone(),
             // v1 SQLite is read-only; the discrimination will land
             // when Phase 21 supports write-through view updates.
             write_policy: WritePolicy::ReadOnly,

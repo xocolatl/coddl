@@ -59,6 +59,10 @@ pub struct ResolvedPublicRelvar {
     /// Attribute-to-SQL-column mapping in heading-canonical (sorted)
     /// order. Each entry is `(heading_attr_name, sql_column_name)`.
     pub columns: Vec<(String, String)>,
+    /// The catalog relvar's declared candidate keys — one inner `Vec` per
+    /// key, each the key's attribute-name set. Carried so the SQL emitter
+    /// can prove a read is already a set and elide `DISTINCT`.
+    pub keys: Vec<Vec<String>>,
     /// What kinds of statements the runtime may issue against this
     /// relvar. v1 SQLite forces every public relvar to read-only;
     /// `WriteThrough` lights up when view-updating semantics land.

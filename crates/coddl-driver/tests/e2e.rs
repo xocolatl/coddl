@@ -756,11 +756,11 @@ fn is_audit_timestamp(ts: &str) -> bool {
 }
 
 /// The single statement the pushed-down read must lower to — the source
-/// projects to `{message}`, so the SELECT list narrows to that one column;
-/// `SELECT DISTINCT` (RM Pro 3), quoted identifiers, and the literal `1`
-/// inlined by the legacy `trace` callback.
-const EXPECTED_PUSHED_SQL: &str =
-    r#"SELECT DISTINCT "message" FROM "greetings" WHERE "id" = 1"#;
+/// projects to `{message}`, so the SELECT list narrows to that one column.
+/// No `DISTINCT`: `where id = 1` pins the key, bounding cardinality to ≤ 1, so
+/// the projection is provably duplicate-free. The literal `1` is inlined by
+/// the legacy `trace` callback.
+const EXPECTED_PUSHED_SQL: &str = r#"SELECT "message" FROM "greetings" WHERE "id" = 1"#;
 
 /// Author a self-contained relvar-rooted pushdown program — `.cd` plus its
 /// `greetings.cddb` / `greetings.cdstore` companions — into `dir`, and seed a

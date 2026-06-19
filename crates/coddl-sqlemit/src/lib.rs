@@ -2,8 +2,10 @@
 //!
 //! The traits in this crate are implemented by `coddl-backend-sqlite`
 //! and `coddl-backend-postgres`. SQL emission follows the mandatory
-//! rules table in `docs/sqlemit.md` — `SELECT DISTINCT` everywhere,
-//! never `NULL`/`NULLABLE`/`IS NULL`/outer joins, explicit `BEGIN`/`COMMIT`,
+//! rules table in `docs/sqlemit.md` — the result is always a set
+//! (`SELECT DISTINCT` unless a surviving key / cardinality bound proves it
+//! redundant; see `RelExpr::needs_distinct`), never
+//! `NULL`/`NULLABLE`/`IS NULL`/outer joins, explicit `BEGIN`/`COMMIT`,
 //! enumerate columns in deterministic order, etc.
 //!
 //! This crate is shared between the compiler and the runtime — the SQL
@@ -165,8 +167,12 @@ pub fn emit_select(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
     } else {
         select_cols.join(", ")
     };
+    // `DISTINCT` only when the result isn't provably already a set — a
+    // surviving candidate key or a cardinality-≤-1 restriction makes it
+    // redundant (RM Pro 3 is still upheld; we only drop a proven no-op).
+    let distinct = if expr.needs_distinct() { "DISTINCT " } else { "" };
     let mut text = format!(
-        "SELECT DISTINCT {select_list} FROM {}",
+        "SELECT {distinct}{select_list} FROM {}",
         quote_ident(table_name),
     );
 
@@ -313,6 +319,7 @@ mod tests {
                 ("id".to_string(), "id".to_string()),
                 ("message".to_string(), "message".to_string()),
             ],
+            keys: vec![vec!["id".to_string()]],
         }
     }
 
@@ -327,11 +334,13 @@ mod tests {
     }
 
     #[test]
-    fn restrict_emits_select_distinct_with_where() {
+    fn restrict_on_key_drops_distinct() {
+        // Full heading keeps the key `id`, so rows are already unique —
+        // `DISTINCT` is provably redundant and elided.
         let q = emit_select(&where_id_1(greetings()), Dialect::SQLite).unwrap();
         assert_eq!(
             q.sql.text,
-            r#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = ?"#
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?"#
         );
         assert_eq!(q.sql.param_count, 1);
         assert_eq!(q.params, vec![Value::Integer(1)]);
@@ -339,19 +348,18 @@ mod tests {
     }
 
     #[test]
-    fn bare_relvar_emits_select_distinct_no_where() {
+    fn bare_relvar_drops_distinct() {
+        // A full relvar read keeps its key → already a set → no `DISTINCT`.
         let q = emit_select(&greetings(), Dialect::SQLite).unwrap();
-        assert_eq!(
-            q.sql.text,
-            r#"SELECT DISTINCT "id", "message" FROM "greetings""#
-        );
+        assert_eq!(q.sql.text, r#"SELECT "id", "message" FROM "greetings""#);
         assert_eq!(q.sql.param_count, 0);
         assert!(q.params.is_empty());
     }
 
     #[test]
     fn author_projection_narrows_the_select_list() {
-        // project { message } (Greetings where id = 1) — author-written, emitted faithfully.
+        // (Greetings where id = 1) project {message}: the key filter bounds
+        // cardinality to ≤ 1, so the projection can't dup → no `DISTINCT`.
         let expr = RelExpr::Project {
             input: Box::new(where_id_1(greetings())),
             keep: vec!["message".to_string()],
@@ -359,7 +367,7 @@ mod tests {
         let q = emit_select(&expr, Dialect::SQLite).unwrap();
         assert_eq!(
             q.sql.text,
-            r#"SELECT DISTINCT "message" FROM "greetings" WHERE "id" = ?"#
+            r#"SELECT "message" FROM "greetings" WHERE "id" = ?"#
         );
         assert_eq!(
             q.result_heading,
@@ -368,20 +376,45 @@ mod tests {
     }
 
     #[test]
+    fn projection_dropping_the_key_keeps_distinct() {
+        // Greetings project {message} — no filter, key dropped, cardinality
+        // unbounded: the projection may create duplicates, so `DISTINCT` stays.
+        let expr = RelExpr::Project {
+            input: Box::new(greetings()),
+            keep: vec!["message".to_string()],
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT DISTINCT "message" FROM "greetings""#
+        );
+    }
+
+    #[test]
     fn nullary_projection_selects_the_constant_one() {
         // `(Greetings where id = 1) project {}` → empty heading. SQL has no
-        // zero-column SELECT, so emit `SELECT DISTINCT 1 …`: one row when a
-        // tuple matches (reltrue), zero rows otherwise (relfalse).
+        // zero-column SELECT, so emit the constant `1`. The key filter bounds
+        // cardinality to ≤ 1, so `DISTINCT` is elided; the row count (0/1) is
+        // marshalled as relfalse/reltrue.
         let expr = RelExpr::Project {
             input: Box::new(where_id_1(greetings())),
             keep: vec![],
         };
         let q = emit_select(&expr, Dialect::SQLite).unwrap();
-        assert_eq!(
-            q.sql.text,
-            r#"SELECT DISTINCT 1 FROM "greetings" WHERE "id" = ?"#
-        );
+        assert_eq!(q.sql.text, r#"SELECT 1 FROM "greetings" WHERE "id" = ?"#);
         assert_eq!(q.result_heading, Heading::new(vec![]));
+    }
+
+    #[test]
+    fn nullary_projection_no_filter_keeps_distinct() {
+        // Greetings project {} — unbounded, so `SELECT DISTINCT 1` collapses
+        // any matching rows to one (reltrue) / none (relfalse).
+        let expr = RelExpr::Project {
+            input: Box::new(greetings()),
+            keep: vec![],
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(q.sql.text, r#"SELECT DISTINCT 1 FROM "greetings""#);
     }
 
     #[test]
@@ -389,7 +422,7 @@ mod tests {
         let q = emit_select(&where_id_1(greetings()), Dialect::Postgres).unwrap();
         assert_eq!(
             q.sql.text,
-            r#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = $1"#
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = $1"#
         );
     }
 
