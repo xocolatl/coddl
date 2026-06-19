@@ -9,7 +9,7 @@
 //! Tests fail loudly if `clang` / `cc` is missing on PATH or if the
 //! runtime staticlib hasn't been built.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn workspace_root() -> PathBuf {
@@ -668,116 +668,35 @@ fn extract_aborts_on_multi_tuples() {
     );
 }
 
-// ── Phase 22: hello-world-db (public relvar + SQLite) ────────────────
-
-/// Build (or refresh) the `examples/hello-world-db/greetings.sqlite`
-/// fixture via the shipped seed script. The script is idempotent: it
-/// removes any existing `.sqlite` file before re-seeding. Required
-/// because the file is gitignored. Guarded against concurrent
-/// invocation so the parallel test scheduler doesn't race on the
-/// `rm -f` + `sqlite3 ...` sequence.
-fn ensure_hello_world_db_seeded() {
-    use std::sync::OnceLock;
-    static SEEDED: OnceLock<()> = OnceLock::new();
-    SEEDED.get_or_init(|| {
-        let script = workspace_root().join("examples/hello-world-db/seed-db.sh");
-        assert!(
-            script.exists(),
-            "seed script missing at {}",
-            script.display()
-        );
-        let status = Command::new("sh")
-            .arg(&script)
-            .status()
-            .expect("invoke seed-db.sh");
-        assert!(status.success(), "seed-db.sh failed");
-    });
-}
+// ── Database-backed reads (public relvar + SQLite) ───────────────────
+//
+// These tests own their source + fixtures (`write_pushdown_fixtures` /
+// `seed_greetings_fixtures`); none reads `examples/hello-world-db`, which is a
+// hand-editable playground a test must never depend on. End-to-end "a
+// DB-backed read prints its value on both backends" is covered by the
+// owned-source `relvar_pushdown_audit_{llvm,cranelift}` tests below.
 
 #[test]
-fn hello_world_db_llvm_backend_prints_message() {
+fn greetings_env_var_override_picks_alternate_path() {
+    // CODDL_GREETINGS_FILE must override the `.cdstore`'s baked `file:`
+    // default. The default fixture db says "hello world"; pointing the
+    // override at a db that says "override hello" and seeing that message
+    // proves the override flows through to the actual connection.
     ensure_runtime_built();
-    ensure_hello_world_db_seeded();
-    let cd = example_path("hello-world-db");
-    let out = coddl()
-        .args(["run", "--backend=llvm"])
-        .arg(&cd)
-        .output()
-        .expect("spawn coddl");
-    assert!(
-        out.status.success(),
-        "coddl run --backend=llvm {:?} failed: stderr=\n{}",
-        cd,
-        String::from_utf8_lossy(&out.stderr),
-    );
-    assert_eq!(out.stdout, b"hello world\n");
-}
-
-#[test]
-fn hello_world_db_cranelift_backend_prints_message() {
-    ensure_runtime_built();
-    ensure_hello_world_db_seeded();
-    let cd = example_path("hello-world-db");
-    let out = coddl()
-        .args(["run", "--backend=cranelift"])
-        .arg(&cd)
-        .output()
-        .expect("spawn coddl");
-    assert!(
-        out.status.success(),
-        "coddl run --backend=cranelift {:?} failed: stderr=\n{}",
-        cd,
-        String::from_utf8_lossy(&out.stderr),
-    );
-    assert_eq!(out.stdout, b"hello world\n");
-}
-
-#[test]
-fn hello_world_db_byte_identical_across_backends() {
-    ensure_runtime_built();
-    ensure_hello_world_db_seeded();
-    let cd = example_path("hello-world-db");
-    let llvm = coddl()
-        .args(["run", "--backend=llvm"])
-        .arg(&cd)
-        .output()
-        .expect("spawn coddl (llvm)");
-    let cl = coddl()
-        .args(["run", "--backend=cranelift"])
-        .arg(&cd)
-        .output()
-        .expect("spawn coddl (cranelift)");
-    assert!(llvm.status.success(), "llvm run failed");
-    assert!(cl.status.success(), "cranelift run failed");
-    assert_eq!(
-        llvm.stdout, cl.stdout,
-        "byte equality violated:\n  llvm={:?}\n  cranelift={:?}",
-        String::from_utf8_lossy(&llvm.stdout),
-        String::from_utf8_lossy(&cl.stdout)
-    );
-}
-
-#[test]
-fn hello_world_db_env_var_override_picks_alternate_path() {
-    ensure_runtime_built();
-    ensure_hello_world_db_seeded();
-    // Re-seed a parallel fixture with a different message; point the
-    // env override at it; assert the override path actually flows
-    // through to materialization. Same `.cd` source; different DB →
-    // different stdout.
     let tmp = tempfile::tempdir().expect("tempdir");
+    let (cd, _default_db) = write_pushdown_fixtures(tmp.path()); // default: "hello world"
+
     let alt = tmp.path().join("alt.sqlite");
-    let alt_str = alt.display().to_string();
     let status = Command::new("sh")
-        .args(["-c"])
+        .arg("-c")
         .arg(format!(
-            "sqlite3 '{alt_str}' \"CREATE TABLE greetings (id INTEGER PRIMARY KEY, message TEXT NOT NULL); INSERT INTO greetings (id, message) VALUES (1, 'override hello');\""
+            "sqlite3 '{}' \"CREATE TABLE greetings (id INTEGER PRIMARY KEY, message TEXT NOT NULL); INSERT INTO greetings (id, message) VALUES (1, 'override hello');\"",
+            alt.display()
         ))
         .status()
         .expect("invoke sqlite3");
     assert!(status.success(), "alt SQLite seed failed");
 
-    let cd = example_path("hello-world-db");
     let out = coddl()
         .env("CODDL_GREETINGS_FILE", &alt)
         .args(["run", "--backend=llvm"])
@@ -843,25 +762,83 @@ fn is_audit_timestamp(ts: &str) -> bool {
 const EXPECTED_PUSHED_SQL: &str =
     r#"SELECT DISTINCT "message" FROM "greetings" WHERE "id" = 1"#;
 
-/// Run `examples/hello-world-db` on `backend`, pointing `CODDL_AUDIT_LOG`
-/// at a fresh per-run temp file, then assert the audit log proves the
-/// pushdown path ran: the program printed `hello world`, every logged line
-/// is well-formed, **no** statement is a `FROM "greetings"` full-table scan
-/// (no `WHERE`), and **exactly one** statement is the parameterized filter —
-/// byte-for-byte `EXPECTED_PUSHED_SQL`.
+/// Author a self-contained relvar-rooted pushdown program — `.cd` plus its
+/// `greetings.cddb` / `greetings.cdstore` companions — into `dir`, and seed a
+/// SQLite db at `<dir>/greetings.sqlite`. Returns the `.cd` and db paths.
+///
+/// This test **owns its source** rather than reading `examples/hello-world-db`:
+/// the audit test asserts a *compiler property* (a relvar-rooted
+/// `where … project …` lowers to one pushed `SELECT`, no startup scan), which
+/// must not be coupled to a hand-editable example whose author may legitimately
+/// rewrite it to read in-process.
+/// Write the `greetings` database companions (`.cddb` / `.cdstore`) into `dir`
+/// and seed a SQLite db at `<dir>/greetings.sqlite` with the single
+/// `(1, 'hello world')` row. Returns the db path. The caller writes its own
+/// `.cd` (with `database greetings;`) alongside.
+fn seed_greetings_fixtures(dir: &Path) -> PathBuf {
+    std::fs::write(
+        dir.join("greetings.cddb"),
+        "database greetings;\n\
+         base relvar Greetings { id: Integer, message: Text } key { id };\n",
+    )
+    .expect("write greetings.cddb");
+    std::fs::write(
+        dir.join("greetings.cdstore"),
+        "store for greetings;\n\
+         backend sqlite { file: \"greetings.sqlite\" };\n\
+         relvar Greetings: table \"greetings\" { columns: { id: \"id\", message: \"message\" } };\n",
+    )
+    .expect("write greetings.cdstore");
+
+    let db = dir.join("greetings.sqlite");
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "sqlite3 '{}' \"CREATE TABLE greetings (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); INSERT INTO greetings (id, message) VALUES (1, 'hello world');\"",
+            db.display()
+        ))
+        .status()
+        .expect("invoke sqlite3");
+    assert!(status.success(), "greetings fixture seed failed");
+    db
+}
+
+fn write_pushdown_fixtures(dir: &Path) -> (PathBuf, PathBuf) {
+    let cd = dir.join("pushdown.cd");
+    std::fs::write(
+        &cd,
+        "program hello_world_db;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             let g = transaction [ extract (Greetings where id = 1 project {message}) ];\n\
+             write_line { message: g.message };\n\
+         ];\n",
+    )
+    .expect("write pushdown.cd");
+    let db = seed_greetings_fixtures(dir);
+    (cd, db)
+}
+
+/// Compile + run a self-owned relvar-rooted pushdown program on `backend`,
+/// pointing `CODDL_AUDIT_LOG` at a fresh per-run temp file, then assert the
+/// audit log proves the pushdown path ran: the program printed `hello world`,
+/// every logged line is well-formed, **no** statement is a `FROM "greetings"`
+/// full-table scan (no `WHERE`), and **exactly one** statement is the
+/// parameterized filter — byte-for-byte `EXPECTED_PUSHED_SQL`.
 ///
 /// A fresh log path per run is mandatory: the sink opens in append mode, so
 /// reusing a path would mix runs and a stale full-scan line would break the
 /// counts.
 fn assert_pushdown_audit(backend: &str) {
     ensure_runtime_built();
-    ensure_hello_world_db_seeded();
     let tmp = tempfile::tempdir().expect("tempdir");
+    let (cd, db) = write_pushdown_fixtures(tmp.path());
     let log = tmp.path().join("audit.log");
-    let cd = example_path("hello-world-db");
 
     let out = coddl()
         .env("CODDL_AUDIT_LOG", &log)
+        .env("CODDL_GREETINGS_FILE", &db)
         .args(["run", &format!("--backend={backend}")])
         .arg(&cd)
         .output()
@@ -922,12 +899,12 @@ fn assert_pushdown_audit(backend: &str) {
 }
 
 #[test]
-fn hello_world_db_pushdown_audit_llvm() {
+fn relvar_pushdown_audit_llvm() {
     assert_pushdown_audit("llvm");
 }
 
 #[test]
-fn hello_world_db_pushdown_audit_cranelift() {
+fn relvar_pushdown_audit_cranelift() {
     assert_pushdown_audit("cranelift");
 }
 
@@ -956,6 +933,135 @@ fn scan_classifier_catches_the_pre_pushdown_full_scan() {
     assert!(legacy.contains("greetings") && !legacy.contains("WHERE"));
     // The pushed read is classified as filtered, not a scan.
     assert!(EXPECTED_PUSHED_SQL.contains("greetings") && EXPECTED_PUSHED_SQL.contains("WHERE"));
+}
+
+// ── in-process projection (Inst::Project → coddl_relation_project) ────
+
+/// `project` over an in-memory relation literal (not relvar-rooted, so the
+/// cut declines) exercises the in-process projection path. Three rows
+/// project to `{a}` → `{a:1}` appears twice and collapses, so the sealed
+/// output is `{a: 1}` then `{a: 2}`.
+const PROJECT_INPROCESS_SRC: &str = "\
+program project_inprocess;
+oper main {} [
+    let r = Relation { {a: 1, b: 10}, {a: 1, b: 20}, {a: 2, b: 30} };
+    let p = r project {a};
+    write_relation { rel: p };
+];
+";
+
+fn run_project_inprocess(backend: &str) -> Vec<u8> {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("project-inprocess.cd");
+    std::fs::write(&src, PROJECT_INPROCESS_SRC).expect("write src");
+    let out = coddl()
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&src)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "in-process project on {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+#[test]
+fn project_inprocess_llvm_narrows_and_dedups() {
+    assert_eq!(run_project_inprocess("llvm"), b"{a: 1}\n{a: 2}\n");
+}
+
+#[test]
+fn project_inprocess_cranelift_narrows_and_dedups() {
+    assert_eq!(run_project_inprocess("cranelift"), b"{a: 1}\n{a: 2}\n");
+}
+
+#[test]
+fn project_inprocess_byte_identical_across_backends() {
+    assert_eq!(
+        run_project_inprocess("llvm"),
+        run_project_inprocess("cranelift"),
+    );
+}
+
+/// `project {}` collapses a multi-row relation to one empty tuple
+/// (`reltrue`), not N — a set, per RM Pro 3.
+const PROJECT_NULLARY_SRC: &str = "\
+program project_nullary;
+oper main {} [
+    let r = Relation { {a: 1}, {a: 2} };
+    let p = r project {};
+    write_relation { rel: p };
+];
+";
+
+fn run_project_nullary(backend: &str) -> Vec<u8> {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("project-nullary.cd");
+    std::fs::write(&src, PROJECT_NULLARY_SRC).expect("write src");
+    let out = coddl()
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&src)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "nullary project on {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+#[test]
+fn project_nullary_collapses_to_single_empty_tuple() {
+    assert_eq!(run_project_nullary("llvm"), b"{}\n");
+    assert_eq!(run_project_nullary("cranelift"), b"{}\n");
+}
+
+/// Pushed nullary projection: `Greetings where id = <n> project {}` lowers to
+/// `SELECT DISTINCT 1 … WHERE "id" = ?`, which the runtime marshals against the
+/// empty descriptor as `reltrue` (one `{}` row when the tuple exists) or
+/// `relfalse` (no rows when it doesn't).
+fn run_pushed_nullary(backend: &str, where_id: i64) -> Vec<u8> {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = seed_greetings_fixtures(tmp.path());
+    let cd = tmp.path().join("np.cd");
+    std::fs::write(
+        &cd,
+        format!(
+            "program np;\n\
+             database greetings;\n\
+             public relvar Greetings {{ id: Integer, message: Text }} key {{ id }};\n\
+             oper main {{}} [ let g = transaction [ Greetings where id = {where_id} project {{}} ]; write_relation {{ rel: g }}; ];\n"
+        ),
+    )
+    .expect("write np.cd");
+    let out = coddl()
+        .env("CODDL_GREETINGS_FILE", &db)
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "pushed nullary on {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+#[test]
+fn pushed_nullary_projection_is_reltrue_or_relfalse() {
+    for backend in ["llvm", "cranelift"] {
+        // id = 1 is present → reltrue (one empty tuple).
+        assert_eq!(run_pushed_nullary(backend, 1), b"{}\n", "reltrue on {backend}");
+        // id = 999 is absent → relfalse (zero tuples, no output).
+        assert_eq!(run_pushed_nullary(backend, 999), b"", "relfalse on {backend}");
+    }
 }
 
 #[test]

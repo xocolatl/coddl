@@ -285,6 +285,109 @@ pub unsafe extern "C" fn coddl_relation_where(
     out
 }
 
+/// Byte width of one cell of the given [`CoddlAttrKind`]. Mirrors the
+/// record-layout table in the module header: scalar cells are 8 bytes,
+/// `Text` is a 16-byte `(ptr, len)` pair.
+fn cell_width(kind: u32) -> usize {
+    if kind == CoddlAttrKind::Text as u32 {
+        16
+    } else {
+        // Integer, Boolean, and any future 8-byte scalar.
+        8
+    }
+}
+
+/// Project a relation onto a subset of its attributes. Returns a fresh
+/// RC-managed relation (rc=1) whose heading is `dst_desc` — the kept
+/// attributes — with each record's cells copied from the source by
+/// attribute name. `src` is left unchanged.
+///
+/// Projection can collapse distinct source rows (those that agreed on
+/// the kept attributes but differed on a dropped one) into duplicates,
+/// so the output is **sealed** (sort + adjacent-dedup) before return to
+/// uphold RM Pro 3. The output is allocated worst-case (`count` rows)
+/// and trimmed by the seal.
+///
+/// `dst_desc` must list a subset of `src_desc`'s attribute names; the
+/// runtime resolves each destination attribute to its source offset by
+/// name (both descriptors are emitted by codegen). Cells are copied by
+/// value — `Text` cells carry the same `(ptr, len)` as the source, which
+/// points at the same immortal string data (no ownership transfer).
+///
+/// # Safety
+/// `src` must point to a payload returned by `coddl_rc_alloc` whose kind
+/// is `Relation` and whose header carries the same descriptor as
+/// `src_desc`. Both descriptors must outlive this call (read-only data
+/// symbols the codegen emitted).
+#[no_mangle]
+pub unsafe extern "C" fn coddl_relation_project(
+    src: *const u8,
+    src_desc: *const CoddlHeadingDesc,
+    dst_desc: *const CoddlHeadingDesc,
+) -> *mut u8 {
+    if src.is_null() || src_desc.is_null() || dst_desc.is_null() {
+        return std::ptr::null_mut();
+    }
+    let header = src.sub(HEADER_SIZE) as *const CoddlRcHeader;
+    let count = (*header).length as usize;
+    let src_record_size = (*src_desc).record_size as usize;
+    let dst_record_size = (*dst_desc).record_size as usize;
+
+    let src_attrs = std::slice::from_raw_parts((*src_desc).attrs, (*src_desc).attr_count as usize);
+    let dst_attrs = std::slice::from_raw_parts((*dst_desc).attrs, (*dst_desc).attr_count as usize);
+
+    // Resolve each destination attribute to its source offset once, by
+    // name: `(src_offset, dst_offset, width)`.
+    let mut moves: Vec<(usize, usize, usize)> = Vec::with_capacity(dst_attrs.len());
+    for d in dst_attrs {
+        let dname = std::slice::from_raw_parts(d.name, d.name_len as usize);
+        let s = src_attrs.iter().find(|s| {
+            let sname = std::slice::from_raw_parts(s.name, s.name_len as usize);
+            sname == dname
+        });
+        // A well-typed projection always finds the attribute; skip
+        // defensively if a malformed descriptor pair ever doesn't.
+        if let Some(s) = s {
+            moves.push((s.offset as usize, d.offset as usize, cell_width(d.kind)));
+        }
+    }
+
+    // Allocate worst-case output; the seal trims after dedup.
+    let out = crate::rc::coddl_rc_alloc(
+        dst_record_size * count,
+        count as u32,
+        crate::rc::CoddlKind::Relation as u32,
+        dst_desc,
+    );
+    if out.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    for i in 0..count {
+        let src_rec = src.add(i * src_record_size);
+        let dst_rec = out.add(i * dst_record_size);
+        for &(src_off, dst_off, width) in &moves {
+            std::ptr::copy_nonoverlapping(src_rec.add(src_off), dst_rec.add(dst_off), width);
+        }
+    }
+
+    if dst_record_size == 0 {
+        // Nullary projection (`project {}`): every record is the empty
+        // tuple, so the result collapses to `reltrue` (one empty tuple)
+        // when the source had any rows, else `relfalse`. `coddl_relation_seal`
+        // can't dedup zero-width records (it early-returns on
+        // `record_size == 0`), so collapse explicitly to keep the result a
+        // set (RM Pro 3).
+        let out_header = out.sub(HEADER_SIZE) as *mut CoddlRcHeader;
+        (*out_header).length = u32::from(count > 0);
+    } else {
+        // Projection may have created duplicates; seal restores the
+        // set + canonical order (RM Pro 3).
+        coddl_relation_seal(out, dst_desc);
+    }
+    out
+}
+
 /// Cardinality-checked collapse from a relation to a tuple (the TTM
 /// RM Pre 10 primitive). Returns the single record's payload
 /// pointer if the relation has exactly one row; otherwise writes a
@@ -416,6 +519,137 @@ mod tests {
             assert_eq!(std::ptr::read(filtered as *const i64), 2);
 
             coddl_rc_release(filtered);
+            coddl_rc_release(src);
+        }
+    }
+
+    /// `{a, b}` source descriptor: two Integer columns, canonical order.
+    fn ab_desc() -> ([CoddlAttrDesc; 2], CoddlHeadingDesc) {
+        let attrs = [
+            CoddlAttrDesc {
+                name: b"a".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 0,
+            },
+            CoddlAttrDesc {
+                name: b"b".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 8,
+            },
+        ];
+        // `attrs.as_ptr()` would dangle once the array moves out of this
+        // fn; callers own the array and rebuild the desc from it.
+        let desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 16,
+            attrs: std::ptr::null(),
+        };
+        (attrs, desc)
+    }
+
+    #[test]
+    fn project_narrows_and_dedups() {
+        // Keep `a`, drop `b`: three rows collapse to two distinct `a`s.
+        let (src_attrs, mut src_desc) = ab_desc();
+        src_desc.attrs = src_attrs.as_ptr();
+        let dst_attrs = [CoddlAttrDesc {
+            name: b"a".as_ptr(),
+            name_len: 1,
+            kind: CoddlAttrKind::Integer as u32,
+            offset: 0,
+        }];
+        let dst_desc = CoddlHeadingDesc {
+            attr_count: 1,
+            record_size: 8,
+            attrs: dst_attrs.as_ptr(),
+        };
+        unsafe {
+            let src = coddl_rc_alloc(3 * 16, 3, CoddlKind::Relation as u32, &src_desc);
+            let put = |row: usize, a: i64, b: i64| {
+                std::ptr::write(src.add(row * 16) as *mut i64, a);
+                std::ptr::write(src.add(row * 16 + 8) as *mut i64, b);
+            };
+            put(0, 1, 10);
+            put(1, 1, 20); // same `a` as row 0 → duplicate after projection
+            put(2, 2, 30);
+
+            let out = coddl_relation_project(src, &src_desc, &dst_desc);
+            assert!(!out.is_null());
+            let header = out.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*header).length, 2, "projection should dedup {{a:1}}");
+            assert_eq!(std::ptr::read(out.add(0) as *const i64), 1);
+            assert_eq!(std::ptr::read(out.add(8) as *const i64), 2);
+
+            coddl_rc_release(out);
+            coddl_rc_release(src);
+        }
+    }
+
+    #[test]
+    fn project_resolves_offsets_by_name() {
+        // Keep `b` (the *second* source column): the kept cell must be
+        // read from `b`'s source offset (8) and written to dst offset 0.
+        let (src_attrs, mut src_desc) = ab_desc();
+        src_desc.attrs = src_attrs.as_ptr();
+        let dst_attrs = [CoddlAttrDesc {
+            name: b"b".as_ptr(),
+            name_len: 1,
+            kind: CoddlAttrKind::Integer as u32,
+            offset: 0,
+        }];
+        let dst_desc = CoddlHeadingDesc {
+            attr_count: 1,
+            record_size: 8,
+            attrs: dst_attrs.as_ptr(),
+        };
+        unsafe {
+            let src = coddl_rc_alloc(2 * 16, 2, CoddlKind::Relation as u32, &src_desc);
+            std::ptr::write(src.add(0) as *mut i64, 1);
+            std::ptr::write(src.add(8) as *mut i64, 20);
+            std::ptr::write(src.add(16) as *mut i64, 2);
+            std::ptr::write(src.add(24) as *mut i64, 10);
+
+            let out = coddl_relation_project(src, &src_desc, &dst_desc);
+            assert!(!out.is_null());
+            let header = out.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            // `b` values {20, 10} → sealed ascending {10, 20}.
+            assert_eq!((*header).length, 2);
+            assert_eq!(std::ptr::read(out.add(0) as *const i64), 10);
+            assert_eq!(std::ptr::read(out.add(8) as *const i64), 20);
+
+            coddl_rc_release(out);
+            coddl_rc_release(src);
+        }
+    }
+
+    #[test]
+    fn project_to_empty_heading_collapses_to_reltrue() {
+        // `project {}` over a multi-row relation: every row becomes the
+        // empty tuple, so the set collapses to one (`reltrue`), not N.
+        let (src_attrs, mut src_desc) = ab_desc();
+        src_desc.attrs = src_attrs.as_ptr();
+        // A zero-attribute heading still needs a valid (non-null, aligned)
+        // attrs pointer — `slice::from_raw_parts` forbids null even at len 0.
+        // The codegen emits exactly this (an empty `@.attrs.N` array).
+        let dst_attrs: [CoddlAttrDesc; 0] = [];
+        let dst_desc = CoddlHeadingDesc {
+            attr_count: 0,
+            record_size: 0,
+            attrs: dst_attrs.as_ptr(),
+        };
+        unsafe {
+            let src = coddl_rc_alloc(3 * 16, 3, CoddlKind::Relation as u32, &src_desc);
+            for (row, (a, b)) in [(1i64, 10i64), (2, 20), (3, 30)].into_iter().enumerate() {
+                std::ptr::write(src.add(row * 16) as *mut i64, a);
+                std::ptr::write(src.add(row * 16 + 8) as *mut i64, b);
+            }
+            let out = coddl_relation_project(src, &src_desc, &dst_desc);
+            assert!(!out.is_null());
+            let header = out.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*header).length, 1, "nullary projection is reltrue");
+            coddl_rc_release(out);
             coddl_rc_release(src);
         }
     }

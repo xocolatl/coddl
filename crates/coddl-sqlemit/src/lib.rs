@@ -155,9 +155,18 @@ pub fn emit_select(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
     for (attr, _ty) in heading.attrs() {
         select_cols.push(quote_ident(column_for(columns, attr)?));
     }
+    // A nullary projection (`project {}`) has an empty heading, and SQL has no
+    // zero-column SELECT. Emit the constant `1`: `SELECT DISTINCT 1 …` returns
+    // exactly one row when any tuple matches and zero rows when none do, which
+    // the runtime marshals against the empty (0-attribute) descriptor as
+    // `reltrue` / `relfalse`. The `1` column is never read.
+    let select_list = if select_cols.is_empty() {
+        "1".to_string()
+    } else {
+        select_cols.join(", ")
+    };
     let mut text = format!(
-        "SELECT DISTINCT {} FROM {}",
-        select_cols.join(", "),
+        "SELECT DISTINCT {select_list} FROM {}",
         quote_ident(table_name),
     );
 
@@ -356,6 +365,23 @@ mod tests {
             q.result_heading,
             Heading::new(vec![("message".to_string(), Type::Text)])
         );
+    }
+
+    #[test]
+    fn nullary_projection_selects_the_constant_one() {
+        // `(Greetings where id = 1) project {}` → empty heading. SQL has no
+        // zero-column SELECT, so emit `SELECT DISTINCT 1 …`: one row when a
+        // tuple matches (reltrue), zero rows otherwise (relfalse).
+        let expr = RelExpr::Project {
+            input: Box::new(where_id_1(greetings())),
+            keep: vec![],
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT DISTINCT 1 FROM "greetings" WHERE "id" = ?"#
+        );
+        assert_eq!(q.result_heading, Heading::new(vec![]));
     }
 
     #[test]

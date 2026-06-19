@@ -257,6 +257,19 @@ pub enum Inst {
         predicate_linkage: String,
         heading_id: HeadingId,
     },
+    /// Project a relation onto a subset of its attributes (surface
+    /// `project`), run in-process. Backends emit a call to
+    /// `coddl_relation_project(src, &src_descriptor, &result_descriptor)`,
+    /// which narrows each record to the kept attributes and re-seals
+    /// (RM Pro 3). `src_heading_id` is the operand's heading;
+    /// `result_heading_id` is the narrowed heading that `dst` carries as
+    /// `ProcType::Relation`. Both index the per-module heading table.
+    Project {
+        dst: ValueId,
+        src: ValueId,
+        src_heading_id: HeadingId,
+        result_heading_id: HeadingId,
+    },
     /// Collapse a single-row relation to a tuple (TTM RM Pre 10).
     /// Backends emit a call to `coddl_extract_check_cardinality(src,
     /// &descriptor)` which aborts if cardinality ≠ 1, then read each
@@ -526,6 +539,16 @@ impl fmt::Display for Inst {
                 f,
                 "{dst} = where {src} by {predicate_linkage} heading_{}",
                 heading_id.0
+            ),
+            Inst::Project {
+                dst,
+                src,
+                src_heading_id,
+                result_heading_id,
+            } => write!(
+                f,
+                "{dst} = project {src} heading_{} -> heading_{}",
+                src_heading_id.0, result_heading_id.0
             ),
             Inst::Extract {
                 dst,

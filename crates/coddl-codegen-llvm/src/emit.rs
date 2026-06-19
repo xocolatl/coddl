@@ -214,6 +214,9 @@ impl Emitter {
         // Phase 20 `where`: takes (src, desc, pred_fn) and returns
         // a fresh relation pointer (rc=1).
         writeln!(self.body, "declare ptr @coddl_relation_where(ptr, ptr, ptr)").unwrap();
+        // `project`: takes (src, src_desc, result_desc) and returns a
+        // fresh narrowed + sealed relation pointer (rc=1).
+        writeln!(self.body, "declare ptr @coddl_relation_project(ptr, ptr, ptr)").unwrap();
         // Phase 21 `extract`: takes (src, desc) and returns a record
         // pointer (the relation's payload, which IS the first record
         // when length==1). Aborts on length != 1.
@@ -677,6 +680,12 @@ impl Emitter {
                 predicate_linkage,
                 heading_id,
             } => self.lower_where_inst(*dst, src, predicate_linkage, *heading_id),
+            Inst::Project {
+                dst,
+                src,
+                src_heading_id,
+                result_heading_id,
+            } => self.lower_project_inst(*dst, src, *src_heading_id, *result_heading_id),
             Inst::Extract {
                 dst,
                 src,
@@ -1065,6 +1074,34 @@ impl Emitter {
             self.body,
             "    {name} = call ptr @coddl_relation_where(ptr {src_op}, ptr @.heading.{}, ptr @{predicate_linkage})",
             heading_id.0,
+        )
+        .unwrap();
+        self.values.insert(
+            dst,
+            ValueRepr::Scalar {
+                ty: "ptr".to_string(),
+                op: name,
+            },
+        );
+        Ok(())
+    }
+
+    /// Emit `call ptr @coddl_relation_project(src, &src_desc, &result_desc)`.
+    /// The runtime narrows each record to the kept attributes and re-seals;
+    /// `dst` carries the result (narrowed) heading.
+    fn lower_project_inst(
+        &mut self,
+        dst: ValueId,
+        src: &ValueId,
+        src_heading_id: HeadingId,
+        result_heading_id: HeadingId,
+    ) -> Result<(), LlvmEmitError> {
+        let src_op = self.scalar_op(src)?;
+        let name = format!("%v{}", dst.0);
+        writeln!(
+            self.body,
+            "    {name} = call ptr @coddl_relation_project(ptr {src_op}, ptr @.heading.{}, ptr @.heading.{})",
+            src_heading_id.0, result_heading_id.0,
         )
         .unwrap();
         self.values.insert(

@@ -307,9 +307,9 @@ each `parse_<x>` has a corresponding `check_<x>`.
   is `Type::Relation(H')` where `H'` is `H` narrowed to the kept
   attributes, canonically re-sorted — so the source order of the names is
   irrelevant. Projection is well-typed regardless of where the relation
-  came from; the **lowerer** restricts v1 to relvar-rooted (pushed)
-  operands and emits **T0029** for a `project` over an in-memory relation
-  (no in-process projection yet).
+  came from; the **lowerer** serves a relvar-rooted operand by pushing the
+  projection into SQL (a narrowed `SELECT`) and an in-memory operand with
+  the in-process `Inst::Project` → `coddl_relation_project`.
 
 
 ## Transaction-scoped public-relvar access (Phase 22)
@@ -383,4 +383,3 @@ check script enforces that.
 | T0026 | Side-effecting operator called inside `transaction [...]` |
 | T0027 | Unknown attribute name in a `project` list                |
 | T0028 | Duplicate attribute name in a `project` list              |
-| T0029 | `project` on a non-relvar relation (in-process projection not yet supported; emitted by the lowerer) |

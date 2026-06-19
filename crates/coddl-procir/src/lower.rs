@@ -685,23 +685,56 @@ impl Lowerer {
         }
     }
 
-    /// Lower a `project` whose operand the cut declined to push (i.e.
-    /// `try_lower_pushed` already returned `None` — the operand is not a
-    /// relvar-rooted subtree). Projecting an in-memory relation needs an
-    /// in-process operator that does not exist yet, so emit a clean
-    /// capability error rather than producing nonsense. The pushable case
-    /// never reaches here; it is served entirely by `Inst::Query`.
+    /// Lower a `project` whose operand the cut declined to push — i.e. an
+    /// in-memory relation (a relation literal, or a `where` over one). The
+    /// pushable case never reaches here; it is served entirely by
+    /// `Inst::Query` with a narrowed SELECT. Lower the operand, compute the
+    /// narrowed result heading, and emit `Inst::Project`.
     fn lower_project_expr(&mut self, pe: &ProjectExpr) -> ValueId {
-        self.diagnostics.push(Diagnostic::error(
-            self.node_span(pe.syntax()),
-            "T0029",
-            "`project` on a non-relvar relation is not yet supported; \
-             v1 only projects relvar-rooted reads"
-                .to_string(),
-        ));
-        let v = self.fresh_value();
-        self.record_type(v, ProcType::Unit);
-        v
+        // 1. Lower the relation operand in the enclosing scope.
+        let src = pe
+            .input()
+            .map(|e| self.lower_expr(&e))
+            .expect("typechecked project has a relation operand");
+        let src_heading_id = match self.value_type(src) {
+            ProcType::Relation(id) => id,
+            other => unreachable!("project on non-relation `{other}` survived typecheck"),
+        };
+        let src_heading = self.headings[src_heading_id.0 as usize].clone();
+
+        // 2. Narrow the heading to the kept attributes. `Heading::new`
+        //    re-canonicalizes, so the written order of `keep` is
+        //    irrelevant — matching the typechecker and RelIR.
+        let keep: Vec<String> = pe.attrs().map(|t| t.text().to_string()).collect();
+        let narrowed: Vec<(String, Type)> = src_heading
+            .attrs()
+            .iter()
+            .filter(|(name, _)| keep.iter().any(|k| k == name))
+            .cloned()
+            .collect();
+        let result_heading_id = self.intern_heading(&Heading::new(narrowed));
+
+        // 3. Emit Inst::Project.
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Relation(result_heading_id));
+        self.insts.push(Inst::Project {
+            dst,
+            src,
+            src_heading_id,
+            result_heading_id,
+        });
+
+        // 4. Release the source if no local owns it — keeps chains like
+        //    `where → project → extract` refcount-balanced without manual
+        //    let-binding (the same balancing `where` installs).
+        let src_owned = self
+            .locals
+            .iter()
+            .any(|layer| layer.values().any(|(vid, _)| *vid == src));
+        if !src_owned {
+            self.insts.push(Inst::Release { src });
+        }
+        dst
     }
 
     /// If `expr` is a relvar-rooted relational subtree the cut can push,
@@ -1771,18 +1804,37 @@ oper main {}\n\
     }
 
     #[test]
-    fn project_on_non_relvar_relation_diagnoses_t0029() {
-        // Projecting an in-memory relation literal isn't relvar-rooted, so
-        // the cut declines; v1 has no in-process projection, so this is a
-        // clean capability error (T0029) rather than a panic or garbage.
+    fn project_over_relation_literal_lowers_to_in_process_project() {
+        // A relation-literal projection isn't relvar-rooted, so the cut
+        // declines and it lowers in-process to `Inst::Project` (not a
+        // pushed query), narrowing the heading to the kept attribute.
         let src = "oper main {} [ let s = Relation { {a: 1, b: 2} } project {a}; ];";
         let out = lower(src, FileId(0));
         assert!(
-            out.diagnostics.iter().any(|d| d.code == "T0029"),
-            "expected T0029, got {:?}",
+            out.diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
             out.diagnostics
         );
-        assert!(out.module.is_none(), "errored lowering should yield no module");
+        let m = out.module.expect("module on clean lowering");
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let insts = &main.blocks[0].insts;
+        assert!(
+            !insts.iter().any(|i| matches!(i, Inst::Query { .. })),
+            "relation-literal project must not push to SQL:\n{m}"
+        );
+        let result_heading_id = insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::Project {
+                    result_heading_id, ..
+                } => Some(*result_heading_id),
+                _ => None,
+            })
+            .expect("expected an Inst::Project");
+        let h = &m.headings[result_heading_id.0 as usize];
+        assert_eq!(h.attrs().len(), 1, "projection should narrow to one attr");
+        assert!(h.lookup("a").is_some());
+        assert!(h.lookup("b").is_none(), "`b` should be projected away");
     }
 
     #[test]
