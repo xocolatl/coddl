@@ -33,6 +33,12 @@ Thumbs.db
 .idea/
 *.iml
 
+# ── Runtime artifacts ────────────────────────────────────────────────────
+# The SQL query-audit log (default path when CODDL_AUDIT_LOG is unset). Lands
+# at the repo root for `coddl run`, or in a crate dir when an e2e test runs the
+# example with default CWD. Ignore the default name everywhere.
+coddl-audit.log
+
 # ── Local scratchpad ─────────────────────────────────────────────────────
 # Anywhere we want a quick local-only workspace. Used today under
 # examples/.local for scratch .cd files.
