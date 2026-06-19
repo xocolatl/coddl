@@ -17,21 +17,19 @@
 // adapters (project / rename / virtual-relvar sources); this
 // hello-world has none, so the file isn't present.
 //
-// OPEN syntax questions:
+// Syntax notes:
 //   - Kind-before-name on relvar declarations: `public relvar X { ... }`,
 //     paralleling `base relvar` / `virtual relvar` in `.cddb` and
-//     `private relvar` for in-memory application relvars. (The
-//     existing `suppliers-and-parts.cd` uses kind-AFTER-name —
-//     `relvar S real { ... }` — which is the older shape and should
-//     migrate to this one.)
+//     `private relvar` for in-memory application relvars. This is the
+//     settled form.
 //   - `public` and `database` are the only storage-aware tokens in
 //     D source (RM Pro 6). `public` declares that a relvar is mapped;
 //     `database` names which catalog it's mapped to. Neither names a
 //     file, backend, table, or column.
 //   - Reading a relvar by bare name is a `Relation H` expression.
 //     `Greetings where id = 1` restricts; `extract` collapses a
-//     single-tuple relation to the tuple. `g.message` is the field
-//     access on the tuple.
+//     single-tuple relation to the tuple. `greeting.message` is the
+//     field access on the tuple.
 //   - v1 SQLite backend is read-only: `:=` against a SQLite-backed
 //     public relvar is a codegen-time error until view-updating
 //     semantics land.
@@ -42,19 +40,14 @@ database greetings;
 public relvar Greetings {
     id: Integer,
     message: Text,
-}
-key { id };
+} key { id };
 
-oper main {}
-[
-    let g = transaction [
-        let greetings =
-            Greetings
-            where id = 1
-            project all but {id}
-            ;
-
-        extract (greetings)
+oper main {} [
+    let greeting = transaction [
+        extract (Greetings where id = 1 project { message })
     ];
-    write_line { message: g.message };
+
+    let message = greeting.message;
+
+    write_line { message };
 ];
