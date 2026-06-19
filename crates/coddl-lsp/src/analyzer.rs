@@ -773,6 +773,63 @@ mod tests {
         );
     }
 
+    // ── project operator (frontend serves the LSP too) ──────────
+
+    #[tokio::test]
+    async fn project_type_error_surfaces_as_diagnostic() {
+        // A bad `project` attribute must surface as a snapshot
+        // diagnostic (T0027) through the same analyze path the CLI uses.
+        let analyzer = Analyzer::new();
+        let uri = url("file:///proj.cd");
+        analyzer
+            .put_document(
+                uri.clone(),
+                1,
+                "oper main {} [ let s = Relation { {a: 1} } project {nope}; ];".to_string(),
+            )
+            .await;
+        let snap = analyzer.snapshot(&uri).await.unwrap();
+        assert!(
+            snap.diagnostics.iter().any(|d| d.code == "T0027"),
+            "expected T0027, got {:?}",
+            snap.diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn project_narrows_inlay_hint_heading() {
+        // The inlay hint on a `project`ed binding reflects the narrowed
+        // heading — it flows from `coddl_types` for free, no LSP wiring.
+        let analyzer = Analyzer::new();
+        let uri = url("file:///proj.cd");
+        analyzer
+            .put_document(
+                uri.clone(),
+                1,
+                "oper main {} [ let s = Relation { {id: 1, message: \"x\"} } project {message}; ];"
+                    .to_string(),
+            )
+            .await;
+        let snap = analyzer.snapshot(&uri).await.unwrap();
+        assert!(
+            snap.diagnostics.is_empty(),
+            "expected clean typecheck, got {:?}",
+            snap.diagnostics
+        );
+        assert!(
+            snap.hints.iter().any(|h| matches!(
+                &h.ty,
+                coddl_types::Type::Relation(hd)
+                    if hd.lookup("message").is_some() && hd.lookup("id").is_none()
+            )),
+            "expected a narrowed Relation {{message}} hint, got {:?}",
+            snap.hints
+                .iter()
+                .map(|h| format!("{}", h.ty))
+                .collect::<Vec<_>>()
+        );
+    }
+
     // ── Project model tests ─────────────────────────────────────
 
     use std::fs;

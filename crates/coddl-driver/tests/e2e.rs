@@ -836,11 +836,12 @@ fn is_audit_timestamp(ts: &str) -> bool {
         && (20..23).all(digit)
 }
 
-/// The single statement the pushed-down read must lower to — full heading
-/// (the source has no `project`), `SELECT DISTINCT` (RM Pro 3), quoted
-/// identifiers, and the literal `1` inlined by the legacy `trace` callback.
+/// The single statement the pushed-down read must lower to — the source
+/// projects to `{message}`, so the SELECT list narrows to that one column;
+/// `SELECT DISTINCT` (RM Pro 3), quoted identifiers, and the literal `1`
+/// inlined by the legacy `trace` callback.
 const EXPECTED_PUSHED_SQL: &str =
-    r#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = 1"#;
+    r#"SELECT DISTINCT "message" FROM "greetings" WHERE "id" = 1"#;
 
 /// Run `examples/hello-world-db` on `backend`, pointing `CODDL_AUDIT_LOG`
 /// at a fresh per-run temp file, then assert the audit log proves the

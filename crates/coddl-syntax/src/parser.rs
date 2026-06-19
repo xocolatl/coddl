@@ -566,12 +566,30 @@ impl<'a> Parser<'a> {
             }
         }
 
-        // Infix loop. Peek the next operator; if its precedence is
-        // below `min_prec`, return and let the caller handle it.
-        // Otherwise wrap the lhs in a BINARY_EXPR, bump the operator
-        // token (or keyword IDENT), and recurse for the rhs at
-        // `prec + 1` (left-associative).
-        while let Some(prec) = self.peek_infix_prec() {
+        // Pipeline loop. Each turn applies whichever relational/operator
+        // form sits at the cursor at this precedence:
+        //
+        //   - `project { … }` — a postfix operator at pipeline precedence
+        //     (the same altitude as `where`). It is gated to the top level
+        //     (`min_prec == 0`) so it binds to the whole pipeline, never to
+        //     a higher-precedence operand such as a `where` predicate.
+        //     Left-associative, and interleaves with `where` in either
+        //     order: `R where p project {a}` and `R project {a} where p`
+        //     both nest left.
+        //   - an infix operator — wrap the lhs in a BINARY_EXPR, bump the
+        //     operator token (or keyword IDENT), and recurse for the rhs at
+        //     `prec + 1` (left-associative). If its precedence is below
+        //     `min_prec`, return and let the caller handle it.
+        loop {
+            if min_prec == 0 && self.at_keyword("project") {
+                self.start_node_at(cp, SyntaxKind::PROJECT_EXPR);
+                self.parse_project_suffix();
+                self.finish_node();
+                continue;
+            }
+            let Some(prec) = self.peek_infix_prec() else {
+                break;
+            };
             if prec < min_prec {
                 break;
             }
@@ -916,22 +934,57 @@ impl<'a> Parser<'a> {
         self.bump_trivia();
         self.start_node(SyntaxKind::KEY_CLAUSE);
         self.bump(); // `key`
+        self.parse_ident_brace_list(
+            ("P0022", "expected `{` to start key clause"),
+            ("P0023", "expected key attribute name"),
+            ("P0024", "expected `}` to close key clause"),
+        );
+        self.finish_node();
+    }
 
+    /// `project { a, b, … }` — relational projection suffix. The enclosing
+    /// `PROJECT_EXPR` node (which wraps the relation operand) is opened by
+    /// the caller in the pipeline loop, so this only consumes the
+    /// `project` keyword and its attribute list.
+    ///
+    /// Diagnostics: P0036 (no `{`), P0037 (no attribute name), P0038
+    /// (no `}`).
+    pub(crate) fn parse_project_suffix(&mut self) {
+        debug_assert!(self.at_keyword("project"));
+        self.bump_trivia();
+        self.bump(); // `project`
+        self.parse_ident_brace_list(
+            ("P0036", "expected `{` to start project list"),
+            ("P0037", "expected project attribute name"),
+            ("P0038", "expected `}` to close project list"),
+        );
+    }
+
+    /// Parse a bare-identifier brace list `{ a, b, … }` (trailing comma
+    /// permitted) into the current node. Shared by `key { … }` clauses and
+    /// `project { … }` suffixes — structurally identical productions that
+    /// differ only in which diagnostic codes/messages they report, passed
+    /// as `(code, message)` pairs for the missing-`{`, missing-name, and
+    /// missing-`}` cases.
+    fn parse_ident_brace_list(
+        &mut self,
+        open: (&'static str, &'static str),
+        ident: (&'static str, &'static str),
+        close: (&'static str, &'static str),
+    ) {
         if !self.eat(SyntaxKind::L_BRACE) {
-            self.error("P0022", "expected `{` to start key clause");
-            self.finish_node();
+            self.error(open.0, open.1);
             return;
         }
 
         if self.eat(SyntaxKind::R_BRACE) {
-            self.finish_node();
             return;
         }
 
         loop {
             self.bump_trivia();
             if !self.eat(SyntaxKind::IDENT) {
-                self.error("P0023", "expected key attribute name");
+                self.error(ident.0, ident.1);
                 break;
             }
             if !self.eat(SyntaxKind::COMMA) {
@@ -944,10 +997,8 @@ impl<'a> Parser<'a> {
         }
 
         if !self.eat(SyntaxKind::R_BRACE) {
-            self.error("P0024", "expected `}` to close key clause");
+            self.error(close.0, close.1);
         }
-
-        self.finish_node();
     }
 }
 
@@ -2009,6 +2060,142 @@ mod tests {
             "expected P0014, got {:?}",
             out.diagnostics
         );
+    }
+
+    // ── project ──────────────────────────────────────────────────────
+
+    #[test]
+    fn project_parses_as_project_expr() {
+        let out = parse_str("oper f {} [ let s = R project {a}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let pe = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::PROJECT_EXPR)
+            .expect("PROJECT_EXPR in tree");
+        // Operand is the NAME_REF for `R`; `a` is a bare attribute token.
+        let operand = pe
+            .children()
+            .find(|n| n.kind() == SyntaxKind::NAME_REF)
+            .expect("operand NAME_REF");
+        assert_eq!(operand.text(), "R");
+        assert!(pe.text().to_string().contains("project"));
+    }
+
+    #[test]
+    fn project_binds_looser_than_where() {
+        // `R where a = 1 project {b}` => PROJECT_EXPR(WHERE(R, a = 1), {b}).
+        let out = parse_str("oper f {} [ let s = R where a = 1 project {b}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        // The outermost expression node is the projection.
+        let pe = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::PROJECT_EXPR)
+            .expect("PROJECT_EXPR in tree");
+        // Its operand is the whole `where` comparison.
+        let inner = pe
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("operand BINARY_EXPR (the where)");
+        assert!(
+            inner.text().to_string().contains(" where "),
+            "expected `where` inside the projection's operand: {}",
+            inner.text()
+        );
+    }
+
+    #[test]
+    fn project_then_where_nests_left() {
+        // The reverse order also parses: `R project {a} where b = 1`
+        // => WHERE(PROJECT(R, {a}), b = 1). Projection is the where's lhs.
+        let out = parse_str("oper f {} [ let s = R project {a} where b = 1; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let let_stmt = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::LET_STMT)
+            .unwrap();
+        let outer = let_stmt
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("outer BINARY_EXPR (the where)");
+        assert!(outer.text().to_string().contains(" where "));
+        assert!(
+            outer
+                .children()
+                .any(|n| n.kind() == SyntaxKind::PROJECT_EXPR),
+            "expected the where's lhs to be a PROJECT_EXPR: {}",
+            outer.text()
+        );
+    }
+
+    #[test]
+    fn project_chains_left_associative() {
+        // `R project {a} project {b}` => PROJECT(PROJECT(R, {a}), {b}).
+        let out = parse_str("oper f {} [ let s = R project {a} project {b}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let outer = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::PROJECT_EXPR)
+            .expect("outer PROJECT_EXPR");
+        assert!(
+            outer
+                .children()
+                .any(|n| n.kind() == SyntaxKind::PROJECT_EXPR),
+            "expected a nested PROJECT_EXPR operand: {}",
+            outer.text()
+        );
+    }
+
+    #[test]
+    fn project_empty_braces_parse_clean() {
+        // Projecting onto the empty heading is syntactically valid.
+        let out = parse_str("oper f {} [ let s = R project {}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert!(out
+            .tree
+            .descendants()
+            .any(|n| n.kind() == SyntaxKind::PROJECT_EXPR));
+    }
+
+    #[test]
+    fn project_missing_open_brace_diagnoses_p0036() {
+        let out = parse_str("oper f {} [ let s = R project a; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0036"),
+            "expected P0036, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn project_non_ident_attr_diagnoses_p0037() {
+        let out = parse_str("oper f {} [ let s = R project { 1 }; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0037"),
+            "expected P0037, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn project_missing_close_brace_diagnoses_p0038() {
+        let out = parse_str("oper f {} [ let s = R project { a ; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0038"),
+            "expected P0038, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn project_is_contextual_not_reserved() {
+        // `project` remains a valid identifier elsewhere (no reserved
+        // words): usable as a local name and as an attribute name.
+        let out = parse_str("oper f {} [ let project = 1; let s = R where project = 2; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }
 
     fn find_first(root: &crate::cst::SyntaxNode, kind: SyntaxKind) -> crate::cst::SyntaxNode {

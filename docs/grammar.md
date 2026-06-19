@@ -4,7 +4,7 @@ The authoritative spec for Coddl's surface syntax — the precise form of the la
 
 This doc has two parts: **rationale** (the design decisions — why prefix-named-args, why no reserved words, why brackets-vs-braces, etc.) and the **productions** (the EBNF the parser implements, lexical and syntactic).
 
-**Last sync:** `1830ac1`. Every commit that adds, removes, or changes a production, token, or diagnostic code updates this file in the same commit; `tools/check-grammar.sh` enforces it from the hygiene gate.
+**Last sync:** `dfe24a6`. Every commit that adds, removes, or changes a production, token, or diagnostic code updates this file in the same commit; `tools/check-grammar.sh` enforces it from the hygiene gate.
 
 ---
 
@@ -47,6 +47,8 @@ Reason: the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-
 
 - **Scope injection.** Identifiers in the predicate resolve against the left operand's heading first, the enclosing scope second. `SP where s# = supplier` reads as: `s#` is the `SP` attribute; `supplier` is a parameter from the enclosing `oper`. The parser and typechecker inject the left operand's heading into the predicate's name-resolution scope automatically. This is the first construct with a non-uniform scoping rule; every later construct that takes a predicate (`extend`, `summarize`'s aggregate expressions, possrep constraints) reuses the same machinery.
 - **Precedence.** `where` binds looser than `=`, `<`, `+`, `and`, `or` — the predicate is expected to be a full scalar expression. `R where x = 1 and y > 0` parses as `R where ((x = 1) and (y > 0))` without parentheses. Practically `where` sits at the bottom of the infix precedence ladder, alongside `union`/`minus`. Full precedence table lands when the parser does — exact order is deferred until then.
+
+**`project` (projection) is a *postfix* operator, not infix.** `R project { a, b }` narrows the relation's heading to the named attributes — the right operand is a brace-list of bare attribute names (structurally identical to a `key { … }` clause), not another expression, so it doesn't fit the infix `<lhs> op <rhs>` shape. It is parsed as a postfix suffix at *pipeline precedence* — the same altitude as `where`, and gated to the top level so it binds to the whole pipeline rather than to a higher-precedence operand such as a `where` predicate. `R where p project { a }` reads as `(R where p) project { a }`; the reverse order `R project { a } where p` also parses, nesting left. It is the first postfix relational operator; later ones (`rename`, `extend`, `summarize`) can reuse the same pipeline slot. `project` remains a contextual keyword — a valid identifier everywhere else (no reserved words).
 
 ### Parenthesized positional for monadic operators
 
@@ -386,7 +388,11 @@ function that implements it.
 <param>         ::= <identifier> ':' <type-ref> ;              -- parse_param
 <type-ref>      ::= <identifier> ;                             -- parse_type_ref
 
-<key-clause>    ::= 'key' '{' [ <identifier> commalist ] '}' ; -- parse_key_clause
+<key-clause>    ::= 'key' <ident-brace-list> ;                 -- parse_key_clause
+<ident-brace-list> ::= '{' [ <identifier> commalist ] '}' ;    -- parse_ident_brace_list
+                    -- Shared bare-identifier brace list (trailing
+                    -- comma OK); used by <key-clause> and
+                    -- <project-suffix>.
                     -- Candidate-key clause on a relvar declaration.
                     -- Shared between `.cd` application relvars
                     -- (`public` / `private`) and `.cddb` database
@@ -406,12 +412,15 @@ function that implements it.
                     '=' <expr> ';' ;                           -- parse_let_stmt
 
 <expr>          ::= <expr-prec> ;                            -- parse_expr
-<expr-prec>     ::= <primary-expr> { <postfix> } { <infix-op> <expr-prec> } ;
+<expr-prec>     ::= <primary-expr> { <postfix> }
+                    { <infix-op> <expr-prec> | <project-suffix> } ;
                                                                -- parse_expr_prec
                     -- Pratt precedence ladder; left-associative.
                     -- min_prec drives which operators may be
                     -- consumed; the parser recurses with `prec + 1`
-                    -- for each rhs.
+                    -- for each rhs. <project-suffix> is consumed only
+                    -- at pipeline level (min_prec 0), interleaved with
+                    -- infix ops, so it binds to the whole pipeline.
 <infix-op>      ::= 'where'                                    -- prec 0
                   | 'or'                                       -- prec 1
                   | 'and'                                      -- prec 2
@@ -443,6 +452,12 @@ function that implements it.
                     -- Transparent grouping; AST view unwraps to
                     -- the inner expression so the typechecker /
                     -- lowerer never see the wrapper.
+<project-suffix> ::= 'project' <ident-brace-list> ;            -- parse_project_suffix
+                    -- Relational projection. Postfix at pipeline
+                    -- precedence; wraps the operand in PROJECT_EXPR.
+                    -- Left-associative, and interleaves with `where`
+                    -- in either order. See the projection rationale
+                    -- above.
 <transaction-expr> ::= 'transaction' <block> ;                 -- parse_transaction_expr
 <name-ref>      ::= <identifier> ;
 <arg-list>      ::= '{' [ <named-arg> commalist ] '}' ;        -- parse_arg_list
@@ -544,6 +559,9 @@ enforces that.
 | P0032 | Expected `{` to start a tuple in a relation literal     |
 | P0033 | Expected `}` to close relation literal                  |
 | P0035 | Expected `)` to close parenthesized expression          |
+| P0036 | Expected `{` to start project list                      |
+| P0037 | Expected project attribute name                         |
+| P0038 | Expected `}` to close project list                      |
 
 Note: missing-type-after-`:` (let annotation) and missing-type-
 after-`->` (operator return clause) both surface as `P0011`

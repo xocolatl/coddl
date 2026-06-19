@@ -13,8 +13,8 @@ use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{
     AstNode, BinaryExpr, BinaryOp, Block, CallExpr, Expr, ExprStmt, FieldAccess,
     Heading as AstHeading, Item, KeyClause, LetStmt, NamedArg, OperDecl, PrivateRelvarDecl,
-    ProgramDecl, PublicRelvarDecl, RelationLit, Root, Stmt, TransactionExpr, TupleLit, UnaryExpr,
-    UnaryOp,
+    ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, Root, Stmt, TransactionExpr, TupleLit,
+    UnaryExpr, UnaryOp,
 };
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
@@ -698,7 +698,62 @@ impl TypeChecker {
             Expr::BoolLit(_) => Type::Boolean,
             Expr::Binary(b) => self.check_binary_expr(b, scope),
             Expr::Unary(u) => self.check_unary_expr(u, scope),
+            Expr::Project(p) => self.check_project_expr(p, scope),
         }
+    }
+
+    /// Walk `R project { a, … }` — relational projection. The operand must
+    /// be `Relation H` (T0023 otherwise, shared with `where`). Each named
+    /// attribute must exist in `H` (T0027) and appear at most once (T0028).
+    /// The result is `Relation H'` where `H'` is `H` narrowed to the kept
+    /// attributes, canonically re-sorted by `Heading::new` — so the order
+    /// the names are written is irrelevant.
+    fn check_project_expr(&mut self, pe: &ProjectExpr, scope: &mut Scope) -> Type {
+        let input_ty = match pe.input() {
+            Some(e) => self.check_expr(&e, scope),
+            None => return Type::Unknown,
+        };
+        let heading = match &input_ty {
+            Type::Relation(h) => h.clone(),
+            Type::Unknown => return Type::Unknown,
+            other => {
+                let span = pe
+                    .input()
+                    .map(|e| self.node_span(e.syntax()))
+                    .unwrap_or_else(|| self.node_span(pe.syntax()));
+                self.error(
+                    span,
+                    "T0023",
+                    format!("`project` expects a Relation on the left, got {other}"),
+                );
+                return Type::Unknown;
+            }
+        };
+        // Validate each projected name; collect the narrowed attributes.
+        // Unknown/duplicate names are reported and dropped (best-effort
+        // recovery), so the result heading is the valid subset.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut kept: Vec<(String, Type)> = Vec::new();
+        for tok in pe.attrs() {
+            let name = tok.text();
+            if !seen.insert(name.to_string()) {
+                self.error(
+                    self.token_span(&tok),
+                    "T0028",
+                    format!("duplicate attribute `{name}` in project list"),
+                );
+                continue;
+            }
+            match heading.lookup(name) {
+                Some(ty) => kept.push((name.to_string(), ty.clone())),
+                None => self.error(
+                    self.token_span(&tok),
+                    "T0027",
+                    format!("unknown attribute `{name}` in project of {heading}"),
+                ),
+            }
+        }
+        Type::Relation(Heading::new(kept))
     }
 
     /// Walk a unary prefix expression. Dispatches on `UnaryOp`.
@@ -1807,6 +1862,66 @@ mod tests {
     fn and_or_on_non_boolean_diagnoses_t0021() {
         let src = "oper main {} [ let b = 1 and 2; ];";
         assert!(codes(src).contains(&"T0021"));
+    }
+
+    // ── project ──────────────────────────────────────────────────────
+
+    #[test]
+    fn project_on_relation_checks_clean() {
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1, b: 2} }; \
+                   let s = r project {a}; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn project_unknown_attr_diagnoses_t0027() {
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1} }; \
+                   let s = r project {nope}; \
+                   ];";
+        assert!(codes(src).contains(&"T0027"));
+    }
+
+    #[test]
+    fn project_duplicate_attr_diagnoses_t0028() {
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1} }; \
+                   let s = r project {a, a}; \
+                   ];";
+        assert!(codes(src).contains(&"T0028"));
+    }
+
+    #[test]
+    fn project_non_relation_lhs_diagnoses_t0023() {
+        let src = "oper main {} [ let s = 1 project {a}; ];";
+        assert!(codes(src).contains(&"T0023"));
+    }
+
+    #[test]
+    fn project_narrows_heading_drops_unprojected_attr() {
+        // After `project {a}` the heading is `{a}`; `extract` gives
+        // `Tuple {a}`, so accessing the projected-away `b` is an unknown
+        // field (T0017) — proof the heading was actually narrowed.
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1, b: 2} }; \
+                   let t = extract (r project {a}); \
+                   let x = t.b; \
+                   ];";
+        assert!(codes(src).contains(&"T0017"));
+    }
+
+    #[test]
+    fn project_keeps_projected_attr_accessible() {
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1, b: 2} }; \
+                   let t = extract (r project {a}); \
+                   let x = t.a; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
     }
 
     // ── extract (Phase 21) ───────────────────────────────────────────

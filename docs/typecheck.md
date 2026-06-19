@@ -300,6 +300,16 @@ each `parse_<x>` has a corresponding `check_<x>`.
   Phase 21 ships `Extract` only. The operand must be
   `Type::Relation(H)`; the result is `Type::Tuple(H)`. T0024 on
   a non-relation operand. Other unary ops slot in here.
+- **`check_project_expr`** — `R project { a, … }`. The operand must be
+  `Type::Relation(H)` (T0023, shared with `where`). Each projected
+  attribute must exist in `H` (T0027) and appear at most once (T0028);
+  offenders are reported and dropped (best-effort recovery). The result
+  is `Type::Relation(H')` where `H'` is `H` narrowed to the kept
+  attributes, canonically re-sorted — so the source order of the names is
+  irrelevant. Projection is well-typed regardless of where the relation
+  came from; the **lowerer** restricts v1 to relvar-rooted (pushed)
+  operands and emits **T0029** for a `project` over an in-memory relation
+  (no in-process projection yet).
 
 
 ## Transaction-scoped public-relvar access (Phase 22)
@@ -367,7 +377,10 @@ check script enforces that.
 | T0020 | `where` predicate must be Boolean                         |
 | T0021 | Scalar operator operand type mismatch                     |
 | T0022 | Captured identifier in `where` predicate not yet supported |
-| T0023 | `where` left operand is not a relation                    |
+| T0023 | `where` / `project` left operand is not a relation        |
 | T0024 | `extract` operand is not a relation                       |
 | T0025 | Public relvar referenced outside any `transaction [...]`  |
 | T0026 | Side-effecting operator called inside `transaction [...]` |
+| T0027 | Unknown attribute name in a `project` list                |
+| T0028 | Duplicate attribute name in a `project` list              |
+| T0029 | `project` on a non-relvar relation (in-process projection not yet supported; emitted by the lowerer) |

@@ -191,6 +191,13 @@ pub enum SyntaxKind {
     /// `columns: { <name>: "<col>", … }` block inside a relvar binding.
     COLUMNS_BLOCK,
 
+    /// `<relExpr> project { a, b, … }` — relational projection. A postfix
+    /// expression node wrapping its relation operand; the brace-list of
+    /// bare attribute names follows the `project` keyword. An expression
+    /// kind, placed at the end of the enum so existing discriminants stay
+    /// stable (per the section-end convention above).
+    PROJECT_EXPR,
+
     /// A range of source whose intended structure couldn't be
     /// recovered. The parser still wraps the tokens so the tree stays
     /// well-formed and downstream passes can keep going.
@@ -336,6 +343,7 @@ mod tests {
             SyntaxKind::RELVAR_BINDING,
             SyntaxKind::CDSTORE_FIELD,
             SyntaxKind::COLUMNS_BLOCK,
+            SyntaxKind::PROJECT_EXPR,
             SyntaxKind::PARSE_ERROR,
         ] {
             assert!(!sk.is_token(), "{sk:?} should be a node kind");

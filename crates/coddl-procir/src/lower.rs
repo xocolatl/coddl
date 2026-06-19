@@ -16,8 +16,8 @@ use coddl_diagnostics::{Diagnostic, FileId, Severity, Span};
 use coddl_plan::Plan;
 use coddl_syntax::ast::{
     AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, Expr, ExprStmt, FieldAccess, Item,
-    LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, RelationLit, Root, Stmt,
-    TransactionExpr, TupleLit, UnaryExpr, UnaryOp,
+    LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, Root,
+    Stmt, TransactionExpr, TupleLit, UnaryExpr, UnaryOp,
 };
 use coddl_syntax::SyntaxKind;
 use coddl_types::{check, Heading, Type};
@@ -680,8 +680,28 @@ impl Lowerer {
             Expr::BoolLit(b) => self.lower_bool_lit(b),
             Expr::Binary(b) => self.lower_binary_expr(b),
             Expr::Unary(u) => self.lower_unary_expr(u),
+            Expr::Project(p) => self.lower_project_expr(p),
             Expr::NameRef(n) => self.lower_name_ref(n),
         }
+    }
+
+    /// Lower a `project` whose operand the cut declined to push (i.e.
+    /// `try_lower_pushed` already returned `None` — the operand is not a
+    /// relvar-rooted subtree). Projecting an in-memory relation needs an
+    /// in-process operator that does not exist yet, so emit a clean
+    /// capability error rather than producing nonsense. The pushable case
+    /// never reaches here; it is served entirely by `Inst::Query`.
+    fn lower_project_expr(&mut self, pe: &ProjectExpr) -> ValueId {
+        self.diagnostics.push(Diagnostic::error(
+            self.node_span(pe.syntax()),
+            "T0029",
+            "`project` on a non-relvar relation is not yet supported; \
+             v1 only projects relvar-rooted reads"
+                .to_string(),
+        ));
+        let v = self.fresh_value();
+        self.record_type(v, ProcType::Unit);
+        v
     }
 
     /// If `expr` is a relvar-rooted relational subtree the cut can push,
@@ -726,6 +746,18 @@ impl Lowerer {
                 Some(RelExpr::Restrict {
                     input: Box::new(input),
                     pred,
+                })
+            }
+            Expr::Project(p) => {
+                // Projection over a pushable subtree pushes too — the cut
+                // gates on `origin()`, which `RelExpr::Project` propagates,
+                // and the emitter narrows the SELECT list from the heading.
+                // `keep` order is irrelevant (the heading re-sorts).
+                let input = self.build_rel_expr(&p.input()?)?;
+                let keep: Vec<String> = p.attrs().map(|t| t.text().to_string()).collect();
+                Some(RelExpr::Project {
+                    input: Box::new(input),
+                    keep,
                 })
             }
             _ => None,
@@ -1683,6 +1715,74 @@ oper main {}\n\
             1,
             "prologue should register exactly one plan"
         );
+    }
+
+    const HELLO_WORLD_DB_PROJECT: &str = "\
+program hello_world_db;\n\
+database greetings;\n\
+\n\
+public relvar Greetings {\n\
+    id: Integer,\n\
+    message: Text,\n\
+}\n\
+key { id };\n\
+\n\
+oper main {}\n\
+[\n\
+    let g = transaction [\n\
+        extract (Greetings where id = 1 project {message})\n\
+    ];\n\
+    write_line { message: g.message };\n\
+];\n";
+
+    #[test]
+    fn relvar_project_lowers_to_one_query_with_narrowed_sql() {
+        let m = lower_ok_with_plan(HELLO_WORLD_DB_PROJECT, &greetings_plan());
+        let main = m.functions.iter().find(|f| f.name == "main").expect("main");
+        let insts = &main.blocks[0].insts;
+
+        // The whole `Greetings where id = 1 project {message}` pushes to one
+        // query; no in-process ops survive.
+        let queries = insts
+            .iter()
+            .filter(|i| matches!(i, Inst::Query { .. }))
+            .count();
+        assert_eq!(queries, 1, "expected exactly one Inst::Query in:\n{m}");
+        assert!(
+            !insts.iter().any(|i| matches!(i, Inst::Where { .. })),
+            "where should be pushed, not in-process"
+        );
+        assert!(
+            !insts.iter().any(|i| matches!(i, Inst::RelvarRead { .. })),
+            "relvar read should be served by the query"
+        );
+        assert!(
+            !insts.iter().any(|i| matches!(i, Inst::RelvarSlotInit { .. })),
+            "startup slot init should be suppressed in:\n{m}"
+        );
+
+        // The projection narrows the SELECT list to the single attribute.
+        assert_eq!(m.plans.len(), 1);
+        assert_eq!(
+            m.plans[0].sql,
+            r#"SELECT DISTINCT "message" FROM "greetings" WHERE "id" = ?"#
+        );
+        assert_eq!(m.plans[0].param_count, 1);
+    }
+
+    #[test]
+    fn project_on_non_relvar_relation_diagnoses_t0029() {
+        // Projecting an in-memory relation literal isn't relvar-rooted, so
+        // the cut declines; v1 has no in-process projection, so this is a
+        // clean capability error (T0029) rather than a panic or garbage.
+        let src = "oper main {} [ let s = Relation { {a: 1, b: 2} } project {a}; ];";
+        let out = lower(src, FileId(0));
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "T0029"),
+            "expected T0029, got {:?}",
+            out.diagnostics
+        );
+        assert!(out.module.is_none(), "errored lowering should yield no module");
     }
 
     #[test]

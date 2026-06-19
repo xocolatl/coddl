@@ -388,6 +388,7 @@ pub enum Expr {
     BoolLit(BoolLit),
     Binary(BinaryExpr),
     Unary(UnaryExpr),
+    Project(ProjectExpr),
 }
 
 impl Expr {
@@ -403,6 +404,7 @@ impl Expr {
             SyntaxKind::BOOL_LITERAL => Expr::BoolLit(BoolLit { syntax }),
             SyntaxKind::BINARY_EXPR => Expr::Binary(BinaryExpr { syntax }),
             SyntaxKind::UNARY_EXPR => Expr::Unary(UnaryExpr { syntax }),
+            SyntaxKind::PROJECT_EXPR => Expr::Project(ProjectExpr { syntax }),
             // Parenthesized expressions are transparent — recurse to
             // the inner `Expr` so the typechecker / lowerer never see
             // the wrapper. Used purely for precedence grouping.
@@ -423,6 +425,7 @@ impl Expr {
             Expr::BoolLit(b) => b.syntax(),
             Expr::Binary(b) => b.syntax(),
             Expr::Unary(u) => u.syntax(),
+            Expr::Project(p) => p.syntax(),
         }
     }
 }
@@ -677,6 +680,29 @@ impl UnaryExpr {
             "extract" => UnaryOp::Extract,
             _ => return None,
         })
+    }
+}
+
+ast_node!(pub ProjectExpr, PROJECT_EXPR);
+
+impl ProjectExpr {
+    /// The relation operand being projected — the single `Expr` child
+    /// (the attribute names are bare tokens, not child nodes).
+    pub fn input(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// The projected attribute names in source order. Mirrors
+    /// [`KeyClause::attrs`]: the operand is a child *node* (its own IDENTs
+    /// are nested inside it), so the only direct IDENT *tokens* of the
+    /// `PROJECT_EXPR` are the `project` keyword followed by the brace-list
+    /// names — skip the first to drop the keyword.
+    pub fn attrs(&self) -> impl Iterator<Item = SyntaxToken> + '_ {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .filter(|t| t.kind() == SyntaxKind::IDENT)
+            .skip(1)
     }
 }
 
