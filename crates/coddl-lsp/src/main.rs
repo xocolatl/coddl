@@ -168,7 +168,8 @@ impl LanguageServer for CoddlLsp {
         let Some(snap) = self.analyzer.snapshot(&params.text_document.uri).await else {
             return Ok(None);
         };
-        let out = coddl_fmt::format(&snap.source, &coddl_fmt::FormatOptions::default());
+        let kind = analyzer::kind_from_uri(&params.text_document.uri);
+        let out = coddl_fmt::format(&snap.source, &coddl_fmt::FormatOptions::default(), kind);
         if out.text.as_str() == snap.source.as_ref() {
             return Ok(None);
         }

@@ -40,7 +40,7 @@ const PLAN_FILE_ID_CDSTORE: FileId = FileId(2);
 /// Derive the dialect for a document from its URI's path extension.
 /// Unrecognized extensions default to [`FileKind::Cd`] so the rest of
 /// the pipeline stays uniform.
-fn kind_from_uri(uri: &Url) -> FileKind {
+pub(crate) fn kind_from_uri(uri: &Url) -> FileKind {
     FileKind::from_path(Path::new(uri.path())).unwrap_or(FileKind::Cd)
 }
 

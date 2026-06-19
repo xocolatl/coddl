@@ -8,7 +8,10 @@
 //! `format(format(x, opts), opts) == format(x, opts)` for every valid
 //! input — verified by unit tests.
 
-use coddl_diagnostics::Diagnostic;
+mod printer;
+
+use coddl_diagnostics::{Diagnostic, FileId};
+use coddl_syntax::FileKind;
 
 /// Stable identifier for a versioned ruleset.
 ///
@@ -60,19 +63,18 @@ pub struct FormatOutput {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// Format a source buffer.
+/// Format a source buffer of the given dialect.
 ///
-/// Pure: same input + same options → same output. The buffer doesn't need
-/// to be syntactically perfect; the formatter formats what parses and
-/// preserves the rest verbatim. Pure: same input + same options
-/// always produce the same output.
-pub fn format(source: &str, _opts: &FormatOptions) -> FormatOutput {
-    // TODO: parse to CST, walk, emit canonical output. The current
-    // no-op identity lets the wiring through `coddl-driver` and
-    // `coddl-lsp` be exercised end-to-end.
+/// Pure: same input + same options + same kind → same output, and idempotent
+/// (`format(format(x))` == `format(x)`). The buffer doesn't need to parse
+/// cleanly — the formatter formats the recovered CST and returns the parse
+/// diagnostics alongside.
+pub fn format(source: &str, opts: &FormatOptions, kind: FileKind) -> FormatOutput {
+    let parsed = coddl_syntax::parse(source, FileId(0), kind);
+    let text = printer::print(&parsed.tree, opts.indent_width as usize);
     FormatOutput {
-        text: source.to_owned(),
-        diagnostics: Vec::new(),
+        text,
+        diagnostics: parsed.diagnostics,
     }
 }
 
@@ -80,19 +82,76 @@ pub fn format(source: &str, _opts: &FormatOptions) -> FormatOutput {
 mod tests {
     use super::*;
 
-    #[test]
-    fn formatter_is_idempotent_on_empty_input() {
-        let opts = FormatOptions::default();
-        let first = format("", &opts);
-        let second = format(&first.text, &opts);
-        assert_eq!(first.text, second.text);
+    fn fmt(src: &str) -> String {
+        format(src, &FormatOptions::default(), FileKind::Cd).text
     }
 
     #[test]
-    fn formatter_preserves_input_until_real_rules_land() {
-        let src = "program hello;\n\noper main {} [\n    write_line { message: \"hi\" };\n];\n";
-        let out = format(src, &FormatOptions::default());
-        assert_eq!(out.text, src);
-        assert!(out.diagnostics.is_empty());
+    fn empty_input_stays_empty() {
+        assert_eq!(fmt(""), "");
+    }
+
+    #[test]
+    fn reformats_messy_into_canonical() {
+        let src = "program p;\noper   main {}[ write_line{message:\"hi\"} ; ];\n";
+        let want = "program p;\noper main {} [\n    write_line { message: \"hi\" };\n];\n";
+        let got = fmt(src);
+        assert_eq!(got, want, "\n=== got ===\n{got}=== want ===\n{want}");
+    }
+
+    #[test]
+    fn already_canonical_is_a_fixpoint() {
+        let src = "program p;\noper main {} [\n    write_line { message: \"hi\" };\n];\n";
+        assert_eq!(fmt(src), src);
+    }
+
+    #[test]
+    fn is_idempotent() {
+        let src = "program p;\noper   main {}[ write_line{message:\"hi\"} ; ];\n";
+        let once = fmt(src);
+        assert_eq!(fmt(&once), once, "second pass changed the output");
+    }
+
+    #[test]
+    fn spacing_around_operators_colon_and_dot() {
+        let src = "program p;\noper main {} [ let x=g.message where id=1; ];\n";
+        let got = fmt(src);
+        assert!(got.contains("let x = g.message where id = 1;"), "got:\n{got}");
+        assert_eq!(fmt(&got), got);
+    }
+
+    #[test]
+    fn preserves_leading_and_trailing_comments() {
+        let src = "// header\nprogram p; // trailing\noper main {} [\n    write_line { message: \"hi\" }; // note\n];\n";
+        let got = fmt(src);
+        assert!(got.starts_with("// header\nprogram p; // trailing\n"), "got:\n{got}");
+        assert!(got.contains("write_line { message: \"hi\" }; // note"), "got:\n{got}");
+        assert_eq!(fmt(&got), got, "comments must survive idempotently");
+    }
+
+    #[test]
+    fn multiline_heading_and_block_are_preserved_and_idempotent() {
+        let src = "program p;\npublic relvar G {\n    id: Integer,\n    name: Text,\n} key { id };\noper main {} [\n    let t = transaction [\n        G where id = 1\n    ];\n];\n";
+        let got = fmt(src);
+        assert_eq!(got, src, "already-canonical multi-line input is a fixpoint:\n{got}");
+    }
+
+    #[test]
+    fn collapses_blank_line_runs_to_one() {
+        let src = "program p;\n\n\n\noper main {} [];\n";
+        let got = fmt(src);
+        assert_eq!(got, "program p;\n\noper main {} [];\n", "got:\n{got}");
+    }
+
+    #[test]
+    fn formats_other_dialects_too() {
+        // A `.cddb` catalog: spacing normalizes via the same printer.
+        let src = "database greetings;\nbase relvar Greetings {id: Integer,message: Text} key {id};\n";
+        let got = format(src, &FormatOptions::default(), FileKind::Cddb).text;
+        assert!(got.contains("{ id: Integer, message: Text }"), "got:\n{got}");
+        assert_eq!(
+            format(&got, &FormatOptions::default(), FileKind::Cddb).text,
+            got
+        );
     }
 }

@@ -1510,6 +1510,30 @@ fn diagnostics_are_not_double_reported() {
 }
 
 #[test]
+fn fmt_reformats_to_canonical_and_is_idempotent() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let messy = tmp.path().join("messy.cd");
+    std::fs::write(
+        &messy,
+        "program p;\noper   main {}[ write_line{message:\"hi\"} ; ];\n",
+    )
+    .expect("write messy.cd");
+    let out = coddl().args(["fmt"]).arg(&messy).output().expect("spawn coddl");
+    assert!(out.status.success(), "fmt failed: {:?}", out.status);
+    let formatted = String::from_utf8(out.stdout).expect("utf8");
+    assert_eq!(
+        formatted,
+        "program p;\noper main {} [\n    write_line { message: \"hi\" };\n];\n"
+    );
+
+    // Formatting the formatted output is byte-identical (idempotent).
+    let clean = tmp.path().join("clean.cd");
+    std::fs::write(&clean, &formatted).expect("write clean.cd");
+    let out2 = coddl().args(["fmt"]).arg(&clean).output().expect("spawn coddl");
+    assert_eq!(String::from_utf8(out2.stdout).expect("utf8"), formatted);
+}
+
+#[test]
 fn public_relvar_outside_transaction_diagnoses_t0025() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cd_path = tmp.path().join("bad.cd");

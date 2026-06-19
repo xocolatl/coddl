@@ -794,7 +794,7 @@ fn cmd_fmt(args: &[String]) -> ExitCode {
     }
 
     let opts = coddl_fmt::FormatOptions::default();
-    let out = coddl_fmt::format(&source, &opts);
+    let out = coddl_fmt::format(&source, &opts, kind);
     if io::stdout().write_all(out.text.as_bytes()).is_err() {
         return ExitCode::from(1);
     }

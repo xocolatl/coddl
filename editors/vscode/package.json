@@ -83,6 +83,24 @@
                     "description": "Trace LSP traffic between VSCode and coddl-lsp."
                 }
             }
+        },
+        "configurationDefaults": {
+            "[coddl]": {
+                "editor.defaultFormatter": "coddl.coddl",
+                "editor.formatOnSave": true
+            },
+            "[coddl-cddb]": {
+                "editor.defaultFormatter": "coddl.coddl",
+                "editor.formatOnSave": true
+            },
+            "[coddl-cdmap]": {
+                "editor.defaultFormatter": "coddl.coddl",
+                "editor.formatOnSave": true
+            },
+            "[coddl-cdstore]": {
+                "editor.defaultFormatter": "coddl.coddl",
+                "editor.formatOnSave": true
+            }
         }
     },
     "scripts": {
