@@ -395,4 +395,4 @@ check script enforces that.
 | T0029 | Unknown attribute name in a `rename` source               |
 | T0030 | `rename` target must be a bare attribute name             |
 | T0031 | `rename` is not a bijection (duplicate source or target collision) |
-| T0032 | *(warning)* unused `let` binding — never referenced and not `_`-prefixed |
+| T0032 | *(warning)* unused `let` binding or parameter — never referenced, not `_`-prefixed (a `self` parameter is exempt) |

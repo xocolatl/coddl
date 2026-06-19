@@ -235,16 +235,25 @@ impl TypeChecker {
     /// attributes) and parameters are excluded by origin.
     fn warn_unused(&mut self, layer: Vec<Binding>) {
         for b in layer {
-            if b.used || !matches!(b.origin, BindingOrigin::Let) {
+            if b.used || !matches!(b.origin, BindingOrigin::Let | BindingOrigin::Param) {
                 continue;
             }
-            if b.name.starts_with('_') {
+            // A leading `_` opts out. `self` is the UFCS receiver — a parameter
+            // literally named `self` is what makes an `oper` callable as
+            // `x.method { ... }`, so renaming it to `_self` would break that
+            // call syntax; it never warns even when the body ignores it.
+            if b.name.starts_with('_') || b.name == "self" {
                 continue;
             }
+            let what = if matches!(b.origin, BindingOrigin::Param) {
+                "parameter"
+            } else {
+                "binding"
+            };
             self.warn(
                 b.span,
                 "T0032",
-                format!("unused binding `{}`; prefix with `_` if intentional", b.name),
+                format!("unused {what} `{}`; prefix with `_` if intentional", b.name),
             );
         }
     }
@@ -1516,9 +1525,11 @@ mod tests {
 
     #[test]
     fn let_shadows_outer_binding() {
-        // The inner let with the same name as an outer binding should
-        // be silently allowed; the inner shadows the outer.
-        let src = "oper f { x: Integer } [ let x = \"shadowed\"; write_line{message: x}; ];";
+        // The inner `let x` shadows the outer binding (here the parameter
+        // `x`) and the later reference resolves to the inner. `let _ = x`
+        // reads the parameter so it isn't itself flagged unused.
+        let src =
+            "oper f { x: Integer } [ let _ = x; let x = \"shadowed\"; write_line{message: x}; ];";
         assert!(
             diagnostics(src).is_empty(),
             "unexpected diagnostics: {:?}",
@@ -2362,6 +2373,32 @@ mod tests {
         // is not flagged. `_s` is exempt.
         let src =
             "oper main {} [ let r = Relation { {a: 1}, {a: 2} }; let _s = r where a = 2; ];";
+        assert!(!codes(src).contains(&"T0032"));
+    }
+
+    #[test]
+    fn unused_parameter_warns_t0032() {
+        let src = "oper f { x: Integer } [];";
+        assert!(codes(src).contains(&"T0032"));
+    }
+
+    #[test]
+    fn underscore_prefixed_parameter_is_exempt() {
+        let src = "oper f { _x: Integer } [];";
+        assert!(!codes(src).contains(&"T0032"));
+    }
+
+    #[test]
+    fn used_parameter_does_not_warn() {
+        let src = "oper f { x: Text } [ write_line { message: x }; ];";
+        assert!(!codes(src).contains(&"T0032"));
+    }
+
+    #[test]
+    fn self_parameter_is_exempt_even_when_unused() {
+        // `self` is the UFCS receiver; renaming it to `_self` would break
+        // `x.method { ... }` call syntax, so it never warns even when unused.
+        let src = "oper describe { self: Text } [ write_line { message: \"a thing\" }; ];";
         assert!(!codes(src).contains(&"T0032"));
     }
 
