@@ -1483,6 +1483,33 @@ fn binding_transparency_folds_to_single_pushed_query() {
 }
 
 #[test]
+fn diagnostics_are_not_double_reported() {
+    // `coddl run` typechecks the `.cd` in both the plan pass and lowering;
+    // a diagnostic must still be printed exactly once, not twice.
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cd = tmp.path().join("dup.cd");
+    std::fs::write(
+        &cd,
+        "program dup;\noper main {} [ let greeting = 1; write_line { message: \"hi\" }; ];\n",
+    )
+    .expect("write dup.cd");
+    let out = coddl().args(["run"]).arg(&cd).output().expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "run failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"hi\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.matches("T0032").count(),
+        1,
+        "the unused-binding warning must print exactly once, got:\n{stderr}"
+    );
+}
+
+#[test]
 fn public_relvar_outside_transaction_diagnoses_t0025() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cd_path = tmp.path().join("bad.cd");

@@ -265,7 +265,7 @@ impl Analyzer {
                 &cd_path_for_blocking,
                 &overrides_for_blocking,
             );
-            build_project_snapshot(out.diagnostics, overrides_for_blocking, &cd_path_for_blocking)
+            build_project_snapshot(out.diagnostics)
         })
         .await
         .ok()?;
@@ -557,58 +557,37 @@ fn extract_database_binding_name(source: &str) -> Option<String> {
     None
 }
 
-/// Construct a `ProjectSnapshot` from the plan diagnostics: group
-/// by `FileId` and build a `LineIndex` per file from the source the
-/// plan layer saw (the override map or disk fallback).
-fn build_project_snapshot(
-    diagnostics: Vec<Diagnostic>,
-    overrides: HashMap<PathBuf, String>,
-    cd_path: &Path,
-) -> ProjectSnapshot {
+/// Construct a `ProjectSnapshot` by grouping the plan diagnostics by `FileId`.
+/// Each diagnostic is published against the per-document snapshot of the file
+/// it targets, so its `LineIndex` comes from there — no per-file index is kept
+/// here.
+fn build_project_snapshot(diagnostics: Vec<Diagnostic>) -> ProjectSnapshot {
     let mut diagnostics_by_file: HashMap<FileId, Vec<Diagnostic>> = HashMap::new();
     for d in diagnostics {
         diagnostics_by_file.entry(d.span.file).or_default().push(d);
     }
-
-    let dir = cd_path.parent();
-    let parent = dir.map(|d| d.to_path_buf());
-    let read_source = |path: &Path| -> Option<String> {
-        if let Some(s) = overrides.get(path) {
-            return Some(s.clone());
-        }
-        std::fs::read_to_string(path).ok()
-    };
-
-    let mut line_indices: HashMap<FileId, LineIndex> = HashMap::new();
-    if let Some(s) = read_source(cd_path) {
-        line_indices.insert(PLAN_FILE_ID_CD, LineIndex::new(Arc::from(s)));
-    }
-    if let Some(p) = parent.as_ref() {
-        // Match the path the plan layer constructs: dir/<db>.cddb /
-        // dir/<db>.cdstore. We don't have the db name here, but
-        // there's at most one of each in the directory we care
-        // about — read whichever paths show up in overrides + the
-        // canonical names derived from open file paths.
-        for (path, src) in &overrides {
-            if path == cd_path {
-                continue;
-            }
-            if path.parent() != Some(p) {
-                continue;
-            }
-            let fid = match path.extension().and_then(|s| s.to_str()) {
-                Some("cddb") => PLAN_FILE_ID_CDDB,
-                Some("cdstore") => PLAN_FILE_ID_CDSTORE,
-                _ => continue,
-            };
-            line_indices.insert(fid, LineIndex::new(Arc::from(src.clone())));
-        }
-    }
-
     ProjectSnapshot {
         diagnostics_by_file,
-        line_indices,
     }
+}
+
+/// The diagnostics to publish for one file: its own parse/typecheck
+/// diagnostics (`own`, from the per-document snapshot) plus the plan pass's
+/// cross-validation diagnostics for the same file (`plan_for_file`). The plan
+/// pass re-typechecks every project member, so its per-file diagnostics
+/// duplicate `own` — only its plan-level (`PL####`) diagnostics are new.
+/// Without this filter every `.cd` diagnostic would publish twice (once from
+/// the document check, once from the plan pass).
+pub fn published_diagnostics(own: &[Diagnostic], plan_for_file: &[Diagnostic]) -> Vec<Diagnostic> {
+    own.iter()
+        .cloned()
+        .chain(
+            plan_for_file
+                .iter()
+                .filter(|d| d.code.starts_with("PL"))
+                .cloned(),
+        )
+        .collect()
 }
 
 /// One open document. The URI is the `HashMap` key in `Analyzer`;
@@ -671,7 +650,6 @@ struct ProjectInner {
 /// member buffer.
 pub struct ProjectSnapshot {
     pub diagnostics_by_file: HashMap<FileId, Vec<Diagnostic>>,
-    pub line_indices: HashMap<FileId, LineIndex>,
 }
 
 #[cfg(test)]
@@ -680,6 +658,23 @@ mod tests {
 
     fn url(s: &str) -> Url {
         Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn published_diagnostics_drops_the_plan_pass_recheck() {
+        // The plan pass re-typechecks the `.cd`, so the same diagnostic appears
+        // in both the document's own set and the plan set. Only the new
+        // plan-level `PL####` diagnostic survives; the duplicated typecheck one
+        // is dropped — otherwise it would publish (and squiggle) twice.
+        let span = coddl_diagnostics::Span::default();
+        let unused = Diagnostic::warning(span, "T0032", "unused binding `x`");
+        let pl = Diagnostic::error(span, "PL0007", "heading mismatch");
+        let own = vec![unused.clone()];
+        let plan = vec![unused.clone(), pl.clone()];
+        let merged = published_diagnostics(&own, &plan);
+        assert_eq!(merged.iter().filter(|d| d.code == "T0032").count(), 1);
+        assert_eq!(merged.iter().filter(|d| d.code == "PL0007").count(), 1);
+        assert_eq!(merged.len(), 2);
     }
 
     #[tokio::test]

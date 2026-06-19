@@ -39,26 +39,29 @@ impl CoddlLsp {
         let Some(snap) = self.analyzer.snapshot(uri).await else {
             return;
         };
-        let mut diagnostics: Vec<_> = snap
-            .diagnostics
-            .iter()
-            .map(|d| lsp_convert::diagnostic(d, &snap.line_index))
-            .collect();
 
-        // Merge per-project plan diagnostics for this URI's role.
-        if let Some(project) = self.analyzer.project_for(uri).await {
-            if let Some(psnap) = self.analyzer.project_snapshot(&project.cd_path).await {
-                let fid = self.analyzer.file_id_for(&project, uri).await;
-                if let Some(fid) = fid {
-                    if let Some(plan_diags) = psnap.diagnostics_by_file.get(&fid) {
-                        let line_index = psnap.line_indices.get(&fid).unwrap_or(&snap.line_index);
-                        for d in plan_diags {
-                            diagnostics.push(lsp_convert::diagnostic(d, line_index));
-                        }
-                    }
-                }
-            }
-        }
+        // The plan pass re-typechecks every project member, so its per-file
+        // diagnostics duplicate the document's own typecheck. Gather its
+        // diagnostics for this URI's role; `published_diagnostics` keeps only
+        // the new plan-level (`PL####`) ones, so nothing reports twice. All of
+        // them are in this file's coordinates, so `snap.line_index` converts
+        // them.
+        let plan_diags = match self.analyzer.project_for(uri).await {
+            Some(project) => match self.analyzer.project_snapshot(&project.cd_path).await {
+                Some(psnap) => match self.analyzer.file_id_for(&project, uri).await {
+                    Some(fid) => psnap.diagnostics_by_file.get(&fid).cloned().unwrap_or_default(),
+                    None => Vec::new(),
+                },
+                None => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+
+        let diagnostics: Vec<_> =
+            analyzer::published_diagnostics(&snap.diagnostics, &plan_diags)
+                .iter()
+                .map(|d| lsp_convert::diagnostic(d, &snap.line_index))
+                .collect();
 
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, Some(snap.version))

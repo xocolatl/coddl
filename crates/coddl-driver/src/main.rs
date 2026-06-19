@@ -578,6 +578,12 @@ fn discover_plan_for_input(positional: &[String]) -> Option<coddl_plan::Plan> {
 /// gets per-relvar init/release wrapping. Stdin and standalone (no
 /// public relvars) inputs go through the legacy plan-less path.
 fn lower_or_bail(source: &str, cd_path: Option<&Path>) -> Option<coddl_procir::Module> {
+    // The `.cd` is typechecked in both the plan pass (`discover_and_validate`)
+    // and lowering (`lower_with_plan`), so its diagnostics surface in both.
+    // Remember the plan pass's set and, after lowering, print only the
+    // diagnostics it didn't already show — otherwise every `.cd` diagnostic
+    // (error or warning) would report twice.
+    let mut plan_diags: Vec<Diagnostic> = Vec::new();
     let plan = if let Some(path) = cd_path {
         let plan_out = coddl_plan::discover_and_validate(path);
         print_diagnostics(&plan_out.diagnostics);
@@ -588,12 +594,19 @@ fn lower_or_bail(source: &str, cd_path: Option<&Path>) -> Option<coddl_procir::M
         {
             return None;
         }
+        plan_diags = plan_out.diagnostics;
         plan_out.plan
     } else {
         None
     };
     let out = coddl_procir::lower_with_plan(source, FileId(0), plan.as_ref());
-    print_diagnostics(&out.diagnostics);
+    let fresh: Vec<Diagnostic> = out
+        .diagnostics
+        .iter()
+        .filter(|&d| !plan_diags.contains(d))
+        .cloned()
+        .collect();
+    print_diagnostics(&fresh);
     if out
         .diagnostics
         .iter()
