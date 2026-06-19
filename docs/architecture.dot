@@ -1,4 +1,7 @@
-// Coddl architecture — TARGET design (not current stub state).
+// Coddl architecture — TARGET design (not current stub state). For what is
+// actually wired today vs. still designed, see docs/relir.md "Implementation
+// status" — e.g. the optimizer, coddl-execlocal, MaterializeAtBoundary, and the
+// runtime RelIR interpreter shown here are designed, not yet built.
 //
 // Shows the full pipeline, the RelIR<->ProcIR seam, and (bold red) the path a
 // relvar-rooted relation takes when it is forced and a SQL call fires.

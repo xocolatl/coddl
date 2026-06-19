@@ -14,9 +14,10 @@
 //! backend. Which backend, and its SQL dialect, are resolved at the storage
 //! boundary — never in this IR.
 //!
-//! Today only the relvar leaf and the `Restrict` / `Project` sugar exist,
-//! with heading and storage-origin inference. The A core, the remaining
-//! sugar, and the FD/constraint sets grow in place.
+//! Today the relvar leaf plus the `Restrict`, `Project`, and `Rename` nodes
+//! exist, with heading and storage-origin inference (and leaf keys for
+//! `DISTINCT`-elision). The remaining A core, the rest of the sugar, and the
+//! FD/constraint sets grow in place.
 
 mod expr;
 

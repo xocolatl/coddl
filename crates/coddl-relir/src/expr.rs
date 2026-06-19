@@ -1,10 +1,12 @@
-//! The RelIR expression tree: a relvar-rooted leaf plus the sugar nodes
-//! needed to restrict and project it.
+//! The RelIR expression tree: a relvar-rooted leaf plus the nodes needed to
+//! restrict, project, and rename it.
 //!
 //! This is the minimal set that represents reading a public relvar, filtering
-//! it, and narrowing it to a subset of attributes. The Algebra A core (AND,
-//! OR, NOT, REMOVE, RENAME, TCLOSE) and the rest of the sugar layer grow here
-//! later; `Restrict` and `Project` are sugar that will desugar onto that core.
+//! it, narrowing it to a subset of attributes, and renaming attributes.
+//! `Restrict` (surface `where`) and `Project` are sugar that will desugar onto
+//! the Algebra A core (`Project` onto the REMOVE primitive); the `Rename` node
+//! realizes the core RENAME directly. The remaining A-core operators (AND, OR,
+//! NOT, TCLOSE) and the rest of the sugar layer grow here later.
 
 use coddl_types::{Heading, Type};
 
