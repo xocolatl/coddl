@@ -378,6 +378,27 @@ mod tests {
     }
 
     #[test]
+    fn restrict_on_text_binds_a_text_param() {
+        // `Greetings where message = "hello world"` pushes the Text literal as
+        // a bound parameter; the surviving key `id` keeps the result a set, so
+        // no `DISTINCT`.
+        let expr = RelExpr::Restrict {
+            input: Box::new(greetings()),
+            pred: Predicate::AttrEq {
+                attr: "message".to_string(),
+                value: Literal::Text("hello world".to_string()),
+            },
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id", "message" FROM "greetings" WHERE "message" = ?"#
+        );
+        assert_eq!(q.sql.param_count, 1);
+        assert_eq!(q.params, vec![Value::Text("hello world".to_string())]);
+    }
+
+    #[test]
     fn bare_relvar_drops_distinct() {
         // A full relvar read keeps its key → already a set → no `DISTINCT`.
         let q = emit_select(&greetings(), Dialect::SQLite).unwrap();

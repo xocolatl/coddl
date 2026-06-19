@@ -285,6 +285,35 @@ pub unsafe extern "C" fn coddl_relation_where(
     out
 }
 
+/// Compare two text values for byte-exact equality. Returns `1` when the two
+/// `(ptr, len)` slices are equal, `0` otherwise. This is the in-process
+/// counterpart to the SQL backend's `=` on Text: a compiled `where` predicate
+/// over a Text attribute calls this rather than an integer compare, because a
+/// Text cell is a 16-byte `(ptr, len)` pair, not an inline scalar.
+///
+/// # Safety
+/// Each `(ptr, len)` pair must describe `len` readable bytes, or have
+/// `len == 0` (in which case the pointer is never dereferenced). The bytes
+/// come from compile-time string constants or sealed relation cells, both
+/// immutable for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_text_eq(
+    a_ptr: *const u8,
+    a_len: usize,
+    b_ptr: *const u8,
+    b_len: usize,
+) -> i8 {
+    if a_len != b_len {
+        return 0;
+    }
+    if a_len == 0 {
+        return 1;
+    }
+    let a = std::slice::from_raw_parts(a_ptr, a_len);
+    let b = std::slice::from_raw_parts(b_ptr, b_len);
+    (a == b) as i8
+}
+
 /// Byte width of one cell of the given [`CoddlAttrKind`]. Mirrors the
 /// record-layout table in the module header: scalar cells are 8 bytes,
 /// `Text` is a 16-byte `(ptr, len)` pair.
@@ -509,6 +538,27 @@ pub(crate) unsafe fn drop_relation_payload(_payload: *mut u8, _header: &CoddlRcH
 mod tests {
     use super::*;
     use crate::rc::{coddl_rc_alloc, coddl_rc_release, CoddlKind};
+
+    #[test]
+    fn text_eq_compares_bytes_not_pointers() {
+        unsafe {
+            let a = b"hello world";
+            let b = b"hello world"; // distinct allocation, equal contents
+            assert_eq!(coddl_text_eq(a.as_ptr(), a.len(), b.as_ptr(), b.len()), 1);
+            let shorter = b"hello";
+            assert_eq!(
+                coddl_text_eq(a.as_ptr(), a.len(), shorter.as_ptr(), shorter.len()),
+                0
+            );
+            let same_len = b"hella world"; // same length, different byte
+            assert_eq!(
+                coddl_text_eq(a.as_ptr(), a.len(), same_len.as_ptr(), same_len.len()),
+                0
+            );
+            // Both empty: pointers are never dereferenced.
+            assert_eq!(coddl_text_eq(std::ptr::null(), 0, std::ptr::null(), 0), 1);
+        }
+    }
 
     #[test]
     fn seal_sorts_and_dedups_single_int_records() {

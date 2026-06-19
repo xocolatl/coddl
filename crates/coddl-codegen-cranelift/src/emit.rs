@@ -237,6 +237,19 @@ fn declare_runtime_rc_externs(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert("coddl_extract_check_cardinality".into(), id);
     }
+    // coddl_text_eq(a_ptr: ptr, a_len: i64, b_ptr: ptr, b_len: i64) -> i8
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I8));
+        let id = obj
+            .declare_function("coddl_text_eq", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_text_eq".into(), id);
+    }
     Ok(())
 }
 
@@ -1164,6 +1177,34 @@ fn emit_inst(
             lhs,
             rhs,
         } => {
+            // Text operands are (ptr, len) pairs, not inline scalars, so
+            // `=`/`<>` call the runtime byte comparison instead of `icmp`.
+            // (Only Eq/NotEq reach here on Text; ordering is Integer-only.)
+            if matches!(operand_type, ProcType::Text) {
+                use cranelift_codegen::ir::condcodes::IntCC;
+                let (lhs_ptr, lhs_len) = text_value(values, lhs)?;
+                let (rhs_ptr, rhs_len) = text_value(values, rhs)?;
+                let eq_id = funcs["coddl_text_eq"];
+                let eq_local = obj.declare_func_in_func(eq_id, builder.func);
+                let call = builder
+                    .ins()
+                    .call(eq_local, &[lhs_ptr, lhs_len, rhs_ptr, rhs_len]);
+                let raw = builder.inst_results(call)[0];
+                // `coddl_text_eq` returns 1 when equal: `Eq` is `raw != 0`,
+                // `NotEq` is `raw == 0`.
+                let cc = match op {
+                    ScalarOp::Eq => IntCC::NotEqual,
+                    ScalarOp::NotEq => IntCC::Equal,
+                    other => {
+                        return Err(CraneliftEmitError::UnsupportedInst(format!(
+                            "operator {other:?} not supported on Text"
+                        )))
+                    }
+                };
+                let result = builder.ins().icmp_imm(cc, raw, 0);
+                values.insert(*dst, ValueRepr::Scalar(result));
+                return Ok(());
+            }
             let lhs_v = scalar_value(values, lhs)?;
             let rhs_v = scalar_value(values, rhs)?;
             let result = match op {

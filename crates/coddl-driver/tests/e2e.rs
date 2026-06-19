@@ -1272,6 +1272,101 @@ fn rename_inprocess_after_transaction_escape() {
     }
 }
 
+// ── Text equality in `where` (pushed via param + in-process via coddl_text_eq) ──
+
+#[test]
+fn pushed_text_where_binds_a_text_param() {
+    // `Greetings where message = "hello world"` is relvar-rooted, so the Text
+    // literal pushes as a bound parameter; the audit log (SQLite's expanded
+    // SQL) shows it inlined as `'hello world'`.
+    for backend in ["llvm", "cranelift"] {
+        ensure_runtime_built();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = seed_greetings_fixtures(tmp.path());
+        let cd = tmp.path().join("tw.cd");
+        std::fs::write(
+            &cd,
+            "program tw;\n\
+             database greetings;\n\
+             public relvar Greetings { id: Integer, message: Text } key { id };\n\
+             oper main {} [ let g = transaction [ extract (Greetings where message = \"hello world\") ]; write_line { message: g.message }; ];\n",
+        )
+        .expect("write tw.cd");
+        let log = tmp.path().join("audit.log");
+        let out = coddl()
+            .env("CODDL_GREETINGS_FILE", &db)
+            .env("CODDL_AUDIT_LOG", &log)
+            .args(["run", &format!("--backend={backend}")])
+            .arg(&cd)
+            .output()
+            .expect("spawn coddl");
+        assert!(
+            out.status.success(),
+            "pushed text where on {backend} failed: stderr=\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"hello world\n", "on {backend}");
+        let log_txt = std::fs::read_to_string(&log).expect("read audit log");
+        assert!(
+            log_txt.contains(r#"WHERE "message" = 'hello world'"#),
+            "expected the text restriction pushed on {backend}, got:\n{log_txt}"
+        );
+    }
+}
+
+/// In-process Text `where` over an in-memory relation literal (not relvar-
+/// rooted, so the cut declines) routes the comparison through the runtime's
+/// `coddl_text_eq` byte compare. Output is sealed in `{n, name}` order.
+const TEXT_WHERE_EQ_SRC: &str = "\
+program text_where_eq;
+oper main {} [
+    let r = Relation { {name: \"alice\", n: 1}, {name: \"bob\", n: 2} };
+    let s = r where name = \"bob\";
+    write_relation { rel: s };
+];
+";
+
+const TEXT_WHERE_NEQ_SRC: &str = "\
+program text_where_neq;
+oper main {} [
+    let r = Relation { {name: \"alice\", n: 1}, {name: \"bob\", n: 2} };
+    let s = r where name <> \"bob\";
+    write_relation { rel: s };
+];
+";
+
+fn run_text_where_inprocess(src: &str, backend: &str) -> Vec<u8> {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("text-where.cd");
+    std::fs::write(&path, src).expect("write src");
+    let out = coddl()
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&path)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "in-process text where on {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+#[test]
+fn text_where_inprocess_eq_byte_identical() {
+    let llvm = run_text_where_inprocess(TEXT_WHERE_EQ_SRC, "llvm");
+    assert_eq!(llvm, b"{n: 2, name: \"bob\"}\n");
+    assert_eq!(llvm, run_text_where_inprocess(TEXT_WHERE_EQ_SRC, "cranelift"));
+}
+
+#[test]
+fn text_where_inprocess_neq_byte_identical() {
+    let llvm = run_text_where_inprocess(TEXT_WHERE_NEQ_SRC, "llvm");
+    assert_eq!(llvm, b"{n: 1, name: \"alice\"}\n");
+    assert_eq!(llvm, run_text_where_inprocess(TEXT_WHERE_NEQ_SRC, "cranelift"));
+}
+
 #[test]
 fn public_relvar_outside_transaction_diagnoses_t0025() {
     let tmp = tempfile::tempdir().expect("tempdir");

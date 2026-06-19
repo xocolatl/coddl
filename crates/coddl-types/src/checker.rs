@@ -1099,7 +1099,7 @@ impl TypeChecker {
     }
 
     /// `lhs = rhs` / `lhs <> rhs` — operands must share a scalar type
-    /// (Integer or Boolean for v1). Result is Boolean.
+    /// (Integer, Text, or Boolean for v1). Result is Boolean.
     fn check_equality_op(&mut self, bin: &BinaryExpr, op: BinaryOp, scope: &mut Scope) -> Type {
         let lhs_ty = match bin.lhs() {
             Some(e) => self.check_expr(&e, scope),
@@ -1109,14 +1109,15 @@ impl TypeChecker {
             Some(e) => self.check_expr(&e, scope),
             None => Type::Unknown,
         };
-        let supported = |t: &Type| matches!(t, Type::Integer | Type::Boolean | Type::Unknown);
+        let supported =
+            |t: &Type| matches!(t, Type::Integer | Type::Text | Type::Boolean | Type::Unknown);
         if !supported(&lhs_ty) || !supported(&rhs_ty) || !lhs_ty.assignable_to(&rhs_ty) {
             let opname = op_display(op);
             self.error(
                 self.node_span(bin.syntax()),
                 "T0021",
                 format!(
-                    "`{opname}` operands must share a scalar type (Integer or Boolean); got {lhs_ty} vs {rhs_ty}"
+                    "`{opname}` operands must share a scalar type (Integer, Text, or Boolean); got {lhs_ty} vs {rhs_ty}"
                 ),
             );
         }
@@ -1931,6 +1932,14 @@ mod tests {
         // `1 = \"x\"` mixes Integer with Text — T0021 fires.
         let src = "oper main {} [ let b = 1 = \"x\"; ];";
         assert!(codes(src).contains(&"T0021"));
+    }
+
+    #[test]
+    fn text_equality_typechecks() {
+        // `=` and `<>` accept matching Text operands (result Boolean); no T0021.
+        let src = "oper main {} [ let a = \"x\" = \"y\"; let b = \"x\" <> \"y\"; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]

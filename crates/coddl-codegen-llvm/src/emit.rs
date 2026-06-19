@@ -223,6 +223,12 @@ impl Emitter {
             "declare ptr @coddl_relation_rename(ptr, ptr, ptr, ptr, i64)"
         )
         .unwrap();
+        // Text byte-equality: (a_ptr, a_len, b_ptr, b_len) -> i8 (1 = equal).
+        writeln!(
+            self.body,
+            "declare i8 @coddl_text_eq(ptr, i64, ptr, i64)"
+        )
+        .unwrap();
         // Phase 21 `extract`: takes (src, desc) and returns a record
         // pointer (the relation's payload, which IS the first record
         // when length==1). Aborts on length != 1.
@@ -967,6 +973,41 @@ impl Emitter {
         lhs: &ValueId,
         rhs: &ValueId,
     ) -> Result<(), LlvmEmitError> {
+        // Text operands aren't inline scalars — a Text cell/value is a
+        // `(ptr, len)` pair, so `=`/`<>` route through the runtime's
+        // byte comparison instead of `icmp`. (The typechecker only admits
+        // `Eq`/`NotEq` on Text; ordering stays Integer-only.)
+        if matches!(operand_type, ProcType::Text) {
+            let (lhs_ptr, lhs_len) = self.text_ops(lhs)?;
+            let (rhs_ptr, rhs_len) = self.text_ops(rhs)?;
+            let raw = format!("%v{}.txt", dst.0);
+            writeln!(
+                self.body,
+                "    {raw} = call i8 @coddl_text_eq(ptr {lhs_ptr}, i64 {lhs_len}, ptr {rhs_ptr}, i64 {rhs_len})"
+            )
+            .unwrap();
+            // `coddl_text_eq` returns 1 when equal: `Eq` is `raw != 0`,
+            // `NotEq` is `raw == 0`.
+            let cmp = match op {
+                ScalarOp::Eq => "ne",
+                ScalarOp::NotEq => "eq",
+                other => {
+                    return Err(LlvmEmitError::UnsupportedInst(format!(
+                        "operator {other:?} not supported on Text"
+                    )))
+                }
+            };
+            let dst_name = format!("%v{}", dst.0);
+            writeln!(self.body, "    {dst_name} = icmp {cmp} i8 {raw}, 0").unwrap();
+            self.values.insert(
+                dst,
+                ValueRepr::Scalar {
+                    ty: "i1".to_string(),
+                    op: dst_name,
+                },
+            );
+            return Ok(());
+        }
         let lhs_op = self.scalar_op(lhs)?;
         let rhs_op = self.scalar_op(rhs)?;
         let dst_name = format!("%v{}", dst.0);

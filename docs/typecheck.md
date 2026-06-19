@@ -278,7 +278,7 @@ each `parse_<x>` has a corresponding `check_<x>`.
   `Inst::WriteRelation`'s `heading_id` field.
 - **`check_binary_expr`** — dispatches on the parsed `BinaryOp`:
   - **Comparison (`=`, `<>`)**: operands must share a scalar type
-    (Integer or Boolean for v1). Result is `Boolean`. T0021 on
+    (Integer, Text, or Boolean for v1). Result is `Boolean`. T0021 on
     mismatch.
   - **Ordering (`<`, `>`, `<=`, `>=`)**: both operands must be
     Integer. Result is `Boolean`. T0021 otherwise.

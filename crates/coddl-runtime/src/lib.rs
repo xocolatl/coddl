@@ -32,8 +32,8 @@ pub use rc::{
 };
 pub use relation::{
     coddl_extract_check_cardinality, coddl_relation_project, coddl_relation_rename,
-    coddl_relation_seal, coddl_relation_where, coddl_write_relation, CoddlAttrDesc, CoddlAttrKind,
-    CoddlHeadingDesc,
+    coddl_relation_seal, coddl_relation_where, coddl_text_eq, coddl_write_relation, CoddlAttrDesc,
+    CoddlAttrKind, CoddlHeadingDesc,
 };
 pub use sqlite::{
     coddl_begin_tx, coddl_commit_tx, coddl_query, coddl_register_database, coddl_register_plan,
