@@ -217,6 +217,12 @@ impl Emitter {
         // `project`: takes (src, src_desc, result_desc) and returns a
         // fresh narrowed + sealed relation pointer (rc=1).
         writeln!(self.body, "declare ptr @coddl_relation_project(ptr, ptr, ptr)").unwrap();
+        // `rename`: (src, src_desc, result_desc, perm, perm_count) -> rc=1 ptr.
+        writeln!(
+            self.body,
+            "declare ptr @coddl_relation_rename(ptr, ptr, ptr, ptr, i64)"
+        )
+        .unwrap();
         // Phase 21 `extract`: takes (src, desc) and returns a record
         // pointer (the relation's payload, which IS the first record
         // when length==1). Aborts on length != 1.
@@ -686,6 +692,13 @@ impl Emitter {
                 src_heading_id,
                 result_heading_id,
             } => self.lower_project_inst(*dst, src, *src_heading_id, *result_heading_id),
+            Inst::Rename {
+                dst,
+                src,
+                src_heading_id,
+                result_heading_id,
+                perm,
+            } => self.lower_rename_inst(*dst, src, *src_heading_id, *result_heading_id, perm),
             Inst::Extract {
                 dst,
                 src,
@@ -1102,6 +1115,52 @@ impl Emitter {
             self.body,
             "    {name} = call ptr @coddl_relation_project(ptr {src_op}, ptr @.heading.{}, ptr @.heading.{})",
             src_heading_id.0, result_heading_id.0,
+        )
+        .unwrap();
+        self.values.insert(
+            dst,
+            ValueRepr::Scalar {
+                ty: "ptr".to_string(),
+                op: name,
+            },
+        );
+        Ok(())
+    }
+
+    /// Emit `Inst::Rename`: a static `u32` permutation array, then
+    /// `call ptr @coddl_relation_rename(src, &src_desc, &result_desc, perm, n)`.
+    /// The runtime permutes each record into the renamed layout and re-seals.
+    fn lower_rename_inst(
+        &mut self,
+        dst: ValueId,
+        src: &ValueId,
+        src_heading_id: HeadingId,
+        result_heading_id: HeadingId,
+        perm: &[u32],
+    ) -> Result<(), LlvmEmitError> {
+        let src_op = self.scalar_op(src)?;
+        // The permutation, baked as read-only data under a module-unique name.
+        let perm_id = self.next_str;
+        self.next_str += 1;
+        write!(
+            self.globals,
+            "@.perm.{} = private unnamed_addr constant [{} x i32] [",
+            perm_id,
+            perm.len()
+        )
+        .unwrap();
+        for (i, p) in perm.iter().enumerate() {
+            if i > 0 {
+                self.globals.push_str(", ");
+            }
+            write!(self.globals, "i32 {p}").unwrap();
+        }
+        writeln!(self.globals, "]").unwrap();
+        let name = format!("%v{}", dst.0);
+        writeln!(
+            self.body,
+            "    {name} = call ptr @coddl_relation_rename(ptr {src_op}, ptr @.heading.{}, ptr @.heading.{}, ptr @.perm.{}, i64 {})",
+            src_heading_id.0, result_heading_id.0, perm_id, perm.len(),
         )
         .unwrap();
         self.values.insert(

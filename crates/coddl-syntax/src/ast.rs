@@ -389,6 +389,7 @@ pub enum Expr {
     Binary(BinaryExpr),
     Unary(UnaryExpr),
     Project(ProjectExpr),
+    Rename(RenameExpr),
 }
 
 impl Expr {
@@ -405,6 +406,7 @@ impl Expr {
             SyntaxKind::BINARY_EXPR => Expr::Binary(BinaryExpr { syntax }),
             SyntaxKind::UNARY_EXPR => Expr::Unary(UnaryExpr { syntax }),
             SyntaxKind::PROJECT_EXPR => Expr::Project(ProjectExpr { syntax }),
+            SyntaxKind::RENAME_EXPR => Expr::Rename(RenameExpr { syntax }),
             // Parenthesized expressions are transparent — recurse to
             // the inner `Expr` so the typechecker / lowerer never see
             // the wrapper. Used purely for precedence grouping.
@@ -426,6 +428,7 @@ impl Expr {
             Expr::Binary(b) => b.syntax(),
             Expr::Unary(u) => u.syntax(),
             Expr::Project(p) => p.syntax(),
+            Expr::Rename(r) => r.syntax(),
         }
     }
 }
@@ -725,6 +728,41 @@ impl ProjectExpr {
                     None
                 }
             })
+    }
+}
+
+ast_node!(pub RenameExpr, RENAME_EXPR);
+
+impl RenameExpr {
+    /// The relation operand being renamed — the single `Expr` child (the
+    /// `old: new` pairs live in the `ARG_LIST` node, which isn't an `Expr`).
+    pub fn input(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// The `{ old: new }` pair list — an `ARG_LIST` of `NAMED_ARG`s.
+    pub fn arg_list(&self) -> Option<ArgList> {
+        child(&self.syntax)
+    }
+
+    /// The rename pairs in source order: `(old, new)` name tokens. `old` is
+    /// the `NAMED_ARG` name; `new` is the value's bare-`NameRef` identifier
+    /// (`None` when the value isn't a bare attribute name — a T0030 case).
+    pub fn renames(&self) -> Vec<(Option<SyntaxToken>, Option<SyntaxToken>)> {
+        self.arg_list()
+            .map(|al| {
+                al.args()
+                    .map(|na| {
+                        let old = na.name();
+                        let new = match na.value() {
+                            Some(Expr::NameRef(n)) => n.ident(),
+                            _ => None,
+                        };
+                        (old, new)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 

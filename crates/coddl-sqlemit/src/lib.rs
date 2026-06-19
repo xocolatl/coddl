@@ -137,25 +137,25 @@ pub type Result<T> = std::result::Result<T, BackendError>;
 /// projection narrows the `SELECT` faithfully — there is no implicit
 /// column pruning. `SELECT DISTINCT` is always emitted (RM Pro 3).
 pub fn emit_select(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
-    // Descend to the relvar leaf, collecting restriction predicates (outermost
-    // first) along the way.
-    let mut preds: Vec<&Predicate> = Vec::new();
-    let leaf = relvar_leaf(expr, &mut preds)?;
-    let (table_name, columns) = match leaf {
-        RelExpr::RelvarRef {
-            table_name,
-            columns,
-            ..
-        } => (table_name, columns.as_slice()),
-        // relvar_leaf only ever returns a RelvarRef.
-        _ => return Err(BackendError::Other("expected a relvar leaf".to_string())),
-    };
+    // Resolve the tree to its physical table and output `(attr, column)` map —
+    // renames remap the attr side, projects narrow it — collecting each
+    // restriction as a resolved `(column, value)` conjunct along the way.
+    let mut wheres: Vec<(String, Literal)> = Vec::new();
+    let (table_name, output_cols) = resolve(expr, &mut wheres)?;
 
-    // SELECT list = the (projection-aware) result heading, in canonical order.
+    // SELECT list = the result heading in canonical order. Each attribute is
+    // its physical column, aliased `AS` the attribute when the names differ —
+    // a `rename`, or any attr/column mismatch — so the rename is pushed to SQL
+    // (the result columns are named by the Coddl attributes).
     let heading = expr.heading();
     let mut select_cols = Vec::with_capacity(heading.attrs().len());
     for (attr, _ty) in heading.attrs() {
-        select_cols.push(quote_ident(column_for(columns, attr)?));
+        let col = column_for(&output_cols, attr)?;
+        if col == attr.as_str() {
+            select_cols.push(quote_ident(col));
+        } else {
+            select_cols.push(format!("{} AS {}", quote_ident(col), quote_ident(attr)));
+        }
     }
     // A nullary projection (`project {}`) has an empty heading, and SQL has no
     // zero-column SELECT. Emit the constant `1`: `SELECT DISTINCT 1 …` returns
@@ -176,21 +176,19 @@ pub fn emit_select(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
         quote_ident(table_name),
     );
 
-    // WHERE = the conjunction of the collected attribute-equals-literal tests.
+    // WHERE = the conjunction of the collected (column, literal) tests. Each
+    // predicate was resolved to its physical column at its own level in the
+    // tree (so a `where` above a `rename` resolves through the rename).
     let mut params: Vec<Value> = Vec::new();
-    if !preds.is_empty() {
-        let mut conjuncts = Vec::with_capacity(preds.len());
-        for pred in &preds {
-            match pred {
-                Predicate::AttrEq { attr, value } => {
-                    let placeholder = match dialect {
-                        Dialect::SQLite => "?".to_string(),
-                        Dialect::Postgres => format!("${}", params.len() + 1),
-                    };
-                    conjuncts.push(format!("{} = {placeholder}", quote_ident(column_for(columns, attr)?)));
-                    params.push(Value::from(value.clone()));
-                }
-            }
+    if !wheres.is_empty() {
+        let mut conjuncts = Vec::with_capacity(wheres.len());
+        for (col, value) in &wheres {
+            let placeholder = match dialect {
+                Dialect::SQLite => "?".to_string(),
+                Dialect::Postgres => format!("${}", params.len() + 1),
+            };
+            conjuncts.push(format!("{} = {placeholder}", quote_ident(col)));
+            params.push(Value::from(value.clone()));
         }
         text.push_str(" WHERE ");
         text.push_str(&conjuncts.join(" AND "));
@@ -208,16 +206,48 @@ pub fn emit_select(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
     })
 }
 
-/// Walk down `Restrict`/`Project` to the underlying `RelvarRef`, pushing each
-/// `Restrict`'s predicate into `preds`.
-fn relvar_leaf<'a>(expr: &'a RelExpr, preds: &mut Vec<&'a Predicate>) -> Result<&'a RelExpr> {
+/// Post-order walk to the `RelvarRef` leaf, returning the physical table name
+/// and the node's output `(attribute, sql_column)` map. `Rename` remaps the
+/// attribute side; `Project` narrows it; `Restrict` resolves its predicate
+/// against the map **at its own level** (so a `where` above a `rename`
+/// resolves through the rename) and pushes the `(column, value)` onto `wheres`.
+fn resolve<'a>(
+    expr: &'a RelExpr,
+    wheres: &mut Vec<(String, Literal)>,
+) -> Result<(&'a str, Vec<(String, String)>)> {
     match expr {
-        RelExpr::RelvarRef { .. } => Ok(expr),
+        RelExpr::RelvarRef {
+            table_name,
+            columns,
+            ..
+        } => Ok((table_name, columns.clone())),
         RelExpr::Restrict { input, pred } => {
-            preds.push(pred);
-            relvar_leaf(input, preds)
+            let (table, cols) = resolve(input, wheres)?;
+            let Predicate::AttrEq { attr, value } = pred;
+            let col = column_for(&cols, attr)?.to_string();
+            wheres.push((col, value.clone()));
+            Ok((table, cols))
         }
-        RelExpr::Project { input, .. } => relvar_leaf(input, preds),
+        RelExpr::Project { input, keep } => {
+            let (table, cols) = resolve(input, wheres)?;
+            let kept = cols.into_iter().filter(|(a, _)| keep.contains(a)).collect();
+            Ok((table, kept))
+        }
+        RelExpr::Rename { input, renames } => {
+            let (table, cols) = resolve(input, wheres)?;
+            let renamed = cols
+                .into_iter()
+                .map(|(a, c)| {
+                    let new = renames
+                        .iter()
+                        .find(|(old, _)| *old == a)
+                        .map(|(_, new)| new.clone())
+                        .unwrap_or(a);
+                    (new, c)
+                })
+                .collect();
+            Ok((table, renamed))
+        }
     }
 }
 
@@ -433,5 +463,52 @@ mod tests {
         assert_eq!(a.plan_id, b.plan_id);
         let bare = emit_select(&greetings(), Dialect::SQLite).unwrap();
         assert_ne!(a.plan_id, bare.plan_id);
+    }
+
+    #[test]
+    fn renamed_read_aliases_columns() {
+        // (Greetings where id = 1) rename {id: identifier, message: msg} —
+        // pushed via `AS`; key `id` renamed to `identifier` still elides DISTINCT.
+        let expr = RelExpr::Rename {
+            input: Box::new(where_id_1(greetings())),
+            renames: vec![
+                ("id".to_string(), "identifier".to_string()),
+                ("message".to_string(), "msg".to_string()),
+            ],
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id" AS "identifier", "message" AS "msg" FROM "greetings" WHERE "id" = ?"#
+        );
+        assert_eq!(
+            q.result_heading,
+            Heading::new(vec![
+                ("identifier".to_string(), Type::Integer),
+                ("msg".to_string(), Type::Text),
+            ])
+        );
+    }
+
+    #[test]
+    fn where_above_rename_resolves_through_it() {
+        // (Greetings rename {id: identifier}) where identifier = 1 — the
+        // predicate references the renamed name; it resolves to column "id".
+        let renamed = RelExpr::Rename {
+            input: Box::new(greetings()),
+            renames: vec![("id".to_string(), "identifier".to_string())],
+        };
+        let expr = RelExpr::Restrict {
+            input: Box::new(renamed),
+            pred: Predicate::AttrEq {
+                attr: "identifier".to_string(),
+                value: Literal::Integer(1),
+            },
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id" AS "identifier", "message" FROM "greetings" WHERE "id" = ?"#
+        );
     }
 }

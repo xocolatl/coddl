@@ -388,6 +388,85 @@ pub unsafe extern "C" fn coddl_relation_project(
     out
 }
 
+/// Rename a relation's attributes in-process. Returns a fresh RC-managed
+/// relation (rc=1) whose heading is `dst_desc` — the renamed, re-sorted
+/// attributes — with each record's cells permuted from the source per `perm`.
+/// `src` is left unchanged.
+///
+/// Renaming re-canonicalizes the heading (it is name-sorted), so record byte
+/// offsets shift: `perm[dst_i]` is the index in `src_desc` of the source
+/// attribute that becomes `dst_desc.attrs[dst_i]`. Cells are copied by value;
+/// the result is then **sealed** to restore the canonical sort under the new
+/// layout. (Dedup is a no-op — rename is a bijection, creating no duplicates —
+/// but the byte order changes, so the sort must be redone.)
+///
+/// # Safety
+/// `src` must point to a payload from `coddl_rc_alloc` (kind `Relation`,
+/// descriptor `src_desc`). Both descriptors and `perm` (length `perm_count` ==
+/// `dst_desc.attr_count`) must outlive this call.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_relation_rename(
+    src: *const u8,
+    src_desc: *const CoddlHeadingDesc,
+    dst_desc: *const CoddlHeadingDesc,
+    perm_ptr: *const u32,
+    perm_count: usize,
+) -> *mut u8 {
+    if src.is_null() || src_desc.is_null() || dst_desc.is_null() {
+        return std::ptr::null_mut();
+    }
+    let header = src.sub(HEADER_SIZE) as *const CoddlRcHeader;
+    let count = (*header).length as usize;
+    let src_record_size = (*src_desc).record_size as usize;
+    let dst_record_size = (*dst_desc).record_size as usize;
+
+    let src_attrs = std::slice::from_raw_parts((*src_desc).attrs, (*src_desc).attr_count as usize);
+    let dst_attrs = std::slice::from_raw_parts((*dst_desc).attrs, (*dst_desc).attr_count as usize);
+    let perm = if perm_ptr.is_null() {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(perm_ptr, perm_count)
+    };
+
+    // Per-dst-attribute byte move `(src_offset, dst_offset, width)`, resolving
+    // the source attribute via `perm`.
+    let mut moves: Vec<(usize, usize, usize)> = Vec::with_capacity(dst_attrs.len());
+    for (dst_i, d) in dst_attrs.iter().enumerate() {
+        let src_i = perm.get(dst_i).copied().unwrap_or(0) as usize;
+        if let Some(s) = src_attrs.get(src_i) {
+            moves.push((s.offset as usize, d.offset as usize, cell_width(d.kind)));
+        }
+    }
+
+    let out = crate::rc::coddl_rc_alloc(
+        dst_record_size * count,
+        count as u32,
+        crate::rc::CoddlKind::Relation as u32,
+        dst_desc,
+    );
+    if out.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    for i in 0..count {
+        let src_rec = src.add(i * src_record_size);
+        let dst_rec = out.add(i * dst_record_size);
+        for &(src_off, dst_off, width) in &moves {
+            std::ptr::copy_nonoverlapping(src_rec.add(src_off), dst_rec.add(dst_off), width);
+        }
+    }
+
+    if dst_record_size == 0 {
+        // Renaming an empty heading: collapse to reltrue/relfalse (seal can't
+        // dedup zero-width records).
+        let out_header = out.sub(HEADER_SIZE) as *mut CoddlRcHeader;
+        (*out_header).length = u32::from(count > 0);
+    } else {
+        coddl_relation_seal(out, dst_desc);
+    }
+    out
+}
+
 /// Cardinality-checked collapse from a relation to a tuple (the TTM
 /// RM Pre 10 primitive). Returns the single record's payload
 /// pointer if the relation has exactly one row; otherwise writes a
@@ -621,6 +700,75 @@ mod tests {
 
             coddl_rc_release(out);
             coddl_rc_release(src);
+        }
+    }
+
+    #[test]
+    fn rename_permutes_and_reseals() {
+        // {a, b} rename {a: z} → {b, z}: `z` gets `a`'s value, and the
+        // canonical order flips (sorted by b,z instead of a,b) so seal re-sorts.
+        let src_attrs = [
+            CoddlAttrDesc {
+                name: b"a".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 0,
+            },
+            CoddlAttrDesc {
+                name: b"b".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 8,
+            },
+        ];
+        let src_desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 16,
+            attrs: src_attrs.as_ptr(),
+        };
+        // dst {b, z}: b@0, z@8.
+        let dst_attrs = [
+            CoddlAttrDesc {
+                name: b"b".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 0,
+            },
+            CoddlAttrDesc {
+                name: b"z".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 8,
+            },
+        ];
+        let dst_desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 16,
+            attrs: dst_attrs.as_ptr(),
+        };
+        // dst b ← src attr 1 (b); dst z ← src attr 0 (a).
+        let perm: [u32; 2] = [1, 0];
+        unsafe {
+            let s = coddl_rc_alloc(2 * 16, 2, CoddlKind::Relation as u32, &src_desc);
+            // sealed input: {a:1,b:5}, {a:2,b:3}
+            std::ptr::write(s.add(0) as *mut i64, 1);
+            std::ptr::write(s.add(8) as *mut i64, 5);
+            std::ptr::write(s.add(16) as *mut i64, 2);
+            std::ptr::write(s.add(24) as *mut i64, 3);
+
+            let out = coddl_relation_rename(s, &src_desc, &dst_desc, perm.as_ptr(), 2);
+            assert!(!out.is_null());
+            let header = out.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*header).length, 2);
+            let read = |row: usize, off: usize| std::ptr::read(out.add(row * 16 + off) as *const i64);
+            // re-sorted by (b, z): {b:3, z:2}, {b:5, z:1}
+            assert_eq!(read(0, 0), 3, "b");
+            assert_eq!(read(0, 8), 2, "z == a of the {{a:2}} row");
+            assert_eq!(read(1, 0), 5, "b");
+            assert_eq!(read(1, 8), 1, "z == a of the {{a:1}} row");
+
+            coddl_rc_release(out);
+            coddl_rc_release(s);
         }
     }
 

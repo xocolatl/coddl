@@ -310,6 +310,15 @@ each `parse_<x>` has a corresponding `check_<x>`.
   came from; the **lowerer** serves a relvar-rooted operand by pushing the
   projection into SQL (a narrowed `SELECT`) and an in-memory operand with
   the in-process `Inst::Project` → `coddl_relation_project`.
+- **`check_rename_expr`** — `R rename { old: new, … }`. The operand must be
+  `Type::Relation(H)` (T0023). Each target must be a bare attribute name
+  (T0030); each source must exist in `H` (T0029); the rename must stay a
+  bijection — no source repeats and no target collides with a surviving
+  attribute (T0031). The result is `Type::Relation(H')` with names remapped,
+  canonically re-sorted. A relvar-rooted rename pushes to SQL (each renamed
+  attribute aliased `AS` its new name); an in-memory operand lowers to the
+  in-process `Inst::Rename` → `coddl_relation_rename`, which permutes record
+  bytes into the re-sorted layout and re-seals.
 
 
 ## Transaction-scoped public-relvar access (Phase 22)
@@ -377,9 +386,12 @@ check script enforces that.
 | T0020 | `where` predicate must be Boolean                         |
 | T0021 | Scalar operator operand type mismatch                     |
 | T0022 | Captured identifier in `where` predicate not yet supported |
-| T0023 | `where` / `project` left operand is not a relation        |
+| T0023 | `where` / `project` / `rename` left operand is not a relation |
 | T0024 | `extract` operand is not a relation                       |
 | T0025 | Public relvar referenced outside any `transaction [...]`  |
 | T0026 | Side-effecting operator called inside `transaction [...]` |
 | T0027 | Unknown attribute name in a `project` list                |
 | T0028 | Duplicate attribute name in a `project` list              |
+| T0029 | Unknown attribute name in a `rename` source               |
+| T0030 | `rename` target must be a bare attribute name             |
+| T0031 | `rename` is not a bijection (duplicate source or target collision) |

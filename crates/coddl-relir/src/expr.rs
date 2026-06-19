@@ -68,6 +68,25 @@ pub enum RelExpr {
         /// Attribute names to retain.
         keep: Vec<String>,
     },
+    /// Rename attributes (surface `rename`). Heading-cardinality-preserving;
+    /// values unchanged, names swapped. The heading re-canonicalizes (sorts)
+    /// under the new names.
+    Rename {
+        input: Box<RelExpr>,
+        /// `(old, new)` pairs. A bijection: no `old` repeats and no `new`
+        /// collides with a surviving attribute (the typechecker enforces it).
+        renames: Vec<(String, String)>,
+    },
+}
+
+/// Apply a rename map to one attribute name: the renamed name if `name` is a
+/// rename source, else `name` unchanged.
+fn apply_rename(renames: &[(String, String)], name: &str) -> String {
+    renames
+        .iter()
+        .find(|(old, _)| old == name)
+        .map(|(_, new)| new.clone())
+        .unwrap_or_else(|| name.to_string())
 }
 
 /// A restriction predicate. Currently a single attribute-equals-literal test;
@@ -107,6 +126,16 @@ impl RelExpr {
                     .collect();
                 Heading::new(kept)
             }
+            RelExpr::Rename { input, renames } => {
+                // Remap names; `Heading::new` re-canonicalizes (re-sorts).
+                let remapped: Vec<(String, Type)> = input
+                    .heading()
+                    .attrs()
+                    .iter()
+                    .map(|(name, ty)| (apply_rename(renames, name), ty.clone()))
+                    .collect();
+                Heading::new(remapped)
+            }
         }
     }
 
@@ -120,6 +149,7 @@ impl RelExpr {
             RelExpr::RelvarRef { .. } => StorageOrigin::RelvarRooted,
             RelExpr::Restrict { input, .. } => input.origin(),
             RelExpr::Project { input, .. } => input.origin(),
+            RelExpr::Rename { input, .. } => input.origin(),
         }
     }
 
@@ -138,6 +168,11 @@ impl RelExpr {
                 .surviving_keys()
                 .into_iter()
                 .filter(|k| k.iter().all(|a| keep.contains(a)))
+                .collect(),
+            RelExpr::Rename { input, renames } => input
+                .surviving_keys()
+                .into_iter()
+                .map(|k| k.iter().map(|a| apply_rename(renames, a)).collect())
                 .collect(),
         }
     }
@@ -163,6 +198,7 @@ impl RelExpr {
                 }
             }
             RelExpr::Project { input, .. } => input.card_le_one(),
+            RelExpr::Rename { input, .. } => input.card_le_one(),
         }
     }
 
@@ -311,6 +347,55 @@ mod tests {
             keep: vec!["message".to_string()],
         };
         assert!(r.surviving_keys().is_empty());
+        assert!(r.card_le_one());
+        assert!(!r.needs_distinct());
+    }
+
+    // ── rename ────────────────────────────────────────────────────────
+
+    fn renamed() -> RelExpr {
+        // Greetings rename {id: identifier, message: msg}
+        RelExpr::Rename {
+            input: Box::new(greetings()),
+            renames: vec![
+                ("id".to_string(), "identifier".to_string()),
+                ("message".to_string(), "msg".to_string()),
+            ],
+        }
+    }
+
+    #[test]
+    fn rename_remaps_and_recanonicalizes_heading() {
+        let r = renamed();
+        assert_eq!(
+            r.heading(),
+            // re-sorted under the new names: identifier < msg
+            Heading::new(vec![
+                ("identifier".to_string(), Type::Integer),
+                ("msg".to_string(), Type::Text),
+            ])
+        );
+        assert_eq!(r.origin(), StorageOrigin::RelvarRooted);
+    }
+
+    #[test]
+    fn rename_carries_keys_through_so_no_distinct() {
+        let r = renamed();
+        // key `id` becomes `identifier`; it still survives → no DISTINCT.
+        assert_eq!(r.surviving_keys(), vec![vec!["identifier".to_string()]]);
+        assert!(!r.needs_distinct());
+    }
+
+    #[test]
+    fn rename_over_key_restriction_keeps_card_bound() {
+        // (Greetings where id = 1) rename {message: msg} — still ≤ 1 tuple.
+        let r = RelExpr::Rename {
+            input: Box::new(RelExpr::Restrict {
+                input: Box::new(greetings()),
+                pred: id_eq_1(),
+            }),
+            renames: vec![("message".to_string(), "msg".to_string())],
+        };
         assert!(r.card_le_one());
         assert!(!r.needs_distinct());
     }

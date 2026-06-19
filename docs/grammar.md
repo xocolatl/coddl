@@ -4,7 +4,7 @@ The authoritative spec for Coddl's surface syntax — the precise form of the la
 
 This doc has two parts: **rationale** (the design decisions — why prefix-named-args, why no reserved words, why brackets-vs-braces, etc.) and the **productions** (the EBNF the parser implements, lexical and syntactic).
 
-**Last sync:** `36f2239`. Every commit that adds, removes, or changes a production, token, or diagnostic code updates this file in the same commit; `tools/check-grammar.sh` enforces it from the hygiene gate.
+**Last sync:** `9bae417`. Every commit that adds, removes, or changes a production, token, or diagnostic code updates this file in the same commit; `tools/check-grammar.sh` enforces it from the hygiene gate.
 
 ---
 
@@ -413,14 +413,15 @@ function that implements it.
 
 <expr>          ::= <expr-prec> ;                            -- parse_expr
 <expr-prec>     ::= <primary-expr> { <postfix> }
-                    { <infix-op> <expr-prec> | <project-suffix> } ;
+                    { <infix-op> <expr-prec> | <project-suffix> | <rename-suffix> } ;
                                                                -- parse_expr_prec
                     -- Pratt precedence ladder; left-associative.
                     -- min_prec drives which operators may be
                     -- consumed; the parser recurses with `prec + 1`
-                    -- for each rhs. <project-suffix> is consumed only
-                    -- at pipeline level (min_prec 0), interleaved with
-                    -- infix ops, so it binds to the whole pipeline.
+                    -- for each rhs. The <project-suffix> / <rename-suffix>
+                    -- postfix forms are consumed only at pipeline level
+                    -- (min_prec 0), interleaved with infix ops, so they
+                    -- bind to the whole pipeline.
 <infix-op>      ::= 'where'                                    -- prec 0
                   | 'or'                                       -- prec 1
                   | 'and'                                      -- prec 2
@@ -461,6 +462,13 @@ function that implements it.
                     -- them (keeps the complement). `all`/`but` are
                     -- contextual keywords, valid identifiers elsewhere.
                     -- See the projection rationale above.
+<rename-suffix> ::= 'rename' <arg-list> ;                       -- parse_rename_suffix
+                    -- Relational rename. Postfix at pipeline precedence
+                    -- (like <project-suffix>); wraps the operand in
+                    -- RENAME_EXPR. The `old: new` pairs reuse <arg-list>
+                    -- (the `new` side parses as a <name-ref>); the
+                    -- typechecker validates each target is a bare
+                    -- attribute name. P0040 on a missing `{`.
 <transaction-expr> ::= 'transaction' <block> ;                 -- parse_transaction_expr
 <name-ref>      ::= <identifier> ;
 <arg-list>      ::= '{' [ <named-arg> commalist ] '}' ;        -- parse_arg_list
@@ -566,6 +574,7 @@ enforces that.
 | P0037 | Expected project attribute name                         |
 | P0038 | Expected `}` to close project list                      |
 | P0039 | Expected `but` after `all` in project                   |
+| P0040 | Expected `{` to start rename list                       |
 
 Note: missing-type-after-`:` (let annotation) and missing-type-
 after-`->` (operator return clause) both surface as `P0011`

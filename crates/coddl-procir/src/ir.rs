@@ -274,6 +274,20 @@ pub enum Inst {
         src_heading_id: HeadingId,
         result_heading_id: HeadingId,
     },
+    /// Rename a relation's attributes in-process (surface `rename`). Backends
+    /// emit a static `u32` permutation (`perm[dst_i]` = the source attribute
+    /// index for destination attribute `dst_i`) and a call to
+    /// `coddl_relation_rename(src, &src_descriptor, &result_descriptor, perm,
+    /// perm_len)`, which permutes each record into the renamed (re-sorted)
+    /// layout and re-seals. `dst` carries the renamed heading at
+    /// `result_heading_id`.
+    Rename {
+        dst: ValueId,
+        src: ValueId,
+        src_heading_id: HeadingId,
+        result_heading_id: HeadingId,
+        perm: Vec<u32>,
+    },
     /// Collapse a single-row relation to a tuple (TTM RM Pre 10).
     /// Backends emit a call to `coddl_extract_check_cardinality(src,
     /// &descriptor)` which aborts if cardinality ≠ 1, then read each
@@ -552,6 +566,17 @@ impl fmt::Display for Inst {
             } => write!(
                 f,
                 "{dst} = project {src} heading_{} -> heading_{}",
+                src_heading_id.0, result_heading_id.0
+            ),
+            Inst::Rename {
+                dst,
+                src,
+                src_heading_id,
+                result_heading_id,
+                perm,
+            } => write!(
+                f,
+                "{dst} = rename {src} heading_{} -> heading_{} perm{perm:?}",
                 src_heading_id.0, result_heading_id.0
             ),
             Inst::Extract {

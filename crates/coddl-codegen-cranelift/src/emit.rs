@@ -212,6 +212,20 @@ fn declare_runtime_rc_externs(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert(name.into(), id);
     }
+    // coddl_relation_rename(src, src_desc, result_desc, perm: ptr, perm_count: usize) -> ptr
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty)); // usize perm_count
+        sig.returns.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_relation_rename", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_relation_rename".into(), id);
+    }
     // coddl_extract_check_cardinality(src: ptr, desc: ptr) -> ptr
     {
         let mut sig = obj.make_signature();
@@ -530,6 +544,31 @@ fn declare_byte_constant(
         dd.define(vec![0u8].into_boxed_slice());
     } else {
         dd.define(bytes.to_vec().into_boxed_slice());
+    }
+    obj.define_data(id, &dd)
+        .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+    Ok(id)
+}
+
+/// Declare + define an anonymous read-only `u32` array (little-endian) — the
+/// rename permutation. Anonymous so each `Inst::Rename` gets a fresh symbol
+/// with no name-collision bookkeeping.
+fn declare_perm_data(obj: &mut ObjectModule, perm: &[u32]) -> Result<DataId, CraneliftEmitError> {
+    let id = obj
+        .declare_anonymous_data(false, false)
+        .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+    let mut bytes: Vec<u8> = Vec::with_capacity(perm.len() * 4);
+    for p in perm {
+        bytes.extend_from_slice(&p.to_le_bytes());
+    }
+    let mut dd = DataDescription::new();
+    dd.set_align(4); // the runtime reads this as `*const u32`
+    if bytes.is_empty() {
+        // DataDescription rejects zero-length payloads; the runtime treats
+        // perm_count == 0 as empty.
+        dd.define(vec![0u8].into_boxed_slice());
+    } else {
+        dd.define(bytes.into_boxed_slice());
     }
     obj.define_data(id, &dd)
         .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
@@ -1241,6 +1280,35 @@ fn emit_inst(
                 builder
                     .ins()
                     .call(project_local, &[src_v, src_desc_val, res_desc_val]);
+            let result = builder.inst_results(call)[0];
+            values.insert(*dst, ValueRepr::Scalar(result));
+            Ok(())
+        }
+        Inst::Rename {
+            dst,
+            src,
+            src_heading_id,
+            result_heading_id,
+            perm,
+        } => {
+            let src_v = scalar_value(values, src)?;
+            let ptr_ty = obj.target_config().pointer_type();
+            let src_desc_id = heading_desc_ids[src_heading_id.0 as usize];
+            let src_desc_gv = obj.declare_data_in_func(src_desc_id, builder.func);
+            let src_desc_val = builder.ins().symbol_value(ptr_ty, src_desc_gv);
+            let res_desc_id = heading_desc_ids[result_heading_id.0 as usize];
+            let res_desc_gv = obj.declare_data_in_func(res_desc_id, builder.func);
+            let res_desc_val = builder.ins().symbol_value(ptr_ty, res_desc_gv);
+            let perm_id = declare_perm_data(obj, perm)?;
+            let perm_gv = obj.declare_data_in_func(perm_id, builder.func);
+            let perm_val = builder.ins().symbol_value(ptr_ty, perm_gv);
+            let count_val = builder.ins().iconst(ptr_ty, perm.len() as i64);
+            let rename_id = funcs["coddl_relation_rename"];
+            let rename_local = obj.declare_func_in_func(rename_id, builder.func);
+            let call = builder.ins().call(
+                rename_local,
+                &[src_v, src_desc_val, res_desc_val, perm_val, count_val],
+            );
             let result = builder.inst_results(call)[0];
             values.insert(*dst, ValueRepr::Scalar(result));
             Ok(())

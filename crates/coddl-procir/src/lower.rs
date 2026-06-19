@@ -16,8 +16,8 @@ use coddl_diagnostics::{Diagnostic, FileId, Severity, Span};
 use coddl_plan::Plan;
 use coddl_syntax::ast::{
     AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, Expr, ExprStmt, FieldAccess, Item,
-    LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, Root,
-    Stmt, TransactionExpr, TupleLit, UnaryExpr, UnaryOp,
+    LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, RenameExpr,
+    Root, Stmt, TransactionExpr, TupleLit, UnaryExpr, UnaryOp,
 };
 use coddl_syntax::SyntaxKind;
 use coddl_types::{check, Heading, Type};
@@ -682,8 +682,89 @@ impl Lowerer {
             Expr::Binary(b) => self.lower_binary_expr(b),
             Expr::Unary(u) => self.lower_unary_expr(u),
             Expr::Project(p) => self.lower_project_expr(p),
+            Expr::Rename(r) => self.lower_rename_expr(r),
             Expr::NameRef(n) => self.lower_name_ref(n),
         }
+    }
+
+    /// Lower a `rename` whose operand the cut declined to push — an in-memory
+    /// relation. (The pushable case is served by `Inst::Query` with the
+    /// `AS`-aliased SELECT.) Lower the operand, compute the renamed (re-sorted)
+    /// result heading and the source→dest permutation, and emit `Inst::Rename`.
+    fn lower_rename_expr(&mut self, re: &RenameExpr) -> ValueId {
+        // 1. Lower the operand.
+        let src = re
+            .input()
+            .map(|e| self.lower_expr(&e))
+            .expect("typechecked rename has a relation operand");
+        let src_heading_id = match self.value_type(src) {
+            ProcType::Relation(id) => id,
+            other => unreachable!("rename on non-relation `{other}` survived typecheck"),
+        };
+        let src_heading = self.headings[src_heading_id.0 as usize].clone();
+
+        // 2. Renamed (re-sorted) result heading.
+        let renames: Vec<(String, String)> = re
+            .renames()
+            .into_iter()
+            .filter_map(|(old, new)| Some((old?.text().to_string(), new?.text().to_string())))
+            .collect();
+        let renamed: Vec<(String, Type)> = src_heading
+            .attrs()
+            .iter()
+            .map(|(name, t)| {
+                let new = renames
+                    .iter()
+                    .find(|(old, _)| old == name)
+                    .map(|(_, new)| new.clone())
+                    .unwrap_or_else(|| name.clone());
+                (new, t.clone())
+            })
+            .collect();
+        let result_heading = Heading::new(renamed);
+        let result_heading_id = self.intern_heading(&result_heading);
+
+        // 3. Permutation `perm[dst_i] = src index`. The source of a destination
+        //    attribute is the `old` whose `new` is the dst name (reverse rename),
+        //    else the dst name itself (pass-through). Both headings are in
+        //    canonical order, so positions are stable.
+        let perm: Vec<u32> = result_heading
+            .attrs()
+            .iter()
+            .map(|(new_name, _)| {
+                let src_name = renames
+                    .iter()
+                    .find(|(_, new)| new == new_name)
+                    .map(|(old, _)| old.as_str())
+                    .unwrap_or(new_name.as_str());
+                src_heading
+                    .attrs()
+                    .iter()
+                    .position(|(n, _)| n == src_name)
+                    .unwrap_or(0) as u32
+            })
+            .collect();
+
+        // 4. Emit Inst::Rename.
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Relation(result_heading_id));
+        self.insts.push(Inst::Rename {
+            dst,
+            src,
+            src_heading_id,
+            result_heading_id,
+            perm,
+        });
+
+        // 5. Release the source if no local owns it (same balancing as `where`).
+        let src_owned = self
+            .locals
+            .iter()
+            .any(|layer| layer.values().any(|(vid, _)| *vid == src));
+        if !src_owned {
+            self.insts.push(Inst::Release { src });
+        }
+        dst
     }
 
     /// Lower a `project` whose operand the cut declined to push — i.e. an
@@ -808,6 +889,23 @@ impl Lowerer {
                 Some(RelExpr::Project {
                     input: Box::new(input),
                     keep,
+                })
+            }
+            Expr::Rename(r) => {
+                // Rename over a pushable subtree pushes too — origin propagates
+                // and the emitter resolves columns through the renames (aliasing
+                // `AS` the new name). On a clean typecheck every pair is present.
+                let input = self.build_rel_expr(&r.input()?)?;
+                let mut renames = Vec::new();
+                for (old, new) in r.renames() {
+                    let (Some(old), Some(new)) = (old, new) else {
+                        return None;
+                    };
+                    renames.push((old.text().to_string(), new.text().to_string()));
+                }
+                Some(RelExpr::Rename {
+                    input: Box::new(input),
+                    renames,
                 })
             }
             _ => None,
@@ -1906,6 +2004,65 @@ oper main {}\n\
         assert_eq!(h.attrs().len(), 1);
         assert!(h.lookup("b").is_some(), "complement keeps `b`");
         assert!(h.lookup("a").is_none(), "`a` was removed");
+    }
+
+    #[test]
+    fn relvar_rename_pushes_aliased_sql() {
+        // `Greetings where id=1 rename {id: identifier, message: msg}` pushes
+        // to one query with the rename expressed via `AS`.
+        let src = "\
+program hello_world_db;
+database greetings;
+public relvar Greetings { id: Integer, message: Text } key { id };
+oper main {} [
+    let g = transaction [ extract (Greetings where id = 1 rename {id: identifier, message: msg}) ];
+    write_line { message: g.msg };
+];
+";
+        let m = lower_ok_with_plan(src, &greetings_plan());
+        assert_eq!(m.plans.len(), 1);
+        assert_eq!(
+            m.plans[0].sql,
+            r#"SELECT "id" AS "identifier", "message" AS "msg" FROM "greetings" WHERE "id" = ?"#
+        );
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        assert_eq!(
+            main.blocks[0]
+                .insts
+                .iter()
+                .filter(|i| matches!(i, Inst::Query { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn rename_over_relation_literal_lowers_to_inst_rename() {
+        // `Relation {{a, b}} rename {a: z}` lowers in-process to `Inst::Rename`
+        // with the renamed (re-sorted) result heading {b, z} and perm [1, 0]
+        // (dst b ← src 1, dst z ← src 0).
+        let src = "oper main {} [ let s = Relation { {a: 1, b: 2} } rename {a: z}; ];";
+        let out = lower(src, FileId(0));
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let m = out.module.expect("module");
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let (result_heading_id, perm) = main.blocks[0]
+            .insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::Rename {
+                    result_heading_id,
+                    perm,
+                    ..
+                } => Some((*result_heading_id, perm.clone())),
+                _ => None,
+            })
+            .expect("expected an Inst::Rename");
+        let h = &m.headings[result_heading_id.0 as usize];
+        assert!(h.lookup("z").is_some(), "renamed to `z`");
+        assert!(h.lookup("b").is_some(), "`b` kept");
+        assert!(h.lookup("a").is_none(), "`a` renamed away");
+        assert_eq!(perm, vec![1, 0], "dst [b, z] ← src [a, b] indices");
     }
 
     #[test]

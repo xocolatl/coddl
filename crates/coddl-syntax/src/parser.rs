@@ -587,6 +587,12 @@ impl<'a> Parser<'a> {
                 self.finish_node();
                 continue;
             }
+            if min_prec == 0 && self.at_keyword("rename") {
+                self.start_node_at(cp, SyntaxKind::RENAME_EXPR);
+                self.parse_rename_suffix();
+                self.finish_node();
+                continue;
+            }
             let Some(prec) = self.peek_infix_prec() else {
                 break;
             };
@@ -972,6 +978,26 @@ impl<'a> Parser<'a> {
             ("P0037", "expected project attribute name"),
             ("P0038", "expected `}` to close project list"),
         );
+    }
+
+    /// `rename { old: new, … }` — relational rename suffix. The enclosing
+    /// `RENAME_EXPR` node (wrapping the operand) is opened by the caller, so
+    /// this consumes the `rename` keyword and the `{ old: new }` pair list.
+    /// The pairs reuse the `ARG_LIST` / `NAMED_ARG` production (`new` parses
+    /// as an `Expr::NameRef`); the typechecker validates each target is a bare
+    /// attribute name.
+    ///
+    /// Diagnostics: P0040 (no `{`); the pair-list reuses the arg-list codes
+    /// P0015 (no `}`), P0016 (no name), P0017 (no `:`).
+    pub(crate) fn parse_rename_suffix(&mut self) {
+        debug_assert!(self.at_keyword("rename"));
+        self.bump_trivia();
+        self.bump(); // `rename`
+        if self.at(SyntaxKind::L_BRACE) {
+            self.parse_arg_list();
+        } else {
+            self.error("P0040", "expected `{` to start rename list");
+        }
     }
 
     /// Parse a bare-identifier brace list `{ a, b, … }` (trailing comma
@@ -2246,6 +2272,56 @@ mod tests {
         // And the plain keep form with `all` as an attribute parses too.
         let keep = parse_str("oper f {} [ let s = R project {all}; ];");
         assert!(keep.diagnostics.is_empty(), "{:?}", keep.diagnostics);
+    }
+
+    // ── rename ───────────────────────────────────────────────────────
+
+    #[test]
+    fn rename_parses_as_rename_expr() {
+        let out = parse_str("oper f {} [ let s = R rename {a: b, c: d}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let re = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::RENAME_EXPR)
+            .expect("RENAME_EXPR in tree");
+        // Operand is the NAME_REF `R`; the pairs are an ARG_LIST.
+        assert!(re.children().any(|n| n.kind() == SyntaxKind::NAME_REF));
+        assert!(re.children().any(|n| n.kind() == SyntaxKind::ARG_LIST));
+    }
+
+    #[test]
+    fn rename_binds_looser_than_where() {
+        // `R where a = 1 rename {a: b}` => RENAME(WHERE(R, a = 1), {a: b}).
+        let out = parse_str("oper f {} [ let s = R where a = 1 rename {a: b}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let re = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::RENAME_EXPR)
+            .expect("RENAME_EXPR in tree");
+        let inner = re
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("operand BINARY_EXPR (the where)");
+        assert!(inner.text().to_string().contains(" where "));
+    }
+
+    #[test]
+    fn rename_missing_brace_diagnoses_p0040() {
+        let out = parse_str("oper f {} [ let s = R rename a; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0040"),
+            "expected P0040, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn rename_is_contextual_not_reserved() {
+        // `rename` remains a valid identifier elsewhere.
+        let out = parse_str("oper f {} [ let rename = 1; let s = R where rename = 2; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }
 
     fn find_first(root: &crate::cst::SyntaxNode, kind: SyntaxKind) -> crate::cst::SyntaxNode {

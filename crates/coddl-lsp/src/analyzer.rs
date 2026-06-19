@@ -884,6 +884,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn rename_type_error_surfaces_as_diagnostic() {
+        // A bad rename source surfaces T0029 through the analyze path.
+        let analyzer = Analyzer::new();
+        let uri = url("file:///r.cd");
+        analyzer
+            .put_document(
+                uri.clone(),
+                1,
+                "oper main {} [ let s = Relation { {a: 1} } rename {nope: x}; ];".to_string(),
+            )
+            .await;
+        let snap = analyzer.snapshot(&uri).await.unwrap();
+        assert!(
+            snap.diagnostics.iter().any(|d| d.code == "T0029"),
+            "expected T0029, got {:?}",
+            snap.diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_inlay_hint_shows_renamed_heading() {
+        // `rename {message: msg}` over {id, message} → {id, msg}; the inlay
+        // hint reflects the renamed heading.
+        let analyzer = Analyzer::new();
+        let uri = url("file:///r.cd");
+        analyzer
+            .put_document(
+                uri.clone(),
+                1,
+                "oper main {} [ let s = Relation { {id: 1, message: \"x\"} } rename {message: msg}; ];"
+                    .to_string(),
+            )
+            .await;
+        let snap = analyzer.snapshot(&uri).await.unwrap();
+        assert!(
+            snap.diagnostics.is_empty(),
+            "expected clean typecheck, got {:?}",
+            snap.diagnostics
+        );
+        assert!(
+            snap.hints.iter().any(|h| matches!(
+                &h.ty,
+                coddl_types::Type::Relation(hd)
+                    if hd.lookup("msg").is_some() && hd.lookup("message").is_none()
+            )),
+            "expected a Relation with renamed `msg`, got {:?}",
+            snap.hints
+                .iter()
+                .map(|h| format!("{}", h.ty))
+                .collect::<Vec<_>>()
+        );
+    }
+
     // ── Project model tests ─────────────────────────────────────
 
     use std::fs;
