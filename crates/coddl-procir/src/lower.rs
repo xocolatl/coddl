@@ -133,6 +133,14 @@ struct Lowerer {
     /// later walks (tuple construction, field access) know the static
     /// shape of a `NameRef` lookup result.
     locals: Vec<HashMap<String, (ValueId, ProcType)>>,
+    /// Relation `let`-bindings whose RHS is a pushable relvar-rooted
+    /// relational expression are recorded here as deferred `RelExpr`
+    /// *aliases* instead of being materialized, so `build_rel_expr` sees
+    /// through them (`let gg = Greetings; gg where id = 1` folds into one
+    /// pushed query, and an unused `gg` emits nothing). Parallel to `locals`
+    /// (same push/pop discipline); an alias carries no `ValueId`, so it never
+    /// appears in `locals` and is invisible to scope-release.
+    relexpr_aliases: Vec<HashMap<String, RelExpr>>,
     /// Type of every SSA value defined in the current function. Built
     /// up as each `Inst` is emitted; consulted by lowerings that need
     /// the static type of a base expression (notably field access on
@@ -195,6 +203,7 @@ impl Lowerer {
             next_block: 0,
             insts: Vec::new(),
             locals: vec![HashMap::new()],
+            relexpr_aliases: vec![HashMap::new()],
             value_types: HashMap::new(),
             outer_locals_for_capture: None,
             public_relvars: HashMap::new(),
@@ -260,10 +269,12 @@ impl Lowerer {
 
     fn push_local_scope(&mut self) {
         self.locals.push(HashMap::new());
+        self.relexpr_aliases.push(HashMap::new());
     }
 
     fn pop_local_scope(&mut self) {
         self.locals.pop();
+        self.relexpr_aliases.pop();
     }
 
     fn bind_local(&mut self, name: String, v: ValueId, ty: ProcType) {
@@ -278,6 +289,21 @@ impl Lowerer {
             .iter()
             .rev()
             .find_map(|l| l.get(name).cloned())
+    }
+
+    /// Record a relation `let`-binding as a deferred `RelExpr` alias (see
+    /// `relexpr_aliases`). The binding emits no instruction; `build_rel_expr`
+    /// substitutes the stored expression wherever the name is used.
+    fn bind_alias(&mut self, name: String, rel: RelExpr) {
+        self.relexpr_aliases
+            .last_mut()
+            .expect("scope stack empty")
+            .insert(name, rel);
+    }
+
+    /// Resolve a name to its deferred `RelExpr` alias, innermost scope first.
+    fn lookup_alias(&self, name: &str) -> Option<&RelExpr> {
+        self.relexpr_aliases.iter().rev().find_map(|l| l.get(name))
     }
 
     fn fresh_value(&mut self) -> ValueId {
@@ -298,6 +324,8 @@ impl Lowerer {
         self.insts.clear();
         self.locals.clear();
         self.locals.push(HashMap::new());
+        self.relexpr_aliases.clear();
+        self.relexpr_aliases.push(HashMap::new());
         self.value_types.clear();
     }
 
@@ -641,6 +669,24 @@ impl Lowerer {
             Some(v) => v,
             None => return,
         };
+        // Binding transparency: when a SQL dialect is active and the RHS is a
+        // pushable relvar-rooted relational expression, record it as a
+        // deferred `RelExpr` alias and emit nothing. Uses of the name fold the
+        // expression down into one pushed query (`let gg = Greetings; gg where
+        // id = 1` → a single `SELECT … WHERE`), and an unused binding emits no
+        // query at all. Gating on `try_push` (a pure, non-emitting check)
+        // guarantees the alias is materializable wherever it is later forced.
+        // A `transaction [...]` RHS isn't relvar-rooted (`build_rel_expr`
+        // returns `None`), so it materializes here — keeping public-relvar
+        // reads inside their transaction.
+        if let (Some(dialect), Some(name_tok)) = (self.dialect, stmt.name()) {
+            if let Some(rel) = self.build_rel_expr(&value_expr) {
+                if crate::cut::try_push(&rel, dialect).is_some() {
+                    self.bind_alias(name_tok.text().to_string(), rel);
+                    return;
+                }
+            }
+        }
         // If the RHS is a NameRef to an existing heap-typed binding,
         // the new let creates a second owner of the same value —
         // emit a retain so the refcount reflects both bindings. Pure
@@ -836,12 +882,20 @@ impl Lowerer {
     /// Build a `coddl-relir` expression from a relational AST subtree, or
     /// `None` if the shape isn't one the cut handles (v1: a public-relvar
     /// leaf, optionally restricted by a single `attr = literal`). A `NameRef`
-    /// shadowed by a local is not a relvar read, so it returns `None`.
+    /// that resolves to a deferred relation alias substitutes the aliased
+    /// expression (binding transparency); a `NameRef` shadowed by a
+    /// materialized local is not a relvar read, so it returns `None`.
     fn build_rel_expr(&self, expr: &Expr) -> Option<RelExpr> {
         match expr {
             Expr::NameRef(n) => {
                 let name = n.ident()?;
                 let name = name.text();
+                // A relation `let`-binding recorded as an alias is transparent:
+                // substitute its `RelExpr` so the surrounding algebra folds
+                // down to one pushed query.
+                if let Some(rel) = self.lookup_alias(name) {
+                    return Some(rel.clone());
+                }
                 if self.lookup_local(name).is_some() {
                     return None;
                 }
@@ -1061,6 +1115,14 @@ impl Lowerer {
     fn lower_name_ref(&mut self, n: &NameRef) -> ValueId {
         if let Some(name_tok) = n.ident() {
             let name = name_tok.text();
+            // An aliased relation binding is always resolved by the pushdown
+            // cut (`try_lower_pushed` runs before this in `lower_expr`).
+            // Reaching here for one means the bind-time `try_push` gate and the
+            // force-time push disagree — a lowerer bug, not a user error.
+            debug_assert!(
+                self.lookup_alias(name).is_none(),
+                "alias `{name}` reached lower_name_ref; pushdown should have resolved it"
+            );
             if let Some((v, _ty)) = self.lookup_local(name) {
                 return v;
             }
@@ -1187,6 +1249,7 @@ impl Lowerer {
         let saved_next_block = std::mem::replace(&mut self.next_block, 0);
         let saved_insts = std::mem::take(&mut self.insts);
         let saved_locals = std::mem::replace(&mut self.locals, vec![HashMap::new()]);
+        let saved_aliases = std::mem::replace(&mut self.relexpr_aliases, vec![HashMap::new()]);
         let saved_value_types = std::mem::take(&mut self.value_types);
         self.outer_locals_for_capture = Some(saved_locals.clone());
 
@@ -1235,6 +1298,7 @@ impl Lowerer {
         self.next_block = saved_next_block;
         self.insts = saved_insts;
         self.locals = saved_locals;
+        self.relexpr_aliases = saved_aliases;
         self.value_types = saved_value_types;
         self.outer_locals_for_capture = None;
 
@@ -1876,6 +1940,140 @@ oper main {}\n\
                 .count(),
             1,
             "prologue should register exactly one plan"
+        );
+    }
+
+    // ── binding transparency (relation `let`-aliases fold into pushdown) ──
+
+    const BT_HEAD: &str = "\
+program hello_world_db;\n\
+database greetings;\n\
+public relvar Greetings { id: Integer, message: Text } key { id };\n\
+";
+
+    fn bt_main_insts(src: &str) -> (Module, Vec<Inst>) {
+        let m = lower_ok_with_plan(src, &greetings_plan());
+        let insts = m
+            .functions
+            .iter()
+            .find(|f| f.name == "main")
+            .expect("main")
+            .blocks[0]
+            .insts
+            .clone();
+        (m, insts)
+    }
+
+    #[test]
+    fn binding_transparency_pushes_where_through_let() {
+        // `gg` and `greeting` are transparent aliases, so `extract greeting`
+        // folds to the same single pushed query as `extract (Greetings where
+        // id = 1)` — no `SELECT *`, no in-process `where`.
+        let src = format!(
+            "{BT_HEAD}oper main {{}} [\n\
+             let m = transaction [\n\
+                 let gg = Greetings;\n\
+                 let greeting = gg where id = 1;\n\
+                 extract greeting\n\
+             ];\n\
+             ];\n"
+        );
+        let (m, insts) = bt_main_insts(&src);
+        assert_eq!(
+            insts.iter().filter(|i| matches!(i, Inst::Query { .. })).count(),
+            1,
+            "should fold to one pushed query in:\n{m}"
+        );
+        assert!(
+            !insts.iter().any(|i| matches!(i, Inst::Where { .. })),
+            "where should push through the binding, not run in-process:\n{m}"
+        );
+        assert!(
+            !insts.iter().any(|i| matches!(i, Inst::RelvarRead { .. })),
+            "no in-process relvar read:\n{m}"
+        );
+        assert_eq!(m.plans.len(), 1);
+        assert_eq!(
+            m.plans[0].sql,
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?"#
+        );
+    }
+
+    #[test]
+    fn unused_relvar_binding_emits_no_query() {
+        // `gg` is bound but never forced — its alias emits nothing, so only the
+        // `where`d read runs (one query, not a stray `SELECT *`).
+        let src = format!(
+            "{BT_HEAD}oper main {{}} [\n\
+             let m = transaction [\n\
+                 let gg = Greetings;\n\
+                 extract (Greetings where id = 1)\n\
+             ];\n\
+             ];\n"
+        );
+        let (m, insts) = bt_main_insts(&src);
+        assert_eq!(
+            insts.iter().filter(|i| matches!(i, Inst::Query { .. })).count(),
+            1,
+            "the unused `gg` alias should add no query in:\n{m}"
+        );
+        assert_eq!(m.plans.len(), 1);
+        assert_eq!(
+            m.plans[0].sql,
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?"#
+        );
+    }
+
+    #[test]
+    fn binding_to_transaction_result_stays_in_process() {
+        // A `transaction [...]` result is a materialized value, not an alias,
+        // so a `where` over it outside the transaction runs in-process — a
+        // public relvar can't be read outside its transaction.
+        let src = format!(
+            "{BT_HEAD}oper main {{}} [\n\
+             let g = transaction [ Greetings ];\n\
+             let hw = g where id = 1;\n\
+             let t = extract hw;\n\
+             ];\n"
+        );
+        let (m, insts) = bt_main_insts(&src);
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::Where { .. })),
+            "where over a transaction-result binding must be in-process:\n{m}"
+        );
+        assert_eq!(m.plans.len(), 1);
+        assert_eq!(
+            m.plans[0].sql,
+            r#"SELECT "id", "message" FROM "greetings""#,
+            "the relvar materializes (SELECT *) inside the transaction:\n{m}"
+        );
+    }
+
+    #[test]
+    fn binding_transparency_pushes_project_through_let() {
+        // `project` folds through the binding into a narrowed pushed SELECT.
+        let src = format!(
+            "{BT_HEAD}oper main {{}} [\n\
+             let m = transaction [\n\
+                 let gg = Greetings;\n\
+                 let p = gg project {{message}};\n\
+                 p\n\
+             ];\n\
+             ];\n"
+        );
+        let (m, insts) = bt_main_insts(&src);
+        assert_eq!(
+            insts.iter().filter(|i| matches!(i, Inst::Query { .. })).count(),
+            1,
+            "project should fold to one pushed query in:\n{m}"
+        );
+        assert!(
+            !insts.iter().any(|i| matches!(i, Inst::Project { .. })),
+            "project should push through the binding, not run in-process:\n{m}"
+        );
+        assert!(
+            m.plans[0].sql.contains(r#""message""#) && !m.plans[0].sql.contains(r#""id""#),
+            "expected a narrowed SELECT on `message` in:\n{m}"
         );
     }
 

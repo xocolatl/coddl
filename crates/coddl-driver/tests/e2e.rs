@@ -1422,6 +1422,66 @@ fn tuple_field_init_shorthand_runs_byte_identical() {
     assert_eq!(llvm, run_shorthand(TUPLE_SHORTHAND_SRC, "cranelift"));
 }
 
+// ── binding transparency (relation `let`-aliases fold into one pushed query) ──
+
+#[test]
+fn binding_transparency_folds_to_single_pushed_query() {
+    // Owned twin of hello-world-db: `gg` and `greeting` are transparent
+    // relation aliases, so the decomposed `let gg = Greetings; gg where id = 1`
+    // lowers to ONE pushed `SELECT … WHERE "id" = 1` — no `SELECT *` for the
+    // unused/aliased `gg`, no in-process `where`.
+    for backend in ["llvm", "cranelift"] {
+        ensure_runtime_built();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = seed_greetings_fixtures(tmp.path());
+        let cd = tmp.path().join("bt.cd");
+        std::fs::write(
+            &cd,
+            "program bt;\n\
+             database greetings;\n\
+             public relvar Greetings { id: Integer, message: Text } key { id };\n\
+             oper main {} [\n\
+                 let message = transaction [\n\
+                     let gg = Greetings;\n\
+                     let greeting = gg where id = 1;\n\
+                     (extract greeting).message\n\
+                 ];\n\
+                 write_line { message };\n\
+             ];\n",
+        )
+        .expect("write bt.cd");
+        let log = tmp.path().join("audit.log");
+        let out = coddl()
+            .env("CODDL_GREETINGS_FILE", &db)
+            .env("CODDL_AUDIT_LOG", &log)
+            .args(["run", &format!("--backend={backend}")])
+            .arg(&cd)
+            .output()
+            .expect("spawn coddl");
+        assert!(
+            out.status.success(),
+            "binding transparency on {backend} failed: stderr=\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"hello world\n", "on {backend}");
+
+        let log_txt = std::fs::read_to_string(&log).expect("read audit log");
+        let selects: Vec<&str> = log_txt
+            .lines()
+            .filter(|l| l.contains("SELECT"))
+            .collect();
+        assert_eq!(
+            selects.len(),
+            1,
+            "expected exactly one query on {backend}, got:\n{log_txt}"
+        );
+        assert!(
+            selects[0].contains(r#"WHERE "id" = 1"#),
+            "the single query should be the pushed filter on {backend}, got:\n{log_txt}"
+        );
+    }
+}
+
 #[test]
 fn public_relvar_outside_transaction_diagnoses_t0025() {
     let tmp = tempfile::tempdir().expect("tempdir");
