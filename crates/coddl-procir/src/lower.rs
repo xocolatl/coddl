@@ -1795,11 +1795,14 @@ mod tests {
 
     fn lower_ok(src: &str) -> Module {
         let out = lower(src, FileId(0));
-        assert!(
-            out.diagnostics.is_empty(),
-            "unexpected diagnostics: {:?}",
-            out.diagnostics
-        );
+        // Lowering requires no *errors*; warnings (e.g. T0032 unused-binding)
+        // are orthogonal and don't block code generation.
+        let errors: Vec<_> = out
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == coddl_diagnostics::Severity::Error)
+            .collect();
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         out.module
             .expect("module should be produced on clean check")
     }
@@ -1872,11 +1875,13 @@ oper main {}\n\
 
     fn lower_ok_with_plan(src: &str, plan: &Plan) -> Module {
         let out = lower_with_plan(src, FileId(0), Some(plan));
-        assert!(
-            out.diagnostics.is_empty(),
-            "unexpected diagnostics: {:?}",
-            out.diagnostics
-        );
+        // Only errors block lowering; T0032 unused-binding warnings don't.
+        let errors: Vec<_> = out
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == coddl_diagnostics::Severity::Error)
+            .collect();
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         out.module.expect("module should be produced on clean check")
     }
 
@@ -2136,7 +2141,7 @@ oper main {}\n\
         // A relation-literal projection isn't relvar-rooted, so the cut
         // declines and it lowers in-process to `Inst::Project` (not a
         // pushed query), narrowing the heading to the kept attribute.
-        let src = "oper main {} [ let s = Relation { {a: 1, b: 2} } project {a}; ];";
+        let src = "oper main {} [ let _s = Relation { {a: 1, b: 2} } project {a}; ];";
         let out = lower(src, FileId(0));
         assert!(
             out.diagnostics.is_empty(),
@@ -2183,7 +2188,7 @@ oper main {}\n\
     fn project_all_but_over_relation_literal_keeps_complement_in_process() {
         // `Relation {{a, b}} project all but {a}` lowers in-process to
         // `Inst::Project` whose result heading is the complement `{b}`.
-        let src = "oper main {} [ let s = Relation { {a: 1, b: 2} } project all but {a}; ];";
+        let src = "oper main {} [ let _s = Relation { {a: 1, b: 2} } project all but {a}; ];";
         let out = lower(src, FileId(0));
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
         let m = out.module.expect("module");
@@ -2239,7 +2244,7 @@ oper main {} [
         // `Relation {{a, b}} rename {a: z}` lowers in-process to `Inst::Rename`
         // with the renamed (re-sorted) result heading {b, z} and perm [1, 0]
         // (dst b ← src 1, dst z ← src 0).
-        let src = "oper main {} [ let s = Relation { {a: 1, b: 2} } rename {a: z}; ];";
+        let src = "oper main {} [ let _s = Relation { {a: 1, b: 2} } rename {a: z}; ];";
         let out = lower(src, FileId(0));
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
         let m = out.module.expect("module");

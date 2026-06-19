@@ -806,7 +806,7 @@ mod tests {
             .put_document(
                 uri.clone(),
                 1,
-                "oper main {} [ let s = Relation { {id: 1, message: \"x\"} } project {message}; ];"
+                "oper main {} [ let _s = Relation { {id: 1, message: \"x\"} } project {message}; ];"
                     .to_string(),
             )
             .await;
@@ -851,6 +851,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unused_binding_surfaces_as_warning() {
+        // An unused `let` reaches the editor as a Warning-severity diagnostic
+        // (the yellow squiggle) — `lsp_convert` maps it to DiagnosticSeverity::WARNING.
+        let analyzer = Analyzer::new();
+        let uri = url("file:///unused.cd");
+        analyzer
+            .put_document(
+                uri.clone(),
+                1,
+                "oper main {} [ let greeting = 1; ];".to_string(),
+            )
+            .await;
+        let snap = analyzer.snapshot(&uri).await.unwrap();
+        let d = snap
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "T0032")
+            .expect("expected T0032 for the unused `greeting`");
+        assert_eq!(d.severity, coddl_diagnostics::Severity::Warning);
+    }
+
+    #[tokio::test]
     async fn project_all_but_inlay_hint_shows_complement() {
         // `all but {id}` keeps the complement `{message}` — the inlay hint
         // reflects it, flowing from `coddl_types` with no LSP wiring.
@@ -860,7 +882,7 @@ mod tests {
             .put_document(
                 uri.clone(),
                 1,
-                "oper main {} [ let s = Relation { {id: 1, message: \"x\"} } project all but {id}; ];"
+                "oper main {} [ let _s = Relation { {id: 1, message: \"x\"} } project all but {id}; ];"
                     .to_string(),
             )
             .await;
@@ -914,7 +936,7 @@ mod tests {
             .put_document(
                 uri.clone(),
                 1,
-                "oper main {} [ let s = Relation { {id: 1, message: \"x\"} } rename {message: msg}; ];"
+                "oper main {} [ let _s = Relation { {id: 1, message: \"x\"} } rename {message: msg}; ];"
                     .to_string(),
             )
             .await;

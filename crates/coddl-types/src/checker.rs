@@ -28,29 +28,86 @@ use crate::ty::{Heading, Type};
 /// parameter scope; each `transaction [...]` block pushes a new layer;
 /// `let` statements insert into the topmost layer. Lookups walk
 /// innermost-first so inner bindings shadow outer ones.
+/// Where a scope binding came from, so the unused-binding check (T0032)
+/// fires only on user `let`s — never on injected names (public relvars,
+/// `where`-predicate heading attributes) or, for now, parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BindingOrigin {
+    Let,
+    Param,
+    Relvar,
+    WhereAttr,
+}
+
+/// One binding in a scope layer: its `Type` for lookup, plus the metadata the
+/// unused-binding check needs — the name-token span (for the squiggle), the
+/// origin, and whether any `NameRef` ever resolved to it.
+struct Binding {
+    ty: Type,
+    name: String,
+    span: Span,
+    origin: BindingOrigin,
+    used: bool,
+}
+
 #[derive(Default)]
 struct Scope {
-    layers: Vec<HashMap<String, Type>>,
+    /// Per layer: name -> index of the *active* binding in `records[layer]`.
+    /// Re-binding a name overwrites the index (shadowing) but leaves the
+    /// shadowed `Binding` in `records`, so it can still be reported unused.
+    layers: Vec<HashMap<String, usize>>,
+    /// Per layer: every binding inserted, in insertion order (append-only),
+    /// parallel to `layers`.
+    records: Vec<Vec<Binding>>,
 }
 
 impl Scope {
     fn push(&mut self) {
         self.layers.push(HashMap::new());
+        self.records.push(Vec::new());
     }
 
-    fn pop(&mut self) {
+    /// Pop the topmost layer, returning its bindings so the caller can report
+    /// any that went unused.
+    fn pop(&mut self) -> Vec<Binding> {
         self.layers.pop();
+        self.records.pop().unwrap_or_default()
     }
 
-    fn insert(&mut self, name: String, ty: Type) {
+    fn insert(&mut self, name: String, ty: Type, span: Span, origin: BindingOrigin) {
+        let records = self.records.last_mut().expect("scope stack is empty");
+        let idx = records.len();
+        records.push(Binding {
+            ty,
+            name: name.clone(),
+            span,
+            origin,
+            used: false,
+        });
         self.layers
             .last_mut()
             .expect("scope stack is empty")
-            .insert(name, ty);
+            .insert(name, idx);
     }
 
     fn lookup(&self, name: &str) -> Option<&Type> {
-        self.layers.iter().rev().find_map(|l| l.get(name))
+        for layer in (0..self.layers.len()).rev() {
+            if let Some(&idx) = self.layers[layer].get(name) {
+                return Some(&self.records[layer][idx].ty);
+            }
+        }
+        None
+    }
+
+    /// Mark the active binding for `name` used (innermost layer first). A
+    /// shadowed binding keeps `used = false` and is still reported unused.
+    fn mark_used(&mut self, name: &str) {
+        for layer in (0..self.layers.len()).rev() {
+            if let Some(&idx) = self.layers[layer].get(name) {
+                self.records[layer][idx].used = true;
+                return;
+            }
+        }
     }
 }
 
@@ -165,6 +222,31 @@ impl TypeChecker {
     fn error(&mut self, span: Span, code: &'static str, message: impl Into<String>) {
         self.diagnostics
             .push(Diagnostic::error(span, code, message));
+    }
+
+    fn warn(&mut self, span: Span, code: &'static str, message: impl Into<String>) {
+        self.diagnostics
+            .push(Diagnostic::warning(span, code, message));
+    }
+
+    /// Emit T0032 for every user `let` binding in a popped scope layer that no
+    /// `NameRef` ever resolved to. A leading `_` (including bare `_`) opts out
+    /// — the "unused-OK" convention. Injected names (relvars, `where`
+    /// attributes) and parameters are excluded by origin.
+    fn warn_unused(&mut self, layer: Vec<Binding>) {
+        for b in layer {
+            if b.used || !matches!(b.origin, BindingOrigin::Let) {
+                continue;
+            }
+            if b.name.starts_with('_') {
+                continue;
+            }
+            self.warn(
+                b.span,
+                "T0032",
+                format!("unused binding `{}`; prefix with `_` if intentional", b.name),
+            );
+        }
     }
 
     fn node_span(&self, node: &SyntaxNode) -> Span {
@@ -462,7 +544,7 @@ impl TypeChecker {
         for (name, info) in self.relvars.iter() {
             if matches!(info.kind, RelvarKind::Public) {
                 let ty = Type::Relation(info.heading.clone());
-                scope.insert(name.to_string(), ty);
+                scope.insert(name.to_string(), ty, Span::default(), BindingOrigin::Relvar);
                 self.public_relvars.insert(name.to_string());
             }
         }
@@ -492,7 +574,7 @@ impl TypeChecker {
                     Some(name_tok) => self.resolve_type_name(&name_tok),
                     None => Type::Unknown,
                 };
-                scope.insert(name, ty);
+                scope.insert(name, ty, self.token_span(&name_tok), BindingOrigin::Param);
                 param_count += 1;
             }
         }
@@ -560,7 +642,8 @@ impl TypeChecker {
             }
         }
 
-        scope.pop();
+        let unused = scope.pop();
+        self.warn_unused(unused);
     }
 
     fn resolve_type_name(&mut self, token: &SyntaxToken) -> Type {
@@ -640,7 +723,12 @@ impl TypeChecker {
         };
 
         if let Some(name_tok) = stmt.name() {
-            scope.insert(name_tok.text().to_string(), bound_ty);
+            scope.insert(
+                name_tok.text().to_string(),
+                bound_ty,
+                self.token_span(&name_tok),
+                BindingOrigin::Let,
+            );
         }
     }
 
@@ -657,7 +745,12 @@ impl TypeChecker {
                     return Type::Unknown;
                 };
                 let name = ident.text();
-                if let Some(ty) = scope.lookup(name) {
+                if let Some(ty) = scope.lookup(name).cloned() {
+                    // Record the reference so the unused-binding check (T0032)
+                    // doesn't flag this binding. This is the sole name-
+                    // resolution site, so it captures every source use —
+                    // including ones the lowerer later folds/pushes away.
+                    scope.mark_used(name);
                     // A public-relvar reference is allowed only inside
                     // a `transaction [...]` block — that's where the
                     // runtime can safely begin/commit (or replay on
@@ -673,7 +766,7 @@ impl TypeChecker {
                             ),
                         );
                     }
-                    return ty.clone();
+                    return ty;
                 }
                 self.error(
                     self.token_span(&ident),
@@ -1048,7 +1141,7 @@ impl TypeChecker {
         // attributes shadow any outer locals with the same name.
         scope.push();
         for (name, ty) in heading.attrs() {
-            scope.insert(name.clone(), ty.clone());
+            scope.insert(name.clone(), ty.clone(), Span::default(), BindingOrigin::WhereAttr);
         }
         let rhs_ty = match bin.rhs() {
             Some(e) => self.check_expr(&e, scope),
@@ -1161,7 +1254,8 @@ impl TypeChecker {
             None => Type::unit(),
         };
         self.transaction_depth -= 1;
-        scope.pop();
+        let unused = scope.pop();
+        self.warn_unused(unused);
         ty
     }
 
@@ -1472,7 +1566,7 @@ mod tests {
     fn let_without_annotation_emits_type_hint() {
         // The unannotated `let count = 42;` should surface a hint
         // of type Integer, positioned at the end of `count`.
-        let src = "oper main {} [ let count = 42; ];";
+        let src = "oper main {} [ let _count = 42; ];";
         let out = check(src, FileId(0), FileKind::Cd);
         assert!(
             out.diagnostics.is_empty(),
@@ -1483,9 +1577,9 @@ mod tests {
             .hints
             .iter()
             .find(|h| matches!(h.ty, Type::Integer))
-            .expect("expected Integer hint for `count`");
-        // The hint span ends at the byte position right after `count`.
-        let count_end = src.find("count").unwrap() + "count".len();
+            .expect("expected Integer hint for `_count`");
+        // The hint span ends at the byte position right after `_count`.
+        let count_end = src.find("_count").unwrap() + "_count".len();
         assert_eq!(hint.span.start as usize, count_end);
         assert_eq!(hint.span.end as usize, count_end);
     }
@@ -1864,7 +1958,7 @@ mod tests {
     #[test]
     fn relation_lit_with_uniform_tuples_checks_clean() {
         let src = "oper main {} [ \
-                   let r = Relation { {a: 1}, {a: 2}, {a: 3} }; \
+                   let _r = Relation { {a: 1}, {a: 2}, {a: 3} }; \
                    ];";
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
@@ -1902,7 +1996,7 @@ mod tests {
         // polymorphic param — no, that wants a Relation. Easier:
         // assign to a let and the typechecker's hint surfaces the
         // inferred type as Boolean; for now just confirm no diags.
-        let src = "oper main {} [ let b = 1 = 2; ];";
+        let src = "oper main {} [ let _b = 1 = 2; ];";
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "{diags:?}");
     }
@@ -1911,7 +2005,7 @@ mod tests {
     fn where_on_relation_filter_checks_clean() {
         let src = "oper main {} [ \
                    let r = Relation { {a: 1}, {a: 2} }; \
-                   let s = r where a = 2; \
+                   let _s = r where a = 2; \
                    ];";
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "{diags:?}");
@@ -1937,7 +2031,7 @@ mod tests {
     #[test]
     fn text_equality_typechecks() {
         // `=` and `<>` accept matching Text operands (result Boolean); no T0021.
-        let src = "oper main {} [ let a = \"x\" = \"y\"; let b = \"x\" <> \"y\"; ];";
+        let src = "oper main {} [ let _a = \"x\" = \"y\"; let _b = \"x\" <> \"y\"; ];";
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "{diags:?}");
     }
@@ -1963,7 +2057,7 @@ mod tests {
     fn tuple_field_init_shorthand_builds_heading() {
         // `{a}` ≡ `{a: a}` — the tuple gets attribute `a` of a's type, so
         // `t.a` resolves.
-        let src = "oper main {} [ let a = 1; let t = {a}; let n = t.a; ];";
+        let src = "oper main {} [ let a = 1; let t = {a}; let _n = t.a; ];";
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "{diags:?}");
     }
@@ -1978,11 +2072,14 @@ mod tests {
     fn where_heading_attrs_shadow_outer_locals() {
         // Outer `a` is Text; the predicate's `a` must resolve to the
         // heading's Integer attribute, so the comparison `a = 2`
-        // (Integer = Integer) typechecks cleanly.
+        // (Integer = Integer) typechecks cleanly. The outer `a` is used by
+        // `write_line` so it isn't itself flagged unused — its presence is
+        // what makes this a genuine shadowing test.
         let src = "oper main {} [ \
                    let a = \"outer\"; \
                    let r = Relation { {a: 1}, {a: 2} }; \
-                   let s = r where a = 2; \
+                   let _s = r where a = 2; \
+                   write_line { message: a }; \
                    ];";
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "{diags:?}");
@@ -2000,7 +2097,7 @@ mod tests {
     fn project_on_relation_checks_clean() {
         let src = "oper main {} [ \
                    let r = Relation { {a: 1, b: 2} }; \
-                   let s = r project {a}; \
+                   let _s = r project {a}; \
                    ];";
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "{diags:?}");
@@ -2048,7 +2145,7 @@ mod tests {
         let src = "oper main {} [ \
                    let r = Relation { {a: 1, b: 2} }; \
                    let t = extract (r project {a}); \
-                   let x = t.a; \
+                   let _x = t.a; \
                    ];";
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "{diags:?}");
@@ -2060,7 +2157,7 @@ mod tests {
         let ok = "oper main {} [ \
                   let r = Relation { {a: 1, b: 2} }; \
                   let t = extract (r project all but {a}); \
-                  let x = t.b; \
+                  let _x = t.b; \
                   ];";
         assert!(diagnostics(ok).is_empty(), "{:?}", diagnostics(ok));
         // …and the removed `a` is gone (T0017 on access).
@@ -2099,8 +2196,8 @@ mod tests {
         let src = "oper main {} [ \
                    let r = Relation { {a: 1, b: 2} }; \
                    let t = extract (r project all but {}); \
-                   let x = t.a; \
-                   let y = t.b; \
+                   let _x = t.a; \
+                   let _y = t.b; \
                    ];";
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "{diags:?}");
@@ -2114,7 +2211,7 @@ mod tests {
         let ok = "oper main {} [ \
                   let r = Relation { {a: 1, b: 2} }; \
                   let t = extract (r rename {a: x}); \
-                  let v = t.x; let w = t.b; \
+                  let _v = t.x; let _w = t.b; \
                   ];";
         assert!(diagnostics(ok).is_empty(), "{:?}", diagnostics(ok));
         let gone = "oper main {} [ \
@@ -2167,7 +2264,7 @@ mod tests {
         // {a, b} rename {a: b, b: a} swaps names — no collision.
         let src = "oper main {} [ \
                    let r = Relation { {a: 1, b: 2} }; \
-                   let s = r rename {a: b, b: a}; \
+                   let _s = r rename {a: b, b: a}; \
                    ];";
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "{diags:?}");
@@ -2185,7 +2282,7 @@ mod tests {
     fn extract_on_relation_checks_clean() {
         let src = "oper main {} [ \
                    let r = Relation { {a: 1}, {a: 2} }; \
-                   let t = extract (r where a = 2); \
+                   let _t = extract (r where a = 2); \
                    ];";
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "{diags:?}");
@@ -2203,6 +2300,69 @@ mod tests {
                    ];";
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    // ── unused-binding warning (T0032) ───────────────────────────────
+
+    #[test]
+    fn unused_let_binding_warns_t0032() {
+        let src = "oper main {} [ let x = 1; ];";
+        assert!(codes(src).contains(&"T0032"));
+    }
+
+    #[test]
+    fn unused_binding_is_a_warning_not_an_error() {
+        let src = "oper main {} [ let x = 1; ];";
+        let d = diagnostics(src);
+        let t0032 = d.iter().find(|d| d.code == "T0032").expect("expected T0032");
+        assert_eq!(t0032.severity, coddl_diagnostics::Severity::Warning);
+    }
+
+    #[test]
+    fn underscore_prefixed_binding_is_exempt() {
+        let src = "oper main {} [ let _x = 1; ];";
+        assert!(!codes(src).contains(&"T0032"));
+    }
+
+    #[test]
+    fn bare_underscore_binding_is_exempt() {
+        let src = "oper main {} [ let _ = 1; ];";
+        assert!(!codes(src).contains(&"T0032"));
+    }
+
+    #[test]
+    fn used_binding_does_not_warn() {
+        let src = "oper main {} [ let x = \"hi\"; write_line { message: x }; ];";
+        assert!(!codes(src).contains(&"T0032"));
+    }
+
+    #[test]
+    fn shadowed_then_unused_binding_warns_once() {
+        // `x = "a"` is shadowed and never read → warns; the active `x = "b"`
+        // is used → no warning. Exactly one T0032.
+        let src = "oper main {} [ let x = \"a\"; let x = \"b\"; write_line { message: x }; ];";
+        let n = codes(src).iter().filter(|c| **c == "T0032").count();
+        assert_eq!(n, 1, "only the shadowed `x` should warn: {:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn where_predicate_attrs_do_not_warn() {
+        // The heading attr `a` injected into the predicate scope must not be
+        // flagged unused (WhereAttr origin); only user `let`s warn. `_s` is
+        // exempt, `r` is used, so the program is diagnostic-free.
+        let src =
+            "oper main {} [ let r = Relation { {a: 1}, {a: 2} }; let _s = r where a = 2; ];";
+        assert!(!codes(src).contains(&"T0032"));
+    }
+
+    #[test]
+    fn binding_used_only_inside_a_pushed_expression_is_used() {
+        // `r` is referenced only inside `r where a = 2` (an expression the
+        // lowerer may fold/push away) — usage is a source-level fact, so `r`
+        // is not flagged. `_s` is exempt.
+        let src =
+            "oper main {} [ let r = Relation { {a: 1}, {a: 2} }; let _s = r where a = 2; ];";
+        assert!(!codes(src).contains(&"T0032"));
     }
 
     #[test]
