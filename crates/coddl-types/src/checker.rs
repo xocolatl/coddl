@@ -1943,6 +1943,32 @@ mod tests {
     }
 
     #[test]
+    fn field_init_shorthand_resolves_the_binding() {
+        // `write_line { message }` ≡ `{ message: message }`: with `message`
+        // bound in scope it checks clean and matches the `message` parameter.
+        let src = "oper main {} [ let message = \"hi\"; write_line { message }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn field_init_shorthand_unbound_diagnoses_t0001() {
+        // Shorthand `{ message }` with no `message` in scope is an unresolved
+        // name, exactly like `{ message: message }` would be.
+        let src = "oper main {} [ write_line { message }; ];";
+        assert!(codes(src).contains(&"T0001"));
+    }
+
+    #[test]
+    fn tuple_field_init_shorthand_builds_heading() {
+        // `{a}` ≡ `{a: a}` — the tuple gets attribute `a` of a's type, so
+        // `t.a` resolves.
+        let src = "oper main {} [ let a = 1; let t = {a}; let n = t.a; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
     fn where_non_relation_lhs_diagnoses_t0023() {
         let src = "oper main {} [ let s = 1 where true; ];";
         assert!(codes(src).contains(&"T0023"));

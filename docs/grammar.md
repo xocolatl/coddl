@@ -466,17 +466,32 @@ function that implements it.
                     -- Relational rename. Postfix at pipeline precedence
                     -- (like <project-suffix>); wraps the operand in
                     -- RENAME_EXPR. The `old: new` pairs reuse <arg-list>
-                    -- (the `new` side parses as a <name-ref>); the
-                    -- typechecker validates each target is a bare
-                    -- attribute name. P0040 on a missing `{`.
+                    -- with field-init shorthand DISABLED — the colon is
+                    -- required (P0017 on `rename { old }`), since a shorthand
+                    -- rename would be the no-op `old -> old`. The `new` side
+                    -- parses as a <name-ref>; the typechecker validates each
+                    -- target is a bare attribute name. P0040 on a missing `{`.
 <transaction-expr> ::= 'transaction' <block> ;                 -- parse_transaction_expr
 <name-ref>      ::= <identifier> ;
 <arg-list>      ::= '{' [ <named-arg> commalist ] '}' ;        -- parse_arg_list
-<named-arg>     ::= <identifier> ':' <expr> ;                  -- parse_named_arg
+<named-arg>     ::= <identifier> [ ':' <expr> ] ;              -- parse_named_arg
+                    -- Field-init shorthand: a bare `<identifier>` (no colon)
+                    -- means `<identifier>: <identifier>` — the value is the
+                    -- same-named binding in scope, like Rust's struct
+                    -- field-init shorthand. The parser wraps the name in a
+                    -- NAME_REF (retroactive start_node_at) so the value view
+                    -- is a name-ref and every consumer sees the explicit
+                    -- form; no tokens are synthesized, so the CST stays
+                    -- byte-lossless. Shorthand is enabled in call-position
+                    -- <arg-list> and in <tuple-lit>, and DISABLED in
+                    -- <rename-suffix> (the colon stays required there: a
+                    -- shorthand rename would be the no-op `old -> old`).
+                    -- P0016 (no name); P0017 (no `:` where it is required).
 <tuple-lit>     ::= '{' [ <named-arg> commalist ] '}' ;        -- parse_tuple_lit
                     -- Same grammar as <arg-list>; the wrapping node
                     -- kind (TUPLE_LIT vs ARG_LIST) distinguishes a
                     -- tuple value from a call-site argument list.
+                    -- Field-init shorthand applies (e.g. `{a}` ≡ `{a: a}`).
                     -- Empty '{}' is the unit value, type Tuple {}.
 <relation-lit>  ::= 'Relation' '{' [ <tuple-lit> commalist ] '}' ;  -- parse_relation_lit
                     -- 'Relation' is a contextual keyword; recognized

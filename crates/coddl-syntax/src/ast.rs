@@ -506,12 +506,22 @@ impl ArgList {
 ast_node!(pub NamedArg, NAMED_ARG);
 
 impl NamedArg {
-    /// The parameter name on the left of the `:`.
+    /// The parameter name. For the explicit `name: value` form it's the
+    /// leading bare `IDENT` before the colon. For the field-init shorthand
+    /// `name` (≡ `name: name`) there is no bare leading `IDENT` — the name is
+    /// wrapped in the value `NAME_REF` — so fall back to that name-ref's
+    /// identifier. (`first_token_of_kind` only scans direct children, so the
+    /// wrapped `IDENT` is invisible to it.)
     pub fn name(&self) -> Option<SyntaxToken> {
-        first_token_of_kind(&self.syntax, SyntaxKind::IDENT)
+        first_token_of_kind(&self.syntax, SyntaxKind::IDENT).or_else(|| match self.value()? {
+            Expr::NameRef(n) => n.ident(),
+            _ => None,
+        })
     }
 
-    /// The value expression on the right of the `:`.
+    /// The value expression. `name: value` yields `value`; the shorthand
+    /// `name` yields the `NAME_REF` wrapping the name (so consumers resolve
+    /// and lower it exactly like the explicit `name: name`).
     pub fn value(&self) -> Option<Expr> {
         self.syntax.children().find_map(Expr::cast)
     }

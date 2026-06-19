@@ -550,7 +550,7 @@ impl<'a> Parser<'a> {
             match self.current() {
                 SyntaxKind::L_BRACE => {
                     self.start_node_at(cp, SyntaxKind::CALL_EXPR);
-                    self.parse_arg_list();
+                    self.parse_arg_list(true); // operator calls allow field-init shorthand
                     self.finish_node();
                 }
                 SyntaxKind::DOT => {
@@ -721,7 +721,7 @@ impl<'a> Parser<'a> {
         }
 
         loop {
-            self.parse_named_arg();
+            self.parse_named_arg(true);
             if !self.eat(SyntaxKind::COMMA) {
                 break;
             }
@@ -823,7 +823,7 @@ impl<'a> Parser<'a> {
 
     /// `{ <named_arg>, … }` — the call-site argument list. Empty and
     /// trailing-comma forms are both accepted.
-    fn parse_arg_list(&mut self) {
+    fn parse_arg_list(&mut self, allow_shorthand: bool) {
         debug_assert!(self.at(SyntaxKind::L_BRACE));
         self.start_node(SyntaxKind::ARG_LIST);
         self.bump(); // {
@@ -834,7 +834,7 @@ impl<'a> Parser<'a> {
         }
 
         loop {
-            self.parse_named_arg();
+            self.parse_named_arg(allow_shorthand);
             if !self.eat(SyntaxKind::COMMA) {
                 break;
             }
@@ -849,18 +849,35 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
-    /// `<name>: <expr>` inside an argument list. The shorthand bare
-    /// `<name>` (= `<name>: <name>`) is deferred.
-    fn parse_named_arg(&mut self) {
+    /// `<name>: <expr>` inside an argument list, or — when `allow_shorthand`
+    /// — the field-init shorthand bare `<name>` (≡ `<name>: <name>`, the
+    /// value is the same-named binding in scope). The shorthand wraps the
+    /// just-read `IDENT` in a `NAME_REF` (retroactive `start_node_at`) so the
+    /// AST's `value()` view yields a name-ref and every consumer sees the
+    /// explicit form; no tokens are synthesized, so the CST stays
+    /// byte-lossless. `allow_shorthand` is `false` in rename position, where
+    /// the colon stays required (a shorthand rename would be an identity
+    /// rename `old -> old`).
+    fn parse_named_arg(&mut self, allow_shorthand: bool) {
         self.bump_trivia();
         self.start_node(SyntaxKind::NAMED_ARG);
-        if !self.eat(SyntaxKind::IDENT) {
+        let cp = self.checkpoint();
+        let has_name = self.eat(SyntaxKind::IDENT);
+        if !has_name {
             self.error("P0016", "expected argument name");
         }
-        if !self.eat(SyntaxKind::COLON) {
+        if self.at(SyntaxKind::COLON) {
+            self.bump(); // `:`
+            self.parse_expr();
+        } else if allow_shorthand && has_name {
+            // Field-init shorthand: wrap the name in a `NAME_REF` so it reads
+            // as the value `<name>`.
+            self.start_node_at(cp, SyntaxKind::NAME_REF);
+            self.finish_node();
+        } else {
             self.error("P0017", "expected `:` after argument name");
+            self.parse_expr();
         }
-        self.parse_expr();
         self.finish_node();
     }
 
@@ -994,7 +1011,7 @@ impl<'a> Parser<'a> {
         self.bump_trivia();
         self.bump(); // `rename`
         if self.at(SyntaxKind::L_BRACE) {
-            self.parse_arg_list();
+            self.parse_arg_list(false); // rename keeps the colon required (no shorthand)
         } else {
             self.error("P0040", "expected `{` to start rename list");
         }
@@ -1792,6 +1809,86 @@ mod tests {
     }
 
     #[test]
+    fn tuple_literal_field_init_shorthand_parses() {
+        // `{a}` ≡ `{a: a}`: the NAMED_ARG has no colon and wraps the name in
+        // a NAME_REF (the value view).
+        let out = parse_str("oper f {} [ let a = 1; let t = {a}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let tuple = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::TUPLE_LIT)
+            .expect("TUPLE_LIT in tree");
+        let fields: Vec<_> = tuple.children().collect();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].kind(), SyntaxKind::NAMED_ARG);
+        assert_eq!(fields[0].text(), "a");
+        assert!(
+            fields[0].children().any(|n| n.kind() == SyntaxKind::NAME_REF),
+            "shorthand value should be a NAME_REF"
+        );
+    }
+
+    #[test]
+    fn arg_list_field_init_shorthand_parses() {
+        let out = parse_str("oper f {} [ let message = \"hi\"; write_line {message}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let arg_list = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::ARG_LIST)
+            .expect("ARG_LIST in tree");
+        let args: Vec<_> = arg_list.children().collect();
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].kind(), SyntaxKind::NAMED_ARG);
+        assert_eq!(args[0].text(), "message");
+        assert!(args[0].children().any(|n| n.kind() == SyntaxKind::NAME_REF));
+    }
+
+    #[test]
+    fn field_init_shorthand_mixes_with_explicit() {
+        // `{a, b: 2}` — a shorthand field followed by an explicit one.
+        let out = parse_str("oper f {} [ let a = 1; let t = {a, b: 2}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let tuple = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::TUPLE_LIT)
+            .expect("TUPLE_LIT in tree");
+        let fields: Vec<_> = tuple.children().collect();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].text(), "a"); // shorthand: no colon
+        let has_colon = |n: &crate::cst::SyntaxNode| -> bool {
+            n.children_with_tokens()
+                .filter_map(|e| e.into_token())
+                .any(|t| t.kind() == SyntaxKind::COLON)
+        };
+        assert!(!has_colon(&fields[0]), "shorthand field has no colon");
+        assert!(has_colon(&fields[1]), "explicit field has a colon");
+    }
+
+    #[test]
+    fn field_init_shorthand_round_trips() {
+        // Losslessness: the shorthand source is reproduced byte-for-byte from
+        // the CST — no synthesized colon/value tokens.
+        let src = "oper f {} [ let message = \"hi\"; write_line { message }; ];";
+        let out = parse_str(src);
+        assert_eq!(out.tree.text(), src);
+    }
+
+    #[test]
+    fn rename_requires_colon_diagnoses_p0017() {
+        // Field-init shorthand is disabled in rename position; `rename { old }`
+        // is missing the required `:`.
+        let out = parse_str("oper f {} [ let s = r rename { old }; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0017"),
+            "expected P0017, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
     fn unterminated_tuple_literal_diagnoses_p0029() {
         let out = parse_str("oper f {} [ let t = {a: 1 ; ];");
         assert!(
@@ -2340,9 +2437,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_arg_colon_diagnoses() {
+    fn malformed_call_arg_after_shorthand_diagnoses() {
+        // In call position the colon is optional (field-init shorthand), so
+        // `{x}` is valid and the stray `1` (no separating comma) is the error:
+        // the `}` is expected. (The colon-required case now lives in rename —
+        // see `rename_requires_colon_diagnoses_p0017`.)
         let out = parse_str("oper f {} [ foo{x 1}; ];");
-        assert!(out.diagnostics.iter().any(|d| d.code == "P0017"));
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0015"));
     }
 
     #[test]

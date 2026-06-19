@@ -1367,6 +1367,61 @@ fn text_where_inprocess_neq_byte_identical() {
     assert_eq!(llvm, run_text_where_inprocess(TEXT_WHERE_NEQ_SRC, "cranelift"));
 }
 
+// ── field-init shorthand (`{ name }` ≡ `{ name: name }`) ─────────────
+
+fn run_shorthand(src: &str, backend: &str) -> Vec<u8> {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("shorthand.cd");
+    std::fs::write(&path, src).expect("write src");
+    let out = coddl()
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&path)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "shorthand on {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+/// Operator-call shorthand: `write_line { message }` forwards the same-named
+/// local.
+const CALL_SHORTHAND_SRC: &str = "\
+program call_shorthand;
+oper main {} [
+    let message = \"shorthand works\";
+    write_line { message };
+];
+";
+
+/// Tuple-literal shorthand: `{ message }` builds `Tuple { message: Text }`
+/// from the same-named local; the field reads back through `t.message`.
+const TUPLE_SHORTHAND_SRC: &str = "\
+program tuple_shorthand;
+oper main {} [
+    let message = \"from a tuple\";
+    let t = { message };
+    write_line { message: t.message };
+];
+";
+
+#[test]
+fn call_field_init_shorthand_runs_byte_identical() {
+    let llvm = run_shorthand(CALL_SHORTHAND_SRC, "llvm");
+    assert_eq!(llvm, b"shorthand works\n");
+    assert_eq!(llvm, run_shorthand(CALL_SHORTHAND_SRC, "cranelift"));
+}
+
+#[test]
+fn tuple_field_init_shorthand_runs_byte_identical() {
+    let llvm = run_shorthand(TUPLE_SHORTHAND_SRC, "llvm");
+    assert_eq!(llvm, b"from a tuple\n");
+    assert_eq!(llvm, run_shorthand(TUPLE_SHORTHAND_SRC, "cranelift"));
+}
+
 #[test]
 fn public_relvar_outside_transaction_diagnoses_t0025() {
     let tmp = tempfile::tempdir().expect("tempdir");
