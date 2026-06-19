@@ -64,6 +64,13 @@ pub struct CoddlRcHeader {
     pub desc: *const CoddlHeadingDesc,
     pub kind: u32,
     pub length: u32,
+    /// The payload byte size passed to [`coddl_rc_alloc`] — the block's
+    /// allocated capacity. Distinct from `length`: relation ops
+    /// (`where`/`project`, relation-literal seal) allocate worst-case then
+    /// trim `length` after dedup/filter, so `length` ≤ capacity. The block
+    /// must be freed with the capacity it was allocated with — the
+    /// `GlobalAlloc` contract requires the dealloc `Layout` to match alloc.
+    pub capacity: usize,
 }
 
 /// Header size in bytes. Backends pad payload allocations by this
@@ -119,6 +126,7 @@ pub unsafe extern "C" fn coddl_rc_alloc(
             desc,
             kind,
             length,
+            capacity: payload_size,
         },
     );
     #[cfg(debug_assertions)]
@@ -171,16 +179,11 @@ pub unsafe extern "C" fn coddl_rc_release(ptr: *mut u8) {
     if kind == CoddlKind::Relation as u32 {
         crate::relation::drop_relation_payload(ptr, &*header);
     }
-    // Free the block.
-    let header_ref = std::ptr::read(header);
-    let payload_size = match (header_ref.kind, header_ref.desc.is_null()) {
-        (k, false) if k == CoddlKind::Relation as u32 => {
-            (*header_ref.desc).record_size as usize * header_ref.length as usize
-        }
-        // Future kinds add their size derivations here.
-        _ => 0,
-    };
-    let total = HEADER_SIZE + payload_size;
+    // Free the block with the SAME layout `coddl_rc_alloc` used — the
+    // allocated `capacity`, not the (possibly seal-shrunk) `length`.
+    // Deallocating with a size different from the allocation is UB under
+    // the `GlobalAlloc` contract.
+    let total = HEADER_SIZE + (*header).capacity;
     let layout = Layout::from_size_align(total, PAYLOAD_ALIGN).expect("bad layout");
     let block = ptr.sub(HEADER_SIZE);
     dealloc(block, layout);
