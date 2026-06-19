@@ -792,6 +792,171 @@ fn hello_world_db_env_var_override_picks_alternate_path() {
     assert_eq!(out.stdout, b"override hello\n");
 }
 
+// ── SQL-pushdown acceptance (assert against the audit log) ────────────
+
+/// Strip the `YYYY-MM-DD HH:MM:SS.mmm - sqlite - ` prefix from one audit
+/// line and return the captured SQL. Returns `None` if the line does not
+/// conform to the audit format — every non-empty line must, so the caller
+/// treats `None` as a hard failure (the format is part of the contract).
+///
+/// Hand-rolled rather than `regex`-backed: the workspace pulls no `regex`
+/// crate (the runtime's own `audit.rs` hand-rolls its date logic too), and
+/// adding one just to split on a fixed prefix isn't worth the lock-graph
+/// churn.
+fn audit_sql(line: &str) -> Option<&str> {
+    const SEP: &str = " - sqlite - ";
+    let idx = line.find(SEP)?;
+    let ts = &line[..idx];
+    if !is_audit_timestamp(ts) {
+        return None;
+    }
+    Some(&line[idx + SEP.len()..])
+}
+
+/// `YYYY-MM-DD HH:MM:SS.mmm` — exactly the shape `audit::format_utc` emits.
+fn is_audit_timestamp(ts: &str) -> bool {
+    let b = ts.as_bytes();
+    if b.len() != 23 {
+        return false;
+    }
+    let digit = |i: usize| b[i].is_ascii_digit();
+    let punct = |i: usize, c: u8| b[i] == c;
+    (0..4).all(digit)
+        && punct(4, b'-')
+        && (5..7).all(digit)
+        && punct(7, b'-')
+        && (8..10).all(digit)
+        && punct(10, b' ')
+        && (11..13).all(digit)
+        && punct(13, b':')
+        && (14..16).all(digit)
+        && punct(16, b':')
+        && (17..19).all(digit)
+        && punct(19, b'.')
+        && (20..23).all(digit)
+}
+
+/// The single statement the pushed-down read must lower to — full heading
+/// (the source has no `project`), `SELECT DISTINCT` (RM Pro 3), quoted
+/// identifiers, and the literal `1` inlined by the legacy `trace` callback.
+const EXPECTED_PUSHED_SQL: &str =
+    r#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = 1"#;
+
+/// Run `examples/hello-world-db` on `backend`, pointing `CODDL_AUDIT_LOG`
+/// at a fresh per-run temp file, then assert the audit log proves the
+/// pushdown path ran: the program printed `hello world`, every logged line
+/// is well-formed, **no** statement is a `FROM "greetings"` full-table scan
+/// (no `WHERE`), and **exactly one** statement is the parameterized filter —
+/// byte-for-byte `EXPECTED_PUSHED_SQL`.
+///
+/// A fresh log path per run is mandatory: the sink opens in append mode, so
+/// reusing a path would mix runs and a stale full-scan line would break the
+/// counts.
+fn assert_pushdown_audit(backend: &str) {
+    ensure_runtime_built();
+    ensure_hello_world_db_seeded();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let log = tmp.path().join("audit.log");
+    let cd = example_path("hello-world-db");
+
+    let out = coddl()
+        .env("CODDL_AUDIT_LOG", &log)
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend={backend} {:?} failed: stderr=\n{}",
+        cd,
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(
+        out.stdout, b"hello world\n",
+        "unexpected stdout on {backend}: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let contents = std::fs::read_to_string(&log).unwrap_or_else(|e| {
+        panic!("read audit log {}: {e}", log.display());
+    });
+    // Every non-empty line must parse — the format itself is part of the
+    // contract this test pins. Collect the captured SQL text.
+    let sqls: Vec<&str> = contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            audit_sql(l).unwrap_or_else(|| panic!("malformed audit line ({backend}): {l:?}"))
+        })
+        .collect();
+    assert!(
+        !sqls.is_empty(),
+        "audit log empty on {backend}: the run logged no SQL"
+    );
+
+    // No startup full-table scan: nothing reads `greetings` without a filter.
+    let scans: Vec<&&str> = sqls
+        .iter()
+        .filter(|s| s.contains("greetings") && !s.contains("WHERE"))
+        .collect();
+    assert!(
+        scans.is_empty(),
+        "startup full-table scan(s) present on {backend}: {scans:?}"
+    );
+
+    // Exactly one filtered read of `greetings`, and it is the pushed query.
+    let filtered: Vec<&&str> = sqls
+        .iter()
+        .filter(|s| s.contains("greetings") && s.contains("WHERE"))
+        .collect();
+    assert_eq!(
+        filtered.len(),
+        1,
+        "expected exactly one pushed filtered query on {backend}, got {filtered:?}"
+    );
+    assert_eq!(
+        *filtered[0], EXPECTED_PUSHED_SQL,
+        "pushed SQL diverged from the golden text on {backend}"
+    );
+}
+
+#[test]
+fn hello_world_db_pushdown_audit_llvm() {
+    assert_pushdown_audit("llvm");
+}
+
+#[test]
+fn hello_world_db_pushdown_audit_cranelift() {
+    assert_pushdown_audit("cranelift");
+}
+
+// Helper-level checks proving the acceptance assertions are non-vacuous —
+// they reject the pre-pushdown world (a startup full scan) and a malformed
+// line — without needing a live runtime to regress.
+
+#[test]
+fn audit_sql_strips_prefix_and_validates_format() {
+    let line = r#"2026-06-19 07:12:36.948 - sqlite - SELECT DISTINCT "id" FROM "greetings" WHERE "id" = 1"#;
+    assert_eq!(
+        audit_sql(line),
+        Some(r#"SELECT DISTINCT "id" FROM "greetings" WHERE "id" = 1"#)
+    );
+    // Malformed timestamp prefixes are rejected (None), so the integration
+    // test panics rather than silently skipping a non-conforming line.
+    assert_eq!(audit_sql("2026-6-19 07:12:36.948 - sqlite - SELECT 1"), None);
+    assert_eq!(audit_sql("not a log line at all"), None);
+    assert_eq!(audit_sql("2026-06-19 07:12:36.948 - postgres - SELECT 1"), None);
+}
+
+#[test]
+fn scan_classifier_catches_the_pre_pushdown_full_scan() {
+    // The legacy startup read (no WHERE) is exactly what the acceptance test must reject.
+    let legacy = "SELECT id, message FROM greetings";
+    assert!(legacy.contains("greetings") && !legacy.contains("WHERE"));
+    // The pushed read is classified as filtered, not a scan.
+    assert!(EXPECTED_PUSHED_SQL.contains("greetings") && EXPECTED_PUSHED_SQL.contains("WHERE"));
+}
+
 #[test]
 fn public_relvar_outside_transaction_diagnoses_t0025() {
     let tmp = tempfile::tempdir().expect("tempdir");
