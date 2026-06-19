@@ -986,6 +986,83 @@ fn project_inprocess_byte_identical_across_backends() {
     );
 }
 
+// ── project all but { … } (TTM project-away) ─────────────────────────
+
+/// `project all but {b}` keeps the complement `{a}` — same result as
+/// `project {a}`: three rows collapse to the sealed `{a: 1}`, `{a: 2}`.
+const PROJECT_ALL_BUT_SRC: &str = "\
+program project_all_but;
+oper main {} [
+    let r = Relation { {a: 1, b: 10}, {a: 1, b: 20}, {a: 2, b: 30} };
+    let p = r project all but {b};
+    write_relation { rel: p };
+];
+";
+
+fn run_all_but_inprocess(backend: &str) -> Vec<u8> {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("all-but.cd");
+    std::fs::write(&src, PROJECT_ALL_BUT_SRC).expect("write src");
+    let out = coddl()
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&src)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "in-process all-but on {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+#[test]
+fn project_all_but_inprocess_keeps_complement() {
+    assert_eq!(run_all_but_inprocess("llvm"), b"{a: 1}\n{a: 2}\n");
+    assert_eq!(run_all_but_inprocess("cranelift"), b"{a: 1}\n{a: 2}\n");
+}
+
+#[test]
+fn project_all_but_pushed_keeps_complement() {
+    // `Greetings where id = 1 project all but {id}` keeps {message}; pushes to
+    // `SELECT "message" FROM "greetings" WHERE "id" = 1` (key-filtered → no
+    // DISTINCT), the same query `project {message}` produces.
+    for backend in ["llvm", "cranelift"] {
+        ensure_runtime_built();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = seed_greetings_fixtures(tmp.path());
+        let cd = tmp.path().join("all-but-pushed.cd");
+        std::fs::write(
+            &cd,
+            "program ab;\n\
+             database greetings;\n\
+             public relvar Greetings { id: Integer, message: Text } key { id };\n\
+             oper main {} [ let g = transaction [ extract (Greetings where id = 1 project all but {id}) ]; write_line { message: g.message }; ];\n",
+        )
+        .expect("write cd");
+        let log = tmp.path().join("audit.log");
+        let out = coddl()
+            .env("CODDL_GREETINGS_FILE", &db)
+            .env("CODDL_AUDIT_LOG", &log)
+            .args(["run", &format!("--backend={backend}")])
+            .arg(&cd)
+            .output()
+            .expect("spawn coddl");
+        assert!(
+            out.status.success(),
+            "pushed all-but on {backend} failed: stderr=\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"hello world\n", "on {backend}");
+        let log_txt = std::fs::read_to_string(&log).expect("read audit log");
+        assert!(
+            log_txt.contains(r#"SELECT "message" FROM "greetings" WHERE "id" = 1"#),
+            "expected message-only no-DISTINCT pushed SQL on {backend}, got:\n{log_txt}"
+        );
+    }
+}
+
 /// `project {}` collapses a multi-row relation to one empty tuple
 /// (`reltrue`), not N — a set, per RM Pro 3.
 const PROJECT_NULLARY_SRC: &str = "\

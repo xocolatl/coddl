@@ -105,6 +105,11 @@
                     "match": "\\b(join|times|union|intersect|minus|where|extend|summarize|rename|project|group|ungroup|wrap|unwrap|semijoin|semiminus|tclose)\\b"
                 },
                 {
+                    "comment": "`all but` projection-away, matched as a pair so a lone identifier named `all` or `but` (e.g. inside the brace list) stays uncolored",
+                    "name": "keyword.other.relational.coddl",
+                    "match": "\\ball\\s+but\\b"
+                },
+                {
                     "name": "keyword.operator.logical.coddl",
                     "match": "\\b(and|or|not)\\b"
                 },

@@ -4,7 +4,7 @@ The authoritative spec for Coddl's surface syntax — the precise form of the la
 
 This doc has two parts: **rationale** (the design decisions — why prefix-named-args, why no reserved words, why brackets-vs-braces, etc.) and the **productions** (the EBNF the parser implements, lexical and syntactic).
 
-**Last sync:** `dfe24a6`. Every commit that adds, removes, or changes a production, token, or diagnostic code updates this file in the same commit; `tools/check-grammar.sh` enforces it from the hygiene gate.
+**Last sync:** `36f2239`. Every commit that adds, removes, or changes a production, token, or diagnostic code updates this file in the same commit; `tools/check-grammar.sh` enforces it from the hygiene gate.
 
 ---
 
@@ -452,12 +452,15 @@ function that implements it.
                     -- Transparent grouping; AST view unwraps to
                     -- the inner expression so the typechecker /
                     -- lowerer never see the wrapper.
-<project-suffix> ::= 'project' <ident-brace-list> ;            -- parse_project_suffix
+<project-suffix> ::= 'project' [ 'all' 'but' ] <ident-brace-list> ; -- parse_project_suffix
                     -- Relational projection. Postfix at pipeline
                     -- precedence; wraps the operand in PROJECT_EXPR.
                     -- Left-associative, and interleaves with `where`
-                    -- in either order. See the projection rationale
-                    -- above.
+                    -- in either order. Plain `project { … }` keeps the
+                    -- named attributes; `project all but { … }` removes
+                    -- them (keeps the complement). `all`/`but` are
+                    -- contextual keywords, valid identifiers elsewhere.
+                    -- See the projection rationale above.
 <transaction-expr> ::= 'transaction' <block> ;                 -- parse_transaction_expr
 <name-ref>      ::= <identifier> ;
 <arg-list>      ::= '{' [ <named-arg> commalist ] '}' ;        -- parse_arg_list
@@ -562,6 +565,7 @@ enforces that.
 | P0036 | Expected `{` to start project list                      |
 | P0037 | Expected project attribute name                         |
 | P0038 | Expected `}` to close project list                      |
+| P0039 | Expected `but` after `all` in project                   |
 
 Note: missing-type-after-`:` (let annotation) and missing-type-
 after-`->` (operator return clause) both surface as `P0011`

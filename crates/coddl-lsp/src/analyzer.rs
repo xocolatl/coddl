@@ -830,6 +830,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn project_all_but_type_error_surfaces_as_diagnostic() {
+        // `all but {nope}` — the removed name must exist; T0027 flows through.
+        let analyzer = Analyzer::new();
+        let uri = url("file:///proj.cd");
+        analyzer
+            .put_document(
+                uri.clone(),
+                1,
+                "oper main {} [ let s = Relation { {a: 1} } project all but {nope}; ];".to_string(),
+            )
+            .await;
+        let snap = analyzer.snapshot(&uri).await.unwrap();
+        assert!(
+            snap.diagnostics.iter().any(|d| d.code == "T0027"),
+            "expected T0027, got {:?}",
+            snap.diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn project_all_but_inlay_hint_shows_complement() {
+        // `all but {id}` keeps the complement `{message}` — the inlay hint
+        // reflects it, flowing from `coddl_types` with no LSP wiring.
+        let analyzer = Analyzer::new();
+        let uri = url("file:///proj.cd");
+        analyzer
+            .put_document(
+                uri.clone(),
+                1,
+                "oper main {} [ let s = Relation { {id: 1, message: \"x\"} } project all but {id}; ];"
+                    .to_string(),
+            )
+            .await;
+        let snap = analyzer.snapshot(&uri).await.unwrap();
+        assert!(
+            snap.diagnostics.is_empty(),
+            "expected clean typecheck, got {:?}",
+            snap.diagnostics
+        );
+        assert!(
+            snap.hints.iter().any(|h| matches!(
+                &h.ty,
+                coddl_types::Type::Relation(hd)
+                    if hd.lookup("message").is_some() && hd.lookup("id").is_none()
+            )),
+            "expected a Relation {{message}} hint (the complement), got {:?}",
+            snap.hints
+                .iter()
+                .map(|h| format!("{}", h.ty))
+                .collect::<Vec<_>>()
+        );
+    }
+
     // ── Project model tests ─────────────────────────────────────
 
     use std::fs;

@@ -702,12 +702,13 @@ impl TypeChecker {
         }
     }
 
-    /// Walk `R project { a, … }` — relational projection. The operand must
-    /// be `Relation H` (T0023 otherwise, shared with `where`). Each named
-    /// attribute must exist in `H` (T0027) and appear at most once (T0028).
-    /// The result is `Relation H'` where `H'` is `H` narrowed to the kept
-    /// attributes, canonically re-sorted by `Heading::new` — so the order
-    /// the names are written is irrelevant.
+    /// Walk `R project { a, … }` / `R project all but { a, … }` — relational
+    /// projection. The operand must be `Relation H` (T0023 otherwise, shared
+    /// with `where`). Each listed attribute must exist in `H` (T0027) and
+    /// appear at most once (T0028). The result is `Relation H'` where `H'` is
+    /// `H` narrowed to the listed attributes — or, for `all but`, to their
+    /// complement — canonically re-sorted by `Heading::new`, so the order the
+    /// names are written is irrelevant.
     fn check_project_expr(&mut self, pe: &ProjectExpr, scope: &mut Scope) -> Type {
         let input_ty = match pe.input() {
             Some(e) => self.check_expr(&e, scope),
@@ -729,11 +730,11 @@ impl TypeChecker {
                 return Type::Unknown;
             }
         };
-        // Validate each projected name; collect the narrowed attributes.
-        // Unknown/duplicate names are reported and dropped (best-effort
-        // recovery), so the result heading is the valid subset.
+        // Validate each listed name (must exist → T0027, unique → T0028).
+        // The surviving valid names form the project list; unknown/duplicate
+        // names are reported and dropped (best-effort recovery).
         let mut seen: HashSet<String> = HashSet::new();
-        let mut kept: Vec<(String, Type)> = Vec::new();
+        let mut listed: HashSet<String> = HashSet::new();
         for tok in pe.attrs() {
             let name = tok.text();
             if !seen.insert(name.to_string()) {
@@ -745,7 +746,9 @@ impl TypeChecker {
                 continue;
             }
             match heading.lookup(name) {
-                Some(ty) => kept.push((name.to_string(), ty.clone())),
+                Some(_) => {
+                    listed.insert(name.to_string());
+                }
                 None => self.error(
                     self.token_span(&tok),
                     "T0027",
@@ -753,7 +756,17 @@ impl TypeChecker {
                 ),
             }
         }
-        Type::Relation(Heading::new(kept))
+        // `project { … }` keeps the listed attributes; `project all but { … }`
+        // keeps the complement. `contains == all_but` is exactly the dropped
+        // set, so `!= all_but` is the kept set.
+        let all_but = pe.is_all_but();
+        let result: Vec<(String, Type)> = heading
+            .attrs()
+            .iter()
+            .filter(|(name, _)| listed.contains(name) != all_but)
+            .cloned()
+            .collect();
+        Type::Relation(Heading::new(result))
     }
 
     /// Walk a unary prefix expression. Dispatches on `UnaryOp`.
@@ -1919,6 +1932,58 @@ mod tests {
                    let r = Relation { {a: 1, b: 2} }; \
                    let t = extract (r project {a}); \
                    let x = t.a; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn project_all_but_keeps_the_complement() {
+        // `all but {a}` over {a, b} keeps {b}: `t.b` is accessible…
+        let ok = "oper main {} [ \
+                  let r = Relation { {a: 1, b: 2} }; \
+                  let t = extract (r project all but {a}); \
+                  let x = t.b; \
+                  ];";
+        assert!(diagnostics(ok).is_empty(), "{:?}", diagnostics(ok));
+        // …and the removed `a` is gone (T0017 on access).
+        let gone = "oper main {} [ \
+                    let r = Relation { {a: 1, b: 2} }; \
+                    let t = extract (r project all but {a}); \
+                    let x = t.a; \
+                    ];";
+        assert!(codes(gone).contains(&"T0017"));
+    }
+
+    #[test]
+    fn project_all_but_unknown_attr_diagnoses_t0027() {
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1} }; \
+                   let s = r project all but {nope}; \
+                   ];";
+        assert!(codes(src).contains(&"T0027"));
+    }
+
+    #[test]
+    fn project_all_but_everything_yields_empty_heading() {
+        // Removing every attribute leaves the empty heading; even the
+        // formerly-present `a` is then an unknown field (T0017).
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1, b: 2} }; \
+                   let t = extract (r project all but {a, b}); \
+                   let x = t.a; \
+                   ];";
+        assert!(codes(src).contains(&"T0017"));
+    }
+
+    #[test]
+    fn project_all_but_nothing_keeps_all() {
+        // `all but {}` removes nothing — both attributes remain accessible.
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1, b: 2} }; \
+                   let t = extract (r project all but {}); \
+                   let x = t.a; \
+                   let y = t.b; \
                    ];";
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "{diags:?}");

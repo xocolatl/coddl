@@ -692,17 +692,39 @@ impl ProjectExpr {
         self.syntax.children().find_map(Expr::cast)
     }
 
-    /// The projected attribute names in source order. Mirrors
-    /// [`KeyClause::attrs`]: the operand is a child *node* (its own IDENTs
-    /// are nested inside it), so the only direct IDENT *tokens* of the
-    /// `PROJECT_EXPR` are the `project` keyword followed by the brace-list
-    /// names — skip the first to drop the keyword.
-    pub fn attrs(&self) -> impl Iterator<Item = SyntaxToken> + '_ {
+    /// Whether this is the `project all but { … }` form, which removes the
+    /// named attributes (keeping the complement) rather than keeping them.
+    /// True iff an IDENT token before the `{` is the contextual keyword `all`.
+    pub fn is_all_but(&self) -> bool {
         self.syntax
             .children_with_tokens()
             .filter_map(|el| el.into_token())
-            .filter(|t| t.kind() == SyntaxKind::IDENT)
-            .skip(1)
+            .take_while(|t| t.kind() != SyntaxKind::L_BRACE)
+            .any(|t| t.kind() == SyntaxKind::IDENT && t.text() == "all")
+    }
+
+    /// The attribute names listed in the braces, in source order. These are
+    /// the kept set for `project { … }`, or the removed set for
+    /// `project all but { … }`.
+    ///
+    /// The operand is a child *node* (its IDENTs are nested inside it) and the
+    /// `project` / `all` / `but` keyword tokens precede the `{`, so the brace
+    /// names are exactly the IDENT *tokens* that appear after the `L_BRACE`.
+    pub fn attrs(&self) -> impl Iterator<Item = SyntaxToken> + '_ {
+        let mut after_brace = false;
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .filter_map(move |t| {
+                if t.kind() == SyntaxKind::L_BRACE {
+                    after_brace = true;
+                    None
+                } else if after_brace && t.kind() == SyntaxKind::IDENT {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
     }
 }
 

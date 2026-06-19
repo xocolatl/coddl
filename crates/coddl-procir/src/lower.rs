@@ -703,14 +703,16 @@ impl Lowerer {
         };
         let src_heading = self.headings[src_heading_id.0 as usize].clone();
 
-        // 2. Narrow the heading to the kept attributes. `Heading::new`
-        //    re-canonicalizes, so the written order of `keep` is
-        //    irrelevant — matching the typechecker and RelIR.
-        let keep: Vec<String> = pe.attrs().map(|t| t.text().to_string()).collect();
+        // 2. Resolve the kept heading. `project { … }` keeps the listed
+        //    names; `project all but { … }` keeps the complement (against the
+        //    statically-known operand heading). `Heading::new` re-canonicalizes,
+        //    so written order is irrelevant — matching the typechecker.
+        let listed: Vec<String> = pe.attrs().map(|t| t.text().to_string()).collect();
+        let all_but = pe.is_all_but();
         let narrowed: Vec<(String, Type)> = src_heading
             .attrs()
             .iter()
-            .filter(|(name, _)| keep.iter().any(|k| k == name))
+            .filter(|(name, _)| listed.iter().any(|k| k == name) != all_but)
             .cloned()
             .collect();
         let result_heading_id = self.intern_heading(&Heading::new(narrowed));
@@ -787,9 +789,22 @@ impl Lowerer {
                 // Projection over a pushable subtree pushes too — the cut
                 // gates on `origin()`, which `RelExpr::Project` propagates,
                 // and the emitter narrows the SELECT list from the heading.
-                // `keep` order is irrelevant (the heading re-sorts).
+                // `keep` order is irrelevant (the heading re-sorts). For
+                // `all but`, resolve the complement against the operand
+                // heading so RelIR still carries a concrete `keep` set.
                 let input = self.build_rel_expr(&p.input()?)?;
-                let keep: Vec<String> = p.attrs().map(|t| t.text().to_string()).collect();
+                let listed: Vec<String> = p.attrs().map(|t| t.text().to_string()).collect();
+                let keep: Vec<String> = if p.is_all_but() {
+                    input
+                        .heading()
+                        .attrs()
+                        .iter()
+                        .map(|(n, _)| n.clone())
+                        .filter(|n| !listed.contains(n))
+                        .collect()
+                } else {
+                    listed
+                };
                 Some(RelExpr::Project {
                     input: Box::new(input),
                     keep,
@@ -1840,6 +1855,45 @@ oper main {}\n\
         assert_eq!(h.attrs().len(), 1, "projection should narrow to one attr");
         assert!(h.lookup("a").is_some());
         assert!(h.lookup("b").is_none(), "`b` should be projected away");
+    }
+
+    #[test]
+    fn relvar_all_but_pushes_same_narrowed_sql() {
+        // `project all but {id}` over {id, message} keeps {message} — same
+        // pushed SQL as `project {message}` (the complement resolves in the
+        // frontend; RelIR carries a concrete keep set).
+        let src = HELLO_WORLD_DB_PROJECT.replace("project {message}", "project all but {id}");
+        let m = lower_ok_with_plan(&src, &greetings_plan());
+        assert_eq!(m.plans.len(), 1);
+        assert_eq!(
+            m.plans[0].sql,
+            r#"SELECT "message" FROM "greetings" WHERE "id" = ?"#
+        );
+    }
+
+    #[test]
+    fn project_all_but_over_relation_literal_keeps_complement_in_process() {
+        // `Relation {{a, b}} project all but {a}` lowers in-process to
+        // `Inst::Project` whose result heading is the complement `{b}`.
+        let src = "oper main {} [ let s = Relation { {a: 1, b: 2} } project all but {a}; ];";
+        let out = lower(src, FileId(0));
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let m = out.module.expect("module");
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let result_heading_id = main.blocks[0]
+            .insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::Project {
+                    result_heading_id, ..
+                } => Some(*result_heading_id),
+                _ => None,
+            })
+            .expect("expected an Inst::Project");
+        let h = &m.headings[result_heading_id.0 as usize];
+        assert_eq!(h.attrs().len(), 1);
+        assert!(h.lookup("b").is_some(), "complement keeps `b`");
+        assert!(h.lookup("a").is_none(), "`a` was removed");
     }
 
     #[test]

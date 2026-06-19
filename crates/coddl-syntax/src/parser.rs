@@ -942,17 +942,31 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
-    /// `project { a, b, … }` — relational projection suffix. The enclosing
-    /// `PROJECT_EXPR` node (which wraps the relation operand) is opened by
-    /// the caller in the pipeline loop, so this only consumes the
-    /// `project` keyword and its attribute list.
+    /// `project [ all but ] { a, b, … }` — relational projection suffix. The
+    /// enclosing `PROJECT_EXPR` node (which wraps the relation operand) is
+    /// opened by the caller in the pipeline loop, so this only consumes the
+    /// `project` keyword, an optional `all but` prefix, and the attribute list.
+    /// Plain `project { … }` keeps the named attributes; `project all but { … }`
+    /// removes them and keeps the complement.
     ///
     /// Diagnostics: P0036 (no `{`), P0037 (no attribute name), P0038
-    /// (no `}`).
+    /// (no `}`), P0039 (`all` not followed by `but`).
     pub(crate) fn parse_project_suffix(&mut self) {
         debug_assert!(self.at_keyword("project"));
         self.bump_trivia();
         self.bump(); // `project`
+        // Optional `all but` prefix — project *away* the named attributes
+        // (keep the complement). `all`/`but` are contextual keywords: in this
+        // position before the `{` they're the operator; inside the braces, or
+        // anywhere else, they remain ordinary identifiers.
+        if self.at_keyword("all") {
+            self.bump(); // `all`
+            if self.at_keyword("but") {
+                self.bump(); // `but`
+            } else {
+                self.error("P0039", "expected `but` after `all` in project");
+            }
+        }
         self.parse_ident_brace_list(
             ("P0036", "expected `{` to start project list"),
             ("P0037", "expected project attribute name"),
@@ -2196,6 +2210,42 @@ mod tests {
         // words): usable as a local name and as an attribute name.
         let out = parse_str("oper f {} [ let project = 1; let s = R where project = 2; ];");
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    #[test]
+    fn project_all_but_parses() {
+        let out = parse_str("oper f {} [ let s = R project all but {a}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let pe = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::PROJECT_EXPR)
+            .expect("PROJECT_EXPR in tree");
+        let text = pe.text().to_string();
+        assert!(text.contains("all but"), "expected `all but` in {text}");
+        // Operand is still the NAME_REF `R`.
+        assert!(pe.children().any(|n| n.kind() == SyntaxKind::NAME_REF));
+    }
+
+    #[test]
+    fn project_all_without_but_diagnoses_p0039() {
+        let out = parse_str("oper f {} [ let s = R project all {a}; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0039"),
+            "expected P0039, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn project_all_and_but_usable_as_attr_names() {
+        // Inside the braces, `all` and `but` are ordinary attribute names —
+        // `project all but {all, but}` removes attributes named `all`/`but`.
+        let out = parse_str("oper f {} [ let s = R project all but {all, but}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        // And the plain keep form with `all` as an attribute parses too.
+        let keep = parse_str("oper f {} [ let s = R project {all}; ];");
+        assert!(keep.diagnostics.is_empty(), "{:?}", keep.diagnostics);
     }
 
     fn find_first(root: &crate::cst::SyntaxNode, kind: SyntaxKind) -> crate::cst::SyntaxNode {

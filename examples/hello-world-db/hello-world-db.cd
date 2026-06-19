@@ -51,7 +51,7 @@ oper main {}
         let greetings =
             Greetings
             where id = 1
-            project {message}
+            project all but {id}
             ;
 
         extract (greetings)
