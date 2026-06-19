@@ -1259,10 +1259,22 @@ impl Lowerer {
             None => self.fresh_value(),
         };
         self.emit_tx_call("coddl_commit_tx");
-        // Release every heap-typed local in this transaction scope
-        // before popping. The body's tail value (if heap-typed) is
-        // not currently a use case Phase 19 exercises — relations
-        // don't yet escape transactions as return values.
+        // If the body's tail value is a heap-typed local in this scope, it
+        // *escapes* as the transaction's result — retain it so the scope
+        // release below leaves the caller a live `rc=1` reference. (A relation
+        // returned from a transaction, e.g. `let x = R; x`, is a real case;
+        // without this the local is freed before the caller can use it.) A
+        // fresh tail value not bound to a local isn't in the release set, so it
+        // survives without a retain.
+        let escapes = Self::is_heap_managed(&self.value_type(value))
+            && self
+                .locals
+                .last()
+                .map(|scope| scope.values().any(|(v, _)| *v == value))
+                .unwrap_or(false);
+        if escapes {
+            self.insts.push(Inst::Retain { src: value });
+        }
         self.release_top_scope_heap_locals();
         self.pop_local_scope();
         value
