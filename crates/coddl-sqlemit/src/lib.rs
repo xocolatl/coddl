@@ -131,12 +131,50 @@ pub type Result<T> = std::result::Result<T, BackendError>;
 
 /// Emit one relvar-rooted relational expression as a backend `SELECT`.
 ///
-/// The expression must bottom out in a `RelvarRef`, optionally wrapped in
-/// `Restrict` (→ `WHERE`) and/or `Project` (→ a narrowed column list). The
-/// column list is exactly the expression's heading, so an author-written
-/// projection narrows the `SELECT` faithfully — there is no implicit
-/// column pruning. `SELECT DISTINCT` is always emitted (RM Pro 3).
+/// The expression bottoms out in a `RelvarRef`, optionally wrapped in
+/// `Restrict` (→ `WHERE`), `Project` (→ a narrowed column list), `Rename`, and
+/// `And` (→ `INNER JOIN`/`CROSS JOIN`). A root `Or` (surface `union`) emits a
+/// set-op query `(<lhs>) UNION (<rhs>)`. The column list is exactly the
+/// expression's heading, so an author-written projection narrows the `SELECT`
+/// faithfully. `DISTINCT` is emitted unless the result is provably a set.
 pub fn emit_select(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
+    emit_select_offset(expr, dialect, 0)
+}
+
+/// `emit_select` with a bind-parameter start offset, threaded so a set-op's
+/// right operand numbers its Postgres `$N` placeholders after the left's. The
+/// public entry passes `0`.
+fn emit_select_offset(expr: &RelExpr, dialect: Dialect, param_offset: u32) -> Result<SqlQuery> {
+    // Root set-op: each operand emits as a full sub-SELECT, combined with
+    // bare `UNION` (set semantics, never `UNION ALL`). Params concatenate (lhs
+    // then rhs); the rhs's placeholders start after the lhs's. CORRESPONDING is
+    // free — both sides emit canonical-sorted SELECT lists over identical
+    // headings (typechecked), so columns align by position. A set-op nested
+    // *under* a relational op never reaches here: `resolve` errs on `Or`, so
+    // `cut::try_push` declines and it runs in-process.
+    if let RelExpr::Or { lhs, rhs } = expr {
+        let l = emit_select_offset(lhs, dialect, param_offset)?;
+        let r = emit_select_offset(rhs, dialect, param_offset + l.sql.param_count)?;
+        // Unparenthesized compound SELECT: `… UNION …`. SQLite rejects
+        // parenthesized operands in a compound query (`(SELECT …) UNION …` is a
+        // syntax error); the bare form is valid in both SQLite and Postgres and
+        // is associative, so nested root set-ops chain correctly.
+        let text = format!("{} UNION {}", l.sql.text, r.sql.text);
+        let mut params = l.params;
+        params.extend(r.params);
+        let plan_id = PlanId(fnv1a(dialect, &text));
+        return Ok(SqlQuery {
+            sql: SqlString {
+                param_count: params.len() as u32,
+                text,
+            },
+            params,
+            // Identical operand headings (typechecked) — either is the result.
+            result_heading: l.result_heading,
+            plan_id,
+        });
+    }
+
     // Resolve the tree to its physical table and output `(attr, column)` map —
     // renames remap the attr side, projects narrow it — collecting each
     // restriction as a resolved `(column, value)` conjunct along the way.
@@ -182,7 +220,7 @@ pub fn emit_select(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
         for (col, value) in &wheres {
             let placeholder = match dialect {
                 Dialect::SQLite => "?".to_string(),
-                Dialect::Postgres => format!("${}", params.len() + 1),
+                Dialect::Postgres => format!("${}", param_offset as usize + params.len() + 1),
             };
             conjuncts.push(format!("{} = {placeholder}", quote_ident(col)));
             params.push(Value::from(value.clone()));
@@ -281,6 +319,15 @@ fn resolve(
             }
             Ok((from, merged))
         }
+        // A set-op nested under a relational op (e.g. `(A union B) where p`).
+        // `resolve` produces a FROM clause, but a `UNION` isn't a table
+        // reference; rather than emit a subquery (out of scope — see
+        // sqlemit.md), err so `cut::try_push` declines and the whole expression
+        // runs in-process. A *root* `Or` is handled in `emit_select_offset`
+        // before `resolve` is ever called.
+        RelExpr::Or { .. } => Err(BackendError::Other(
+            "set operation nested under a relational operator does not push to SQL".to_string(),
+        )),
         // Never reached: a materialized leaf fails the cut's `RelvarRooted`
         // gate before SQL emission. Defensive only.
         RelExpr::MaterializedRelvar { name, .. } => Err(BackendError::Other(format!(
@@ -616,6 +663,49 @@ mod tests {
                 ("name".to_string(), Type::Text),
             ])
         );
+    }
+
+    #[test]
+    fn union_emits_union_of_selects() {
+        // `Morning union Evening` → RelExpr::Or. Each operand emits a full
+        // SELECT, combined with bare UNION (set semantics, never UNION ALL). No
+        // DISTINCT on the operands — each keeps key `id` — and UNION dedups.
+        let expr = RelExpr::Or {
+            lhs: Box::new(morning()),
+            rhs: Box::new(evening()),
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            // Unparenthesized — SQLite rejects parens around compound operands.
+            r#"SELECT "id", "name" FROM "morning" UNION SELECT "id", "name" FROM "evening""#
+        );
+        assert_eq!(q.sql.param_count, 0);
+        assert!(q.params.is_empty());
+        assert_eq!(
+            q.result_heading,
+            Heading::new(vec![
+                ("id".to_string(), Type::Integer),
+                ("name".to_string(), Type::Text),
+            ])
+        );
+    }
+
+    #[test]
+    fn union_postgres_offsets_rhs_params() {
+        // Postgres `$N` placeholders are statement-global, so the rhs operand's
+        // params number after the lhs's: lhs `$1`, rhs `$2`. (SQLite's `?` is
+        // positional and needs no offset.)
+        let expr = RelExpr::Or {
+            lhs: Box::new(where_id_1(morning())),
+            rhs: Box::new(where_id_1(evening())),
+        };
+        let q = emit_select(&expr, Dialect::Postgres).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id", "name" FROM "morning" WHERE "id" = $1 UNION SELECT "id", "name" FROM "evening" WHERE "id" = $2"#
+        );
+        assert_eq!(q.sql.param_count, 2);
     }
 
     #[test]

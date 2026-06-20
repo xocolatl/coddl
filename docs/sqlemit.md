@@ -67,6 +67,8 @@ In every drift case the two handle differently, `USING` either stays correct or 
 
 Keep emitted SQL to a **portable subset** (CTEs, window functions, standard joins). Isolate dialect divergence behind backend methods — `emit_select` returns dialect-specific text, but the same RelIR plan should produce semantically equivalent results across backends.
 
+**Set operations emit unparenthesized.** A root `Or` (surface `union`) emits `<lhs> UNION <rhs>` — a bare compound `SELECT`, *not* `(<lhs>) UNION (<rhs>)`. SQLite rejects parentheses around the operands of a compound query (`(SELECT …) UNION …` is a syntax error), whereas Postgres tolerates them; the unparenthesized form is valid in both and is the portable subset. `UNION` is associative, so a nested root chain `A union B union C` emits `… UNION … UNION …` and binds correctly. Operand `$N` placeholders (Postgres) are renumbered: the right operand starts after the left's parameter count, threaded via an `emit_select` start-offset. Bare `UNION` (set semantics, never `UNION ALL`); CORRESPONDING is satisfied for free because both operands emit canonical-sorted column lists over identical (typechecked) headings. A set operation *nested under* a relational operator (`(A union B) where p`) does not push — `resolve` errs on it, so the cut runs it in-process.
+
 Per-backend golden-file tests live in `tests/golden/`: `RelIR plan → expected SQL` per dialect. The validation matrix (see [validation.md](validation.md)) confirms that whatever the backend differences in the SQL text, the *results* match.
 
 ## Sending in-memory relations back into SQL

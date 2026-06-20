@@ -45,4 +45,10 @@ oper main {} [
         Morning intersect Evening
     ];
     write_relation { rel: both };
+
+    // union: pushes one `(SELECT ... FROM "morning") UNION (SELECT ... FROM "evening")`.
+    let either = transaction [
+        Morning union Evening
+    ];
+    write_relation { rel: either };
 ];

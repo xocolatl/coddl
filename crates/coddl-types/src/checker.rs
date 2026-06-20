@@ -1181,6 +1181,7 @@ impl TypeChecker {
             BinaryOp::Times => self.check_times_binary(bin, scope),
             BinaryOp::Compose => self.check_compose_binary(bin, scope),
             BinaryOp::Intersect => self.check_intersect_binary(bin, scope),
+            BinaryOp::Union => self.check_union_binary(bin, scope),
             BinaryOp::And | BinaryOp::Or => self.check_logical_op(bin, op, scope),
             BinaryOp::Eq | BinaryOp::NotEq => self.check_equality_op(bin, op, scope),
             BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => {
@@ -1467,6 +1468,23 @@ impl TypeChecker {
         }
     }
 
+    /// `R union S` — set union (Algebra-A OR restricted to matching headings;
+    /// Coddl has no nulls, so no heading-agnostic union). Both operands must be
+    /// relations with the **same** heading; mismatched headings → T0038. The
+    /// result heading is that shared heading.
+    fn check_union_binary(&mut self, bin: &BinaryExpr, scope: &mut Scope) -> Type {
+        // Check both operands first so each surfaces its own diagnostics.
+        let lhs_h = self.relation_operand(bin.lhs(), "union", scope);
+        let rhs_h = self.relation_operand(bin.rhs(), "union", scope);
+        let (Some(lhs_h), Some(rhs_h)) = (lhs_h, rhs_h) else {
+            return Type::Unknown;
+        };
+        match self.identical_headings(bin, &lhs_h, &rhs_h, "union") {
+            Some(h) => Type::Relation(h),
+            None => Type::Unknown,
+        }
+    }
+
     /// `lhs and rhs` / `lhs or rhs` — both operands must be Boolean,
     /// result is Boolean.
     fn check_logical_op(&mut self, bin: &BinaryExpr, op: BinaryOp, scope: &mut Scope) -> Type {
@@ -1725,6 +1743,7 @@ fn op_display(op: BinaryOp) -> &'static str {
         BinaryOp::Times => "times",
         BinaryOp::Compose => "compose",
         BinaryOp::Intersect => "intersect",
+        BinaryOp::Union => "union",
     }
 }
 
@@ -1934,6 +1953,27 @@ mod tests {
                    private relvar R { a: Integer, b: Text } key { a }; \
                    private relvar S { a: Integer, c: Text } key { a }; \
                    oper main {} [ write_relation { rel: R intersect S }; ];";
+        assert!(codes(src).contains(&"T0038"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn union_with_identical_headings_checks_clean() {
+        // R { a, b } union S { a, b } — identical headings -> ok, result { a, b }.
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   private relvar S { a: Integer, b: Text } key { a }; \
+                   oper main {} [ write_relation { rel: R union S }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn union_with_differing_headings_diagnoses_t0038() {
+        // S has `c` where R has `b` -> headings not identical -> T0038.
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   private relvar S { a: Integer, c: Text } key { a }; \
+                   oper main {} [ write_relation { rel: R union S }; ];";
         assert!(codes(src).contains(&"T0038"), "{:?}", codes(src));
     }
 

@@ -88,6 +88,15 @@ pub enum RelExpr {
         lhs: Box<RelExpr>,
         rhs: Box<RelExpr>,
     },
+    /// Set union (surface `union`) — the Algebra-A `OR` core node, restricted to
+    /// identical operand headings (the typechecker enforces it; Coddl has no
+    /// nulls, so no heading-agnostic union). The result heading is that shared
+    /// heading. Both operands relvar-rooted → pushes to SQL as `… UNION …`; both
+    /// materialized → in-process; mixed → a materialization boundary.
+    Or {
+        lhs: Box<RelExpr>,
+        rhs: Box<RelExpr>,
+    },
     /// An in-memory (`private`) relvar read — the materialized counterpart of
     /// the relvar-rooted `RelvarRef` leaf. No SQL source, so any subtree
     /// containing it is `Materialized` and lowers in-process.
@@ -95,6 +104,17 @@ pub enum RelExpr {
         name: String,
         heading: Heading,
     },
+}
+
+/// Combine the storage origins of a binary node's two operands (`And` / `Or`):
+/// both relvar-rooted → pushable; both materialized → in-process; otherwise a
+/// materialization boundary (`Mixed`).
+fn combine_origin(lhs: StorageOrigin, rhs: StorageOrigin) -> StorageOrigin {
+    match (lhs, rhs) {
+        (StorageOrigin::RelvarRooted, StorageOrigin::RelvarRooted) => StorageOrigin::RelvarRooted,
+        (StorageOrigin::Materialized, StorageOrigin::Materialized) => StorageOrigin::Materialized,
+        _ => StorageOrigin::Mixed,
+    }
 }
 
 /// Apply a rename map to one attribute name: the renamed name if `name` is a
@@ -175,6 +195,8 @@ impl RelExpr {
                 .heading()
                 .union(&rhs.heading())
                 .expect("typechecked join has compatible shared attributes"),
+            // Identical operand headings (typechecked) — either is the result.
+            RelExpr::Or { lhs, .. } => lhs.heading(),
             RelExpr::MaterializedRelvar { heading, .. } => heading.clone(),
         }
     }
@@ -190,15 +212,10 @@ impl RelExpr {
             RelExpr::Restrict { input, .. } => input.origin(),
             RelExpr::Project { input, .. } => input.origin(),
             RelExpr::Rename { input, .. } => input.origin(),
-            RelExpr::And { lhs, rhs } => match (lhs.origin(), rhs.origin()) {
-                (StorageOrigin::RelvarRooted, StorageOrigin::RelvarRooted) => {
-                    StorageOrigin::RelvarRooted
-                }
-                (StorageOrigin::Materialized, StorageOrigin::Materialized) => {
-                    StorageOrigin::Materialized
-                }
-                _ => StorageOrigin::Mixed,
-            },
+            // Binary nodes combine operand origins: both pushable → pushable,
+            // both materialized → in-process, else a materialization boundary.
+            RelExpr::And { lhs, rhs } => combine_origin(lhs.origin(), rhs.origin()),
+            RelExpr::Or { lhs, rhs } => combine_origin(lhs.origin(), rhs.origin()),
             RelExpr::MaterializedRelvar { .. } => StorageOrigin::Materialized,
         }
     }
@@ -255,6 +272,11 @@ impl RelExpr {
                 lhs.render_into(out, depth + 1);
                 rhs.render_into(out, depth + 1);
             }
+            RelExpr::Or { lhs, rhs } => {
+                let _ = writeln!(out, "{pad}Or");
+                lhs.render_into(out, depth + 1);
+                rhs.render_into(out, depth + 1);
+            }
         }
     }
 
@@ -279,8 +301,11 @@ impl RelExpr {
                 .into_iter()
                 .map(|k| k.iter().map(|a| apply_rename(renames, a)).collect())
                 .collect(),
-            // Conservative: join key-inference is deferred (always DISTINCT).
+            // Conservative: join / union key-inference is deferred. (A `union`
+            // pushes as a SQL `UNION`, which dedups itself, so no DISTINCT is
+            // needed on the operand SELECTs anyway.)
             RelExpr::And { .. } => Vec::new(),
+            RelExpr::Or { .. } => Vec::new(),
             RelExpr::MaterializedRelvar { .. } => Vec::new(),
         }
     }
@@ -308,6 +333,7 @@ impl RelExpr {
             RelExpr::Project { input, .. } => input.card_le_one(),
             RelExpr::Rename { input, .. } => input.card_le_one(),
             RelExpr::And { .. } => false,
+            RelExpr::Or { .. } => false,
             RelExpr::MaterializedRelvar { .. } => false,
         }
     }

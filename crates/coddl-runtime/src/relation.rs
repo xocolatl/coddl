@@ -333,6 +333,50 @@ pub unsafe extern "C" fn coddl_relation_join(
     out
 }
 
+/// Set union of two relations with identical headings (surface `union`,
+/// Algebra-A OR restricted to matching headings). Concatenate both payloads
+/// into a worst-case `lhs_count + rhs_count` buffer, then `coddl_relation_seal`
+/// (content-aware sort + dedup) drops the cross-operand duplicates so the result
+/// is a set (RM Pro 3). Identical headings ⇒ one shared descriptor. Text cells
+/// copy by value — the `(ptr, len)` references immortal string data, so seal's
+/// content-aware dedup is what makes a shared tuple collapse to one.
+///
+/// # Safety
+/// All pointers must be non-null payloads / a descriptor from the runtime and
+/// must outlive the call; both operands must share the `desc` layout.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_relation_union(
+    lhs: *const u8,
+    rhs: *const u8,
+    desc: *const CoddlHeadingDesc,
+) -> *mut u8 {
+    if lhs.is_null() || rhs.is_null() || desc.is_null() {
+        return std::ptr::null_mut();
+    }
+    let lhs_count = (*(lhs.sub(HEADER_SIZE) as *const CoddlRcHeader)).length as usize;
+    let rhs_count = (*(rhs.sub(HEADER_SIZE) as *const CoddlRcHeader)).length as usize;
+    let rec = (*desc).record_size as usize;
+    let total = lhs_count + rhs_count;
+    let out = crate::rc::coddl_rc_alloc(
+        rec.saturating_mul(total),
+        total as u32,
+        crate::rc::CoddlKind::Relation as u32,
+        desc,
+    );
+    if out.is_null() {
+        return std::ptr::null_mut();
+    }
+    // Concatenate lhs records then rhs records; seal dedups the overlap.
+    if lhs_count > 0 {
+        std::ptr::copy_nonoverlapping(lhs, out, lhs_count * rec);
+    }
+    if rhs_count > 0 {
+        std::ptr::copy_nonoverlapping(rhs, out.add(lhs_count * rec), rhs_count * rec);
+    }
+    coddl_relation_seal(out, desc);
+    out
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn coddl_write_relation(ptr: *const u8, desc: *const CoddlHeadingDesc) {
     if ptr.is_null() || desc.is_null() {
@@ -882,6 +926,78 @@ mod tests {
             let (ptr, len) = read_text_cell(payload, 0);
             assert_eq!(std::slice::from_raw_parts(ptr, len), b"Grace");
             coddl_rc_release(payload);
+        }
+    }
+
+    #[test]
+    fn union_concats_and_dedups_cross_operand_text() {
+        // lhs {(1,Ada),(2,grace_a)} ∪ rhs {(2,grace_b),(3,Zoe)} = {(1,Ada),(2,Grace),(3,Zoe)}.
+        // The (2,Grace) tuple appears in both with DIFFERENT Text pointers; the
+        // content-aware seal must collapse it to one row. Heading {id, name}:
+        // id@0 (8), name@8 (ptr@8,len@16); record_size 24.
+        let attrs = [
+            CoddlAttrDesc {
+                name: b"id".as_ptr(),
+                name_len: 2,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 0,
+            },
+            CoddlAttrDesc {
+                name: b"name".as_ptr(),
+                name_len: 4,
+                kind: CoddlAttrKind::Text as u32,
+                offset: 8,
+            },
+        ];
+        let desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 24,
+            attrs: attrs.as_ptr(),
+        };
+        let ada: Vec<u8> = b"Ada".to_vec();
+        let grace_a: Vec<u8> = b"Grace".to_vec();
+        let grace_b: Vec<u8> = b"Grace".to_vec();
+        let zoe: Vec<u8> = b"Zoe".to_vec();
+        assert_ne!(grace_a.as_ptr(), grace_b.as_ptr());
+        unsafe {
+            let write_row = |rec: *mut u8, id: i64, s: &[u8]| {
+                std::ptr::write(rec as *mut i64, id);
+                std::ptr::write(rec.add(8) as *mut usize, s.as_ptr() as usize);
+                std::ptr::write(rec.add(16) as *mut usize, s.len());
+            };
+            let lhs = coddl_rc_alloc(2 * 24, 2, CoddlKind::Relation as u32, &desc);
+            write_row(lhs, 1, &ada);
+            write_row(lhs.add(24), 2, &grace_a);
+            let rhs = coddl_rc_alloc(2 * 24, 2, CoddlKind::Relation as u32, &desc);
+            write_row(rhs, 2, &grace_b);
+            write_row(rhs.add(24), 3, &zoe);
+
+            let out = coddl_relation_union(lhs, rhs, &desc);
+            assert!(!out.is_null());
+            let len = (*(out.sub(HEADER_SIZE) as *const CoddlRcHeader)).length as usize;
+            assert_eq!(len, 3, "the shared (2, Grace) collapses to one row");
+
+            // Collect the result as a set of (id, name).
+            let mut got: Vec<(i64, Vec<u8>)> = (0..len)
+                .map(|i| {
+                    let rec = out.add(i * 24);
+                    let id = std::ptr::read(rec as *const i64);
+                    let (p, l) = read_text_cell(rec, 8);
+                    (id, std::slice::from_raw_parts(p, l).to_vec())
+                })
+                .collect();
+            got.sort();
+            assert_eq!(
+                got,
+                vec![
+                    (1, b"Ada".to_vec()),
+                    (2, b"Grace".to_vec()),
+                    (3, b"Zoe".to_vec()),
+                ]
+            );
+            coddl_rc_release(out);
+            coddl_rc_release(rhs);
+            coddl_rc_release(lhs);
         }
     }
 

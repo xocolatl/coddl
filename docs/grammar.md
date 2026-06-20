@@ -438,6 +438,7 @@ function that implements it.
                   | 'times'                                    -- prec 0
                   | 'compose'                                  -- prec 0
                   | 'intersect'                                -- prec 0
+                  | 'union'                                    -- prec 0
                   | 'or'                                       -- prec 1
                   | 'and'                                      -- prec 2
                   | '=' | '<>' | '<' | '>' | '<=' | '>=' ;     -- prec 3
@@ -540,10 +541,11 @@ is explicit, not implied:
   user-defined types.
 - **Type generators** in `<type-ref>` — `Tuple H`, `Relation H`,
   `Sequence T`.
-- **Infix relational operators** not yet parsed — `union`, `minus`.
-  (`join` landed in M2, `times` in M3, `compose` in M4, `intersect`
-  thereafter; comparison `=` `<>` `<` `>` `<=` `>=`, logical `and` / `or`,
-  and `where` landed in Phase 20; arithmetic is listed separately below.)
+- **Infix relational operators** not yet parsed — `minus`.
+  (`join` landed in M2, `times` in M3, `compose` in M4, `intersect` and
+  `union` thereafter; comparison `=` `<>` `<` `>` `<=` `>=`, logical
+  `and` / `or`, and `where` landed in Phase 20; arithmetic is listed
+  separately below.)
 - **Statement forms** other than `<let-stmt>`, `<assign-stmt>`, and
   `<expr> ';'` — `mut`, `return`, `insert`, `delete`, `update`.
 - **Type / relvar / constraint declarations** at the top level.

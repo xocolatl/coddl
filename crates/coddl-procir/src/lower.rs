@@ -1325,7 +1325,11 @@ impl Lowerer {
         }
         if matches!(
             op,
-            BinaryOp::Join | BinaryOp::Times | BinaryOp::Compose | BinaryOp::Intersect
+            BinaryOp::Join
+                | BinaryOp::Times
+                | BinaryOp::Compose
+                | BinaryOp::Intersect
+                | BinaryOp::Union
         ) {
             return self.lower_join_inprocess(bin);
         }
@@ -1342,7 +1346,8 @@ impl Lowerer {
             | BinaryOp::Join
             | BinaryOp::Times
             | BinaryOp::Compose
-            | BinaryOp::Intersect => {
+            | BinaryOp::Intersect
+            | BinaryOp::Union => {
                 unreachable!("handled above")
             }
         };
@@ -1396,6 +1401,15 @@ impl Lowerer {
                     rhs: Box::new(rhs),
                 })
             }
+            // `union` → the A-core `OR` node (identical headings, typechecked).
+            Some(BinaryOp::Union) => {
+                let lhs = self.build_rel_expr(&b.lhs()?)?;
+                let rhs = self.build_rel_expr(&b.rhs()?)?;
+                Some(RelExpr::Or {
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                })
+            }
             // `A compose B` → `AND` then REMOVE the shared attributes: a
             // `Project` keeping only the attributes that appear in exactly one
             // operand. (Typecheck guarantees ≥1 shared attribute.)
@@ -1422,12 +1436,13 @@ impl Lowerer {
         }
     }
 
-    /// Lower `R join S` / `R times S` / `R compose S` in-process: build the
-    /// RelIR (`AND`, or `Project{AND}` for compose) and consume it via the
+    /// Lower an in-process relational binary — `join` / `times` / `intersect`
+    /// (→ `Inst::Join`), `compose` (→ `Inst::Join` + `Inst::Project`), or
+    /// `union` (→ `Inst::Union`). Builds the RelIR and consumes it via the
     /// in-process RelExpr→ProcIR path (`MaterializedRelvar` → slot read, `And`
-    /// → `Inst::Join`, `Project` → `Inst::Project`). Falls back to lowering the
-    /// operands directly for shapes the consumer doesn't handle yet (e.g.
-    /// mixed-origin), projecting away the shared attributes for `compose`.
+    /// → `Inst::Join`, `Or` → `Inst::Union`, `Project` → `Inst::Project`). Falls
+    /// back to lowering the operands directly for shapes the consumer declines
+    /// (e.g. a relation-literal operand), dispatching on the surface operator.
     fn lower_join_inprocess(&mut self, bin: &BinaryExpr) -> ValueId {
         if let (Some(lhs_e), Some(rhs_e)) = (bin.lhs(), bin.rhs()) {
             if let Some(rel) = self.build_rel_binary(bin) {
@@ -1437,10 +1452,15 @@ impl Lowerer {
             }
             let lhs = self.lower_expr(&lhs_e);
             let rhs = self.lower_expr(&rhs_e);
+            // `union` is a set union, not a join — dispatch before `emit_join`.
+            // (The primary path above handles the common case; this fallback
+            // fires for shapes the RelExpr consumer declines, e.g. a
+            // relation-literal operand.)
+            if matches!(bin.op_kind(), Some(BinaryOp::Union)) {
+                return self.emit_union(lhs, rhs);
+            }
             let joined = self.emit_join(lhs, rhs);
-            // `compose` removes the shared attributes after the join. (The
-            // primary path above handles this via `Project`; this fallback only
-            // fires for shapes the RelExpr consumer declines, e.g. mixed-origin.)
+            // `compose` removes the shared attributes after the join.
             if matches!(bin.op_kind(), Some(BinaryOp::Compose)) {
                 let keep = self.compose_keep(lhs, rhs);
                 return self.emit_project(joined, &keep);
@@ -1494,6 +1514,11 @@ impl Lowerer {
                 let r = self.lower_relexpr_inprocess(rhs)?;
                 Some(self.emit_join(l, r))
             }
+            RelExpr::Or { lhs, rhs } => {
+                let l = self.lower_relexpr_inprocess(lhs)?;
+                let r = self.lower_relexpr_inprocess(rhs)?;
+                Some(self.emit_union(l, r))
+            }
             // `compose` lowers to `Project{And}`: lower the join, then narrow to
             // the kept attributes via `Inst::Project`.
             RelExpr::Project { input, keep } => {
@@ -1531,6 +1556,25 @@ impl Lowerer {
             lhs_heading_id,
             rhs_heading_id,
             result_heading_id,
+        });
+        dst
+    }
+
+    /// Emit `Inst::Union` over two already-lowered relation values with
+    /// identical headings (surface `union`). The result heading is that shared
+    /// heading; the runtime concatenates and re-seals (content-aware dedup).
+    fn emit_union(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
+        let heading_id = match self.value_type(lhs) {
+            ProcType::Relation(id) => id,
+            other => unreachable!("union lhs non-relation `{other}` survived typecheck"),
+        };
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Relation(heading_id));
+        self.insts.push(Inst::Union {
+            dst,
+            lhs,
+            rhs,
+            heading_id,
         });
         dst
     }

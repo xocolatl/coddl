@@ -45,4 +45,9 @@ oper main {} [
     // intersect: the tuples in BOTH shifts — the overlap { (2, Grace), (3, Alan) }.
     let both = Morning intersect Evening;
     write_relation { rel: both };
+
+    // union: everyone on either shift — { (1,Ada),(2,Grace),(3,Alan),(4,Edsger) }.
+    // The shared (2,Grace) and (3,Alan) each appear once (a relation is a set).
+    let either = Morning union Evening;
+    write_relation { rel: either };
 ];

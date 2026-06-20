@@ -133,6 +133,9 @@ oper main {} [
 
     let both = Morning intersect Evening;
     write_relation { rel: both };
+
+    let either = Morning union Evening;
+    write_relation { rel: either };
 ];
 ";
 
@@ -1845,9 +1848,9 @@ fn join_times_compose_inprocess_relations_equal_across_backends() {
 
 /// The in-process twin populates two identical-heading `private` relvars
 /// (`Morning`, `Evening`, heading { id, name }) that overlap in two tuples, dumps
-/// each raw, then dumps `Morning intersect Evening` (the overlap). Tuple order is
-/// unspecified (RM Pro 1), so the tests compare this set, not bytes; the shared
-/// tuples recur across the raw dumps and the intersection.
+/// each raw, then dumps `Morning intersect Evening` (the overlap) and `Morning
+/// union Evening` (everyone). Tuple order is unspecified (RM Pro 1), so the tests
+/// compare this set, not bytes; the shared tuples recur across the queries.
 const UNION_INTERSECT_MINUS_TUPLES: &[&str] = &[
     // Morning
     "{id: 1, name: \"Ada\"}",
@@ -1860,6 +1863,11 @@ const UNION_INTERSECT_MINUS_TUPLES: &[&str] = &[
     // Morning intersect Evening
     "{id: 2, name: \"Grace\"}",
     "{id: 3, name: \"Alan\"}",
+    // Morning union Evening
+    "{id: 1, name: \"Ada\"}",
+    "{id: 2, name: \"Grace\"}",
+    "{id: 3, name: \"Alan\"}",
+    "{id: 4, name: \"Edsger\"}",
 ];
 
 #[test]

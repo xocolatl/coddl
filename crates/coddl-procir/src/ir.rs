@@ -307,6 +307,17 @@ pub enum Inst {
         rhs_heading_id: HeadingId,
         result_heading_id: HeadingId,
     },
+    /// Set union of two in-memory relations with identical headings (surface
+    /// `union`, Algebra-A OR). Backends emit a call to
+    /// `coddl_relation_union(lhs, rhs, &descriptor)`, which concatenates both
+    /// payloads and re-seals (content-aware dedup). Identical headings ⇒ one
+    /// `heading_id` for both operands and the result.
+    Union {
+        dst: ValueId,
+        lhs: ValueId,
+        rhs: ValueId,
+        heading_id: HeadingId,
+    },
     /// Collapse a single-row relation to a tuple (TTM RM Pre 10).
     /// Backends emit a call to `coddl_extract_check_cardinality(src,
     /// &descriptor)` which aborts if cardinality ≠ 1, then read each
@@ -629,6 +640,12 @@ impl fmt::Display for Inst {
                 "{dst} = join {lhs} heading_{} {rhs} heading_{} -> heading_{}",
                 lhs_heading_id.0, rhs_heading_id.0, result_heading_id.0
             ),
+            Inst::Union {
+                dst,
+                lhs,
+                rhs,
+                heading_id,
+            } => write!(f, "{dst} = union {lhs} {rhs} -> heading_{}", heading_id.0),
             Inst::Extract {
                 dst,
                 src,
