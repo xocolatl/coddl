@@ -145,21 +145,27 @@ pub fn emit_select(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
 /// right operand numbers its Postgres `$N` placeholders after the left's. The
 /// public entry passes `0`.
 fn emit_select_offset(expr: &RelExpr, dialect: Dialect, param_offset: u32) -> Result<SqlQuery> {
-    // Root set-op: each operand emits as a full sub-SELECT, combined with
-    // bare `UNION` (set semantics, never `UNION ALL`). Params concatenate (lhs
-    // then rhs); the rhs's placeholders start after the lhs's. CORRESPONDING is
-    // free — both sides emit canonical-sorted SELECT lists over identical
-    // headings (typechecked), so columns align by position. A set-op nested
-    // *under* a relational op never reaches here: `resolve` errs on `Or`, so
-    // `cut::try_push` declines and it runs in-process.
-    if let RelExpr::Or { lhs, rhs } = expr {
+    // Root set-op: each operand emits as a full sub-SELECT, combined with a bare
+    // compound operator (`UNION` for `Or`, `EXCEPT` for `Minus`; set semantics,
+    // never `… ALL`). Params concatenate (lhs then rhs); the rhs's placeholders
+    // start after the lhs's. CORRESPONDING is free — both sides emit
+    // canonical-sorted SELECT lists over identical headings (typechecked), so
+    // columns align by position. A set-op nested *under* a relational op never
+    // reaches here: `resolve` errs on `Or`/`Minus`, so `cut::try_push` declines
+    // and it runs in-process.
+    let set_op = match expr {
+        RelExpr::Or { lhs, rhs } => Some(("UNION", lhs, rhs)),
+        RelExpr::Minus { lhs, rhs } => Some(("EXCEPT", lhs, rhs)),
+        _ => None,
+    };
+    if let Some((op, lhs, rhs)) = set_op {
         let l = emit_select_offset(lhs, dialect, param_offset)?;
         let r = emit_select_offset(rhs, dialect, param_offset + l.sql.param_count)?;
-        // Unparenthesized compound SELECT: `… UNION …`. SQLite rejects
+        // Unparenthesized compound SELECT: `… UNION/EXCEPT …`. SQLite rejects
         // parenthesized operands in a compound query (`(SELECT …) UNION …` is a
         // syntax error); the bare form is valid in both SQLite and Postgres and
         // is associative, so nested root set-ops chain correctly.
-        let text = format!("{} UNION {}", l.sql.text, r.sql.text);
+        let text = format!("{} {op} {}", l.sql.text, r.sql.text);
         let mut params = l.params;
         params.extend(r.params);
         let plan_id = PlanId(fnv1a(dialect, &text));
@@ -169,7 +175,8 @@ fn emit_select_offset(expr: &RelExpr, dialect: Dialect, param_offset: u32) -> Re
                 text,
             },
             params,
-            // Identical operand headings (typechecked) — either is the result.
+            // `UNION`: identical operand headings (typechecked). `EXCEPT`: the
+            // result is the lhs's rows. Either way the lhs heading is correct.
             result_heading: l.result_heading,
             plan_id,
         });
@@ -325,7 +332,7 @@ fn resolve(
         // sqlemit.md), err so `cut::try_push` declines and the whole expression
         // runs in-process. A *root* `Or` is handled in `emit_select_offset`
         // before `resolve` is ever called.
-        RelExpr::Or { .. } => Err(BackendError::Other(
+        RelExpr::Or { .. } | RelExpr::Minus { .. } => Err(BackendError::Other(
             "set operation nested under a relational operator does not push to SQL".to_string(),
         )),
         // Never reached: a materialized leaf fails the cut's `RelvarRooted`
@@ -706,6 +713,47 @@ mod tests {
             r#"SELECT "id", "name" FROM "morning" WHERE "id" = $1 UNION SELECT "id", "name" FROM "evening" WHERE "id" = $2"#
         );
         assert_eq!(q.sql.param_count, 2);
+    }
+
+    #[test]
+    fn minus_emits_except_of_selects() {
+        // `Morning minus Evening` → RelExpr::Minus. Each operand emits a full
+        // SELECT, combined with bare EXCEPT (set difference, dedups). No DISTINCT
+        // on the operands — each keeps key `id`.
+        let expr = RelExpr::Minus {
+            lhs: Box::new(morning()),
+            rhs: Box::new(evening()),
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id", "name" FROM "morning" EXCEPT SELECT "id", "name" FROM "evening""#
+        );
+        assert_eq!(q.sql.param_count, 0);
+        assert!(q.params.is_empty());
+        assert_eq!(
+            q.result_heading,
+            Heading::new(vec![
+                ("id".to_string(), Type::Integer),
+                ("name".to_string(), Type::Text),
+            ])
+        );
+    }
+
+    #[test]
+    fn minus_with_where_on_left_pushes_the_param() {
+        // `(Morning where id = 1) minus Evening` — the lhs WHERE param precedes
+        // the (param-free) rhs; one bind on the left.
+        let expr = RelExpr::Minus {
+            lhs: Box::new(where_id_1(morning())),
+            rhs: Box::new(evening()),
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id", "name" FROM "morning" WHERE "id" = ? EXCEPT SELECT "id", "name" FROM "evening""#
+        );
+        assert_eq!(q.sql.param_count, 1);
     }
 
     #[test]

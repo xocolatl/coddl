@@ -291,6 +291,18 @@ fn declare_runtime_rc_externs(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert("coddl_relation_union".into(), id);
     }
+    // coddl_relation_minus(lhs, rhs, desc) -> ptr. Identical headings ⇒ one desc.
+    {
+        let mut sig = obj.make_signature();
+        for _ in 0..3 {
+            sig.params.push(AbiParam::new(ptr_ty));
+        }
+        sig.returns.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_relation_minus", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_relation_minus".into(), id);
+    }
     // Private-relvar in-memory slots:
     //   coddl_relvar_slot_init_empty(desc: ptr, slot: ptr) -> ()
     //   coddl_relvar_slot_store(value: ptr, slot: ptr) -> ()
@@ -1430,6 +1442,25 @@ fn emit_inst(
             let union_id = funcs["coddl_relation_union"];
             let union_local = obj.declare_func_in_func(union_id, builder.func);
             let call = builder.ins().call(union_local, &[lhs_v, rhs_v, desc_val]);
+            let result = builder.inst_results(call)[0];
+            values.insert(*dst, ValueRepr::Scalar(result));
+            Ok(())
+        }
+        Inst::Minus {
+            dst,
+            lhs,
+            rhs,
+            heading_id,
+        } => {
+            let lhs_v = scalar_value(values, lhs)?;
+            let rhs_v = scalar_value(values, rhs)?;
+            let ptr_ty = obj.target_config().pointer_type();
+            let desc_gv =
+                obj.declare_data_in_func(heading_desc_ids[heading_id.0 as usize], builder.func);
+            let desc_val = builder.ins().symbol_value(ptr_ty, desc_gv);
+            let minus_id = funcs["coddl_relation_minus"];
+            let minus_local = obj.declare_func_in_func(minus_id, builder.func);
+            let call = builder.ins().call(minus_local, &[lhs_v, rhs_v, desc_val]);
             let result = builder.inst_results(call)[0];
             values.insert(*dst, ValueRepr::Scalar(result));
             Ok(())

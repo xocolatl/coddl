@@ -50,4 +50,8 @@ oper main {} [
     // The shared (2,Grace) and (3,Alan) each appear once (a relation is a set).
     let either = Morning union Evening;
     write_relation { rel: either };
+
+    // minus: on the morning shift but NOT the evening one — just { (1, Ada) }.
+    let morning_only = Morning minus Evening;
+    write_relation { rel: morning_only };
 ];

@@ -46,9 +46,15 @@ oper main {} [
     ];
     write_relation { rel: both };
 
-    // union: pushes one `(SELECT ... FROM "morning") UNION (SELECT ... FROM "evening")`.
+    // union: pushes one `SELECT ... FROM "morning" UNION SELECT ... FROM "evening"`.
     let either = transaction [
         Morning union Evening
     ];
     write_relation { rel: either };
+
+    // minus: pushes one `SELECT ... FROM "morning" EXCEPT SELECT ... FROM "evening"`.
+    let morning_only = transaction [
+        Morning minus Evening
+    ];
+    write_relation { rel: morning_only };
 ];

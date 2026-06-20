@@ -619,6 +619,7 @@ pub enum BinaryOp {
     Compose,
     Intersect,
     Union,
+    Minus,
 }
 
 ast_node!(pub BinaryExpr, BINARY_EXPR);
@@ -655,7 +656,7 @@ impl BinaryExpr {
                         if matches!(
                             tok.text(),
                             "and" | "or" | "where" | "join" | "times" | "compose" | "intersect"
-                                | "union"
+                                | "union" | "minus"
                         ) =>
                     {
                         return Some(tok);
@@ -687,6 +688,7 @@ impl BinaryExpr {
                 "compose" => BinaryOp::Compose,
                 "intersect" => BinaryOp::Intersect,
                 "union" => BinaryOp::Union,
+                "minus" => BinaryOp::Minus,
                 _ => return None,
             },
             _ => return None,

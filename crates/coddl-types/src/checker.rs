@@ -1182,6 +1182,7 @@ impl TypeChecker {
             BinaryOp::Compose => self.check_compose_binary(bin, scope),
             BinaryOp::Intersect => self.check_intersect_binary(bin, scope),
             BinaryOp::Union => self.check_union_binary(bin, scope),
+            BinaryOp::Minus => self.check_minus_binary(bin, scope),
             BinaryOp::And | BinaryOp::Or => self.check_logical_op(bin, op, scope),
             BinaryOp::Eq | BinaryOp::NotEq => self.check_equality_op(bin, op, scope),
             BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => {
@@ -1485,6 +1486,23 @@ impl TypeChecker {
         }
     }
 
+    /// `R minus S` — set difference (Algebra-A AND-NOT restricted to matching
+    /// headings). Both operands must be relations with the **same** heading;
+    /// mismatched headings → T0038. The result heading is that shared heading
+    /// (the result is the subset of `lhs` not in `rhs`).
+    fn check_minus_binary(&mut self, bin: &BinaryExpr, scope: &mut Scope) -> Type {
+        // Check both operands first so each surfaces its own diagnostics.
+        let lhs_h = self.relation_operand(bin.lhs(), "minus", scope);
+        let rhs_h = self.relation_operand(bin.rhs(), "minus", scope);
+        let (Some(lhs_h), Some(rhs_h)) = (lhs_h, rhs_h) else {
+            return Type::Unknown;
+        };
+        match self.identical_headings(bin, &lhs_h, &rhs_h, "minus") {
+            Some(h) => Type::Relation(h),
+            None => Type::Unknown,
+        }
+    }
+
     /// `lhs and rhs` / `lhs or rhs` — both operands must be Boolean,
     /// result is Boolean.
     fn check_logical_op(&mut self, bin: &BinaryExpr, op: BinaryOp, scope: &mut Scope) -> Type {
@@ -1744,6 +1762,7 @@ fn op_display(op: BinaryOp) -> &'static str {
         BinaryOp::Compose => "compose",
         BinaryOp::Intersect => "intersect",
         BinaryOp::Union => "union",
+        BinaryOp::Minus => "minus",
     }
 }
 
@@ -1974,6 +1993,27 @@ mod tests {
                    private relvar R { a: Integer, b: Text } key { a }; \
                    private relvar S { a: Integer, c: Text } key { a }; \
                    oper main {} [ write_relation { rel: R union S }; ];";
+        assert!(codes(src).contains(&"T0038"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn minus_with_identical_headings_checks_clean() {
+        // R { a, b } minus S { a, b } — identical headings -> ok, result { a, b }.
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   private relvar S { a: Integer, b: Text } key { a }; \
+                   oper main {} [ write_relation { rel: R minus S }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn minus_with_differing_headings_diagnoses_t0038() {
+        // S has `c` where R has `b` -> headings not identical -> T0038.
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   private relvar S { a: Integer, c: Text } key { a }; \
+                   oper main {} [ write_relation { rel: R minus S }; ];";
         assert!(codes(src).contains(&"T0038"), "{:?}", codes(src));
     }
 

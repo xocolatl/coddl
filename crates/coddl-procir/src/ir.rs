@@ -318,6 +318,17 @@ pub enum Inst {
         rhs: ValueId,
         heading_id: HeadingId,
     },
+    /// Set difference of two in-memory relations with identical headings
+    /// (surface `minus`, Algebra-A AND-NOT). Backends emit a call to
+    /// `coddl_relation_minus(lhs, rhs, &descriptor)`, which keeps each `lhs`
+    /// record not present in `rhs` (content-aware membership; no re-seal —
+    /// the result is a subset of the already-sealed `lhs`).
+    Minus {
+        dst: ValueId,
+        lhs: ValueId,
+        rhs: ValueId,
+        heading_id: HeadingId,
+    },
     /// Collapse a single-row relation to a tuple (TTM RM Pre 10).
     /// Backends emit a call to `coddl_extract_check_cardinality(src,
     /// &descriptor)` which aborts if cardinality ≠ 1, then read each
@@ -646,6 +657,12 @@ impl fmt::Display for Inst {
                 rhs,
                 heading_id,
             } => write!(f, "{dst} = union {lhs} {rhs} -> heading_{}", heading_id.0),
+            Inst::Minus {
+                dst,
+                lhs,
+                rhs,
+                heading_id,
+            } => write!(f, "{dst} = minus {lhs} {rhs} -> heading_{}", heading_id.0),
             Inst::Extract {
                 dst,
                 src,

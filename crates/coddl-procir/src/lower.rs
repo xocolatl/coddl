@@ -1330,6 +1330,7 @@ impl Lowerer {
                 | BinaryOp::Compose
                 | BinaryOp::Intersect
                 | BinaryOp::Union
+                | BinaryOp::Minus
         ) {
             return self.lower_join_inprocess(bin);
         }
@@ -1347,7 +1348,8 @@ impl Lowerer {
             | BinaryOp::Times
             | BinaryOp::Compose
             | BinaryOp::Intersect
-            | BinaryOp::Union => {
+            | BinaryOp::Union
+            | BinaryOp::Minus => {
                 unreachable!("handled above")
             }
         };
@@ -1410,6 +1412,15 @@ impl Lowerer {
                     rhs: Box::new(rhs),
                 })
             }
+            // `minus` → the A-core `AND NOT` node (identical headings, typechecked).
+            Some(BinaryOp::Minus) => {
+                let lhs = self.build_rel_expr(&b.lhs()?)?;
+                let rhs = self.build_rel_expr(&b.rhs()?)?;
+                Some(RelExpr::Minus {
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                })
+            }
             // `A compose B` → `AND` then REMOVE the shared attributes: a
             // `Project` keeping only the attributes that appear in exactly one
             // operand. (Typecheck guarantees ≥1 shared attribute.)
@@ -1452,12 +1463,15 @@ impl Lowerer {
             }
             let lhs = self.lower_expr(&lhs_e);
             let rhs = self.lower_expr(&rhs_e);
-            // `union` is a set union, not a join — dispatch before `emit_join`.
-            // (The primary path above handles the common case; this fallback
-            // fires for shapes the RelExpr consumer declines, e.g. a
+            // `union` / `minus` are set ops, not joins — dispatch before
+            // `emit_join`. (The primary path above handles the common case; this
+            // fallback fires for shapes the RelExpr consumer declines, e.g. a
             // relation-literal operand.)
             if matches!(bin.op_kind(), Some(BinaryOp::Union)) {
                 return self.emit_union(lhs, rhs);
+            }
+            if matches!(bin.op_kind(), Some(BinaryOp::Minus)) {
+                return self.emit_minus(lhs, rhs);
             }
             let joined = self.emit_join(lhs, rhs);
             // `compose` removes the shared attributes after the join.
@@ -1519,6 +1533,11 @@ impl Lowerer {
                 let r = self.lower_relexpr_inprocess(rhs)?;
                 Some(self.emit_union(l, r))
             }
+            RelExpr::Minus { lhs, rhs } => {
+                let l = self.lower_relexpr_inprocess(lhs)?;
+                let r = self.lower_relexpr_inprocess(rhs)?;
+                Some(self.emit_minus(l, r))
+            }
             // `compose` lowers to `Project{And}`: lower the join, then narrow to
             // the kept attributes via `Inst::Project`.
             RelExpr::Project { input, keep } => {
@@ -1571,6 +1590,25 @@ impl Lowerer {
         let dst = self.fresh_value();
         self.record_type(dst, ProcType::Relation(heading_id));
         self.insts.push(Inst::Union {
+            dst,
+            lhs,
+            rhs,
+            heading_id,
+        });
+        dst
+    }
+
+    /// Emit `Inst::Minus` over two already-lowered relation values with
+    /// identical headings (surface `minus`). The result heading is that shared
+    /// heading; the runtime keeps each `lhs` record not present in `rhs`.
+    fn emit_minus(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
+        let heading_id = match self.value_type(lhs) {
+            ProcType::Relation(id) => id,
+            other => unreachable!("minus lhs non-relation `{other}` survived typecheck"),
+        };
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Relation(heading_id));
+        self.insts.push(Inst::Minus {
             dst,
             lhs,
             rhs,

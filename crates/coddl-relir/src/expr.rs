@@ -97,6 +97,15 @@ pub enum RelExpr {
         lhs: Box<RelExpr>,
         rhs: Box<RelExpr>,
     },
+    /// Set difference (surface `minus`) — the Algebra-A `AND NOT` core, restricted
+    /// to identical operand headings (typechecked). The result is the `lhs` tuples
+    /// not in `rhs`, so its heading is `lhs`'s (= `rhs`'s). Both operands
+    /// relvar-rooted → pushes to SQL as `… EXCEPT …`; both materialized →
+    /// in-process; mixed → a materialization boundary.
+    Minus {
+        lhs: Box<RelExpr>,
+        rhs: Box<RelExpr>,
+    },
     /// An in-memory (`private`) relvar read — the materialized counterpart of
     /// the relvar-rooted `RelvarRef` leaf. No SQL source, so any subtree
     /// containing it is `Materialized` and lowers in-process.
@@ -197,6 +206,8 @@ impl RelExpr {
                 .expect("typechecked join has compatible shared attributes"),
             // Identical operand headings (typechecked) — either is the result.
             RelExpr::Or { lhs, .. } => lhs.heading(),
+            // The result is a subset of `lhs`, so its heading is `lhs`'s.
+            RelExpr::Minus { lhs, .. } => lhs.heading(),
             RelExpr::MaterializedRelvar { heading, .. } => heading.clone(),
         }
     }
@@ -216,6 +227,7 @@ impl RelExpr {
             // both materialized → in-process, else a materialization boundary.
             RelExpr::And { lhs, rhs } => combine_origin(lhs.origin(), rhs.origin()),
             RelExpr::Or { lhs, rhs } => combine_origin(lhs.origin(), rhs.origin()),
+            RelExpr::Minus { lhs, rhs } => combine_origin(lhs.origin(), rhs.origin()),
             RelExpr::MaterializedRelvar { .. } => StorageOrigin::Materialized,
         }
     }
@@ -277,6 +289,11 @@ impl RelExpr {
                 lhs.render_into(out, depth + 1);
                 rhs.render_into(out, depth + 1);
             }
+            RelExpr::Minus { lhs, rhs } => {
+                let _ = writeln!(out, "{pad}Minus");
+                lhs.render_into(out, depth + 1);
+                rhs.render_into(out, depth + 1);
+            }
         }
     }
 
@@ -306,6 +323,9 @@ impl RelExpr {
             // needed on the operand SELECTs anyway.)
             RelExpr::And { .. } => Vec::new(),
             RelExpr::Or { .. } => Vec::new(),
+            // Conservative: `minus` preserves `lhs`'s keys (the result is a
+            // subset of `lhs`), but lhs-key preservation is deferred.
+            RelExpr::Minus { .. } => Vec::new(),
             RelExpr::MaterializedRelvar { .. } => Vec::new(),
         }
     }
@@ -334,6 +354,7 @@ impl RelExpr {
             RelExpr::Rename { input, .. } => input.card_le_one(),
             RelExpr::And { .. } => false,
             RelExpr::Or { .. } => false,
+            RelExpr::Minus { .. } => false,
             RelExpr::MaterializedRelvar { .. } => false,
         }
     }
