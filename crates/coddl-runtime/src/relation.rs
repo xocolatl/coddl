@@ -110,16 +110,37 @@ pub unsafe extern "C" fn coddl_relation_seal(ptr: *mut u8, desc: *const CoddlHea
         return;
     }
 
-    // Sort record indices, permute into a fresh buffer, then drop adjacent
-    // duplicates. Records compare via `record_cmp` (content-aware): scalar
-    // cells by their fixed-width bytes, `Text` cells by string content — never
-    // the `(ptr, len)` fat pointer, since equal-content strings from different
-    // sources have different pointers (relation-literal constants are not
-    // deduped across literals, and `intern_string` is append-only). For an
-    // all-scalar record this matches the old whole-record byte compare.
     let attrs = std::slice::from_raw_parts((*desc).attrs, (*desc).attr_count as usize);
     let payload = std::slice::from_raw_parts_mut(ptr, count * record_size);
+    let new_len = dedup_records(payload, record_size, attrs);
+    (*header).length = new_len as u32;
+}
 
+/// Sort + adjacent-dedup a record buffer in place (content-aware via
+/// `record_cmp`), returning the number of surviving (unique) records. The
+/// first `new_len * record_size` bytes of `payload` hold the unique records in
+/// sorted order; the tail is left as scratch. The caller updates any header
+/// `length`.
+///
+/// Records compare via `record_cmp`: scalar cells by their fixed-width bytes,
+/// `Text` cells by string content — never the `(ptr, len)` fat pointer, since
+/// equal-content strings from different sources have different pointers
+/// (relation-literal constants are not deduped across literals, and
+/// `intern_string` is append-only). For an all-scalar record this matches a
+/// whole-record byte compare. Shared by [`coddl_relation_seal`] and
+/// [`coddl_relation_tclose`].
+///
+/// # Safety
+/// `payload.len()` must be a multiple of `record_size > 0`, and every `Text`
+/// cell's `(ptr, len)` must describe `len` readable bytes (or `len == 0`).
+unsafe fn dedup_records(payload: &mut [u8], record_size: usize, attrs: &[CoddlAttrDesc]) -> usize {
+    let count = payload.len() / record_size;
+    if count <= 1 {
+        return count;
+    }
+
+    // Sort record indices, permute into a fresh buffer, then drop adjacent
+    // duplicates.
     let mut indices: Vec<usize> = (0..count).collect();
     indices.sort_by(|&a, &b| {
         let ra = &payload[a * record_size..(a + 1) * record_size];
@@ -153,7 +174,7 @@ pub unsafe extern "C" fn coddl_relation_seal(ptr: *mut u8, desc: *const CoddlHea
 
     // Copy the sorted+deduped records back into the payload.
     payload[..write_idx * record_size].copy_from_slice(&sorted[..write_idx * record_size]);
-    (*header).length = write_idx as u32;
+    write_idx
 }
 
 /// Print a relation: one tuple per line in canonical heading order,
@@ -427,6 +448,110 @@ pub unsafe extern "C" fn coddl_relation_minus(
     out
 }
 
+/// Transitive closure of a binary relation (surface `tclose`, Algebra-A
+/// ◄TCLOSE►) — the one genuinely irreducible relational operator. The operand
+/// is a relation of exactly two identically-typed attributes (typechecked);
+/// treat `attrs[0]` as the source and `attrs[1]` as the target. The choice is
+/// arbitrary because closure is **direction-agnostic**: `TC(reverse G) =
+/// reverse(TC G)`, and writing the closure pair back into the `{a, b}` heading
+/// undoes the very swap that reversing the pair performs, so the result is the
+/// same relation either way — hence one `desc` for operand and result.
+///
+/// A naive fixpoint composes the accumulating result with the *original* edge
+/// set: for a result pair `x → y` and an input edge `y → z`, add `x → z`;
+/// repeat until a round adds nothing new. `R_{i+1} = R_i ∪ (R_i ∘ E)` converges
+/// to `∪_{k≥1} E^k`, the transitive closure. Each round's additions are merged
+/// and content-deduped (`dedup_records`), so the loop terminates — the pair set
+/// is finite (bounded by distinct source×target pairs). Cell matching (`cell_eq`)
+/// and dedup are content-aware (`Text` by content, not pointer), so closures
+/// over string-keyed graphs are correct. 0 or 1 input edges → the input is its
+/// own closure (the first round composes nothing new).
+///
+/// # Safety
+/// `rel`/`desc` must be a non-null payload/descriptor from the runtime and must
+/// outlive the call; `desc` must describe a binary (2-attribute) heading whose
+/// two attributes share a kind.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_relation_tclose(
+    rel: *const u8,
+    desc: *const CoddlHeadingDesc,
+) -> *mut u8 {
+    if rel.is_null() || desc.is_null() {
+        return std::ptr::null_mut();
+    }
+    let record_size = (*desc).record_size as usize;
+    let attrs = std::slice::from_raw_parts((*desc).attrs, (*desc).attr_count as usize);
+    let count = (*(rel.sub(HEADER_SIZE) as *const CoddlRcHeader)).length as usize;
+    // Defensive: a malformed (non-binary or zero-width) descriptor can't be
+    // closed — copy the input through unchanged.
+    if attrs.len() != 2 || record_size == 0 {
+        let out = crate::rc::coddl_rc_alloc(
+            record_size.saturating_mul(count),
+            count as u32,
+            CoddlKind::Relation as u32,
+            desc,
+        );
+        if !out.is_null() && count > 0 {
+            std::ptr::copy_nonoverlapping(rel, out, count * record_size);
+        }
+        return out;
+    }
+    let off_a = attrs[0].offset as usize; // source cell
+    let off_b = attrs[1].offset as usize; // target cell
+    let kind = attrs[0].kind; // identical to attrs[1].kind (typechecked)
+    let w = cell_width(kind);
+
+    // The accumulating edge set, seeded with a copy of the input records.
+    let mut result: Vec<u8> = std::slice::from_raw_parts(rel, count * record_size).to_vec();
+
+    loop {
+        let prev_len = result.len();
+        let cur_count = prev_len / record_size;
+        // Compose each accumulated pair (x → y) with each input edge (y → z).
+        let mut round: Vec<u8> = Vec::new();
+        for ri in 0..cur_count {
+            let r = &result[ri * record_size..(ri + 1) * record_size];
+            for ei in 0..count {
+                let e = std::slice::from_raw_parts(rel.add(ei * record_size), record_size);
+                // r's target (off_b) == e's source (off_a)?
+                if cell_eq(r.as_ptr(), off_b, e.as_ptr(), off_a, kind) {
+                    // New pair (x → z): r's source cell + e's target cell, into
+                    // a zeroed record (padding bytes are never read by
+                    // `record_cmp`, which walks only the two attribute cells).
+                    let mut cand = vec![0u8; record_size];
+                    cand[off_a..off_a + w].copy_from_slice(&r[off_a..off_a + w]);
+                    cand[off_b..off_b + w].copy_from_slice(&e[off_b..off_b + w]);
+                    round.extend_from_slice(&cand);
+                }
+            }
+        }
+        if round.is_empty() {
+            break;
+        }
+        result.extend_from_slice(&round);
+        let new_count = dedup_records(&mut result, record_size, attrs);
+        result.truncate(new_count * record_size);
+        if result.len() == prev_len {
+            break; // fixpoint: the round added no pair that survived dedup
+        }
+    }
+
+    let n = result.len() / record_size;
+    let out = crate::rc::coddl_rc_alloc(
+        record_size.saturating_mul(n),
+        n as u32,
+        CoddlKind::Relation as u32,
+        desc,
+    );
+    if out.is_null() {
+        return std::ptr::null_mut();
+    }
+    if n > 0 {
+        std::ptr::copy_nonoverlapping(result.as_ptr(), out, n * record_size);
+    }
+    out
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn coddl_write_relation(ptr: *const u8, desc: *const CoddlHeadingDesc) {
     if ptr.is_null() || desc.is_null() {
@@ -656,6 +781,40 @@ unsafe fn record_cmp(ra: &[u8], rb: &[u8], attrs: &[CoddlAttrDesc]) -> std::cmp:
         }
     }
     Ordering::Equal
+}
+
+/// Content-aware equality of one cell from each of two records: `ra` at `off_a`
+/// vs `rb` at `off_b`, both of kind `kind`. `Text` compares by string content
+/// (via `read_text_cell`); scalars compare their fixed-width bytes — the same
+/// basis as `record_cmp`, but for a single cell across (possibly) different
+/// offsets. Used by [`coddl_relation_tclose`] to test whether one edge's target
+/// matches another edge's source.
+///
+/// # Safety
+/// `ra.add(off_a)` and `rb.add(off_b)` must each point at one readable cell of
+/// `kind` (8 bytes scalar, or a 16-byte `(ptr, len)` Text fat pointer whose
+/// `len` bytes are readable, or `len == 0`).
+unsafe fn cell_eq(ra: *const u8, off_a: usize, rb: *const u8, off_b: usize, kind: u32) -> bool {
+    if kind == CoddlAttrKind::Text as u32 {
+        let (pa, la) = read_text_cell(ra, off_a);
+        let (pb, lb) = read_text_cell(rb, off_b);
+        let sa: &[u8] = if la == 0 {
+            &[]
+        } else {
+            std::slice::from_raw_parts(pa, la)
+        };
+        let sb: &[u8] = if lb == 0 {
+            &[]
+        } else {
+            std::slice::from_raw_parts(pb, lb)
+        };
+        sa == sb
+    } else {
+        let w = cell_width(kind);
+        let a = std::slice::from_raw_parts(ra.add(off_a), w);
+        let b = std::slice::from_raw_parts(rb.add(off_b), w);
+        a == b
+    }
 }
 
 /// Project a relation onto a subset of its attributes. Returns a fresh
@@ -1105,6 +1264,131 @@ mod tests {
             coddl_rc_release(out);
             coddl_rc_release(rhs);
             coddl_rc_release(lhs);
+        }
+    }
+
+    #[test]
+    fn tclose_computes_reachability_integer_chain() {
+        // Edges {from, to} (both Integer): 1→2, 2→3. The transitive closure
+        // adds 1→3, so {(1,2),(2,3),(1,3)}. Canonical heading order sorts
+        // `from` < `to`: from@0 (8), to@8 (8); record_size 16. attrs[0]=from
+        // (source), attrs[1]=to (target).
+        let attrs = [
+            CoddlAttrDesc {
+                name: b"from".as_ptr(),
+                name_len: 4,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 0,
+            },
+            CoddlAttrDesc {
+                name: b"to".as_ptr(),
+                name_len: 2,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 8,
+            },
+        ];
+        let desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 16,
+            attrs: attrs.as_ptr(),
+        };
+        unsafe {
+            let write_edge = |rec: *mut u8, from: i64, to: i64| {
+                std::ptr::write(rec as *mut i64, from);
+                std::ptr::write(rec.add(8) as *mut i64, to);
+            };
+            let edges = coddl_rc_alloc(2 * 16, 2, CoddlKind::Relation as u32, &desc);
+            write_edge(edges, 1, 2);
+            write_edge(edges.add(16), 2, 3);
+
+            let out = coddl_relation_tclose(edges, &desc);
+            assert!(!out.is_null());
+            let len = (*(out.sub(HEADER_SIZE) as *const CoddlRcHeader)).length as usize;
+            assert_eq!(len, 3, "closure of 1→2→3 adds 1→3");
+            let mut got: Vec<(i64, i64)> = (0..len)
+                .map(|i| {
+                    let rec = out.add(i * 16);
+                    (
+                        std::ptr::read(rec as *const i64),
+                        std::ptr::read(rec.add(8) as *const i64),
+                    )
+                })
+                .collect();
+            got.sort();
+            assert_eq!(got, vec![(1, 2), (1, 3), (2, 3)]);
+            coddl_rc_release(out);
+            coddl_rc_release(edges);
+        }
+    }
+
+    #[test]
+    fn tclose_computes_reachability_text_keyed_by_content() {
+        // A Text-keyed graph "a"→"b", "b"→"c" whose shared "b" nodes have
+        // DISTINCT pointers (independent heap allocations). The closure must
+        // add "a"→"c", which requires the cell match to compare Text by
+        // CONTENT, not by the `(ptr, len)` fat pointer. Heading {from, to} Text:
+        // from@0 (ptr@0,len@8), to@16 (ptr@16,len@24); record_size 32.
+        let attrs = [
+            CoddlAttrDesc {
+                name: b"from".as_ptr(),
+                name_len: 4,
+                kind: CoddlAttrKind::Text as u32,
+                offset: 0,
+            },
+            CoddlAttrDesc {
+                name: b"to".as_ptr(),
+                name_len: 2,
+                kind: CoddlAttrKind::Text as u32,
+                offset: 16,
+            },
+        ];
+        let desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 32,
+            attrs: attrs.as_ptr(),
+        };
+        let a: Vec<u8> = b"a".to_vec();
+        let b_src: Vec<u8> = b"b".to_vec();
+        let b_dst: Vec<u8> = b"b".to_vec();
+        let c: Vec<u8> = b"c".to_vec();
+        assert_ne!(b_src.as_ptr(), b_dst.as_ptr());
+        unsafe {
+            let write_edge = |rec: *mut u8, from: &[u8], to: &[u8]| {
+                std::ptr::write(rec as *mut usize, from.as_ptr() as usize);
+                std::ptr::write(rec.add(8) as *mut usize, from.len());
+                std::ptr::write(rec.add(16) as *mut usize, to.as_ptr() as usize);
+                std::ptr::write(rec.add(24) as *mut usize, to.len());
+            };
+            let edges = coddl_rc_alloc(2 * 32, 2, CoddlKind::Relation as u32, &desc);
+            write_edge(edges, &a, &b_dst); // "a" → "b" (target uses b_dst)
+            write_edge(edges.add(32), &b_src, &c); // "b" → "c" (source uses b_src)
+
+            let out = coddl_relation_tclose(edges, &desc);
+            assert!(!out.is_null());
+            let len = (*(out.sub(HEADER_SIZE) as *const CoddlRcHeader)).length as usize;
+            assert_eq!(len, 3, "closure adds \"a\"→\"c\" across distinct \"b\" pointers");
+            let mut got: Vec<(Vec<u8>, Vec<u8>)> = (0..len)
+                .map(|i| {
+                    let rec = out.add(i * 32);
+                    let (pf, lf) = read_text_cell(rec, 0);
+                    let (pt, lt) = read_text_cell(rec, 16);
+                    (
+                        std::slice::from_raw_parts(pf, lf).to_vec(),
+                        std::slice::from_raw_parts(pt, lt).to_vec(),
+                    )
+                })
+                .collect();
+            got.sort();
+            assert_eq!(
+                got,
+                vec![
+                    (b"a".to_vec(), b"b".to_vec()),
+                    (b"a".to_vec(), b"c".to_vec()),
+                    (b"b".to_vec(), b"c".to_vec()),
+                ]
+            );
+            coddl_rc_release(out);
+            coddl_rc_release(edges);
         }
     }
 

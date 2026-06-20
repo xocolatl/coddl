@@ -612,6 +612,12 @@ impl<'a> Parser<'a> {
                 self.finish_node();
                 continue;
             }
+            if min_prec == 0 && self.at_keyword("tclose") {
+                self.start_node_at(cp, SyntaxKind::TCLOSE_EXPR);
+                self.parse_tclose_suffix();
+                self.finish_node();
+                continue;
+            }
             let Some(prec) = self.peek_infix_prec() else {
                 break;
             };
@@ -1039,6 +1045,48 @@ impl<'a> Parser<'a> {
             self.parse_arg_list(false); // rename keeps the colon required (no shorthand)
         } else {
             self.error("P0040", "expected `{` to start rename list");
+        }
+    }
+
+    /// `tclose [ '{' <ident> { ',' <ident> } '}' ]` — relational transitive
+    /// closure suffix. The enclosing `TCLOSE_EXPR` node (wrapping the operand)
+    /// is opened by the caller in the pipeline loop, so this consumes the
+    /// `tclose` keyword and the *optional* unordered two-attribute brace-list.
+    /// The braces are sugar for `(R project { a, b }) tclose`; the bare form
+    /// `R tclose` requires the operand to already be a binary relation.
+    ///
+    /// Unlike `key`/`project`, the brace-list is optional, so this does not
+    /// reuse `parse_ident_brace_list` (which makes the braces mandatory): the
+    /// bare form is not an error. When the braces *are* present, P0041 reports
+    /// a missing attribute name and P0042 a missing close `}`.
+    pub(crate) fn parse_tclose_suffix(&mut self) {
+        debug_assert!(self.at_keyword("tclose"));
+        self.bump_trivia();
+        self.bump(); // `tclose`
+        // Optional `{ a, b }` brace-list. Absent → bare form, no error.
+        if !self.at(SyntaxKind::L_BRACE) {
+            return;
+        }
+        self.bump(); // {
+        if self.eat(SyntaxKind::R_BRACE) {
+            return; // empty `{}` parses; the typechecker rejects non-binary (T0041)
+        }
+        loop {
+            self.bump_trivia();
+            if !self.eat(SyntaxKind::IDENT) {
+                self.error("P0041", "expected attribute name in tclose list");
+                break;
+            }
+            if !self.eat(SyntaxKind::COMMA) {
+                break;
+            }
+            // Trailing comma ok.
+            if self.at(SyntaxKind::R_BRACE) {
+                break;
+            }
+        }
+        if !self.eat(SyntaxKind::R_BRACE) {
+            self.error("P0042", "expected `}` to close tclose list");
         }
     }
 
@@ -2611,6 +2659,124 @@ mod tests {
         // `rename` remains a valid identifier elsewhere.
         let out = parse_str("oper f {} [ let rename = 1; let s = R where rename = 2; ];");
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    // ── tclose ───────────────────────────────────────────────────────
+
+    #[test]
+    fn tclose_bare_parses_as_tclose_expr() {
+        let out = parse_str("oper f {} [ let s = R tclose; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let te = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::TCLOSE_EXPR)
+            .expect("TCLOSE_EXPR in tree");
+        // Operand is the NAME_REF for `R`; no brace-list in the bare form.
+        let operand = te
+            .children()
+            .find(|n| n.kind() == SyntaxKind::NAME_REF)
+            .expect("operand NAME_REF");
+        assert_eq!(operand.text(), "R");
+        assert!(te.text().to_string().contains("tclose"));
+    }
+
+    #[test]
+    fn tclose_braced_parses_with_two_attrs() {
+        let out = parse_str("oper f {} [ let s = R tclose { a, b }; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let te = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::TCLOSE_EXPR)
+            .expect("TCLOSE_EXPR in tree");
+        let text = te.text().to_string();
+        assert!(text.contains('a') && text.contains('b'), "{text}");
+        assert!(te.children().any(|n| n.kind() == SyntaxKind::NAME_REF));
+    }
+
+    #[test]
+    fn tclose_binds_looser_than_where() {
+        // `R where a = 1 tclose` => TCLOSE(WHERE(R, a = 1)).
+        let out = parse_str("oper f {} [ let s = R where a = 1 tclose; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let te = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::TCLOSE_EXPR)
+            .expect("TCLOSE_EXPR in tree");
+        let inner = te
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("operand BINARY_EXPR (the where)");
+        assert!(
+            inner.text().to_string().contains(" where "),
+            "expected `where` inside the closure's operand: {}",
+            inner.text()
+        );
+    }
+
+    #[test]
+    fn tclose_chains_left_associative() {
+        // `R tclose tclose` => TCLOSE(TCLOSE(R)).
+        let out = parse_str("oper f {} [ let s = R tclose tclose; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let outer = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::TCLOSE_EXPR)
+            .expect("outer TCLOSE_EXPR");
+        assert!(
+            outer
+                .children()
+                .any(|n| n.kind() == SyntaxKind::TCLOSE_EXPR),
+            "expected a nested TCLOSE_EXPR operand: {}",
+            outer.text()
+        );
+    }
+
+    #[test]
+    fn tclose_interleaves_with_project() {
+        // `R project { a, b } tclose` => TCLOSE(PROJECT(R, {a, b})).
+        let out = parse_str("oper f {} [ let s = R project { a, b } tclose; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let te = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::TCLOSE_EXPR)
+            .expect("TCLOSE_EXPR in tree");
+        assert!(
+            te.children().any(|n| n.kind() == SyntaxKind::PROJECT_EXPR),
+            "expected a PROJECT_EXPR operand: {}",
+            te.text()
+        );
+    }
+
+    #[test]
+    fn tclose_is_contextual_not_reserved() {
+        // `tclose` remains a valid identifier elsewhere (no reserved words).
+        let out = parse_str("oper f {} [ let tclose = 1; let s = R where tclose = 2; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    #[test]
+    fn tclose_non_ident_attr_diagnoses_p0041() {
+        let out = parse_str("oper f {} [ let s = R tclose { 1 }; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0041"),
+            "expected P0041, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn tclose_missing_close_brace_diagnoses_p0042() {
+        let out = parse_str("oper f {} [ let s = R tclose { a ; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0042"),
+            "expected P0042, got {:?}",
+            out.diagnostics
+        );
     }
 
     fn find_first(root: &crate::cst::SyntaxNode, kind: SyntaxKind) -> crate::cst::SyntaxNode {

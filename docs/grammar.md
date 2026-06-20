@@ -424,15 +424,16 @@ function that implements it.
 
 <expr>          ::= <expr-prec> ;                            -- parse_expr
 <expr-prec>     ::= <primary-expr> { <postfix> }
-                    { <infix-op> <expr-prec> | <project-suffix> | <rename-suffix> } ;
+                    { <infix-op> <expr-prec> | <project-suffix>
+                      | <rename-suffix> | <tclose-suffix> } ;
                                                                -- parse_expr_prec
                     -- Pratt precedence ladder; left-associative.
                     -- min_prec drives which operators may be
                     -- consumed; the parser recurses with `prec + 1`
                     -- for each rhs. The <project-suffix> / <rename-suffix>
-                    -- postfix forms are consumed only at pipeline level
-                    -- (min_prec 0), interleaved with infix ops, so they
-                    -- bind to the whole pipeline.
+                    -- / <tclose-suffix> postfix forms are consumed only at
+                    -- pipeline level (min_prec 0), interleaved with infix
+                    -- ops, so they bind to the whole pipeline.
 <infix-op>      ::= 'where'                                    -- prec 0
                   | 'join'                                     -- prec 0
                   | 'times'                                    -- prec 0
@@ -488,6 +489,21 @@ function that implements it.
                     -- rename would be the no-op `old -> old`. The `new` side
                     -- parses as a <name-ref>; the typechecker validates each
                     -- target is a bare attribute name. P0040 on a missing `{`.
+<tclose-suffix> ::= 'tclose' [ '{' <ident> { ',' <ident> } '}' ] ; -- parse_tclose_suffix
+                    -- Relational transitive closure. Postfix at pipeline
+                    -- precedence (like <project-suffix> / <rename-suffix>);
+                    -- wraps the operand in TCLOSE_EXPR. The brace-list is
+                    -- OPTIONAL and UNORDERED: `R tclose { a, b }` is sugar
+                    -- for `(R project { a, b }) tclose`, picking two columns
+                    -- from a wider relation; bare `R tclose` requires the
+                    -- operand to already be a binary relation. Direction-
+                    -- agnostic: the result heading == the operand heading
+                    -- (no from/to). Because the braces are optional this does
+                    -- NOT reuse <ident-brace-list> (which makes them
+                    -- mandatory); the bare form is not an error. P0041 on a
+                    -- missing attribute name inside the braces, P0042 on a
+                    -- missing closing `}`. `tclose` is a contextual keyword,
+                    -- a valid identifier elsewhere (no reserved words).
 <transaction-expr> ::= 'transaction' <block> ;                 -- parse_transaction_expr
 <name-ref>      ::= <identifier> ;
 <arg-list>      ::= '{' [ <named-arg> commalist ] '}' ;        -- parse_arg_list
@@ -603,6 +619,8 @@ enforces that.
 | P0038 | Expected `}` to close project list                      |
 | P0039 | Expected `but` after `all` in project                   |
 | P0040 | Expected `{` to start rename list                       |
+| P0041 | Expected attribute name in tclose list                  |
+| P0042 | Expected `}` to close tclose list                       |
 
 Note: missing-type-after-`:` (let annotation) and missing-type-
 after-`->` (operator return clause) both surface as `P0011`

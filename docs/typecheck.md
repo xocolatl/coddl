@@ -404,3 +404,4 @@ check script enforces that.
 | T0038 | `union`/`intersect`/`minus` operands must have identical headings |
 | T0039 | `join` operands have identical headings (the join is a set intersection) — suggest `intersect` |
 | T0040 | `compose` operands have identical headings (every attribute removed, result always nullary) — suggest `intersect` |
+| T0041 | `tclose` operand must be a relation of exactly two attributes of the same type (binary graph relation) |

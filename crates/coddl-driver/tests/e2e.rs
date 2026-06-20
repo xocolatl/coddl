@@ -35,6 +35,7 @@ fn fixtures_dir() -> &'static Path {
             ("transaction", TRANSACTION_SRC),
             ("join-times-compose", JOIN_TIMES_COMPOSE_SRC),
             ("union-intersect-minus", UNION_INTERSECT_MINUS_SRC),
+            ("transitive-closure", TCLOSE_SRC),
         ] {
             std::fs::write(tmp.path().join(format!("{name}.cd")), src)
                 .unwrap_or_else(|e| panic!("write {name}.cd fixture: {e}"));
@@ -139,6 +140,35 @@ oper main {} [
 
     let morning_only = Morning minus Evening;
     write_relation { rel: morning_only };
+];
+";
+
+const TCLOSE_SRC: &str = "\
+program transitive_closure;
+
+private relvar Edges { from: Integer, to: Integer } key { from, to };
+private relvar Contains { major: Integer, minor: Integer, qty: Integer } key { major, minor };
+
+oper main {} [
+    Edges := Relation {
+        { from: 1, to: 2 },
+        { from: 2, to: 3 },
+        { from: 3, to: 4 },
+    };
+    Contains := Relation {
+        { major: 1, minor: 2, qty: 2 },
+        { major: 1, minor: 3, qty: 1 },
+        { major: 2, minor: 4, qty: 32 },
+        { major: 3, minor: 5, qty: 1 },
+    };
+
+    write_relation { rel: Edges };
+
+    let reachable = Edges tclose;
+    write_relation { rel: reachable };
+
+    let all_parts = Contains tclose { major, minor };
+    write_relation { rel: all_parts };
 ];
 ";
 
@@ -1933,5 +1963,87 @@ fn union_intersect_minus_inprocess_relations_equal_across_backends() {
         tuple_lines(&llvm.stdout),
         tuple_lines(&cranelift.stdout),
         "backends disagree on the union-intersect-minus tuple set"
+    );
+}
+
+/// The in-process twin populates a binary edge relvar (`Edges`, heading { from,
+/// to }) and a wider bill-of-materials (`Contains`, heading { major, minor, qty
+/// }), dumps the raw edges, then dumps `Edges tclose` (the reachability closure,
+/// bare form) and `Contains tclose { major, minor }` (the brace form — pick two
+/// columns, then close). Tuple order is unspecified (RM Pro 1), so the tests
+/// compare this set, not bytes; the direct edges recur in the closure.
+const TCLOSE_TUPLES: &[&str] = &[
+    // Edges (raw direct edges)
+    "{from: 1, to: 2}",
+    "{from: 2, to: 3}",
+    "{from: 3, to: 4}",
+    // Edges tclose — direct edges plus the transitively reachable pairs
+    "{from: 1, to: 2}",
+    "{from: 2, to: 3}",
+    "{from: 3, to: 4}",
+    "{from: 1, to: 3}",
+    "{from: 2, to: 4}",
+    "{from: 1, to: 4}",
+    // Contains tclose { major, minor } — project to {major, minor}, then close:
+    // direct (1,2),(1,3),(2,4),(3,5) plus transitive (1,4),(1,5)
+    "{major: 1, minor: 2}",
+    "{major: 1, minor: 3}",
+    "{major: 2, minor: 4}",
+    "{major: 3, minor: 5}",
+    "{major: 1, minor: 4}",
+    "{major: 1, minor: 5}",
+];
+
+#[test]
+fn tclose_inprocess_llvm_dumps_closures() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("transitive-closure"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "transitive-closure LLVM failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(tuple_lines(&out.stdout), sorted_tuples(TCLOSE_TUPLES));
+}
+
+#[test]
+fn tclose_inprocess_cranelift_dumps_closures() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("transitive-closure"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "transitive-closure Cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(tuple_lines(&out.stdout), sorted_tuples(TCLOSE_TUPLES));
+}
+
+#[test]
+fn tclose_inprocess_relations_equal_across_backends() {
+    ensure_runtime_built();
+    let llvm = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("transitive-closure"))
+        .output()
+        .expect("spawn LLVM");
+    assert!(llvm.status.success());
+    let cranelift = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("transitive-closure"))
+        .output()
+        .expect("spawn Cranelift");
+    assert!(cranelift.status.success());
+    assert_eq!(
+        tuple_lines(&llvm.stdout),
+        tuple_lines(&cranelift.stdout),
+        "backends disagree on the transitive-closure tuple set"
     );
 }

@@ -335,6 +335,15 @@ fn resolve(
         RelExpr::Or { .. } | RelExpr::Minus { .. } => Err(BackendError::Other(
             "set operation nested under a relational operator does not push to SQL".to_string(),
         )),
+        // Transitive closure has no SQL emission in v1 (the `WITH RECURSIVE`
+        // push is a deferred follow-up). Err so `cut::try_push` declines and
+        // the whole `tclose` runs in-process. Reached even at the root: a root
+        // `TClose` is not a set-op, so `emit_select_offset` falls through to
+        // `resolve`. The operand still fetches via its own SQL (a plain SELECT),
+        // then the closure runs in-process — correct.
+        RelExpr::TClose { .. } => Err(BackendError::Other(
+            "transitive closure (tclose) does not push to SQL in v1".to_string(),
+        )),
         // Never reached: a materialized leaf fails the cut's `RelvarRooted`
         // gate before SQL emission. Defensive only.
         RelExpr::MaterializedRelvar { name, .. } => Err(BackendError::Other(format!(

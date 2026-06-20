@@ -329,6 +329,17 @@ pub enum Inst {
         rhs: ValueId,
         heading_id: HeadingId,
     },
+    /// Transitive closure of a binary relation (surface `tclose`, Algebra-A
+    /// `◄TCLOSE►`). Backends emit a call to `coddl_relation_tclose(src,
+    /// &descriptor)`, which iterates a naive fixpoint (compose the result with
+    /// the input edge set until no new pair is added) and re-seals. The result
+    /// heading equals the (binary) operand heading, so one `heading_id`
+    /// describes both operand and result.
+    TClose {
+        dst: ValueId,
+        src: ValueId,
+        heading_id: HeadingId,
+    },
     /// Collapse a single-row relation to a tuple (TTM RM Pre 10).
     /// Backends emit a call to `coddl_extract_check_cardinality(src,
     /// &descriptor)` which aborts if cardinality ≠ 1, then read each
@@ -663,6 +674,11 @@ impl fmt::Display for Inst {
                 rhs,
                 heading_id,
             } => write!(f, "{dst} = minus {lhs} {rhs} -> heading_{}", heading_id.0),
+            Inst::TClose {
+                dst,
+                src,
+                heading_id,
+            } => write!(f, "{dst} = tclose {src} -> heading_{}", heading_id.0),
             Inst::Extract {
                 dst,
                 src,

@@ -235,6 +235,9 @@ impl Emitter {
         writeln!(self.body, "declare ptr @coddl_relation_union(ptr, ptr, ptr)").unwrap();
         // `minus`: (lhs, rhs, desc) -> rc=1 ptr. Identical headings ⇒ one desc.
         writeln!(self.body, "declare ptr @coddl_relation_minus(ptr, ptr, ptr)").unwrap();
+        // `tclose`: (src, desc) -> rc=1 ptr. Result heading == operand heading
+        // ⇒ one desc for both.
+        writeln!(self.body, "declare ptr @coddl_relation_tclose(ptr, ptr)").unwrap();
         // `rename`: (src, src_desc, result_desc, perm, perm_count) -> rc=1 ptr.
         writeln!(
             self.body,
@@ -750,6 +753,11 @@ impl Emitter {
                 rhs,
                 heading_id,
             } => self.lower_minus_inst(*dst, lhs, rhs, *heading_id),
+            Inst::TClose {
+                dst,
+                src,
+                heading_id,
+            } => self.lower_tclose_inst(*dst, src, *heading_id),
             Inst::Extract {
                 dst,
                 src,
@@ -1330,6 +1338,32 @@ impl Emitter {
         writeln!(
             self.body,
             "    {name} = call ptr @coddl_relation_minus(ptr {lhs_op}, ptr {rhs_op}, ptr @.heading.{})",
+            heading_id.0,
+        )
+        .unwrap();
+        self.values.insert(
+            dst,
+            ValueRepr::Scalar {
+                ty: "ptr".to_string(),
+                op: name,
+            },
+        );
+        Ok(())
+    }
+
+    /// Emit `Inst::TClose`: `call ptr @coddl_relation_tclose(src, &desc)`.
+    /// Result heading == operand heading ⇒ one descriptor for both.
+    fn lower_tclose_inst(
+        &mut self,
+        dst: ValueId,
+        src: &ValueId,
+        heading_id: HeadingId,
+    ) -> Result<(), LlvmEmitError> {
+        let src_op = self.scalar_op(src)?;
+        let name = format!("%v{}", dst.0);
+        writeln!(
+            self.body,
+            "    {name} = call ptr @coddl_relation_tclose(ptr {src_op}, ptr @.heading.{})",
             heading_id.0,
         )
         .unwrap();

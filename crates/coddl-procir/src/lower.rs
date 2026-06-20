@@ -18,7 +18,7 @@ use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, Expr, ExprStmt,
     FieldAccess, Item,
     LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, RenameExpr,
-    Root, Stmt, TransactionExpr, TupleLit, UnaryExpr, UnaryOp,
+    Root, Stmt, TcloseExpr, TransactionExpr, TupleLit, UnaryExpr, UnaryOp,
 };
 use coddl_syntax::SyntaxKind;
 use coddl_types::{check, Heading, RelvarKind, RelvarTable, Type};
@@ -848,6 +848,7 @@ impl Lowerer {
             Expr::Unary(u) => self.lower_unary_expr(u),
             Expr::Project(p) => self.lower_project_expr(p),
             Expr::Rename(r) => self.lower_rename_expr(r),
+            Expr::Tclose(t) => self.lower_tclose_expr(t),
             Expr::NameRef(n) => self.lower_name_ref(n),
         }
     }
@@ -986,6 +987,46 @@ impl Lowerer {
         dst
     }
 
+    /// Lower a `tclose` whose operand the cut declined to push — an in-memory
+    /// relation. (v1 has no `tclose` SQL emission, so this is the only path;
+    /// even a relvar-rooted operand fetches via a plain SELECT, then closes
+    /// here.) The optional brace-list narrows to two columns first — sugar for
+    /// `(R project { a, b }) tclose` — then `Inst::TClose` runs the fixpoint.
+    fn lower_tclose_expr(&mut self, te: &TcloseExpr) -> ValueId {
+        // 1. Lower the relation operand in the enclosing scope.
+        let mut src = te
+            .input()
+            .map(|e| self.lower_expr(&e))
+            .expect("typechecked tclose has a relation operand");
+        // 2. A brace-list picks two columns first (the `R tclose { a, b }`
+        //    form). `emit_project` mints a fresh value, so release the
+        //    pre-projection source if no local owns it.
+        let names: Vec<String> = te.attrs().map(|t| t.text().to_string()).collect();
+        if !names.is_empty() {
+            let projected = self.emit_project(src, &names);
+            let src_owned = self
+                .locals
+                .iter()
+                .any(|layer| layer.values().any(|(vid, _)| *vid == src));
+            if !src_owned {
+                self.insts.push(Inst::Release { src });
+            }
+            src = projected;
+        }
+        // 3. Emit Inst::TClose (result heading == src heading).
+        let dst = self.emit_tclose(src);
+        // 4. Release the (possibly projected) source if no local owns it — the
+        //    same balancing `where`/`project` install.
+        let src_owned = self
+            .locals
+            .iter()
+            .any(|layer| layer.values().any(|(vid, _)| *vid == src));
+        if !src_owned {
+            self.insts.push(Inst::Release { src });
+        }
+        dst
+    }
+
     /// If `expr` is a relvar-rooted relational subtree the cut can push,
     /// bake its SQL into `Module::plans` and emit an `Inst::Query`, returning
     /// its result value. Otherwise return `None` so the caller lowers `expr`
@@ -1084,6 +1125,25 @@ impl Lowerer {
                 Some(RelExpr::Rename {
                     input: Box::new(input),
                     renames,
+                })
+            }
+            Expr::Tclose(t) => {
+                // `R tclose { a, b }` ≡ `(R project { a, b }) tclose` — wrap the
+                // operand in a `Project` when a brace-list is present, then a
+                // `TClose`. v1 has no `tclose` SQL emission (sqlemit's `resolve`
+                // errs on `TClose`), so a relvar-rooted closure still declines
+                // the push and runs in-process; building the RelExpr is what
+                // lets the `explain` path render the `TClose` node.
+                let mut input = self.build_rel_expr(&t.input()?)?;
+                let keep: Vec<String> = t.attrs().map(|tok| tok.text().to_string()).collect();
+                if !keep.is_empty() {
+                    input = RelExpr::Project {
+                        input: Box::new(input),
+                        keep,
+                    };
+                }
+                Some(RelExpr::TClose {
+                    input: Box::new(input),
                 })
             }
             _ => None,
@@ -1544,6 +1604,10 @@ impl Lowerer {
                 let src = self.lower_relexpr_inprocess(input)?;
                 Some(self.emit_project(src, keep))
             }
+            RelExpr::TClose { input } => {
+                let src = self.lower_relexpr_inprocess(input)?;
+                Some(self.emit_tclose(src))
+            }
             _ => None,
         }
     }
@@ -1612,6 +1676,25 @@ impl Lowerer {
             dst,
             lhs,
             rhs,
+            heading_id,
+        });
+        dst
+    }
+
+    /// Emit `Inst::TClose` over an already-lowered binary relation value
+    /// (surface `tclose`). The result heading equals the operand heading —
+    /// closure is direction-agnostic and adds tuples without changing the
+    /// heading — so one `heading_id` describes both.
+    fn emit_tclose(&mut self, src: ValueId) -> ValueId {
+        let heading_id = match self.value_type(src) {
+            ProcType::Relation(id) => id,
+            other => unreachable!("tclose on non-relation `{other}` survived typecheck"),
+        };
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Relation(heading_id));
+        self.insts.push(Inst::TClose {
+            dst,
+            src,
             heading_id,
         });
         dst

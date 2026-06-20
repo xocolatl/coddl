@@ -13,8 +13,8 @@ use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, Expr, ExprStmt, FieldAccess,
     Heading as AstHeading, Item, KeyClause, LetStmt, NamedArg, OperDecl, PrivateRelvarDecl,
-    ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr, Root, Stmt, TransactionExpr,
-    TupleLit, UnaryExpr, UnaryOp,
+    ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr, Root, Stmt, TcloseExpr,
+    TransactionExpr, TupleLit, UnaryExpr, UnaryOp,
 };
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
@@ -866,6 +866,7 @@ impl TypeChecker {
             Expr::Unary(u) => self.check_unary_expr(u, scope),
             Expr::Project(p) => self.check_project_expr(p, scope),
             Expr::Rename(r) => self.check_rename_expr(r, scope),
+            Expr::Tclose(t) => self.check_tclose_expr(t, scope),
         }
     }
 
@@ -1015,6 +1016,93 @@ impl TypeChecker {
             result.push((new_name, ty.clone()));
         }
         Type::Relation(Heading::new(result))
+    }
+
+    /// Walk `R tclose` / `R tclose { a, b }` — relational transitive closure.
+    /// The operand must be `Relation H` (T0023, shared with `where`/`project`).
+    /// When a brace-list is given it picks two columns first (sugar for
+    /// `(R project { a, b }) tclose`): each listed name must exist in `H`
+    /// (T0027) and appear at most once (T0028), and the *effective* heading is
+    /// `H` narrowed to those names. The effective heading must then be a binary
+    /// relation of two **identically-typed** attributes (else T0041) — the
+    /// precondition for closing a graph. Direction-agnostic: the result heading
+    /// is exactly that effective heading (no from/to; `TC(reverse G) =
+    /// reverse(TC G)`).
+    fn check_tclose_expr(&mut self, te: &TcloseExpr, scope: &mut Scope) -> Type {
+        let input_ty = match te.input() {
+            Some(e) => self.check_expr(&e, scope),
+            None => return Type::Unknown,
+        };
+        let heading = match &input_ty {
+            Type::Relation(h) => h.clone(),
+            Type::Unknown => return Type::Unknown,
+            other => {
+                let span = te
+                    .input()
+                    .map(|e| self.node_span(e.syntax()))
+                    .unwrap_or_else(|| self.node_span(te.syntax()));
+                self.error(
+                    span,
+                    "T0023",
+                    format!("`tclose` expects a Relation on the left, got {other}"),
+                );
+                return Type::Unknown;
+            }
+        };
+        // Effective heading: with a brace-list, project onto the listed names
+        // (each must exist → T0027, unique → T0028); without, the operand
+        // heading itself. The final binary/same-type check (T0041) catches a
+        // list that isn't exactly two valid attributes.
+        let listed: Vec<SyntaxToken> = te.attrs().collect();
+        let effective = if listed.is_empty() {
+            heading.clone()
+        } else {
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut picked: HashSet<String> = HashSet::new();
+            for tok in &listed {
+                let name = tok.text();
+                if !seen.insert(name.to_string()) {
+                    self.error(
+                        self.token_span(tok),
+                        "T0028",
+                        format!("duplicate attribute `{name}` in tclose list"),
+                    );
+                    continue;
+                }
+                match heading.lookup(name) {
+                    Some(_) => {
+                        picked.insert(name.to_string());
+                    }
+                    None => self.error(
+                        self.token_span(tok),
+                        "T0027",
+                        format!("unknown attribute `{name}` in tclose of {heading}"),
+                    ),
+                }
+            }
+            let kept: Vec<(String, Type)> = heading
+                .attrs()
+                .iter()
+                .filter(|(name, _)| picked.contains(name))
+                .cloned()
+                .collect();
+            Heading::new(kept)
+        };
+        // Require exactly two attributes of identical type — a binary graph
+        // relation. (`Heading::attrs()` is canonically sorted; comparing the
+        // two types directly is order-independent.)
+        let attrs = effective.attrs();
+        if attrs.len() != 2 || attrs[0].1 != attrs[1].1 {
+            self.error(
+                self.node_span(te.syntax()),
+                "T0041",
+                "`tclose` operand must be a relation of exactly two attributes \
+                 of the same type"
+                    .to_string(),
+            );
+            return Type::Unknown;
+        }
+        Type::Relation(effective)
     }
 
     /// Walk a unary prefix expression. Dispatches on `UnaryOp`.
@@ -2852,6 +2940,66 @@ mod tests {
     #[test]
     fn rename_non_relation_diagnoses_t0023() {
         let src = "oper main {} [ let s = 1 rename {a: b}; ];";
+        assert!(codes(src).contains(&"T0023"));
+    }
+
+    // ── tclose ────────────────────────────────────────────────────────
+
+    #[test]
+    fn tclose_on_binary_same_typed_relation_checks_clean() {
+        // {from, to} are both Integer — a binary same-typed graph relation.
+        let src = "oper main {} [ \
+                   let g = Relation { {from: 1, to: 2}, {to: 3, from: 2} }; \
+                   let _c = g tclose; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn tclose_braces_pick_two_columns_checks_clean() {
+        // A ternary relation narrowed to two same-typed attributes by the
+        // brace-list — sugar for `(g project { major, minor }) tclose`.
+        let src = "oper main {} [ \
+                   let g = Relation { {major: 1, minor: 2, qty: 5} }; \
+                   let _c = g tclose { major, minor }; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn tclose_non_binary_relation_diagnoses_t0041() {
+        // Three attributes, no brace-list → not a binary relation.
+        let src = "oper main {} [ \
+                   let g = Relation { {a: 1, b: 2, c: 3} }; \
+                   let _c = g tclose; \
+                   ];";
+        assert!(codes(src).contains(&"T0041"));
+    }
+
+    #[test]
+    fn tclose_different_attr_types_diagnoses_t0041() {
+        // Binary but the two attributes differ in type (Integer vs Text).
+        let src = "oper main {} [ \
+                   let g = Relation { {from: 1, to: \"x\"} }; \
+                   let _c = g tclose; \
+                   ];";
+        assert!(codes(src).contains(&"T0041"));
+    }
+
+    #[test]
+    fn tclose_unknown_attr_in_braces_diagnoses_t0027() {
+        let src = "oper main {} [ \
+                   let g = Relation { {from: 1, to: 2} }; \
+                   let _c = g tclose { from, nope }; \
+                   ];";
+        assert!(codes(src).contains(&"T0027"));
+    }
+
+    #[test]
+    fn tclose_non_relation_diagnoses_t0023() {
+        let src = "oper main {} [ let s = 1 tclose; ];";
         assert!(codes(src).contains(&"T0023"));
     }
 

@@ -1,0 +1,60 @@
+// tclose.cd
+//
+// Transitive closure — the one genuinely irreducible relational operator (it is
+// not first-order expressible, so it cannot be built from join / union / minus).
+// `tclose` is a postfix operator on a binary graph relation; the result heading
+// equals the operand heading. It is direction-agnostic: closing { from, to } and
+// closing { to, from } describe the same relation.
+//
+// Two forms, both shown below against a bill-of-materials theme (which assembly
+// contains which part):
+//
+//   R tclose          R is already binary (two same-typed attributes)
+//   R tclose { a, b }  pick two columns from a wider relation,
+//                      i.e. sugar for `(R project { a, b }) tclose`
+//
+// A relation is a set, so the printed tuple order is unspecified.
+
+program transitive_closure;
+
+// Direct edges of a small reachability graph: part `from` connects to part `to`.
+private relvar Edges {
+    from: Integer,
+    to: Integer,
+} key { from, to };
+
+// A wider bill-of-materials: assembly `major` directly contains `qty` of `minor`.
+private relvar Contains {
+    major: Integer,
+    minor: Integer,
+    qty: Integer,
+} key { major, minor };
+
+oper main {} [
+    Edges := Relation {
+        { from: 1, to: 2 },
+        { from: 2, to: 3 },
+        { from: 3, to: 4 },
+    };
+
+    Contains := Relation {
+        { major: 1, minor: 2, qty: 2 }, // a bicycle has 2 wheels
+        { major: 1, minor: 3, qty: 1 }, // and 1 frame
+        { major: 2, minor: 4, qty: 32 }, // each wheel has 32 spokes
+        { major: 3, minor: 5, qty: 1 }, // each frame has 1 tube
+    };
+
+    // Baseline: the direct edges.
+    write_relation { rel: Edges };
+
+    // Bare form: the operand is already binary, so `Edges tclose` closes it.
+    // Reachability adds 1->3, 2->4, 1->4 on top of the direct 1->2, 2->3, 3->4.
+    let reachable = Edges tclose;
+    write_relation { rel: reachable };
+
+    // Brace form: pick { major, minor } out of the ternary `Contains` (dropping
+    // qty), then close. The transitive containment adds 1->4 (bicycle->spoke,
+    // via the wheel) and 1->5 (bicycle->tube, via the frame).
+    let all_parts = Contains tclose { major, minor };
+    write_relation { rel: all_parts };
+];

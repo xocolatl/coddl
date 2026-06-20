@@ -410,6 +410,7 @@ pub enum Expr {
     Unary(UnaryExpr),
     Project(ProjectExpr),
     Rename(RenameExpr),
+    Tclose(TcloseExpr),
 }
 
 impl Expr {
@@ -427,6 +428,7 @@ impl Expr {
             SyntaxKind::UNARY_EXPR => Expr::Unary(UnaryExpr { syntax }),
             SyntaxKind::PROJECT_EXPR => Expr::Project(ProjectExpr { syntax }),
             SyntaxKind::RENAME_EXPR => Expr::Rename(RenameExpr { syntax }),
+            SyntaxKind::TCLOSE_EXPR => Expr::Tclose(TcloseExpr { syntax }),
             // Parenthesized expressions are transparent — recurse to
             // the inner `Expr` so the typechecker / lowerer never see
             // the wrapper. Used purely for precedence grouping.
@@ -449,6 +451,7 @@ impl Expr {
             Expr::Unary(u) => u.syntax(),
             Expr::Project(p) => p.syntax(),
             Expr::Rename(r) => r.syntax(),
+            Expr::Tclose(t) => t.syntax(),
         }
     }
 }
@@ -814,6 +817,43 @@ impl RenameExpr {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+ast_node!(pub TcloseExpr, TCLOSE_EXPR);
+
+impl TcloseExpr {
+    /// The relation operand whose transitive closure is taken — the single
+    /// `Expr` child (the optional `{ a, b }` attribute names are bare tokens,
+    /// not child nodes).
+    pub fn input(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// The two attribute names listed in the optional braces, in source order
+    /// (`R tclose { a, b }` ≡ `(R project { a, b }) tclose`). Absent braces
+    /// yield zero names — the bare `R tclose` form, where the operand must
+    /// already be binary.
+    ///
+    /// The operand is a child *node* (its IDENTs are nested inside it) and the
+    /// `tclose` keyword token precedes the `{`, so the brace names are exactly
+    /// the IDENT *tokens* that appear after the `L_BRACE`. (Same shape as
+    /// `ProjectExpr::attrs`.)
+    pub fn attrs(&self) -> impl Iterator<Item = SyntaxToken> + '_ {
+        let mut after_brace = false;
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .filter_map(move |t| {
+                if t.kind() == SyntaxKind::L_BRACE {
+                    after_brace = true;
+                    None
+                } else if after_brace && t.kind() == SyntaxKind::IDENT {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
     }
 }
 

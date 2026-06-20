@@ -204,6 +204,13 @@ pub enum SyntaxKind {
     /// the end of the enum to keep existing discriminants stable.
     RENAME_EXPR,
 
+    /// `<relExpr> tclose [ { a, b } ]` — relational transitive closure. A
+    /// postfix expression node wrapping its binary relation operand; the
+    /// optional unordered brace-list of two attribute names (sugar for
+    /// `project { a, b } tclose`) follows the `tclose` keyword. Placed at the
+    /// end of the enum to keep existing discriminants stable.
+    TCLOSE_EXPR,
+
     /// A range of source whose intended structure couldn't be
     /// recovered. The parser still wraps the tokens so the tree stays
     /// well-formed and downstream passes can keep going.
@@ -351,6 +358,7 @@ mod tests {
             SyntaxKind::COLUMNS_BLOCK,
             SyntaxKind::PROJECT_EXPR,
             SyntaxKind::RENAME_EXPR,
+            SyntaxKind::TCLOSE_EXPR,
             SyntaxKind::PARSE_ERROR,
         ] {
             assert!(!sk.is_token(), "{sk:?} should be a node kind");

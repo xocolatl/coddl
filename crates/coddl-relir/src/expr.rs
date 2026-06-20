@@ -106,6 +106,19 @@ pub enum RelExpr {
         lhs: Box<RelExpr>,
         rhs: Box<RelExpr>,
     },
+    /// Transitive closure (surface `tclose`) — the Algebra-A `◄TCLOSE►` core,
+    /// the one genuinely irreducible operator (transitive closure is not
+    /// first-order expressible, so it cannot be built from finite AND/OR/NOT
+    /// composition). **Unary.** The operand is a binary relation of two
+    /// identically-typed attributes (typechecked); the result heading is
+    /// unchanged — closure is direction-agnostic, so the result is the same
+    /// relation regardless of which attribute is treated as source. v1 has no
+    /// SQL emission (a `WITH RECURSIVE` push is a deferred follow-up), so a
+    /// relvar-rooted `tclose` fetches its operand via SQL then closes
+    /// in-process.
+    TClose {
+        input: Box<RelExpr>,
+    },
     /// An in-memory (`private`) relvar read — the materialized counterpart of
     /// the relvar-rooted `RelvarRef` leaf. No SQL source, so any subtree
     /// containing it is `Materialized` and lowers in-process.
@@ -208,6 +221,8 @@ impl RelExpr {
             RelExpr::Or { lhs, .. } => lhs.heading(),
             // The result is a subset of `lhs`, so its heading is `lhs`'s.
             RelExpr::Minus { lhs, .. } => lhs.heading(),
+            // Closure preserves the (binary) operand heading.
+            RelExpr::TClose { input } => input.heading(),
             RelExpr::MaterializedRelvar { heading, .. } => heading.clone(),
         }
     }
@@ -228,6 +243,11 @@ impl RelExpr {
             RelExpr::And { lhs, rhs } => combine_origin(lhs.origin(), rhs.origin()),
             RelExpr::Or { lhs, rhs } => combine_origin(lhs.origin(), rhs.origin()),
             RelExpr::Minus { lhs, rhs } => combine_origin(lhs.origin(), rhs.origin()),
+            // A unary node inherits its input's origin (like Restrict/Project).
+            // Note v1 has no `tclose` SQL emission, so a relvar-rooted closure
+            // still declines the push (sqlemit errs) and runs in-process — the
+            // operand fetch alone pushes.
+            RelExpr::TClose { input } => input.origin(),
             RelExpr::MaterializedRelvar { .. } => StorageOrigin::Materialized,
         }
     }
@@ -294,6 +314,10 @@ impl RelExpr {
                 lhs.render_into(out, depth + 1);
                 rhs.render_into(out, depth + 1);
             }
+            RelExpr::TClose { input } => {
+                let _ = writeln!(out, "{pad}TClose");
+                input.render_into(out, depth + 1);
+            }
         }
     }
 
@@ -326,6 +350,9 @@ impl RelExpr {
             // Conservative: `minus` preserves `lhs`'s keys (the result is a
             // subset of `lhs`), but lhs-key preservation is deferred.
             RelExpr::Minus { .. } => Vec::new(),
+            // Closure introduces new tuples, so the operand's keys need not
+            // survive; conservatively keyless.
+            RelExpr::TClose { .. } => Vec::new(),
             RelExpr::MaterializedRelvar { .. } => Vec::new(),
         }
     }
@@ -355,6 +382,7 @@ impl RelExpr {
             RelExpr::And { .. } => false,
             RelExpr::Or { .. } => false,
             RelExpr::Minus { .. } => false,
+            RelExpr::TClose { .. } => false,
             RelExpr::MaterializedRelvar { .. } => false,
         }
     }
@@ -577,6 +605,49 @@ mod tests {
         // key `id` becomes `identifier`; it still survives → no DISTINCT.
         assert_eq!(r.surviving_keys(), vec![vec!["identifier".to_string()]]);
         assert!(!r.needs_distinct());
+    }
+
+    // ── tclose ─────────────────────────────────────────────────────────
+
+    fn edges() -> RelExpr {
+        // A binary same-typed graph relvar {from: Integer, to: Integer}.
+        RelExpr::RelvarRef {
+            name: "Edges".to_string(),
+            database: "graph".to_string(),
+            heading: Heading::new(vec![
+                ("from".to_string(), Type::Integer),
+                ("to".to_string(), Type::Integer),
+            ]),
+            table_name: "edges".to_string(),
+            columns: vec![
+                ("from".to_string(), "from".to_string()),
+                ("to".to_string(), "to".to_string()),
+            ],
+            keys: vec![vec!["from".to_string(), "to".to_string()]],
+        }
+    }
+
+    #[test]
+    fn tclose_preserves_heading_and_origin() {
+        let r = RelExpr::TClose {
+            input: Box::new(edges()),
+        };
+        assert_eq!(r.heading(), edges().heading());
+        assert_eq!(r.origin(), StorageOrigin::RelvarRooted);
+        // Closure introduces tuples → conservatively keyless → needs DISTINCT.
+        assert!(r.surviving_keys().is_empty());
+        assert!(!r.card_le_one());
+    }
+
+    #[test]
+    fn tclose_renders_one_indented_child() {
+        let r = RelExpr::TClose {
+            input: Box::new(edges()),
+        };
+        assert_eq!(
+            r.render(),
+            "TClose\n  RelvarRef Edges { db: graph, table: edges }"
+        );
     }
 
     #[test]
