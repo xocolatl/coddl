@@ -25,6 +25,7 @@ These are not optimizations; they're correctness requirements imposed by TTM's P
 | Always enumerate columns explicitly in a deterministic (name-sorted) order. Never emit `SELECT *`. Never emit `INSERT … VALUES` without a column list. Never emit bare `UNION` / `INTERSECT` / `EXCEPT` — use `… CORRESPONDING …` (or simulate by aligning explicit lists). | RM Pro 1 (no ordinal attribute order). |
 | Never declare a column `NULL`; always `NOT NULL`. Reject SQL DDL paths that would allow nullable columns. | RM Pro 4 (no nulls). |
 | Outer joins are forbidden in lowered SQL. Coddl source has no construct that compiles to one; the type system can't express "this attribute might not have a value" as an attribute property. | RM Pro 4. |
+| Joins name their key explicitly: `INNER JOIN … USING (k, …)` over the shared attributes the **typechecker** computed; disjoint headings (`times`) emit `CROSS JOIN`. Never `NATURAL JOIN`. | The `.cddb`, not the live schema, is the source of truth; see the note below. |
 | Aggregates: wrap to honor identity (OO Pre 6). Emit `COALESCE(SUM(x), 0)`, `COALESCE(MAX(x), CAST(<lowest> AS T))`, etc. AVG over empty is undefined — emit a guarded expression that signals an error if the result would be queried. | OO Pre 6. |
 | Relational assignment `R := expr` compiles inside a transaction to `DELETE FROM R; INSERT INTO R (…) SELECT … FROM (…)` (or `TRUNCATE` + `INSERT` on Postgres). Single-tuple INSERT/UPDATE/DELETE in source desugars to a relational-assignment expression first; the backend never sees the singular form. | RM Pre 21, RM Pro 7. |
 | Always emit explicit `BEGIN` / `COMMIT`. Never rely on SQL's implicit transaction start. Set constraints `IMMEDIATE` at session start; never `INITIALLY DEFERRED`. | OO Pre 4; RM Pre 23 (statement-boundary check). |
@@ -43,6 +44,24 @@ The **set invariant** above is non-negotiable and enforced by construction. The 
 - a restriction **bounds cardinality to ≤ 1** (`card_le_one()`) — an equality on a full candidate key (v1: a single-attribute key pinned by `attr = literal`), so any projection is trivially duplicate-free.
 
 Otherwise (a projection that drops below every candidate key with unbounded cardinality) `DISTINCT` stays. A keyless or not-yet-analyzable leaf is conservative — it keeps `DISTINCT`. This is a compile-time down payment on candidate-key inference (VSS 3): today only declared keys propagate; inferred FDs extend `surviving_keys()`/`card_le_one()` later without touching `emit_select`.
+
+### `USING` over `NATURAL JOIN`
+
+`join` lowers to `… INNER JOIN … USING (k, …)`, naming the exact shared attributes the typechecker computed from the catalog (`coddl-sqlemit`, `RelExpr::And`); a disjoint-heading `times` lowers to `CROSS JOIN`. The emitter never produces SQL's `NATURAL JOIN`. The two read as interchangeable — both coalesce each shared column into a single output column — but they disagree on *who chooses the join key*, and that is a correctness boundary.
+
+`USING (k)` freezes the key into the emitted SQL: the join runs on whatever the `.cddb` declares the shared attributes to be, fixed at compile time and baked into the `plan_id`. `NATURAL JOIN` re-derives the key at execution time by name-matching the **live** physical schema, making the live table a second source of truth the compiler doesn't control. The `.cddb` is the source of truth (see [storage.md](storage.md)) — so the join key must come from it, not from whatever columns a table happens to have when the query runs.
+
+The distinction is invisible until the physical schema drifts from the `.cddb` — a DBA adds, drops, or renames a column the catalog doesn't know about. There `NATURAL` fails the worst possible way: silently.
+
+| Physical table drifts from `.cddb` | `… USING (k)` | `NATURAL JOIN` |
+|---|---|---|
+| New column whose name collides with the other operand | join key unchanged; the extra column is ignored (we never emit `SELECT *`) — **stays correct** | the column is silently folded into the join key → the join over-restricts → **silent wrong rows, no error** |
+| A join column is dropped or renamed | the `USING` list names a column that's gone → the engine raises *no such column* → **loud, attributable halt** | the column drops out of the inferred key → the join weakens, perhaps to a cross-product → **silent wrong or exploded result** |
+| A non-join column is added or renamed | ignored, or a loud error from an explicit projection — same either way | same |
+
+In every drift case the two handle differently, `USING` either stays correct or fails loud, while `NATURAL` returns a silently wrong answer. There is no drift scenario where `NATURAL` does better. A miscount from a join key that quietly grew or shrank is exactly the failure class Coddl's observational equality (RM Pre 8) and *correctness over convenience* ([principles.md](principles.md)) exist to forbid — here a loud error is the *good* outcome. `USING` also keeps the golden-file tests (`tests/golden/`) honest: the meaning of the emitted SQL is fixed by its text, not by the schema it happens to execute against.
+
+`USING` is the emission-side half of this guarantee. The complementary half — failing loud the moment a backend's live schema diverges from the `.cddb`, instead of at the first dependent query — belongs at connection time in the `Backend`/`Conn` contract (see [storage.md](storage.md)). Even without it, `USING` ensures drift surfaces as a wrong-column error rather than a wrong result.
 
 ## Dialect surface
 

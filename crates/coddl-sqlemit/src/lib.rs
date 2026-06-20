@@ -257,10 +257,13 @@ fn resolve(
                 .filter(|(a, _)| rhs_cols.iter().any(|(b, _)| b == a))
                 .map(|(_, c)| quote_ident(c))
                 .collect();
-            // ≥1 shared column → natural `INNER JOIN … USING (…)` (the shared
-            // columns coalesced once). Zero shared columns (`times`) → a
-            // `CROSS JOIN`: `USING ()` is invalid SQL. Inner/cross only — no
-            // outer joins (RM Pro 4).
+            // ≥1 shared column → `INNER JOIN … USING (…)` naming the shared
+            // columns (coalesced once). Never SQL `NATURAL JOIN`: the join key
+            // comes from the catalog, not the live schema, so schema drift
+            // fails loud instead of returning silently-wrong rows — see
+            // docs/sqlemit.md "`USING` over `NATURAL JOIN`". Zero shared columns
+            // (`times`) → a `CROSS JOIN`: `USING ()` is invalid SQL. Inner/cross
+            // only — no outer joins (RM Pro 4).
             let from = if using.is_empty() {
                 format!("{lhs_from} CROSS JOIN {rhs_from}")
             } else {
