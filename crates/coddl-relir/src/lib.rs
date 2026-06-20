@@ -2,7 +2,7 @@
 //! during lowering. See `docs/relir.md`.
 //!
 //! Core operators: AND (natural join), OR, NOT, REMOVE, RENAME, TCLOSE.
-//! Sugar: Project, Restrict (WHERE), Join, Union, Minus, Intersect,
+//! Sugar: Project, Restrict (WHERE), Join, Union, Minus, Intersect, Compose,
 //! SemiJoin, SemiMinus, Extend, Summarize, Group, Ungroup, Wrap, Unwrap.
 //!
 //! Every node carries: heading, FD set, constraint set, storage-origin

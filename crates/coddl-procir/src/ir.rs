@@ -47,6 +47,11 @@ pub struct Module {
     /// `Inst::RegisterPlan`); `Inst::Query` references an entry by its
     /// `plan_id`. Empty when nothing was pushed.
     pub plans: Vec<PlanEntry>,
+    /// In-memory `private` relvars that need a runtime slot (those read or
+    /// assigned), each with its interned heading. Drives codegen of one slot
+    /// global + an empty-init in `main`'s prologue and a release in its
+    /// epilogue. Name-sorted for deterministic emission.
+    pub private_relvar_slots: Vec<(String, HeadingId)>,
 }
 
 impl Module {
@@ -288,6 +293,20 @@ pub enum Inst {
         result_heading_id: HeadingId,
         perm: Vec<u32>,
     },
+    /// Natural join two in-memory relations (surface `join`, Algebra-A AND).
+    /// Backends emit a call to `coddl_relation_join(lhs, &lhs_descriptor, rhs,
+    /// &rhs_descriptor, &result_descriptor)`, which matches records on the
+    /// shared attributes, emits the union of attributes, and re-seals.
+    /// `dst` carries the union heading at `result_heading_id`. All three index
+    /// the per-module heading table.
+    Join {
+        dst: ValueId,
+        lhs: ValueId,
+        rhs: ValueId,
+        lhs_heading_id: HeadingId,
+        rhs_heading_id: HeadingId,
+        result_heading_id: HeadingId,
+    },
     /// Collapse a single-row relation to a tuple (TTM RM Pre 10).
     /// Backends emit a call to `coddl_extract_check_cardinality(src,
     /// &descriptor)` which aborts if cardinality ≠ 1, then read each
@@ -327,6 +346,25 @@ pub enum Inst {
         dst: ValueId,
         name: String,
         heading_id: HeadingId,
+    },
+    /// Initialize an in-memory `private` relvar's slot with an empty
+    /// relation at program start. Emitted once per used private relvar in
+    /// `main`'s prologue (after `coddl_runtime_init`, before the body).
+    /// Unlike `RelvarSlotInit` there is no SQL source — the slot starts
+    /// empty and is filled by `RelvarSlotStore`. Lowers to a single call to
+    /// `coddl_relvar_slot_init_empty`.
+    PrivateRelvarSlotInit {
+        name: String,
+        heading_id: HeadingId,
+    },
+    /// Store a relation value into a relvar's slot — relational assignment
+    /// `R := <expr>`. Move semantics: the runtime releases the slot's
+    /// previous value (if any) and takes ownership of `value`, so the
+    /// lowerer emits no release for the RHS. Lowers to a single call to
+    /// `coddl_relvar_slot_store`.
+    RelvarSlotStore {
+        name: String,
+        value: ValueId,
     },
     /// Register the logical database so the runtime can resolve its
     /// connection path. Emitted once in `main`'s prologue when the program
@@ -579,6 +617,18 @@ impl fmt::Display for Inst {
                 "{dst} = rename {src} heading_{} -> heading_{} perm{perm:?}",
                 src_heading_id.0, result_heading_id.0
             ),
+            Inst::Join {
+                dst,
+                lhs,
+                rhs,
+                lhs_heading_id,
+                rhs_heading_id,
+                result_heading_id,
+            } => write!(
+                f,
+                "{dst} = join {lhs} heading_{} {rhs} heading_{} -> heading_{}",
+                lhs_heading_id.0, rhs_heading_id.0, result_heading_id.0
+            ),
             Inst::Extract {
                 dst,
                 src,
@@ -593,6 +643,12 @@ impl fmt::Display for Inst {
                 name,
                 heading_id,
             } => write!(f, "{dst} = relvar_read {name} heading_{}", heading_id.0),
+            Inst::PrivateRelvarSlotInit { name, heading_id } => {
+                write!(f, "private_relvar_slot_init {name} heading_{}", heading_id.0)
+            }
+            Inst::RelvarSlotStore { name, value } => {
+                write!(f, "relvar_slot_store {name} {value}")
+            }
             Inst::RegisterDatabase => f.write_str("register_database"),
             Inst::RegisterPlan { plan_id } => write!(f, "register_plan plan_{plan_id}"),
             Inst::Query {
@@ -769,6 +825,7 @@ mod tests {
             db_path_default: None,
             db_name: None,
             plans: Vec::new(),
+            private_relvar_slots: Vec::new(),
         };
         let text = format!("{m}");
         assert!(text.starts_with("module hello_world {"));
@@ -786,6 +843,7 @@ mod tests {
             db_path_default: None,
             db_name: None,
             plans: Vec::new(),
+            private_relvar_slots: Vec::new(),
         };
         let text = format!("{m}");
         assert!(text.contains("block_0:"), "no block label in:\n{text}");

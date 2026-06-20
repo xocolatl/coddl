@@ -79,6 +79,22 @@ pub enum RelExpr {
         /// collides with a surviving attribute (the typechecker enforces it).
         renames: Vec<(String, String)>,
     },
+    /// Natural join (surface `join`) — the Algebra-A `AND` core node. The
+    /// result heading is the union of the operands' headings (shared
+    /// attributes appear once, with matching types the typechecker enforces).
+    /// Both operands relvar-rooted → pushes to SQL; both materialized →
+    /// in-process; mixed → a materialization boundary.
+    And {
+        lhs: Box<RelExpr>,
+        rhs: Box<RelExpr>,
+    },
+    /// An in-memory (`private`) relvar read — the materialized counterpart of
+    /// the relvar-rooted `RelvarRef` leaf. No SQL source, so any subtree
+    /// containing it is `Materialized` and lowers in-process.
+    MaterializedRelvar {
+        name: String,
+        heading: Heading,
+    },
 }
 
 /// Apply a rename map to one attribute name: the renamed name if `name` is a
@@ -138,6 +154,11 @@ impl RelExpr {
                     .collect();
                 Heading::new(remapped)
             }
+            RelExpr::And { lhs, rhs } => lhs
+                .heading()
+                .union(&rhs.heading())
+                .expect("typechecked join has compatible shared attributes"),
+            RelExpr::MaterializedRelvar { heading, .. } => heading.clone(),
         }
     }
 
@@ -152,6 +173,16 @@ impl RelExpr {
             RelExpr::Restrict { input, .. } => input.origin(),
             RelExpr::Project { input, .. } => input.origin(),
             RelExpr::Rename { input, .. } => input.origin(),
+            RelExpr::And { lhs, rhs } => match (lhs.origin(), rhs.origin()) {
+                (StorageOrigin::RelvarRooted, StorageOrigin::RelvarRooted) => {
+                    StorageOrigin::RelvarRooted
+                }
+                (StorageOrigin::Materialized, StorageOrigin::Materialized) => {
+                    StorageOrigin::Materialized
+                }
+                _ => StorageOrigin::Mixed,
+            },
+            RelExpr::MaterializedRelvar { .. } => StorageOrigin::Materialized,
         }
     }
 
@@ -176,6 +207,9 @@ impl RelExpr {
                 .into_iter()
                 .map(|k| k.iter().map(|a| apply_rename(renames, a)).collect())
                 .collect(),
+            // Conservative: join key-inference is deferred (always DISTINCT).
+            RelExpr::And { .. } => Vec::new(),
+            RelExpr::MaterializedRelvar { .. } => Vec::new(),
         }
     }
 
@@ -201,6 +235,8 @@ impl RelExpr {
             }
             RelExpr::Project { input, .. } => input.card_le_one(),
             RelExpr::Rename { input, .. } => input.card_le_one(),
+            RelExpr::And { .. } => false,
+            RelExpr::MaterializedRelvar { .. } => false,
         }
     }
 

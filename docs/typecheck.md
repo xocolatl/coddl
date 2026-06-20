@@ -83,7 +83,7 @@ Integrity constraints attach only to **database relvars** (real, virtual). Coddl
 
 The rest of this doc pins what `coddl-types` enforces today.
 
-**Last sync:** `1830ac1`. Every commit that adds, removes, or changes a `T####` code, a built-in operator, or a typechecker walk method updates this file in the same commit; `tools/check-grammar.sh` enforces it from the hygiene gate.
+**Last sync:** `94dfa9f`. Every commit that adds, removes, or changes a `T####` code, a built-in operator, or a typechecker walk method updates this file in the same commit; `tools/check-grammar.sh` enforces it from the hygiene gate.
 
 
 ## Type representation
@@ -396,3 +396,8 @@ check script enforces that.
 | T0030 | `rename` target must be a bare attribute name             |
 | T0031 | `rename` is not a bijection (duplicate source or target collision) |
 | T0032 | *(warning)* unused `let` binding or parameter — never referenced, not `_`-prefixed (a `self` parameter is exempt) |
+| T0033 | relational-assignment target is not an assignable (private) relvar (not a relvar name, or a read-only public relvar) |
+| T0034 | relational-assignment RHS does not match the target relvar's heading |
+| T0035 | `join`/`compose` operands share no attribute (disjoint headings) — suggest `times` |
+| T0036 | `join`/`compose` shared attribute has different types on each side |
+| T0037 | `times` operands share an attribute (overlapping headings) — suggest `join` |

@@ -4,7 +4,7 @@ The authoritative spec for Coddl's surface syntax — the precise form of the la
 
 This doc has two parts: **rationale** (the design decisions — why prefix-named-args, why no reserved words, why brackets-vs-braces, etc.) and the **productions** (the EBNF the parser implements, lexical and syntactic).
 
-**Last sync:** `9bae417`. Every commit that adds, removes, or changes a production, token, or diagnostic code updates this file in the same commit; `tools/check-grammar.sh` enforces it from the hygiene gate.
+**Last sync:** `94dfa9f`. Every commit that adds, removes, or changes a production, token, or diagnostic code updates this file in the same commit; `tools/check-grammar.sh` enforces it from the hygiene gate.
 
 ---
 
@@ -33,13 +33,18 @@ Three operator-shape categories, with deliberate exceptions:
 ### Infix for binary operators (symbolic *and* textual)
 
 - **Symbolic**: `=`, `<>`, `<`, `>`, `<=`, `>=`, `+`, `-`, `*`, `/`. The comparison operators `<=` and `>=` are polymorphic: scalar comparison on scalars (as ever); **subset** and **superset** on relations (`R <= S` iff every tuple in `R` appears in `S`; `S >= R` iff `R <= S`). `<` and `>` give strict subset / superset analogously. Identical headings are required for the relation overload — checked at compile time. There's no separate `subset` keyword; `<=` covers it.
-- **Textual relational**: `join`, `times`, `intersect`, `union`, `minus`, `where`.
+- **Textual relational**: `join`, `times`, `intersect`, `compose`, `union`, `minus`, `where`.
 - **Textual logical**: `and`, `or`. (Both `Boolean × Boolean → Boolean`. `or` < `and` < `not` < comparison on the precedence ladder; final ordering deferred to the parser phase.)
 - **Textual arithmetic**: `mod`. (`Integer × Integer → Integer`. Binds at multiplicative precedence, alongside `*` and `/`. Defined only for `Integer` in v1 — extending to `Rational`/`Approximate` needs a separate semantic decision.)
 
 Reason: the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-unfriendly names, and the textual binary ops all have natural infix readings from math and SQL. No-reserved-words still holds — `join` is recognized contextually in expression position; it remains a valid identifier elsewhere.
 
-**`times` and `intersect` are typed aliases of `join`.** Both lower to the same `AND` node in Algebra A (see [relir.md](relir.md) — `AND` generalizes TIMES and INTERSECT). The aliases exist for intent-signaling and compile-time enforcement: `times` requires the two heading sets to be **disjoint** (otherwise the user meant `join`, not a cartesian product, and the type checker catches the slip); `intersect` requires the two heading sets to be **identical**. Both checks are static, both are zero-cost at runtime.
+**`times` and `intersect` are typed aliases of `join`; `compose` is a sibling with a different lowering.** `join`, `times`, and `intersect` all lower to the same `AND` node in Algebra A (see [relir.md](relir.md) — `AND` generalizes TIMES and INTERSECT); `compose` lowers to `AND` followed by `REMOVE` of the shared attributes. All four exist for intent-signaling and compile-time enforcement — every check below is static and zero-cost at runtime:
+
+- **`join`** requires the two headings to **overlap** (share at least one attribute). With no overlap the result would be a Cartesian product the user almost never means by accident, so the typechecker rejects it and suggests `times`.
+- **`times`** requires the two headings to be **disjoint**. With any attribute in common the typechecker rejects it and suggests `join`.
+- **`intersect`** requires the two headings to be **identical**.
+- **`compose`** requires the two headings to **overlap** (like `join`): it joins on the common attributes and removes them. With no overlap the typechecker rejects it and suggests `times` (a disjoint compose is just a Cartesian product with nothing to remove).
 
 **`union` and `minus` require identical headings.** `union` lowers to A-core `OR` (heading-agnostic relational union, restricted at the type level to matching headings since Coddl has no nulls). `minus` lowers to `AND NOT` (set difference is `R join (NOT S)` when headings match). Both checks are static; mismatched-heading attempts are rejected at compile time with a diagnostic.
 
@@ -56,7 +61,7 @@ Reason: the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-
 
 ### Named-prefix with braces for everything else
 
-N-ary or structured operands: selectors, `oper` calls in general, `extend`, `summarize`, `rename`, `group`, `ungroup`, `wrap`, `unwrap`. These all have meaningful name slots that would be lost in a positional form.
+N-ary or structured operands: selectors, `oper` calls in general, `extend`, `summarize`, `rename`, `group`, `ungroup`, `wrap`, `unwrap`. These all have meaningful name slots that would be lost in a positional form. (The binary relational operators — `join`, `times`, `intersect`, `compose`, `union`, `minus`, `where` — are **infix only**; there is no named-prefix brace variant for them.)
 
 This eliminates the relational-algebra/scalar-op syntactic distinction the authors regret, and matches RM Pro 1 (no ordinal-position semantics) at the surface where it's easiest to enforce.
 
@@ -407,7 +412,13 @@ function that implements it.
                     -- the block's value. Statements terminated by ';'
                     -- have their results discarded.
 <stmt>          ::= <let-stmt>
-                  | <expr> ';' ;                               -- parse_stmt (LET_STMT or EXPR_STMT)
+                  | <assign-stmt>
+                  | <expr> ';' ;                               -- parse_stmt (LET_STMT, ASSIGN_STMT, or EXPR_STMT)
+<assign-stmt>   ::= <expr> ':=' <expr> ';' ;                   -- parse_stmt (ASSIGN_STMT)
+                    -- Relational assignment. The parser accepts any
+                    -- expression as the target (LHS); the typechecker
+                    -- restricts it to a name bound to a private relvar
+                    -- (T0033 otherwise; public relvars are read-only in v1).
 <let-stmt>      ::= 'let' <identifier> [ ':' <type-ref> ]
                     '=' <expr> ';' ;                           -- parse_let_stmt
 
@@ -423,6 +434,9 @@ function that implements it.
                     -- (min_prec 0), interleaved with infix ops, so they
                     -- bind to the whole pipeline.
 <infix-op>      ::= 'where'                                    -- prec 0
+                  | 'join'                                     -- prec 0
+                  | 'times'                                    -- prec 0
+                  | 'compose'                                  -- prec 0
                   | 'or'                                       -- prec 1
                   | 'and'                                      -- prec 2
                   | '=' | '<>' | '<' | '>' | '<=' | '>=' ;     -- prec 3
@@ -525,12 +539,12 @@ is explicit, not implied:
   user-defined types.
 - **Type generators** in `<type-ref>` — `Tuple H`, `Relation H`,
   `Sequence T`.
-- **Infix operators** — relational (`join`, `times`, `intersect`,
-  `union`, `minus`, `where`), comparison (`=`, `<>`, `<`, `>`, `<=`,
-  `>=` polymorphic over scalars and relations), logical (`and`, `or`),
-  arithmetic (`+`, `-`, `*`, `/`, `mod`).
-- **Statement forms** other than `<let-stmt>` and `<expr> ';'` —
-  `mut`, `return`, `insert`, `delete`, `update`.
+- **Infix relational operators** not yet parsed — `intersect`, `union`,
+  `minus`. (`join` landed in M2, `times` in M3, `compose` in M4; comparison `=`
+  `<>` `<` `>` `<=` `>=`, logical `and` / `or`, and `where` landed in Phase 20;
+  arithmetic is listed separately below.)
+- **Statement forms** other than `<let-stmt>`, `<assign-stmt>`, and
+  `<expr> ';'` — `mut`, `return`, `insert`, `delete`, `update`.
 - **Type / relvar / constraint declarations** at the top level.
 - **Literals**: sequence `[ … ]` in expression position. (Tuple
   `{ … }` literals and dot-prefix field access landed in Phase 18.

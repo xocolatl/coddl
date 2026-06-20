@@ -141,7 +141,7 @@ pub fn emit_select(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
     // renames remap the attr side, projects narrow it — collecting each
     // restriction as a resolved `(column, value)` conjunct along the way.
     let mut wheres: Vec<(String, Literal)> = Vec::new();
-    let (table_name, output_cols) = resolve(expr, &mut wheres)?;
+    let (from_clause, output_cols) = resolve(expr, &mut wheres)?;
 
     // SELECT list = the result heading in canonical order. Each attribute is
     // its physical column, aliased `AS` the attribute when the names differ —
@@ -171,10 +171,7 @@ pub fn emit_select(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
     // surviving candidate key or a cardinality-≤-1 restriction makes it
     // redundant (RM Pro 3 is still upheld; we only drop a proven no-op).
     let distinct = if expr.needs_distinct() { "DISTINCT " } else { "" };
-    let mut text = format!(
-        "SELECT {distinct}{select_list} FROM {}",
-        quote_ident(table_name),
-    );
+    let mut text = format!("SELECT {distinct}{select_list} FROM {from_clause}");
 
     // WHERE = the conjunction of the collected (column, literal) tests. Each
     // predicate was resolved to its physical column at its own level in the
@@ -206,35 +203,36 @@ pub fn emit_select(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
     })
 }
 
-/// Post-order walk to the `RelvarRef` leaf, returning the physical table name
-/// and the node's output `(attribute, sql_column)` map. `Rename` remaps the
-/// attribute side; `Project` narrows it; `Restrict` resolves its predicate
-/// against the map **at its own level** (so a `where` above a `rename`
-/// resolves through the rename) and pushes the `(column, value)` onto `wheres`.
-fn resolve<'a>(
-    expr: &'a RelExpr,
+/// Post-order walk returning the node's **FROM expression** (a quoted table,
+/// or a composed `… INNER JOIN …`) and its output `(attribute, sql_column)`
+/// map. `Rename` remaps the attribute side; `Project` narrows it; `Restrict`
+/// resolves its predicate against the map **at its own level** (so a `where`
+/// above a `rename` resolves through the rename) and pushes the
+/// `(column, value)` onto `wheres`; `And` joins two FROM expressions.
+fn resolve(
+    expr: &RelExpr,
     wheres: &mut Vec<(String, Literal)>,
-) -> Result<(&'a str, Vec<(String, String)>)> {
+) -> Result<(String, Vec<(String, String)>)> {
     match expr {
         RelExpr::RelvarRef {
             table_name,
             columns,
             ..
-        } => Ok((table_name, columns.clone())),
+        } => Ok((quote_ident(table_name), columns.clone())),
         RelExpr::Restrict { input, pred } => {
-            let (table, cols) = resolve(input, wheres)?;
+            let (from, cols) = resolve(input, wheres)?;
             let Predicate::AttrEq { attr, value } = pred;
             let col = column_for(&cols, attr)?.to_string();
             wheres.push((col, value.clone()));
-            Ok((table, cols))
+            Ok((from, cols))
         }
         RelExpr::Project { input, keep } => {
-            let (table, cols) = resolve(input, wheres)?;
+            let (from, cols) = resolve(input, wheres)?;
             let kept = cols.into_iter().filter(|(a, _)| keep.contains(a)).collect();
-            Ok((table, kept))
+            Ok((from, kept))
         }
         RelExpr::Rename { input, renames } => {
-            let (table, cols) = resolve(input, wheres)?;
+            let (from, cols) = resolve(input, wheres)?;
             let renamed = cols
                 .into_iter()
                 .map(|(a, c)| {
@@ -246,8 +244,45 @@ fn resolve<'a>(
                     (new, c)
                 })
                 .collect();
-            Ok((table, renamed))
+            Ok((from, renamed))
         }
+        RelExpr::And { lhs, rhs } => {
+            let (lhs_from, lhs_cols) = resolve(lhs, wheres)?;
+            let (rhs_from, rhs_cols) = resolve(rhs, wheres)?;
+            // The shared columns. `join` has ≥1 (typechecked); `times` has 0
+            // (disjoint headings, typechecked). Assumes a shared attribute maps
+            // to the same column name on both sides.
+            let using: Vec<String> = lhs_cols
+                .iter()
+                .filter(|(a, _)| rhs_cols.iter().any(|(b, _)| b == a))
+                .map(|(_, c)| quote_ident(c))
+                .collect();
+            // ≥1 shared column → natural `INNER JOIN … USING (…)` (the shared
+            // columns coalesced once). Zero shared columns (`times`) → a
+            // `CROSS JOIN`: `USING ()` is invalid SQL. Inner/cross only — no
+            // outer joins (RM Pro 4).
+            let from = if using.is_empty() {
+                format!("{lhs_from} CROSS JOIN {rhs_from}")
+            } else {
+                format!(
+                    "{lhs_from} INNER JOIN {rhs_from} USING ({})",
+                    using.join(", ")
+                )
+            };
+            // Merged map: every LHS column plus the RHS columns not shared.
+            let mut merged = lhs_cols.clone();
+            for (a, c) in rhs_cols {
+                if !lhs_cols.iter().any(|(la, _)| la == &a) {
+                    merged.push((a, c));
+                }
+            }
+            Ok((from, merged))
+        }
+        // Never reached: a materialized leaf fails the cut's `RelvarRooted`
+        // gate before SQL emission. Defensive only.
+        RelExpr::MaterializedRelvar { name, .. } => Err(BackendError::Other(format!(
+            "materialized relvar `{name}` reached SQL emission (should be in-process)"
+        ))),
     }
 }
 
@@ -405,6 +440,189 @@ mod tests {
         assert_eq!(q.sql.text, r#"SELECT "id", "message" FROM "greetings""#);
         assert_eq!(q.sql.param_count, 0);
         assert!(q.params.is_empty());
+    }
+
+    fn employees() -> RelExpr {
+        RelExpr::RelvarRef {
+            name: "Employees".to_string(),
+            database: "staffing".to_string(),
+            heading: Heading::new(vec![
+                ("emp_id".to_string(), Type::Integer),
+                ("emp_name".to_string(), Type::Text),
+                ("dept_id".to_string(), Type::Integer),
+            ]),
+            table_name: "employees".to_string(),
+            columns: vec![
+                ("emp_id".to_string(), "emp_id".to_string()),
+                ("emp_name".to_string(), "emp_name".to_string()),
+                ("dept_id".to_string(), "dept_id".to_string()),
+            ],
+            keys: vec![vec!["emp_id".to_string()]],
+        }
+    }
+
+    fn departments() -> RelExpr {
+        RelExpr::RelvarRef {
+            name: "Departments".to_string(),
+            database: "staffing".to_string(),
+            heading: Heading::new(vec![
+                ("dept_id".to_string(), Type::Integer),
+                ("dept_name".to_string(), Type::Text),
+            ]),
+            table_name: "departments".to_string(),
+            columns: vec![
+                ("dept_id".to_string(), "dept_id".to_string()),
+                ("dept_name".to_string(), "dept_name".to_string()),
+            ],
+            keys: vec![vec!["dept_id".to_string()]],
+        }
+    }
+
+    #[test]
+    fn and_emits_inner_join_using_the_shared_column() {
+        // `Employees join Departments` → RelExpr::And. Natural join on the one
+        // shared attribute `dept_id`, emitted as `INNER JOIN ... USING`. The
+        // SELECT list is the union heading in canonical (sorted) order; the join
+        // drops both keys so `DISTINCT` stays (RM Pro 3).
+        let expr = RelExpr::And {
+            lhs: Box::new(employees()),
+            rhs: Box::new(departments()),
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT DISTINCT "dept_id", "dept_name", "emp_id", "emp_name" FROM "employees" INNER JOIN "departments" USING ("dept_id")"#
+        );
+        assert_eq!(q.sql.param_count, 0);
+        assert!(q.params.is_empty());
+        assert_eq!(
+            q.result_heading,
+            Heading::new(vec![
+                ("dept_id".to_string(), Type::Integer),
+                ("dept_name".to_string(), Type::Text),
+                ("emp_id".to_string(), Type::Integer),
+                ("emp_name".to_string(), Type::Text),
+            ])
+        );
+    }
+
+    fn job_titles() -> RelExpr {
+        RelExpr::RelvarRef {
+            name: "JobTitles".to_string(),
+            database: "staffing".to_string(),
+            heading: Heading::new(vec![("title".to_string(), Type::Text)]),
+            table_name: "job_titles".to_string(),
+            columns: vec![("title".to_string(), "title".to_string())],
+            keys: vec![vec!["title".to_string()]],
+        }
+    }
+
+    fn locations() -> RelExpr {
+        RelExpr::RelvarRef {
+            name: "Locations".to_string(),
+            database: "staffing".to_string(),
+            heading: Heading::new(vec![("location".to_string(), Type::Text)]),
+            table_name: "locations".to_string(),
+            columns: vec![("location".to_string(), "location".to_string())],
+            keys: vec![vec!["location".to_string()]],
+        }
+    }
+
+    #[test]
+    fn and_with_disjoint_headings_emits_cross_join() {
+        // `JobTitles times Locations` → RelExpr::And with no shared column.
+        // `USING ()` is invalid SQL, so a disjoint product emits `CROSS JOIN`.
+        // SELECT list is the union heading in canonical (sorted) order
+        // (`location` before `title`); both single-attr keys are dropped, so
+        // `DISTINCT` stays (RM Pro 3).
+        let expr = RelExpr::And {
+            lhs: Box::new(job_titles()),
+            rhs: Box::new(locations()),
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT DISTINCT "location", "title" FROM "job_titles" CROSS JOIN "locations""#
+        );
+        assert_eq!(q.sql.param_count, 0);
+        assert!(q.params.is_empty());
+        assert_eq!(
+            q.result_heading,
+            Heading::new(vec![
+                ("location".to_string(), Type::Text),
+                ("title".to_string(), Type::Text),
+            ])
+        );
+    }
+
+    #[test]
+    fn compose_emits_join_with_shared_columns_dropped() {
+        // `Employees compose Departments` → Project{And} keeping the non-shared
+        // attributes. The And builds the natural join on `dept_id`; the Project
+        // narrows the SELECT to drop `dept_id`. Result heading in canonical
+        // (sorted) order; the dropped key means `DISTINCT` stays (RM Pro 3).
+        let expr = RelExpr::Project {
+            input: Box::new(RelExpr::And {
+                lhs: Box::new(employees()),
+                rhs: Box::new(departments()),
+            }),
+            keep: vec![
+                "dept_name".to_string(),
+                "emp_id".to_string(),
+                "emp_name".to_string(),
+            ],
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT DISTINCT "dept_name", "emp_id", "emp_name" FROM "employees" INNER JOIN "departments" USING ("dept_id")"#
+        );
+        assert_eq!(q.sql.param_count, 0);
+        assert!(q.params.is_empty());
+        assert_eq!(
+            q.result_heading,
+            Heading::new(vec![
+                ("dept_name".to_string(), Type::Text),
+                ("emp_id".to_string(), Type::Integer),
+                ("emp_name".to_string(), Type::Text),
+            ])
+        );
+    }
+
+    #[test]
+    fn restrict_then_project_over_a_join() {
+        // `(Employees join Departments) where dept_name = "Engineering"
+        //  project { emp_name, dept_name }` — a join feeding `where` then
+        // `project`. The Restrict resolves `dept_name` against the join's merged
+        // column map and pushes it as a bound `WHERE`; the Project narrows the
+        // SELECT. The join drops both keys, so `DISTINCT` stays.
+        let expr = RelExpr::Project {
+            input: Box::new(RelExpr::Restrict {
+                input: Box::new(RelExpr::And {
+                    lhs: Box::new(employees()),
+                    rhs: Box::new(departments()),
+                }),
+                pred: Predicate::AttrEq {
+                    attr: "dept_name".to_string(),
+                    value: Literal::Text("Engineering".to_string()),
+                },
+            }),
+            keep: vec!["dept_name".to_string(), "emp_name".to_string()],
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT DISTINCT "dept_name", "emp_name" FROM "employees" INNER JOIN "departments" USING ("dept_id") WHERE "dept_name" = ?"#
+        );
+        assert_eq!(q.sql.param_count, 1);
+        assert_eq!(q.params, vec![Value::Text("Engineering".to_string())]);
+        assert_eq!(
+            q.result_heading,
+            Heading::new(vec![
+                ("dept_name".to_string(), Type::Text),
+                ("emp_name".to_string(), Type::Text),
+            ])
+        );
     }
 
     #[test]

@@ -15,12 +15,13 @@ use std::collections::{HashMap, HashSet};
 use coddl_diagnostics::{Diagnostic, FileId, Severity, Span};
 use coddl_plan::Plan;
 use coddl_syntax::ast::{
-    AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, Expr, ExprStmt, FieldAccess, Item,
+    AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, Expr, ExprStmt,
+    FieldAccess, Item,
     LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, RenameExpr,
     Root, Stmt, TransactionExpr, TupleLit, UnaryExpr, UnaryOp,
 };
 use coddl_syntax::SyntaxKind;
-use coddl_types::{check, Heading, Type};
+use coddl_types::{check, Heading, RelvarKind, RelvarTable, Type};
 
 use coddl_relir::{Literal as RelLiteral, Predicate, RelExpr};
 use coddl_sqlemit::{Dialect, SqlQuery, Value};
@@ -89,6 +90,7 @@ pub fn lower_with_plan(source: &str, file: FileId, plan: Option<&Plan>) -> Lower
     if let Some(plan) = plan {
         lowerer.absorb_plan(plan);
     }
+    lowerer.absorb_private_relvars(&check_out.relvars);
     let module = lowerer.lower_root(&root);
     // Merge in any diagnostics the lowerer itself emitted (e.g.
     // T0022 for captures in `where` predicates). If the lowerer
@@ -186,6 +188,16 @@ struct Lowerer {
     /// pushed to SQL). Slot init/release in `main` is emitted only for these;
     /// fully-pushed (or unreferenced) relvars get no startup materialization.
     legacy_used_relvars: HashSet<String>,
+    /// In-memory `private` relvars: surface name → interned heading id.
+    /// Absorbed from the typechecker's relvar table; they have no SQL source,
+    /// so their slots start empty and are filled by assignment.
+    private_relvars: HashMap<String, HeadingId>,
+    /// Private-relvar names in a stable (name-sorted) order, so slot
+    /// init/release emits identically across backends and runs.
+    private_relvar_order: Vec<String>,
+    /// Private relvars actually read or assigned; only these get a slot
+    /// init/release in `main`.
+    used_private_relvars: HashSet<String>,
 }
 
 impl Lowerer {
@@ -215,6 +227,9 @@ impl Lowerer {
             plan_ids: HashMap::new(),
             next_plan_id: 0,
             legacy_used_relvars: HashSet::new(),
+            private_relvars: HashMap::new(),
+            private_relvar_order: Vec::new(),
+            used_private_relvars: HashSet::new(),
         }
     }
 
@@ -243,6 +258,22 @@ impl Lowerer {
             };
             self.public_relvar_order.push(r.app_name.clone());
             self.public_relvars.insert(r.app_name.clone(), binding);
+        }
+    }
+
+    /// Absorb `private` relvars from the typechecker's relvar table: intern
+    /// each heading and record it for in-memory slot storage. They have no
+    /// plan entry (no SQL source). Name-sorted for deterministic emission.
+    fn absorb_private_relvars(&mut self, relvars: &RelvarTable) {
+        let mut privs: Vec<_> = relvars
+            .iter()
+            .filter(|(_, info)| matches!(info.kind, RelvarKind::Private))
+            .collect();
+        privs.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, info) in privs {
+            let heading_id = self.intern_heading(&info.heading);
+            self.private_relvar_order.push(name.to_string());
+            self.private_relvars.insert(name.to_string(), heading_id);
         }
     }
 
@@ -450,6 +481,12 @@ impl Lowerer {
                     .expect("public_relvar_order names live in public_relvars")
             })
             .collect();
+        let private_relvar_slots: Vec<(String, HeadingId)> = self
+            .private_relvar_order
+            .iter()
+            .filter(|n| self.used_private_relvars.contains(*n))
+            .map(|n| (n.clone(), self.private_relvars[n]))
+            .collect();
         Module {
             program_name: std::mem::take(&mut self.program_name),
             functions: std::mem::take(&mut self.functions),
@@ -458,6 +495,7 @@ impl Lowerer {
             db_path_default: self.db_path_default.take(),
             db_name: self.db_name.take(),
             plans: std::mem::take(&mut self.plans),
+            private_relvar_slots,
         }
     }
 
@@ -484,12 +522,27 @@ impl Lowerer {
                 });
             }
         }
-        let releases: Vec<Inst> = self
+        // Private (in-memory) relvars: init an empty slot for each used one.
+        for name in &self.private_relvar_order {
+            if self.used_private_relvars.contains(name) {
+                let heading_id = self.private_relvars[name];
+                prologue.push(Inst::PrivateRelvarSlotInit {
+                    name: name.clone(),
+                    heading_id,
+                });
+            }
+        }
+        let mut releases: Vec<Inst> = self
             .public_relvar_order
             .iter()
             .filter(|n| self.legacy_used_relvars.contains(*n))
             .map(|n| Inst::RelvarSlotRelease { name: n.clone() })
             .collect();
+        for name in &self.private_relvar_order {
+            if self.used_private_relvars.contains(name) {
+                releases.push(Inst::RelvarSlotRelease { name: name.clone() });
+            }
+        }
         if prologue.is_empty() && releases.is_empty() {
             return;
         }
@@ -647,6 +700,7 @@ impl Lowerer {
         for stmt in block.statements() {
             match stmt {
                 Stmt::Let(l) => self.lower_let_stmt(&l),
+                Stmt::Assign(a) => self.lower_assign_stmt(&a),
                 Stmt::ExprStmt(e) => self.lower_expr_stmt(&e),
             }
         }
@@ -658,6 +712,26 @@ impl Lowerer {
                 v
             }
         }
+    }
+
+    /// Lower a relational assignment `R := <expr>;` — store the RHS relation
+    /// value into the target private relvar's slot (move semantics; the slot
+    /// owns the value, the runtime releases the previous one).
+    fn lower_assign_stmt(&mut self, stmt: &AssignStmt) {
+        // Target: a private relvar name (the typechecker enforced this — T0033).
+        let Some(Expr::NameRef(target)) = stmt.target() else {
+            return;
+        };
+        let Some(name_tok) = target.ident() else { return };
+        let name = name_tok.text().to_string();
+        // Lower the RHS to a relation value.
+        let value = match stmt.value() {
+            Some(v) => self.lower_expr(&v),
+            None => return,
+        };
+        // Mark the slot live and store the value.
+        self.used_private_relvars.insert(name.clone());
+        self.insts.push(Inst::RelvarSlotStore { name, value });
     }
 
     fn lower_let_stmt(&mut self, stmt: &LetStmt) {
@@ -899,6 +973,13 @@ impl Lowerer {
                 if self.lookup_local(name).is_some() {
                     return None;
                 }
+                // A `private` relvar is the in-memory (materialized) leaf.
+                if let Some(&heading_id) = self.private_relvars.get(name) {
+                    return Some(RelExpr::MaterializedRelvar {
+                        name: name.to_string(),
+                        heading: self.headings[heading_id.0 as usize].clone(),
+                    });
+                }
                 let binding = self.public_relvars.get(name)?;
                 Some(RelExpr::RelvarRef {
                     name: binding.name.clone(),
@@ -909,17 +990,7 @@ impl Lowerer {
                     keys: binding.keys.clone(),
                 })
             }
-            Expr::Binary(b) => {
-                if !matches!(b.op_kind(), Some(BinaryOp::Where)) {
-                    return None;
-                }
-                let input = self.build_rel_expr(&b.lhs()?)?;
-                let pred = self.build_predicate(&b.rhs()?, &input.heading())?;
-                Some(RelExpr::Restrict {
-                    input: Box::new(input),
-                    pred,
-                })
-            }
+            Expr::Binary(b) => self.build_rel_binary(b),
             Expr::Project(p) => {
                 // Projection over a pushable subtree pushes too — the cut
                 // gates on `origin()`, which `RelExpr::Project` propagates,
@@ -1145,6 +1216,20 @@ impl Lowerer {
                 });
                 return dst;
             }
+            // Private relvar reference: an in-memory slot load + retain (same
+            // `RelvarRead` node as public, no SQL source). Mark it so `main`
+            // inits / releases its slot.
+            if let Some(&heading_id) = self.private_relvars.get(name) {
+                self.used_private_relvars.insert(name.to_string());
+                let dst = self.fresh_value();
+                self.record_type(dst, ProcType::Relation(heading_id));
+                self.insts.push(Inst::RelvarRead {
+                    dst,
+                    name: name.to_string(),
+                    heading_id,
+                });
+                return dst;
+            }
             if let Some(outer) = &self.outer_locals_for_capture {
                 let captured = outer.iter().rev().any(|l| l.contains_key(name));
                 if captured {
@@ -1185,6 +1270,9 @@ impl Lowerer {
         if matches!(op, BinaryOp::Where) {
             return self.lower_where_expr(bin);
         }
+        if matches!(op, BinaryOp::Join | BinaryOp::Times | BinaryOp::Compose) {
+            return self.lower_join_inprocess(bin);
+        }
         let scalar_op = match op {
             BinaryOp::Eq => ScalarOp::Eq,
             BinaryOp::NotEq => ScalarOp::NotEq,
@@ -1194,7 +1282,9 @@ impl Lowerer {
             BinaryOp::GtEq => ScalarOp::GtEq,
             BinaryOp::And => ScalarOp::And,
             BinaryOp::Or => ScalarOp::Or,
-            BinaryOp::Where => unreachable!("handled above"),
+            BinaryOp::Where | BinaryOp::Join | BinaryOp::Times | BinaryOp::Compose => {
+                unreachable!("handled above")
+            }
         };
         let lhs = bin
             .lhs()
@@ -1213,6 +1303,197 @@ impl Lowerer {
             operand_type,
             lhs,
             rhs,
+        });
+        dst
+    }
+
+    /// Build the RelIR for a binary relational expression (`where`, `join`,
+    /// `times`, `compose`). `join`/`times` → the Algebra-A `AND` node;
+    /// `compose` → `AND` with the shared attributes projected away (the canonical
+    /// AND-then-REMOVE). Operands build recursively; the cut decides SQL vs
+    /// in-process by `origin()`. Shared by `build_rel_expr` (the SQL-push path)
+    /// and `lower_join_inprocess` (the in-process path) so the lowering is
+    /// identical on both. `None` for non-relational binaries.
+    fn build_rel_binary(&self, b: &BinaryExpr) -> Option<RelExpr> {
+        match b.op_kind() {
+            Some(BinaryOp::Where) => {
+                let input = self.build_rel_expr(&b.lhs()?)?;
+                let pred = self.build_predicate(&b.rhs()?, &input.heading())?;
+                Some(RelExpr::Restrict {
+                    input: Box::new(input),
+                    pred,
+                })
+            }
+            Some(BinaryOp::Join) | Some(BinaryOp::Times) => {
+                let lhs = self.build_rel_expr(&b.lhs()?)?;
+                let rhs = self.build_rel_expr(&b.rhs()?)?;
+                Some(RelExpr::And {
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                })
+            }
+            // `A compose B` → `AND` then REMOVE the shared attributes: a
+            // `Project` keeping only the attributes that appear in exactly one
+            // operand. (Typecheck guarantees ≥1 shared attribute.)
+            Some(BinaryOp::Compose) => {
+                let lhs = self.build_rel_expr(&b.lhs()?)?;
+                let rhs = self.build_rel_expr(&b.rhs()?)?;
+                let shared = lhs.heading().shared_names(&rhs.heading());
+                let union = lhs.heading().union(&rhs.heading()).ok()?;
+                let keep: Vec<String> = union
+                    .attrs()
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .filter(|name| !shared.contains(name))
+                    .collect();
+                Some(RelExpr::Project {
+                    input: Box::new(RelExpr::And {
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    }),
+                    keep,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Lower `R join S` / `R times S` / `R compose S` in-process: build the
+    /// RelIR (`AND`, or `Project{AND}` for compose) and consume it via the
+    /// in-process RelExpr→ProcIR path (`MaterializedRelvar` → slot read, `And`
+    /// → `Inst::Join`, `Project` → `Inst::Project`). Falls back to lowering the
+    /// operands directly for shapes the consumer doesn't handle yet (e.g.
+    /// mixed-origin), projecting away the shared attributes for `compose`.
+    fn lower_join_inprocess(&mut self, bin: &BinaryExpr) -> ValueId {
+        if let (Some(lhs_e), Some(rhs_e)) = (bin.lhs(), bin.rhs()) {
+            if let Some(rel) = self.build_rel_binary(bin) {
+                if let Some(v) = self.lower_relexpr_inprocess(&rel) {
+                    return v;
+                }
+            }
+            let lhs = self.lower_expr(&lhs_e);
+            let rhs = self.lower_expr(&rhs_e);
+            let joined = self.emit_join(lhs, rhs);
+            // `compose` removes the shared attributes after the join. (The
+            // primary path above handles this via `Project`; this fallback only
+            // fires for shapes the RelExpr consumer declines, e.g. mixed-origin.)
+            if matches!(bin.op_kind(), Some(BinaryOp::Compose)) {
+                let keep = self.compose_keep(lhs, rhs);
+                return self.emit_project(joined, &keep);
+            }
+            return joined;
+        }
+        let v = self.fresh_value();
+        self.record_type(v, ProcType::Unit);
+        v
+    }
+
+    /// The `compose` keep-list (attributes appearing in exactly one operand),
+    /// computed from two already-lowered relation values' headings.
+    fn compose_keep(&self, lhs: ValueId, rhs: ValueId) -> Vec<String> {
+        let heading_of = |v: ValueId| match self.value_type(v) {
+            ProcType::Relation(id) => self.headings[id.0 as usize].clone(),
+            other => unreachable!("compose operand non-relation `{other}` survived typecheck"),
+        };
+        let lhs_h = heading_of(lhs);
+        let rhs_h = heading_of(rhs);
+        let shared = lhs_h.shared_names(&rhs_h);
+        lhs_h
+            .union(&rhs_h)
+            .expect("typechecked compose has compatible shared attributes")
+            .attrs()
+            .iter()
+            .map(|(name, _)| name.clone())
+            .filter(|name| !shared.contains(name))
+            .collect()
+    }
+
+    /// Consume a materialized `RelExpr` subtree into ProcIR. `Some(value)` for
+    /// the nodes the in-process path handles today (`MaterializedRelvar`, `And`,
+    /// `Project`); `None` otherwise so the caller falls back.
+    fn lower_relexpr_inprocess(&mut self, rel: &RelExpr) -> Option<ValueId> {
+        match rel {
+            RelExpr::MaterializedRelvar { name, .. } => {
+                let &heading_id = self.private_relvars.get(name)?;
+                self.used_private_relvars.insert(name.clone());
+                let dst = self.fresh_value();
+                self.record_type(dst, ProcType::Relation(heading_id));
+                self.insts.push(Inst::RelvarRead {
+                    dst,
+                    name: name.clone(),
+                    heading_id,
+                });
+                Some(dst)
+            }
+            RelExpr::And { lhs, rhs } => {
+                let l = self.lower_relexpr_inprocess(lhs)?;
+                let r = self.lower_relexpr_inprocess(rhs)?;
+                Some(self.emit_join(l, r))
+            }
+            // `compose` lowers to `Project{And}`: lower the join, then narrow to
+            // the kept attributes via `Inst::Project`.
+            RelExpr::Project { input, keep } => {
+                let src = self.lower_relexpr_inprocess(input)?;
+                Some(self.emit_project(src, keep))
+            }
+            _ => None,
+        }
+    }
+
+    /// Emit `Inst::Join` over two already-lowered relation values, computing
+    /// the union result heading. (RC mirrors the existing read path: operands
+    /// are read temps; the result is rc=1.)
+    fn emit_join(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
+        let lhs_heading_id = match self.value_type(lhs) {
+            ProcType::Relation(id) => id,
+            other => unreachable!("join lhs non-relation `{other}` survived typecheck"),
+        };
+        let rhs_heading_id = match self.value_type(rhs) {
+            ProcType::Relation(id) => id,
+            other => unreachable!("join rhs non-relation `{other}` survived typecheck"),
+        };
+        let lhs_heading = self.headings[lhs_heading_id.0 as usize].clone();
+        let rhs_heading = self.headings[rhs_heading_id.0 as usize].clone();
+        let result_heading = lhs_heading
+            .union(&rhs_heading)
+            .expect("typechecked join has compatible shared attributes");
+        let result_heading_id = self.intern_heading(&result_heading);
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Relation(result_heading_id));
+        self.insts.push(Inst::Join {
+            dst,
+            lhs,
+            rhs,
+            lhs_heading_id,
+            rhs_heading_id,
+            result_heading_id,
+        });
+        dst
+    }
+
+    /// Emit `Inst::Project` narrowing an already-lowered relation value to the
+    /// `keep` attributes (the relation-level counterpart of `lower_project_expr`
+    /// steps 1–3). The result heading re-canonicalizes via `Heading::new`.
+    fn emit_project(&mut self, src: ValueId, keep: &[String]) -> ValueId {
+        let src_heading_id = match self.value_type(src) {
+            ProcType::Relation(id) => id,
+            other => unreachable!("project on non-relation `{other}` survived typecheck"),
+        };
+        let src_heading = self.headings[src_heading_id.0 as usize].clone();
+        let narrowed: Vec<(String, Type)> = src_heading
+            .attrs()
+            .iter()
+            .filter(|(name, _)| keep.iter().any(|k| k == name))
+            .cloned()
+            .collect();
+        let result_heading_id = self.intern_heading(&Heading::new(narrowed));
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Relation(result_heading_id));
+        self.insts.push(Inst::Project {
+            dst,
+            src,
+            src_heading_id,
+            result_heading_id,
         });
         dst
     }

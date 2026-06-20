@@ -119,6 +119,22 @@ impl Codegen for CraneliftBackend {
             relvar_data.insert(relvar.name.clone(), ids);
         }
 
+        // Per-private-relvar writable slot (in-memory; filled by assignment,
+        // empty-initialized in `main`'s prologue). Just the slot global — no
+        // SQL strings.
+        let mut private_relvar_slots: HashMap<String, DataId> = HashMap::new();
+        for (name, _heading_id) in &module.private_relvar_slots {
+            let slot = obj
+                .declare_data(&format!("{name}_slot"), Linkage::Local, true, false)
+                .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+            let mut slot_dd = DataDescription::new();
+            slot_dd.set_align(ptr_bytes as u64);
+            slot_dd.define(vec![0u8; ptr_bytes].into_boxed_slice());
+            obj.define_data(slot, &slot_dd)
+                .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+            private_relvar_slots.insert(name.clone(), slot);
+        }
+
         // Per-plan + database data symbols for the pushdown prologue.
         let db_data: Option<DbDataIds> = if module.plans.is_empty() {
             None
@@ -142,6 +158,7 @@ impl Codegen for CraneliftBackend {
                 &layouts,
                 &heading_desc_ids,
                 &relvar_data,
+                &private_relvar_slots,
                 &plan_data,
                 db_data.as_ref(),
                 &mut next_data,
@@ -249,6 +266,30 @@ fn declare_runtime_rc_externs(
             .declare_function("coddl_text_eq", Linkage::Import, &sig)
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert("coddl_text_eq".into(), id);
+    }
+    // coddl_relation_join(lhs, lhs_desc, rhs, rhs_desc, result_desc) -> ptr
+    {
+        let mut sig = obj.make_signature();
+        for _ in 0..5 {
+            sig.params.push(AbiParam::new(ptr_ty));
+        }
+        sig.returns.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_relation_join", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_relation_join".into(), id);
+    }
+    // Private-relvar in-memory slots:
+    //   coddl_relvar_slot_init_empty(desc: ptr, slot: ptr) -> ()
+    //   coddl_relvar_slot_store(value: ptr, slot: ptr) -> ()
+    for name in ["coddl_relvar_slot_init_empty", "coddl_relvar_slot_store"] {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function(name, Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert(name.into(), id);
     }
     Ok(())
 }
@@ -827,6 +868,7 @@ fn emit_function(
     heading_layouts: &[RecordLayout],
     heading_desc_ids: &[DataId],
     relvar_data: &HashMap<String, RelvarDataIds>,
+    private_relvar_slots: &HashMap<String, DataId>,
     plan_data: &HashMap<u32, PlanDataIds>,
     db_data: Option<&DbDataIds>,
     next_data: &mut u32,
@@ -892,6 +934,7 @@ fn emit_function(
             heading_layouts,
             heading_desc_ids,
             relvar_data,
+            private_relvar_slots,
             plan_data,
             db_data,
             &mut values,
@@ -918,6 +961,7 @@ fn emit_block(
     heading_layouts: &[RecordLayout],
     heading_desc_ids: &[DataId],
     relvar_data: &HashMap<String, RelvarDataIds>,
+    private_relvar_slots: &HashMap<String, DataId>,
     plan_data: &HashMap<u32, PlanDataIds>,
     db_data: Option<&DbDataIds>,
     values: &mut HashMap<ValueId, ValueRepr>,
@@ -933,6 +977,7 @@ fn emit_block(
             heading_layouts,
             heading_desc_ids,
             relvar_data,
+            private_relvar_slots,
             plan_data,
             db_data,
             values,
@@ -952,6 +997,7 @@ fn emit_inst(
     heading_layouts: &[RecordLayout],
     heading_desc_ids: &[DataId],
     relvar_data: &HashMap<String, RelvarDataIds>,
+    private_relvar_slots: &HashMap<String, DataId>,
     plan_data: &HashMap<u32, PlanDataIds>,
     db_data: Option<&DbDataIds>,
     values: &mut HashMap<ValueId, ValueRepr>,
@@ -1325,6 +1371,38 @@ fn emit_inst(
             values.insert(*dst, ValueRepr::Scalar(result));
             Ok(())
         }
+        Inst::Join {
+            dst,
+            lhs,
+            rhs,
+            lhs_heading_id,
+            rhs_heading_id,
+            result_heading_id,
+        } => {
+            let lhs_v = scalar_value(values, lhs)?;
+            let rhs_v = scalar_value(values, rhs)?;
+            let ptr_ty = obj.target_config().pointer_type();
+            let lhs_desc_gv = obj
+                .declare_data_in_func(heading_desc_ids[lhs_heading_id.0 as usize], builder.func);
+            let lhs_desc_val = builder.ins().symbol_value(ptr_ty, lhs_desc_gv);
+            let rhs_desc_gv = obj
+                .declare_data_in_func(heading_desc_ids[rhs_heading_id.0 as usize], builder.func);
+            let rhs_desc_val = builder.ins().symbol_value(ptr_ty, rhs_desc_gv);
+            let res_desc_gv = obj.declare_data_in_func(
+                heading_desc_ids[result_heading_id.0 as usize],
+                builder.func,
+            );
+            let res_desc_val = builder.ins().symbol_value(ptr_ty, res_desc_gv);
+            let join_id = funcs["coddl_relation_join"];
+            let join_local = obj.declare_func_in_func(join_id, builder.func);
+            let call = builder.ins().call(
+                join_local,
+                &[lhs_v, lhs_desc_val, rhs_v, rhs_desc_val, res_desc_val],
+            );
+            let result = builder.inst_results(call)[0];
+            values.insert(*dst, ValueRepr::Scalar(result));
+            Ok(())
+        }
         Inst::Rename {
             dst,
             src,
@@ -1479,13 +1557,17 @@ fn emit_inst(
             Ok(())
         }
         Inst::RelvarSlotRelease { name } => {
-            let ids = relvar_data.get(name).ok_or_else(|| {
-                CraneliftEmitError::UnsupportedInst(format!(
-                    "RelvarSlotRelease references unknown relvar `{name}`"
-                ))
-            })?;
+            let slot = relvar_data
+                .get(name)
+                .map(|ids| ids.slot)
+                .or_else(|| private_relvar_slots.get(name).copied())
+                .ok_or_else(|| {
+                    CraneliftEmitError::UnsupportedInst(format!(
+                        "RelvarSlotRelease references unknown relvar `{name}`"
+                    ))
+                })?;
             let ptr_ty = obj.target_config().pointer_type();
-            let slot_gv = obj.declare_data_in_func(ids.slot, builder.func);
+            let slot_gv = obj.declare_data_in_func(slot, builder.func);
             let slot_addr = builder.ins().symbol_value(ptr_ty, slot_gv);
             let payload = builder
                 .ins()
@@ -1500,13 +1582,17 @@ fn emit_inst(
             name,
             heading_id: _,
         } => {
-            let ids = relvar_data.get(name).ok_or_else(|| {
-                CraneliftEmitError::UnsupportedInst(format!(
-                    "RelvarRead references unknown relvar `{name}`"
-                ))
-            })?;
+            let slot = relvar_data
+                .get(name)
+                .map(|ids| ids.slot)
+                .or_else(|| private_relvar_slots.get(name).copied())
+                .ok_or_else(|| {
+                    CraneliftEmitError::UnsupportedInst(format!(
+                        "RelvarRead references unknown relvar `{name}`"
+                    ))
+                })?;
             let ptr_ty = obj.target_config().pointer_type();
-            let slot_gv = obj.declare_data_in_func(ids.slot, builder.func);
+            let slot_gv = obj.declare_data_in_func(slot, builder.func);
             let slot_addr = builder.ins().symbol_value(ptr_ty, slot_gv);
             let payload = builder
                 .ins()
@@ -1515,6 +1601,42 @@ fn emit_inst(
             let retain_local = obj.declare_func_in_func(retain_id, builder.func);
             builder.ins().call(retain_local, &[payload]);
             values.insert(*dst, ValueRepr::Scalar(payload));
+            Ok(())
+        }
+        Inst::PrivateRelvarSlotInit { name, heading_id } => {
+            let slot = private_relvar_slots.get(name).copied().ok_or_else(|| {
+                CraneliftEmitError::UnsupportedInst(format!(
+                    "PrivateRelvarSlotInit references unknown relvar `{name}`"
+                ))
+            })?;
+            let ptr_ty = obj.target_config().pointer_type();
+            let desc_id = heading_desc_ids[heading_id.0 as usize];
+            let desc_gv = obj.declare_data_in_func(desc_id, builder.func);
+            let desc_val = builder.ins().symbol_value(ptr_ty, desc_gv);
+            let slot_gv = obj.declare_data_in_func(slot, builder.func);
+            let slot_addr = builder.ins().symbol_value(ptr_ty, slot_gv);
+            let init_id = funcs["coddl_relvar_slot_init_empty"];
+            let init_local = obj.declare_func_in_func(init_id, builder.func);
+            builder.ins().call(init_local, &[desc_val, slot_addr]);
+            Ok(())
+        }
+        Inst::RelvarSlotStore { name, value } => {
+            let slot = private_relvar_slots
+                .get(name)
+                .copied()
+                .or_else(|| relvar_data.get(name).map(|ids| ids.slot))
+                .ok_or_else(|| {
+                    CraneliftEmitError::UnsupportedInst(format!(
+                        "RelvarSlotStore references unknown relvar `{name}`"
+                    ))
+                })?;
+            let value_v = scalar_value(values, value)?;
+            let ptr_ty = obj.target_config().pointer_type();
+            let slot_gv = obj.declare_data_in_func(slot, builder.func);
+            let slot_addr = builder.ins().symbol_value(ptr_ty, slot_gv);
+            let store_id = funcs["coddl_relvar_slot_store"];
+            let store_local = obj.declare_func_in_func(store_id, builder.func);
+            builder.ins().call(store_local, &[value_v, slot_addr]);
             Ok(())
         }
         Inst::RegisterDatabase => {

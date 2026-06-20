@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn from_path_pulls_extension() {
-        let path = PathBuf::from("examples/hello-world-db/greetings.cddb");
+        let path = PathBuf::from("schema/greetings.cddb");
         assert_eq!(FileKind::from_path(&path), Some(FileKind::Cddb));
     }
 

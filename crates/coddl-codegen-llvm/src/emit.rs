@@ -211,12 +211,26 @@ impl Emitter {
         writeln!(self.body, "declare void @coddl_rc_release(ptr)").unwrap();
         writeln!(self.body, "declare void @coddl_relation_seal(ptr, ptr)").unwrap();
         writeln!(self.body, "declare void @coddl_write_relation(ptr, ptr)").unwrap();
+        // Private-relvar in-memory slots: empty-init a slot, and store (move)
+        // a relation into a slot.
+        writeln!(
+            self.body,
+            "declare void @coddl_relvar_slot_init_empty(ptr, ptr)"
+        )
+        .unwrap();
+        writeln!(self.body, "declare void @coddl_relvar_slot_store(ptr, ptr)").unwrap();
         // Phase 20 `where`: takes (src, desc, pred_fn) and returns
         // a fresh relation pointer (rc=1).
         writeln!(self.body, "declare ptr @coddl_relation_where(ptr, ptr, ptr)").unwrap();
         // `project`: takes (src, src_desc, result_desc) and returns a
         // fresh narrowed + sealed relation pointer (rc=1).
         writeln!(self.body, "declare ptr @coddl_relation_project(ptr, ptr, ptr)").unwrap();
+        // `join`: (lhs, lhs_desc, rhs, rhs_desc, result_desc) -> rc=1 ptr.
+        writeln!(
+            self.body,
+            "declare ptr @coddl_relation_join(ptr, ptr, ptr, ptr, ptr)"
+        )
+        .unwrap();
         // `rename`: (src, src_desc, result_desc, perm, perm_count) -> rc=1 ptr.
         writeln!(
             self.body,
@@ -705,6 +719,21 @@ impl Emitter {
                 result_heading_id,
                 perm,
             } => self.lower_rename_inst(*dst, src, *src_heading_id, *result_heading_id, perm),
+            Inst::Join {
+                dst,
+                lhs,
+                rhs,
+                lhs_heading_id,
+                rhs_heading_id,
+                result_heading_id,
+            } => self.lower_join_inst(
+                *dst,
+                lhs,
+                rhs,
+                *lhs_heading_id,
+                *rhs_heading_id,
+                *result_heading_id,
+            ),
             Inst::Extract {
                 dst,
                 src,
@@ -719,6 +748,10 @@ impl Emitter {
                 name,
                 heading_id,
             } => self.lower_relvar_read(*dst, name, *heading_id),
+            Inst::PrivateRelvarSlotInit { name, heading_id } => {
+                self.lower_private_relvar_slot_init(name, *heading_id)
+            }
+            Inst::RelvarSlotStore { name, value } => self.lower_relvar_slot_store(name, value),
             Inst::RegisterDatabase => self.lower_register_database(),
             Inst::RegisterPlan { plan_id } => self.lower_register_plan(*plan_id),
             Inst::Query {
@@ -914,6 +947,45 @@ impl Emitter {
         let v = format!("%v_{name}_release_load");
         writeln!(self.body, "    {v} = load ptr, ptr @{name}_slot").unwrap();
         writeln!(self.body, "    call void @coddl_rc_release(ptr {v})").unwrap();
+        Ok(())
+    }
+
+    /// Init an in-memory `private` relvar's slot with an empty relation. Emits
+    /// the slot global (shared with `RelvarRead` / store / release) and the
+    /// empty-init call. No SQL source, unlike `lower_relvar_slot_init`.
+    fn lower_private_relvar_slot_init(
+        &mut self,
+        name: &str,
+        heading_id: HeadingId,
+    ) -> Result<(), LlvmEmitError> {
+        writeln!(
+            self.globals,
+            "@{name}_slot = private unnamed_addr global ptr null",
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    call void @coddl_relvar_slot_init_empty(ptr @.heading.{}, ptr @{name}_slot)",
+            heading_id.0,
+        )
+        .unwrap();
+        Ok(())
+    }
+
+    /// Store a relation value into a relvar's slot (relational assignment).
+    /// Move semantics — the runtime releases the slot's old value and takes
+    /// ownership of `value`.
+    fn lower_relvar_slot_store(
+        &mut self,
+        name: &str,
+        value: &ValueId,
+    ) -> Result<(), LlvmEmitError> {
+        let op = self.scalar_op(value)?;
+        writeln!(
+            self.body,
+            "    call void @coddl_relvar_slot_store(ptr {op}, ptr @{name}_slot)",
+        )
+        .unwrap();
         Ok(())
     }
 
@@ -1171,6 +1243,34 @@ impl Emitter {
     /// Emit `Inst::Rename`: a static `u32` permutation array, then
     /// `call ptr @coddl_relation_rename(src, &src_desc, &result_desc, perm, n)`.
     /// The runtime permutes each record into the renamed layout and re-seals.
+    fn lower_join_inst(
+        &mut self,
+        dst: ValueId,
+        lhs: &ValueId,
+        rhs: &ValueId,
+        lhs_heading_id: HeadingId,
+        rhs_heading_id: HeadingId,
+        result_heading_id: HeadingId,
+    ) -> Result<(), LlvmEmitError> {
+        let lhs_op = self.scalar_op(lhs)?;
+        let rhs_op = self.scalar_op(rhs)?;
+        let name = format!("%v{}", dst.0);
+        writeln!(
+            self.body,
+            "    {name} = call ptr @coddl_relation_join(ptr {lhs_op}, ptr @.heading.{}, ptr {rhs_op}, ptr @.heading.{}, ptr @.heading.{})",
+            lhs_heading_id.0, rhs_heading_id.0, result_heading_id.0,
+        )
+        .unwrap();
+        self.values.insert(
+            dst,
+            ValueRepr::Scalar {
+                ty: "ptr".to_string(),
+                op: name,
+            },
+        );
+        Ok(())
+    }
+
     fn lower_rename_inst(
         &mut self,
         dst: ValueId,

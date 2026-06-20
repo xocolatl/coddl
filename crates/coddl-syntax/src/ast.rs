@@ -311,12 +311,14 @@ impl Block {
     }
 }
 
-/// Statement variants. `let` is a binding; `ExprStmt` evaluates an
+/// Statement variants. `let` is a binding; `Assign` is relational
+/// assignment to a relvar (`R := <expr>;`); `ExprStmt` evaluates an
 /// expression and discards the result. `mut` / `return` / `insert` /
 /// `delete` / `update` arrive when their semantics are settled.
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Let(LetStmt),
+    Assign(AssignStmt),
     ExprStmt(ExprStmt),
 }
 
@@ -324,6 +326,7 @@ impl Stmt {
     pub fn cast(syntax: SyntaxNode) -> Option<Self> {
         Some(match syntax.kind() {
             SyntaxKind::LET_STMT => Stmt::Let(LetStmt { syntax }),
+            SyntaxKind::ASSIGN_STMT => Stmt::Assign(AssignStmt { syntax }),
             SyntaxKind::EXPR_STMT => Stmt::ExprStmt(ExprStmt { syntax }),
             _ => return None,
         })
@@ -332,6 +335,7 @@ impl Stmt {
     pub fn syntax(&self) -> &SyntaxNode {
         match self {
             Stmt::Let(s) => s.syntax(),
+            Stmt::Assign(s) => s.syntax(),
             Stmt::ExprStmt(s) => s.syntax(),
         }
     }
@@ -366,6 +370,22 @@ impl ExprStmt {
     /// discarded unless this is the block's tail).
     pub fn expr(&self) -> Option<Expr> {
         self.syntax.children().find_map(Expr::cast)
+    }
+}
+
+ast_node!(pub AssignStmt, ASSIGN_STMT);
+
+impl AssignStmt {
+    /// The assignment target — the LHS, the first `Expr` child. The parser
+    /// accepts any expression here; the typechecker requires a name
+    /// reference bound to a private relvar (T0033).
+    pub fn target(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// The assigned value — the RHS, the second `Expr` child (after `:=`).
+    pub fn value(&self) -> Option<Expr> {
+        self.syntax.children().filter_map(Expr::cast).nth(1)
     }
 }
 
@@ -575,9 +595,14 @@ impl BoolLit {
 }
 
 /// Binary infix operator kinds — `=`, `<>`, `<`, `>`, `<=`, `>=`,
-/// `and`, `or`, `where`. The `where` form's operands are
-/// (relation, predicate) rather than two scalars; the typechecker
-/// dispatches on this enum to apply the right operand-type rules.
+/// `and`, `or`, `where`, `join`, `times`, `compose`. `where`'s operands are
+/// (relation, predicate) and `join`'s / `times`'s / `compose`'s are
+/// (relation, relation); the rest are scalar. The typechecker dispatches on
+/// this enum to apply the right operand-type rules. `Join` is the relational
+/// natural join (Algebra-A AND), distinct from the scalar boolean `And`;
+/// `Times` is the Cartesian product — the same AND, typed to require disjoint
+/// headings; `Compose` is the natural join with the shared attributes removed
+/// (AND then REMOVE), typed to require overlapping headings like `Join`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
     Eq,
@@ -589,6 +614,9 @@ pub enum BinaryOp {
     And,
     Or,
     Where,
+    Join,
+    Times,
+    Compose,
 }
 
 ast_node!(pub BinaryExpr, BINARY_EXPR);
@@ -622,7 +650,10 @@ impl BinaryExpr {
                     | SyntaxKind::LT_EQ
                     | SyntaxKind::GT_EQ => return Some(tok),
                     SyntaxKind::IDENT
-                        if matches!(tok.text(), "and" | "or" | "where") =>
+                        if matches!(
+                            tok.text(),
+                            "and" | "or" | "where" | "join" | "times" | "compose"
+                        ) =>
                     {
                         return Some(tok);
                     }
@@ -648,6 +679,9 @@ impl BinaryExpr {
                 "and" => BinaryOp::And,
                 "or" => BinaryOp::Or,
                 "where" => BinaryOp::Where,
+                "join" => BinaryOp::Join,
+                "times" => BinaryOp::Times,
+                "compose" => BinaryOp::Compose,
                 _ => return None,
             },
             _ => return None,

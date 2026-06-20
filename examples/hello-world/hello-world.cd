@@ -1,6 +1,5 @@
 program hello_world;
 
-oper main {}
-[
-    write_line{message: "Hello, world!"};
+oper main {} [
+    write_line { message: "Hello, world!" };
 ];

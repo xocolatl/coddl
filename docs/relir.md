@@ -22,7 +22,7 @@ This doc describes the **target** RelIR. The code implements a thin slice of it;
 **Designed, not yet built**
 
 - The remaining **A-core nodes** (`AND`, `OR`, `NOT`, `TCLOSE`) and the **sugar → A-core desugaring**. The four nodes above are consumed as-is; nothing is rewritten into A-core form yet. (`REMOVE` and `RENAME` already exist, as `Project` and `Rename`.)
-- The rest of the **sugar layer**: `Join`, `Union`, `Minus`, `Intersect`, `SemiJoin`, `SemiMinus`, `Extend`, `Summarize`, `Group`, `Ungroup`, `Wrap`, `Unwrap`.
+- The rest of the **sugar layer**: `Join`, `Union`, `Minus`, `Intersect`, `Compose`, `SemiJoin`, `SemiMinus`, `Extend`, `Summarize`, `Group`, `Ungroup`, `Wrap`, `Unwrap`.
 - The **optimizer** and **cost model**, the `MaterializeAtBoundary` node, and mixed-origin handling beyond the `StorageOrigin::Mixed` flag.
 - The per-node **FD set** and **constraint set** (only heading, origin, and leaf keys exist today).
 - `coddl-execlocal` (an empty stub) as the RelIR→ProcIR consumer, and the runtime RelIR interpreter (the dynamic path).
@@ -62,7 +62,9 @@ Over-reducing for SQL specifically is a pessimization: SQL is itself a high-leve
 
 Desugars to A core during the same lowering pass that builds RelIR — sugar does not survive into the optimizer:
 
-`Project`, `Restrict` (surface `where`), `Join`, `Union`, `Minus`, `Intersect`, `SemiJoin`, `SemiMinus`, `Extend`, `Summarize`, `Group`, `Ungroup`, `Wrap`, `Unwrap`.
+`Project`, `Restrict` (surface `where`), `Join`, `Union`, `Minus`, `Intersect`, `Compose`, `SemiJoin`, `SemiMinus`, `Extend`, `Summarize`, `Group`, `Ungroup`, `Wrap`, `Unwrap`.
+
+`Compose` lowers to `AND` followed by `REMOVE` of the attributes common to both operands (Manifesto appendix A); it is *not* an A-core primitive.
 
 PascalCase as Rust enum-variant names; the corresponding surface keywords are lowercase (`join`, `union`, `extend`, …) — see [grammar.md](grammar.md).
 

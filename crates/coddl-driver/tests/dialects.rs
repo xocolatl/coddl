@@ -1,23 +1,37 @@
 //! Integration tests for the `.cddb` / `.cdmap` / `.cdstore` dialect
 //! parsers wired through the `coddl` driver.
 //!
-//! Each test invokes the built `coddl` binary against one of the
-//! companion files in `examples/hello-world-db/` and asserts that the
-//! parser produces a clean tree (zero diagnostics) and that
-//! `coddl check` rejects dialect input with a clear error.
+//! Each test **owns its source**: it authors a dialect file in a tempdir,
+//! invokes the built `coddl` binary against it, and asserts that the parser
+//! produces a clean tree (zero diagnostics) and that `coddl check` rejects
+//! dialect input with a clear error.
 
 use std::path::PathBuf;
 use std::process::Command;
 
-fn workspace_root() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.pop();
-    p.pop();
-    p
+/// Author a `greetings.cddb` catalog in `tmp` and return its path.
+fn write_cddb(tmp: &tempfile::TempDir) -> PathBuf {
+    let path = tmp.path().join("greetings.cddb");
+    std::fs::write(
+        &path,
+        "database greetings;\n\
+         base relvar Greetings { id: Integer, message: Text } key { id };\n",
+    )
+    .expect("write greetings.cddb");
+    path
 }
 
-fn companion_path(name: &str) -> PathBuf {
-    workspace_root().join(format!("examples/hello-world-db/{name}"))
+/// Author a `greetings.cdstore` binding in `tmp` and return its path.
+fn write_cdstore(tmp: &tempfile::TempDir) -> PathBuf {
+    let path = tmp.path().join("greetings.cdstore");
+    std::fs::write(
+        &path,
+        "store for greetings;\n\
+         backend sqlite { file: \"greetings.sqlite\" };\n\
+         relvar Greetings: table \"greetings\" { columns: { id: \"id\", message: \"message\" } };\n",
+    )
+    .expect("write greetings.cdstore");
+    path
 }
 
 fn coddl() -> Command {
@@ -25,10 +39,11 @@ fn coddl() -> Command {
 }
 
 #[test]
-fn coddl_parse_cddb_round_trips_example() {
+fn coddl_parse_cddb_round_trips() {
+    let tmp = tempfile::tempdir().expect("tempdir");
     let out = coddl()
         .args(["parse"])
-        .arg(companion_path("greetings.cddb"))
+        .arg(write_cddb(&tmp))
         .output()
         .expect("spawn coddl");
     assert!(
@@ -44,13 +59,11 @@ fn coddl_parse_cddb_round_trips_example() {
     );
 }
 
-// `.cdmap` integration test omitted: hello-world-db is identity-mapped
-// (the catalog's relvars are reused under the same names), so the
-// example doesn't ship a `.cdmap` file. The `.cdmap` parser is
-// exercised thoroughly by the unit tests in
-// `coddl_syntax::parser_cdmap`; an end-to-end driver test against an
-// example file lands when a non-identity adapter example appears
-// (Phase 16+).
+// The identity-mapped case (the catalog's relvars reused under the same
+// names) needs no `.cdmap`, so the round-trip tests above don't author one.
+// The `.cdmap` parser is exercised thoroughly by the unit tests in
+// `coddl_syntax::parser_cdmap`; the driver-dispatch test below authors a
+// `.cdmap` tempfile to confirm the driver routes the dialect.
 
 #[test]
 fn coddl_parse_cdmap_stdin_round_trips() {
@@ -81,10 +94,11 @@ fn coddl_parse_cdmap_stdin_round_trips() {
 }
 
 #[test]
-fn coddl_parse_cdstore_round_trips_example() {
+fn coddl_parse_cdstore_round_trips() {
+    let tmp = tempfile::tempdir().expect("tempdir");
     let out = coddl()
         .args(["parse"])
-        .arg(companion_path("greetings.cdstore"))
+        .arg(write_cdstore(&tmp))
         .output()
         .expect("spawn coddl");
     assert!(
@@ -102,12 +116,12 @@ fn coddl_parse_cdstore_round_trips_example() {
 
 #[test]
 fn coddl_check_accepts_cddb_file() {
-    // Phase 15: `coddl check` now typechecks `.cddb` — the example
-    // catalog has well-formed relvar declarations and should exit
-    // cleanly.
+    // Phase 15: `coddl check` now typechecks `.cddb` — a well-formed
+    // catalog with sound relvar declarations should exit cleanly.
+    let tmp = tempfile::tempdir().expect("tempdir");
     let out = coddl()
         .args(["check"])
-        .arg(companion_path("greetings.cddb"))
+        .arg(write_cddb(&tmp))
         .output()
         .expect("spawn coddl");
     assert!(
@@ -121,9 +135,10 @@ fn coddl_check_accepts_cddb_file() {
 fn coddl_lex_works_on_any_dialect() {
     // The lexer is dialect-agnostic; `coddl lex` should succeed on a
     // `.cddb` file even though its grammar is different.
+    let tmp = tempfile::tempdir().expect("tempdir");
     let out = coddl()
         .args(["lex"])
-        .arg(companion_path("greetings.cddb"))
+        .arg(write_cddb(&tmp))
         .output()
         .expect("spawn coddl");
     assert!(

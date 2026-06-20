@@ -66,6 +66,39 @@ impl Heading {
             .zip(other.0.iter())
             .all(|((an, at), (bn, bt))| an == bn && at.assignable_to(bt))
     }
+
+    /// Attribute names present in both headings (the natural-join key), in
+    /// `self`'s canonical order.
+    pub fn shared_names(&self, other: &Heading) -> Vec<String> {
+        self.0
+            .iter()
+            .filter(|(n, _)| other.lookup(n).is_some())
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// True iff the two headings share no attribute name.
+    pub fn is_disjoint_from(&self, other: &Heading) -> bool {
+        self.0.iter().all(|(n, _)| other.lookup(n).is_none())
+    }
+
+    /// The union of two headings — every attribute from both, shared names
+    /// appearing once. `Err(name)` if a shared attribute has incompatible
+    /// types on the two sides. Re-canonicalized (sorted).
+    pub fn union(&self, other: &Heading) -> Result<Heading, String> {
+        let mut merged: Vec<(String, Type)> = self.0.clone();
+        for (n, t) in &other.0 {
+            match self.lookup(n) {
+                Some(existing) => {
+                    if !existing.assignable_to(t) {
+                        return Err(n.clone());
+                    }
+                }
+                None => merged.push((n.clone(), t.clone())),
+            }
+        }
+        Ok(Heading::new(merged))
+    }
 }
 
 impl fmt::Display for Heading {

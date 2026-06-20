@@ -56,7 +56,7 @@ A first-class relation is one of three things, behind a single `Relation` handle
 - The program prologue registers each logical database once, then each static plan:
   - `coddl_register_database(name, path)` — binds a `database <name>;` handle to its resolved connection path (codegen resolves the path via `coddl_resolve_op_field` first). By TTM a database binds exactly one backend and is the scope of a transaction, so the entry is 1:1 with a connection; `coddl_begin_tx`/`coddl_commit_tx` reuse it when write-through lands.
   - `coddl_register_plan(plan_id, db_name, sql, param_count, result_desc)` — the plan references its database by name. No separate parameter-type table: bind parameters self-describe via `CoddlParam.kind` at the call site.
-- At the force point, codegen calls `coddl_query(plan_id, params, n) -> *Relation`: it resolves the plan's database, fires the prepared statement (cached by SQL text per connection) on a pool connection — so the audit `trace` hook captures it — marshals the rows into a sealed RC relation, and returns the pointer (the same shape `coddl_relation_where` returns; consumed by `coddl_extract_check_cardinality`). It aborts on any hard error (unknown plan/database, parameter mismatch, prepare/step failure, NULL cell); the `*Relation` return has no status channel. (`TempRelRef`s built from in-memory relations join the parameter list once temp-table shipping lands.)
+- At the force point, codegen calls `coddl_query(plan_id, params, n) -> *Relation`: it resolves the plan's database, fires the prepared statement (cached by SQL text per connection) on a pool connection — so the audit `trace` hook captures it — marshals the rows into an RC relation (no seal: the query's `DISTINCT`/key already makes the rows a set), and returns the pointer (the same shape `coddl_relation_where` returns; consumed by `coddl_extract_check_cardinality`). It aborts on any hard error (unknown plan/database, parameter mismatch, prepare/step failure, NULL cell); the `*Relation` return has no status channel. (`TempRelRef`s built from in-memory relations join the parameter list once temp-table shipping lands.)
 - Dynamic plans (relation-polymorphic, runtime-shaped) register later — the runtime interpreter assigns plan IDs the first time it lowers a previously-unseen plan shape and caches by shape from then on.
 
 ## Iteration: the `load` primitive
@@ -150,9 +150,9 @@ calling convention works for both heap-managed and immortal values.
 | `coddl_rc_release`         | `(ptr) -> ()`                                       | Decrement `rc`. On zero: dispatch the drop walker by `kind`, then free the entire block (`header + payload`).            |
 | `coddl_relation_seal`      | `(payload, desc) -> ()`                             | Sort the relation's records by byte-wise comparison, then adjacent-dedup in place; updates the header's `length`.        |
 | `coddl_write_relation`     | `(payload, desc) -> ()`                             | Print the relation, one tuple per line, in canonical heading order. Empty relation writes zero bytes.                    |
-| `coddl_relation_where`     | `(src, desc, pred_fn) -> ptr`                       | Restrict `src` by `pred_fn(record_ptr) != 0`. Returns a fresh RC-managed relation (rc=1) holding the matching rows in the input's original order. Worst-case alloc; header `length` trimmed to the actual count. No re-seal — filter preserves the input's sealed (sorted/dedup'd) order. |
+| `coddl_relation_where`     | `(src, desc, pred_fn) -> ptr`                       | Restrict `src` by `pred_fn(record_ptr) != 0`. Returns a fresh RC-managed relation (rc=1) holding the matching rows in the input's original order. Worst-case alloc; header `length` trimmed to the actual count. No re-seal — restricting a duplicate-free relation can't introduce duplicates (RM Pro 3 preserved). |
 | `coddl_extract_check_cardinality` | `(src, desc) -> ptr`                          | TTM RM Pre 10 cardinality check: if `src`'s header `length` is exactly 1, returns a pointer to the single record's bytes (which equals `src` itself, since records start at the payload base). Otherwise writes `"coddl: extract: expected exactly 1 tuple, got N"` to stderr and calls `std::process::abort()`. The caller reads each attribute via the descriptor before releasing the source — the lowering's "Extract then Release" order guarantees the buffer is live during attribute reads. |
-| `coddl_sqlite_relvar_init` | `(relvar_name, relvar_name_len, db_path, db_path_len, table, table_len, columns, column_lens, column_count, desc, slot) -> CoddlStatus` | Materialize one public relvar from SQLite at startup. Opens the connection read-only (one per resolved path, via `OnceCell`), prepares `SELECT <columns> FROM <table>` in heading-canonical order, steps rows, marshals each cell into a `record_layout` buffer, allocates via `coddl_rc_alloc`, seals, writes the RC pointer into `*slot`, and registers the slot in the runtime's slot map. NULL columns and type mismatches abort with a clear stderr message (RM Pro 4). |
+| `coddl_sqlite_relvar_init` | `(relvar_name, relvar_name_len, db_path, db_path_len, table, table_len, columns, column_lens, column_count, desc, slot) -> CoddlStatus` | Materialize one public relvar from SQLite at startup. Opens the connection read-only (one per resolved path, via `OnceCell`), prepares `SELECT <columns> FROM <table>` in heading-canonical order, steps rows, marshals each cell into a `record_layout` buffer, allocates via `coddl_rc_alloc` (no seal: the table's rows are already a set, unique by the relvar's key), writes the RC pointer into `*slot`, and registers the slot in the runtime's slot map. NULL columns and type mismatches abort with a clear stderr message (RM Pro 4). |
 | `coddl_resolve_op_field`   | `(env_name, env_name_len, default, default_len, out_len) -> ptr` | Operational-field resolver. Reads `getenv(env_name)`; on hit, returns a pointer into a per-process intern (writes the length into `*out_len`). On miss, returns `default` and writes `default_len`. The env-var convention is `CODDL_<DBNAME>_<FIELD>` (e.g. `CODDL_GREETINGS_FILE`); the database name comes from `database <name>;`. |
 | `coddl_begin_tx`           | `() -> CoddlStatus`                                  | Begin a transaction. v1 no-op (the materialized in-memory slot is the source of truth; SQLite isn't touched inside a transaction body). Real BEGIN ships with write-through. |
 | `coddl_commit_tx`          | `() -> CoddlStatus`                                  | Commit a transaction. v1 no-op; see `coddl_begin_tx`. |
@@ -227,17 +227,23 @@ that exercises the full pipeline.
 ## Seal discipline
 
 `coddl_relation_seal` enforces RM Pro 3 (no duplicates in a
-relation) in two steps:
+relation **built in process** — literals, `project`, `join`/`times`)
+in two steps:
 
 1. **Sort.** Records are sorted by byte-wise comparison of their
-   record buffers. The order is unspecified beyond "total and
-   deterministic" — the same source program produces the same byte
-   order on every run and every backend, because the layout is
-   canonical and every cell's encoding is host-endian fixed-width.
+   record buffers — purely to bring equal records adjacent for the
+   dedup pass. The resulting order is **not meaningful**: a relation
+   is a set with no tuple order (RM Pro 1), so output order is
+   unspecified and two backends agree on a relation as a *set* of
+   tuples (RM Pre 8), not byte-for-byte. (Integer/Boolean cells sort
+   by their content bytes, which is cross-backend stable; Text cells
+   sort by their `(ptr, len)` pair, so a Text-leading relation's order
+   differs across backends — harmless precisely because order is
+   unspecified.)
 2. **Adjacent dedup.** Equal-byte adjacent records collapse; the
    header's `length` shrinks accordingly.
 
-Byte-equality is the right equivalence for Phase 19's cell set:
+Byte-equality is the right *dedup* equivalence for Phase 19's cell set:
 Integer/Boolean cells are content-encoded directly; Text cells hold
 `(ptr, len)` pairs that — for compile-time string literals —
 deduplicate by content at codegen time, so equal-content strings
@@ -247,10 +253,17 @@ content-aware comparison; the current byte-wise sort would then
 under-dedupe in safe ways (treat semantically-equal strings as
 distinct) but never over-dedupe.
 
+The **SQL path does not seal**: the backend already returns a
+duplicate-free set (`SELECT DISTINCT`, or a surviving key that let
+`needs_distinct()` elide it; a relvar's table rows are unique by its
+key), so `sqlite::finalize_relation` materializes the rows as-is —
+re-sorting/re-deduping would be redundant work for an order nothing
+consumes.
+
 ## Canonical printer
 
-`coddl_write_relation` walks the sealed payload and writes one tuple
-per line:
+`coddl_write_relation` walks the relation's payload and writes one
+tuple per line (in storage order, which is unspecified — RM Pro 1):
 
 ```
 {a: 1}

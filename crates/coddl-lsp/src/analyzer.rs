@@ -768,6 +768,52 @@ mod tests {
         );
     }
 
+    // ── relational assignment (frontend serves the LSP too) ──────
+
+    #[tokio::test]
+    async fn relational_assignment_type_error_surfaces_as_diagnostic() {
+        // A heading-mismatched relational assignment surfaces as a snapshot
+        // diagnostic (T0034) through the same frontend the CLI uses.
+        let analyzer = Analyzer::new();
+        let uri = url("file:///assign.cd");
+        analyzer
+            .put_document(
+                uri.clone(),
+                1,
+                "private relvar R { a: Integer } key { a }; \
+                 oper main {} [ R := Relation { {b: 1} }; ];"
+                    .to_string(),
+            )
+            .await;
+        let snap = analyzer.snapshot(&uri).await.unwrap();
+        assert!(
+            snap.diagnostics.iter().any(|d| d.code == "T0034"),
+            "expected T0034, got {:?}",
+            snap.diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_relational_assignment_has_no_diagnostics() {
+        let analyzer = Analyzer::new();
+        let uri = url("file:///assign_ok.cd");
+        analyzer
+            .put_document(
+                uri.clone(),
+                1,
+                "program p; private relvar R { a: Integer } key { a }; \
+                 oper main {} [ R := Relation { {a: 1} }; write_relation { rel: R }; ];"
+                    .to_string(),
+            )
+            .await;
+        let snap = analyzer.snapshot(&uri).await.unwrap();
+        assert!(
+            snap.diagnostics.is_empty(),
+            "expected no diagnostics, got {:?}",
+            snap.diagnostics
+        );
+    }
+
     // ── project operator (frontend serves the LSP too) ──────────
 
     #[tokio::test]

@@ -511,6 +511,25 @@ impl<'a> Parser<'a> {
             return;
         }
 
+        // Relational assignment: the parsed expression is the target and the
+        // next token is `:=`. The LHS is parser-permissive (any expression);
+        // the typechecker restricts it to a private-relvar name (T0033).
+        // Retroactively wrap the target expression under ASSIGN_STMT.
+        if self.at(SyntaxKind::ASSIGN) {
+            self.start_node_at(cp, SyntaxKind::ASSIGN_STMT);
+            self.bump(); // `:=`
+            let before_rhs = self.pos;
+            self.parse_expr();
+            if self.pos == before_rhs {
+                self.error("P0014", "expected expression after `:=`");
+            }
+            if !self.eat(SyntaxKind::SEMICOLON) {
+                self.error("P0013", "expected `;` after assignment");
+            }
+            self.finish_node();
+            return;
+        }
+
         // Expression statement: wrap in EXPR_STMT, expect `;`.
         self.start_node_at(cp, SyntaxKind::EXPR_STMT);
         if !self.eat(SyntaxKind::SEMICOLON) {
@@ -625,6 +644,9 @@ impl<'a> Parser<'a> {
             SyntaxKind::IDENT if self.at_keyword("and") => Some(2),
             SyntaxKind::IDENT if self.at_keyword("or") => Some(1),
             SyntaxKind::IDENT if self.at_keyword("where") => Some(0),
+            SyntaxKind::IDENT if self.at_keyword("join") => Some(0),
+            SyntaxKind::IDENT if self.at_keyword("times") => Some(0),
+            SyntaxKind::IDENT if self.at_keyword("compose") => Some(0),
             _ => None,
         }
     }
@@ -1630,6 +1652,119 @@ mod tests {
             "expected P0018, got {:?}",
             out.diagnostics
         );
+    }
+
+    #[test]
+    fn assign_stmt_parses() {
+        let out = parse_str("oper main {} [ R := S; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.tree.text(), "oper main {} [ R := S; ];");
+        let assign = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::ASSIGN_STMT)
+            .expect("ASSIGN_STMT in tree");
+        // Target then value, both NAME_REF nodes, in order.
+        let names: Vec<_> = assign
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::NAME_REF)
+            .map(|n| n.text().to_string())
+            .collect();
+        assert_eq!(names, vec!["R".to_string(), "S".to_string()]);
+    }
+
+    #[test]
+    fn assign_stmt_rhs_relation_literal_parses() {
+        let out = parse_str("oper main {} [ R := Relation { {a: 1} }; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let assign = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::ASSIGN_STMT)
+            .expect("ASSIGN_STMT in tree");
+        let child_kinds: Vec<_> = assign.children().map(|n| n.kind()).collect();
+        assert!(
+            child_kinds.contains(&SyntaxKind::NAME_REF),
+            "target NAME_REF in {child_kinds:?}"
+        );
+        assert!(
+            child_kinds.contains(&SyntaxKind::RELATION_LIT),
+            "RHS RELATION_LIT in {child_kinds:?}"
+        );
+    }
+
+    #[test]
+    fn assign_stmt_missing_rhs_diagnoses_p0014() {
+        let out = parse_str("oper main {} [ R := ; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0014"),
+            "expected P0014, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn assign_stmt_missing_semicolon_diagnoses_p0013() {
+        let out = parse_str("oper main {} [ R := S ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0013"),
+            "expected P0013, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn join_infix_parses() {
+        let out = parse_str("oper main {} [ R join S ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let bin = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("BINARY_EXPR for `R join S`");
+        let names: Vec<_> = bin
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::NAME_REF)
+            .map(|n| n.text().to_string())
+            .collect();
+        assert_eq!(names, vec!["R".to_string(), "S".to_string()]);
+        assert!(bin.text().to_string().contains("join"));
+    }
+
+    #[test]
+    fn times_infix_parses() {
+        let out = parse_str("oper main {} [ R times S ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let bin = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("BINARY_EXPR for `R times S`");
+        let names: Vec<_> = bin
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::NAME_REF)
+            .map(|n| n.text().to_string())
+            .collect();
+        assert_eq!(names, vec!["R".to_string(), "S".to_string()]);
+        assert!(bin.text().to_string().contains("times"));
+    }
+
+    #[test]
+    fn compose_infix_parses() {
+        let out = parse_str("oper main {} [ R compose S ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let bin = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("BINARY_EXPR for `R compose S`");
+        let names: Vec<_> = bin
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::NAME_REF)
+            .map(|n| n.text().to_string())
+            .collect();
+        assert_eq!(names, vec!["R".to_string(), "S".to_string()]);
+        assert!(bin.text().to_string().contains("compose"));
     }
 
     #[test]

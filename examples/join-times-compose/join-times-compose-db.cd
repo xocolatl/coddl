@@ -1,0 +1,67 @@
+// join-times-compose-db.cd
+//
+// SQL-backed twin of join-times-compose.cd: the same schema and the same join-family
+// queries, but the relvars are `public` and backed by a seeded SQLite database, so each
+// query pushes DOWN to SQL instead of running in process. Side by side, the two files
+// show the same surface language driving both the in-process engine (private relvars)
+// and SQL emission (public relvars).
+//
+// The .cd-family (storage stays out of D):
+//   join-times-compose-db.cd  — this program: the external schema + queries
+//   staffing.cddb             — database catalog (conceptual schema)
+//   staffing.cdstore          — conceptual -> physical (SQLite) binding
+//   seed-db.sh                — recreates staffing.sqlite with the demo data
+//
+// `public` relvars are read-only, so there is no `:=` — the data lives in the seeded
+// database. A public-relvar read must sit inside a `transaction [...]` block, which each
+// query below does.
+
+program join_times_compose_db;
+database staffing;
+
+public relvar Employees {
+    emp_id: Integer,
+    emp_name: Text,
+    dept_id: Integer,
+} key { emp_id };
+
+public relvar Departments {
+    dept_id: Integer,
+    dept_name: Text,
+} key { dept_id };
+
+public relvar JobTitles {
+    title: Text,
+} key { title };
+
+public relvar Locations {
+    location: Text,
+} key { location };
+
+oper main {} [
+    // join: pushes one `INNER JOIN ... USING (dept_id)`.
+    let staffed = transaction [
+        Employees join Departments
+    ];
+    write_relation { rel: staffed };
+
+    // times: disjoint headings, so it pushes one `CROSS JOIN`.
+    let grid = transaction [
+        JobTitles times Locations
+    ];
+    write_relation { rel: grid };
+
+    // compose: join on `dept_id`, then drop it — pushes the join with `dept_id`
+    // removed from the SELECT.
+    let dept_names = transaction [
+        Employees compose Departments
+    ];
+    write_relation { rel: dept_names };
+
+    // a join feeding `where` and `project`: pushes as one
+    // `... INNER JOIN ... WHERE "dept_name" = ?` selecting { dept_name, emp_name }.
+    let eng = transaction [
+        (Employees join Departments) where dept_name = "Engineering" project { emp_name, dept_name }
+    ];
+    write_relation { rel: eng };
+];

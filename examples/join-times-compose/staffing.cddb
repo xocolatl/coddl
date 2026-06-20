@@ -1,0 +1,31 @@
+// staffing.cddb
+//
+// Conceptual schema for the `staffing` database — the SQL-backed twin of the
+// in-process join-times-compose example. Database-side `base relvar`
+// declarations; the headings mirror the `public relvar`s in
+// join-times-compose-db.cd.
+
+database staffing;
+
+base relvar Employees {
+    emp_id: Integer,
+    emp_name: Text,
+    dept_id: Integer,
+}
+key { emp_id };
+
+base relvar Departments {
+    dept_id: Integer,
+    dept_name: Text,
+}
+key { dept_id };
+
+base relvar JobTitles {
+    title: Text,
+}
+key { title };
+
+base relvar Locations {
+    location: Text,
+}
+key { location };

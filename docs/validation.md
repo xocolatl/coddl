@@ -60,7 +60,7 @@ change.
 | Program          | Files                                                                          | Surface covered                                                                                                                                  |
 |------------------|--------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------|
 | `hello-world`    | `examples/hello-world/hello-world.cd`                                          | Single-file program: lex → parse → typecheck → lower → both backends → link → `coddl_write_line`. The seed example (Phase 9).                    |
-| `hello-world-db` | `examples/hello-world-db/{hello-world-db.cd, greetings.cddb, greetings.cdstore}` + locally-seeded `greetings.sqlite` | Four-file `.cd` family: Phase 16 plan discovery, public-relvar materialization from SQLite at startup, `transaction [...]` brackets, `extract (R where p)` reading one row, field access on the extracted tuple. Adds Phase 22's storage path to the equivalence proof. |
+| `hello-world-db` | `examples/hello-world/{hello-world-db.cd, greetings.cddb, greetings.cdstore}` + locally-seeded `greetings.sqlite` | Four-file `.cd` family: Phase 16 plan discovery, public-relvar materialization from SQLite at startup, `transaction [...]` brackets, `extract (R where p)` reading one row, field access on the extracted tuple. Adds Phase 22's storage path to the equivalence proof. |
 
 Each canonical example contributes the three e2e tests in
 `crates/coddl-driver/tests/e2e.rs`. The hello-world-db trio also has

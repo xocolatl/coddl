@@ -1,0 +1,95 @@
+// join-times-compose.cd
+//
+// The three join-family relational operators of Coddl, all infix:
+//
+//   A join B      natural join — pair tuples that agree on the COMMON attributes
+//   A times B     Cartesian product — every combination, used when NONE in common
+//   A compose B   relational composition — join, then REMOVE the common attributes
+//
+// Typing rules, checked at compile time:
+//   - `join`    requires A and B to share at least one attribute. With none, the
+//               typechecker rejects it and suggests `times` — a join with nothing in
+//               common is a Cartesian product, which you rarely mean by accident.
+//   - `times`   requires A and B to share NO attributes. With any in common, the
+//               typechecker rejects it and suggests `join`.
+//   - `compose` requires A and B to share at least one attribute, like `join`: it
+//               joins on the common attributes and removes them. With none, the
+//               typechecker rejects it and suggests `times`.
+//
+// Heading overlap decides which operator is legal on a given pair of operands, so the
+// typechecker always knows which you mean. `main` populates four private relvars and
+// dumps each operator, plus a join feeding `where` and `project`.
+
+program join_times_compose;
+
+// Relvars that SHARE an attribute (join / compose territory): `dept_id` appears in
+// both Employees and Departments — what `join` matches on and what `compose` removes.
+
+private relvar Employees {
+    emp_id: Integer,
+    emp_name: Text,
+    dept_id: Integer,
+} key { emp_id };
+
+private relvar Departments {
+    dept_id: Integer,
+    dept_name: Text,
+} key { dept_id };
+
+// Relvars that share NOTHING (times territory).
+
+private relvar JobTitles {
+    title: Text,
+} key { title };
+
+private relvar Locations {
+    location: Text,
+} key { location };
+
+// main: populate the relvars by relational assignment (`R := <relation literal>`),
+// then dump each query. A relation is a set, so the printed tuple order is unspecified.
+oper main {} [
+    Departments := Relation {
+        { dept_id: 10, dept_name: "Engineering" },
+        { dept_id: 20, dept_name: "Sales" },
+        { dept_id: 30, dept_name: "Marketing" },
+    };
+
+    Employees := Relation {
+        { emp_id: 1, emp_name: "Ada", dept_id: 10 },
+        { emp_id: 2, emp_name: "Grace", dept_id: 10 },
+        { emp_id: 3, emp_name: "Alan", dept_id: 20 },
+        { emp_id: 4, emp_name: "Edsger", dept_id: 30 },
+    };
+
+    JobTitles := Relation {
+        { title: "Engineer" },
+        { title: "Manager" },
+    };
+
+    Locations := Relation {
+        { location: "London" },
+        { location: "Paris" },
+    };
+
+    // join: match each employee to its department on the shared `dept_id`.
+    // Result heading { dept_id, dept_name, emp_id, emp_name }. Private relvars are
+    // plain in-memory values, so no `transaction` is needed (unlike the SQL twin).
+    let staffed = Employees join Departments;
+    write_relation { rel: staffed };
+
+    // times: the Cartesian product of the two disjoint relvars — every
+    // (title, location) pairing. Result heading { location, title }.
+    let grid = JobTitles times Locations;
+    write_relation { rel: grid };
+
+    // compose: join on `dept_id`, then remove it — each employee paired with its
+    // department's name. Result heading { dept_name, emp_id, emp_name }.
+    let dept_names = Employees compose Departments;
+    write_relation { rel: dept_names };
+
+    // a join feeding `where` and `project`: restrict the join to the Engineering
+    // department, then keep only { emp_name, dept_name }. Result: Ada and Grace.
+    let eng = (Employees join Departments) where dept_name = "Engineering" project { emp_name, dept_name };
+    write_relation { rel: eng };
+];

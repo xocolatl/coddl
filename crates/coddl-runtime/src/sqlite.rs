@@ -31,7 +31,7 @@ use std::sync::Mutex;
 use rusqlite::{params_from_iter, Connection, OpenFlags};
 
 use crate::rc::{coddl_rc_alloc, CoddlKind};
-use crate::relation::{coddl_relation_seal, CoddlAttrDesc, CoddlAttrKind, CoddlHeadingDesc};
+use crate::relation::{CoddlAttrDesc, CoddlAttrKind, CoddlHeadingDesc};
 use crate::{CoddlStatus, PlanId};
 
 /// One open SQLite connection per resolved database path, opened
@@ -228,11 +228,13 @@ pub unsafe extern "C" fn coddl_sqlite_relvar_init(
     let table_quoted = format!("\"{}\"", table.replace('"', "\"\""));
     let sql = format!("SELECT {select_cols} FROM {table_quoted}");
 
-    // Marshal rows. The row-stepping loop and the alloc/seal finalize are
+    // Marshal rows. The row-stepping loop and the alloc/finalize step are
     // shared verbatim with `coddl_query` via [`marshal_rows`] /
     // [`finalize_relation`] so the canonical record layout and NULL-rejection
-    // (RM Pro 4) live in exactly one place. `ctx` parameterizes the abort
-    // messages so this path keeps its byte-identical relvar-named diagnostics.
+    // (RM Pro 4) live in exactly one place. The table's rows are already a set
+    // (unique by the relvar's key), so `finalize_relation` does not dedup/seal.
+    // `ctx` parameterizes the abort messages so this path keeps its relvar-named
+    // diagnostics.
     let attrs = std::slice::from_raw_parts((*desc).attrs, (*desc).attr_count as usize);
     let record_size = (*desc).record_size as usize;
     let ctx = MarshalCtx {
@@ -384,13 +386,18 @@ unsafe fn marshal_rows(
     row_buffers
 }
 
-/// Allocate an RC relation, copy the marshalled record buffers in, and seal it
-/// (sort + adjacent-dedup into canonical order). Seal is required even after
-/// `SELECT DISTINCT`: DISTINCT removes duplicates but not the byte-canonical
-/// ordering the printer / `=` / `extract` rely on. Returns the payload pointer
-/// (rc=1, kind=Relation). The caller decides whether to stash it in a relvar
-/// slot (init) or return it as a transient handle (query). Aborts on
-/// allocation failure.
+/// Allocate an RC relation and copy the marshalled record buffers in. The rows
+/// come straight from the backend, which already hands back a duplicate-free
+/// set — the query carries `SELECT DISTINCT`, or `needs_distinct()` elided it
+/// only because a surviving key guarantees uniqueness — so there is nothing to
+/// dedup in process. We deliberately do **not** seal here: a relation is a set
+/// with no tuple order (RM Pro 1), so the backend's row order is left as-is and
+/// is not made canonical. (Sealing would re-sort + re-dedup purely for an order
+/// nothing consumes — the printer emits whatever order it finds, `extract`
+/// works on a cardinality-1 relation, and relation `=` is observational, not a
+/// sorted-payload memcmp.) Returns the payload pointer (rc=1, kind=Relation).
+/// The caller decides whether to stash it in a relvar slot (init) or return it
+/// as a transient handle (query). Aborts on allocation failure.
 ///
 /// # Safety
 /// `desc` must outlive the returned relation (a codegen-emitted static); each
@@ -421,7 +428,6 @@ unsafe fn finalize_relation(
         let start = i * record_size;
         dest[start..start + record_size].copy_from_slice(row);
     }
-    coddl_relation_seal(payload, desc);
     payload
 }
 

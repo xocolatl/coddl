@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# examples/hello-world-db/seed-db.sh
+# examples/hello-world/seed-db.sh
 #
 # Recreates greetings.sqlite from scratch with the single hello-world
 # row the example expects. The .sqlite file itself is gitignored; this

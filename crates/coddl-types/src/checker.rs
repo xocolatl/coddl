@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{
-    AstNode, BinaryExpr, BinaryOp, Block, CallExpr, Expr, ExprStmt, FieldAccess,
+    AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, Expr, ExprStmt, FieldAccess,
     Heading as AstHeading, Item, KeyClause, LetStmt, NamedArg, OperDecl, PrivateRelvarDecl,
     ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr, Root, Stmt, TransactionExpr,
     TupleLit, UnaryExpr, UnaryOp,
@@ -542,19 +542,21 @@ impl TypeChecker {
         let mut scope = Scope::default();
         scope.push(); // operator parameter layer
 
-        // Seed the scope with every public relvar in this file. A bare
-        // `Greetings` in expression position then resolves to
-        // `Type::Relation(H)` via the standard scope-lookup path. The
-        // parallel `public_relvars` set records which names are
-        // relvars so NameRef can apply the T0025 transaction-scope
-        // rule (RM Pre 14 / OO Pre 4: every public-relvar access lives
-        // inside a `transaction [...]`).
+        // Seed the scope with every public *and* private relvar in this
+        // file. A bare `Greetings` / `Employees` in expression position then
+        // resolves to `Type::Relation(H)` via the standard scope-lookup path.
+        // The parallel `public_relvars` set records which names are *public*
+        // relvars so NameRef can apply the T0025 transaction-scope rule
+        // (RM Pre 14 / OO Pre 4: every public-relvar access lives inside a
+        // `transaction [...]`). Private relvars are in-memory — no transaction.
         self.public_relvars.clear();
         for (name, info) in self.relvars.iter() {
-            if matches!(info.kind, RelvarKind::Public) {
+            if matches!(info.kind, RelvarKind::Public | RelvarKind::Private) {
                 let ty = Type::Relation(info.heading.clone());
                 scope.insert(name.to_string(), ty, Span::default(), BindingOrigin::Relvar);
-                self.public_relvars.insert(name.to_string());
+                if matches!(info.kind, RelvarKind::Public) {
+                    self.public_relvars.insert(name.to_string());
+                }
             }
         }
 
@@ -674,12 +676,74 @@ impl TypeChecker {
         for stmt in block.statements() {
             match stmt {
                 Stmt::Let(l) => self.check_let_stmt(&l, scope),
+                Stmt::Assign(a) => self.check_assignment_stmt(&a, scope),
                 Stmt::ExprStmt(e) => self.check_expr_stmt(&e, scope),
             }
         }
         match block.tail_expr() {
             Some(expr) => self.check_expr(&expr, scope),
             None => Type::unit(),
+        }
+    }
+
+    /// Check a relational assignment `R := <expr>;`. The target must be a
+    /// bare name bound to a *private* relvar (public relvars are read-only in
+    /// v1); the RHS must be a relation whose heading matches the relvar's.
+    fn check_assignment_stmt(&mut self, stmt: &AssignStmt, scope: &mut Scope) {
+        // Check the RHS first so its own diagnostics surface regardless of
+        // the target's validity.
+        let rhs_ty = match stmt.value() {
+            Some(v) => self.check_expr(&v, scope),
+            None => return, // parser recovery already emitted a diagnostic
+        };
+
+        // The target must be a bare name reference …
+        let Some(Expr::NameRef(target)) = stmt.target() else {
+            let span = stmt
+                .target()
+                .map(|t| self.node_span(t.syntax()))
+                .unwrap_or_else(|| self.node_span(stmt.syntax()));
+            self.error(span, "T0033", "assignment target must be a private relvar name");
+            return;
+        };
+        let Some(ident) = target.ident() else { return };
+        let name = ident.text();
+
+        // … bound to a private relvar.
+        let lookup = self
+            .relvars
+            .get(name)
+            .map(|i| (matches!(i.kind, RelvarKind::Private), i.heading.clone()));
+        let Some((is_private, heading)) = lookup else {
+            self.error(
+                self.token_span(&ident),
+                "T0033",
+                format!("cannot assign to `{name}`: not an assignable (private) relvar"),
+            );
+            return;
+        };
+        if !is_private {
+            self.error(
+                self.token_span(&ident),
+                "T0033",
+                format!("cannot assign to `{name}`: only private relvars are assignable (public relvars are read-only in v1)"),
+            );
+            return;
+        }
+        scope.mark_used(name);
+
+        // The RHS heading must match the relvar's.
+        let target_ty = Type::Relation(heading);
+        if !rhs_ty.assignable_to(&target_ty) {
+            let span = stmt
+                .value()
+                .map(|v| self.node_span(v.syntax()))
+                .unwrap_or_else(|| self.token_span(&ident));
+            self.error(
+                span,
+                "T0034",
+                format!("cannot assign {rhs_ty} to relvar `{name}` (heading mismatch)"),
+            );
         }
     }
 
@@ -1113,6 +1177,9 @@ impl TypeChecker {
         };
         match op {
             BinaryOp::Where => self.check_where_binary(bin, scope),
+            BinaryOp::Join => self.check_join_binary(bin, scope),
+            BinaryOp::Times => self.check_times_binary(bin, scope),
+            BinaryOp::Compose => self.check_compose_binary(bin, scope),
             BinaryOp::And | BinaryOp::Or => self.check_logical_op(bin, op, scope),
             BinaryOp::Eq | BinaryOp::NotEq => self.check_equality_op(bin, op, scope),
             BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => {
@@ -1170,6 +1237,136 @@ impl TypeChecker {
             );
         }
         Type::Relation(heading)
+    }
+
+    /// Type-check one relational operand of a binary op: returns its heading,
+    /// or `None` (after emitting T0023) if it isn't a `Relation`.
+    fn relation_operand(
+        &mut self,
+        operand: Option<Expr>,
+        op_name: &str,
+        scope: &mut Scope,
+    ) -> Option<Heading> {
+        let e = operand?;
+        match self.check_expr(&e, scope) {
+            Type::Relation(h) => Some(h),
+            Type::Unknown => None,
+            other => {
+                self.error(
+                    self.node_span(e.syntax()),
+                    "T0023",
+                    format!("`{op_name}` expects a Relation, got {other}"),
+                );
+                None
+            }
+        }
+    }
+
+    /// The natural-join heading check shared by `join` and `compose`: both
+    /// require overlapping headings (≥1 shared attribute, with matching types on
+    /// the shared ones). Returns the union heading, or `None` after emitting the
+    /// diagnostic — disjoint headings → T0035 (suggest `times`), a shared-
+    /// attribute type clash → T0036. `op_name` is interpolated so each operator
+    /// reports under its own lexeme.
+    fn natural_join_heading(
+        &mut self,
+        bin: &BinaryExpr,
+        lhs_h: &Heading,
+        rhs_h: &Heading,
+        op_name: &str,
+    ) -> Option<Heading> {
+        if lhs_h.is_disjoint_from(rhs_h) {
+            self.error(
+                self.node_span(bin.syntax()),
+                "T0035",
+                format!("`{op_name}` operands share no attribute — did you mean `times`?"),
+            );
+            return None;
+        }
+        match lhs_h.union(rhs_h) {
+            Ok(h) => Some(h),
+            Err(name) => {
+                self.error(
+                    self.node_span(bin.syntax()),
+                    "T0036",
+                    format!(
+                        "`{op_name}` shared attribute `{name}` has different types on each side"
+                    ),
+                );
+                None
+            }
+        }
+    }
+
+    /// `R join S` — natural join (Algebra-A AND). Both operands must be
+    /// relations that share ≥1 attribute (with matching types on the shared
+    /// attributes); the result heading is the union. Disjoint headings →
+    /// T0035 (suggest `times`); a shared-attribute type clash → T0036.
+    fn check_join_binary(&mut self, bin: &BinaryExpr, scope: &mut Scope) -> Type {
+        // Check both operands first so each surfaces its own diagnostics.
+        let lhs_h = self.relation_operand(bin.lhs(), "join", scope);
+        let rhs_h = self.relation_operand(bin.rhs(), "join", scope);
+        let (Some(lhs_h), Some(rhs_h)) = (lhs_h, rhs_h) else {
+            return Type::Unknown;
+        };
+        match self.natural_join_heading(bin, &lhs_h, &rhs_h, "join") {
+            Some(h) => Type::Relation(h),
+            None => Type::Unknown,
+        }
+    }
+
+    /// `R times S` — Cartesian product (Algebra-A AND of disjoint operands).
+    /// Both operands must be relations whose headings are disjoint (share no
+    /// attribute); the result heading is the union. Overlapping headings →
+    /// T0037 (suggest `join`). Because the operands are proven disjoint, the
+    /// union can never conflict on a shared attribute (join's T0036 case is
+    /// unreachable here), so the `union` result is unwrapped.
+    fn check_times_binary(&mut self, bin: &BinaryExpr, scope: &mut Scope) -> Type {
+        // Check both operands first so each surfaces its own diagnostics.
+        let lhs_h = self.relation_operand(bin.lhs(), "times", scope);
+        let rhs_h = self.relation_operand(bin.rhs(), "times", scope);
+        let (Some(lhs_h), Some(rhs_h)) = (lhs_h, rhs_h) else {
+            return Type::Unknown;
+        };
+        if !lhs_h.is_disjoint_from(&rhs_h) {
+            self.error(
+                self.node_span(bin.syntax()),
+                "T0037",
+                "`times` operands share an attribute — did you mean `join`?".to_string(),
+            );
+            return Type::Unknown;
+        }
+        Type::Relation(
+            lhs_h
+                .union(&rhs_h)
+                .expect("disjoint headings cannot conflict on a shared attribute"),
+        )
+    }
+
+    /// `R compose S` — natural join then REMOVE the shared attributes (Algebra-A
+    /// AND then REMOVE). Like `join`, both operands must be relations sharing ≥1
+    /// attribute (disjoint → T0035 suggest `times`; type clash → T0036); the
+    /// result heading is the union with the shared attributes dropped.
+    fn check_compose_binary(&mut self, bin: &BinaryExpr, scope: &mut Scope) -> Type {
+        // Check both operands first so each surfaces its own diagnostics.
+        let lhs_h = self.relation_operand(bin.lhs(), "compose", scope);
+        let rhs_h = self.relation_operand(bin.rhs(), "compose", scope);
+        let (Some(lhs_h), Some(rhs_h)) = (lhs_h, rhs_h) else {
+            return Type::Unknown;
+        };
+        let Some(union_h) = self.natural_join_heading(bin, &lhs_h, &rhs_h, "compose") else {
+            return Type::Unknown;
+        };
+        // Drop the shared attributes: the result keeps only attributes that
+        // appear in exactly one operand.
+        let shared = lhs_h.shared_names(&rhs_h);
+        let kept: Vec<(String, Type)> = union_h
+            .attrs()
+            .iter()
+            .filter(|(name, _)| !shared.contains(name))
+            .cloned()
+            .collect();
+        Type::Relation(Heading::new(kept))
     }
 
     /// `lhs and rhs` / `lhs or rhs` — both operands must be Boolean,
@@ -1426,6 +1623,9 @@ fn op_display(op: BinaryOp) -> &'static str {
         BinaryOp::And => "and",
         BinaryOp::Or => "or",
         BinaryOp::Where => "where",
+        BinaryOp::Join => "join",
+        BinaryOp::Times => "times",
+        BinaryOp::Compose => "compose",
     }
 }
 
@@ -1459,6 +1659,140 @@ mod tests {
     #[test]
     fn hello_world_checks_clean() {
         let diags = diagnostics(HELLO_WORLD);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn private_relvar_assignment_checks_clean() {
+        let src = "program p; private relvar R { a: Integer } key { a }; \
+                   oper main {} [ R := Relation { {a: 1} }; write_relation { rel: R }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn private_relvar_resolves_in_scope_no_t0001() {
+        // Before M1a a bare private-relvar name was T0001; now it resolves.
+        let src = "program p; private relvar R { a: Integer } key { a }; \
+                   oper main {} [ write_relation { rel: R }; ];";
+        assert!(!codes(src).contains(&"T0001"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn assignment_heading_mismatch_diagnoses_t0034() {
+        let src = "program p; private relvar R { a: Integer } key { a }; \
+                   oper main {} [ R := Relation { {b: 1} }; ];";
+        assert!(codes(src).contains(&"T0034"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn assignment_to_public_relvar_diagnoses_t0033() {
+        // Public relvars are read-only in v1.
+        let src = "program p; public relvar R { a: Integer } key { a }; \
+                   oper main {} [ R := Relation { {a: 1} }; ];";
+        assert!(codes(src).contains(&"T0033"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn assignment_to_undeclared_name_diagnoses_t0033() {
+        let src = "program p; oper main {} [ Nope := Relation { {a: 1} }; ];";
+        assert!(codes(src).contains(&"T0033"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn join_with_shared_attribute_checks_clean() {
+        // R { a, b } join S { a, c } shares `a` (same type) -> ok, result { a, b, c }.
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   private relvar S { a: Integer, c: Text } key { a }; \
+                   oper main {} [ write_relation { rel: R join S }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn join_with_disjoint_headings_diagnoses_t0035() {
+        // No shared attribute -> the user wants `times`.
+        let src = "program p; \
+                   private relvar R { a: Integer } key { a }; \
+                   private relvar S { b: Integer } key { b }; \
+                   oper main {} [ write_relation { rel: R join S }; ];";
+        assert!(codes(src).contains(&"T0035"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn join_with_shared_attribute_type_mismatch_diagnoses_t0036() {
+        // Shared name `a` but Integer on one side, Text on the other.
+        let src = "program p; \
+                   private relvar R { a: Integer } key { a }; \
+                   private relvar S { a: Text } key { a }; \
+                   oper main {} [ write_relation { rel: R join S }; ];";
+        assert!(codes(src).contains(&"T0036"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn times_with_disjoint_headings_checks_clean() {
+        // R { a } times S { b } — disjoint -> ok, result { a, b }.
+        let src = "program p; \
+                   private relvar R { a: Integer } key { a }; \
+                   private relvar S { b: Integer } key { b }; \
+                   oper main {} [ write_relation { rel: R times S }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn times_with_shared_attribute_diagnoses_t0037() {
+        // Shared attribute `a` -> not disjoint -> the user wants `join`.
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   private relvar S { a: Integer, c: Text } key { a }; \
+                   oper main {} [ write_relation { rel: R times S }; ];";
+        assert!(codes(src).contains(&"T0037"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn compose_with_shared_attribute_removes_it_checks_clean() {
+        // R { a, b } compose S { a, c } shares `a` -> join on `a`, remove `a`,
+        // result { b, c }.
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   private relvar S { a: Integer, c: Text } key { a }; \
+                   oper main {} [ write_relation { rel: R compose S }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn compose_with_disjoint_headings_diagnoses_t0035() {
+        // Like `join`, `compose` requires overlap; disjoint -> suggest `times`.
+        let src = "program p; \
+                   private relvar R { a: Integer } key { a }; \
+                   private relvar S { b: Integer } key { b }; \
+                   oper main {} [ write_relation { rel: R compose S }; ];";
+        assert!(codes(src).contains(&"T0035"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn compose_with_shared_type_mismatch_diagnoses_t0036() {
+        // Shared name `a` but Integer on one side, Text on the other.
+        let src = "program p; \
+                   private relvar R { a: Integer } key { a }; \
+                   private relvar S { a: Text } key { a }; \
+                   oper main {} [ write_relation { rel: R compose S }; ];";
+        assert!(codes(src).contains(&"T0036"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn join_feeding_where_project_checks_clean() {
+        // A `join` feeds the already-implemented `where` and `project`: the join's
+        // union heading is injected into the predicate scope (`dept_name` resolves),
+        // then the result narrows to { dept_name, emp_name }. No new machinery.
+        let src = "program p; \
+                   private relvar Employees { emp_id: Integer, emp_name: Text, dept_id: Integer } key { emp_id }; \
+                   private relvar Departments { dept_id: Integer, dept_name: Text } key { dept_id }; \
+                   oper main {} [ write_relation { rel: (Employees join Departments) where dept_name = \"Engineering\" project { emp_name, dept_name } }; ];";
+        let diags = diagnostics(src);
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
     }
 

@@ -22,11 +22,17 @@
 //!
 //! ## Seal discipline (RM Pro 3)
 //!
-//! [`coddl_relation_seal`] sorts records by byte-wise comparison
-//! (total because the layout is canonical) then adjacent-dedups in
-//! place by trimming the header's `length`. The sort is unspecified
-//! beyond "total and deterministic" — backends rely on the same
-//! sort so cross-backend stdout matches byte-for-byte.
+//! [`coddl_relation_seal`] enforces "no duplicate tuples" on a relation
+//! built in process (literals, `project`, `join`/`times`): it sorts
+//! records by byte-wise comparison only to bring equal records adjacent,
+//! then dedups in place by trimming the header's `length`. The resulting
+//! order is **not** meaningful — a relation is a set with no tuple order
+//! (RM Pro 1), so output order is unspecified and two backends agree on a
+//! relation as a *set* of tuples (RM Pre 8), not byte-for-byte. (For
+//! Text-leading relations the byte sort even orders by string pointer,
+//! which differs across backends — harmless precisely because order is
+//! unspecified.) The SQL path does **not** seal: the backend already
+//! returns a duplicate-free set (see `sqlite::finalize_relation`).
 //!
 //! ## Printer
 //!
@@ -38,7 +44,7 @@
 
 use std::io::Write;
 
-use crate::rc::{CoddlRcHeader, HEADER_SIZE};
+use crate::rc::{coddl_rc_alloc, coddl_rc_release, CoddlKind, CoddlRcHeader, HEADER_SIZE};
 
 /// Per-attribute kind tag in the heading descriptor. Stable
 /// integers — backends and runtime mirror these constants. The same
@@ -77,10 +83,13 @@ pub struct CoddlHeadingDesc {
     pub attrs: *const CoddlAttrDesc,
 }
 
-/// Sort + adjacent-dedup a relation's payload in place. Updates the
-/// header's `length` to reflect dedup. After this returns, the
-/// relation upholds RM Pro 3 (no duplicates) and presents records
-/// in a total deterministic order.
+/// Dedup a relation's payload in place to uphold RM Pro 3 (no duplicate
+/// tuples), updating the header's `length`. Sorting is just the mechanism
+/// — it brings equal records adjacent so one linear pass removes them. The
+/// resulting record order is an implementation byproduct, not meaningful: a
+/// relation is a set with no tuple order (RM Pro 1), so callers must not
+/// rely on it (and for Text-leading relations it is not even cross-backend
+/// stable, since Text cells sort by pointer).
 ///
 /// # Safety
 /// `ptr` must point to a payload returned by `coddl_rc_alloc` whose
@@ -153,6 +162,160 @@ pub unsafe extern "C" fn coddl_relation_seal(ptr: *mut u8, desc: *const CoddlHea
 ///
 /// # Safety
 /// `ptr` must satisfy the same preconditions as `coddl_relation_seal`.
+/// Initialize an in-memory `private` relvar slot with an empty relation.
+/// Allocates a 0-row relation carrying `desc` and stores its RC pointer into
+/// `*slot`. There is no SQL source; the slot is later filled by relational
+/// assignment (`coddl_relvar_slot_store`).
+///
+/// # Safety
+/// `desc` must outlive the slot; `slot` must point to a writable `*mut u8`.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_relvar_slot_init_empty(
+    desc: *const CoddlHeadingDesc,
+    slot: *mut *mut u8,
+) {
+    *slot = coddl_rc_alloc(0, 0, CoddlKind::Relation as u32, desc);
+}
+
+/// Store `value` into a relvar slot — relational assignment `R := <expr>`.
+/// Move semantics: the slot's previous value (if any) is released and the slot
+/// takes ownership of `value`, so the caller must not also release it.
+///
+/// # Safety
+/// `slot` must point to a writable `*mut u8` previously initialized by a slot
+/// init; `value` must be an RC relation payload the caller owns.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_relvar_slot_store(value: *mut u8, slot: *mut *mut u8) {
+    let old = *slot;
+    if !old.is_null() {
+        coddl_rc_release(old);
+    }
+    *slot = value;
+}
+
+/// Natural join two relations on their shared attributes (surface `join`,
+/// Algebra-A AND). A pair of records matches when all shared cells are
+/// byte-equal; each match emits the union of attributes — every result
+/// attribute copied from whichever side defines it (lhs preferred for shared).
+/// Zero shared attributes ⇒ Cartesian product. Worst-case allocation, then
+/// `coddl_relation_seal` (sort + dedup, RM Pro 3).
+///
+/// # Safety
+/// All pointers must be non-null payloads / descriptors from the runtime and
+/// must outlive the call.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_relation_join(
+    lhs: *const u8,
+    lhs_desc: *const CoddlHeadingDesc,
+    rhs: *const u8,
+    rhs_desc: *const CoddlHeadingDesc,
+    result_desc: *const CoddlHeadingDesc,
+) -> *mut u8 {
+    if lhs.is_null()
+        || rhs.is_null()
+        || lhs_desc.is_null()
+        || rhs_desc.is_null()
+        || result_desc.is_null()
+    {
+        return std::ptr::null_mut();
+    }
+    let lhs_count = (*(lhs.sub(HEADER_SIZE) as *const CoddlRcHeader)).length as usize;
+    let rhs_count = (*(rhs.sub(HEADER_SIZE) as *const CoddlRcHeader)).length as usize;
+    let lhs_rec = (*lhs_desc).record_size as usize;
+    let rhs_rec = (*rhs_desc).record_size as usize;
+    let res_rec = (*result_desc).record_size as usize;
+
+    let lhs_attrs =
+        std::slice::from_raw_parts((*lhs_desc).attrs, (*lhs_desc).attr_count as usize);
+    let rhs_attrs =
+        std::slice::from_raw_parts((*rhs_desc).attrs, (*rhs_desc).attr_count as usize);
+    let res_attrs =
+        std::slice::from_raw_parts((*result_desc).attrs, (*result_desc).attr_count as usize);
+
+    // Shared attributes → byte-equality test pairs (lhs_off, rhs_off, width).
+    let mut shared: Vec<(usize, usize, usize)> = Vec::new();
+    for la in lhs_attrs {
+        let lname = std::slice::from_raw_parts(la.name, la.name_len as usize);
+        for ra in rhs_attrs {
+            let rname = std::slice::from_raw_parts(ra.name, ra.name_len as usize);
+            if lname == rname {
+                shared.push((la.offset as usize, ra.offset as usize, cell_width(la.kind)));
+                break;
+            }
+        }
+    }
+
+    // Result-attribute copies: (res_off, from_lhs, src_off, width). Each result
+    // attribute is defined by exactly one side (lhs preferred for shared).
+    let mut moves: Vec<(usize, bool, usize, usize)> = Vec::new();
+    for d in res_attrs {
+        let dname = std::slice::from_raw_parts(d.name, d.name_len as usize);
+        let mut placed = false;
+        for la in lhs_attrs {
+            let lname = std::slice::from_raw_parts(la.name, la.name_len as usize);
+            if lname == dname {
+                moves.push((d.offset as usize, true, la.offset as usize, cell_width(d.kind)));
+                placed = true;
+                break;
+            }
+        }
+        if placed {
+            continue;
+        }
+        for ra in rhs_attrs {
+            let rname = std::slice::from_raw_parts(ra.name, ra.name_len as usize);
+            if rname == dname {
+                moves.push((d.offset as usize, false, ra.offset as usize, cell_width(d.kind)));
+                break;
+            }
+        }
+    }
+
+    let cap = lhs_count.saturating_mul(rhs_count);
+    let out = crate::rc::coddl_rc_alloc(
+        res_rec.saturating_mul(cap),
+        0,
+        crate::rc::CoddlKind::Relation as u32,
+        result_desc,
+    );
+    if out.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let mut written = 0usize;
+    for li in 0..lhs_count {
+        let lrec = lhs.add(li * lhs_rec);
+        for ri in 0..rhs_count {
+            let rrec = rhs.add(ri * rhs_rec);
+            let mut matched = true;
+            for &(loff, roff, w) in &shared {
+                let a = std::slice::from_raw_parts(lrec.add(loff), w);
+                let b = std::slice::from_raw_parts(rrec.add(roff), w);
+                if a != b {
+                    matched = false;
+                    break;
+                }
+            }
+            if !matched {
+                continue;
+            }
+            let orec = out.add(written * res_rec);
+            for &(res_off, from_lhs, src_off, w) in &moves {
+                let src = if from_lhs {
+                    lrec.add(src_off)
+                } else {
+                    rrec.add(src_off)
+                };
+                std::ptr::copy_nonoverlapping(src, orec.add(res_off), w);
+            }
+            written += 1;
+        }
+    }
+    (*(out.sub(HEADER_SIZE) as *mut CoddlRcHeader)).length = written as u32;
+    coddl_relation_seal(out, result_desc);
+    out
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn coddl_write_relation(ptr: *const u8, desc: *const CoddlHeadingDesc) {
     if ptr.is_null() || desc.is_null() {
@@ -600,6 +763,87 @@ mod tests {
             assert_eq!(std::ptr::read(slot(0)), 1);
             assert_eq!(std::ptr::read(slot(1)), 2);
             coddl_rc_release(payload);
+        }
+    }
+
+    #[test]
+    fn join_zero_shared_is_cartesian_product() {
+        // Disjoint headings ⇒ no shared cells to match on, so the join is the
+        // Cartesian product (`times`): every lhs row paired with every rhs row.
+        // Locks in the vacuous-truth match in `coddl_relation_join` when the
+        // shared-attribute count is 0. Tuple order is not meaningful (RM Pro 1),
+        // so we compare the result as a set of (a, b) pairs.
+        let lhs_attrs = [CoddlAttrDesc {
+            name: b"a".as_ptr(),
+            name_len: 1,
+            kind: CoddlAttrKind::Integer as u32,
+            offset: 0,
+        }];
+        let lhs_desc = CoddlHeadingDesc {
+            attr_count: 1,
+            record_size: 8,
+            attrs: lhs_attrs.as_ptr(),
+        };
+        let rhs_attrs = [CoddlAttrDesc {
+            name: b"b".as_ptr(),
+            name_len: 1,
+            kind: CoddlAttrKind::Integer as u32,
+            offset: 0,
+        }];
+        let rhs_desc = CoddlHeadingDesc {
+            attr_count: 1,
+            record_size: 8,
+            attrs: rhs_attrs.as_ptr(),
+        };
+        // Result heading `{a, b}` in canonical order: a at 0, b at 8.
+        let res_attrs = [
+            CoddlAttrDesc {
+                name: b"a".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 0,
+            },
+            CoddlAttrDesc {
+                name: b"b".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 8,
+            },
+        ];
+        let res_desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 16,
+            attrs: res_attrs.as_ptr(),
+        };
+        unsafe {
+            // lhs { {a:1}, {a:2} }, rhs { {b:10}, {b:20} } (pre-sealed sets).
+            let lhs = coddl_rc_alloc(2 * 8, 2, CoddlKind::Relation as u32, &lhs_desc);
+            std::ptr::write(lhs.add(0) as *mut i64, 1);
+            std::ptr::write(lhs.add(8) as *mut i64, 2);
+            let rhs = coddl_rc_alloc(2 * 8, 2, CoddlKind::Relation as u32, &rhs_desc);
+            std::ptr::write(rhs.add(0) as *mut i64, 10);
+            std::ptr::write(rhs.add(8) as *mut i64, 20);
+
+            let out = coddl_relation_join(lhs, &lhs_desc, rhs, &rhs_desc, &res_desc);
+            assert!(!out.is_null());
+            let len = (*(out.sub(HEADER_SIZE) as *const CoddlRcHeader)).length as usize;
+            assert_eq!(len, 4, "2 × 2 Cartesian product has 4 tuples");
+
+            let mut pairs: Vec<(i64, i64)> = (0..len)
+                .map(|i| {
+                    let rec = out.add(i * 16);
+                    (
+                        std::ptr::read(rec as *const i64),
+                        std::ptr::read(rec.add(8) as *const i64),
+                    )
+                })
+                .collect();
+            pairs.sort();
+            assert_eq!(pairs, vec![(1, 10), (1, 20), (2, 10), (2, 20)]);
+
+            coddl_rc_release(out);
+            coddl_rc_release(rhs);
+            coddl_rc_release(lhs);
         }
     }
 

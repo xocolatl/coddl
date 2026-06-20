@@ -2,9 +2,10 @@
 //!
 //! Invokes the built `coddl` binary as a subprocess (located via the
 //! `CARGO_BIN_EXE_coddl` env var that Cargo sets for integration
-//! tests). Each test exercises one of the new subcommands —
-//! `coddl run` or `coddl compile` — against `hello-world.cd` and
-//! asserts the resulting binary's stdout.
+//! tests). Each test exercises one of the subcommands — `coddl run` or
+//! `coddl compile` — against a program the suite **authors itself** (into
+//! a tempdir; never a hand-editable on-disk scratchpad) and asserts the
+//! resulting binary's stdout.
 //!
 //! Tests fail loudly if `clang` / `cc` is missing on PATH or if the
 //! runtime staticlib hasn't been built.
@@ -19,14 +20,94 @@ fn workspace_root() -> PathBuf {
     p
 }
 
-/// `examples/<name>/<name>.cd` is the on-disk convention.
-fn example_path(name: &str) -> PathBuf {
-    workspace_root().join(format!("examples/{name}/{name}.cd"))
+/// A process-lifetime tempdir holding the source programs the suite authors
+/// for its subprocess `coddl` runs. A `OnceLock` keeps the `TempDir` alive for
+/// the whole test binary, so the returned paths stay valid across runs. The
+/// suite **owns every source it runs** — it never reads a hand-editable on-disk
+/// scratchpad, which a developer may freely rewrite or delete.
+fn fixtures_dir() -> &'static Path {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let tmp = tempfile::tempdir().expect("fixtures tempdir");
+        for (name, src) in [
+            ("hello-world", HELLO_WORLD_SRC),
+            ("transaction", TRANSACTION_SRC),
+            ("join-times-compose", JOIN_TIMES_COMPOSE_SRC),
+        ] {
+            std::fs::write(tmp.path().join(format!("{name}.cd")), src)
+                .unwrap_or_else(|e| panic!("write {name}.cd fixture: {e}"));
+        }
+        tmp
+    })
+    .path()
+}
+
+/// Path to a suite-authored source program by name.
+fn fixture_path(name: &str) -> PathBuf {
+    fixtures_dir().join(format!("{name}.cd"))
 }
 
 fn hello_world_path() -> PathBuf {
-    example_path("hello-world")
+    fixture_path("hello-world")
 }
+
+const HELLO_WORLD_SRC: &str = "\
+program hello_world;
+oper main {} [
+    write_line { message: \"Hello, world!\" };
+];
+";
+
+const TRANSACTION_SRC: &str = "\
+program transaction_demo;
+oper main {} [
+    let ok = transaction [
+        \"ok\"
+    ];
+    write_line { message: ok };
+];
+";
+
+const JOIN_TIMES_COMPOSE_SRC: &str = "\
+program join_times_compose;
+
+private relvar Employees { emp_id: Integer, emp_name: Text, dept_id: Integer } key { emp_id };
+private relvar Departments { dept_id: Integer, dept_name: Text } key { dept_id };
+private relvar JobTitles { title: Text } key { title };
+private relvar Locations { location: Text } key { location };
+
+oper main {} [
+    Departments := Relation {
+        { dept_id: 10, dept_name: \"Engineering\" },
+        { dept_id: 20, dept_name: \"Sales\" },
+        { dept_id: 30, dept_name: \"Marketing\" },
+    };
+    Employees := Relation {
+        { emp_id: 1, emp_name: \"Ada\", dept_id: 10 },
+        { emp_id: 2, emp_name: \"Grace\", dept_id: 10 },
+        { emp_id: 3, emp_name: \"Alan\", dept_id: 20 },
+        { emp_id: 4, emp_name: \"Edsger\", dept_id: 30 },
+    };
+    JobTitles := Relation {
+        { title: \"Engineer\" },
+        { title: \"Manager\" },
+    };
+    Locations := Relation {
+        { location: \"London\" },
+        { location: \"Paris\" },
+    };
+
+    let staffed = Employees join Departments;
+    write_relation { rel: staffed };
+    let grid = JobTitles times Locations;
+    write_relation { rel: grid };
+    let dept_names = Employees compose Departments;
+    write_relation { rel: dept_names };
+    let eng = (Employees join Departments) where dept_name = \"Engineering\" project { emp_name, dept_name };
+    write_relation { rel: eng };
+];
+";
 
 fn ensure_runtime_built() {
     let path = workspace_root().join("target/debug/libcoddl_runtime.a");
@@ -197,7 +278,7 @@ fn transaction_llvm_backend_prints_ok() {
     ensure_runtime_built();
     let out = coddl()
         .args(["run", "--backend=llvm"])
-        .arg(example_path("transaction"))
+        .arg(fixture_path("transaction"))
         .output()
         .expect("spawn coddl");
     assert!(
@@ -213,7 +294,7 @@ fn transaction_cranelift_backend_prints_ok() {
     ensure_runtime_built();
     let out = coddl()
         .args(["run", "--backend=cranelift"])
-        .arg(example_path("transaction"))
+        .arg(fixture_path("transaction"))
         .output()
         .expect("spawn coddl");
     assert!(
@@ -229,7 +310,7 @@ fn transaction_byte_identical_across_backends() {
     ensure_runtime_built();
     let llvm = coddl()
         .args(["run", "--backend=llvm"])
-        .arg(example_path("transaction"))
+        .arg(fixture_path("transaction"))
         .output()
         .expect("spawn LLVM");
     assert!(
@@ -239,7 +320,7 @@ fn transaction_byte_identical_across_backends() {
     );
     let cranelift = coddl()
         .args(["run", "--backend=cranelift"])
-        .arg(example_path("transaction"))
+        .arg(fixture_path("transaction"))
         .output()
         .expect("spawn Cranelift");
     assert!(
@@ -261,7 +342,7 @@ fn transaction_byte_identical_across_backends() {
 
 /// Inline-source program exercising tuple literal + field access. The
 /// e2e suite owns the canonical Phase 18 program rather than depending
-/// on an `examples/` dir — the latter is a deletable scratchpad.
+/// on a hand-editable on-disk scratchpad.
 const TUPLE_LET_SRC: &str = "\
 program tuple_let;
 oper main {} [
@@ -671,8 +752,8 @@ fn extract_aborts_on_multi_tuples() {
 // ── Database-backed reads (public relvar + SQLite) ───────────────────
 //
 // These tests own their source + fixtures (`write_pushdown_fixtures` /
-// `seed_greetings_fixtures`); none reads `examples/hello-world-db`, which is a
-// hand-editable playground a test must never depend on. End-to-end "a
+// `seed_greetings_fixtures`); none reads a hand-editable on-disk scratchpad,
+// which a test must never depend on. End-to-end "a
 // DB-backed read prints its value on both backends" is covered by the
 // owned-source `relvar_pushdown_audit_{llvm,cranelift}` tests below.
 
@@ -766,7 +847,7 @@ const EXPECTED_PUSHED_SQL: &str = r#"SELECT "message" FROM "greetings" WHERE "id
 /// `greetings.cddb` / `greetings.cdstore` companions — into `dir`, and seed a
 /// SQLite db at `<dir>/greetings.sqlite`. Returns the `.cd` and db paths.
 ///
-/// This test **owns its source** rather than reading `examples/hello-world-db`:
+/// This test **owns its source** rather than reading an on-disk scratchpad:
 /// the audit test asserts a *compiler property* (a relvar-rooted
 /// `where … project …` lowers to one pushed `SELECT`, no startup scan), which
 /// must not be coupled to a hand-editable example whose author may legitimately
@@ -1426,7 +1507,7 @@ fn tuple_field_init_shorthand_runs_byte_identical() {
 
 #[test]
 fn binding_transparency_folds_to_single_pushed_query() {
-    // Owned twin of hello-world-db: `gg` and `greeting` are transparent
+    // Owned twin of the hello-world db example: `gg` and `greeting` are transparent
     // relation aliases, so the decomposed `let gg = Greetings; gg where id = 1`
     // lowers to ONE pushed `SELECT … WHERE "id" = 1` — no `SELECT *` for the
     // unused/aliased `gg`, no in-process `where`.
@@ -1587,5 +1668,115 @@ fn coddl_run_unknown_backend_fails_clearly() {
     assert!(
         stderr.contains("unknown backend") && stderr.contains("foo"),
         "stderr didn't mention unknown backend: {stderr}"
+    );
+}
+
+// ── join-times-compose (in-process, private relvars; M1b parity) ──────────
+
+/// Parse `write_relation` stdout into a **sorted** `Vec` of tuple-lines. A
+/// relation is a set with no tuple order (RM Pro 1), and each tuple renders
+/// identically on both backends (canonical heading order), so two relations'
+/// outputs are equal iff their line *sets* match — never their raw byte order.
+/// (For the all-`Text` product below the seal even orders by string pointer, so
+/// the line order genuinely differs across backends; that's harmless here.)
+fn tuple_lines(stdout: &[u8]) -> Vec<String> {
+    let s = String::from_utf8_lossy(stdout);
+    let mut lines: Vec<String> = s.lines().map(str::to_string).collect();
+    lines.sort();
+    lines
+}
+
+/// The expected `&[&str]` tuple set, sorted for comparison with `tuple_lines`.
+fn sorted_tuples(tuples: &[&str]) -> Vec<String> {
+    let mut v: Vec<String> = tuples.iter().map(|s| s.to_string()).collect();
+    v.sort();
+    v
+}
+
+/// The in-process twin populates four `private` relvars, then dumps the natural
+/// join `Employees join Departments` (on `dept_id`), the Cartesian product
+/// `JobTitles times Locations`, and the composition `Employees compose
+/// Departments` (join on `dept_id`, then drop it). Tuple order is unspecified
+/// (RM Pro 1), so the tests compare this set, not bytes.
+const JOIN_TIMES_COMPOSE_TUPLES: &[&str] = &[
+    // Employees join Departments
+    "{dept_id: 10, dept_name: \"Engineering\", emp_id: 1, emp_name: \"Ada\"}",
+    "{dept_id: 10, dept_name: \"Engineering\", emp_id: 2, emp_name: \"Grace\"}",
+    "{dept_id: 20, dept_name: \"Sales\", emp_id: 3, emp_name: \"Alan\"}",
+    "{dept_id: 30, dept_name: \"Marketing\", emp_id: 4, emp_name: \"Edsger\"}",
+    // JobTitles times Locations
+    "{location: \"London\", title: \"Engineer\"}",
+    "{location: \"London\", title: \"Manager\"}",
+    "{location: \"Paris\", title: \"Engineer\"}",
+    "{location: \"Paris\", title: \"Manager\"}",
+    // Employees compose Departments (dept_id dropped)
+    "{dept_name: \"Engineering\", emp_id: 1, emp_name: \"Ada\"}",
+    "{dept_name: \"Engineering\", emp_id: 2, emp_name: \"Grace\"}",
+    "{dept_name: \"Sales\", emp_id: 3, emp_name: \"Alan\"}",
+    "{dept_name: \"Marketing\", emp_id: 4, emp_name: \"Edsger\"}",
+    // (Employees join Departments) where dept_name = "Engineering" project {emp_name, dept_name}
+    "{dept_name: \"Engineering\", emp_name: \"Ada\"}",
+    "{dept_name: \"Engineering\", emp_name: \"Grace\"}",
+];
+
+#[test]
+fn join_times_compose_inprocess_llvm_dumps_join_and_times() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("join-times-compose"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "join-times-compose LLVM failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        tuple_lines(&out.stdout),
+        sorted_tuples(JOIN_TIMES_COMPOSE_TUPLES)
+    );
+}
+
+#[test]
+fn join_times_compose_inprocess_cranelift_dumps_join_and_times() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("join-times-compose"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "join-times-compose Cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        tuple_lines(&out.stdout),
+        sorted_tuples(JOIN_TIMES_COMPOSE_TUPLES)
+    );
+}
+
+#[test]
+fn join_times_compose_inprocess_relations_equal_across_backends() {
+    // Both backends compute the same relations, so the same tuple sets — the
+    // printed order may differ (RM Pro 1; the all-Text product sorts by pointer).
+    ensure_runtime_built();
+    let llvm = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("join-times-compose"))
+        .output()
+        .expect("spawn LLVM");
+    assert!(llvm.status.success());
+    let cranelift = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("join-times-compose"))
+        .output()
+        .expect("spawn Cranelift");
+    assert!(cranelift.status.success());
+    assert_eq!(
+        tuple_lines(&llvm.stdout),
+        tuple_lines(&cranelift.stdout),
+        "backends disagree on the join-times-compose tuple set"
     );
 }

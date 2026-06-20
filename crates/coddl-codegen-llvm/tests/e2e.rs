@@ -1,8 +1,8 @@
 //! End-to-end test for the LLVM backend.
 //!
-//! Lowers `examples/hello-world/hello-world.cd` to ProcIR, emits LLVM
-//! IR text, invokes `clang` to compile + link with the runtime
-//! staticlib, runs the binary, and asserts stdout equals
+//! Lowers an inline hello-world program (the test owns its source) to
+//! ProcIR, emits LLVM IR text, invokes `clang` to compile + link with the
+//! runtime staticlib, runs the binary, and asserts stdout equals
 //! `"Hello, world!\n"`. Fails loudly if `clang` is missing on PATH or
 //! if the runtime staticlib hasn't been built.
 

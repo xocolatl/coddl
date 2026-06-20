@@ -743,16 +743,37 @@ base relvar Greetings { id: Integer, message: Boolean } key { id };
     }
 
     #[test]
-    fn shipped_hello_world_db_example_resolves_cleanly() {
-        // Anchor on the workspace root via CARGO_MANIFEST_DIR.
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let cd = PathBuf::from(manifest_dir)
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("examples/hello-world-db/hello-world-db.cd");
-        let out = discover_and_validate(&cd);
+    fn sqlite_backed_cd_family_resolves_cleanly() {
+        // Owns its source: author a `.cd` plus its `greetings.cddb` /
+        // `greetings.cdstore` companions in a tempdir, then discover + validate
+        // the family. No on-disk fixture dependency.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("app.cd"),
+            "program hello_world_db;\n\
+             database greetings;\n\
+             public relvar Greetings { id: Integer, message: Text } key { id };\n\
+             oper main {} [\n\
+                 let g = transaction [ extract (Greetings where id = 1 project { message }) ];\n\
+                 write_line { message: g.message };\n\
+             ];\n",
+        )
+        .expect("write app.cd");
+        std::fs::write(
+            tmp.path().join("greetings.cddb"),
+            "database greetings;\n\
+             base relvar Greetings { id: Integer, message: Text } key { id };\n",
+        )
+        .expect("write greetings.cddb");
+        std::fs::write(
+            tmp.path().join("greetings.cdstore"),
+            "store for greetings;\n\
+             backend sqlite { file: \"greetings.sqlite\" };\n\
+             relvar Greetings: table \"greetings\" { columns: { id: \"id\", message: \"message\" } };\n",
+        )
+        .expect("write greetings.cdstore");
+
+        let out = discover_and_validate(&tmp.path().join("app.cd"));
         let pl: Vec<_> = out
             .diagnostics
             .iter()
