@@ -403,3 +403,4 @@ check script enforces that.
 | T0037 | `times` operands share an attribute (overlapping headings) — suggest `join` |
 | T0038 | `union`/`intersect`/`minus` operands must have identical headings |
 | T0039 | `join` operands have identical headings (the join is a set intersection) — suggest `intersect` |
+| T0040 | `compose` operands have identical headings (every attribute removed, result always nullary) — suggest `intersect` |

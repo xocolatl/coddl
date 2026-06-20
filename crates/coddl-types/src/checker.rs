@@ -1404,9 +1404,14 @@ impl TypeChecker {
     }
 
     /// `R compose S` — natural join then REMOVE the shared attributes (Algebra-A
-    /// AND then REMOVE). Like `join`, both operands must be relations sharing ≥1
-    /// attribute (disjoint → T0035 suggest `times`; type clash → T0036); the
-    /// result heading is the union with the shared attributes dropped.
+    /// AND then REMOVE). `compose` is meaningful only when **both** derived sets
+    /// are non-empty: the shared attributes `A ∩ B` (the join/remove key) and the
+    /// symmetric difference `A △ B` (the result heading). Empty `A ∩ B` (disjoint)
+    /// → T0035 (suggest `times`, nothing to join on). Empty `A △ B` (identical
+    /// headings) → T0040 (every attribute removed, result always nullary; suggest
+    /// `intersect`). A shared-attribute type clash → T0036. So `compose`'s legal
+    /// domain is partial overlap — same as `join`; a proper subset/superset like
+    /// `{a,b,c} compose {b,c}` (→ `{a}`) is fine.
     fn check_compose_binary(&mut self, bin: &BinaryExpr, scope: &mut Scope) -> Type {
         // Check both operands first so each surfaces its own diagnostics.
         let lhs_h = self.relation_operand(bin.lhs(), "compose", scope);
@@ -1414,6 +1419,22 @@ impl TypeChecker {
         let (Some(lhs_h), Some(rhs_h)) = (lhs_h, rhs_h) else {
             return Type::Unknown;
         };
+        // Identical headings: every attribute is shared, so the REMOVE drops them
+        // all and the result is always the nullary relation regardless of data.
+        // Reject and suggest `intersect` (the likely intent — keep the matching
+        // tuples). Checked before `natural_join_heading` (identical non-empty
+        // headings are not disjoint and would otherwise pass).
+        if lhs_h == rhs_h {
+            self.error(
+                self.node_span(bin.syntax()),
+                "T0040",
+                "`compose` operands have identical headings — every attribute \
+                 would be removed (the result is always nullary); did you mean \
+                 `intersect`?"
+                    .to_string(),
+            );
+            return Type::Unknown;
+        }
         let Some(union_h) = self.natural_join_heading(bin, &lhs_h, &rhs_h, "compose") else {
             return Type::Unknown;
         };
@@ -1870,6 +1891,29 @@ mod tests {
                    private relvar S { a: Text } key { a }; \
                    oper main {} [ write_relation { rel: R compose S }; ];";
         assert!(codes(src).contains(&"T0036"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn compose_with_identical_headings_diagnoses_t0040() {
+        // Every attribute is shared -> REMOVE drops them all -> always nullary ->
+        // the user wants `intersect`.
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   private relvar S { a: Integer, b: Text } key { a }; \
+                   oper main {} [ write_relation { rel: R compose S }; ];";
+        assert!(codes(src).contains(&"T0040"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn compose_with_subset_heading_checks_clean() {
+        // R { a, b, c } compose S { b, c } — shares { b, c }, not identical:
+        // join on { b, c }, remove them, keep { a }. A proper partial overlap.
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Integer, c: Integer } key { a }; \
+                   private relvar S { b: Integer, c: Integer } key { b, c }; \
+                   oper main {} [ write_relation { rel: R compose S }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
     }
 
     #[test]
