@@ -4,7 +4,7 @@ The authoritative spec for the `coddl` command-line driver: every subcommand, ev
 
 The driver is the user's first contact with Coddl. It calls into the frontend crates ([grammar.md](grammar.md), [typecheck.md](typecheck.md)) for `lex` / `parse` / `check`, into the plan layer ([plan.md](plan.md)) when a `.cd` declares public relvars, into [codegen.md](codegen.md) for emission, and links against the runtime [staticlib](runtime.md). Frontend diagnostics are routed through `coddl-diagnostics` (see [lsp.md](lsp.md)) so terminal output and LSP output share one source.
 
-**Last sync:** `c42493a`. Every commit that adds, removes, or changes a subcommand, a flag, an exit code, or the runtime-discovery rule updates this file in the same commit.
+**Last sync:** `a2c3fd3`. Every commit that adds, removes, or changes a subcommand, a flag, an exit code, or the runtime-discovery rule updates this file in the same commit.
 
 
 ## Subcommand reference
