@@ -1,0 +1,42 @@
+// union-intersect-minus-db.cd
+//
+// SQL-backed twin of union-intersect-minus.cd: the same { id, name } schema and the
+// same set operators, but the relvars are `public` and backed by a seeded SQLite
+// database, so each query pushes DOWN to SQL instead of running in process. Side by
+// side, the two files show one surface language driving both the in-process engine
+// (private relvars) and SQL emission (public relvars).
+//
+// The .cd-family (storage stays out of D):
+//   union-intersect-minus-db.cd  — this program: the external schema + queries
+//   shifts.cddb                  — database catalog (conceptual schema)
+//   shifts.cdstore               — conceptual -> physical (SQLite) binding
+//   seed-db.sh                   — recreates shifts.sqlite with the demo data
+//
+// `public` relvars are read-only, so there is no `:=` — the data lives in the seeded
+// database. A public-relvar read must sit inside a `transaction [...]` block.
+
+program union_intersect_minus_db;
+database shifts;
+
+public relvar Morning {
+    id: Integer,
+    name: Text,
+} key { id };
+
+public relvar Evening {
+    id: Integer,
+    name: Text,
+} key { id };
+
+oper main {} [
+    // Baseline: dump each raw relvar — pushes one `SELECT "id", "name" FROM ...`.
+    let m = transaction [
+        Morning
+    ];
+    write_relation { rel: m };
+
+    let e = transaction [
+        Evening
+    ];
+    write_relation { rel: e };
+];

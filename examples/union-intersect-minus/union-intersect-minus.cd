@@ -1,0 +1,44 @@
+// union-intersect-minus.cd
+//
+// The three set-style relational operators of Coddl, all infix. Unlike the join
+// family, all three require their two operands to have the SAME heading — Coddl has
+// no nulls, so there is no heading-agnostic union:
+//
+//   A union B       every tuple in A or in B (set union)
+//   A intersect B   every tuple in both A and B (set intersection)
+//   A minus B       every tuple in A that is not in B (set difference)
+//
+// `Morning` and `Evening` share the heading { id, name } and overlap in two tuples,
+// so each operator yields a distinct, meaningful result. `main` populates the two
+// relvars by relational assignment (`R := <relation literal>`) and dumps them. A
+// relation is a set, so the printed tuple order is unspecified.
+
+program union_intersect_minus;
+
+private relvar Morning {
+    id: Integer,
+    name: Text,
+} key { id };
+
+private relvar Evening {
+    id: Integer,
+    name: Text,
+} key { id };
+
+oper main {} [
+    Morning := Relation {
+        { id: 1, name: "Ada" },
+        { id: 2, name: "Grace" },
+        { id: 3, name: "Alan" },
+    };
+
+    Evening := Relation {
+        { id: 2, name: "Grace" },
+        { id: 3, name: "Alan" },
+        { id: 4, name: "Edsger" },
+    };
+
+    // Baseline: dump the two raw relvars.
+    write_relation { rel: Morning };
+    write_relation { rel: Evening };
+];

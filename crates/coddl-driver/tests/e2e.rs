@@ -34,6 +34,7 @@ fn fixtures_dir() -> &'static Path {
             ("hello-world", HELLO_WORLD_SRC),
             ("transaction", TRANSACTION_SRC),
             ("join-times-compose", JOIN_TIMES_COMPOSE_SRC),
+            ("union-intersect-minus", UNION_INTERSECT_MINUS_SRC),
         ] {
             std::fs::write(tmp.path().join(format!("{name}.cd")), src)
                 .unwrap_or_else(|e| panic!("write {name}.cd fixture: {e}"));
@@ -106,6 +107,29 @@ oper main {} [
     write_relation { rel: dept_names };
     let eng = (Employees join Departments) where dept_name = \"Engineering\" project { emp_name, dept_name };
     write_relation { rel: eng };
+];
+";
+
+const UNION_INTERSECT_MINUS_SRC: &str = "\
+program union_intersect_minus;
+
+private relvar Morning { id: Integer, name: Text } key { id };
+private relvar Evening { id: Integer, name: Text } key { id };
+
+oper main {} [
+    Morning := Relation {
+        { id: 1, name: \"Ada\" },
+        { id: 2, name: \"Grace\" },
+        { id: 3, name: \"Alan\" },
+    };
+    Evening := Relation {
+        { id: 2, name: \"Grace\" },
+        { id: 3, name: \"Alan\" },
+        { id: 4, name: \"Edsger\" },
+    };
+
+    write_relation { rel: Morning };
+    write_relation { rel: Evening };
 ];
 ";
 
@@ -1813,5 +1837,81 @@ fn join_times_compose_inprocess_relations_equal_across_backends() {
         tuple_lines(&llvm.stdout),
         tuple_lines(&cranelift.stdout),
         "backends disagree on the join-times-compose tuple set"
+    );
+}
+
+/// The in-process twin populates two identical-heading `private` relvars
+/// (`Morning`, `Evening`, heading { id, name }) that overlap in two tuples, then
+/// dumps each raw — the baseline before the set operators (`union` / `intersect` /
+/// `minus`) land. Tuple order is unspecified (RM Pro 1), so the tests compare this
+/// set, not bytes; the two shared tuples appear once per relvar dump.
+const UNION_INTERSECT_MINUS_TUPLES: &[&str] = &[
+    // Morning
+    "{id: 1, name: \"Ada\"}",
+    "{id: 2, name: \"Grace\"}",
+    "{id: 3, name: \"Alan\"}",
+    // Evening
+    "{id: 2, name: \"Grace\"}",
+    "{id: 3, name: \"Alan\"}",
+    "{id: 4, name: \"Edsger\"}",
+];
+
+#[test]
+fn union_intersect_minus_inprocess_llvm_dumps_relvars() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("union-intersect-minus"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "union-intersect-minus LLVM failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        tuple_lines(&out.stdout),
+        sorted_tuples(UNION_INTERSECT_MINUS_TUPLES)
+    );
+}
+
+#[test]
+fn union_intersect_minus_inprocess_cranelift_dumps_relvars() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("union-intersect-minus"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "union-intersect-minus Cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        tuple_lines(&out.stdout),
+        sorted_tuples(UNION_INTERSECT_MINUS_TUPLES)
+    );
+}
+
+#[test]
+fn union_intersect_minus_inprocess_relations_equal_across_backends() {
+    ensure_runtime_built();
+    let llvm = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("union-intersect-minus"))
+        .output()
+        .expect("spawn LLVM");
+    assert!(llvm.status.success());
+    let cranelift = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("union-intersect-minus"))
+        .output()
+        .expect("spawn Cranelift");
+    assert!(cranelift.status.success());
+    assert_eq!(
+        tuple_lines(&llvm.stdout),
+        tuple_lines(&cranelift.stdout),
+        "backends disagree on the union-intersect-minus tuple set"
     );
 }

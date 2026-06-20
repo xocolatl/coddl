@@ -1,0 +1,19 @@
+// shifts.cddb
+//
+// Conceptual schema for the `shifts` database — the SQL-backed twin of the in-process
+// union-intersect-minus example. Database-side `base relvar` declarations; the headings
+// mirror the `public relvar`s in union-intersect-minus-db.cd.
+
+database shifts;
+
+base relvar Morning {
+    id: Integer,
+    name: Text,
+}
+key { id };
+
+base relvar Evening {
+    id: Integer,
+    name: Text,
+}
+key { id };
