@@ -39,4 +39,10 @@ oper main {} [
         Evening
     ];
     write_relation { rel: e };
+
+    // intersect: pushes one `INNER JOIN "evening" USING ("id", "name")`.
+    let both = transaction [
+        Morning intersect Evening
+    ];
+    write_relation { rel: both };
 ];

@@ -617,6 +617,7 @@ pub enum BinaryOp {
     Join,
     Times,
     Compose,
+    Intersect,
 }
 
 ast_node!(pub BinaryExpr, BINARY_EXPR);
@@ -652,7 +653,7 @@ impl BinaryExpr {
                     SyntaxKind::IDENT
                         if matches!(
                             tok.text(),
-                            "and" | "or" | "where" | "join" | "times" | "compose"
+                            "and" | "or" | "where" | "join" | "times" | "compose" | "intersect"
                         ) =>
                     {
                         return Some(tok);
@@ -682,6 +683,7 @@ impl BinaryExpr {
                 "join" => BinaryOp::Join,
                 "times" => BinaryOp::Times,
                 "compose" => BinaryOp::Compose,
+                "intersect" => BinaryOp::Intersect,
                 _ => return None,
             },
             _ => return None,

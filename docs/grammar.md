@@ -41,9 +41,9 @@ Reason: the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-
 
 **`times` and `intersect` are typed aliases of `join`; `compose` is a sibling with a different lowering.** `join`, `times`, and `intersect` all lower to the same `AND` node in Algebra A (see [relir.md](relir.md) — `AND` generalizes TIMES and INTERSECT); `compose` lowers to `AND` followed by `REMOVE` of the shared attributes. All four exist for intent-signaling and compile-time enforcement — every check below is static and zero-cost at runtime:
 
-- **`join`** requires the two headings to **overlap** (share at least one attribute). With no overlap the result would be a Cartesian product the user almost never means by accident, so the typechecker rejects it and suggests `times`.
+- **`join`** requires the two headings to **partially overlap** — share at least one attribute, but **not** be identical. With no overlap the result would be a Cartesian product the user almost never means by accident, so the typechecker rejects it and suggests `times`. With *identical* headings the result would be a set intersection, so it rejects it and suggests `intersect`. The three AND-family operators therefore partition the heading relationship completely and exclusively: **disjoint → `times`, partial overlap → `join`, identical → `intersect`** — each operand pair has exactly one legal spelling.
 - **`times`** requires the two headings to be **disjoint**. With any attribute in common the typechecker rejects it and suggests `join`.
-- **`intersect`** requires the two headings to be **identical**.
+- **`intersect`** requires the two headings to be **identical**. Anything else is rejected (it names the differing attributes).
 - **`compose`** requires the two headings to **overlap** (like `join`): it joins on the common attributes and removes them. With no overlap the typechecker rejects it and suggests `times` (a disjoint compose is just a Cartesian product with nothing to remove).
 
 **`union` and `minus` require identical headings.** `union` lowers to A-core `OR` (heading-agnostic relational union, restricted at the type level to matching headings since Coddl has no nulls). `minus` lowers to `AND NOT` (set difference is `R join (NOT S)` when headings match). Both checks are static; mismatched-heading attempts are rejected at compile time with a diagnostic.
@@ -437,6 +437,7 @@ function that implements it.
                   | 'join'                                     -- prec 0
                   | 'times'                                    -- prec 0
                   | 'compose'                                  -- prec 0
+                  | 'intersect'                                -- prec 0
                   | 'or'                                       -- prec 1
                   | 'and'                                      -- prec 2
                   | '=' | '<>' | '<' | '>' | '<=' | '>=' ;     -- prec 3
@@ -539,10 +540,10 @@ is explicit, not implied:
   user-defined types.
 - **Type generators** in `<type-ref>` — `Tuple H`, `Relation H`,
   `Sequence T`.
-- **Infix relational operators** not yet parsed — `intersect`, `union`,
-  `minus`. (`join` landed in M2, `times` in M3, `compose` in M4; comparison `=`
-  `<>` `<` `>` `<=` `>=`, logical `and` / `or`, and `where` landed in Phase 20;
-  arithmetic is listed separately below.)
+- **Infix relational operators** not yet parsed — `union`, `minus`.
+  (`join` landed in M2, `times` in M3, `compose` in M4, `intersect`
+  thereafter; comparison `=` `<>` `<` `>` `<=` `>=`, logical `and` / `or`,
+  and `where` landed in Phase 20; arithmetic is listed separately below.)
 - **Statement forms** other than `<let-stmt>`, `<assign-stmt>`, and
   `<expr> ';'` — `mut`, `return`, `insert`, `delete`, `update`.
 - **Type / relvar / constraint declarations** at the top level.

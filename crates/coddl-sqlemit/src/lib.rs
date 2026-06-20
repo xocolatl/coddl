@@ -558,6 +558,66 @@ mod tests {
         );
     }
 
+    fn morning() -> RelExpr {
+        RelExpr::RelvarRef {
+            name: "Morning".to_string(),
+            database: "shifts".to_string(),
+            heading: Heading::new(vec![
+                ("id".to_string(), Type::Integer),
+                ("name".to_string(), Type::Text),
+            ]),
+            table_name: "morning".to_string(),
+            columns: vec![
+                ("id".to_string(), "id".to_string()),
+                ("name".to_string(), "name".to_string()),
+            ],
+            keys: vec![vec!["id".to_string()]],
+        }
+    }
+
+    fn evening() -> RelExpr {
+        RelExpr::RelvarRef {
+            name: "Evening".to_string(),
+            database: "shifts".to_string(),
+            heading: Heading::new(vec![
+                ("id".to_string(), Type::Integer),
+                ("name".to_string(), Type::Text),
+            ]),
+            table_name: "evening".to_string(),
+            columns: vec![
+                ("id".to_string(), "id".to_string()),
+                ("name".to_string(), "name".to_string()),
+            ],
+            keys: vec![vec!["id".to_string()]],
+        }
+    }
+
+    #[test]
+    fn intersect_emits_inner_join_using_all_columns() {
+        // `Morning intersect Evening` → RelExpr::And on identical headings, so
+        // every column is shared and the join key is all of them, emitted as
+        // `INNER JOIN ... USING ("id", "name")`. DISTINCT stays — the join drops
+        // both keys (RM Pro 3), like `and_emits_inner_join_using_the_shared_column`.
+        let expr = RelExpr::And {
+            lhs: Box::new(morning()),
+            rhs: Box::new(evening()),
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT DISTINCT "id", "name" FROM "morning" INNER JOIN "evening" USING ("id", "name")"#
+        );
+        assert_eq!(q.sql.param_count, 0);
+        assert!(q.params.is_empty());
+        assert_eq!(
+            q.result_heading,
+            Heading::new(vec![
+                ("id".to_string(), Type::Integer),
+                ("name".to_string(), Type::Text),
+            ])
+        );
+    }
+
     #[test]
     fn compose_emits_join_with_shared_columns_dropped() {
         // `Employees compose Departments` → Project{And} keeping the non-shared

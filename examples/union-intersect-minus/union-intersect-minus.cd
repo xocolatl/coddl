@@ -41,4 +41,8 @@ oper main {} [
     // Baseline: dump the two raw relvars.
     write_relation { rel: Morning };
     write_relation { rel: Evening };
+
+    // intersect: the tuples in BOTH shifts — the overlap { (2, Grace), (3, Alan) }.
+    let both = Morning intersect Evening;
+    write_relation { rel: both };
 ];

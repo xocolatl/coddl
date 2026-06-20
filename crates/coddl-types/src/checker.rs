@@ -1180,6 +1180,7 @@ impl TypeChecker {
             BinaryOp::Join => self.check_join_binary(bin, scope),
             BinaryOp::Times => self.check_times_binary(bin, scope),
             BinaryOp::Compose => self.check_compose_binary(bin, scope),
+            BinaryOp::Intersect => self.check_intersect_binary(bin, scope),
             BinaryOp::And | BinaryOp::Or => self.check_logical_op(bin, op, scope),
             BinaryOp::Eq | BinaryOp::NotEq => self.check_equality_op(bin, op, scope),
             BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => {
@@ -1298,10 +1299,57 @@ impl TypeChecker {
         }
     }
 
+    /// The identical-headings check shared by `union`, `intersect`, and
+    /// `minus`: all three require the two operands to have the *same* heading
+    /// (Coddl has no nulls, so there is no heading-agnostic set operation).
+    /// Returns the shared heading, or `None` after emitting T0038 naming the
+    /// attribute(s) that differ. `Heading` is canonical-sorted, so equality is
+    /// order-independent. `op_name` is interpolated so each operator reports
+    /// under its own lexeme.
+    fn identical_headings(
+        &mut self,
+        bin: &BinaryExpr,
+        lhs_h: &Heading,
+        rhs_h: &Heading,
+        op_name: &str,
+    ) -> Option<Heading> {
+        if lhs_h == rhs_h {
+            return Some(lhs_h.clone());
+        }
+        // Name the attributes present (by name and type) on one side but not
+        // the other, so the diagnostic points at the actual mismatch.
+        let mut differing: Vec<String> = Vec::new();
+        for (name, ty) in lhs_h.attrs() {
+            if !rhs_h.attrs().iter().any(|(n, t)| n == name && t == ty) {
+                differing.push(name.clone());
+            }
+        }
+        for (name, ty) in rhs_h.attrs() {
+            if !lhs_h.attrs().iter().any(|(n, t)| n == name && t == ty)
+                && !differing.contains(name)
+            {
+                differing.push(name.clone());
+            }
+        }
+        differing.sort();
+        differing.dedup();
+        self.error(
+            self.node_span(bin.syntax()),
+            "T0038",
+            format!(
+                "`{op_name}` operands must have identical headings — they differ on `{}`",
+                differing.join("`, `")
+            ),
+        );
+        None
+    }
+
     /// `R join S` — natural join (Algebra-A AND). Both operands must be
     /// relations that share ≥1 attribute (with matching types on the shared
-    /// attributes); the result heading is the union. Disjoint headings →
-    /// T0035 (suggest `times`); a shared-attribute type clash → T0036.
+    /// attributes), but **not** identical headings; the result heading is the
+    /// union. This makes the AND-family heading relationship a total, mutually
+    /// exclusive partition: disjoint → `times` (T0035), identical → `intersect`
+    /// (T0039), partial overlap → `join`. A shared-attribute type clash → T0036.
     fn check_join_binary(&mut self, bin: &BinaryExpr, scope: &mut Scope) -> Type {
         // Check both operands first so each surfaces its own diagnostics.
         let lhs_h = self.relation_operand(bin.lhs(), "join", scope);
@@ -1309,6 +1357,18 @@ impl TypeChecker {
         let (Some(lhs_h), Some(rhs_h)) = (lhs_h, rhs_h) else {
             return Type::Unknown;
         };
+        // Identical headings: the join would be a set intersection (a join on
+        // every attribute). Require `intersect`, mirroring how disjoint headings
+        // require `times`. Checked before `natural_join_heading` because
+        // identical non-empty headings are not disjoint and would otherwise pass.
+        if lhs_h == rhs_h {
+            self.error(
+                self.node_span(bin.syntax()),
+                "T0039",
+                "`join` operands have identical headings — did you mean `intersect`?".to_string(),
+            );
+            return Type::Unknown;
+        }
         match self.natural_join_heading(bin, &lhs_h, &rhs_h, "join") {
             Some(h) => Type::Relation(h),
             None => Type::Unknown,
@@ -1367,6 +1427,23 @@ impl TypeChecker {
             .cloned()
             .collect();
         Type::Relation(Heading::new(kept))
+    }
+
+    /// `R intersect S` — set intersection (Algebra-A AND on identical headings:
+    /// a join on *every* attribute). Both operands must be relations with the
+    /// **same** heading; mismatched headings → T0038. The result heading is that
+    /// shared heading.
+    fn check_intersect_binary(&mut self, bin: &BinaryExpr, scope: &mut Scope) -> Type {
+        // Check both operands first so each surfaces its own diagnostics.
+        let lhs_h = self.relation_operand(bin.lhs(), "intersect", scope);
+        let rhs_h = self.relation_operand(bin.rhs(), "intersect", scope);
+        let (Some(lhs_h), Some(rhs_h)) = (lhs_h, rhs_h) else {
+            return Type::Unknown;
+        };
+        match self.identical_headings(bin, &lhs_h, &rhs_h, "intersect") {
+            Some(h) => Type::Relation(h),
+            None => Type::Unknown,
+        }
     }
 
     /// `lhs and rhs` / `lhs or rhs` — both operands must be Boolean,
@@ -1626,6 +1703,7 @@ fn op_display(op: BinaryOp) -> &'static str {
         BinaryOp::Join => "join",
         BinaryOp::Times => "times",
         BinaryOp::Compose => "compose",
+        BinaryOp::Intersect => "intersect",
     }
 }
 
@@ -1721,6 +1799,17 @@ mod tests {
     }
 
     #[test]
+    fn join_with_identical_headings_diagnoses_t0039() {
+        // Identical headings -> the join is a set intersection -> the user wants
+        // `intersect` (mirrors disjoint -> `times`).
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   private relvar S { a: Integer, b: Text } key { a }; \
+                   oper main {} [ write_relation { rel: R join S }; ];";
+        assert!(codes(src).contains(&"T0039"), "{:?}", codes(src));
+    }
+
+    #[test]
     fn join_with_shared_attribute_type_mismatch_diagnoses_t0036() {
         // Shared name `a` but Integer on one side, Text on the other.
         let src = "program p; \
@@ -1781,6 +1870,27 @@ mod tests {
                    private relvar S { a: Text } key { a }; \
                    oper main {} [ write_relation { rel: R compose S }; ];";
         assert!(codes(src).contains(&"T0036"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn intersect_with_identical_headings_checks_clean() {
+        // R { a, b } intersect S { a, b } — identical headings -> ok, result { a, b }.
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   private relvar S { a: Integer, b: Text } key { a }; \
+                   oper main {} [ write_relation { rel: R intersect S }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn intersect_with_differing_headings_diagnoses_t0038() {
+        // S has `c` where R has `b` -> headings not identical -> T0038.
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   private relvar S { a: Integer, c: Text } key { a }; \
+                   oper main {} [ write_relation { rel: R intersect S }; ];";
+        assert!(codes(src).contains(&"T0038"), "{:?}", codes(src));
     }
 
     #[test]

@@ -401,3 +401,5 @@ check script enforces that.
 | T0035 | `join`/`compose` operands share no attribute (disjoint headings) — suggest `times` |
 | T0036 | `join`/`compose` shared attribute has different types on each side |
 | T0037 | `times` operands share an attribute (overlapping headings) — suggest `join` |
+| T0038 | `union`/`intersect`/`minus` operands must have identical headings |
+| T0039 | `join` operands have identical headings (the join is a set intersection) — suggest `intersect` |

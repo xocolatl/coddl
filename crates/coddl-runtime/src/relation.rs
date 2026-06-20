@@ -232,14 +232,24 @@ pub unsafe extern "C" fn coddl_relation_join(
     let res_attrs =
         std::slice::from_raw_parts((*result_desc).attrs, (*result_desc).attr_count as usize);
 
-    // Shared attributes → byte-equality test pairs (lhs_off, rhs_off, width).
-    let mut shared: Vec<(usize, usize, usize)> = Vec::new();
+    // Shared attributes → equality test pairs (lhs_off, rhs_off, width, is_text).
+    // `is_text` selects content comparison over raw bytes: a Text cell is a
+    // 16-byte (ptr, len) fat pointer, and equal text from two different string
+    // constants has different pointers — so the shared cells must be compared by
+    // content, not by their fat-pointer bytes.
+    let mut shared: Vec<(usize, usize, usize, bool)> = Vec::new();
     for la in lhs_attrs {
         let lname = std::slice::from_raw_parts(la.name, la.name_len as usize);
         for ra in rhs_attrs {
             let rname = std::slice::from_raw_parts(ra.name, ra.name_len as usize);
             if lname == rname {
-                shared.push((la.offset as usize, ra.offset as usize, cell_width(la.kind)));
+                let is_text = la.kind == CoddlAttrKind::Text as u32;
+                shared.push((
+                    la.offset as usize,
+                    ra.offset as usize,
+                    cell_width(la.kind),
+                    is_text,
+                ));
                 break;
             }
         }
@@ -288,10 +298,17 @@ pub unsafe extern "C" fn coddl_relation_join(
         for ri in 0..rhs_count {
             let rrec = rhs.add(ri * rhs_rec);
             let mut matched = true;
-            for &(loff, roff, w) in &shared {
-                let a = std::slice::from_raw_parts(lrec.add(loff), w);
-                let b = std::slice::from_raw_parts(rrec.add(roff), w);
-                if a != b {
+            for &(loff, roff, w, is_text) in &shared {
+                let eq = if is_text {
+                    let (lptr, llen) = read_text_cell(lrec, loff);
+                    let (rptr, rlen) = read_text_cell(rrec, roff);
+                    coddl_text_eq(lptr, llen, rptr, rlen) != 0
+                } else {
+                    let a = std::slice::from_raw_parts(lrec.add(loff), w);
+                    let b = std::slice::from_raw_parts(rrec.add(roff), w);
+                    a == b
+                };
+                if !eq {
                     matched = false;
                     break;
                 }
@@ -487,6 +504,25 @@ fn cell_width(kind: u32) -> usize {
         // Integer, Boolean, and any future 8-byte scalar.
         8
     }
+}
+
+/// Read a `Text` cell — a 16-byte `(ptr, len)` fat pointer — from `rec` at
+/// `off`, returning `(ptr, len)`. Mirrors the layout `print_cell` reads;
+/// byte-copies via `from_ne_bytes` so it's safe regardless of record alignment.
+///
+/// # Safety
+/// `rec.add(off)` must point at 16 readable bytes (one Text cell).
+unsafe fn read_text_cell(rec: *const u8, off: usize) -> (*const u8, usize) {
+    let ptr_bytes: [u8; 8] = std::slice::from_raw_parts(rec.add(off), 8)
+        .try_into()
+        .unwrap();
+    let len_bytes: [u8; 8] = std::slice::from_raw_parts(rec.add(off + 8), 8)
+        .try_into()
+        .unwrap();
+    (
+        usize::from_ne_bytes(ptr_bytes) as *const u8,
+        usize::from_ne_bytes(len_bytes),
+    )
 }
 
 /// Project a relation onto a subset of its attributes. Returns a fresh
@@ -840,6 +876,79 @@ mod tests {
                 .collect();
             pairs.sort();
             assert_eq!(pairs, vec![(1, 10), (1, 20), (2, 10), (2, 20)]);
+
+            coddl_rc_release(out);
+            coddl_rc_release(rhs);
+            coddl_rc_release(lhs);
+        }
+    }
+
+    #[test]
+    fn join_matches_shared_text_by_content_not_pointer() {
+        // A join whose shared attribute is `Text` must match on string content,
+        // not on the 16-byte (ptr, len) fat pointer: equal text from two
+        // different constants has different pointers. This is the path
+        // `intersect` (identical headings, so every attr shared) first exercises.
+        // Heading {id: Integer, name: Text}: id@0 (8), name@8 (ptr@8, len@16); 24.
+        let mk_attrs = || {
+            [
+                CoddlAttrDesc {
+                    name: b"id".as_ptr(),
+                    name_len: 2,
+                    kind: CoddlAttrKind::Integer as u32,
+                    offset: 0,
+                },
+                CoddlAttrDesc {
+                    name: b"name".as_ptr(),
+                    name_len: 4,
+                    kind: CoddlAttrKind::Text as u32,
+                    offset: 8,
+                },
+            ]
+        };
+        let lhs_attrs = mk_attrs();
+        let rhs_attrs = mk_attrs();
+        let res_attrs = mk_attrs();
+        let desc = |a: &[CoddlAttrDesc]| CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 24,
+            attrs: a.as_ptr(),
+        };
+        let lhs_desc = desc(&lhs_attrs);
+        let rhs_desc = desc(&rhs_attrs);
+        let res_desc = desc(&res_attrs);
+
+        // Distinct heap allocations of "Grace" so the two cells hold different
+        // pointers — a raw-byte compare of the fat pointer would miss the match.
+        let grace_a: Vec<u8> = b"Grace".to_vec();
+        let grace_b: Vec<u8> = b"Grace".to_vec();
+        let zoe: Vec<u8> = b"Zoe".to_vec();
+        assert_ne!(grace_a.as_ptr(), grace_b.as_ptr());
+
+        unsafe {
+            let write_row = |rec: *mut u8, id: i64, s: &[u8]| {
+                std::ptr::write(rec as *mut i64, id);
+                std::ptr::write(rec.add(8) as *mut usize, s.as_ptr() as usize);
+                std::ptr::write(rec.add(16) as *mut usize, s.len());
+            };
+            // lhs { (2, grace_a) }; rhs { (2, grace_b), (5, zoe) }.
+            let lhs = coddl_rc_alloc(24, 1, CoddlKind::Relation as u32, &lhs_desc);
+            write_row(lhs, 2, &grace_a);
+            let rhs = coddl_rc_alloc(2 * 24, 2, CoddlKind::Relation as u32, &rhs_desc);
+            write_row(rhs, 2, &grace_b);
+            write_row(rhs.add(24), 5, &zoe);
+
+            let out = coddl_relation_join(lhs, &lhs_desc, rhs, &rhs_desc, &res_desc);
+            assert!(!out.is_null());
+            let len = (*(out.sub(HEADER_SIZE) as *const CoddlRcHeader)).length as usize;
+            assert_eq!(len, 1, "only (2, Grace) is in both operands");
+
+            // The surviving row is (2, "Grace").
+            let id = std::ptr::read(out as *const i64);
+            let (ptr, slen) = read_text_cell(out, 8);
+            let name = std::slice::from_raw_parts(ptr, slen);
+            assert_eq!(id, 2);
+            assert_eq!(name, b"Grace");
 
             coddl_rc_release(out);
             coddl_rc_release(rhs);

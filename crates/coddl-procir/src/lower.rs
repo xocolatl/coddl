@@ -1323,7 +1323,10 @@ impl Lowerer {
         if matches!(op, BinaryOp::Where) {
             return self.lower_where_expr(bin);
         }
-        if matches!(op, BinaryOp::Join | BinaryOp::Times | BinaryOp::Compose) {
+        if matches!(
+            op,
+            BinaryOp::Join | BinaryOp::Times | BinaryOp::Compose | BinaryOp::Intersect
+        ) {
             return self.lower_join_inprocess(bin);
         }
         let scalar_op = match op {
@@ -1335,7 +1338,11 @@ impl Lowerer {
             BinaryOp::GtEq => ScalarOp::GtEq,
             BinaryOp::And => ScalarOp::And,
             BinaryOp::Or => ScalarOp::Or,
-            BinaryOp::Where | BinaryOp::Join | BinaryOp::Times | BinaryOp::Compose => {
+            BinaryOp::Where
+            | BinaryOp::Join
+            | BinaryOp::Times
+            | BinaryOp::Compose
+            | BinaryOp::Intersect => {
                 unreachable!("handled above")
             }
         };
@@ -1377,7 +1384,11 @@ impl Lowerer {
                     pred,
                 })
             }
-            Some(BinaryOp::Join) | Some(BinaryOp::Times) => {
+            // `join` / `times` / `intersect` all lower to the A-core `AND`
+            // node: `intersect` is `AND` on identical headings (a join on every
+            // attribute = set intersection). The heading check that
+            // distinguishes the three is the typechecker's, not the lowerer's.
+            Some(BinaryOp::Join) | Some(BinaryOp::Times) | Some(BinaryOp::Intersect) => {
                 let lhs = self.build_rel_expr(&b.lhs()?)?;
                 let rhs = self.build_rel_expr(&b.rhs()?)?;
                 Some(RelExpr::And {

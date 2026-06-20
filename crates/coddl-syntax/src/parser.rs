@@ -647,6 +647,7 @@ impl<'a> Parser<'a> {
             SyntaxKind::IDENT if self.at_keyword("join") => Some(0),
             SyntaxKind::IDENT if self.at_keyword("times") => Some(0),
             SyntaxKind::IDENT if self.at_keyword("compose") => Some(0),
+            SyntaxKind::IDENT if self.at_keyword("intersect") => Some(0),
             _ => None,
         }
     }
@@ -1765,6 +1766,24 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["R".to_string(), "S".to_string()]);
         assert!(bin.text().to_string().contains("compose"));
+    }
+
+    #[test]
+    fn intersect_infix_parses() {
+        let out = parse_str("oper main {} [ R intersect S ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let bin = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("BINARY_EXPR for `R intersect S`");
+        let names: Vec<_> = bin
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::NAME_REF)
+            .map(|n| n.text().to_string())
+            .collect();
+        assert_eq!(names, vec!["R".to_string(), "S".to_string()]);
+        assert!(bin.text().to_string().contains("intersect"));
     }
 
     #[test]
