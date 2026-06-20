@@ -85,11 +85,14 @@ pub struct CoddlHeadingDesc {
 
 /// Dedup a relation's payload in place to uphold RM Pro 3 (no duplicate
 /// tuples), updating the header's `length`. Sorting is just the mechanism
-/// — it brings equal records adjacent so one linear pass removes them. The
-/// resulting record order is an implementation byproduct, not meaningful: a
-/// relation is a set with no tuple order (RM Pro 1), so callers must not
-/// rely on it (and for Text-leading relations it is not even cross-backend
-/// stable, since Text cells sort by pointer).
+/// — it brings equal records adjacent so one linear pass removes them.
+/// Comparison is content-aware (`record_cmp`): `Text` cells compare by string
+/// content, not by their `(ptr, len)` fat pointer, so a tuple present in two
+/// independently-sourced operands (whose equal strings have *different*
+/// pointers) is correctly deduped — this is what makes `union`'s concat+seal
+/// correct. The resulting record order is an implementation byproduct, not
+/// meaningful: a relation is a set with no tuple order (RM Pro 1), so callers
+/// must not rely on it.
 ///
 /// # Safety
 /// `ptr` must point to a payload returned by `coddl_rc_alloc` whose
@@ -107,24 +110,21 @@ pub unsafe extern "C" fn coddl_relation_seal(ptr: *mut u8, desc: *const CoddlHea
         return;
     }
 
-    // Build a Vec of record indices, sort it by byte-wise comparison
-    // of the records, then permute the records into a fresh buffer
-    // and dedup adjacent equal ones.
-    //
-    // Byte-wise comparison is total because the layout is canonical
-    // and every cell's encoding is fixed-width and host-endian
-    // consistent. Text cells compare by pointer/length pair, which
-    // is equality-correct for interned/static strings (Phase 19's
-    // Text payloads come from compile-time string constants — they
-    // dedupe by content at compile time, so equal-content strings
-    // share the same pointer and length).
+    // Sort record indices, permute into a fresh buffer, then drop adjacent
+    // duplicates. Records compare via `record_cmp` (content-aware): scalar
+    // cells by their fixed-width bytes, `Text` cells by string content — never
+    // the `(ptr, len)` fat pointer, since equal-content strings from different
+    // sources have different pointers (relation-literal constants are not
+    // deduped across literals, and `intern_string` is append-only). For an
+    // all-scalar record this matches the old whole-record byte compare.
+    let attrs = std::slice::from_raw_parts((*desc).attrs, (*desc).attr_count as usize);
     let payload = std::slice::from_raw_parts_mut(ptr, count * record_size);
 
     let mut indices: Vec<usize> = (0..count).collect();
     indices.sort_by(|&a, &b| {
         let ra = &payload[a * record_size..(a + 1) * record_size];
         let rb = &payload[b * record_size..(b + 1) * record_size];
-        ra.cmp(rb)
+        record_cmp(ra, rb, attrs)
     });
 
     let mut sorted: Vec<u8> = Vec::with_capacity(count * record_size);
@@ -132,7 +132,7 @@ pub unsafe extern "C" fn coddl_relation_seal(ptr: *mut u8, desc: *const CoddlHea
         sorted.extend_from_slice(&payload[i * record_size..(i + 1) * record_size]);
     }
 
-    // Adjacent dedup.
+    // Adjacent dedup (content-aware equality).
     let mut write_idx = 0usize;
     for read_idx in 0..count {
         if read_idx == 0 {
@@ -141,7 +141,7 @@ pub unsafe extern "C" fn coddl_relation_seal(ptr: *mut u8, desc: *const CoddlHea
         }
         let prev = &sorted[(write_idx - 1) * record_size..write_idx * record_size];
         let cur = &sorted[read_idx * record_size..(read_idx + 1) * record_size];
-        if prev != cur {
+        if record_cmp(prev, cur, attrs) != std::cmp::Ordering::Equal {
             if read_idx != write_idx {
                 let (head, tail) = sorted.split_at_mut(read_idx * record_size);
                 let dest = &mut head[write_idx * record_size..(write_idx + 1) * record_size];
@@ -525,6 +525,45 @@ unsafe fn read_text_cell(rec: *const u8, off: usize) -> (*const u8, usize) {
     )
 }
 
+/// Total order on two records (`ra`, `rb`, same `attrs` layout) by walking
+/// `attrs`: scalar cells compare by their fixed-width bytes, `Text` cells by
+/// string *content* (not the `(ptr, len)` fat pointer). Two records compare
+/// `Equal` iff every cell is content-equal — the basis for [`coddl_relation_seal`]'s
+/// content-aware dedup. For an all-scalar record this is the old whole-record
+/// byte comparison.
+///
+/// # Safety
+/// `ra`/`rb` must each hold one record's bytes for `attrs`' layout; every
+/// `Text` cell's `(ptr, len)` must describe `len` readable bytes (or `len == 0`).
+unsafe fn record_cmp(ra: &[u8], rb: &[u8], attrs: &[CoddlAttrDesc]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for attr in attrs {
+        let off = attr.offset as usize;
+        let ord = if attr.kind == CoddlAttrKind::Text as u32 {
+            let (pa, la) = read_text_cell(ra.as_ptr(), off);
+            let (pb, lb) = read_text_cell(rb.as_ptr(), off);
+            let sa: &[u8] = if la == 0 {
+                &[]
+            } else {
+                std::slice::from_raw_parts(pa, la)
+            };
+            let sb: &[u8] = if lb == 0 {
+                &[]
+            } else {
+                std::slice::from_raw_parts(pb, lb)
+            };
+            sa.cmp(sb)
+        } else {
+            let w = cell_width(attr.kind);
+            ra[off..off + w].cmp(&rb[off..off + w])
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
 /// Project a relation onto a subset of its attributes. Returns a fresh
 /// RC-managed relation (rc=1) whose heading is `dst_desc` — the kept
 /// attributes — with each record's cells copied from the source by
@@ -798,6 +837,50 @@ mod tests {
             // Records sorted ascending.
             assert_eq!(std::ptr::read(slot(0)), 1);
             assert_eq!(std::ptr::read(slot(1)), 2);
+            coddl_rc_release(payload);
+        }
+    }
+
+    #[test]
+    fn seal_dedups_text_by_content_not_pointer() {
+        // Two records with equal Text content but DIFFERENT pointers (distinct
+        // heap allocations) must dedup to one. A whole-record byte compare would
+        // see the fat pointers differ and keep both — this is the hazard that
+        // would make `union`'s concat+seal return a duplicate tuple.
+        // Heading {name: Text}: name@0 (ptr@0, len@8); record_size 16.
+        let attrs = [CoddlAttrDesc {
+            name: b"name".as_ptr(),
+            name_len: 4,
+            kind: CoddlAttrKind::Text as u32,
+            offset: 0,
+        }];
+        let desc = CoddlHeadingDesc {
+            attr_count: 1,
+            record_size: 16,
+            attrs: attrs.as_ptr(),
+        };
+        let grace_a: Vec<u8> = b"Grace".to_vec();
+        let grace_b: Vec<u8> = b"Grace".to_vec();
+        assert_ne!(grace_a.as_ptr(), grace_b.as_ptr());
+        unsafe {
+            let payload = coddl_rc_alloc(
+                2 * 16,
+                2,
+                CoddlKind::Relation as u32,
+                &desc as *const CoddlHeadingDesc,
+            );
+            assert!(!payload.is_null());
+            let write_row = |rec: *mut u8, s: &[u8]| {
+                std::ptr::write(rec as *mut usize, s.as_ptr() as usize);
+                std::ptr::write(rec.add(8) as *mut usize, s.len());
+            };
+            write_row(payload, &grace_a);
+            write_row(payload.add(16), &grace_b);
+            coddl_relation_seal(payload, &desc as *const CoddlHeadingDesc);
+            let header = payload.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*header).length, 1, "equal-content Text rows dedup to one");
+            let (ptr, len) = read_text_cell(payload, 0);
+            assert_eq!(std::slice::from_raw_parts(ptr, len), b"Grace");
             coddl_rc_release(payload);
         }
     }
