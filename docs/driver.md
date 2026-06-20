@@ -15,6 +15,7 @@ The driver is the user's first contact with Coddl. It calls into the frontend cr
 | `parse <file>`      | file or `-`   | rust-analyzer-style CST dump → stdout      | —                              |
 | `check <file>`      | file or `-`   | diagnostics → stderr                       | —                              |
 | `lower <file>`      | file or `-`   | ProcIR module's `Display` form → stdout    | —                              |
+| `explain <file>`    | file or `-`   | as-lowered RelIR + SQL per pushed query → stdout | —                        |
 | `emit-llvm <file>`  | file or `-`   | LLVM IR text → stdout                      | —                              |
 | `emit-obj <file>`   | file or `-`   | Cranelift object bytes → stdout (or `-o`)  | `-o <path>` optional           |
 | `compile <file>`    | file (or `-` with `-o`) | native binary at `<output>`     | `--backend=llvm`, `-o <basename>` |
@@ -24,6 +25,39 @@ The driver is the user's first contact with Coddl. It calls into the frontend cr
 Every subcommand exits `0` on success, `1` on I/O / compile failure,
 `2` on usage error (unknown flag, missing required argument), and
 forwards the compiled binary's exit code for `run`.
+
+
+## `explain`
+
+`explain` runs the pipeline through RelIR lowering and prints, for each
+relational expression the cut pushes to SQL, the **as-lowered RelIR tree**
+paired with the SQL it lowered to:
+
+```text
+query 1:
+  RelIR:
+    Project { keep: message }
+      Restrict { id = 1 }
+        RelvarRef Greetings { db: greetings, table: greetings }
+  SQL:
+    SELECT "message" FROM "greetings" WHERE "id" = ?
+```
+
+It is the *logical* (RelIR) view of a program's queries — what
+[`coddl-sqlemit`](sqlemit.md) consumes — not an optimized query plan. Two
+honest limits on the naming:
+
+- **Not optimized.** There is no logical optimizer yet, so the tree is the
+  shape lowering produced, before any rewrite.
+- **Not minimal Algebra A.** It is the hybrid RelIR: `join`/`times`/… collapse
+  to the A `And` core, but `Restrict`/`Project`/`Rename` are still the rich
+  sugar nodes, not reduced to the Appendix-A primitives (the
+  operators-as-relations desugaring [relir.md](relir.md) never materializes).
+
+Scope is the SQL-pushdown pathway only — relational subtrees evaluated
+in-process (materialized / `private` leaves) are not shown. `explain` discovers
+`.cd` companions for the plan exactly as `lower` does; with no pushable backend
+it prints `no relational expressions were pushed to SQL`.
 
 
 ## `compile` and `run`

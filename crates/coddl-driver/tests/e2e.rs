@@ -901,6 +901,41 @@ fn write_pushdown_fixtures(dir: &Path) -> (PathBuf, PathBuf) {
     (cd, db)
 }
 
+/// `coddl explain` is compile-time only (no runtime, no `run`): it dumps the
+/// as-lowered RelIR for each SQL-pushed relational expression, paired with the
+/// SQL it became. Assert the `project { message } (Greetings where id = 1)`
+/// program surfaces its RelIR tree (project over restrict over the relvar leaf)
+/// and the matching `SELECT`.
+#[test]
+fn explain_dumps_relir_tree_paired_with_its_sql() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (cd, _db) = write_pushdown_fixtures(tmp.path());
+
+    let out = coddl()
+        .args(["explain"])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl explain {:?} failed: stderr=\n{}",
+        cd,
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for needle in [
+        "Project { keep: message }",
+        "Restrict { id = 1 }",
+        "RelvarRef Greetings { db: greetings, table: greetings }",
+        r#"SELECT "message" FROM "greetings" WHERE "id" = ?"#,
+    ] {
+        assert!(
+            stdout.contains(needle),
+            "explain output missing {needle:?}; got:\n{stdout}"
+        );
+    }
+}
+
 /// Compile + run a self-owned relvar-rooted pushdown program on `backend`,
 /// pointing `CODDL_AUDIT_LOG` at a fresh per-run temp file, then assert the
 /// audit log proves the pushdown path ran: the program printed `hello world`,

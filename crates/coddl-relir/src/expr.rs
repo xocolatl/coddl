@@ -107,6 +107,23 @@ fn apply_rename(renames: &[(String, String)], name: &str) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
+/// Render a restriction predicate for `RelExpr::render` (e.g. `id = 1`).
+fn render_predicate(pred: &Predicate) -> String {
+    match pred {
+        Predicate::AttrEq { attr, value } => format!("{attr} = {}", render_literal(value)),
+    }
+}
+
+/// Render a scalar literal for `RelExpr::render`. `Text` is quoted so the
+/// rendered predicate is unambiguous; `Integer`/`Boolean` print bare.
+fn render_literal(lit: &Literal) -> String {
+    match lit {
+        Literal::Integer(n) => n.to_string(),
+        Literal::Text(s) => format!("{s:?}"),
+        Literal::Boolean(b) => b.to_string(),
+    }
+}
+
 /// A restriction predicate. Currently a single attribute-equals-literal test;
 /// this grows to comparisons, conjunction/disjunction, and attribute-vs-
 /// attribute tests as the surface `where` support grows.
@@ -183,6 +200,61 @@ impl RelExpr {
                 _ => StorageOrigin::Mixed,
             },
             RelExpr::MaterializedRelvar { .. } => StorageOrigin::Materialized,
+        }
+    }
+
+    /// Render this expression as an indented, multi-line RelIR tree for human
+    /// inspection (the `coddl explain` subcommand). No trailing newline.
+    ///
+    /// Honest naming: this is the **as-lowered RelIR** — the Algebra-A core
+    /// (`And`) plus the sugar nodes (`Restrict`/`Project`/`Rename`) that are
+    /// not yet reduced to the minimal A primitives (the operators-as-relations
+    /// desugaring `docs/relir.md` never materializes). It is not "optimized"
+    /// (there is no optimizer) and not minimal Algebra A.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        self.render_into(&mut out, 0);
+        out.truncate(out.trim_end().len());
+        out
+    }
+
+    fn render_into(&self, out: &mut String, depth: usize) {
+        use std::fmt::Write as _;
+        let pad = "  ".repeat(depth);
+        match self {
+            RelExpr::RelvarRef {
+                name,
+                database,
+                table_name,
+                ..
+            } => {
+                let _ = writeln!(out, "{pad}RelvarRef {name} {{ db: {database}, table: {table_name} }}");
+            }
+            RelExpr::MaterializedRelvar { name, .. } => {
+                let _ = writeln!(out, "{pad}MaterializedRelvar {name}");
+            }
+            RelExpr::Restrict { input, pred } => {
+                let _ = writeln!(out, "{pad}Restrict {{ {} }}", render_predicate(pred));
+                input.render_into(out, depth + 1);
+            }
+            RelExpr::Project { input, keep } => {
+                let _ = writeln!(out, "{pad}Project {{ keep: {} }}", keep.join(", "));
+                input.render_into(out, depth + 1);
+            }
+            RelExpr::Rename { input, renames } => {
+                let pairs = renames
+                    .iter()
+                    .map(|(old, new)| format!("{old} -> {new}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(out, "{pad}Rename {{ {pairs} }}");
+                input.render_into(out, depth + 1);
+            }
+            RelExpr::And { lhs, rhs } => {
+                let _ = writeln!(out, "{pad}And");
+                lhs.render_into(out, depth + 1);
+                rhs.render_into(out, depth + 1);
+            }
         }
     }
 
@@ -329,6 +401,42 @@ mod tests {
             Heading::new(vec![("message".to_string(), Type::Text)])
         );
         assert_eq!(r.origin(), StorageOrigin::RelvarRooted);
+    }
+
+    // ── render (coddl explain) ────────────────────────────────────────
+
+    #[test]
+    fn render_indents_the_tree_outermost_first() {
+        // project { message } (Greetings where id = 1)
+        let r = RelExpr::Project {
+            input: Box::new(RelExpr::Restrict {
+                input: Box::new(greetings()),
+                pred: id_eq_1(),
+            }),
+            keep: vec!["message".to_string()],
+        };
+        assert_eq!(
+            r.render(),
+            "Project { keep: message }\n  \
+             Restrict { id = 1 }\n    \
+             RelvarRef Greetings { db: greetings, table: greetings }"
+        );
+    }
+
+    #[test]
+    fn render_quotes_text_predicate_literals() {
+        let r = RelExpr::Restrict {
+            input: Box::new(greetings()),
+            pred: Predicate::AttrEq {
+                attr: "message".to_string(),
+                value: Literal::Text("hi".to_string()),
+            },
+        };
+        assert!(
+            r.render().contains(r#"Restrict { message = "hi" }"#),
+            "text literals render quoted: {}",
+            r.render()
+        );
     }
 
     // ── DISTINCT-elision analyses ─────────────────────────────────────

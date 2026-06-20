@@ -23,4 +23,4 @@ pub use ir::{
     PublicRelvarBinding, ScalarOp, Terminator, Type, ValueId,
 };
 pub use layout::{cell_kind, cell_width, kind_tag, record_layout, AttrLayout, RecordLayout};
-pub use lower::{lower, lower_with_plan, LowerOutput};
+pub use lower::{explain_with_plan, lower, lower_with_plan, ExplainEntry, LowerOutput};

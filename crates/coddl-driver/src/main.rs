@@ -22,6 +22,7 @@ fn main() -> ExitCode {
         Some("check") => cmd_check(&args[2..]),
         Some("plan") => cmd_plan(&args[2..]),
         Some("lower") => cmd_lower(&args[2..]),
+        Some("explain") => cmd_explain(&args[2..]),
         Some("emit-llvm") => cmd_emit_llvm(&args[2..]),
         Some("emit-obj") => cmd_emit_obj(&args[2..]),
         Some("compile") => cmd_compile(&args[2..]),
@@ -39,6 +40,8 @@ fn main() -> ExitCode {
             eprintln!("  plan <file>          discover .cd companions, validate the chain,");
             eprintln!("                       dump the resolved Plan");
             eprintln!("  lower <file>         lower <file> to ProcIR and dump it");
+            eprintln!("  explain <file>       dump the as-lowered RelIR for each");
+            eprintln!("                       relational expression pushed to SQL");
             eprintln!("  emit-llvm <file>     emit LLVM IR text for <file>");
             eprintln!("  emit-obj <file>      emit a native object file via Cranelift");
             eprintln!("                       [-o <path>] writes to <path> (default stdout)");
@@ -335,6 +338,60 @@ fn cmd_lower(args: &[String]) -> ExitCode {
         let stdout = io::stdout();
         let mut w = stdout.lock();
         let _ = writeln!(w, "{module}");
+    }
+
+    if out.diagnostics.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        for d in &out.diagnostics {
+            eprintln!(
+                "{}: {} [{}] at {}..{}",
+                d.severity, d.message, d.code, d.span.start, d.span.end
+            );
+        }
+        ExitCode::from(1)
+    }
+}
+
+/// `coddl explain <file>` — dump the as-lowered RelIR for each relational
+/// expression the cut pushes to SQL, paired with the SQL it became. This is the
+/// logical (RelIR) view of the program's queries, not an optimized plan: there
+/// is no optimizer yet, and the tree is the hybrid A-core + sugar form, not
+/// minimal Algebra A. In-process relational evaluation is not covered.
+fn cmd_explain(args: &[String]) -> ExitCode {
+    let Some((source, kind)) = read_input(args, "explain") else {
+        return ExitCode::from(1);
+    };
+    if let Err(code) = require_cd(kind, "explain") {
+        return code;
+    }
+    let plan = discover_plan_for_input(args);
+    let out = coddl_procir::explain_with_plan(&source, FileId(0), plan.as_ref());
+
+    // `module` is `Some` exactly when the program is free of error-severity
+    // diagnostics (same gate `lower` uses); only then is the RelIR meaningful.
+    if out.module.is_some() {
+        let stdout = io::stdout();
+        let mut w = stdout.lock();
+        if out.relir.is_empty() {
+            let _ = writeln!(w, "no relational expressions were pushed to SQL");
+        } else {
+            let _ = writeln!(
+                w,
+                "as-lowered RelIR for {} relational expression(s) pushed to SQL:",
+                out.relir.len()
+            );
+            for (i, entry) in out.relir.iter().enumerate() {
+                let _ = writeln!(w);
+                let _ = writeln!(w, "query {}:", i + 1);
+                let _ = writeln!(w, "  RelIR:");
+                for line in entry.expr.render().lines() {
+                    let _ = writeln!(w, "    {line}");
+                }
+                let _ = writeln!(w, "  SQL:");
+                let _ = writeln!(w, "    {}", entry.sql);
+            }
+        }
     }
 
     if out.diagnostics.is_empty() {

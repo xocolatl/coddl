@@ -55,6 +55,21 @@ struct BuiltinExtern {
 pub struct LowerOutput {
     pub module: Option<Module>,
     pub diagnostics: Vec<Diagnostic>,
+    /// Each relvar-rooted relational subtree the cut pushed to SQL, paired
+    /// with the SQL it lowered to — populated only by [`explain_with_plan`]
+    /// (the `coddl explain` subcommand); always empty on the compile path so
+    /// normal lowering pays nothing.
+    pub relir: Vec<ExplainEntry>,
+}
+
+/// One pushed relational expression captured for `coddl explain`: the
+/// as-lowered RelIR tree and the SQL it became. Only successful pushdowns are
+/// captured — a successful push is a clean RelExpr root (the cut returns
+/// immediately, so no sub-expression is captured twice).
+#[derive(Debug, Clone)]
+pub struct ExplainEntry {
+    pub expr: RelExpr,
+    pub sql: String,
 }
 
 /// Tokenize, parse, type-check, and lower `source` to ProcIR.
@@ -74,6 +89,22 @@ pub fn lower(source: &str, file: FileId) -> LowerOutput {
 /// behavior matches the legacy `lower()` path: no relvar slots, no
 /// SQLite, no transaction externs.
 pub fn lower_with_plan(source: &str, file: FileId, plan: Option<&Plan>) -> LowerOutput {
+    lower_impl(source, file, plan, false)
+}
+
+/// Plan-aware lowering that also captures each pushed relational subtree's
+/// RelIR tree + emitted SQL into [`LowerOutput::relir`], for the `coddl
+/// explain` subcommand. Otherwise identical to [`lower_with_plan`].
+pub fn explain_with_plan(source: &str, file: FileId, plan: Option<&Plan>) -> LowerOutput {
+    lower_impl(source, file, plan, true)
+}
+
+fn lower_impl(
+    source: &str,
+    file: FileId,
+    plan: Option<&Plan>,
+    collect_relir: bool,
+) -> LowerOutput {
     let check_out = check(source, file, coddl_syntax::FileKind::Cd);
     let has_errors = check_out
         .diagnostics
@@ -83,15 +114,18 @@ pub fn lower_with_plan(source: &str, file: FileId, plan: Option<&Plan>) -> Lower
         return LowerOutput {
             module: None,
             diagnostics: check_out.diagnostics,
+            relir: Vec::new(),
         };
     }
     let root = Root::cast(check_out.tree).expect("parser always returns a Root");
     let mut lowerer = Lowerer::new(file);
+    lowerer.collect_relir = collect_relir;
     if let Some(plan) = plan {
         lowerer.absorb_plan(plan);
     }
     lowerer.absorb_private_relvars(&check_out.relvars);
     let module = lowerer.lower_root(&root);
+    let relir = std::mem::take(&mut lowerer.relir);
     // Merge in any diagnostics the lowerer itself emitted (e.g.
     // T0022 for captures in `where` predicates). If the lowerer
     // emitted error-severity diagnostics, the IR is unsafe to
@@ -102,6 +136,7 @@ pub fn lower_with_plan(source: &str, file: FileId, plan: Option<&Plan>) -> Lower
     LowerOutput {
         module: if lower_errored { None } else { Some(module) },
         diagnostics,
+        relir,
     }
 }
 
@@ -121,6 +156,14 @@ struct Lowerer {
     /// Lowering-time diagnostics. Merged into `LowerOutput::diagnostics`
     /// at the end of `lower()`.
     diagnostics: Vec<Diagnostic>,
+    /// When set, capture each pushed relational subtree's RelIR + SQL into
+    /// `relir` (for `coddl explain`). Off on the compile path, so normal
+    /// lowering never clones a `RelExpr`.
+    collect_relir: bool,
+    /// Pushed relational subtrees captured for `coddl explain`, in lowering
+    /// order. Empty unless `collect_relir` is set. Drained onto
+    /// `LowerOutput::relir`.
+    relir: Vec<ExplainEntry>,
     /// Counter for synthesized predicate function names
     /// (`__coddl_where_<n>`). Per-module; never reset.
     next_where: u32,
@@ -210,6 +253,8 @@ impl Lowerer {
             heading_ids: HashMap::new(),
             file,
             diagnostics: Vec::new(),
+            collect_relir: false,
+            relir: Vec::new(),
             next_where: 0,
             next_value: 0,
             next_block: 0,
@@ -950,6 +995,14 @@ impl Lowerer {
         let dialect = self.dialect?;
         let rel = self.build_rel_expr(expr)?;
         let query = crate::cut::try_push(&rel, dialect)?;
+        // For `coddl explain`: a successful push is a clean RelExpr root (the
+        // caller returns here, so no nested sub-expression is captured twice).
+        if self.collect_relir {
+            self.relir.push(ExplainEntry {
+                expr: rel.clone(),
+                sql: query.sql.text.clone(),
+            });
+        }
         Some(self.emit_query(query))
     }
 
@@ -2164,6 +2217,28 @@ oper main {}\n\
             .collect();
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         out.module.expect("module should be produced on clean check")
+    }
+
+    #[test]
+    fn explain_captures_pushed_relir_with_its_sql() {
+        let out = explain_with_plan(HELLO_WORLD_DB, FileId(0), Some(&greetings_plan()));
+        assert_eq!(out.relir.len(), 1, "one pushed query expected");
+        let entry = &out.relir[0];
+        assert_eq!(
+            entry.sql,
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?"#
+        );
+        assert_eq!(
+            entry.expr.render(),
+            "Restrict { id = 1 }\n  RelvarRef Greetings { db: greetings, table: greetings }"
+        );
+    }
+
+    #[test]
+    fn lower_does_not_capture_relir() {
+        // The compile path never clones a RelExpr — `relir` stays empty.
+        let out = lower_with_plan(HELLO_WORLD_DB, FileId(0), Some(&greetings_plan()));
+        assert!(out.relir.is_empty());
     }
 
     #[test]
