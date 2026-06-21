@@ -1,0 +1,41 @@
+// extend-replace.cd
+//
+// In-process twin of extend-replace-db.cd: the same `extend` and `replace`
+// operations, but over a `private relvar` populated in-process (no database),
+// so each query runs through the in-process engine instead of pushing to SQL.
+// Side by side, the two files show one surface language driving both engines.
+//
+//   R extend  { c: <expr> }   adds `c`, KEEPING every operand attribute
+//   R replace { c: <expr> }   adds `c`, CONSUMING the attributes <expr> reads
+//
+// A `private` relvar is local program state (RM Pre 14), so it is populated by
+// relational assignment (`R := <relation literal>`) — no transaction needed.
+// Money is integer cents. A relation is a set, so the printed tuple order is
+// unspecified.
+
+program extend_replace;
+
+private relvar Sales {
+    id: Integer,
+    customer: Text,
+    item: Text,
+    unit_cents: Integer,
+    qty: Integer,
+} key { id };
+
+oper main {} [
+    Sales := Relation {
+        { id: 1, customer: "ada", item: "widget", unit_cents: 500, qty: 3 },
+        { id: 2, customer: "bo",  item: "gadget", unit_cents: 800, qty: 2 },
+    };
+
+    // extend: add a computed `line_cents = unit_cents * qty`, KEEPING the
+    // inputs. The per-tuple multiply runs in-process.
+    let priced = Sales extend { line_cents: unit_cents * qty };
+    write_relation { rel: priced };
+
+    // replace (rename): id -> ref. The bare-attribute-reference form removes
+    // `id` and adds `ref`.
+    let reffed = Sales replace { ref: id };
+    write_relation { rel: reffed };
+];

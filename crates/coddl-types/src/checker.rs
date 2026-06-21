@@ -1100,6 +1100,7 @@ impl TypeChecker {
         for (name_tok, value) in ee.pairs() {
             let Some(name_tok) = name_tok else { continue };
             let name = name_tok.text();
+            let value_span = value.as_ref().map(|v| self.node_span(v.syntax()));
             let vty = match value {
                 Some(v) => self.check_expr(&v, scope),
                 None => Type::Unknown,
@@ -1109,6 +1110,20 @@ impl TypeChecker {
                     self.token_span(&name_tok),
                     "T0045",
                     format!("`extend` attribute `{name}` already exists in {heading}"),
+                );
+                continue;
+            }
+            // v1: only Integer and Text are representable as relation cells (the
+            // arithmetic→Integer / concatenation→Text scalars), so an extend
+            // value's type is restricted to those — both for the SQL push and
+            // the in-process path. Boolean/Character and non-scalar values await
+            // wider cell support.
+            if !matches!(vty, Type::Integer | Type::Text | Type::Unknown) {
+                let span = value_span.unwrap_or_else(|| self.token_span(&name_tok));
+                self.error(
+                    span,
+                    "T0046",
+                    format!("`extend` value for `{name}` must be Integer or Text, got {vty}"),
                 );
                 continue;
             }
@@ -3213,6 +3228,24 @@ mod tests {
     fn extend_value_unknown_attr_diagnoses_t0001() {
         let src = "oper main {} [ let s = Relation { {a: 1} } extend {c: nope + 1}; ];";
         assert!(codes(src).contains(&"T0001"));
+    }
+
+    #[test]
+    fn extend_boolean_value_diagnoses_t0046() {
+        // Only Integer/Text are representable as relation cells in v1; a
+        // Boolean-valued extend (a comparison) is rejected.
+        let src = "oper main {} [ let s = Relation { {a: 1, b: 2} } extend {c: a = b}; ];";
+        assert!(codes(src).contains(&"T0046"));
+    }
+
+    #[test]
+    fn extend_integer_and_text_values_clean() {
+        let src = "oper main {} [ \
+                   let _i = Relation { {a: 1} } extend {c: a * 2}; \
+                   let _t = Relation { {x: \"a\"} } extend {y: x || \"!\"}; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
     }
 
     // ── tclose ────────────────────────────────────────────────────────

@@ -315,6 +315,18 @@ fn declare_runtime_rc_externs(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert("coddl_text_eq".into(), id);
     }
+    // coddl_relation_extend(src, src_desc, result_desc, helper_fn) -> ptr
+    {
+        let mut sig = obj.make_signature();
+        for _ in 0..4 {
+            sig.params.push(AbiParam::new(ptr_ty));
+        }
+        sig.returns.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_relation_extend", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_relation_extend".into(), id);
+    }
     // coddl_relation_join(lhs, lhs_desc, rhs, rhs_desc, result_desc) -> ptr
     {
         let mut sig = obj.make_signature();
@@ -1476,6 +1488,50 @@ fn emit_inst(
                 builder
                     .ins()
                     .call(where_local, &[src_v, desc_val, pred_addr]);
+            let result = builder.inst_results(call)[0];
+            values.insert(*dst, ValueRepr::Scalar(result));
+            Ok(())
+        }
+        Inst::AttrStore {
+            record,
+            offset,
+            value,
+            attr_type: _,
+        } => {
+            let payload = scalar_value(values, record)?;
+            let repr = values.get(value).cloned().ok_or_else(|| {
+                CraneliftEmitError::UnsupportedInst(format!("undefined value {value:?} in AttrStore"))
+            })?;
+            store_attr(builder, payload, *offset as i32, &repr)
+        }
+        Inst::Extend {
+            dst,
+            src,
+            helper_linkage,
+            src_heading_id,
+            result_heading_id,
+        } => {
+            let src_v = scalar_value(values, src)?;
+            let ptr_ty = obj.target_config().pointer_type();
+            let src_desc_gv =
+                obj.declare_data_in_func(heading_desc_ids[src_heading_id.0 as usize], builder.func);
+            let src_desc_val = builder.ins().symbol_value(ptr_ty, src_desc_gv);
+            let res_desc_gv = obj
+                .declare_data_in_func(heading_desc_ids[result_heading_id.0 as usize], builder.func);
+            let res_desc_val = builder.ins().symbol_value(ptr_ty, res_desc_gv);
+            let helper_id = *funcs.get(helper_linkage).ok_or_else(|| {
+                CraneliftEmitError::UnsupportedInst(format!(
+                    "unresolved extend helper {helper_linkage}"
+                ))
+            })?;
+            let helper_ref = obj.declare_func_in_func(helper_id, builder.func);
+            let helper_addr = builder.ins().func_addr(ptr_ty, helper_ref);
+            let extend_id = funcs["coddl_relation_extend"];
+            let extend_local = obj.declare_func_in_func(extend_id, builder.func);
+            let call = builder.ins().call(
+                extend_local,
+                &[src_v, src_desc_val, res_desc_val, helper_addr],
+            );
             let result = builder.inst_results(call)[0];
             values.insert(*dst, ValueRepr::Scalar(result));
             Ok(())

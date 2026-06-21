@@ -336,12 +336,15 @@ each `parse_<x>` has a corresponding `check_<x>`.
   a general scalar expression typechecked in a scope with `H`'s attributes
   injected (the same machinery `where` uses), so it may reference the operand's
   attributes. The new name `c` must not collide with an existing attribute or
-  another `extend` target (T0045). The result is `Type::Relation(H')` where `H'`
-  is `H` plus each `(c, type_of e)`, canonically re-sorted. A relvar-rooted
-  operand with arithmetic/concatenation values pushes to SQL (a computed
-  `(<e>) AS "c"` column); other cases (an in-memory operand, or a value the SQL
-  renderer can't express yet) are reported by the **lowerer** with T0046 until
-  in-process `extend` lands.
+  another `extend` target (T0045). Each value's type is restricted to **Integer
+  or Text** — the only types representable as relation cells in v1 (T0046
+  otherwise; Boolean/Character and non-scalar values await wider cell support).
+  The result is `Type::Relation(H')` where `H'` is `H` plus each `(c, type_of
+  e)`, canonically re-sorted. A relvar-rooted operand pushes to SQL (a computed
+  `(<e>) AS "c"` column); a materialized operand (relation literal / private
+  relvar) computes the column **in-process** — the lowerer synthesizes a
+  per-tuple helper `fn(src_record, dst_record)` that writes the widened record,
+  driven by the runtime's `coddl_relation_extend`.
 
 
 ## Transaction-scoped public-relvar access (Phase 22)
@@ -432,4 +435,4 @@ check script enforces that.
 | T0043 | arithmetic operator (`+`, `-`, `*`, `/`) requires Integer operands |
 | T0044 | `||` requires Text or Character operands |
 | T0045 | `extend` attribute already exists / duplicate `extend` target |
-| T0046 | `extend` not supported here yet (lowerer; relvar-rooted + renderable-only in v1) |
+| T0046 | `extend` value must be Integer or Text (v1 relation-cell support) |

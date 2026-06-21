@@ -684,6 +684,64 @@ pub unsafe extern "C" fn coddl_relation_where(
     out
 }
 
+/// Build a widened relation by computing one or more new attributes per tuple
+/// (surface `extend`). For each source record, `synth_fn(src_record,
+/// dst_record)` fills the **entire** destination (result-heading) record — the
+/// surviving source cells permuted to their result offsets, plus the computed
+/// new cells — so this function stays oblivious to the layout (the synthesized
+/// helper owns it). The result is re-sealed, because computing a column can
+/// change sort order and can collapse formerly-distinct rows into duplicates
+/// (RM Pro 3). `src` is left unchanged.
+///
+/// Computed `Text` cells written by `synth_fn` (e.g. from `coddl_text_concat`)
+/// inherit the scalar-Text leak documented in `docs/memory.md`; surviving
+/// source `Text` cells are shared by value (no retain), matching `rename`.
+///
+/// # Safety
+/// `src` must point to a `Relation` payload whose header descriptor matches
+/// `src_desc`. `result_desc` must describe the widened heading. `synth_fn` must
+/// be safe to call with a readable source record and a writable
+/// `result_desc.record_size`-byte destination record.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_relation_extend(
+    src: *const u8,
+    src_desc: *const CoddlHeadingDesc,
+    result_desc: *const CoddlHeadingDesc,
+    synth_fn: extern "C" fn(*const u8, *mut u8),
+) -> *mut u8 {
+    if src.is_null() || src_desc.is_null() || result_desc.is_null() {
+        return std::ptr::null_mut();
+    }
+    let header = src.sub(HEADER_SIZE) as *const CoddlRcHeader;
+    let count = (*header).length as usize;
+    let src_record_size = (*src_desc).record_size as usize;
+    let result_record_size = (*result_desc).record_size as usize;
+
+    let out = crate::rc::coddl_rc_alloc(
+        result_record_size * count,
+        count as u32,
+        crate::rc::CoddlKind::Relation as u32,
+        result_desc,
+    );
+    if out.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    // Each helper call fills one full widened record from its source record.
+    for i in 0..count {
+        let src_record = src.add(i * src_record_size);
+        let dst_record = out.add(i * result_record_size);
+        (synth_fn)(src_record, dst_record);
+    }
+
+    // Re-seal: extend changes record content, so the sorted order may break and
+    // distinct source rows may now coincide. `seal` sorts + content-aware
+    // dedups and trims the header length.
+    coddl_relation_seal(out, result_desc);
+
+    out
+}
+
 /// Compare two text values for byte-exact equality. Returns `1` when the two
 /// `(ptr, len)` slices are equal, `0` otherwise. This is the in-process
 /// counterpart to the SQL backend's `=` on Text: a compiled `where` predicate
@@ -1888,6 +1946,57 @@ mod tests {
             assert_eq!(read(0, 8), 2, "z == a of the {{a:2}} row");
             assert_eq!(read(1, 0), 5, "b");
             assert_eq!(read(1, 8), 1, "z == a of the {{a:1}} row");
+
+            coddl_rc_release(out);
+            coddl_rc_release(s);
+        }
+    }
+
+    /// Helper used by `extend_widens_and_computes`: fills the widened record
+    /// for source `{a, b}` → result `{a, b, c}` with `c = a + b`. Result order
+    /// is canonical (a@0, b@8, c@16); the source layout is a@0, b@8.
+    extern "C" fn extend_c_eq_a_plus_b(src: *const u8, dst: *mut u8) {
+        unsafe {
+            let a = std::ptr::read(src.add(0) as *const i64);
+            let b = std::ptr::read(src.add(8) as *const i64);
+            std::ptr::write(dst.add(0) as *mut i64, a);
+            std::ptr::write(dst.add(8) as *mut i64, b);
+            std::ptr::write(dst.add(16) as *mut i64, a + b);
+        }
+    }
+
+    #[test]
+    fn extend_widens_and_computes() {
+        // {a, b} extend {c: a + b} → {a, b, c}. The helper fills each widened
+        // record; the runtime allocates, loops, and re-seals.
+        let src_attrs = [
+            CoddlAttrDesc { name: b"a".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 0 },
+            CoddlAttrDesc { name: b"b".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 8 },
+        ];
+        let src_desc = CoddlHeadingDesc { attr_count: 2, record_size: 16, attrs: src_attrs.as_ptr() };
+        // result {a, b, c}: a@0, b@8, c@16.
+        let res_attrs = [
+            CoddlAttrDesc { name: b"a".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 0 },
+            CoddlAttrDesc { name: b"b".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 8 },
+            CoddlAttrDesc { name: b"c".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 16 },
+        ];
+        let res_desc = CoddlHeadingDesc { attr_count: 3, record_size: 24, attrs: res_attrs.as_ptr() };
+        unsafe {
+            let s = coddl_rc_alloc(2 * 16, 2, CoddlKind::Relation as u32, &src_desc);
+            // sealed input: {a:1,b:2}, {a:3,b:1}
+            std::ptr::write(s.add(0) as *mut i64, 1);
+            std::ptr::write(s.add(8) as *mut i64, 2);
+            std::ptr::write(s.add(16) as *mut i64, 3);
+            std::ptr::write(s.add(24) as *mut i64, 1);
+
+            let out = coddl_relation_extend(s, &src_desc, &res_desc, extend_c_eq_a_plus_b);
+            assert!(!out.is_null());
+            let header = out.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*header).length, 2, "two distinct widened rows");
+            let read = |row: usize, off: usize| std::ptr::read(out.add(row * 24 + off) as *const i64);
+            // sorted by (a, b, c): {1, 2, 3} then {3, 1, 4}
+            assert_eq!((read(0, 0), read(0, 8), read(0, 16)), (1, 2, 3));
+            assert_eq!((read(1, 0), read(1, 8), read(1, 16)), (3, 1, 4));
 
             coddl_rc_release(out);
             coddl_rc_release(s);

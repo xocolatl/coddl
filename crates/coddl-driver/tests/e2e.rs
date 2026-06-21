@@ -1256,27 +1256,71 @@ fn extend_pushdown_audit_cranelift() {
     assert_extend_pushdown("cranelift");
 }
 
-#[test]
-fn extend_over_in_memory_relation_fails_with_t0046() {
-    // v1 supports `extend` only via SQL pushdown; a materialized operand has no
-    // in-process path yet, so it fails to compile with T0046.
+/// Run a materialized (in-memory) `extend` on `backend` and return stdout: an
+/// Integer arithmetic extend over a relation literal, then a Text concatenation
+/// extend — both computed per-tuple in-process.
+fn run_in_process_extend(backend: &str) -> Vec<u8> {
     ensure_runtime_built();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let cd = tmp.path().join("matext.cd");
+    let cd = tmp.path().join("inproc-extend.cd");
     std::fs::write(
         &cd,
-        "program p;\noper main {} [ let _s = Relation { {a: 1, b: 2} } extend {c: a + b}; ];\n",
+        "program p;\n\
+         oper main {} [\n\
+             let s = Relation { {a: 1, b: 2}, {a: 3, b: 1} } extend { sum: a + b };\n\
+             write_relation { rel: s };\n\
+             let t = Relation { {x: \"wid\", y: \"get\"} } extend { word: x || y };\n\
+             write_relation { rel: t };\n\
+         ];\n",
     )
-    .expect("write matext.cd");
+    .expect("write inproc-extend.cd");
+    let out = coddl()
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "in-process extend on {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+#[test]
+fn extend_in_process_computes_integer_and_text() {
+    let expected = sorted_tuples(&[
+        "{a: 1, b: 2, sum: 3}",
+        "{a: 3, b: 1, sum: 4}",
+        r#"{word: "widget", x: "wid", y: "get"}"#,
+    ]);
+    for backend in ["llvm", "cranelift"] {
+        assert_eq!(
+            tuple_lines(&run_in_process_extend(backend)),
+            expected,
+            "in-process extend output on {backend}"
+        );
+    }
+}
+
+#[test]
+fn extend_boolean_value_fails_with_t0046() {
+    // Only Integer/Text are representable as relation cells in v1; a Boolean
+    // (comparison) value is rejected at typecheck.
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cd = tmp.path().join("boolext.cd");
+    std::fs::write(
+        &cd,
+        "program p;\noper main {} [ let _s = Relation { {a: 1, b: 2} } extend {c: a = b}; ];\n",
+    )
+    .expect("write boolext.cd");
     let out = coddl()
         .args(["run", "--backend=llvm"])
         .arg(&cd)
         .output()
         .expect("spawn coddl");
-    assert!(
-        !out.status.success(),
-        "materialized extend should fail to compile"
-    );
+    assert!(!out.status.success(), "Boolean-valued extend should fail");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("T0046"),
         "expected T0046, got stderr:\n{}",

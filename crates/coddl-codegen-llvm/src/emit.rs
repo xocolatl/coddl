@@ -246,6 +246,12 @@ impl Emitter {
         // Phase 20 `where`: takes (src, desc, pred_fn) and returns
         // a fresh relation pointer (rc=1).
         writeln!(self.body, "declare ptr @coddl_relation_where(ptr, ptr, ptr)").unwrap();
+        // `extend`: (src, src_desc, result_desc, helper_fn) -> rc=1 ptr.
+        writeln!(
+            self.body,
+            "declare ptr @coddl_relation_extend(ptr, ptr, ptr, ptr)"
+        )
+        .unwrap();
         // `project`: takes (src, src_desc, result_desc) and returns a
         // fresh narrowed + sealed relation pointer (rc=1).
         writeln!(self.body, "declare ptr @coddl_relation_project(ptr, ptr, ptr)").unwrap();
@@ -747,12 +753,41 @@ impl Emitter {
                 offset,
                 attr_type,
             } => self.lower_attr_load(*dst, src, *offset, attr_type),
+            Inst::AttrStore {
+                record,
+                offset,
+                value,
+                attr_type: _,
+            } => {
+                let base = self.scalar_op(record)?;
+                let repr = self
+                    .values
+                    .get(value)
+                    .ok_or_else(|| {
+                        LlvmEmitError::UnsupportedInst(format!("undefined value {value:?} in AttrStore"))
+                    })?
+                    .clone();
+                self.emit_attr_store(&base, *offset as usize, &repr)
+            }
             Inst::Where {
                 dst,
                 src,
                 predicate_linkage,
                 heading_id,
             } => self.lower_where_inst(*dst, src, predicate_linkage, *heading_id),
+            Inst::Extend {
+                dst,
+                src,
+                helper_linkage,
+                src_heading_id,
+                result_heading_id,
+            } => self.lower_extend_inst(
+                *dst,
+                src,
+                helper_linkage,
+                *src_heading_id,
+                *result_heading_id,
+            ),
             Inst::Project {
                 dst,
                 src,
@@ -1347,6 +1382,32 @@ impl Emitter {
             self.body,
             "    {name} = call ptr @coddl_relation_where(ptr {src_op}, ptr @.heading.{}, ptr @{predicate_linkage})",
             heading_id.0,
+        )
+        .unwrap();
+        self.values.insert(
+            dst,
+            ValueRepr::Scalar {
+                ty: "ptr".to_string(),
+                op: name,
+            },
+        );
+        Ok(())
+    }
+
+    fn lower_extend_inst(
+        &mut self,
+        dst: ValueId,
+        src: &ValueId,
+        helper_linkage: &str,
+        src_heading_id: HeadingId,
+        result_heading_id: HeadingId,
+    ) -> Result<(), LlvmEmitError> {
+        let src_op = self.scalar_op(src)?;
+        let name = format!("%v{}", dst.0);
+        writeln!(
+            self.body,
+            "    {name} = call ptr @coddl_relation_extend(ptr {src_op}, ptr @.heading.{}, ptr @.heading.{}, ptr @{helper_linkage})",
+            src_heading_id.0, result_heading_id.0,
         )
         .unwrap();
         self.values.insert(

@@ -262,6 +262,19 @@ pub enum Inst {
         offset: u32,
         attr_type: ProcType,
     },
+    /// Store one scalar into a record cell at the static byte offset — the dual
+    /// of [`Inst::AttrLoad`]. Used inside an `extend` helper to write the
+    /// widened record's cells (surviving operand attributes and computed new
+    /// ones). `record` is the destination record pointer; `value` is the scalar
+    /// to store; `attr_type` is its machine-level type (Integer or Text).
+    /// Defines no SSA value. Backends emit a byte-offset `getelementptr` +
+    /// `store` (Text stores the `(ptr, len)` pair at `offset` / `offset + 8`).
+    AttrStore {
+        record: ValueId,
+        offset: u32,
+        value: ValueId,
+        attr_type: ProcType,
+    },
     /// Restrict a relation by a predicate. `predicate_linkage` is the
     /// linkage name of a synthesized helper function with C ABI
     /// `fn(*const u8) -> i8` (non-zero = keep). Backends emit a call
@@ -273,6 +286,20 @@ pub enum Inst {
         src: ValueId,
         predicate_linkage: String,
         heading_id: HeadingId,
+    },
+    /// Extend a relation with computed attributes (surface `extend`), run
+    /// in-process. `helper_linkage` is the linkage name of a synthesized helper
+    /// with C ABI `fn(*const u8 src_record, *mut u8 dst_record)` that fills the
+    /// whole widened record (surviving cells permuted to result offsets + new
+    /// computed cells). Backends emit a call to `coddl_relation_extend(src,
+    /// &src_descriptor, &result_descriptor, &helper)`. `src_heading_id` /
+    /// `result_heading_id` index the per-module heading table.
+    Extend {
+        dst: ValueId,
+        src: ValueId,
+        helper_linkage: String,
+        src_heading_id: HeadingId,
+        result_heading_id: HeadingId,
     },
     /// Project a relation onto a subset of its attributes (surface
     /// `project`), run in-process. Backends emit a call to
@@ -646,6 +673,12 @@ impl fmt::Display for Inst {
                 offset,
                 attr_type,
             } => write!(f, "{dst} = attr_load {src}+{offset} : {attr_type}"),
+            Inst::AttrStore {
+                record,
+                offset,
+                value,
+                attr_type,
+            } => write!(f, "attr_store {record}+{offset} = {value} : {attr_type}"),
             Inst::Where {
                 dst,
                 src,
@@ -655,6 +688,17 @@ impl fmt::Display for Inst {
                 f,
                 "{dst} = where {src} by {predicate_linkage} heading_{}",
                 heading_id.0
+            ),
+            Inst::Extend {
+                dst,
+                src,
+                helper_linkage,
+                src_heading_id,
+                result_heading_id,
+            } => write!(
+                f,
+                "{dst} = extend {src} by {helper_linkage} heading_{} -> heading_{}",
+                src_heading_id.0, result_heading_id.0
             ),
             Inst::Project {
                 dst,

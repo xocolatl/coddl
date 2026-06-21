@@ -167,6 +167,9 @@ struct Lowerer {
     /// Counter for synthesized predicate function names
     /// (`__coddl_where_<n>`). Per-module; never reset.
     next_where: u32,
+    /// Counter for synthesized `extend` helper names
+    /// (`__coddl_extend_<n>`). Per-module; never reset.
+    next_extend: u32,
     // Per-function state, reset on each `lower_oper_decl`.
     next_value: u32,
     next_block: u32,
@@ -256,6 +259,7 @@ impl Lowerer {
             collect_relir: false,
             relir: Vec::new(),
             next_where: 0,
+            next_extend: 0,
             next_value: 0,
             next_block: 0,
             insts: Vec::new(),
@@ -937,27 +941,146 @@ impl Lowerer {
         dst
     }
 
-    /// Lower an `extend` the cut declined to push. v1 supports `extend` only
-    /// via SQL pushdown — a relvar-rooted operand with arithmetic/concatenation
-    /// values — so reaching here means the operand is an in-memory relation
-    /// (or the value uses something not yet renderable). In-process `extend`
-    /// lands in a later step; for now report the limitation (which makes the
-    /// module `None`) rather than emit a wrong relation. The operand is lowered
-    /// so its `ValueId` (a `ProcType::Relation`) can be returned, keeping value
-    /// types consistent for the rest of the discarded lowering pass.
+    /// Lower `R extend { c: e, … }` the cut declined to push — i.e. over an
+    /// in-memory relation (a relation literal, a private relvar, or a fetched
+    /// relvar whose value didn't render to SQL). Mirror `lower_where_expr`:
+    /// synthesize a helper `__coddl_extend_<n>(src_record, dst_record)` that
+    /// loads the operand cells, computes each new value, and writes the whole
+    /// widened record into `dst`; then emit `Inst::Extend`. The typechecker
+    /// restricts extend values to Integer or Text (T0046), so every new cell
+    /// has a supported relation-cell layout.
     fn lower_extend_expr(&mut self, e: &ExtendExpr) -> ValueId {
+        // 1. Lower the operand in the enclosing function's scope.
         let src = e
             .input()
             .map(|i| self.lower_expr(&i))
-            .unwrap_or_else(|| self.fresh_value());
-        self.diagnostics.push(Diagnostic::error(
-            self.node_span(e.syntax()),
-            "T0046",
-            "`extend` is not supported here yet — it currently requires a stored \
-             (relvar-rooted) operand with arithmetic/concatenation values that push to SQL"
-                .to_string(),
-        ));
-        src
+            .expect("typechecked extend has a relation operand");
+        let src_heading_id = match self.value_type(src) {
+            ProcType::Relation(id) => id,
+            other => unreachable!("extend on non-relation `{other}` survived typecheck"),
+        };
+        let src_heading = self.headings[src_heading_id.0 as usize].clone();
+        let src_layout = crate::layout::record_layout(&src_heading);
+
+        // 2. Mint a fresh helper name.
+        let helper_name = format!("__coddl_extend_{}", self.next_extend);
+        self.next_extend += 1;
+
+        // 3. Snapshot enclosing per-function state; install fresh helper state.
+        //    Stash outer locals so a value referencing an enclosing `let`
+        //    triggers the T0022 capture diagnostic (same as `where`).
+        let saved_next_value = std::mem::replace(&mut self.next_value, 0);
+        let saved_next_block = std::mem::replace(&mut self.next_block, 0);
+        let saved_insts = std::mem::take(&mut self.insts);
+        let saved_locals = std::mem::replace(&mut self.locals, vec![HashMap::new()]);
+        let saved_aliases = std::mem::replace(&mut self.relexpr_aliases, vec![HashMap::new()]);
+        let saved_value_types = std::mem::take(&mut self.value_types);
+        self.outer_locals_for_capture = Some(saved_locals.clone());
+
+        // 4. Helper params: `src_record` (ValueId 0), `dst_record` (ValueId 1).
+        let block_id = self.fresh_block();
+        let src_ptr = self.fresh_value();
+        self.record_type(src_ptr, ProcType::Pointer);
+        let dst_ptr = self.fresh_value();
+        self.record_type(dst_ptr, ProcType::Pointer);
+
+        // 5. AttrLoad each operand cell from `src_ptr`; bind so value `NameRef`s
+        //    resolve. Remember the loaded value per name for the store step.
+        let mut cell_value: HashMap<String, (ValueId, ProcType)> = HashMap::new();
+        for attr in &src_layout.attrs {
+            let attr_type = proc_type_from_kind(attr.kind);
+            let dst = self.fresh_value();
+            self.record_type(dst, attr_type.clone());
+            self.insts.push(Inst::AttrLoad {
+                dst,
+                src: src_ptr,
+                offset: attr.offset,
+                attr_type: attr_type.clone(),
+            });
+            self.bind_local(attr.name.clone(), dst, attr_type.clone());
+            cell_value.insert(attr.name.clone(), (dst, attr_type));
+        }
+
+        // 6. Lower each new value expression; collect its `(name, value, type)`.
+        let mut result_attrs: Vec<(String, Type)> = src_heading.attrs().to_vec();
+        for (name_tok, value) in e.pairs() {
+            let name = name_tok
+                .expect("typechecked extend pair has a name")
+                .text()
+                .to_string();
+            let v = value
+                .map(|ve| self.lower_expr(&ve))
+                .expect("typechecked extend pair has a value");
+            let pt = self.value_type(v);
+            result_attrs.push((name.clone(), type_from_proc(&pt)));
+            cell_value.insert(name, (v, pt));
+        }
+
+        // 7. Result heading + layout (canonically re-sorted with the new attrs).
+        let result_heading = Heading::new(result_attrs);
+        let result_heading_id = self.intern_heading(&result_heading);
+        let result_layout = crate::layout::record_layout(&result_heading);
+
+        // 8. AttrStore each result cell into `dst_ptr` at its result offset —
+        //    surviving operand attrs (their loaded value) and new ones alike.
+        for attr in &result_layout.attrs {
+            let (value, pt) = cell_value
+                .get(&attr.name)
+                .expect("every result attribute has a computed value")
+                .clone();
+            self.insts.push(Inst::AttrStore {
+                record: dst_ptr,
+                offset: attr.offset,
+                value,
+                attr_type: pt,
+            });
+        }
+
+        // 9. Close the helper (void return, two pointer params).
+        let block = BasicBlock {
+            id: block_id,
+            insts: std::mem::take(&mut self.insts),
+            terminator: Terminator::Return(None),
+        };
+        self.functions.push(Function {
+            name: helper_name.clone(),
+            linkage_name: helper_name.clone(),
+            params: vec![
+                ("src_record".to_string(), ProcType::Pointer),
+                ("dst_record".to_string(), ProcType::Pointer),
+            ],
+            return_type: ProcType::Unit,
+            blocks: vec![block],
+        });
+
+        // 10. Restore the enclosing function's state.
+        self.next_value = saved_next_value;
+        self.next_block = saved_next_block;
+        self.insts = saved_insts;
+        self.locals = saved_locals;
+        self.relexpr_aliases = saved_aliases;
+        self.value_types = saved_value_types;
+        self.outer_locals_for_capture = None;
+
+        // 11. Emit Inst::Extend in the enclosing function.
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Relation(result_heading_id));
+        self.insts.push(Inst::Extend {
+            dst,
+            src,
+            helper_linkage: helper_name,
+            src_heading_id,
+            result_heading_id,
+        });
+        // Release the source if no local owns it (same balancing as `where`).
+        let src_owned = self
+            .locals
+            .iter()
+            .any(|layer| layer.values().any(|(vid, _)| *vid == src));
+        if !src_owned {
+            self.insts.push(Inst::Release { src });
+        }
+        dst
     }
 
     /// Lower a `project` whose operand the cut declined to push — i.e. an
@@ -3039,17 +3162,40 @@ oper main {} [
     }
 
     #[test]
-    fn extend_over_relation_literal_diagnoses_t0046() {
-        // A materialized operand has no in-process extend path yet → T0046,
-        // and the module is dropped.
+    fn extend_over_relation_literal_lowers_in_process() {
+        // A materialized operand lowers to `Inst::Extend` plus a synthesized
+        // `__coddl_extend_<n>` helper (two pointer params, void return).
         let src = "oper main {} [ let _s = Relation { {a: 1, b: 2} } extend {c: a + b}; ];";
         let out = lower(src, FileId(0));
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let m = out.module.expect("module");
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
         assert!(
-            out.diagnostics.iter().any(|d| d.code == "T0046"),
-            "expected T0046, got {:?}",
-            out.diagnostics
+            main.blocks[0]
+                .insts
+                .iter()
+                .any(|i| matches!(i, Inst::Extend { .. })),
+            "main emits Inst::Extend"
         );
-        assert!(out.module.is_none(), "module should be None on T0046");
+        let helper = m
+            .functions
+            .iter()
+            .find(|f| f.name.starts_with("__coddl_extend_"))
+            .expect("synthesized extend helper");
+        assert_eq!(helper.params.len(), 2, "helper has src + dst pointer params");
+        assert_eq!(helper.return_type, ProcType::Unit);
+        // The helper computes `a + b` (a ScalarOp::Add) and stores cells.
+        let insts = &helper.blocks[0].insts;
+        assert!(
+            insts
+                .iter()
+                .any(|i| matches!(i, Inst::ScalarOp { op: ScalarOp::Add, .. })),
+            "helper computes a + b"
+        );
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::AttrStore { .. })),
+            "helper stores the widened cells"
+        );
     }
 
     #[test]
