@@ -10,16 +10,12 @@ backend sqlite {
     file: "shifts.sqlite",
 };
 
+// Every attribute maps to a same-named column, so the columns blocks use the
+// bare-name shorthand (`columns: { a, b }` ≡ `columns: { a: "a", b: "b" }`).
 relvar Morning: table "morning" {
-    columns: {
-        id:   "id",
-        name: "name",
-    },
+    columns: { id, name }
 };
 
 relvar Evening: table "evening" {
-    columns: {
-        id:   "id",
-        name: "name",
-    },
+    columns: { id, name }
 };

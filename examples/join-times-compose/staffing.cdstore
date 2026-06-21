@@ -10,29 +10,20 @@ backend sqlite {
     file: "staffing.sqlite",
 };
 
+// Every attribute maps to a same-named column, so the columns blocks use the
+// bare-name shorthand (`columns: { a, b }` ≡ `columns: { a: "a", b: "b" }`).
 relvar Employees: table "employees" {
-    columns: {
-        emp_id:   "emp_id",
-        emp_name: "emp_name",
-        dept_id:  "dept_id",
-    },
+    columns: { emp_id, emp_name, dept_id }
 };
 
 relvar Departments: table "departments" {
-    columns: {
-        dept_id:   "dept_id",
-        dept_name: "dept_name",
-    },
+    columns: { dept_id, dept_name }
 };
 
 relvar JobTitles: table "job_titles" {
-    columns: {
-        title: "title",
-    },
+    columns: { title }
 };
 
 relvar Locations: table "locations" {
-    columns: {
-        location: "location",
-    },
+    columns: { location }
 };

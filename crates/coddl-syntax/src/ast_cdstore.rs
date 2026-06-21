@@ -89,9 +89,20 @@ impl ColumnsBlock {
 ast_node!(pub CdstoreField, CDSTORE_FIELD);
 
 impl CdstoreField {
-    /// The field name (LHS of `:`).
+    /// The field name (LHS of `:`, or the whole field in shorthand form).
     pub fn name(&self) -> Option<SyntaxToken> {
         ast::first_token_of_kind(&self.syntax, SyntaxKind::IDENT)
+    }
+
+    /// True when this is the columns-block shorthand `<name>` (no `:` value):
+    /// the column name equals the attribute name. Detected by the absence of a
+    /// `:` token, so it's distinct from a colon-present field whose value the
+    /// parser recovered past.
+    pub fn is_shorthand(&self) -> bool {
+        !self
+            .syntax
+            .children_with_tokens()
+            .any(|el| el.kind() == SyntaxKind::COLON)
     }
 
     /// The field value.
@@ -233,5 +244,36 @@ mod tests {
         let fields: Vec<_> = cols.fields().collect();
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].name().unwrap().text(), "id");
+        assert!(!fields[0].is_shorthand(), "explicit `id: \"id\"` field");
+    }
+
+    #[test]
+    fn shorthand_field_has_name_and_no_value() {
+        // `columns: { id, body: "message" }` — `id` is shorthand (name only,
+        // no value); `body` is explicit.
+        let src = "store for d;\n\
+                   relvar Greetings: table \"greetings\" {\n\
+                       columns: { id, body: \"message\" }\n\
+                   };\n";
+        let root = ast(src);
+        let cols = root
+            .bindings()
+            .next()
+            .unwrap()
+            .columns_block()
+            .expect("columns");
+        let fields: Vec<_> = cols.fields().collect();
+        assert_eq!(fields.len(), 2);
+
+        assert_eq!(fields[0].name().unwrap().text(), "id");
+        assert!(fields[0].is_shorthand());
+        assert!(fields[0].value().is_none());
+
+        assert_eq!(fields[1].name().unwrap().text(), "body");
+        assert!(!fields[1].is_shorthand());
+        match fields[1].value().unwrap() {
+            CdstoreValue::String(s) => assert_eq!(s.text(), "\"message\""),
+            other => panic!("expected string value, got {other:?}"),
+        }
     }
 }

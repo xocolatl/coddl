@@ -58,9 +58,12 @@
 //     binds a base catalog relvar's heading to a physical table and
 //     column set. Every attribute in the catalog heading must have a
 //     column entry; every column entry must name an attribute.
-//   - Whether to allow `columns: { id, message }` shorthand when the
-//     attribute name and column name match. Skipped for v1 — explicit
-//     mapping is clearer and the lines are short.
+//   - Column shorthand: when the attribute name and the SQL column name
+//     match, write the bare attribute name — `columns: { id, message }`
+//     is sugar for `columns: { id: "id", message: "message" }`. Mix with
+//     the explicit `attr: "col"` form for the columns that genuinely
+//     differ. Shorthand is columns-only; `backend` fields always carry a
+//     value.
 
 store for greetings;
 
@@ -68,9 +71,9 @@ backend sqlite {
     file: "greetings.sqlite",
 };
 
+// The table is named `greetings` and both columns match their attribute
+// names, so the columns block uses the bare-name shorthand. The explicit
+// form `columns: { id: "id", message: "message" }` is equivalent.
 relvar Greetings: table "greetings" {
-    columns: {
-        id:      "id",
-        message: "message",
-    },
+    columns: { id, message }
 };

@@ -11,7 +11,7 @@
 //! <backend-decl>    ::= 'backend' IDENT '{' (<cdstore-field> (',' <cdstore-field>)* ','?)? '}' ';'
 //! <relvar-binding>  ::= 'relvar' IDENT ':' 'table' STRING_LIT '{' <columns-block> ','? '}' ';'
 //! <columns-block>   ::= 'columns' ':' '{' (<cdstore-field> (',' <cdstore-field>)* ','?)? '}'
-//! <cdstore-field>   ::= IDENT ':' <cdstore-value>
+//! <cdstore-field>   ::= IDENT [ ':' <cdstore-value> ]   -- value optional only in <columns-block>
 //! <cdstore-value>   ::= STRING_LIT | IDENT | <env-call>
 //! <env-call>        ::= 'env' '(' STRING_LIT (',' 'default' ':' STRING_LIT)? ')'
 //! ```
@@ -103,7 +103,7 @@ fn parse_backend_decl(p: &mut Parser) {
         return;
     }
 
-    parse_field_list(p);
+    parse_field_list(p, false); // backend fields carry values — no shorthand
 
     if !p.eat(SyntaxKind::R_BRACE) {
         p.error("PS0009", "expected `}` to close backend body");
@@ -174,7 +174,7 @@ fn parse_relvar_binding_body(p: &mut Parser) {
         if p.at_keyword("columns") {
             parse_columns_block(p);
         } else if p.at(SyntaxKind::IDENT) {
-            parse_cdstore_field(p);
+            parse_cdstore_field(p, false); // operational field — value required
         } else {
             p.error("PS0017", "expected relvar binding field");
             return;
@@ -201,7 +201,7 @@ fn parse_columns_block(p: &mut Parser) {
         p.finish_node();
         return;
     }
-    parse_field_list(p);
+    parse_field_list(p, true); // columns allow the `<name>` ≡ `<name>: "<name>"` shorthand
     if !p.eat(SyntaxKind::R_BRACE) {
         p.error("PS0020", "expected `}` to close columns block");
     }
@@ -209,16 +209,18 @@ fn parse_columns_block(p: &mut Parser) {
     p.finish_node();
 }
 
-/// Parse a comma-separated list of `<name>: <value>` fields. Empty,
-/// trailing-comma, and lone-name (no `:`) forms each diagnose cleanly.
-fn parse_field_list(p: &mut Parser) {
+/// Parse a comma-separated list of fields. Empty and trailing-comma forms are
+/// accepted. `allow_shorthand` is forwarded to each field: `true` in a
+/// `columns: { … }` block (where `<name>` is sugar for `<name>: "<name>"`),
+/// `false` in a `backend { … }` body (where a lone name is the PS0022 error).
+fn parse_field_list(p: &mut Parser, allow_shorthand: bool) {
     p.bump_trivia();
     if p.at(SyntaxKind::R_BRACE) || p.current() == SyntaxKind::EOF {
         return;
     }
 
     loop {
-        parse_cdstore_field(p);
+        parse_cdstore_field(p, allow_shorthand);
         if !p.eat(SyntaxKind::COMMA) {
             break;
         }
@@ -229,18 +231,27 @@ fn parse_field_list(p: &mut Parser) {
     }
 }
 
-/// `<name>: <value>` — one field of a backend or columns block.
-fn parse_cdstore_field(p: &mut Parser) {
+/// `<name>: <value>`, or — when `allow_shorthand` (in a `columns: { … }`
+/// block) — the lone-name shorthand `<name>` (no `:` value), which means
+/// `<name>: "<name>"`: the column name equals the attribute name. A field with
+/// no `:` and no shorthand is the missing-colon error PS0022. Shorthand is
+/// disabled in a `backend { … }` body, where every operational field carries a
+/// meaningful value.
+fn parse_cdstore_field(p: &mut Parser, allow_shorthand: bool) {
     p.bump_trivia();
     p.start_node(SyntaxKind::CDSTORE_FIELD);
 
     if !p.eat(SyntaxKind::IDENT) {
         p.error("PS0021", "expected field name");
     }
-    if !p.eat(SyntaxKind::COLON) {
+    if p.at(SyntaxKind::COLON) {
+        p.bump(); // `:`
+        parse_cdstore_value(p);
+    } else if !allow_shorthand {
         p.error("PS0022", "expected `:` after field name");
     }
-    parse_cdstore_value(p);
+    // else: columns shorthand `<name>` — no value node; the consumer fills in
+    // the column name from the attribute name.
 
     p.finish_node();
 }
@@ -453,6 +464,61 @@ mod tests {
             .filter(|n| n.kind() == SyntaxKind::CDSTORE_FIELD)
             .collect();
         assert_eq!(fields.len(), 2);
+    }
+
+    #[test]
+    fn columns_shorthand_parses() {
+        // `columns: { id, message }` — the bare-name shorthand (≡ `id: "id"`).
+        let src = "store for d;\n\
+                   relvar Greetings: table \"greetings\" {\n\
+                       columns: { id, message }\n\
+                   };\n";
+        let out = parse_str(src);
+        assert_eq!(
+            out.diagnostics.len(),
+            0,
+            "diagnostics: {:?}",
+            out.diagnostics
+        );
+        let columns = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::COLUMNS_BLOCK)
+            .unwrap();
+        let fields: Vec<_> = columns
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::CDSTORE_FIELD)
+            .collect();
+        assert_eq!(fields.len(), 2);
+        // A shorthand field has no COLON token.
+        assert!(!fields[0]
+            .children_with_tokens()
+            .any(|el| el.kind() == SyntaxKind::COLON));
+    }
+
+    #[test]
+    fn columns_mix_shorthand_and_explicit() {
+        // The two forms coexist in one block: `id` (shorthand) and
+        // `body: "message"` (explicit, renamed column).
+        let src = "store for d;\n\
+                   relvar Greetings: table \"greetings\" {\n\
+                       columns: { id, body: \"message\" }\n\
+                   };\n";
+        let out = parse_str(src);
+        assert_eq!(
+            out.diagnostics.len(),
+            0,
+            "diagnostics: {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn backend_lone_name_still_diagnoses_ps0022() {
+        // Shorthand is columns-only — a value-less backend field is still the
+        // missing-colon error.
+        let out = parse_str("store for d;\nbackend sqlite { file };\n");
+        assert!(out.diagnostics.iter().any(|d| d.code == "PS0022"));
     }
 
     #[test]

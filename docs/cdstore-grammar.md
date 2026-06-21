@@ -51,9 +51,19 @@ database, followed by a `backend` declaration and zero-or-more
 
 <field-list>     ::= [ <cdstore-field> commalist ] ;             -- parse_field_list
                      -- Shared between <backend-decl> body and
-                     -- <columns-block> body.
+                     -- <columns-block> body. The shorthand form of
+                     -- <cdstore-field> (name only) is accepted only in
+                     -- a <columns-block>; in a <backend-decl> body a
+                     -- value-less field is PS0022.
 
-<cdstore-field>  ::= <identifier> ':' <cdstore-value> ;          -- parse_cdstore_field
+<cdstore-field>  ::= <identifier> [ ':' <cdstore-value> ] ;      -- parse_cdstore_field
+                     -- The value is optional only inside a
+                     -- <columns-block>: the lone-name shorthand
+                     -- `id` means `id: "id"` — the SQL column name
+                     -- equals the attribute name. Mix freely with the
+                     -- explicit `attr: "col"` form (used when they
+                     -- differ). In a <backend-decl> body the
+                     -- `':' <cdstore-value>` is required.
 
 <cdstore-value>  ::= <string-literal>
                    | <identifier>

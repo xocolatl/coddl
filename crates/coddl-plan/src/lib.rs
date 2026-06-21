@@ -377,9 +377,15 @@ fn collect_columns(
                 continue;
             };
             let attr_name = name_tok.text().to_string();
-            let column_name = match field.value() {
-                Some(CdstoreValue::String(t)) => unquote(t.text()),
-                _ => String::new(),
+            // Shorthand `id` ≡ `id: "id"` — the column name is the attribute
+            // name. An explicit `attr: "col"` uses the quoted column string.
+            let column_name = if field.is_shorthand() {
+                attr_name.clone()
+            } else {
+                match field.value() {
+                    Some(CdstoreValue::String(t)) => unquote(t.text()),
+                    _ => String::new(),
+                }
             };
 
             if heading.lookup(&attr_name).is_none() {
@@ -561,6 +567,42 @@ relvar Greetings: table \"greetings\" {
         let col_attrs: Vec<&str> = r.columns.iter().map(|(a, _)| a.as_str()).collect();
         assert!(col_attrs.contains(&"id"));
         assert!(col_attrs.contains(&"message"));
+    }
+
+    #[test]
+    fn columns_shorthand_maps_each_attr_to_its_own_name() {
+        // `columns: { id, message }` — the shorthand binds each attribute to a
+        // column of the same name, exactly like the explicit `id: "id"` form.
+        const CDSTORE_SHORTHAND: &str = "\
+store for greetings;
+backend sqlite { file: \"greetings.sqlite\" };
+relvar Greetings: table \"greetings\" {
+    columns: { id, message }
+};
+";
+        let (_dir, cd) =
+            write_project(CD_HELLO, Some(CDDB_GREETINGS), Some(CDSTORE_SHORTHAND));
+        let out = discover_and_validate(&cd);
+        let pl: Vec<_> = out
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.starts_with("PL"))
+            .map(|d| d.code)
+            .collect();
+        assert!(pl.is_empty(), "unexpected PL diagnostics: {pl:?}");
+
+        let plan = out.plan.expect("plan");
+        let r = &plan.resolved[0];
+        let mut cols = r.columns.clone();
+        cols.sort();
+        assert_eq!(
+            cols,
+            vec![
+                ("id".to_string(), "id".to_string()),
+                ("message".to_string(), "message".to_string()),
+            ],
+            "shorthand maps each attribute to a same-named column"
+        );
     }
 
     #[test]

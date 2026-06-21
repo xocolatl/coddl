@@ -10,17 +10,14 @@ backend sqlite {
     file: "tclose.sqlite",
 };
 
+// Every attribute maps to a same-named column, so the columns blocks use the
+// bare-name shorthand (`columns: { a, b }` ≡ `columns: { a: "a", b: "b" }`).
+// `from`/`to` are reserved SQL keywords used as attribute names; the emitter
+// quotes every identifier, so they bind cleanly.
 relvar Edges: table "edges" {
-    columns: {
-        from: "from",
-        to:   "to",
-    },
+    columns: { from, to }
 };
 
 relvar Contains: table "contains" {
-    columns: {
-        major: "major",
-        minor: "minor",
-        qty:   "qty",
-    },
+    columns: { major, minor, qty }
 };
