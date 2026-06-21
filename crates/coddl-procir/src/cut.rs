@@ -60,4 +60,35 @@ mod tests {
         );
         assert_eq!(q.sql.param_count, 1);
     }
+
+    #[test]
+    fn pushes_relvar_rooted_tclose() {
+        // A binary same-typed relvar `{ a: Integer, b: Integer }` closed: a
+        // relvar-rooted `TClose` passes the origin gate and emits a
+        // `WITH RECURSIVE` query (the deferred half of `tclose`, now landed).
+        let edges = RelExpr::RelvarRef {
+            name: "Edges".to_string(),
+            database: "graph".to_string(),
+            heading: Heading::new(vec![
+                ("a".to_string(), Type::Integer),
+                ("b".to_string(), Type::Integer),
+            ]),
+            table_name: "edges".to_string(),
+            columns: vec![
+                ("a".to_string(), "a".to_string()),
+                ("b".to_string(), "b".to_string()),
+            ],
+            keys: vec![vec!["a".to_string(), "b".to_string()]],
+        };
+        let expr = RelExpr::TClose {
+            input: Box::new(edges),
+        };
+        let q = try_push(&expr, Dialect::SQLite).expect("relvar-rooted tclose pushes");
+        assert!(
+            q.sql.text.starts_with("WITH RECURSIVE "),
+            "tclose pushes as a recursive CTE: {}",
+            q.sql.text
+        );
+        assert!(q.sql.text.contains(r#"JOIN coddl_tc_op ON coddl_tc."b" = coddl_tc_op."a""#));
+    }
 }

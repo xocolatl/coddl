@@ -111,6 +111,7 @@ The storage-origin flag drives the optimizer's central decision: **where each su
 
 What pushes cleanly:
 - Algebra A core (JOIN, AND, OR, AND NOT, project, rename).
+- Plain transitive closure (TCLOSE) — a root `tclose` emits a `WITH RECURSIVE` query (see [sqlemit.md](sqlemit.md)).
 - Aggregation (SUMMARIZE).
 - Restriction predicates whose operators have SQL equivalents (`=`, `<`, `+`, `mod`, etc.).
 - Subset and superset (the `<=` / `>=` on relations — see [grammar.md](grammar.md)).

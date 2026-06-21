@@ -1,0 +1,58 @@
+// tclose-db.cd
+//
+// SQL-backed twin of tclose.cd: the same binary edge graph and bill-of-materials,
+// but the relvars are `public` and backed by a seeded SQLite database, so each
+// `tclose` pushes DOWN to SQL as a `WITH RECURSIVE` query instead of running the
+// in-process fixpoint. Side by side, the two files show one surface operator
+// driving both the in-process engine (private relvars) and recursive-CTE SQL
+// emission (public relvars).
+//
+// The .cd-family (storage stays out of D):
+//   tclose-db.cd   — this program: the external schema + closures
+//   tclose.cddb    — database catalog (conceptual schema)
+//   tclose.cdstore — conceptual -> physical (SQLite) binding
+//   seed-db.sh     — recreates tclose.sqlite with the demo data
+//
+// `public` relvars are read-only, so there is no `:=` — the data lives in the
+// seeded database. A public-relvar read must sit inside a `transaction [...]`.
+//
+// Note `from`/`to` are ordinary attribute names here (Coddl has no reserved
+// words); they are reserved SQL keywords, so the emitter quotes every identifier
+// and they push cleanly all the same.
+
+program transitive_closure_db;
+database tclose;
+
+public relvar Edges {
+    from: Integer,
+    to: Integer,
+} key { from, to };
+
+public relvar Contains {
+    major: Integer,
+    minor: Integer,
+    qty: Integer,
+} key { major, minor };
+
+oper main {} [
+    // Baseline: the direct edges — pushes a plain `SELECT "from", "to" FROM ...`.
+    let direct = transaction [
+        Edges
+    ];
+    write_relation { rel: direct };
+
+    // Bare form: `Edges tclose` pushes one `WITH RECURSIVE` over the edge set.
+    // Reachability adds 1->3, 2->4, 1->4 on top of the direct 1->2, 2->3, 3->4.
+    let reachable = transaction [
+        Edges tclose
+    ];
+    write_relation { rel: reachable };
+
+    // Brace form: pick { major, minor } out of the ternary `Contains` (dropping
+    // qty), then close — the operand SELECT narrows inside the recursive CTE.
+    // Transitive containment adds 1->4 (bicycle->spoke) and 1->5 (bicycle->tube).
+    let all_parts = transaction [
+        Contains tclose { major, minor }
+    ];
+    write_relation { rel: all_parts };
+];

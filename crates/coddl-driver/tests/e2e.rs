@@ -2047,3 +2047,137 @@ fn tclose_inprocess_relations_equal_across_backends() {
         "backends disagree on the transitive-closure tuple set"
     );
 }
+
+// ── tclose SQL pushdown (WITH RECURSIVE) ─────────────────────────────────────
+
+/// Write the `tclose` database companions (`.cddb` / `.cdstore`) into `dir` and
+/// seed `<dir>/tclose.sqlite` with a binary edge graph (`edges`, columns
+/// `"from"`/`"to"` — reserved SQL keywords, quoted) and a bill-of-materials
+/// (`contains`). Returns the db path. The caller writes its own `.cd` (with
+/// `database tclose;`) alongside. Tests own their source — never the example.
+fn seed_tclose_fixtures(dir: &Path) -> PathBuf {
+    std::fs::write(
+        dir.join("tclose.cddb"),
+        "database tclose;\n\
+         base relvar Edges { from: Integer, to: Integer } key { from, to };\n\
+         base relvar Contains { major: Integer, minor: Integer, qty: Integer } key { major, minor };\n",
+    )
+    .expect("write tclose.cddb");
+    std::fs::write(
+        dir.join("tclose.cdstore"),
+        "store for tclose;\n\
+         backend sqlite { file: \"tclose.sqlite\" };\n\
+         relvar Edges: table \"edges\" { columns: { from: \"from\", to: \"to\" } };\n\
+         relvar Contains: table \"contains\" { columns: { major: \"major\", minor: \"minor\", qty: \"qty\" } };\n",
+    )
+    .expect("write tclose.cdstore");
+
+    let db = dir.join("tclose.sqlite");
+    // Pass the SQL as a single sqlite3 argument (no shell), so the quoted
+    // `"from"`/`"to"` identifiers need no extra escaping.
+    let sql = "CREATE TABLE edges (\"from\" INTEGER NOT NULL, \"to\" INTEGER NOT NULL, PRIMARY KEY (\"from\", \"to\")); \
+               CREATE TABLE contains (major INTEGER NOT NULL, minor INTEGER NOT NULL, qty INTEGER NOT NULL, PRIMARY KEY (major, minor)); \
+               INSERT INTO edges (\"from\", \"to\") VALUES (1,2),(2,3),(3,4); \
+               INSERT INTO contains (major, minor, qty) VALUES (1,2,2),(1,3,1),(2,4,32),(3,5,1);";
+    let status = Command::new("sqlite3")
+        .arg(&db)
+        .arg(sql)
+        .status()
+        .expect("invoke sqlite3");
+    assert!(status.success(), "tclose fixture seed failed");
+    db
+}
+
+/// The two pushed closures, dumped: `Edges tclose` (reachability over the 1→2→3→4
+/// chain, adding 1→3, 2→4, 1→4) and `Contains tclose { major, minor }` (transitive
+/// containment, adding 1→4 and 1→5). Tuple order is unspecified (RM Pro 1), so the
+/// test compares this set.
+const TCLOSE_DB_TUPLES: &[&str] = &[
+    // Edges tclose
+    "{from: 1, to: 2}",
+    "{from: 2, to: 3}",
+    "{from: 3, to: 4}",
+    "{from: 1, to: 3}",
+    "{from: 2, to: 4}",
+    "{from: 1, to: 4}",
+    // Contains tclose { major, minor }
+    "{major: 1, minor: 2}",
+    "{major: 1, minor: 3}",
+    "{major: 2, minor: 4}",
+    "{major: 3, minor: 5}",
+    "{major: 1, minor: 4}",
+    "{major: 1, minor: 5}",
+];
+
+/// The exact `WITH RECURSIVE` query each closure pushes — the golden text the
+/// audit log must contain. Pins the recursive-CTE emission end-to-end.
+const TCLOSE_EDGES_SQL: &str = r#"WITH RECURSIVE coddl_tc_op("from", "to") AS (SELECT "from", "to" FROM "edges"), coddl_tc("from", "to") AS (SELECT "from", "to" FROM coddl_tc_op UNION SELECT coddl_tc."from", coddl_tc_op."to" FROM coddl_tc JOIN coddl_tc_op ON coddl_tc."to" = coddl_tc_op."from") SELECT DISTINCT "from", "to" FROM coddl_tc"#;
+const TCLOSE_CONTAINS_SQL: &str = r#"WITH RECURSIVE coddl_tc_op("major", "minor") AS (SELECT "major", "minor" FROM "contains"), coddl_tc("major", "minor") AS (SELECT "major", "minor" FROM coddl_tc_op UNION SELECT coddl_tc."major", coddl_tc_op."minor" FROM coddl_tc JOIN coddl_tc_op ON coddl_tc."minor" = coddl_tc_op."major") SELECT DISTINCT "major", "minor" FROM coddl_tc"#;
+
+/// Compile + run a self-owned relvar-rooted `tclose` program on `backend`: each
+/// closure must push to SQL as a `WITH RECURSIVE` query (asserted via the audit
+/// log) and return the correct closure tuple set.
+fn assert_tclose_pushdown_audit(backend: &str) {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = seed_tclose_fixtures(tmp.path());
+    let cd = tmp.path().join("tclose-db.cd");
+    std::fs::write(
+        &cd,
+        "program transitive_closure_db;\n\
+         database tclose;\n\
+         public relvar Edges { from: Integer, to: Integer } key { from, to };\n\
+         public relvar Contains { major: Integer, minor: Integer, qty: Integer } key { major, minor };\n\
+         oper main {} [\n\
+             let reachable = transaction [ Edges tclose ];\n\
+             write_relation { rel: reachable };\n\
+             let all_parts = transaction [ Contains tclose { major, minor } ];\n\
+             write_relation { rel: all_parts };\n\
+         ];\n",
+    )
+    .expect("write tclose-db.cd");
+    let log = tmp.path().join("audit.log");
+
+    let out = coddl()
+        .env("CODDL_AUDIT_LOG", &log)
+        .env("CODDL_TCLOSE_FILE", &db)
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "tclose pushdown on {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(
+        tuple_lines(&out.stdout),
+        sorted_tuples(TCLOSE_DB_TUPLES),
+        "wrong closure tuple set on {backend}"
+    );
+
+    // The audit log must show each closure pushed as its `WITH RECURSIVE` query.
+    let contents = std::fs::read_to_string(&log)
+        .unwrap_or_else(|e| panic!("read audit log {}: {e}", log.display()));
+    let sqls: Vec<&str> = contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| audit_sql(l).unwrap_or_else(|| panic!("malformed audit line ({backend}): {l:?}")))
+        .collect();
+    for needle in [TCLOSE_EDGES_SQL, TCLOSE_CONTAINS_SQL] {
+        assert!(
+            sqls.iter().any(|s| *s == needle),
+            "audit log on {backend} missing pushed query:\n{needle}\ngot:\n{sqls:#?}"
+        );
+    }
+}
+
+#[test]
+fn tclose_pushdown_audit_llvm() {
+    assert_tclose_pushdown_audit("llvm");
+}
+
+#[test]
+fn tclose_pushdown_audit_cranelift() {
+    assert_tclose_pushdown_audit("cranelift");
+}

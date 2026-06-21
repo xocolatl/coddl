@@ -129,16 +129,86 @@ impl std::error::Error for BackendError {}
 
 pub type Result<T> = std::result::Result<T, BackendError>;
 
+/// CTE names for the `WITH RECURSIVE` transitive-closure emission: `coddl_tc`
+/// is the recursive closure relation; `coddl_tc_op` is the non-recursive CTE
+/// that holds the operand (edge set) once. The `coddl_tc*` prefix keeps them
+/// clear of user tables — a clash needs a table bound to literally that SQL
+/// name.
+const TCLOSE_RESULT_CTE: &str = "coddl_tc";
+const TCLOSE_OPERAND_CTE: &str = "coddl_tc_op";
+
 /// Emit one relvar-rooted relational expression as a backend `SELECT`.
 ///
 /// The expression bottoms out in a `RelvarRef`, optionally wrapped in
 /// `Restrict` (→ `WHERE`), `Project` (→ a narrowed column list), `Rename`, and
 /// `And` (→ `INNER JOIN`/`CROSS JOIN`). A root `Or` (surface `union`) emits a
-/// set-op query `(<lhs>) UNION (<rhs>)`. The column list is exactly the
-/// expression's heading, so an author-written projection narrows the `SELECT`
-/// faithfully. `DISTINCT` is emitted unless the result is provably a set.
+/// set-op query `(<lhs>) UNION (<rhs>)`; a root `TClose` (surface `tclose`)
+/// emits a `WITH RECURSIVE` query. The column list is exactly the expression's
+/// heading, so an author-written projection narrows the `SELECT` faithfully.
+/// `DISTINCT` is emitted unless the result is provably a set.
 pub fn emit_select(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
+    // Root transitive closure → a `WITH RECURSIVE` query. Handled here at the
+    // true statement root, NOT in `emit_select_offset`: a `WITH`-prefixed query
+    // cannot be a compound-`UNION`/`EXCEPT` operand (invalid SQL, and SQLite
+    // rejects parenthesizing it), so a `TClose` reached as a set-op operand
+    // goes through `emit_select_offset` → `resolve`'s Err arm, declines the
+    // push, and decomposes in-process instead.
+    if let RelExpr::TClose { input } = expr {
+        return emit_tclose(input, dialect);
+    }
     emit_select_offset(expr, dialect, 0)
+}
+
+/// Emit a root `TClose` (surface `tclose`) as a backend `WITH RECURSIVE` query.
+///
+/// The operand is a binary relation of two same-typed attributes `a` (canonical
+/// `attrs[0]`, the source) and `b` (`attrs[1]`, the target) — the typechecker
+/// guarantees this shape. It is defined **once** as a non-recursive CTE so its
+/// bind parameters appear once; the recursive closure CTE references that CTE
+/// for both its base and recursive members, computing
+/// `R_{i+1} = R_i ∪ (R_i ∘ E)` which converges to `⋃_{k≥1} Eᵏ` (the closure).
+/// Closure is direction-agnostic, so the result heading equals the operand
+/// heading and the final `SELECT DISTINCT "a", "b"` marshals against it
+/// unchanged.
+fn emit_tclose(input: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
+    let heading = input.heading();
+    let attrs = heading.attrs();
+    // Defensive: a non-binary operand can't be closed. The typechecker rejects
+    // it (T0041), so this only guards against a malformed RelIR.
+    if attrs.len() != 2 {
+        return Err(BackendError::Other(
+            "tclose operand is not a binary relation".to_string(),
+        ));
+    }
+    let a = quote_ident(&attrs[0].0); // source column (canonical order)
+    let b = quote_ident(&attrs[1].0); // target column
+    // Operand SELECT — its two columns are aliased to the attribute names a, b.
+    // Emitted via `emit_select_offset` (not `emit_select`): the operand is never
+    // itself a root `TClose` (a nested `(R tclose) tclose` declines through
+    // `resolve` and decomposes in-process), and its placeholders start at the
+    // statement's `$1`.
+    let op = emit_select_offset(input, dialect, 0)?;
+    let src = &op.sql.text;
+    let result = TCLOSE_RESULT_CTE;
+    let edges = TCLOSE_OPERAND_CTE;
+    let text = format!(
+        "WITH RECURSIVE {edges}({a}, {b}) AS ({src}), \
+         {result}({a}, {b}) AS (\
+         SELECT {a}, {b} FROM {edges} \
+         UNION \
+         SELECT {result}.{a}, {edges}.{b} FROM {result} JOIN {edges} ON {result}.{b} = {edges}.{a}) \
+         SELECT DISTINCT {a}, {b} FROM {result}"
+    );
+    let plan_id = PlanId(fnv1a(dialect, &text));
+    Ok(SqlQuery {
+        sql: SqlString {
+            param_count: op.sql.param_count,
+            text,
+        },
+        params: op.params,
+        result_heading: heading,
+        plan_id,
+    })
 }
 
 /// `emit_select` with a bind-parameter start offset, threaded so a set-op's
@@ -335,14 +405,17 @@ fn resolve(
         RelExpr::Or { .. } | RelExpr::Minus { .. } => Err(BackendError::Other(
             "set operation nested under a relational operator does not push to SQL".to_string(),
         )),
-        // Transitive closure has no SQL emission in v1 (the `WITH RECURSIVE`
-        // push is a deferred follow-up). Err so `cut::try_push` declines and
-        // the whole `tclose` runs in-process. Reached even at the root: a root
-        // `TClose` is not a set-op, so `emit_select_offset` falls through to
-        // `resolve`. The operand still fetches via its own SQL (a plain SELECT),
-        // then the closure runs in-process — correct.
+        // A `TClose` reached *here* (via `resolve`) is non-root — nested under a
+        // relational op (`(R tclose) where p`), or a set-op operand
+        // (`(R tclose) union S`). A `WITH RECURSIVE` query can't be a `FROM`
+        // table-expression or a compound operand, so err: the whole push
+        // declines and the expression decomposes in-process (each closure
+        // pushes its own `WITH RECURSIVE`, the surrounding op runs in process).
+        // A *root* `TClose` never reaches here — `emit_select` emits its
+        // `WITH RECURSIVE` before delegating to `emit_select_offset`/`resolve`.
         RelExpr::TClose { .. } => Err(BackendError::Other(
-            "transitive closure (tclose) does not push to SQL in v1".to_string(),
+            "transitive closure (tclose) nested under another operator does not push to SQL"
+                .to_string(),
         )),
         // Never reached: a materialized leaf fails the cut's `RelvarRooted`
         // gate before SQL emission. Defensive only.
@@ -763,6 +836,158 @@ mod tests {
             r#"SELECT "id", "name" FROM "morning" WHERE "id" = ? EXCEPT SELECT "id", "name" FROM "evening""#
         );
         assert_eq!(q.sql.param_count, 1);
+    }
+
+    // ── tclose (WITH RECURSIVE) ──────────────────────────────────────────
+
+    /// A binary same-typed graph relvar `{ from: Integer, to: Integer }` keyed on
+    /// both endpoints — the canonical `tclose` operand. (`from` < `to`, so
+    /// `attrs[0]` = `from` = source, `attrs[1]` = `to` = target.)
+    fn edges() -> RelExpr {
+        RelExpr::RelvarRef {
+            name: "Edges".to_string(),
+            database: "tclose".to_string(),
+            heading: Heading::new(vec![
+                ("from".to_string(), Type::Integer),
+                ("to".to_string(), Type::Integer),
+            ]),
+            table_name: "edges".to_string(),
+            columns: vec![
+                ("from".to_string(), "from".to_string()),
+                ("to".to_string(), "to".to_string()),
+            ],
+            keys: vec![vec!["from".to_string(), "to".to_string()]],
+        }
+    }
+
+    /// A wider bill-of-materials `{ major, minor, qty }` keyed on `{ major, minor }`
+    /// — the operand of the brace form `Contains tclose { major, minor }`, which
+    /// projects to the two key columns before closing.
+    fn contains() -> RelExpr {
+        RelExpr::RelvarRef {
+            name: "Contains".to_string(),
+            database: "tclose".to_string(),
+            heading: Heading::new(vec![
+                ("major".to_string(), Type::Integer),
+                ("minor".to_string(), Type::Integer),
+                ("qty".to_string(), Type::Integer),
+            ]),
+            table_name: "contains".to_string(),
+            columns: vec![
+                ("major".to_string(), "major".to_string()),
+                ("minor".to_string(), "minor".to_string()),
+                ("qty".to_string(), "qty".to_string()),
+            ],
+            keys: vec![vec!["major".to_string(), "minor".to_string()]],
+        }
+    }
+
+    #[test]
+    fn tclose_emits_with_recursive() {
+        // `Edges tclose` → a two-CTE `WITH RECURSIVE`: the operand once
+        // (`coddl_tc_op`), then the recursive closure (`coddl_tc`) composing on
+        // `to = from`. Direction-agnostic: result heading == operand heading.
+        let expr = RelExpr::TClose {
+            input: Box::new(edges()),
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"WITH RECURSIVE coddl_tc_op("from", "to") AS (SELECT "from", "to" FROM "edges"), coddl_tc("from", "to") AS (SELECT "from", "to" FROM coddl_tc_op UNION SELECT coddl_tc."from", coddl_tc_op."to" FROM coddl_tc JOIN coddl_tc_op ON coddl_tc."to" = coddl_tc_op."from") SELECT DISTINCT "from", "to" FROM coddl_tc"#
+        );
+        assert_eq!(q.sql.param_count, 0);
+        assert!(q.params.is_empty());
+        assert_eq!(
+            q.result_heading,
+            Heading::new(vec![
+                ("from".to_string(), Type::Integer),
+                ("to".to_string(), Type::Integer),
+            ])
+        );
+    }
+
+    #[test]
+    fn tclose_braced_operand_projects_first() {
+        // `Contains tclose { major, minor }` → TClose over a Project that narrows
+        // to the two columns; the operand CTE is the projected SELECT.
+        let expr = RelExpr::TClose {
+            input: Box::new(RelExpr::Project {
+                input: Box::new(contains()),
+                keep: vec!["major".to_string(), "minor".to_string()],
+            }),
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"WITH RECURSIVE coddl_tc_op("major", "minor") AS (SELECT "major", "minor" FROM "contains"), coddl_tc("major", "minor") AS (SELECT "major", "minor" FROM coddl_tc_op UNION SELECT coddl_tc."major", coddl_tc_op."minor" FROM coddl_tc JOIN coddl_tc_op ON coddl_tc."minor" = coddl_tc_op."major") SELECT DISTINCT "major", "minor" FROM coddl_tc"#
+        );
+        assert_eq!(q.sql.param_count, 0);
+        assert_eq!(
+            q.result_heading,
+            Heading::new(vec![
+                ("major".to_string(), Type::Integer),
+                ("minor".to_string(), Type::Integer),
+            ])
+        );
+    }
+
+    #[test]
+    fn tclose_with_where_param_appears_once() {
+        // `(Edges where from = 1) tclose` — the restricted operand is defined in a
+        // single CTE, so its bind parameter appears exactly once (no duplication),
+        // both as SQLite `?` and Postgres `$1`.
+        let restricted = RelExpr::Restrict {
+            input: Box::new(edges()),
+            pred: Predicate::AttrEq {
+                attr: "from".to_string(),
+                value: Literal::Integer(1),
+            },
+        };
+        let expr = RelExpr::TClose {
+            input: Box::new(restricted),
+        };
+
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(q.sql.param_count, 1);
+        assert_eq!(q.params, vec![Value::Integer(1)]);
+        assert_eq!(
+            q.sql.text.matches('?').count(),
+            1,
+            "the operand CTE holds the only `?`: {}",
+            q.sql.text
+        );
+        assert!(q
+            .sql
+            .text
+            .starts_with(r#"WITH RECURSIVE coddl_tc_op("from", "to") AS (SELECT "from", "to" FROM "edges" WHERE "from" = ?)"#));
+
+        let pg = emit_select(&expr, Dialect::Postgres).unwrap();
+        assert_eq!(pg.sql.param_count, 1);
+        assert!(
+            pg.sql.text.contains(r#"WHERE "from" = $1"#) && !pg.sql.text.contains("$2"),
+            "the operand appears once, so only `$1`: {}",
+            pg.sql.text
+        );
+    }
+
+    #[test]
+    fn tclose_union_operand_does_not_push() {
+        // `(Edges tclose) union (Edges tclose)` — a `WITH RECURSIVE` query can't
+        // be a compound-`UNION` operand, so the whole push must DECLINE (the
+        // operand `TClose` reaches `resolve` via `emit_select_offset` and errs).
+        // It then decomposes in-process (each closure pushes separately).
+        let expr = RelExpr::Or {
+            lhs: Box::new(RelExpr::TClose {
+                input: Box::new(edges()),
+            }),
+            rhs: Box::new(RelExpr::TClose {
+                input: Box::new(edges()),
+            }),
+        };
+        assert!(
+            emit_select(&expr, Dialect::SQLite).is_err(),
+            "a tclose as a set-op operand must not push as one query"
+        );
     }
 
     #[test]

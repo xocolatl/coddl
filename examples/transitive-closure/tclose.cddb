@@ -1,0 +1,20 @@
+// tclose.cddb
+//
+// Conceptual schema for the `tclose` database — the SQL-backed twin of the
+// in-process transitive-closure example. Database-side `base relvar`
+// declarations; the headings mirror the `public relvar`s in tclose-db.cd.
+
+database tclose;
+
+base relvar Edges {
+    from: Integer,
+    to: Integer,
+}
+key { from, to };
+
+base relvar Contains {
+    major: Integer,
+    minor: Integer,
+    qty: Integer,
+}
+key { major, minor };
