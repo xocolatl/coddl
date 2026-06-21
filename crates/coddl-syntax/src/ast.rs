@@ -623,6 +623,15 @@ pub enum BinaryOp {
     Intersect,
     Union,
     Minus,
+    /// Scalar arithmetic: `Integer × Integer → Integer` (integer division
+    /// truncates toward zero). The symbolic `-` (token `MINUS`) is `Sub`,
+    /// distinct from the relational `minus` keyword (`Minus`).
+    Add,
+    Sub,
+    Mul,
+    Div,
+    /// Concatenation `||`: `(Text|Character) × (Text|Character) → Text`.
+    Concat,
 }
 
 ast_node!(pub BinaryExpr, BINARY_EXPR);
@@ -654,7 +663,12 @@ impl BinaryExpr {
                     | SyntaxKind::LT
                     | SyntaxKind::GT
                     | SyntaxKind::LT_EQ
-                    | SyntaxKind::GT_EQ => return Some(tok),
+                    | SyntaxKind::GT_EQ
+                    | SyntaxKind::PLUS
+                    | SyntaxKind::MINUS
+                    | SyntaxKind::STAR
+                    | SyntaxKind::SLASH
+                    | SyntaxKind::PIPE_PIPE => return Some(tok),
                     SyntaxKind::IDENT
                         if matches!(
                             tok.text(),
@@ -682,6 +696,11 @@ impl BinaryExpr {
             SyntaxKind::GT => BinaryOp::Gt,
             SyntaxKind::LT_EQ => BinaryOp::LtEq,
             SyntaxKind::GT_EQ => BinaryOp::GtEq,
+            SyntaxKind::PLUS => BinaryOp::Add,
+            SyntaxKind::MINUS => BinaryOp::Sub,
+            SyntaxKind::STAR => BinaryOp::Mul,
+            SyntaxKind::SLASH => BinaryOp::Div,
+            SyntaxKind::PIPE_PIPE => BinaryOp::Concat,
             SyntaxKind::IDENT => match tok.text() {
                 "and" => BinaryOp::And,
                 "or" => BinaryOp::Or,
@@ -1223,6 +1242,11 @@ mod tests {
             ("1 >= 2", BinaryOp::GtEq),
             ("true and false", BinaryOp::And),
             ("true or false", BinaryOp::Or),
+            ("1 + 2", BinaryOp::Add),
+            ("1 - 2", BinaryOp::Sub),
+            ("1 * 2", BinaryOp::Mul),
+            ("1 / 2", BinaryOp::Div),
+            ("1 || 2", BinaryOp::Concat),
         ];
         for (rhs, expected) in cases {
             let src = format!("oper f {{}} [ let b = {rhs}; ];");

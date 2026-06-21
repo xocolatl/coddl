@@ -121,6 +121,15 @@ mod tests {
     }
 
     #[test]
+    fn spacing_around_arithmetic_and_concat_operators() {
+        let src = "program p;\noper main {} [ let x=1+2*3; let y=\"a\"||\"b\"; ];\n";
+        let got = fmt(src);
+        assert!(got.contains("let x = 1 + 2 * 3;"), "got:\n{got}");
+        assert!(got.contains("let y = \"a\" || \"b\";"), "got:\n{got}");
+        assert_eq!(fmt(&got), got);
+    }
+
+    #[test]
     fn preserves_leading_and_trailing_comments() {
         let src = "// header\nprogram p; // trailing\noper main {} [\n    write_line { message: \"hi\" }; // note\n];\n";
         let got = fmt(src);

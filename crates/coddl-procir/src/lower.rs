@@ -1408,6 +1408,11 @@ impl Lowerer {
             BinaryOp::GtEq => ScalarOp::GtEq,
             BinaryOp::And => ScalarOp::And,
             BinaryOp::Or => ScalarOp::Or,
+            BinaryOp::Add => ScalarOp::Add,
+            BinaryOp::Sub => ScalarOp::Sub,
+            BinaryOp::Mul => ScalarOp::Mul,
+            BinaryOp::Div => ScalarOp::Div,
+            BinaryOp::Concat => ScalarOp::Concat,
             BinaryOp::Where
             | BinaryOp::Join
             | BinaryOp::Times
@@ -1418,17 +1423,38 @@ impl Lowerer {
                 unreachable!("handled above")
             }
         };
-        let lhs = bin
+        let mut lhs = bin
             .lhs()
             .map(|e| self.lower_expr(&e))
             .unwrap_or_else(|| self.fresh_value());
-        let rhs = bin
+        let mut rhs = bin
             .rhs()
             .map(|e| self.lower_expr(&e))
             .unwrap_or_else(|| self.fresh_value());
-        let operand_type = self.value_type(lhs);
+        // The operand machine type and the result type depend on the op:
+        // comparison/logical compare arbitrary scalars → Boolean; arithmetic
+        // is Integer → Integer; concat normalizes Character operands to Text →
+        // Text (so `ScalarOp::Concat` always sees Text operands).
+        let (operand_type, result_type) = match scalar_op {
+            ScalarOp::Add | ScalarOp::Sub | ScalarOp::Mul | ScalarOp::Div => {
+                (ProcType::Integer, ProcType::Integer)
+            }
+            ScalarOp::Concat => {
+                lhs = self.coerce_to_text(lhs);
+                rhs = self.coerce_to_text(rhs);
+                (ProcType::Text, ProcType::Text)
+            }
+            ScalarOp::Eq
+            | ScalarOp::NotEq
+            | ScalarOp::Lt
+            | ScalarOp::Gt
+            | ScalarOp::LtEq
+            | ScalarOp::GtEq
+            | ScalarOp::And
+            | ScalarOp::Or => (self.value_type(lhs), ProcType::Boolean),
+        };
         let dst = self.fresh_value();
-        self.record_type(dst, ProcType::Boolean);
+        self.record_type(dst, result_type);
         self.insts.push(Inst::ScalarOp {
             dst,
             op: scalar_op,
@@ -1437,6 +1463,20 @@ impl Lowerer {
             rhs,
         });
         dst
+    }
+
+    /// Normalize a scalar operand to `Text` for concatenation: a `Character`
+    /// value is converted via [`Inst::CharToText`]; a value already `Text`
+    /// passes through unchanged.
+    fn coerce_to_text(&mut self, v: ValueId) -> ValueId {
+        if matches!(self.value_type(v), ProcType::Character) {
+            let dst = self.fresh_value();
+            self.record_type(dst, ProcType::Text);
+            self.insts.push(Inst::CharToText { dst, src: v });
+            dst
+        } else {
+            v
+        }
     }
 
     /// Build the RelIR for a binary relational expression (`where`, `join`,
@@ -2020,10 +2060,13 @@ impl Lowerer {
                 let n = parse_integer_literal(token.text());
                 (Const::Integer(n), ProcType::Integer)
             }
-            // CHAR_LIT, RATIONAL_LIT, APPROXIMATE_LIT land here as the
-            // language exercises them. The typechecker already accepts
-            // them; lowering catches up when the runtime grows to
-            // consume them.
+            SyntaxKind::CHAR_LIT => {
+                let cp = decode_char_literal(token.text());
+                (Const::Character(cp), ProcType::Character)
+            }
+            // RATIONAL_LIT / APPROXIMATE_LIT land here as the language
+            // exercises them. The typechecker already accepts them; lowering
+            // catches up when the runtime grows to consume them.
             other => unreachable!("literal kind {other:?} not yet lowered"),
         };
         let dst = self.fresh_value();
@@ -2264,6 +2307,36 @@ fn decode_string_literal(text: &str) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Decode the body of a `CHAR_LIT` token (with surrounding `'`s) to its
+/// Unicode scalar value. The lexer guarantees exactly one codepoint and the
+/// same escape set as `STRING_LIT` (`\n`, `\r`, `\t`, `\"`, `\\`, `\u{...}`).
+fn decode_char_literal(text: &str) -> u32 {
+    let inner = text
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .unwrap_or(text);
+    let mut chars = inner.chars();
+    let c = chars.next().expect("lexer rejects empty char literal");
+    if c != '\\' {
+        return c as u32;
+    }
+    match chars.next().expect("lexer rejects a lone backslash") {
+        'n' => '\n' as u32,
+        'r' => '\r' as u32,
+        't' => '\t' as u32,
+        '"' => '"' as u32,
+        '\'' => '\'' as u32,
+        '\\' => '\\' as u32,
+        'u' => {
+            // `\u{XXXX}` — the lexer already validated the form.
+            debug_assert_eq!(chars.next(), Some('{'));
+            let hex: String = chars.by_ref().take_while(|h| *h != '}').collect();
+            u32::from_str_radix(&hex, 16).expect("lexer validated the codepoint")
+        }
+        esc => unreachable!("unknown escape `\\{esc}` survived lexing"),
+    }
 }
 
 /// Parse an `INTEGER_LIT` lexeme into its `i64` value. Handles the
@@ -2744,6 +2817,66 @@ oper main {}\n\
         assert_eq!(h.attrs().len(), 1);
         assert!(h.lookup("b").is_some(), "complement keeps `b`");
         assert!(h.lookup("a").is_none(), "`a` was removed");
+    }
+
+    // ── arithmetic & concatenation lowering ──────────────────────────
+
+    #[test]
+    fn char_literal_lowers_to_const_character() {
+        let src = "oper main {} [ let _c = 'a'; ];";
+        let out = lower(src, FileId(0));
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let m = out.module.expect("module");
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            main.blocks[0].insts.iter().any(
+                |i| matches!(i, Inst::Const { value: Const::Character(c), .. } if *c == 'a' as u32)
+            ),
+            "char literal lowers to Const::Character"
+        );
+    }
+
+    #[test]
+    fn concat_with_char_lowers_char_to_text_then_concat() {
+        // `"x" || 'y'` — the Character operand is normalized to Text via
+        // `Inst::CharToText`, then concatenated via `ScalarOp::Concat`.
+        let src = "oper main {} [ let _s = \"x\" || 'y'; ];";
+        let out = lower(src, FileId(0));
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let m = out.module.expect("module");
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let insts = &main.blocks[0].insts;
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::CharToText { .. })),
+            "char operand normalized via CharToText"
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|i| matches!(i, Inst::ScalarOp { op: ScalarOp::Concat, .. })),
+            "concatenation lowers to ScalarOp::Concat"
+        );
+    }
+
+    #[test]
+    fn arithmetic_in_where_predicate_lowers_scalar_add() {
+        // `a + b > 2` over a relation literal lowers in-process; the predicate
+        // helper computes `a + b` via `ScalarOp::Add`.
+        let src = "oper main {} [ let _s = Relation { {a: 1, b: 2} } where a + b > 2; ];";
+        let out = lower(src, FileId(0));
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let m = out.module.expect("module");
+        let pred = m
+            .functions
+            .iter()
+            .find(|f| f.name.starts_with("__coddl_where_"))
+            .expect("predicate helper function");
+        let has_add = pred
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::ScalarOp { op: ScalarOp::Add, .. }));
+        assert!(has_add, "predicate body computes a + b via ScalarOp::Add");
     }
 
     #[test]

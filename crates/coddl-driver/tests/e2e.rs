@@ -673,6 +673,76 @@ fn where_byte_identical_across_backends() {
     assert_eq!(llvm.stdout, b"{a: 2}\n");
 }
 
+// ── arithmetic & concatenation (Chunk 1) ──────────────────────────────
+
+/// Write `src` to a temp file, run it on both backends, and assert each
+/// succeeds and produces exactly `expected` (so the backends also agree).
+fn run_both_backends_expect(src: &str, name: &str, expected: &[u8]) {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src_path = tmp.path().join(name);
+    std::fs::write(&src_path, src).expect("write source");
+    for backend in ["llvm", "cranelift"] {
+        let out = coddl()
+            .args(["run", &format!("--backend={backend}")])
+            .arg(&src_path)
+            .output()
+            .expect("spawn coddl");
+        assert!(
+            out.status.success(),
+            "{name} {backend} run failed: stderr=\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            out.stdout,
+            expected,
+            "{name} {backend} stdout mismatch: got {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}
+
+#[test]
+fn concat_text_and_char_prints_joined_text() {
+    // `"Hi" || '!'` → `Hi!` — exercises Text||Character, CharToText, and the
+    // runtime `coddl_text_concat` end to end.
+    let src = "\
+program concat_test;
+oper main {} [
+    write_line { message: \"Hi\" || '!' };
+];
+";
+    run_both_backends_expect(src, "concat.cd", b"Hi!\n");
+}
+
+#[test]
+fn arithmetic_in_where_filters_in_process() {
+    // `a + b > 4` over three rows keeps exactly `{a: 2, b: 3}` (sum 5). Runs
+    // in-process (arithmetic predicates don't push to SQL).
+    let src = "\
+program arith_where;
+oper main {} [
+    let r = Relation { {a: 1, b: 1}, {a: 2, b: 3}, {a: 0, b: 0} };
+    write_relation { rel: r where a + b > 4 };
+];
+";
+    run_both_backends_expect(src, "arith-where.cd", b"{a: 2, b: 3}\n");
+}
+
+#[test]
+fn integer_division_truncates_toward_zero() {
+    // `5 / 2 = 2` (not 2.5): the row survives the predicate, observably
+    // confirming integer (truncating) division.
+    let src = "\
+program div_trunc;
+oper main {} [
+    let r = Relation { {a: 5} };
+    write_relation { rel: r where a / 2 = 2 };
+];
+";
+    run_both_backends_expect(src, "div-trunc.cd", b"{a: 5}\n");
+}
+
 // ── extract (Phase 21) ────────────────────────────────────────────────
 
 const EXTRACT_SRC: &str = "\

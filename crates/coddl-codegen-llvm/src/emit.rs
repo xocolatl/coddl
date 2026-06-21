@@ -132,6 +132,11 @@ impl Emitter {
         if !module.headings.is_empty() {
             self.emit_runtime_rc_externs();
         }
+        // Scalar `Text` concatenation externs are needed whenever `||` appears,
+        // independent of any relation machinery (a concat program may touch no
+        // relations at all). Unused declares are harmless, so emit them
+        // unconditionally.
+        self.emit_scalar_text_externs();
         if !module.public_relvars.is_empty() {
             self.emit_runtime_relvar_externs();
         }
@@ -193,6 +198,25 @@ impl Emitter {
         }
 
         Ok(())
+    }
+
+    /// Declare the scalar `Text` concatenation runtime symbols (`||` and the
+    /// `Character`→`Text` normalization). These are needed independent of any
+    /// relation machinery, so they are declared unconditionally. (`coddl_text_eq`
+    /// stays with the relation externs since it predates this and is only used
+    /// from contexts that already pull those in.)
+    fn emit_scalar_text_externs(&mut self) {
+        // Text concatenation `||`: (a_ptr, a_len, b_ptr, b_len) -> payload ptr
+        // (length is `a_len + b_len`, recomputed at the call site).
+        writeln!(
+            self.body,
+            "declare ptr @coddl_text_concat(ptr, i64, ptr, i64)"
+        )
+        .unwrap();
+        // Character → Text: (codepoint) -> payload ptr; paired with
+        // `coddl_utf8_len` for the length.
+        writeln!(self.body, "declare ptr @coddl_char_to_text(i32)").unwrap();
+        writeln!(self.body, "declare i64 @coddl_utf8_len(i32)").unwrap();
     }
 
     /// Declare the runtime symbols that `Inst::RelationLit`,
@@ -595,6 +619,21 @@ impl Emitter {
             }
             Inst::Const {
                 dst,
+                value: Const::Character(cp),
+                ty: ProcType::Character,
+            } => {
+                // A Character is an inline `i32` codepoint.
+                self.values.insert(
+                    *dst,
+                    ValueRepr::Scalar {
+                        ty: "i32".to_string(),
+                        op: format!("{cp}"),
+                    },
+                );
+                Ok(())
+            }
+            Inst::Const {
+                dst,
                 value: Const::Boolean(b),
                 ty: ProcType::Boolean,
             } => {
@@ -701,6 +740,7 @@ impl Emitter {
                 lhs,
                 rhs,
             } => self.lower_scalar_op(*dst, *op, operand_type, lhs, rhs),
+            Inst::CharToText { dst, src } => self.lower_char_to_text(*dst, src),
             Inst::AttrLoad {
                 dst,
                 src,
@@ -1069,6 +1109,30 @@ impl Emitter {
         lhs: &ValueId,
         rhs: &ValueId,
     ) -> Result<(), LlvmEmitError> {
+        // Concatenation: `Text × Text → Text`. The lowerer has already
+        // normalized any `Character` operand to Text, so both operands are
+        // `(ptr, len)` pairs. The runtime returns the payload pointer; the
+        // result length is `lhs_len + rhs_len` (it can't return a fat pointer).
+        if matches!(op, ScalarOp::Concat) {
+            let (lhs_ptr, lhs_len) = self.text_ops(lhs)?;
+            let (rhs_ptr, rhs_len) = self.text_ops(rhs)?;
+            let ptr_name = format!("%v{}.ptr", dst.0);
+            let len_name = format!("%v{}.len", dst.0);
+            writeln!(
+                self.body,
+                "    {ptr_name} = call ptr @coddl_text_concat(ptr {lhs_ptr}, i64 {lhs_len}, ptr {rhs_ptr}, i64 {rhs_len})"
+            )
+            .unwrap();
+            writeln!(self.body, "    {len_name} = add i64 {lhs_len}, {rhs_len}").unwrap();
+            self.values.insert(
+                dst,
+                ValueRepr::Text {
+                    ptr_op: ptr_name,
+                    len_op: len_name,
+                },
+            );
+            return Ok(());
+        }
         // Text operands aren't inline scalars — a Text cell/value is a
         // `(ptr, len)` pair, so `=`/`<>` route through the runtime's
         // byte comparison instead of `icmp`. (The typechecker only admits
@@ -1111,13 +1175,43 @@ impl Emitter {
         match op {
             ScalarOp::And | ScalarOp::Or => {
                 let instr = if matches!(op, ScalarOp::And) { "and" } else { "or" };
+                writeln!(self.body, "    {dst_name} = {instr} i1 {lhs_op}, {rhs_op}").unwrap();
+                self.values.insert(
+                    dst,
+                    ValueRepr::Scalar {
+                        ty: "i1".to_string(),
+                        op: dst_name,
+                    },
+                );
+            }
+            ScalarOp::Add | ScalarOp::Sub | ScalarOp::Mul | ScalarOp::Div => {
+                // `Integer × Integer → Integer`; `sdiv` truncates toward zero.
+                let instr = match op {
+                    ScalarOp::Add => "add",
+                    ScalarOp::Sub => "sub",
+                    ScalarOp::Mul => "mul",
+                    ScalarOp::Div => "sdiv",
+                    _ => unreachable!(),
+                };
                 writeln!(
                     self.body,
-                    "    {dst_name} = {instr} i1 {lhs_op}, {rhs_op}"
+                    "    {dst_name} = {instr} {operand_ty} {lhs_op}, {rhs_op}"
                 )
                 .unwrap();
+                self.values.insert(
+                    dst,
+                    ValueRepr::Scalar {
+                        ty: operand_ty.to_string(),
+                        op: dst_name,
+                    },
+                );
             }
-            _ => {
+            ScalarOp::Eq
+            | ScalarOp::NotEq
+            | ScalarOp::Lt
+            | ScalarOp::Gt
+            | ScalarOp::LtEq
+            | ScalarOp::GtEq => {
                 let pred = match op {
                     ScalarOp::Eq => "eq",
                     ScalarOp::NotEq => "ne",
@@ -1125,20 +1219,49 @@ impl Emitter {
                     ScalarOp::Gt => "sgt",
                     ScalarOp::LtEq => "sle",
                     ScalarOp::GtEq => "sge",
-                    ScalarOp::And | ScalarOp::Or => unreachable!(),
+                    _ => unreachable!(),
                 };
                 writeln!(
                     self.body,
                     "    {dst_name} = icmp {pred} {operand_ty} {lhs_op}, {rhs_op}"
                 )
                 .unwrap();
+                self.values.insert(
+                    dst,
+                    ValueRepr::Scalar {
+                        ty: "i1".to_string(),
+                        op: dst_name,
+                    },
+                );
             }
+            ScalarOp::Concat => unreachable!("Concat handled before the inline-scalar path"),
         }
+        Ok(())
+    }
+
+    /// Convert a `Character` (inline `i32` codepoint) to a `Text` `(ptr, len)`
+    /// value: the runtime's `coddl_char_to_text` gives the payload pointer and
+    /// `coddl_utf8_len` the byte length. Used to normalize a `Character`
+    /// operand of `||`.
+    fn lower_char_to_text(&mut self, dst: ValueId, src: &ValueId) -> Result<(), LlvmEmitError> {
+        let cp = self.scalar_op(src)?;
+        let ptr_name = format!("%v{}.ptr", dst.0);
+        let len_name = format!("%v{}.len", dst.0);
+        writeln!(
+            self.body,
+            "    {ptr_name} = call ptr @coddl_char_to_text(i32 {cp})"
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "    {len_name} = call i64 @coddl_utf8_len(i32 {cp})"
+        )
+        .unwrap();
         self.values.insert(
             dst,
-            ValueRepr::Scalar {
-                ty: "i1".to_string(),
-                op: dst_name,
+            ValueRepr::Text {
+                ptr_op: ptr_name,
+                len_op: len_name,
             },
         );
         Ok(())

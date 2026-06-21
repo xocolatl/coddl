@@ -52,6 +52,12 @@ pub enum CoddlKind {
     /// Relation payload. `desc` points to the heading descriptor;
     /// `length` is the number of records.
     Relation = 0,
+    /// A heap-allocated scalar `Text` payload — a flat run of UTF-8 bytes,
+    /// `length` bytes long, with no nested RC pointers. Produced by `||`
+    /// (`coddl_text_concat` / `coddl_char_to_text`). The drop walker treats it
+    /// like any non-`Relation` kind (free the block, no recursion); scalar-Text
+    /// RC is not yet wired, so these currently leak — see `docs/memory.md`.
+    Text = 1,
 }
 
 /// RC header preceding every heap payload at offset `-HEADER_SIZE`.

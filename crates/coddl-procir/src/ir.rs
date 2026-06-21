@@ -232,10 +232,12 @@ pub enum Inst {
         rel: ValueId,
         heading_id: HeadingId,
     },
-    /// Scalar binary operator — comparison or Boolean logical. Result
-    /// is always `ProcType::Boolean`. `operand_type` is the operand
-    /// types (which match per the typechecker) so backends pick the
-    /// right native compare op.
+    /// Scalar binary operator. The result type depends on `op`: comparison /
+    /// Boolean ops yield `ProcType::Boolean`, arithmetic ops yield
+    /// `ProcType::Integer`, and `Concat` yields `ProcType::Text`.
+    /// `operand_type` is the (shared) operand type — for `Concat` it is always
+    /// `Text` (the lowerer converts a `Character` operand via
+    /// [`Inst::CharToText`] first) — so backends pick the right native op.
     ScalarOp {
         dst: ValueId,
         op: ScalarOp,
@@ -243,6 +245,12 @@ pub enum Inst {
         lhs: ValueId,
         rhs: ValueId,
     },
+    /// Convert a `Character` (an inline codepoint) to a one-character `Text`
+    /// value. Emitted by the lowerer to normalize a `Character` operand of
+    /// `||` before a `ScalarOp::Concat`. Backends call the runtime's
+    /// `coddl_char_to_text` (payload pointer) and `coddl_utf8_len` (byte
+    /// length) to build the resulting `(ptr, len)` Text.
+    CharToText { dst: ValueId, src: ValueId },
     /// Load one attribute from a record pointer at the static byte
     /// offset. Used inside predicate helper functions to read the
     /// row's attributes. `attr_type` is the attribute's machine-level
@@ -427,8 +435,11 @@ pub enum Inst {
     },
 }
 
-/// Scalar binary operator kinds. Lowered by both backends to native
-/// `icmp` / `and` / `or` ops; result is always Boolean.
+/// Scalar binary operator kinds. The comparison ops (`Eq`…`GtEq`) and the
+/// Boolean `And`/`Or` produce a Boolean; the arithmetic ops (`Add`…`Div`)
+/// produce an Integer; `Concat` produces a Text. Backends lower them to
+/// native `icmp` / `and` / `or` / `add` / `sub` / `mul` / `sdiv` ops, or (for
+/// `Concat`) a call to the runtime's `coddl_text_concat`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ScalarOp {
     Eq,
@@ -439,6 +450,14 @@ pub enum ScalarOp {
     GtEq,
     And,
     Or,
+    /// `Integer × Integer → Integer`. `Div` truncates toward zero.
+    Add,
+    Sub,
+    Mul,
+    Div,
+    /// `Text × Text → Text` (operands normalized to Text by the lowerer, so a
+    /// `Character` operand is converted via [`Inst::CharToText`] first).
+    Concat,
 }
 
 #[derive(Clone, Debug)]
@@ -454,6 +473,9 @@ pub enum Const {
     Integer(i64),
     /// String literal payload as UTF-8 bytes (escapes already decoded).
     Text(Vec<u8>),
+    /// A `Character` literal as its Unicode scalar value (escapes already
+    /// decoded). Stored inline as a codepoint (`i32` at the ABI).
+    Character(u32),
     /// `true` / `false` — Boolean literal value.
     Boolean(bool),
     /// The `Tuple {}` value — produced where the source had `{}` or
@@ -543,6 +565,10 @@ impl fmt::Display for Const {
                 }
                 f.write_str("\"")
             }
+            Const::Character(cp) => match char::from_u32(*cp) {
+                Some(c) => write!(f, "'{}'", c.escape_default()),
+                None => write!(f, "'\\u{{{cp:x}}}'"),
+            },
             Const::Boolean(b) => f.write_str(if *b { "true" } else { "false" }),
             Const::Unit => f.write_str("{}"),
         }
@@ -613,6 +639,7 @@ impl fmt::Display for Inst {
                 lhs,
                 rhs,
             } => write!(f, "{dst} = scalar_op {op} {lhs} {rhs}"),
+            Inst::CharToText { dst, src } => write!(f, "{dst} = char_to_text {src}"),
             Inst::AttrLoad {
                 dst,
                 src,
@@ -731,6 +758,11 @@ impl fmt::Display for ScalarOp {
             ScalarOp::GtEq => "ge",
             ScalarOp::And => "and",
             ScalarOp::Or => "or",
+            ScalarOp::Add => "add",
+            ScalarOp::Sub => "sub",
+            ScalarOp::Mul => "mul",
+            ScalarOp::Div => "sdiv",
+            ScalarOp::Concat => "concat",
         })
     }
 }

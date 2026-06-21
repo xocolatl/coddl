@@ -1312,6 +1312,10 @@ impl TypeChecker {
             BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => {
                 self.check_ordering_op(bin, op, scope)
             }
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+                self.check_arith_op(bin, op, scope)
+            }
+            BinaryOp::Concat => self.check_concat_op(bin, scope),
         }
     }
 
@@ -1704,6 +1708,54 @@ impl TypeChecker {
         Type::Boolean
     }
 
+    /// `lhs + rhs` / `lhs - rhs` / `lhs * rhs` / `lhs / rhs` — scalar
+    /// arithmetic. Both operands must be Integer (integer division truncates
+    /// toward zero). Result is Integer. T0043 on a non-Integer operand.
+    fn check_arith_op(&mut self, bin: &BinaryExpr, op: BinaryOp, scope: &mut Scope) -> Type {
+        let lhs_ty = match bin.lhs() {
+            Some(e) => self.check_expr(&e, scope),
+            None => Type::Unknown,
+        };
+        let rhs_ty = match bin.rhs() {
+            Some(e) => self.check_expr(&e, scope),
+            None => Type::Unknown,
+        };
+        let supported = |t: &Type| matches!(t, Type::Integer | Type::Unknown);
+        if !supported(&lhs_ty) || !supported(&rhs_ty) {
+            let opname = op_display(op);
+            self.error(
+                self.node_span(bin.syntax()),
+                "T0043",
+                format!("`{opname}` requires Integer operands; got {lhs_ty} vs {rhs_ty}"),
+            );
+        }
+        Type::Integer
+    }
+
+    /// `lhs || rhs` — text/character concatenation. Each operand must be Text
+    /// or Character (any mix); the result is always Text (two Characters can't
+    /// be one Character). T0044 on an operand that is neither Text nor
+    /// Character.
+    fn check_concat_op(&mut self, bin: &BinaryExpr, scope: &mut Scope) -> Type {
+        let lhs_ty = match bin.lhs() {
+            Some(e) => self.check_expr(&e, scope),
+            None => Type::Unknown,
+        };
+        let rhs_ty = match bin.rhs() {
+            Some(e) => self.check_expr(&e, scope),
+            None => Type::Unknown,
+        };
+        let supported = |t: &Type| matches!(t, Type::Text | Type::Character | Type::Unknown);
+        if !supported(&lhs_ty) || !supported(&rhs_ty) {
+            self.error(
+                self.node_span(bin.syntax()),
+                "T0044",
+                format!("`||` requires Text or Character operands; got {lhs_ty} vs {rhs_ty}"),
+            );
+        }
+        Type::Text
+    }
+
     fn check_transaction_expr(&mut self, txn: &TransactionExpr, scope: &mut Scope) -> Type {
         // `transaction [ ... ]` is a block expression; its value is
         // the body block's value. The scope push gates inner
@@ -1887,6 +1939,11 @@ fn op_display(op: BinaryOp) -> &'static str {
         BinaryOp::Intersect => "intersect",
         BinaryOp::Union => "union",
         BinaryOp::Minus => "minus",
+        BinaryOp::Add => "+",
+        BinaryOp::Sub => "-",
+        BinaryOp::Mul => "*",
+        BinaryOp::Div => "/",
+        BinaryOp::Concat => "||",
     }
 }
 
@@ -2792,6 +2849,57 @@ mod tests {
     fn and_or_on_non_boolean_diagnoses_t0021() {
         let src = "oper main {} [ let b = 1 and 2; ];";
         assert!(codes(src).contains(&"T0021"));
+    }
+
+    // ── arithmetic & concatenation ───────────────────────────────────
+
+    #[test]
+    fn integer_arithmetic_typechecks_clean() {
+        // `+ - * /` on Integer operands are all Integer-typed; no diagnostic.
+        let src = "oper main {} [ \
+                   let _a = 1 + 2; \
+                   let _b = 5 - 3; \
+                   let _c = 4 * 6; \
+                   let _d = 5 / 2; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn arithmetic_on_non_integer_diagnoses_t0043() {
+        let src = "oper main {} [ let b = 1 + \"x\"; ];";
+        assert!(codes(src).contains(&"T0043"));
+    }
+
+    #[test]
+    fn concat_on_text_and_character_typechecks_clean() {
+        // Text||Text, Text||Character, Character||Character all yield Text.
+        let src = "oper main {} [ \
+                   let _a = \"a\" || \"b\"; \
+                   let _b = \"a\" || 'b'; \
+                   let _c = 'a' || 'b'; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn concat_on_integer_diagnoses_t0044() {
+        let src = "oper main {} [ let b = 1 || 2; ];";
+        assert!(codes(src).contains(&"T0044"));
+    }
+
+    #[test]
+    fn arithmetic_in_where_predicate_typechecks_clean() {
+        // The heading attributes `a`/`b` are Integer; `a + b > 2` is a
+        // Boolean predicate over them — runs in-process.
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1, b: 2} }; \
+                   let _s = r where a + b > 2; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
     }
 
     // ── project ──────────────────────────────────────────────────────

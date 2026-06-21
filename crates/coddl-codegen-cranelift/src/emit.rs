@@ -86,6 +86,9 @@ impl Codegen for CraneliftBackend {
         if !module.headings.is_empty() {
             declare_runtime_rc_externs(&mut obj, &mut funcs)?;
         }
+        // Scalar `Text` concatenation (`||`) externs are needed independent of
+        // any relation machinery — a concat-only program touches no headings.
+        declare_scalar_text_externs(&mut obj, &mut funcs)?;
         if !module.public_relvars.is_empty() {
             declare_runtime_relvar_externs(&mut obj, &mut funcs)?;
         }
@@ -170,6 +173,51 @@ impl Codegen for CraneliftBackend {
             .emit()
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))
     }
+}
+
+/// Declare the scalar `Text` concatenation externs (`||` and the
+/// `Character`→`Text` normalization). Needed independent of any relation
+/// machinery, so declared unconditionally. Mirrors the LLVM backend's
+/// `emit_scalar_text_externs`.
+fn declare_scalar_text_externs(
+    obj: &mut ObjectModule,
+    funcs: &mut HashMap<String, FuncId>,
+) -> Result<(), CraneliftEmitError> {
+    let ptr_ty = obj.target_config().pointer_type();
+    // coddl_text_concat(a_ptr, a_len, b_ptr, b_len) -> payload ptr
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_text_concat", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_text_concat".into(), id);
+    }
+    // coddl_char_to_text(codepoint: i32) -> payload ptr
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(types::I32));
+        sig.returns.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_char_to_text", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_char_to_text".into(), id);
+    }
+    // coddl_utf8_len(codepoint: i32) -> i64
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(types::I32));
+        sig.returns.push(AbiParam::new(types::I64));
+        let id = obj
+            .declare_function("coddl_utf8_len", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_utf8_len".into(), id);
+    }
+    Ok(())
 }
 
 /// Declare the runtime RC + relation extern symbols. Mirrors the
@@ -1073,6 +1121,16 @@ fn emit_inst(
         }
         Inst::Const {
             dst,
+            value: Const::Character(cp),
+            ty: ProcType::Character,
+        } => {
+            // A Character is an inline I32 codepoint.
+            let v = builder.ins().iconst(types::I32, *cp as i64);
+            values.insert(*dst, ValueRepr::Scalar(v));
+            Ok(())
+        }
+        Inst::Const {
+            dst,
             value: Const::Boolean(b),
             ty: ProcType::Boolean,
         } => {
@@ -1260,6 +1318,23 @@ fn emit_inst(
             lhs,
             rhs,
         } => {
+            // Concatenation: `Text × Text → Text`. The lowerer normalized any
+            // `Character` operand to Text, so both operands are (ptr, len).
+            // The runtime returns the payload pointer; the result length is
+            // `lhs_len + rhs_len` (no fat-pointer return).
+            if matches!(op, ScalarOp::Concat) {
+                let (lhs_ptr, lhs_len) = text_value(values, lhs)?;
+                let (rhs_ptr, rhs_len) = text_value(values, rhs)?;
+                let concat_id = funcs["coddl_text_concat"];
+                let concat_local = obj.declare_func_in_func(concat_id, builder.func);
+                let call = builder
+                    .ins()
+                    .call(concat_local, &[lhs_ptr, lhs_len, rhs_ptr, rhs_len]);
+                let ptr = builder.inst_results(call)[0];
+                let len = builder.ins().iadd(lhs_len, rhs_len);
+                values.insert(*dst, ValueRepr::Text { ptr, len });
+                return Ok(());
+            }
             // Text operands are (ptr, len) pairs, not inline scalars, so
             // `=`/`<>` call the runtime byte comparison instead of `icmp`.
             // (Only Eq/NotEq reach here on Text; ordering is Integer-only.)
@@ -1293,7 +1368,17 @@ fn emit_inst(
             let result = match op {
                 ScalarOp::And => builder.ins().band(lhs_v, rhs_v),
                 ScalarOp::Or => builder.ins().bor(lhs_v, rhs_v),
-                _ => {
+                // `Integer × Integer → Integer`; `sdiv` truncates toward zero.
+                ScalarOp::Add => builder.ins().iadd(lhs_v, rhs_v),
+                ScalarOp::Sub => builder.ins().isub(lhs_v, rhs_v),
+                ScalarOp::Mul => builder.ins().imul(lhs_v, rhs_v),
+                ScalarOp::Div => builder.ins().sdiv(lhs_v, rhs_v),
+                ScalarOp::Eq
+                | ScalarOp::NotEq
+                | ScalarOp::Lt
+                | ScalarOp::Gt
+                | ScalarOp::LtEq
+                | ScalarOp::GtEq => {
                     use cranelift_codegen::ir::condcodes::IntCC;
                     let cc = match op {
                         ScalarOp::Eq => IntCC::Equal,
@@ -1304,18 +1389,29 @@ fn emit_inst(
                         ScalarOp::GtEq => IntCC::SignedGreaterThanOrEqual,
                         _ => unreachable!(),
                     };
-                    let cmp = builder.ins().icmp(cc, lhs_v, rhs_v);
-                    // Cranelift `icmp` returns an I8 already on the
-                    // boolean lane; ensure it matches the
-                    // `cranelift_value_type(Boolean) = I8`
-                    // expectation by avoiding unnecessary
-                    // conversions. (As of Cranelift's current API the
-                    // result is already i8-equivalent.)
-                    let _ = operand_type; // kept for backend symmetry
-                    cmp
+                    // Cranelift `icmp` already yields an I8 on the boolean
+                    // lane, matching `cranelift_value_type(Boolean) = I8`.
+                    builder.ins().icmp(cc, lhs_v, rhs_v)
+                }
+                ScalarOp::Concat => {
+                    unreachable!("Concat handled before the inline-scalar path")
                 }
             };
             values.insert(*dst, ValueRepr::Scalar(result));
+            Ok(())
+        }
+        Inst::CharToText { dst, src } => {
+            // Normalize a `Character` (inline I32 codepoint) to a Text
+            // `(ptr, len)`: `coddl_char_to_text` gives the payload pointer and
+            // `coddl_utf8_len` the byte length.
+            let cp = scalar_value(values, src)?;
+            let to_text = obj.declare_func_in_func(funcs["coddl_char_to_text"], builder.func);
+            let ptr_call = builder.ins().call(to_text, &[cp]);
+            let ptr = builder.inst_results(ptr_call)[0];
+            let len_fn = obj.declare_func_in_func(funcs["coddl_utf8_len"], builder.func);
+            let len_call = builder.ins().call(len_fn, &[cp]);
+            let len = builder.inst_results(len_call)[0];
+            values.insert(*dst, ValueRepr::Text { ptr, len });
             Ok(())
         }
         Inst::AttrLoad {

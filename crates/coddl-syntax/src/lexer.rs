@@ -159,6 +159,7 @@ impl<'a> Lexer<'a> {
             ':' => self.lex_colon(start),
             '<' => self.lex_lt(start),
             '>' => self.lex_gt(start),
+            '|' => self.lex_pipe(start),
 
             // Unicode glyph synonyms (§3 "Unicode operator glyphs")
             '⋈' | '∪' | '∩' | '∖' => self.lex_word_glyph(start),
@@ -222,6 +223,20 @@ impl<'a> Lexer<'a> {
                 self.emit(TokenKind::NotEq, start);
             }
             _ => self.emit(TokenKind::Lt, start),
+        }
+    }
+
+    fn lex_pipe(&mut self, start: usize) {
+        self.bump(); // '|'
+        if self.peek() == Some('|') {
+            self.bump();
+            self.emit(TokenKind::PipePipe, start);
+        } else {
+            // A lone `|` is not (yet) an operator — emit the same
+            // unexpected-character diagnostic the catch-all would.
+            let span = self.span(start);
+            self.diag(span, "E0001", "unexpected character '|'");
+            self.emit(TokenKind::Error, start);
         }
     }
 
@@ -739,6 +754,23 @@ mod tests {
     fn arithmetic_operators() {
         use TokenKind::*;
         assert_eq!(lex_kinds("+ - * /"), vec![Plus, Minus, Star, Slash, Eof]);
+    }
+
+    #[test]
+    fn double_pipe_lexes_as_concat() {
+        use TokenKind::*;
+        assert_eq!(
+            lex_kinds("a || b"),
+            vec![Ident, PipePipe, Ident, Eof]
+        );
+        let out = lex_all("||");
+        assert!(out.diagnostics.is_empty(), "`||` is a clean token");
+    }
+
+    #[test]
+    fn lone_pipe_is_diagnosed() {
+        let out = lex_all("|");
+        assert!(out.diagnostics.iter().any(|d| d.code == "E0001"));
     }
 
     #[test]

@@ -103,6 +103,8 @@ pub enum TokenKind {
     Star,
     /// `/`
     Slash,
+    /// `||`  (text/character concatenation)
+    PipePipe,
 
     // ── trivia (kept for CST) ────────────────────────────────────────────
     /// Run of `XID_Continue` / Unicode `White_Space`. Discarded by the

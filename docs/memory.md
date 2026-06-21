@@ -69,6 +69,14 @@ The two layers exist deliberately: the user reasons about *values*; the compiler
 
 **What we lose vs. Rust**: zero-cost moves. We always pay one atomic refcount op on heap-value assignment. **What we gain vs. tracing GC**: predictable, low-latency reclamation; no stop-the-world pauses; the runtime stays tiny.
 
+### Known gap: scalar `Text` reference counting (deferred)
+
+The table above describes the **target**. Today the RC machinery is wired for `Relation` payloads only (`is_heap_managed` in `coddl-procir` returns `true` only for `Relation`); every `Text` the language could produce until now was an **immortal compile-time literal** (a rodata `(ptr, len)` with no header), so nothing needed freeing.
+
+Concatenation (`||`) introduces the **first heap-allocated scalar `Text`** — `coddl_text_concat` / `coddl_char_to_text` allocate via `coddl_rc_alloc` (kind `Text`), but no `Inst::Release` is ever emitted for a scalar `Text` value, so these **currently leak**. The leak is contained: the language has no loops, so it cannot accumulate within a run, and the OS reclaims at process exit.
+
+Closing this gap (teach `is_heap_managed` about `Text`, emit retain/release for `Text` locals, thread ownership through rebinds and record cells) is a dedicated follow-up — it is the `Text` row of the strategy table coming true. Until then, treat heap scalar `Text` as immortal-for-the-run.
+
 ## Discipline (defaults — push back if a proposal conflicts)
 
 These are the working assumptions that keep the model honest. They are *not* commandments — flag a conflict and we'll resolve it explicitly.

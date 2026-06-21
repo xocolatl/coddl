@@ -53,6 +53,7 @@ pub enum SyntaxKind {
     MINUS,
     STAR,
     SLASH,
+    PIPE_PIPE,
 
     WHITESPACE,
     LINE_COMMENT,
@@ -271,6 +272,7 @@ impl From<TokenKind> for SyntaxKind {
             TokenKind::Minus => SyntaxKind::MINUS,
             TokenKind::Star => SyntaxKind::STAR,
             TokenKind::Slash => SyntaxKind::SLASH,
+            TokenKind::PipePipe => SyntaxKind::PIPE_PIPE,
 
             TokenKind::Whitespace => SyntaxKind::WHITESPACE,
             TokenKind::LineComment => SyntaxKind::LINE_COMMENT,
@@ -318,6 +320,7 @@ mod tests {
             TokenKind::Minus,
             TokenKind::Star,
             TokenKind::Slash,
+            TokenKind::PipePipe,
             TokenKind::Whitespace,
             TokenKind::LineComment,
             TokenKind::BlockComment,

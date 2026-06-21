@@ -540,11 +540,11 @@ impl<'a> Parser<'a> {
 
     /// An expression. Driven by a precedence-climbing Pratt walker:
     /// primary → postfix loop (call, field access) → infix loop
-    /// (comparison, logical, `where`). Postfix binds tighter than
-    /// every infix operator; among infix operators, the precedence
+    /// (arithmetic, comparison, logical, `where`). Postfix binds tighter
+    /// than every infix operator; among infix operators, the precedence
     /// ladder from lowest to highest is `where`(0) < `or`(1) < `and`(2)
-    /// < comparison(3). All Phase-20 infix operators are
-    /// left-associative.
+    /// < comparison(3) < additive `+`/`-`/`||`(4) < multiplicative
+    /// `*`/`/`(5). All infix operators are left-associative.
     fn parse_expr(&mut self) {
         self.parse_expr_prec(0);
     }
@@ -636,11 +636,17 @@ impl<'a> Parser<'a> {
 
     /// Peek the next infix operator's precedence. Returns `None` if
     /// the cursor isn't on a recognized infix operator. Operators
-    /// recognized by token kind: `=`, `<>`, `<`, `>`, `<=`, `>=` (all
-    /// at prec 3). Operators recognized by contextual-keyword IDENT:
-    /// `and` (2), `or` (1), `where` (0).
+    /// recognized by token kind: `*`, `/` (5); `+`, `-`, `||` (4);
+    /// `=`, `<>`, `<`, `>`, `<=`, `>=` (all at prec 3). Operators
+    /// recognized by contextual-keyword IDENT: `and` (2), `or` (1),
+    /// `where` (0) (and the relational ops, also at 0).
     fn peek_infix_prec(&self) -> Option<u8> {
         match self.current() {
+            // Multiplicative — binds tightest among infix ops.
+            SyntaxKind::STAR | SyntaxKind::SLASH => Some(5),
+            // Additive, plus text/character concatenation (`||`). Disjoint
+            // operand types, so `||`'s rank among level-4 ops is immaterial.
+            SyntaxKind::PLUS | SyntaxKind::MINUS | SyntaxKind::PIPE_PIPE => Some(4),
             SyntaxKind::EQ
             | SyntaxKind::NOT_EQ
             | SyntaxKind::LT
@@ -2387,6 +2393,66 @@ mod tests {
                 out.diagnostics
             );
         }
+    }
+
+    // ── arithmetic & concatenation ───────────────────────────────────
+
+    #[test]
+    fn arithmetic_operators_all_parse() {
+        for op in &["+", "-", "*", "/", "||"] {
+            let src = format!("oper f {{}} [ let b = 1 {op} 2; ];");
+            let out = parse_str(&src);
+            assert!(
+                out.diagnostics.is_empty(),
+                "operator `{op}` failed: {:?}",
+                out.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn arithmetic_binds_tighter_than_comparison() {
+        // `a + b > c` parses as `(a + b) > c`: the outer BINARY_EXPR is `>`,
+        // and its lhs is the `a + b` BINARY_EXPR.
+        let out = parse_str("oper f {} [ let b = a + b > c; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let let_stmt = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::LET_STMT)
+            .unwrap();
+        let outer = let_stmt
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("outer BINARY_EXPR");
+        assert!(outer.text().to_string().contains(" > "), "outer is `>`");
+        let inner = outer
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("inner BINARY_EXPR (the `a + b` sum)");
+        assert_eq!(inner.text().to_string().trim(), "a + b");
+    }
+
+    #[test]
+    fn multiplicative_binds_tighter_than_additive() {
+        // `a + b * c` parses as `a + (b * c)`: outer `+`, its rhs is `b * c`.
+        let out = parse_str("oper f {} [ let b = a + b * c; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let let_stmt = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::LET_STMT)
+            .unwrap();
+        let outer = let_stmt
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("outer BINARY_EXPR");
+        assert!(outer.text().to_string().contains(" + "), "outer is `+`");
+        let inner = outer
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("inner BINARY_EXPR (the `b * c` product)");
+        assert_eq!(inner.text().to_string().trim(), "b * c");
     }
 
     // ── extract (Phase 21) ───────────────────────────────────────────

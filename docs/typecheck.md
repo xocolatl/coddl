@@ -284,6 +284,12 @@ each `parse_<x>` has a corresponding `check_<x>`.
     Integer. Result is `Boolean`. T0021 otherwise.
   - **Logical (`and`, `or`)**: both operands must be Boolean.
     Result is `Boolean`. T0021 otherwise.
+  - **Arithmetic (`+`, `-`, `*`, `/`)**: both operands must be
+    Integer (integer division truncates toward zero). Result is
+    `Integer`. T0043 otherwise.
+  - **Concatenation (`||`)**: each operand must be Text or
+    Character (any mix). Result is always `Text` (two Characters
+    can't be one Character). T0044 otherwise.
   - **`where`**: lhs must be `Relation H` (T0023 if not). A fresh
     scope layer is pushed with the heading's attributes as
     bindings, then the rhs (predicate) is checked; the predicate
@@ -411,3 +417,5 @@ check script enforces that.
 | T0040 | `compose` operands have identical headings (every attribute removed, result always nullary) — suggest `intersect` |
 | T0041 | `tclose` operand must be a relation of exactly two attributes of the same type (binary graph relation) |
 | T0042 | `replace` value references no attribute, so it removes nothing — use `extend` to add without removing |
+| T0043 | arithmetic operator (`+`, `-`, `*`, `/`) requires Integer operands |
+| T0044 | `||` requires Text or Character operands |

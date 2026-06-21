@@ -275,6 +275,17 @@ fn is_comment(k: SyntaxKind) -> bool {
 fn is_op(k: SyntaxKind) -> bool {
     matches!(
         k,
-        EQ | NOT_EQ | LT | GT | LT_EQ | GT_EQ | PLUS | MINUS | STAR | SLASH | ASSIGN | ARROW
+        EQ | NOT_EQ
+            | LT
+            | GT
+            | LT_EQ
+            | GT_EQ
+            | PLUS
+            | MINUS
+            | STAR
+            | SLASH
+            | PIPE_PIPE
+            | ASSIGN
+            | ARROW
     )
 }

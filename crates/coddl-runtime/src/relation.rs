@@ -713,6 +713,86 @@ pub unsafe extern "C" fn coddl_text_eq(
     (a == b) as i8
 }
 
+/// Concatenate two `Text` values (surface `||`) into a freshly allocated
+/// heap `Text` payload. Returns the payload pointer; the caller pairs it with
+/// the length `a_len + b_len` to form the `(ptr, len)` Text value (the runtime
+/// can't return a fat pointer by value, so the length is recomputed at the
+/// call site).
+///
+/// KNOWN LEAK: this is the first heap-allocated scalar `Text`. Scalar-Text
+/// reference counting is not yet wired (every prior `Text` was immortal
+/// rodata), so the result is never released. The leak is contained — the
+/// language has no loops, so it cannot accumulate, and the OS reclaims at
+/// exit. Tracked in `docs/memory.md`; a dedicated follow-up adds the RC path.
+///
+/// # Safety
+/// Each `(ptr, len)` pair must describe `len` readable bytes (or `len == 0`).
+#[no_mangle]
+pub unsafe extern "C" fn coddl_text_concat(
+    a_ptr: *const u8,
+    a_len: usize,
+    b_ptr: *const u8,
+    b_len: usize,
+) -> *mut u8 {
+    let total = a_len + b_len;
+    let out = crate::rc::coddl_rc_alloc(
+        total,
+        total as u32,
+        crate::rc::CoddlKind::Text as u32,
+        std::ptr::null(),
+    );
+    if a_len > 0 {
+        std::ptr::copy_nonoverlapping(a_ptr, out, a_len);
+    }
+    if b_len > 0 {
+        std::ptr::copy_nonoverlapping(b_ptr, out.add(a_len), b_len);
+    }
+    out
+}
+
+/// UTF-8-encode a `Character` (Unicode scalar value) into a freshly allocated
+/// heap `Text` payload. Returns the payload pointer; the caller pairs it with
+/// [`coddl_utf8_len`] of the same codepoint to form the `(ptr, len)` Text.
+/// Used to normalize a `Character` operand of `||` to `Text`. No caller-side
+/// safety obligation — `cp` is a plain value — so this is a safe `extern "C"`.
+///
+/// KNOWN LEAK: see [`coddl_text_concat`].
+#[no_mangle]
+pub extern "C" fn coddl_char_to_text(cp: u32) -> *mut u8 {
+    let mut buf = [0u8; 4];
+    let bytes = match char::from_u32(cp) {
+        Some(c) => c.encode_utf8(&mut buf).as_bytes(),
+        // A `Character` is always a valid codepoint by construction; degrade
+        // to an empty Text rather than panic across the FFI boundary.
+        None => &[],
+    };
+    let n = bytes.len();
+    // SAFETY: `coddl_rc_alloc` returns a fresh `n`-byte payload; we copy
+    // exactly `n` bytes from the on-stack `buf` into it.
+    unsafe {
+        let out = crate::rc::coddl_rc_alloc(
+            n,
+            n as u32,
+            crate::rc::CoddlKind::Text as u32,
+            std::ptr::null(),
+        );
+        if n > 0 {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, n);
+        }
+        out
+    }
+}
+
+/// The UTF-8 byte length (1–4) of a `Character`'s codepoint — the length that
+/// pairs with [`coddl_char_to_text`]'s payload. A pure function (no
+/// allocation) so codegen can obtain the Text length without a fat-pointer
+/// return. Agrees byte-for-byte with `coddl_char_to_text` by construction
+/// (`char::len_utf8` ↔ `char::encode_utf8`).
+#[no_mangle]
+pub extern "C" fn coddl_utf8_len(cp: u32) -> usize {
+    char::from_u32(cp).map_or(0, |c| c.len_utf8())
+}
+
 /// Byte width of one cell of the given [`CoddlAttrKind`]. Mirrors the
 /// record-layout table in the module header: scalar cells are 8 bytes,
 /// `Text` is a 16-byte `(ptr, len)` pair.
@@ -1048,6 +1128,55 @@ mod tests {
             );
             // Both empty: pointers are never dereferenced.
             assert_eq!(coddl_text_eq(std::ptr::null(), 0, std::ptr::null(), 0), 1);
+        }
+    }
+
+    #[test]
+    fn text_concat_joins_bytes() {
+        unsafe {
+            let a = b"Hello, ";
+            let b = b"world!";
+            let out = coddl_text_concat(a.as_ptr(), a.len(), b.as_ptr(), b.len());
+            let n = a.len() + b.len();
+            assert_eq!(std::slice::from_raw_parts(out, n), b"Hello, world!");
+            // Release is possible (kind=Text frees the block); the *compiled
+            // program* doesn't yet emit one — that's the documented leak.
+            coddl_rc_release(out);
+        }
+    }
+
+    #[test]
+    fn text_concat_handles_empty_operands() {
+        unsafe {
+            let a = b"abc";
+            let out = coddl_text_concat(a.as_ptr(), a.len(), std::ptr::null(), 0);
+            assert_eq!(std::slice::from_raw_parts(out, a.len()), b"abc");
+            coddl_rc_release(out);
+            let empty = coddl_text_concat(std::ptr::null(), 0, std::ptr::null(), 0);
+            coddl_rc_release(empty);
+        }
+    }
+
+    #[test]
+    fn char_to_text_and_utf8_len_agree_across_widths() {
+        // 1/2/3/4-byte codepoints: 'A', 'é', '€', '😀'.
+        for (cp, expect) in [
+            ('A' as u32, "A".as_bytes()),
+            ('é' as u32, "é".as_bytes()),
+            ('€' as u32, "€".as_bytes()),
+            ('😀' as u32, "😀".as_bytes()),
+        ] {
+            let len = coddl_utf8_len(cp);
+            assert_eq!(len, expect.len(), "utf8_len for U+{cp:04X}");
+            unsafe {
+                let out = coddl_char_to_text(cp);
+                assert_eq!(
+                    std::slice::from_raw_parts(out, len),
+                    expect,
+                    "bytes for U+{cp:04X}"
+                );
+                coddl_rc_release(out);
+            }
         }
     }
 

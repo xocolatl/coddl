@@ -307,6 +307,7 @@ Unterminated `'…` or `"…` emits **E0005** and **E0003** respectively.
 | `Minus`       | `-`                                             |
 | `Star`        | `*`                                             |
 | `Slash`       | `/`                                             |
+| `PipePipe`    | `\|\|`                                          |
 
 ### Unicode glyph synonyms
 
@@ -443,11 +444,23 @@ function that implements it.
                   | 'minus'                                    -- prec 0
                   | 'or'                                       -- prec 1
                   | 'and'                                      -- prec 2
-                  | '=' | '<>' | '<' | '>' | '<=' | '>=' ;     -- prec 3
+                  | '=' | '<>' | '<' | '>' | '<=' | '>='       -- prec 3
+                  | '+' | '-' | '||'                           -- prec 4
+                  | '*' | '/' ;                                -- prec 5
                     -- `where`, `and`, `or` are contextual
                     -- keywords; the symbolic forms are token kinds
                     -- already lexed (Eq, Lt, Gt, LtEq, GtEq,
-                    -- NotEq).
+                    -- NotEq, Plus, Minus, Star, Slash, PipePipe).
+                    -- Arithmetic binds tighter than comparison:
+                    -- additive `+`/`-` and concatenation `||` at
+                    -- prec 4, multiplicative `*`/`/` at prec 5.
+                    -- `||` shares prec 4 with `+`/`-`; its rank
+                    -- there is immaterial since its operands
+                    -- (Text/Character) never mix with arithmetic.
+                    -- The relational ops `join`/`times`/`compose`/
+                    -- `intersect`/`union`/`minus` are also contextual
+                    -- keywords. (Symbolic `-` is `Sub`; the keyword
+                    -- `minus` is the relational set-difference op.)
 <postfix>       ::= <arg-list>                                 -- call: CALL_EXPR
                   | <field-access-tail> ;                      -- field access: FIELD_ACCESS
 <field-access-tail> ::= '.' <identifier> ;
@@ -573,8 +586,10 @@ is explicit, not implied:
   literals `true` / `false` and infix `=`, `<>`, `<`, `>`, `<=`,
   `>=`, `and`, `or`, `where` landed in Phase 20.)
 - **Indexing** (`s[i]`) in expression postfix position.
-- **Arithmetic** (`+`, `-`, `*`, `/`, `mod`). Reserved precedence
-  slot above comparison; not yet parsed.
+- **`mod`** (`Integer × Integer → Integer`, multiplicative precedence) and
+  **unary minus** / negative literals. Still deferred. (Binary arithmetic
+  `+`, `-`, `*`, `/` on `Integer` and concatenation `||` on `Text`/`Character`
+  landed — they parse at prec 4/5 above comparison, see `<infix-op>`.)
 - **Pattern matching**, **`if`/`else`**, **anonymous opers**.
 
 
