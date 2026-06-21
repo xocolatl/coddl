@@ -1,0 +1,16 @@
+// sales.cddb
+//
+// Conceptual schema for the `sales` database — the SQL-backed twin of the
+// in-process extend/replace example. Database-side `base relvar` declarations;
+// the heading mirrors the `public relvar Sales` in extend-replace-db.cd.
+
+database sales;
+
+base relvar Sales {
+    id: Integer,
+    customer: Text,
+    item: Text,
+    unit_cents: Integer,
+    qty: Integer,
+}
+key { id };

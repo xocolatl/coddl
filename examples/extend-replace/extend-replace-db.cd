@@ -1,0 +1,52 @@
+// extend-replace-db.cd
+//
+// `extend` and `replace`, the two postfix operators that reshape a relation's
+// heading by computing new attributes — shown SQL-backed, so each query pushes
+// DOWN to SQLite.
+//
+//   R extend  { c: <expr> }   adds `c`, KEEPING every operand attribute
+//   R replace { c: <expr> }   adds `c`, CONSUMING the attributes <expr> reads
+//
+// `extend` and `replace` over the same expression differ only in what they keep
+// vs. consume — the spine of this example. This `-db` twin shows two cases that
+// push as one `SELECT … AS …` each: `extend` with a computed column, and the
+// `replace` rename (a bare attribute reference — id -> ref). The compute-and-
+// consume `replace` forms land alongside the in-process twin.
+//
+// The .cd-family (storage stays out of D):
+//   extend-replace-db.cd  — this program: the external schema + queries
+//   sales.cddb            — database catalog (conceptual schema)
+//   sales.cdstore         — conceptual -> physical (SQLite) binding
+//   seed-db.sh            — recreates sales.sqlite with the demo data
+//
+// `public` relvars are read-only, so there is no `:=` — the data lives in the
+// seeded database. A public-relvar read must sit inside a `transaction [...]`.
+// Money is integer cents (Coddl has no nulls and v1 has no Rational arithmetic
+// in `extend` yet; cents keep the totals exact).
+
+program extend_replace_db;
+database sales;
+
+public relvar Sales {
+    id: Integer,
+    customer: Text,
+    item: Text,
+    unit_cents: Integer,
+    qty: Integer,
+} key { id };
+
+oper main {} [
+    // extend: add a computed `line_cents = unit_cents * qty`, KEEPING the
+    // inputs. Pushes one `SELECT …, ("unit_cents" * "qty") AS "line_cents" …`.
+    let priced = transaction [
+        Sales extend { line_cents: unit_cents * qty }
+    ];
+    write_relation { rel: priced };
+
+    // replace (rename): id -> ref. The bare-attribute-reference form removes
+    // `id` and adds `ref`. Pushes one `SELECT "id" AS "ref", … FROM "sales"`.
+    let reffed = transaction [
+        Sales replace { ref: id }
+    ];
+    write_relation { rel: reffed };
+];

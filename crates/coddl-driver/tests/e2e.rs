@@ -1157,6 +1157,133 @@ fn relvar_pushdown_audit_cranelift() {
     assert_pushdown_audit("cranelift");
 }
 
+// ── extend pushdown ───────────────────────────────────────────────────
+
+/// Write the `sales` database companions and seed a SQLite db with two rows.
+/// Returns the db path; the caller writes its own `.cd` (with `database sales;`)
+/// alongside. The suite owns this fixture — it never reads `examples/`.
+fn seed_sales_fixtures(dir: &Path) -> PathBuf {
+    std::fs::write(
+        dir.join("sales.cddb"),
+        "database sales;\n\
+         base relvar Sales { id: Integer, customer: Text, item: Text, unit_cents: Integer, qty: Integer } key { id };\n",
+    )
+    .expect("write sales.cddb");
+    std::fs::write(
+        dir.join("sales.cdstore"),
+        "store for sales;\n\
+         backend sqlite { file: \"sales.sqlite\" };\n\
+         relvar Sales: table \"sales\" { columns: { id, customer, item, unit_cents, qty } };\n",
+    )
+    .expect("write sales.cdstore");
+
+    let db = dir.join("sales.sqlite");
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "sqlite3 '{}' \"CREATE TABLE sales (id INTEGER NOT NULL, customer TEXT NOT NULL, item TEXT NOT NULL, unit_cents INTEGER NOT NULL, qty INTEGER NOT NULL, PRIMARY KEY (id)); INSERT INTO sales (id, customer, item, unit_cents, qty) VALUES (1, 'ada', 'widget', 500, 3), (2, 'bo', 'gadget', 800, 2);\"",
+            db.display()
+        ))
+        .status()
+        .expect("invoke sqlite3");
+    assert!(status.success(), "sales fixture seed failed");
+    db
+}
+
+/// Run a relvar-rooted `extend` over the seeded `sales` db on `backend`: assert
+/// the computed `line_cents = unit_cents * qty` column appears in the output
+/// tuple set, and that `CODDL_AUDIT_LOG` proves the computed column pushed to
+/// SQL (`("unit_cents" * "qty") AS "line_cents"`).
+fn assert_extend_pushdown(backend: &str) {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = seed_sales_fixtures(tmp.path());
+    let cd = tmp.path().join("ext.cd");
+    std::fs::write(
+        &cd,
+        "program sales_db;\n\
+         database sales;\n\
+         public relvar Sales { id: Integer, customer: Text, item: Text, unit_cents: Integer, qty: Integer } key { id };\n\
+         oper main {} [\n\
+             let p = transaction [ Sales extend { line_cents: unit_cents * qty } ];\n\
+             write_relation { rel: p };\n\
+         ];\n",
+    )
+    .expect("write ext.cd");
+    let log = tmp.path().join("audit.log");
+
+    let out = coddl()
+        .env("CODDL_AUDIT_LOG", &log)
+        .env("CODDL_SALES_FILE", &db)
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "extend pushdown on {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(
+        tuple_lines(&out.stdout),
+        sorted_tuples(&[
+            r#"{customer: "ada", id: 1, item: "widget", line_cents: 1500, qty: 3, unit_cents: 500}"#,
+            r#"{customer: "bo", id: 2, item: "gadget", line_cents: 1600, qty: 2, unit_cents: 800}"#,
+        ]),
+        "unexpected extend output on {backend}",
+    );
+
+    let contents = std::fs::read_to_string(&log).expect("read audit log");
+    let sqls: Vec<&str> = contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| audit_sql(l).unwrap_or_else(|| panic!("malformed audit line ({backend}): {l:?}")))
+        .collect();
+    assert!(
+        sqls.iter()
+            .any(|s| s.contains(r#"("unit_cents" * "qty") AS "line_cents""#)),
+        "expected the computed extend column in pushed SQL on {backend}; got {sqls:?}",
+    );
+}
+
+#[test]
+fn extend_pushdown_audit_llvm() {
+    assert_extend_pushdown("llvm");
+}
+
+#[test]
+fn extend_pushdown_audit_cranelift() {
+    assert_extend_pushdown("cranelift");
+}
+
+#[test]
+fn extend_over_in_memory_relation_fails_with_t0046() {
+    // v1 supports `extend` only via SQL pushdown; a materialized operand has no
+    // in-process path yet, so it fails to compile with T0046.
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cd = tmp.path().join("matext.cd");
+    std::fs::write(
+        &cd,
+        "program p;\noper main {} [ let _s = Relation { {a: 1, b: 2} } extend {c: a + b}; ];\n",
+    )
+    .expect("write matext.cd");
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        !out.status.success(),
+        "materialized extend should fail to compile"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("T0046"),
+        "expected T0046, got stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 // Helper-level checks proving the acceptance assertions are non-vacuous —
 // they reject the pre-pushdown world (a startup full scan) and a malformed
 // line — without needing a live runtime to regress.

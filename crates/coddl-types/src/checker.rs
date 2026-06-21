@@ -11,10 +11,10 @@ use std::collections::{HashMap, HashSet};
 
 use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{
-    AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, Expr, ExprStmt, FieldAccess,
-    Heading as AstHeading, Item, KeyClause, LetStmt, NamedArg, OperDecl, PrivateRelvarDecl,
-    ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, ReplaceExpr, Root, Stmt, TcloseExpr,
-    TransactionExpr, TupleLit, UnaryExpr, UnaryOp,
+    AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, Expr, ExprStmt, ExtendExpr,
+    FieldAccess, Heading as AstHeading, Item, KeyClause, LetStmt, NamedArg, OperDecl,
+    PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, ReplaceExpr, Root,
+    Stmt, TcloseExpr, TransactionExpr, TupleLit, UnaryExpr, UnaryOp,
 };
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
@@ -866,6 +866,7 @@ impl TypeChecker {
             Expr::Unary(u) => self.check_unary_expr(u, scope),
             Expr::Project(p) => self.check_project_expr(p, scope),
             Expr::Replace(r) => self.check_replace_expr(r, scope),
+            Expr::Extend(e) => self.check_extend_expr(e, scope),
             Expr::Tclose(t) => self.check_tclose_expr(t, scope),
         }
     }
@@ -1051,6 +1052,69 @@ impl TypeChecker {
             }
             result.push((new_name, ty.clone()));
         }
+        Type::Relation(Heading::new(result))
+    }
+
+    /// Walk `R extend { c: e, … }` — relational extend: add each new attribute
+    /// `c` bound to the computed value `e`, keeping every operand attribute.
+    /// The operand must be `Relation H` (T0023, shared with `where`/`replace`).
+    /// Each value `e` is a general scalar expression typechecked in a scope
+    /// with `H`'s attributes injected (the same machinery `where` uses), so it
+    /// may reference the operand's attributes. The new name `c` must not
+    /// collide with an existing attribute or another `extend` target (T0045).
+    /// The result heading is `H` plus each `(c, type_of e)`, canonically
+    /// re-sorted.
+    fn check_extend_expr(&mut self, ee: &ExtendExpr, scope: &mut Scope) -> Type {
+        let input_ty = match ee.input() {
+            Some(e) => self.check_expr(&e, scope),
+            None => return Type::Unknown,
+        };
+        let heading = match &input_ty {
+            Type::Relation(h) => h.clone(),
+            Type::Unknown => return Type::Unknown,
+            other => {
+                let span = ee
+                    .input()
+                    .map(|e| self.node_span(e.syntax()))
+                    .unwrap_or_else(|| self.node_span(ee.syntax()));
+                self.error(
+                    span,
+                    "T0023",
+                    format!("`extend` expects a Relation on the left, got {other}"),
+                );
+                return Type::Unknown;
+            }
+        };
+        // Inject the operand's attributes so each value expression resolves
+        // against the heading first (the same scope rule as `where`).
+        scope.push();
+        for (name, ty) in heading.attrs() {
+            scope.insert(name.clone(), ty.clone(), Span::default(), BindingOrigin::WhereAttr);
+        }
+        // Result heading: existing attributes plus each computed one. `seen` is
+        // seeded with `H`'s names so a new name colliding with an existing
+        // attribute OR a duplicate `extend` target both fire T0045 (without it
+        // `Heading::new` would silently dedup and drop a column).
+        let mut result: Vec<(String, Type)> = heading.attrs().to_vec();
+        let mut seen: HashSet<String> = heading.attrs().iter().map(|(n, _)| n.clone()).collect();
+        for (name_tok, value) in ee.pairs() {
+            let Some(name_tok) = name_tok else { continue };
+            let name = name_tok.text();
+            let vty = match value {
+                Some(v) => self.check_expr(&v, scope),
+                None => Type::Unknown,
+            };
+            if !seen.insert(name.to_string()) {
+                self.error(
+                    self.token_span(&name_tok),
+                    "T0045",
+                    format!("`extend` attribute `{name}` already exists in {heading}"),
+                );
+                continue;
+            }
+            result.push((name.to_string(), vty));
+        }
+        scope.pop();
         Type::Relation(Heading::new(result))
     }
 
@@ -3098,6 +3162,57 @@ mod tests {
     fn replace_non_relation_diagnoses_t0023() {
         let src = "oper main {} [ let s = 1 replace {a: b}; ];";
         assert!(codes(src).contains(&"T0023"));
+    }
+
+    // ── extend ────────────────────────────────────────────────────────
+
+    #[test]
+    fn extend_adds_computed_integer_attribute() {
+        // `c: a + b` adds an Integer attribute `c`; `extract(...).c` resolves,
+        // proving `c` is in the result heading (and a/b survive).
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1, b: 2} } extend {c: a + b}; \
+                   let t = extract r; \
+                   let _n = t.c; \
+                   let _a = t.a; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn extend_concat_adds_text_attribute() {
+        let src = "oper main {} [ \
+                   let r = Relation { {x: \"a\", y: \"b\"} } extend {z: x || y}; \
+                   let t = extract r; \
+                   let _z = t.z; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn extend_collision_with_existing_attribute_diagnoses_t0045() {
+        let src = "oper main {} [ let s = Relation { {a: 1, b: 2} } extend {a: b}; ];";
+        assert!(codes(src).contains(&"T0045"));
+    }
+
+    #[test]
+    fn extend_duplicate_target_diagnoses_t0045() {
+        let src = "oper main {} [ let s = Relation { {a: 1} } extend {c: a, c: a}; ];";
+        assert!(codes(src).contains(&"T0045"));
+    }
+
+    #[test]
+    fn extend_non_relation_diagnoses_t0023() {
+        let src = "oper main {} [ let s = 1 extend {c: a}; ];";
+        assert!(codes(src).contains(&"T0023"));
+    }
+
+    #[test]
+    fn extend_value_unknown_attr_diagnoses_t0001() {
+        let src = "oper main {} [ let s = Relation { {a: 1} } extend {c: nope + 1}; ];";
+        assert!(codes(src).contains(&"T0001"));
     }
 
     // ── tclose ────────────────────────────────────────────────────────

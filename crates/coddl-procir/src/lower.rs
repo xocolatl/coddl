@@ -16,14 +16,14 @@ use coddl_diagnostics::{Diagnostic, FileId, Severity, Span};
 use coddl_plan::Plan;
 use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, Expr, ExprStmt,
-    FieldAccess, Item,
+    ExtendExpr, FieldAccess, Item,
     LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, ReplaceExpr,
     Root, Stmt, TcloseExpr, TransactionExpr, TupleLit, UnaryExpr, UnaryOp,
 };
 use coddl_syntax::SyntaxKind;
 use coddl_types::{check, Heading, RelvarKind, RelvarTable, Type};
 
-use coddl_relir::{Literal as RelLiteral, Predicate, RelExpr};
+use coddl_relir::{Literal as RelLiteral, Predicate, RelExpr, ScalarBinOp, ScalarExpr};
 use coddl_sqlemit::{Dialect, SqlQuery, Value};
 
 use crate::ir::{
@@ -848,6 +848,7 @@ impl Lowerer {
             Expr::Unary(u) => self.lower_unary_expr(u),
             Expr::Project(p) => self.lower_project_expr(p),
             Expr::Replace(r) => self.lower_replace_expr(r),
+            Expr::Extend(e) => self.lower_extend_expr(e),
             Expr::Tclose(t) => self.lower_tclose_expr(t),
             Expr::NameRef(n) => self.lower_name_ref(n),
         }
@@ -934,6 +935,29 @@ impl Lowerer {
             self.insts.push(Inst::Release { src });
         }
         dst
+    }
+
+    /// Lower an `extend` the cut declined to push. v1 supports `extend` only
+    /// via SQL pushdown — a relvar-rooted operand with arithmetic/concatenation
+    /// values — so reaching here means the operand is an in-memory relation
+    /// (or the value uses something not yet renderable). In-process `extend`
+    /// lands in a later step; for now report the limitation (which makes the
+    /// module `None`) rather than emit a wrong relation. The operand is lowered
+    /// so its `ValueId` (a `ProcType::Relation`) can be returned, keeping value
+    /// types consistent for the rest of the discarded lowering pass.
+    fn lower_extend_expr(&mut self, e: &ExtendExpr) -> ValueId {
+        let src = e
+            .input()
+            .map(|i| self.lower_expr(&i))
+            .unwrap_or_else(|| self.fresh_value());
+        self.diagnostics.push(Diagnostic::error(
+            self.node_span(e.syntax()),
+            "T0046",
+            "`extend` is not supported here yet — it currently requires a stored \
+             (relvar-rooted) operand with arithmetic/concatenation values that push to SQL"
+                .to_string(),
+        ));
+        src
     }
 
     /// Lower a `project` whose operand the cut declined to push — i.e. an
@@ -1149,6 +1173,71 @@ impl Lowerer {
                 }
                 Some(RelExpr::TClose {
                     input: Box::new(input),
+                })
+            }
+            Expr::Extend(e) => {
+                // `R extend { c: e, … }` — add each computed column. Build the
+                // operand, then walk each value expression into a `ScalarExpr`
+                // (declining the push — `None` — if a value uses anything the
+                // SQL renderer can't express yet, e.g. a comparison or call).
+                // The result type is computed from the operand heading; the
+                // typechecker is the authority, so this just mirrors its rule.
+                let input = self.build_rel_expr(&e.input()?)?;
+                let in_heading = input.heading();
+                let mut extends = Vec::new();
+                for (name_tok, value) in e.pairs() {
+                    let name = name_tok?.text().to_string();
+                    let scalar = self.build_scalar_expr(&value?)?;
+                    let ty = scalar_result_type(&scalar, &in_heading);
+                    extends.push((name, ty, scalar));
+                }
+                Some(RelExpr::Extend {
+                    input: Box::new(input),
+                    extends,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Walk an `extend` value expression into a RelIR [`ScalarExpr`], or `None`
+    /// if it uses anything the SQL renderer can't express yet (a comparison,
+    /// call, etc.) — in which case the whole `extend` declines the push. Covers
+    /// attribute references, Integer/Text/Character literals, and the
+    /// arithmetic/concatenation binary operators (Chunk 1's scalars). Cannot
+    /// reuse `literal_value`, which drops `CHAR_LIT` (the predicate/bind path
+    /// has no Character `Value`).
+    fn build_scalar_expr(&self, expr: &Expr) -> Option<ScalarExpr> {
+        match expr {
+            Expr::NameRef(n) => Some(ScalarExpr::Attr(n.ident()?.text().to_string())),
+            Expr::Literal(l) => {
+                let tok = l.token()?;
+                match tok.kind() {
+                    SyntaxKind::INTEGER_LIT => {
+                        Some(ScalarExpr::Int(parse_integer_literal(tok.text())))
+                    }
+                    SyntaxKind::STRING_LIT => {
+                        Some(ScalarExpr::Str(String::from_utf8(decode_string_literal(tok.text())).ok()?))
+                    }
+                    SyntaxKind::CHAR_LIT => Some(ScalarExpr::Char(decode_char_literal(tok.text()))),
+                    _ => None,
+                }
+            }
+            Expr::Binary(b) => {
+                let op = match b.op_kind()? {
+                    BinaryOp::Add => ScalarBinOp::Add,
+                    BinaryOp::Sub => ScalarBinOp::Sub,
+                    BinaryOp::Mul => ScalarBinOp::Mul,
+                    BinaryOp::Div => ScalarBinOp::Div,
+                    BinaryOp::Concat => ScalarBinOp::Concat,
+                    _ => return None,
+                };
+                let lhs = self.build_scalar_expr(&b.lhs()?)?;
+                let rhs = self.build_scalar_expr(&b.rhs()?)?;
+                Some(ScalarExpr::Bin {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
                 })
             }
             _ => None,
@@ -2309,6 +2398,25 @@ fn decode_string_literal(text: &str) -> Vec<u8> {
     out
 }
 
+/// The result type of an `extend` value, mirroring the typechecker's rule:
+/// arithmetic is `Integer`, concatenation is `Text`, an attribute reference
+/// takes the operand heading's type, and a literal takes its own type. The
+/// checker is the type authority (a clean typecheck guarantees the `Attr`
+/// lookup succeeds); this just re-states the rule so the `Extend` node can
+/// carry the type without relir re-deriving it.
+fn scalar_result_type(e: &ScalarExpr, heading: &Heading) -> Type {
+    match e {
+        ScalarExpr::Attr(name) => heading.lookup(name).cloned().unwrap_or(Type::Unknown),
+        ScalarExpr::Int(_) => Type::Integer,
+        ScalarExpr::Str(_) => Type::Text,
+        ScalarExpr::Char(_) => Type::Character,
+        ScalarExpr::Bin { op, .. } => match op {
+            ScalarBinOp::Concat => Type::Text,
+            _ => Type::Integer,
+        },
+    }
+}
+
 /// Decode the body of a `CHAR_LIT` token (with surrounding `'`s) to its
 /// Unicode scalar value. The lexer guarantees exactly one codepoint and the
 /// same escape set as `STRING_LIT` (`\n`, `\r`, `\t`, `\"`, `\\`, `\u{...}`).
@@ -2907,6 +3015,41 @@ oper main {} [
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn relvar_extend_pushes_computed_column_sql() {
+        // `Greetings where id=1 extend {twice: id + id}` pushes to one query
+        // with the computed column expressed via `(<expr>) AS`.
+        let src = "\
+program hello_world_db;
+database greetings;
+public relvar Greetings { id: Integer, message: Text } key { id };
+oper main {} [
+    let g = transaction [ extract (Greetings where id = 1 extend {twice: id + id}) ];
+    write_line { message: g.message };
+];
+";
+        let m = lower_ok_with_plan(src, &greetings_plan());
+        assert_eq!(m.plans.len(), 1);
+        assert_eq!(
+            m.plans[0].sql,
+            r#"SELECT "id", "message", ("id" + "id") AS "twice" FROM "greetings" WHERE "id" = ?"#
+        );
+    }
+
+    #[test]
+    fn extend_over_relation_literal_diagnoses_t0046() {
+        // A materialized operand has no in-process extend path yet → T0046,
+        // and the module is dropped.
+        let src = "oper main {} [ let _s = Relation { {a: 1, b: 2} } extend {c: a + b}; ];";
+        let out = lower(src, FileId(0));
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "T0046"),
+            "expected T0046, got {:?}",
+            out.diagnostics
+        );
+        assert!(out.module.is_none(), "module should be None on T0046");
     }
 
     #[test]

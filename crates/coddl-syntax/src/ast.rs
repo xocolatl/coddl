@@ -410,6 +410,7 @@ pub enum Expr {
     Unary(UnaryExpr),
     Project(ProjectExpr),
     Replace(ReplaceExpr),
+    Extend(ExtendExpr),
     Tclose(TcloseExpr),
 }
 
@@ -428,6 +429,7 @@ impl Expr {
             SyntaxKind::UNARY_EXPR => Expr::Unary(UnaryExpr { syntax }),
             SyntaxKind::PROJECT_EXPR => Expr::Project(ProjectExpr { syntax }),
             SyntaxKind::REPLACE_EXPR => Expr::Replace(ReplaceExpr { syntax }),
+            SyntaxKind::EXTEND_EXPR => Expr::Extend(ExtendExpr { syntax }),
             SyntaxKind::TCLOSE_EXPR => Expr::Tclose(TcloseExpr { syntax }),
             // Parenthesized expressions are transparent — recurse to
             // the inner `Expr` so the typechecker / lowerer never see
@@ -451,6 +453,7 @@ impl Expr {
             Expr::Unary(u) => u.syntax(),
             Expr::Project(p) => p.syntax(),
             Expr::Replace(r) => r.syntax(),
+            Expr::Extend(e) => e.syntax(),
             Expr::Tclose(t) => t.syntax(),
         }
     }
@@ -850,6 +853,31 @@ impl ReplaceExpr {
                     })
                     .collect()
             })
+            .unwrap_or_default()
+    }
+}
+
+ast_node!(pub ExtendExpr, EXTEND_EXPR);
+
+impl ExtendExpr {
+    /// The relation operand being extended — the single `Expr` child (the
+    /// `new: e` pairs live in the `ARG_LIST` node, which isn't an `Expr`).
+    pub fn input(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// The `{ new: e }` pair list — an `ARG_LIST` of `NAMED_ARG`s.
+    pub fn arg_list(&self) -> Option<ArgList> {
+        child(&self.syntax)
+    }
+
+    /// The pairs in source order as `(new_name, value_expr)`: the `NAMED_ARG`
+    /// name (the new attribute) and its value expression. Unlike `replace`,
+    /// the value is a general scalar expression (the computed attribute's
+    /// value); `extend` adds it without removing anything.
+    pub fn pairs(&self) -> Vec<(Option<SyntaxToken>, Option<Expr>)> {
+        self.arg_list()
+            .map(|al| al.args().map(|na| (na.name(), na.value())).collect())
             .unwrap_or_default()
     }
 }

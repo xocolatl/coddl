@@ -14,7 +14,7 @@
 
 use std::fmt;
 
-use coddl_relir::{Heading, Literal, Predicate, RelExpr};
+use coddl_relir::{Heading, Literal, Predicate, RelExpr, ScalarBinOp, ScalarExpr};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Dialect {
@@ -252,24 +252,47 @@ fn emit_select_offset(expr: &RelExpr, dialect: Dialect, param_offset: u32) -> Re
         });
     }
 
+    // A root `extend` is handled here (like root set-ops / `tclose`): resolve
+    // its *input* to the physical table + column map, then render each computed
+    // attribute as an inline `(<expr>) AS "c"` in the SELECT list. `resolve`
+    // never sees `Extend` — a *nested* extend declines the push (its `resolve`
+    // arm errs), so only a root extend pushes. `core` is the operand for an
+    // extend, else the expression itself; `extends` is empty otherwise.
+    let (core, extends): (&RelExpr, &[(String, coddl_relir::Type, ScalarExpr)]) = match expr {
+        RelExpr::Extend { input, extends } => (input, extends),
+        other => (other, &[]),
+    };
+
     // Resolve the tree to its physical table and output `(attr, column)` map —
     // renames remap the attr side, projects narrow it — collecting each
     // restriction as a resolved `(column, value)` conjunct along the way.
     let mut wheres: Vec<(String, Literal)> = Vec::new();
-    let (from_clause, output_cols) = resolve(expr, &mut wheres)?;
+    let (from_clause, output_cols) = resolve(core, &mut wheres)?;
+
+    // Computed columns: each extend value rendered to SQL against the resolved
+    // column map (`attr` → its rendered SQL expression).
+    let mut computed: Vec<(String, String)> = Vec::with_capacity(extends.len());
+    for (name, _ty, value) in extends {
+        computed.push((name.clone(), render_scalar(value, &output_cols)?));
+    }
 
     // SELECT list = the result heading in canonical order. Each attribute is
-    // its physical column, aliased `AS` the attribute when the names differ —
-    // a `rename`, or any attr/column mismatch — so the rename is pushed to SQL
-    // (the result columns are named by the Coddl attributes).
+    // either a computed extend value (`(<expr>) AS "c"`) or a physical column,
+    // aliased `AS` the attribute when the names differ — a `rename`, or any
+    // attr/column mismatch — so the rename is pushed to SQL (the result columns
+    // are named by the Coddl attributes).
     let heading = expr.heading();
     let mut select_cols = Vec::with_capacity(heading.attrs().len());
     for (attr, _ty) in heading.attrs() {
-        let col = column_for(&output_cols, attr)?;
-        if col == attr.as_str() {
-            select_cols.push(quote_ident(col));
+        if let Some((_, sql)) = computed.iter().find(|(a, _)| a == attr) {
+            select_cols.push(format!("{sql} AS {}", quote_ident(attr)));
         } else {
-            select_cols.push(format!("{} AS {}", quote_ident(col), quote_ident(attr)));
+            let col = column_for(&output_cols, attr)?;
+            if col == attr.as_str() {
+                select_cols.push(quote_ident(col));
+            } else {
+                select_cols.push(format!("{} AS {}", quote_ident(col), quote_ident(attr)));
+            }
         }
     }
     // A nullary projection (`project {}`) has an empty heading, and SQL has no
@@ -417,12 +440,51 @@ fn resolve(
             "transitive closure (tclose) nested under another operator does not push to SQL"
                 .to_string(),
         )),
+        // A *root* `Extend` is peeled in `emit_select_offset` before `resolve`
+        // is called; reaching here means it's nested under another relational
+        // operator. A computed column isn't a table reference, so decline: the
+        // whole push declines and the expression runs in-process.
+        RelExpr::Extend { .. } => Err(BackendError::Other(
+            "extend nested under another operator does not push to SQL".to_string(),
+        )),
         // Never reached: a materialized leaf fails the cut's `RelvarRooted`
         // gate before SQL emission. Defensive only.
         RelExpr::MaterializedRelvar { name, .. } => Err(BackendError::Other(format!(
             "materialized relvar `{name}` reached SQL emission (should be in-process)"
         ))),
     }
+}
+
+/// Render a [`ScalarExpr`] (an `extend` value) to a SQL expression, resolving
+/// each attribute reference to its quoted physical column via `cols`. Integer
+/// `/` is SQLite/Postgres integer division (`5 / 2 = 2`); `||` is SQL string
+/// concatenation. Literals are inlined (no bind params): an `extend`'s value
+/// is part of the SELECT list, which precedes the WHERE clause, so inlining
+/// keeps the positional `?`/`$n` numbering of the restrict params intact.
+fn render_scalar(e: &ScalarExpr, cols: &[(String, String)]) -> Result<String> {
+    Ok(match e {
+        ScalarExpr::Attr(name) => quote_ident(column_for(cols, name)?),
+        ScalarExpr::Int(n) => n.to_string(),
+        ScalarExpr::Str(s) => format!("'{}'", s.replace('\'', "''")),
+        ScalarExpr::Char(cp) => {
+            let c = char::from_u32(*cp).unwrap_or('\u{FFFD}');
+            format!("'{}'", c.to_string().replace('\'', "''"))
+        }
+        ScalarExpr::Bin { op, lhs, rhs } => {
+            let sym = match op {
+                ScalarBinOp::Add => "+",
+                ScalarBinOp::Sub => "-",
+                ScalarBinOp::Mul => "*",
+                ScalarBinOp::Div => "/",
+                ScalarBinOp::Concat => "||",
+            };
+            format!(
+                "({} {sym} {})",
+                render_scalar(lhs, cols)?,
+                render_scalar(rhs, cols)?
+            )
+        }
+    })
 }
 
 /// The SQL column an attribute maps to, per the relvar's `(attr, column)` map.
@@ -1162,6 +1224,72 @@ mod tests {
                 ("msg".to_string(), Type::Text),
             ])
         );
+    }
+
+    #[test]
+    fn extend_renders_computed_column_as_alias() {
+        use coddl_relir::{ScalarBinOp, ScalarExpr};
+        // Greetings extend { c: id * id, d: id + 10 } — two computed columns;
+        // the key `id` survives so no DISTINCT. Result heading is canonically
+        // sorted: c, d, id, message.
+        let expr = RelExpr::Extend {
+            input: Box::new(greetings()),
+            extends: vec![
+                (
+                    "c".to_string(),
+                    Type::Integer,
+                    ScalarExpr::Bin {
+                        op: ScalarBinOp::Mul,
+                        lhs: Box::new(ScalarExpr::Attr("id".to_string())),
+                        rhs: Box::new(ScalarExpr::Attr("id".to_string())),
+                    },
+                ),
+                (
+                    "d".to_string(),
+                    Type::Integer,
+                    ScalarExpr::Bin {
+                        op: ScalarBinOp::Add,
+                        lhs: Box::new(ScalarExpr::Attr("id".to_string())),
+                        rhs: Box::new(ScalarExpr::Int(10)),
+                    },
+                ),
+            ],
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT ("id" * "id") AS "c", ("id" + 10) AS "d", "id", "message" FROM "greetings""#
+        );
+        assert_eq!(
+            q.result_heading,
+            Heading::new(vec![
+                ("c".to_string(), Type::Integer),
+                ("d".to_string(), Type::Integer),
+                ("id".to_string(), Type::Integer),
+                ("message".to_string(), Type::Text),
+            ])
+        );
+    }
+
+    #[test]
+    fn extend_nested_under_restrict_declines_push() {
+        use coddl_relir::{ScalarBinOp, ScalarExpr};
+        // A restrict *over* an extend isn't a root extend, so it declines the
+        // push (runs in-process) rather than emitting wrong SQL.
+        let extended = RelExpr::Extend {
+            input: Box::new(greetings()),
+            extends: vec![(
+                "c".to_string(),
+                Type::Integer,
+                ScalarExpr::Bin {
+                    op: ScalarBinOp::Add,
+                    lhs: Box::new(ScalarExpr::Attr("id".to_string())),
+                    rhs: Box::new(ScalarExpr::Int(1)),
+                },
+            )],
+        };
+        let expr = where_id_1(extended);
+        assert!(emit_select(&expr, Dialect::SQLite).is_err());
     }
 
     #[test]

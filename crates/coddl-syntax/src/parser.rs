@@ -618,6 +618,12 @@ impl<'a> Parser<'a> {
                 self.finish_node();
                 continue;
             }
+            if min_prec == 0 && self.at_keyword("extend") {
+                self.start_node_at(cp, SyntaxKind::EXTEND_EXPR);
+                self.parse_extend_suffix();
+                self.finish_node();
+                continue;
+            }
             let Some(prec) = self.peek_infix_prec() else {
                 break;
             };
@@ -1053,6 +1059,27 @@ impl<'a> Parser<'a> {
             self.parse_arg_list(false); // replace keeps the colon required (no shorthand)
         } else {
             self.error("P0040", "expected `{` to start replace list");
+        }
+    }
+
+    /// `extend { new: e, … }` — relational extend suffix. The enclosing
+    /// `EXTEND_EXPR` node (wrapping the operand) is opened by the caller, so
+    /// this consumes the `extend` keyword and the `{ new: e }` pair list. Each
+    /// pair binds a new attribute name (left of the colon) to a computed value
+    /// expression (right); `extend` adds it without removing anything.
+    ///
+    /// Mirrors `parse_replace_suffix`: the pairs reuse the `ARG_LIST` /
+    /// `NAMED_ARG` production with field-init shorthand DISABLED (the colon is
+    /// required — a shorthand `extend { x }` would be the no-op `x: x`).
+    /// Diagnostics: P0043 (no `{`); the pair-list reuses P0015/P0016/P0017.
+    pub(crate) fn parse_extend_suffix(&mut self) {
+        debug_assert!(self.at_keyword("extend"));
+        self.bump_trivia();
+        self.bump(); // `extend`
+        if self.at(SyntaxKind::L_BRACE) {
+            self.parse_arg_list(false); // colon required (no shorthand)
+        } else {
+            self.error("P0043", "expected `{` to start extend list");
         }
     }
 
@@ -2729,6 +2756,70 @@ mod tests {
         let out = parse_str(
             "oper f {} [ let replace = 1; let rename = 2; let s = R where replace = rename; ];",
         );
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    // ── extend ───────────────────────────────────────────────────────
+
+    #[test]
+    fn extend_parses_as_extend_expr() {
+        let out = parse_str("oper f {} [ let s = R extend {total: a * b, c: d}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let ee = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::EXTEND_EXPR)
+            .expect("EXTEND_EXPR in tree");
+        // Operand is the NAME_REF `R`; the pairs are an ARG_LIST.
+        assert!(ee.children().any(|n| n.kind() == SyntaxKind::NAME_REF));
+        assert!(ee.children().any(|n| n.kind() == SyntaxKind::ARG_LIST));
+    }
+
+    #[test]
+    fn extend_binds_looser_than_where() {
+        // `R where a = 1 extend {b: a + 1}` => EXTEND(WHERE(R, a = 1), {b: a + 1}).
+        let out = parse_str("oper f {} [ let s = R where a = 1 extend {b: a + 1}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let ee = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::EXTEND_EXPR)
+            .expect("EXTEND_EXPR in tree");
+        let inner = ee
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("operand BINARY_EXPR (the where)");
+        assert!(inner.text().to_string().contains(" where "));
+    }
+
+    #[test]
+    fn extend_interleaves_with_replace() {
+        // `R extend {c: a * b} replace {ref: id}` nests left: REPLACE(EXTEND(R)).
+        let out = parse_str("oper f {} [ let s = R extend {c: a * b} replace {ref: id}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let re = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::REPLACE_EXPR)
+            .expect("REPLACE_EXPR at the top");
+        assert!(re
+            .children()
+            .any(|n| n.kind() == SyntaxKind::EXTEND_EXPR));
+    }
+
+    #[test]
+    fn extend_missing_brace_diagnoses_p0043() {
+        let out = parse_str("oper f {} [ let s = R extend a; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0043"),
+            "expected P0043, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn extend_is_contextual_not_reserved() {
+        let out = parse_str("oper f {} [ let extend = 1; let s = R where extend = 2; ];");
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }
 

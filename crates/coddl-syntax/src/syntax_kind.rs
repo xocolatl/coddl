@@ -214,6 +214,14 @@ pub enum SyntaxKind {
     /// end of the enum to keep existing discriminants stable.
     TCLOSE_EXPR,
 
+    /// `<relExpr> extend { new: e, … }` — relational extend. A postfix
+    /// expression node wrapping its relation operand; the `new: e` pairs (an
+    /// `ARG_LIST` of `NAMED_ARG`) follow the `extend` keyword. Adds each `new`
+    /// attribute bound to the computed value `e`, keeping every operand
+    /// attribute. Placed at the end of the enum to keep existing discriminants
+    /// stable.
+    EXTEND_EXPR,
+
     /// A range of source whose intended structure couldn't be
     /// recovered. The parser still wraps the tokens so the tree stays
     /// well-formed and downstream passes can keep going.

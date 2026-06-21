@@ -426,15 +426,17 @@ function that implements it.
 <expr>          ::= <expr-prec> ;                            -- parse_expr
 <expr-prec>     ::= <primary-expr> { <postfix> }
                     { <infix-op> <expr-prec> | <project-suffix>
-                      | <replace-suffix> | <tclose-suffix> } ;
+                      | <replace-suffix> | <tclose-suffix>
+                      | <extend-suffix> } ;
                                                                -- parse_expr_prec
                     -- Pratt precedence ladder; left-associative.
                     -- min_prec drives which operators may be
                     -- consumed; the parser recurses with `prec + 1`
                     -- for each rhs. The <project-suffix> / <replace-suffix>
-                    -- / <tclose-suffix> postfix forms are consumed only at
-                    -- pipeline level (min_prec 0), interleaved with infix
-                    -- ops, so they bind to the whole pipeline.
+                    -- / <tclose-suffix> / <extend-suffix> postfix forms are
+                    -- consumed only at pipeline level (min_prec 0),
+                    -- interleaved with infix ops, so they bind to the whole
+                    -- pipeline.
 <infix-op>      ::= 'where'                                    -- prec 0
                   | 'join'                                     -- prec 0
                   | 'times'                                    -- prec 0
@@ -523,6 +525,18 @@ function that implements it.
                     -- missing attribute name inside the braces, P0042 on a
                     -- missing closing `}`. `tclose` is a contextual keyword,
                     -- a valid identifier elsewhere (no reserved words).
+<extend-suffix> ::= 'extend' <arg-list> ;                     -- parse_extend_suffix
+                    -- Relational extend. Postfix at pipeline precedence (like
+                    -- <replace-suffix>); wraps the operand in EXTEND_EXPR. Each
+                    -- `new: e` pair adds a new attribute name (left) bound to a
+                    -- computed value expression (right), KEEPING every operand
+                    -- attribute (the dual of `replace`, which consumes the
+                    -- attributes its value references). The pairs reuse
+                    -- <arg-list> with field-init shorthand DISABLED — the colon
+                    -- is required (P0017 on `extend { new }`), since a shorthand
+                    -- would be the no-op identity `new: new`. P0043 on a missing
+                    -- `{`. `extend` is a contextual keyword, a valid identifier
+                    -- elsewhere (no reserved words).
 <transaction-expr> ::= 'transaction' <block> ;                 -- parse_transaction_expr
 <name-ref>      ::= <identifier> ;
 <arg-list>      ::= '{' [ <named-arg> commalist ] '}' ;        -- parse_arg_list
@@ -642,6 +656,7 @@ enforces that.
 | P0040 | Expected `{` to start replace list                      |
 | P0041 | Expected attribute name in tclose list                  |
 | P0042 | Expected `}` to close tclose list                       |
+| P0043 | Expected `{` to start extend list                       |
 
 Note: missing-type-after-`:` (let annotation) and missing-type-
 after-`->` (operator return clause) both surface as `P0011`

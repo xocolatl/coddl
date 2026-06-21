@@ -79,6 +79,19 @@ pub enum RelExpr {
         /// collides with a surviving attribute (the typechecker enforces it).
         renames: Vec<(String, String)>,
     },
+    /// Extend (surface `extend`) — add each new attribute bound to a computed
+    /// scalar expression, keeping every operand attribute. Heading-growing;
+    /// the result re-canonicalizes (sorts) with the new attributes mixed in.
+    /// Each entry carries the new attribute name, its (typechecked) result
+    /// type, and the scalar expression that computes it. Origin/keys inherit
+    /// from the input (a scalar extend doesn't change rooting, and adds a
+    /// functionally-determined column that can't break a surviving key). A
+    /// relvar-rooted operand pushes to SQL as `SELECT …, (<expr>) AS <c> …`.
+    Extend {
+        input: Box<RelExpr>,
+        /// `(new_name, result_type, value)` triples, in source order.
+        extends: Vec<(String, Type, ScalarExpr)>,
+    },
     /// Natural join (surface `join`) — the Algebra-A `AND` core node. The
     /// result heading is the union of the operands' headings (shared
     /// attributes appear once, with matching types the typechecker enforces).
@@ -184,6 +197,66 @@ pub enum Literal {
     Boolean(bool),
 }
 
+/// A scalar expression computed per tuple — the value of an `extend`'s new
+/// attribute. Self-contained (it does not reuse [`Literal`]) so the surface
+/// scalar grammar can grow here without touching the predicate/`Value` paths.
+/// v1 covers attribute references, Integer/Text/Character literals, and the
+/// arithmetic/concatenation binary operators.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScalarExpr {
+    /// An operand-attribute reference.
+    Attr(String),
+    /// An `Integer` literal.
+    Int(i64),
+    /// A `Text` literal (already-decoded UTF-8).
+    Str(String),
+    /// A `Character` literal as its Unicode scalar value.
+    Char(u32),
+    /// A binary operator over two scalar sub-expressions.
+    Bin {
+        op: ScalarBinOp,
+        lhs: Box<ScalarExpr>,
+        rhs: Box<ScalarExpr>,
+    },
+}
+
+/// The binary scalar operators an `extend` value may use: arithmetic
+/// (`Integer × Integer → Integer`, `Div` truncating) and concatenation
+/// (`(Text|Character) × (Text|Character) → Text`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScalarBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Concat,
+}
+
+/// Render a scalar expression for `RelExpr::render` (the `coddl explain`
+/// human view) — e.g. `(unit_cents * qty)`. Not SQL; the SQL form lives in
+/// `coddl-sqlemit`.
+fn render_scalar(e: &ScalarExpr) -> String {
+    match e {
+        ScalarExpr::Attr(name) => name.clone(),
+        ScalarExpr::Int(n) => n.to_string(),
+        ScalarExpr::Str(s) => format!("{s:?}"),
+        ScalarExpr::Char(cp) => match char::from_u32(*cp) {
+            Some(c) => format!("'{}'", c.escape_default()),
+            None => format!("'\\u{{{cp:x}}}'"),
+        },
+        ScalarExpr::Bin { op, lhs, rhs } => {
+            let sym = match op {
+                ScalarBinOp::Add => "+",
+                ScalarBinOp::Sub => "-",
+                ScalarBinOp::Mul => "*",
+                ScalarBinOp::Div => "/",
+                ScalarBinOp::Concat => "||",
+            };
+            format!("({} {sym} {})", render_scalar(lhs), render_scalar(rhs))
+        }
+    }
+}
+
 impl RelExpr {
     /// The heading of the relation this expression produces.
     ///
@@ -223,6 +296,13 @@ impl RelExpr {
             RelExpr::Minus { lhs, .. } => lhs.heading(),
             // Closure preserves the (binary) operand heading.
             RelExpr::TClose { input } => input.heading(),
+            // Input attributes plus each computed `(name, type)`; `Heading::new`
+            // re-canonicalizes (re-sorts) with the new attributes mixed in.
+            RelExpr::Extend { input, extends } => {
+                let mut attrs: Vec<(String, Type)> = input.heading().attrs().to_vec();
+                attrs.extend(extends.iter().map(|(name, ty, _)| (name.clone(), ty.clone())));
+                Heading::new(attrs)
+            }
             RelExpr::MaterializedRelvar { heading, .. } => heading.clone(),
         }
     }
@@ -248,6 +328,8 @@ impl RelExpr {
             // still declines the push (sqlemit errs) and runs in-process — the
             // operand fetch alone pushes.
             RelExpr::TClose { input } => input.origin(),
+            // A scalar extend doesn't change what the data is rooted in.
+            RelExpr::Extend { input, .. } => input.origin(),
             RelExpr::MaterializedRelvar { .. } => StorageOrigin::Materialized,
         }
     }
@@ -318,6 +400,15 @@ impl RelExpr {
                 let _ = writeln!(out, "{pad}TClose");
                 input.render_into(out, depth + 1);
             }
+            RelExpr::Extend { input, extends } => {
+                let pairs = extends
+                    .iter()
+                    .map(|(name, _ty, e)| format!("{name} = {}", render_scalar(e)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(out, "{pad}Extend {{ {pairs} }}");
+                input.render_into(out, depth + 1);
+            }
         }
     }
 
@@ -353,6 +444,10 @@ impl RelExpr {
             // Closure introduces new tuples, so the operand's keys need not
             // survive; conservatively keyless.
             RelExpr::TClose { .. } => Vec::new(),
+            // Extend adds a column functionally determined by existing ones
+            // and removes nothing, so every input key still uniquely
+            // identifies a row.
+            RelExpr::Extend { input, .. } => input.surviving_keys(),
             RelExpr::MaterializedRelvar { .. } => Vec::new(),
         }
     }
@@ -383,6 +478,8 @@ impl RelExpr {
             RelExpr::Or { .. } => false,
             RelExpr::Minus { .. } => false,
             RelExpr::TClose { .. } => false,
+            // Extend is cardinality-preserving (one input tuple → one output).
+            RelExpr::Extend { input, .. } => input.card_le_one(),
             RelExpr::MaterializedRelvar { .. } => false,
         }
     }
@@ -664,5 +761,49 @@ mod tests {
         };
         assert!(r.card_le_one());
         assert!(!r.needs_distinct());
+    }
+
+    // ── extend ─────────────────────────────────────────────────────────
+
+    fn doubled() -> RelExpr {
+        // Greetings extend { twice: id * id } — adds an Integer column.
+        RelExpr::Extend {
+            input: Box::new(greetings()),
+            extends: vec![(
+                "twice".to_string(),
+                Type::Integer,
+                ScalarExpr::Bin {
+                    op: ScalarBinOp::Mul,
+                    lhs: Box::new(ScalarExpr::Attr("id".to_string())),
+                    rhs: Box::new(ScalarExpr::Attr("id".to_string())),
+                },
+            )],
+        }
+    }
+
+    #[test]
+    fn extend_adds_attribute_keeps_origin_and_keys() {
+        let r = doubled();
+        assert_eq!(
+            r.heading(),
+            Heading::new(vec![
+                ("id".to_string(), Type::Integer),
+                ("message".to_string(), Type::Text),
+                ("twice".to_string(), Type::Integer),
+            ])
+        );
+        assert_eq!(r.origin(), StorageOrigin::RelvarRooted);
+        // The key `id` survives (extend removes nothing) → no DISTINCT.
+        assert_eq!(r.surviving_keys(), vec![vec!["id".to_string()]]);
+        assert!(!r.needs_distinct());
+    }
+
+    #[test]
+    fn extend_renders_expr_and_one_child() {
+        assert_eq!(
+            doubled().render(),
+            "Extend { twice = (id * id) }\n  \
+             RelvarRef Greetings { db: greetings, table: greetings }"
+        );
     }
 }
