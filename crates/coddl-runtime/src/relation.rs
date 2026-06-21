@@ -1698,7 +1698,7 @@ mod tests {
 
     #[test]
     fn rename_permutes_and_reseals() {
-        // {a, b} rename {a: z} → {b, z}: `z` gets `a`'s value, and the
+        // {a, b} replace {z: a} → {b, z}: `z` gets `a`'s value, and the
         // canonical order flips (sorted by b,z instead of a,b) so seal re-sorts.
         let src_attrs = [
             CoddlAttrDesc {

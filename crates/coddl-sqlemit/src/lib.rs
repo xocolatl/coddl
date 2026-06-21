@@ -1141,7 +1141,7 @@ mod tests {
 
     #[test]
     fn renamed_read_aliases_columns() {
-        // (Greetings where id = 1) rename {id: identifier, message: msg} —
+        // (Greetings where id = 1) replace {identifier: id, msg: message} —
         // pushed via `AS`; key `id` renamed to `identifier` still elides DISTINCT.
         let expr = RelExpr::Rename {
             input: Box::new(where_id_1(greetings())),
@@ -1166,7 +1166,7 @@ mod tests {
 
     #[test]
     fn where_above_rename_resolves_through_it() {
-        // (Greetings rename {id: identifier}) where identifier = 1 — the
+        // (Greetings replace {identifier: id}) where identifier = 1 — the
         // predicate references the renamed name; it resolves to column "id".
         let renamed = RelExpr::Rename {
             input: Box::new(greetings()),

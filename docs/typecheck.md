@@ -310,15 +310,20 @@ each `parse_<x>` has a corresponding `check_<x>`.
   came from; the **lowerer** serves a relvar-rooted operand by pushing the
   projection into SQL (a narrowed `SELECT`) and an in-memory operand with
   the in-process `Inst::Project` → `coddl_relation_project`.
-- **`check_rename_expr`** — `R rename { old: new, … }`. The operand must be
-  `Type::Relation(H)` (T0023). Each target must be a bare attribute name
-  (T0030); each source must exist in `H` (T0029); the rename must stay a
-  bijection — no source repeats and no target collides with a surviving
-  attribute (T0031). The result is `Type::Relation(H')` with names remapped,
-  canonically re-sorted. A relvar-rooted rename pushes to SQL (each renamed
-  attribute aliased `AS` its new name); an in-memory operand lowers to the
-  in-process `Inst::Rename` → `coddl_relation_rename`, which permutes record
-  bytes into the re-sorted layout and re-seals.
+- **`check_replace_expr`** — `R replace { new: e, … }` (subsumes the former
+  `rename`). Adds each `new` attribute bound to `e` and removes the operand
+  attributes `e` references. The operand must be `Type::Relation(H)` (T0023).
+  The general expression forms desugar through `extend` (not yet built), so
+  today the value `e` is restricted to a **bare attribute reference** — the
+  rename case. Dispatch on the value: a bare name-ref `old` must exist in `H`
+  (T0029) and the replace must stay a bijection — no source removed twice, no
+  target colliding with a surviving attribute (T0031); a constant references no
+  attribute, so it removes nothing → use `extend` (T0042); any other expression
+  awaits `extend` (T0030). The result is `Type::Relation(H')` with the renamed
+  names, canonically re-sorted. A relvar-rooted replace (bare-ref) pushes to SQL
+  (each renamed attribute aliased `AS` its new name); an in-memory operand lowers
+  to the in-process `Inst::Rename` → `coddl_relation_rename`, which permutes
+  record bytes into the re-sorted layout and re-seals.
 
 
 ## Transaction-scoped public-relvar access (Phase 22)
@@ -386,15 +391,15 @@ check script enforces that.
 | T0020 | `where` predicate must be Boolean                         |
 | T0021 | Scalar operator operand type mismatch                     |
 | T0022 | Captured identifier in `where` predicate not yet supported |
-| T0023 | `where` / `project` / `rename` left operand is not a relation |
+| T0023 | `where` / `project` / `replace` left operand is not a relation |
 | T0024 | `extract` operand is not a relation                       |
 | T0025 | Public relvar referenced outside any `transaction [...]`  |
 | T0026 | Side-effecting operator called inside `transaction [...]` |
 | T0027 | Unknown attribute name in a `project` list                |
 | T0028 | Duplicate attribute name in a `project` list              |
-| T0029 | Unknown attribute name in a `rename` source               |
-| T0030 | `rename` target must be a bare attribute name             |
-| T0031 | `rename` is not a bijection (duplicate source or target collision) |
+| T0029 | Unknown attribute name in a `replace` source (the value side) |
+| T0030 | `replace` value is a general expression (not a bare attribute reference) — awaits `extend` |
+| T0031 | `replace` is not a bijection (a source removed twice, or a target collides with a surviving attribute) |
 | T0032 | *(warning)* unused `let` binding or parameter — never referenced, not `_`-prefixed (a `self` parameter is exempt) |
 | T0033 | relational-assignment target is not an assignable (private) relvar (not a relvar name, or a read-only public relvar) |
 | T0034 | relational-assignment RHS does not match the target relvar's heading |
@@ -405,3 +410,4 @@ check script enforces that.
 | T0039 | `join` operands have identical headings (the join is a set intersection) — suggest `intersect` |
 | T0040 | `compose` operands have identical headings (every attribute removed, result always nullary) — suggest `intersect` |
 | T0041 | `tclose` operand must be a relation of exactly two attributes of the same type (binary graph relation) |
+| T0042 | `replace` value references no attribute, so it removes nothing — use `extend` to add without removing |

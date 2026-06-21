@@ -575,7 +575,9 @@ mod tests {
     // ── rename ────────────────────────────────────────────────────────
 
     fn renamed() -> RelExpr {
-        // Greetings rename {id: identifier, message: msg}
+        // Greetings replace {identifier: id, msg: message} — the surface
+        // `replace` (bare-ref case) maps to this `Rename` node; the `(old, new)`
+        // tuples are (source, target), unchanged by the surface direction.
         RelExpr::Rename {
             input: Box::new(greetings()),
             renames: vec![
@@ -652,7 +654,7 @@ mod tests {
 
     #[test]
     fn rename_over_key_restriction_keeps_card_bound() {
-        // (Greetings where id = 1) rename {message: msg} — still ≤ 1 tuple.
+        // (Greetings where id = 1) replace {msg: message} — still ≤ 1 tuple.
         let r = RelExpr::Rename {
             input: Box::new(RelExpr::Restrict {
                 input: Box::new(greetings()),

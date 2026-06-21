@@ -948,15 +948,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_type_error_surfaces_as_diagnostic() {
-        // A bad rename source surfaces T0029 through the analyze path.
+    async fn replace_type_error_surfaces_as_diagnostic() {
+        // A bad replace source (`nope` doesn't exist) surfaces T0029 through the
+        // analyze path.
         let analyzer = Analyzer::new();
         let uri = url("file:///r.cd");
         analyzer
             .put_document(
                 uri.clone(),
                 1,
-                "oper main {} [ let s = Relation { {a: 1} } rename {nope: x}; ];".to_string(),
+                "oper main {} [ let s = Relation { {a: 1} } replace {x: nope}; ];".to_string(),
             )
             .await;
         let snap = analyzer.snapshot(&uri).await.unwrap();
@@ -968,8 +969,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_inlay_hint_shows_renamed_heading() {
-        // `rename {message: msg}` over {id, message} → {id, msg}; the inlay
+    async fn replace_inlay_hint_shows_renamed_heading() {
+        // `replace {msg: message}` over {id, message} → {id, msg}; the inlay
         // hint reflects the renamed heading.
         let analyzer = Analyzer::new();
         let uri = url("file:///r.cd");
@@ -977,7 +978,7 @@ mod tests {
             .put_document(
                 uri.clone(),
                 1,
-                "oper main {} [ let _s = Relation { {id: 1, message: \"x\"} } rename {message: msg}; ];"
+                "oper main {} [ let _s = Relation { {id: 1, message: \"x\"} } replace {msg: message}; ];"
                     .to_string(),
             )
             .await;

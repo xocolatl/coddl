@@ -198,11 +198,13 @@ pub enum SyntaxKind {
     /// stable (per the section-end convention above).
     PROJECT_EXPR,
 
-    /// `<relExpr> rename { old: new, … }` — relational rename. A postfix
-    /// expression node wrapping its relation operand; the `old: new` pairs
-    /// (an `ARG_LIST` of `NAMED_ARG`) follow the `rename` keyword. Placed at
-    /// the end of the enum to keep existing discriminants stable.
-    RENAME_EXPR,
+    /// `<relExpr> replace { new: e, … }` — relational replace. A postfix
+    /// expression node wrapping its relation operand; the `new: e` pairs
+    /// (an `ARG_LIST` of `NAMED_ARG`) follow the `replace` keyword. Adds each
+    /// `new` attribute and removes the operand attributes its value references.
+    /// Subsumes the former `rename` (the bare-attribute-reference value case).
+    /// Placed at the end of the enum to keep existing discriminants stable.
+    REPLACE_EXPR,
 
     /// `<relExpr> tclose [ { a, b } ]` — relational transitive closure. A
     /// postfix expression node wrapping its binary relation operand; the
@@ -357,7 +359,7 @@ mod tests {
             SyntaxKind::CDSTORE_FIELD,
             SyntaxKind::COLUMNS_BLOCK,
             SyntaxKind::PROJECT_EXPR,
-            SyntaxKind::RENAME_EXPR,
+            SyntaxKind::REPLACE_EXPR,
             SyntaxKind::TCLOSE_EXPR,
             SyntaxKind::PARSE_ERROR,
         ] {

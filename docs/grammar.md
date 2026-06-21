@@ -53,7 +53,7 @@ Reason: the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-
 - **Scope injection.** Identifiers in the predicate resolve against the left operand's heading first, the enclosing scope second. `SP where s# = supplier` reads as: `s#` is the `SP` attribute; `supplier` is a parameter from the enclosing `oper`. The parser and typechecker inject the left operand's heading into the predicate's name-resolution scope automatically. This is the first construct with a non-uniform scoping rule; every later construct that takes a predicate (`extend`, `summarize`'s aggregate expressions, possrep constraints) reuses the same machinery.
 - **Precedence.** `where` binds looser than `=`, `<`, `+`, `and`, `or` — the predicate is expected to be a full scalar expression. `R where x = 1 and y > 0` parses as `R where ((x = 1) and (y > 0))` without parentheses. Practically `where` sits at the bottom of the infix precedence ladder, alongside `union`/`minus`. Full precedence table lands when the parser does — exact order is deferred until then.
 
-**`project` (projection) is a *postfix* operator, not infix.** `R project { a, b }` narrows the relation's heading to the named attributes — the right operand is a brace-list of bare attribute names (structurally identical to a `key { … }` clause), not another expression, so it doesn't fit the infix `<lhs> op <rhs>` shape. It is parsed as a postfix suffix at *pipeline precedence* — the same altitude as `where`, and gated to the top level so it binds to the whole pipeline rather than to a higher-precedence operand such as a `where` predicate. `R where p project { a }` reads as `(R where p) project { a }`; the reverse order `R project { a } where p` also parses, nesting left. It is the first postfix relational operator; later ones (`rename`, `extend`, `summarize`) can reuse the same pipeline slot. `project` remains a contextual keyword — a valid identifier everywhere else (no reserved words).
+**`project` (projection) is a *postfix* operator, not infix.** `R project { a, b }` narrows the relation's heading to the named attributes — the right operand is a brace-list of bare attribute names (structurally identical to a `key { … }` clause), not another expression, so it doesn't fit the infix `<lhs> op <rhs>` shape. It is parsed as a postfix suffix at *pipeline precedence* — the same altitude as `where`, and gated to the top level so it binds to the whole pipeline rather than to a higher-precedence operand such as a `where` predicate. `R where p project { a }` reads as `(R where p) project { a }`; the reverse order `R project { a } where p` also parses, nesting left. It is the first postfix relational operator; later ones (`replace`, `extend`, `summarize`) can reuse the same pipeline slot. `project` remains a contextual keyword — a valid identifier everywhere else (no reserved words).
 
 ### Parenthesized positional for monadic operators
 
@@ -61,7 +61,7 @@ Reason: the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-
 
 ### Named-prefix with braces for everything else
 
-N-ary or structured operands: selectors, `oper` calls in general, `extend`, `summarize`, `rename`, `group`, `ungroup`, `wrap`, `unwrap`. These all have meaningful name slots that would be lost in a positional form. (The binary relational operators — `join`, `times`, `intersect`, `compose`, `union`, `minus`, `where` — are **infix only**; there is no named-prefix brace variant for them.)
+N-ary or structured operands: selectors, `oper` calls in general, `extend`, `summarize`, `replace`, `group`, `ungroup`, `wrap`, `unwrap`. These all have meaningful name slots that would be lost in a positional form. (The binary relational operators — `join`, `times`, `intersect`, `compose`, `union`, `minus`, `where` — are **infix only**; there is no named-prefix brace variant for them.)
 
 This eliminates the relational-algebra/scalar-op syntactic distinction the authors regret, and matches RM Pro 1 (no ordinal-position semantics) at the surface where it's easiest to enforce.
 
@@ -425,12 +425,12 @@ function that implements it.
 <expr>          ::= <expr-prec> ;                            -- parse_expr
 <expr-prec>     ::= <primary-expr> { <postfix> }
                     { <infix-op> <expr-prec> | <project-suffix>
-                      | <rename-suffix> | <tclose-suffix> } ;
+                      | <replace-suffix> | <tclose-suffix> } ;
                                                                -- parse_expr_prec
                     -- Pratt precedence ladder; left-associative.
                     -- min_prec drives which operators may be
                     -- consumed; the parser recurses with `prec + 1`
-                    -- for each rhs. The <project-suffix> / <rename-suffix>
+                    -- for each rhs. The <project-suffix> / <replace-suffix>
                     -- / <tclose-suffix> postfix forms are consumed only at
                     -- pipeline level (min_prec 0), interleaved with infix
                     -- ops, so they bind to the whole pipeline.
@@ -480,18 +480,24 @@ function that implements it.
                     -- them (keeps the complement). `all`/`but` are
                     -- contextual keywords, valid identifiers elsewhere.
                     -- See the projection rationale above.
-<rename-suffix> ::= 'rename' <arg-list> ;                       -- parse_rename_suffix
-                    -- Relational rename. Postfix at pipeline precedence
-                    -- (like <project-suffix>); wraps the operand in
-                    -- RENAME_EXPR. The `old: new` pairs reuse <arg-list>
-                    -- with field-init shorthand DISABLED — the colon is
-                    -- required (P0017 on `rename { old }`), since a shorthand
-                    -- rename would be the no-op `old -> old`. The `new` side
-                    -- parses as a <name-ref>; the typechecker validates each
-                    -- target is a bare attribute name. P0040 on a missing `{`.
+<replace-suffix> ::= 'replace' <arg-list> ;                    -- parse_replace_suffix
+                    -- Relational replace (subsumes the former `rename`).
+                    -- Postfix at pipeline precedence (like <project-suffix>);
+                    -- wraps the operand in REPLACE_EXPR. Each `new: e` pair
+                    -- binds a new attribute name (left) to a value expression
+                    -- (right) and removes the operand attributes the value
+                    -- references. The pairs reuse <arg-list> with field-init
+                    -- shorthand DISABLED — the colon is required (P0017 on
+                    -- `replace { new }`), since a shorthand would be the no-op
+                    -- identity `new -> new`. The value parses as a general
+                    -- <expr> (forward-compatible with the expression forms),
+                    -- but the typechecker restricts it to a bare attribute
+                    -- reference until `extend` lands — the bare-ref case. A
+                    -- constant value (it removes nothing) is T0042 (use
+                    -- `extend`). P0040 on a missing `{`.
 <tclose-suffix> ::= 'tclose' [ '{' <ident> { ',' <ident> } '}' ] ; -- parse_tclose_suffix
                     -- Relational transitive closure. Postfix at pipeline
-                    -- precedence (like <project-suffix> / <rename-suffix>);
+                    -- precedence (like <project-suffix> / <replace-suffix>);
                     -- wraps the operand in TCLOSE_EXPR. The brace-list is
                     -- OPTIONAL and UNORDERED: `R tclose { a, b }` is sugar
                     -- for `(R project { a, b }) tclose`, picking two columns
@@ -517,8 +523,8 @@ function that implements it.
                     -- form; no tokens are synthesized, so the CST stays
                     -- byte-lossless. Shorthand is enabled in call-position
                     -- <arg-list> and in <tuple-lit>, and DISABLED in
-                    -- <rename-suffix> (the colon stays required there: a
-                    -- shorthand rename would be the no-op `old -> old`).
+                    -- <replace-suffix> (the colon stays required there: a
+                    -- shorthand `replace { x }` would be the no-op `x -> x`).
                     -- P0016 (no name); P0017 (no `:` where it is required).
 <tuple-lit>     ::= '{' [ <named-arg> commalist ] '}' ;        -- parse_tuple_lit
                     -- Same grammar as <arg-list>; the wrapping node
@@ -618,7 +624,7 @@ enforces that.
 | P0037 | Expected project attribute name                         |
 | P0038 | Expected `}` to close project list                      |
 | P0039 | Expected `but` after `all` in project                   |
-| P0040 | Expected `{` to start rename list                       |
+| P0040 | Expected `{` to start replace list                      |
 | P0041 | Expected attribute name in tclose list                  |
 | P0042 | Expected `}` to close tclose list                       |
 

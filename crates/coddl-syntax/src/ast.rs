@@ -409,7 +409,7 @@ pub enum Expr {
     Binary(BinaryExpr),
     Unary(UnaryExpr),
     Project(ProjectExpr),
-    Rename(RenameExpr),
+    Replace(ReplaceExpr),
     Tclose(TcloseExpr),
 }
 
@@ -427,7 +427,7 @@ impl Expr {
             SyntaxKind::BINARY_EXPR => Expr::Binary(BinaryExpr { syntax }),
             SyntaxKind::UNARY_EXPR => Expr::Unary(UnaryExpr { syntax }),
             SyntaxKind::PROJECT_EXPR => Expr::Project(ProjectExpr { syntax }),
-            SyntaxKind::RENAME_EXPR => Expr::Rename(RenameExpr { syntax }),
+            SyntaxKind::REPLACE_EXPR => Expr::Replace(ReplaceExpr { syntax }),
             SyntaxKind::TCLOSE_EXPR => Expr::Tclose(TcloseExpr { syntax }),
             // Parenthesized expressions are transparent — recurse to
             // the inner `Expr` so the typechecker / lowerer never see
@@ -450,7 +450,7 @@ impl Expr {
             Expr::Binary(b) => b.syntax(),
             Expr::Unary(u) => u.syntax(),
             Expr::Project(p) => p.syntax(),
-            Expr::Rename(r) => r.syntax(),
+            Expr::Replace(r) => r.syntax(),
             Expr::Tclose(t) => t.syntax(),
         }
     }
@@ -785,30 +785,45 @@ impl ProjectExpr {
     }
 }
 
-ast_node!(pub RenameExpr, RENAME_EXPR);
+ast_node!(pub ReplaceExpr, REPLACE_EXPR);
 
-impl RenameExpr {
-    /// The relation operand being renamed — the single `Expr` child (the
-    /// `old: new` pairs live in the `ARG_LIST` node, which isn't an `Expr`).
+impl ReplaceExpr {
+    /// The relation operand being replaced — the single `Expr` child (the
+    /// `new: e` pairs live in the `ARG_LIST` node, which isn't an `Expr`).
     pub fn input(&self) -> Option<Expr> {
         self.syntax.children().find_map(Expr::cast)
     }
 
-    /// The `{ old: new }` pair list — an `ARG_LIST` of `NAMED_ARG`s.
+    /// The `{ new: e }` pair list — an `ARG_LIST` of `NAMED_ARG`s. The left of
+    /// each colon is the new attribute name; the right is the value expression.
     pub fn arg_list(&self) -> Option<ArgList> {
         child(&self.syntax)
     }
 
-    /// The rename pairs in source order: `(old, new)` name tokens. `old` is
-    /// the `NAMED_ARG` name; `new` is the value's bare-`NameRef` identifier
-    /// (`None` when the value isn't a bare attribute name — a T0030 case).
+    /// The pairs in source order as `(new_name, value_expr)`: the `NAMED_ARG`
+    /// name (the new/target attribute) and its value expression. The
+    /// typechecker dispatches on the value's kind (a bare `NameRef` is the
+    /// rename case; a constant suggests `extend`; any other expression awaits
+    /// `extend`).
+    pub fn pairs(&self) -> Vec<(Option<SyntaxToken>, Option<Expr>)> {
+        self.arg_list()
+            .map(|al| al.args().map(|na| (na.name(), na.value())).collect())
+            .unwrap_or_default()
+    }
+
+    /// The bare-reference (rename) view: `(old, new)` name tokens, where `old`
+    /// is the value's bare-`NameRef` identifier (the source attribute) and
+    /// `new` is the `NAMED_ARG` name (the target). `old` is `None` when the
+    /// value isn't a bare attribute name (not the rename case). Used by
+    /// lowering, which only runs after the typechecker has confirmed every
+    /// value is a bare reference.
     pub fn renames(&self) -> Vec<(Option<SyntaxToken>, Option<SyntaxToken>)> {
         self.arg_list()
             .map(|al| {
                 al.args()
                     .map(|na| {
-                        let old = na.name();
-                        let new = match na.value() {
+                        let new = na.name();
+                        let old = match na.value() {
                             Some(Expr::NameRef(n)) => n.ident(),
                             _ => None,
                         };

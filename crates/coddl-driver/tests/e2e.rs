@@ -1320,11 +1320,11 @@ fn pushed_nullary_projection_is_reltrue_or_relfalse() {
     }
 }
 
-// ── rename (pushed to SQL via AS) ────────────────────────────────────
+// ── replace (pushed to SQL via AS) ───────────────────────────────────
 
 #[test]
-fn pushed_rename_aliases_columns() {
-    // `Greetings where id = 1 rename {id: identifier, message: msg}` pushes to
+fn pushed_replace_aliases_columns() {
+    // `Greetings where id = 1 replace {identifier: id, msg: message}` pushes to
     // `SELECT "id" AS "identifier", "message" AS "msg" … WHERE "id" = 1`; the
     // renamed `msg` is read back and printed.
     for backend in ["llvm", "cranelift"] {
@@ -1337,7 +1337,7 @@ fn pushed_rename_aliases_columns() {
             "program rn;\n\
              database greetings;\n\
              public relvar Greetings { id: Integer, message: Text } key { id };\n\
-             oper main {} [ let g = transaction [ extract (Greetings where id = 1 rename {id: identifier, message: msg}) ]; write_line { message: g.msg }; ];\n",
+             oper main {} [ let g = transaction [ extract (Greetings where id = 1 replace {identifier: id, msg: message}) ]; write_line { message: g.msg }; ];\n",
         )
         .expect("write rn.cd");
         let log = tmp.path().join("audit.log");
@@ -1350,7 +1350,7 @@ fn pushed_rename_aliases_columns() {
             .expect("spawn coddl");
         assert!(
             out.status.success(),
-            "pushed rename on {backend} failed: stderr=\n{}",
+            "pushed replace on {backend} failed: stderr=\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(out.stdout, b"hello world\n", "on {backend}");
@@ -1359,32 +1359,32 @@ fn pushed_rename_aliases_columns() {
             log_txt.contains(
                 r#"SELECT "id" AS "identifier", "message" AS "msg" FROM "greetings" WHERE "id" = 1"#
             ),
-            "expected the rename pushed via AS on {backend}, got:\n{log_txt}"
+            "expected the replace pushed via AS on {backend}, got:\n{log_txt}"
         );
     }
 }
 
-// ── in-process rename (Inst::Rename → coddl_relation_rename) ──────────
+// ── in-process replace (Inst::Rename → coddl_relation_rename) ─────────
 
-/// `rename` over an in-memory relation literal (not relvar-rooted, so the cut
-/// declines) exercises the in-process path. Renaming `a → z` re-sorts the
-/// heading from `{a, b}` to `{b, z}`, so the runtime must *permute* record
-/// bytes into the new canonical layout, not just relabel. Output is sealed in
-/// `{b, z}` order: `{b: 10, z: 1}` then `{b: 20, z: 2}`.
-const RENAME_INPROCESS_SRC: &str = "\
-program rename_inprocess;
+/// `replace` (bare-ref / rename case) over an in-memory relation literal (not
+/// relvar-rooted, so the cut declines) exercises the in-process path. Renaming
+/// `a → z` re-sorts the heading from `{a, b}` to `{b, z}`, so the runtime must
+/// *permute* record bytes into the new canonical layout, not just relabel.
+/// Output is sealed in `{b, z}` order: `{b: 10, z: 1}` then `{b: 20, z: 2}`.
+const REPLACE_INPROCESS_SRC: &str = "\
+program replace_inprocess;
 oper main {} [
     let r = Relation { {a: 1, b: 10}, {a: 2, b: 20} };
-    let s = r rename {a: z};
+    let s = r replace {z: a};
     write_relation { rel: s };
 ];
 ";
 
-fn run_rename_inprocess(backend: &str) -> Vec<u8> {
+fn run_replace_inprocess(backend: &str) -> Vec<u8> {
     ensure_runtime_built();
     let tmp = tempfile::tempdir().expect("tempdir");
-    let src = tmp.path().join("rename-inprocess.cd");
-    std::fs::write(&src, RENAME_INPROCESS_SRC).expect("write src");
+    let src = tmp.path().join("replace-inprocess.cd");
+    std::fs::write(&src, REPLACE_INPROCESS_SRC).expect("write src");
     let out = coddl()
         .args(["run", &format!("--backend={backend}")])
         .arg(&src)
@@ -1392,37 +1392,40 @@ fn run_rename_inprocess(backend: &str) -> Vec<u8> {
         .expect("spawn coddl");
     assert!(
         out.status.success(),
-        "in-process rename on {backend} failed: stderr=\n{}",
+        "in-process replace on {backend} failed: stderr=\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
     out.stdout
 }
 
 #[test]
-fn rename_inprocess_llvm_permutes_into_new_layout() {
-    assert_eq!(run_rename_inprocess("llvm"), b"{b: 10, z: 1}\n{b: 20, z: 2}\n");
+fn replace_inprocess_llvm_permutes_into_new_layout() {
+    assert_eq!(run_replace_inprocess("llvm"), b"{b: 10, z: 1}\n{b: 20, z: 2}\n");
 }
 
 #[test]
-fn rename_inprocess_cranelift_permutes_into_new_layout() {
+fn replace_inprocess_cranelift_permutes_into_new_layout() {
     assert_eq!(
-        run_rename_inprocess("cranelift"),
+        run_replace_inprocess("cranelift"),
         b"{b: 10, z: 1}\n{b: 20, z: 2}\n"
     );
 }
 
 #[test]
-fn rename_inprocess_byte_identical_across_backends() {
-    assert_eq!(run_rename_inprocess("llvm"), run_rename_inprocess("cranelift"));
+fn replace_inprocess_byte_identical_across_backends() {
+    assert_eq!(
+        run_replace_inprocess("llvm"),
+        run_replace_inprocess("cranelift")
+    );
 }
 
 #[test]
-fn rename_inprocess_after_transaction_escape() {
-    // Owned twin of the hello-world example: a pushed rename whose relation
+fn replace_inprocess_after_transaction_escape() {
+    // Owned twin of the hello-world example: a pushed replace whose relation
     // *escapes* the transaction as the block's tail value (a `let`-bound
-    // local), then a second, in-process rename over that local, then extract +
-    // print. Covers both the in-process rename path and a relation surviving as
-    // a transaction's return value.
+    // local), then a second, in-process replace over that local, then extract +
+    // print. Covers both the in-process replace path and a relation surviving
+    // as a transaction's return value.
     for backend in ["llvm", "cranelift"] {
         ensure_runtime_built();
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1433,7 +1436,7 @@ fn rename_inprocess_after_transaction_escape() {
             "program escape;\n\
              database greetings;\n\
              public relvar Greetings { id: Integer, message: Text } key { id };\n\
-             oper main {} [ let g = transaction [ let x = Greetings where id = 1 rename {id: identifier, message: msg}; x ]; let g2 = g rename {msg: the_message}; let t = extract g2; write_line { message: t.the_message }; ];\n",
+             oper main {} [ let g = transaction [ let x = Greetings where id = 1 replace {identifier: id, msg: message}; x ]; let g2 = g replace {the_message: msg}; let t = extract g2; write_line { message: t.the_message }; ];\n",
         )
         .expect("write escape.cd");
         let out = coddl()
@@ -1444,7 +1447,7 @@ fn rename_inprocess_after_transaction_escape() {
             .expect("spawn coddl");
         assert!(
             out.status.success(),
-            "escape rename on {backend} failed: stderr=\n{}",
+            "escape replace on {backend} failed: stderr=\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(out.stdout, b"hello world\n", "on {backend}");

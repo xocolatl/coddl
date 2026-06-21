@@ -17,7 +17,7 @@ use coddl_plan::Plan;
 use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, Expr, ExprStmt,
     FieldAccess, Item,
-    LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, RenameExpr,
+    LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, ReplaceExpr,
     Root, Stmt, TcloseExpr, TransactionExpr, TupleLit, UnaryExpr, UnaryOp,
 };
 use coddl_syntax::SyntaxKind;
@@ -847,17 +847,20 @@ impl Lowerer {
             Expr::Binary(b) => self.lower_binary_expr(b),
             Expr::Unary(u) => self.lower_unary_expr(u),
             Expr::Project(p) => self.lower_project_expr(p),
-            Expr::Rename(r) => self.lower_rename_expr(r),
+            Expr::Replace(r) => self.lower_replace_expr(r),
             Expr::Tclose(t) => self.lower_tclose_expr(t),
             Expr::NameRef(n) => self.lower_name_ref(n),
         }
     }
 
-    /// Lower a `rename` whose operand the cut declined to push — an in-memory
-    /// relation. (The pushable case is served by `Inst::Query` with the
-    /// `AS`-aliased SELECT.) Lower the operand, compute the renamed (re-sorted)
-    /// result heading and the source→dest permutation, and emit `Inst::Rename`.
-    fn lower_rename_expr(&mut self, re: &RenameExpr) -> ValueId {
+    /// Lower a `replace` whose operand the cut declined to push — an in-memory
+    /// relation. Today `replace`'s value is a bare attribute reference (the
+    /// rename case; `re.renames()` yields the `(old, new)` pairs), so this is
+    /// the rename lowering: the pushable case is served by `Inst::Query` with
+    /// the `AS`-aliased SELECT. Lower the operand, compute the renamed
+    /// (re-sorted) result heading and the source→dest permutation, and emit
+    /// `Inst::Rename`.
+    fn lower_replace_expr(&mut self, re: &ReplaceExpr) -> ValueId {
         // 1. Lower the operand.
         let src = re
             .input()
@@ -1110,10 +1113,12 @@ impl Lowerer {
                     keep,
                 })
             }
-            Expr::Rename(r) => {
-                // Rename over a pushable subtree pushes too — origin propagates
-                // and the emitter resolves columns through the renames (aliasing
-                // `AS` the new name). On a clean typecheck every pair is present.
+            Expr::Replace(r) => {
+                // Today `replace`'s value is a bare attribute reference (the
+                // rename case), so it maps to the `Rename` node. A replace over
+                // a pushable subtree pushes too — origin propagates and the
+                // emitter resolves columns through the renames (aliasing `AS` the
+                // new name). On a clean typecheck every pair is a bare ref.
                 let input = self.build_rel_expr(&r.input()?)?;
                 let mut renames = Vec::new();
                 for (old, new) in r.renames() {
@@ -2742,15 +2747,15 @@ oper main {}\n\
     }
 
     #[test]
-    fn relvar_rename_pushes_aliased_sql() {
-        // `Greetings where id=1 rename {id: identifier, message: msg}` pushes
+    fn relvar_replace_pushes_aliased_sql() {
+        // `Greetings where id=1 replace {identifier: id, msg: message}` pushes
         // to one query with the rename expressed via `AS`.
         let src = "\
 program hello_world_db;
 database greetings;
 public relvar Greetings { id: Integer, message: Text } key { id };
 oper main {} [
-    let g = transaction [ extract (Greetings where id = 1 rename {id: identifier, message: msg}) ];
+    let g = transaction [ extract (Greetings where id = 1 replace {identifier: id, msg: message}) ];
     write_line { message: g.msg };
 ];
 ";
@@ -2772,11 +2777,11 @@ oper main {} [
     }
 
     #[test]
-    fn rename_over_relation_literal_lowers_to_inst_rename() {
-        // `Relation {{a, b}} rename {a: z}` lowers in-process to `Inst::Rename`
+    fn replace_over_relation_literal_lowers_to_inst_rename() {
+        // `Relation {{a, b}} replace {z: a}` lowers in-process to `Inst::Rename`
         // with the renamed (re-sorted) result heading {b, z} and perm [1, 0]
         // (dst b ← src 1, dst z ← src 0).
-        let src = "oper main {} [ let _s = Relation { {a: 1, b: 2} } rename {a: z}; ];";
+        let src = "oper main {} [ let _s = Relation { {a: 1, b: 2} } replace {z: a}; ];";
         let out = lower(src, FileId(0));
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
         let m = out.module.expect("module");

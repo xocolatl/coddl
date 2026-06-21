@@ -79,7 +79,7 @@ extend r add { c: x + y }
 desugars to the A-level
 
 ```
-r join (plus rename { a: x, b: y, c: z })
+r join (plus replace { x: a, y: b, z: c })
 ```
 
 (where `plus` is the `Integer × Integer → Integer` operator viewed as a 3-ary relation). Surface `where`-clauses similarly desugar to joins against constant relations. This collapses much of the operator zoo into pure JOIN-and-REMOVE — which is what the optimizer actually wants. It also makes the SQL-pushdown surface uniform: the same machinery handles relational and scalar pushdown because everything is a join.
@@ -110,7 +110,7 @@ The storage-origin flag drives the optimizer's central decision: **where each su
 ## What pushes down and what doesn't
 
 What pushes cleanly:
-- Algebra A core (JOIN, AND, OR, AND NOT, project, rename).
+- Algebra A core (JOIN, AND, OR, AND NOT, project, replace — the `Rename` node).
 - Plain transitive closure (TCLOSE) — a root `tclose` emits a `WITH RECURSIVE` query (see [sqlemit.md](sqlemit.md)).
 - Aggregation (SUMMARIZE).
 - Restriction predicates whose operators have SQL equivalents (`=`, `<`, `+`, `mod`, etc.).

@@ -606,9 +606,9 @@ impl<'a> Parser<'a> {
                 self.finish_node();
                 continue;
             }
-            if min_prec == 0 && self.at_keyword("rename") {
-                self.start_node_at(cp, SyntaxKind::RENAME_EXPR);
-                self.parse_rename_suffix();
+            if min_prec == 0 && self.at_keyword("replace") {
+                self.start_node_at(cp, SyntaxKind::REPLACE_EXPR);
+                self.parse_replace_suffix();
                 self.finish_node();
                 continue;
             }
@@ -886,9 +886,9 @@ impl<'a> Parser<'a> {
     /// just-read `IDENT` in a `NAME_REF` (retroactive `start_node_at`) so the
     /// AST's `value()` view yields a name-ref and every consumer sees the
     /// explicit form; no tokens are synthesized, so the CST stays
-    /// byte-lossless. `allow_shorthand` is `false` in rename position, where
-    /// the colon stays required (a shorthand rename would be an identity
-    /// rename `old -> old`).
+    /// byte-lossless. `allow_shorthand` is `false` in replace position, where
+    /// the colon stays required (a shorthand `replace { x }` would bind the new
+    /// attribute `x` to itself — the no-op identity `x -> x`).
     fn parse_named_arg(&mut self, allow_shorthand: bool) {
         self.bump_trivia();
         self.start_node(SyntaxKind::NAMED_ARG);
@@ -1028,23 +1028,25 @@ impl<'a> Parser<'a> {
         );
     }
 
-    /// `rename { old: new, … }` — relational rename suffix. The enclosing
-    /// `RENAME_EXPR` node (wrapping the operand) is opened by the caller, so
-    /// this consumes the `rename` keyword and the `{ old: new }` pair list.
-    /// The pairs reuse the `ARG_LIST` / `NAMED_ARG` production (`new` parses
-    /// as an `Expr::NameRef`); the typechecker validates each target is a bare
-    /// attribute name.
+    /// `replace { new: e, … }` — relational replace suffix. The enclosing
+    /// `REPLACE_EXPR` node (wrapping the operand) is opened by the caller, so
+    /// this consumes the `replace` keyword and the `{ new: e }` pair list. Each
+    /// pair binds a new attribute name (left of the colon) to a value
+    /// expression (right). The pairs reuse the `ARG_LIST` / `NAMED_ARG`
+    /// production, so the value parses as a general `Expr` — forward-compatible
+    /// with the expression forms; the typechecker restricts it to a bare
+    /// attribute reference until `extend` lands (the rename case).
     ///
     /// Diagnostics: P0040 (no `{`); the pair-list reuses the arg-list codes
     /// P0015 (no `}`), P0016 (no name), P0017 (no `:`).
-    pub(crate) fn parse_rename_suffix(&mut self) {
-        debug_assert!(self.at_keyword("rename"));
+    pub(crate) fn parse_replace_suffix(&mut self) {
+        debug_assert!(self.at_keyword("replace"));
         self.bump_trivia();
-        self.bump(); // `rename`
+        self.bump(); // `replace`
         if self.at(SyntaxKind::L_BRACE) {
-            self.parse_arg_list(false); // rename keeps the colon required (no shorthand)
+            self.parse_arg_list(false); // replace keeps the colon required (no shorthand)
         } else {
-            self.error("P0040", "expected `{` to start rename list");
+            self.error("P0040", "expected `{` to start replace list");
         }
     }
 
@@ -2117,10 +2119,10 @@ mod tests {
     }
 
     #[test]
-    fn rename_requires_colon_diagnoses_p0017() {
-        // Field-init shorthand is disabled in rename position; `rename { old }`
+    fn replace_requires_colon_diagnoses_p0017() {
+        // Field-init shorthand is disabled in replace position; `replace { new }`
         // is missing the required `:`.
-        let out = parse_str("oper f {} [ let s = r rename { old }; ];");
+        let out = parse_str("oper f {} [ let s = r replace { new }; ];");
         assert!(
             out.diagnostics.iter().any(|d| d.code == "P0017"),
             "expected P0017, got {:?}",
@@ -2611,32 +2613,32 @@ mod tests {
         assert!(keep.diagnostics.is_empty(), "{:?}", keep.diagnostics);
     }
 
-    // ── rename ───────────────────────────────────────────────────────
+    // ── replace ──────────────────────────────────────────────────────
 
     #[test]
-    fn rename_parses_as_rename_expr() {
-        let out = parse_str("oper f {} [ let s = R rename {a: b, c: d}; ];");
+    fn replace_parses_as_replace_expr() {
+        let out = parse_str("oper f {} [ let s = R replace {a: b, c: d}; ];");
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
         let re = out
             .tree
             .descendants()
-            .find(|n| n.kind() == SyntaxKind::RENAME_EXPR)
-            .expect("RENAME_EXPR in tree");
+            .find(|n| n.kind() == SyntaxKind::REPLACE_EXPR)
+            .expect("REPLACE_EXPR in tree");
         // Operand is the NAME_REF `R`; the pairs are an ARG_LIST.
         assert!(re.children().any(|n| n.kind() == SyntaxKind::NAME_REF));
         assert!(re.children().any(|n| n.kind() == SyntaxKind::ARG_LIST));
     }
 
     #[test]
-    fn rename_binds_looser_than_where() {
-        // `R where a = 1 rename {a: b}` => RENAME(WHERE(R, a = 1), {a: b}).
-        let out = parse_str("oper f {} [ let s = R where a = 1 rename {a: b}; ];");
+    fn replace_binds_looser_than_where() {
+        // `R where a = 1 replace {b: a}` => REPLACE(WHERE(R, a = 1), {b: a}).
+        let out = parse_str("oper f {} [ let s = R where a = 1 replace {b: a}; ];");
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
         let re = out
             .tree
             .descendants()
-            .find(|n| n.kind() == SyntaxKind::RENAME_EXPR)
-            .expect("RENAME_EXPR in tree");
+            .find(|n| n.kind() == SyntaxKind::REPLACE_EXPR)
+            .expect("REPLACE_EXPR in tree");
         let inner = re
             .children()
             .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
@@ -2645,8 +2647,8 @@ mod tests {
     }
 
     #[test]
-    fn rename_missing_brace_diagnoses_p0040() {
-        let out = parse_str("oper f {} [ let s = R rename a; ];");
+    fn replace_missing_brace_diagnoses_p0040() {
+        let out = parse_str("oper f {} [ let s = R replace a; ];");
         assert!(
             out.diagnostics.iter().any(|d| d.code == "P0040"),
             "expected P0040, got {:?}",
@@ -2655,9 +2657,12 @@ mod tests {
     }
 
     #[test]
-    fn rename_is_contextual_not_reserved() {
-        // `rename` remains a valid identifier elsewhere.
-        let out = parse_str("oper f {} [ let rename = 1; let s = R where rename = 2; ];");
+    fn replace_is_contextual_not_reserved() {
+        // `replace` remains a valid identifier elsewhere; the retired `rename`
+        // is now an ordinary identifier too.
+        let out = parse_str(
+            "oper f {} [ let replace = 1; let rename = 2; let s = R where replace = rename; ];",
+        );
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }
 
@@ -2798,8 +2803,8 @@ mod tests {
     fn malformed_call_arg_after_shorthand_diagnoses() {
         // In call position the colon is optional (field-init shorthand), so
         // `{x}` is valid and the stray `1` (no separating comma) is the error:
-        // the `}` is expected. (The colon-required case now lives in rename —
-        // see `rename_requires_colon_diagnoses_p0017`.)
+        // the `}` is expected. (The colon-required case now lives in replace —
+        // see `replace_requires_colon_diagnoses_p0017`.)
         let out = parse_str("oper f {} [ foo{x 1}; ];");
         assert!(out.diagnostics.iter().any(|d| d.code == "P0015"));
     }
