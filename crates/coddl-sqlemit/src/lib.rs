@@ -252,28 +252,73 @@ fn emit_select_offset(expr: &RelExpr, dialect: Dialect, param_offset: u32) -> Re
         });
     }
 
-    // A root `extend` is handled here (like root set-ops / `tclose`): resolve
-    // its *input* to the physical table + column map, then render each computed
-    // attribute as an inline `(<expr>) AS "c"` in the SELECT list. `resolve`
-    // never sees `Extend` — a *nested* extend declines the push (its `resolve`
-    // arm errs), so only a root extend pushes. `core` is the operand for an
-    // extend, else the expression itself; `extends` is empty otherwise.
-    let (core, extends): (&RelExpr, &[(String, coddl_relir::Type, ScalarExpr)]) = match expr {
-        RelExpr::Extend { input, extends } => (input, extends),
-        other => (other, &[]),
-    };
+    // A computed-column chain is handled here (like root set-ops / `tclose`):
+    // peel a root `Rename?` over `Project?` over `Extend`, resolve the Extend's
+    // input, render each computed attribute, then replay the project/rename
+    // wrappers onto the column map. This is exactly the shape a general
+    // `replace` desugars to (`extend → project all-but → rename`) plus a bare
+    // root `extend`. `resolve` never sees the `Extend` — a *genuinely* nested
+    // extend (under `Restrict`/`And`/…) is NOT peeled, so its `resolve` arm
+    // still errs and the push declines.
+    let mut core = expr;
+    let mut peeled_rename: Option<&[(String, String)]> = None;
+    let mut peeled_keep: Option<&[String]> = None;
+    let mut extends: &[(String, coddl_relir::Type, ScalarExpr)] = &[];
+    {
+        let mut n = expr;
+        let mut rename = None;
+        let mut keep = None;
+        if let RelExpr::Rename { input, renames } = n {
+            rename = Some(renames.as_slice());
+            n = input;
+        }
+        if let RelExpr::Project { input, keep: k } = n {
+            keep = Some(k.as_slice());
+            n = input;
+        }
+        // Commit the peel only if the chain bottoms out in an Extend; otherwise
+        // leave `core = expr` so `resolve` handles it (and declines a nested
+        // extend) exactly as before.
+        if let RelExpr::Extend { input, extends: e } = n {
+            peeled_rename = rename;
+            peeled_keep = keep;
+            extends = e.as_slice();
+            core = input;
+        }
+    }
 
-    // Resolve the tree to its physical table and output `(attr, column)` map —
+    // Resolve the core to its physical table and output `(attr, column)` map —
     // renames remap the attr side, projects narrow it — collecting each
     // restriction as a resolved `(column, value)` conjunct along the way.
     let mut wheres: Vec<(String, Literal)> = Vec::new();
-    let (from_clause, output_cols) = resolve(core, &mut wheres)?;
+    let (from_clause, mut output_cols) = resolve(core, &mut wheres)?;
 
     // Computed columns: each extend value rendered to SQL against the resolved
     // column map (`attr` → its rendered SQL expression).
     let mut computed: Vec<(String, String)> = Vec::with_capacity(extends.len());
     for (name, _ty, value) in extends {
         computed.push((name.clone(), render_scalar(value, &output_cols)?));
+    }
+    // Replay the peeled `project all-but` (retain kept attrs) and `rename`
+    // (remap attr keys) onto both physical and computed columns.
+    if let Some(keep) = peeled_keep {
+        output_cols.retain(|(a, _)| keep.iter().any(|k| k == a));
+        computed.retain(|(a, _)| keep.iter().any(|k| k == a));
+    }
+    if let Some(renames) = peeled_rename {
+        let remap = |a: &str| {
+            renames
+                .iter()
+                .find(|(old, _)| old == a)
+                .map(|(_, new)| new.clone())
+                .unwrap_or_else(|| a.to_string())
+        };
+        for (a, _) in output_cols.iter_mut() {
+            *a = remap(a);
+        }
+        for (a, _) in computed.iter_mut() {
+            *a = remap(a);
+        }
     }
 
     // SELECT list = the result heading in canonical order. Each attribute is
@@ -1290,6 +1335,68 @@ mod tests {
         };
         let expr = where_id_1(extended);
         assert!(emit_select(&expr, Dialect::SQLite).is_err());
+    }
+
+    #[test]
+    fn replace_collapse_desugar_pushes_computed_column() {
+        use coddl_relir::{ScalarBinOp, ScalarExpr};
+        // `Greetings replace { c: id * id }` desugars to
+        // Project all-but {id} over Extend {c: id*id}: the computed column
+        // pushes and `id` (consumed) is absent. No temp/rename (c ∉ heading).
+        let extended = RelExpr::Extend {
+            input: Box::new(greetings()),
+            extends: vec![(
+                "c".to_string(),
+                Type::Integer,
+                ScalarExpr::Bin {
+                    op: ScalarBinOp::Mul,
+                    lhs: Box::new(ScalarExpr::Attr("id".to_string())),
+                    rhs: Box::new(ScalarExpr::Attr("id".to_string())),
+                },
+            )],
+        };
+        let expr = RelExpr::Project {
+            input: Box::new(extended),
+            keep: vec!["message".to_string(), "c".to_string()],
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT DISTINCT ("id" * "id") AS "c", "message" FROM "greetings""#
+        );
+    }
+
+    #[test]
+    fn replace_in_place_desugar_pushes_via_temp_rename() {
+        use coddl_relir::{ScalarBinOp, ScalarExpr};
+        // `Greetings replace { id: id + 1 }` desugars to Rename {__t → id} over
+        // Project all-but {id} over Extend {__t: id+1}: the computed column is
+        // aliased back to `id`.
+        let extended = RelExpr::Extend {
+            input: Box::new(greetings()),
+            extends: vec![(
+                "__t".to_string(),
+                Type::Integer,
+                ScalarExpr::Bin {
+                    op: ScalarBinOp::Add,
+                    lhs: Box::new(ScalarExpr::Attr("id".to_string())),
+                    rhs: Box::new(ScalarExpr::Int(1)),
+                },
+            )],
+        };
+        let projected = RelExpr::Project {
+            input: Box::new(extended),
+            keep: vec!["message".to_string(), "__t".to_string()],
+        };
+        let expr = RelExpr::Rename {
+            input: Box::new(projected),
+            renames: vec![("__t".to_string(), "id".to_string())],
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT DISTINCT ("id" + 1) AS "id", "message" FROM "greetings""#
+        );
     }
 
     #[test]

@@ -34,8 +34,26 @@ oper main {} [
     let priced = Sales extend { line_cents: unit_cents * qty };
     write_relation { rel: priced };
 
-    // replace (rename): id -> ref. The bare-attribute-reference form removes
-    // `id` and adds `ref`.
+    // replace COLLAPSE: the SAME `unit_cents * qty`, but `replace` CONSUMES the
+    // attributes the value reads — `unit_cents` and `qty` are gone, `line_cents`
+    // takes their place. This is the heart of the example: extend keeps, replace
+    // consumes.
+    let collapsed = Sales replace { line_cents: unit_cents * qty };
+    write_relation { rel: collapsed };
+
+    // replace IN-PLACE: the new name `qty` is also read by the value, so the old
+    // `qty` is consumed and the updated one re-added — a heading-preserving
+    // update ("bump the quantity").
+    let bumped = Sales replace { qty: qty + 1 };
+    write_relation { rel: bumped };
+
+    // replace COLLAPSE via concatenation: a '-' Character separator. `customer`
+    // and `item` are consumed into `handle`.
+    let handled = Sales replace { handle: customer || '-' || item };
+    write_relation { rel: handled };
+
+    // replace RENAME: id -> ref. The bare-attribute-reference form (the simplest
+    // end of the spectrum) removes `id` and adds `ref`.
     let reffed = Sales replace { ref: id };
     write_relation { rel: reffed };
 ];

@@ -64,6 +64,12 @@ In every drift case the two handle differently, `USING` either stays correct or 
 
 `USING` is the emission-side half of this guarantee. The complementary half — failing loud the moment a backend's live schema diverges from the `.cddb`, instead of at the first dependent query — belongs at connection time in the `Backend`/`Conn` contract (see [storage.md](storage.md)). Even without it, `USING` ensures drift surfaces as a wrong-column error rather than a wrong result.
 
+### Computed columns: `extend` and general `replace` (the peel-chain)
+
+`extend { c: e }` pushes its computed attribute as a `SELECT (e) AS "c", …` — the value `e` is rendered by `render_scalar` against the resolved operand's columns, and the select list is the operand's surviving columns plus the computed ones (name-sorted as always). A general-expression `replace { c: e }` reaches `coddl-sqlemit` already desugared (by the lowerer) into the chain `Rename?( Project?( Extend( core ) ) )` — extend adds `c`, the project keeps all-but the attributes `e` consumed, and the rename fires only when the new name collides with a surviving attribute (via an internal `__coddl_replace_tmp_*` temp).
+
+`emit_select` handles this by **peeling that chain at the root** rather than threading computed state through `resolve`: it peels an optional root `Rename`, then an optional `Project`, then a (required, for any computed column) `Extend`, resolves the `core` underneath, renders the computed columns against the resolved columns, then **replays** the project's keep-filter and the rename's remap onto both the resolved columns and the computed list. `resolve`'s signature and its invariant are untouched — a *genuinely* nested `Extend` (one buried under a `Restrict`/`And`, not the root desugar chain) is not peeled, so it still reaches `resolve` and declines the push (decomposing in-process). The net SQL: a collapse `replace { line_cents: unit_cents * qty }` emits `SELECT ("unit_cents" * "qty") AS "line_cents", <survivors> …` with the consumed columns absent; an in-place `replace { qty: qty + 1 }` emits `SELECT …, ("qty" + 1) AS "qty", …`. A value that isn't SQL-renderable (e.g. a `Unary`/`Call`) declines the push and runs in-process.
+
 ## Dialect surface
 
 Keep emitted SQL to a **portable subset** (CTEs, window functions, standard joins). Isolate dialect divergence behind backend methods — `emit_select` returns dialect-specific text, but the same RelIR plan should produce semantically equivalent results across backends.

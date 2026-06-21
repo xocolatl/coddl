@@ -940,19 +940,20 @@ impl TypeChecker {
 
     /// Walk `R replace { new: e, … }` — relational replace: add each `new`
     /// attribute bound to `e` and remove the operand attributes `e` references.
-    /// The operand must be `Relation H` (T0023).
+    /// The operand must be `Relation H` (T0023). Dispatch on each value:
+    /// - a bare `NameRef` `old` → the rename case: `old` must exist in `H`
+    ///   (T0029), no source removed twice (T0031). Type-agnostic.
+    /// - a constant (or a general expression that reads no operand attribute):
+    ///   it removes nothing → use `extend` (T0042).
+    /// - any other (general) expression `e`: typechecked in a scope with `H`'s
+    ///   attributes injected (the same rule as `where`/`extend`); its type is
+    ///   restricted to Integer or Text (T0046); it adds `new` and removes the
+    ///   operand attributes `e` references (the compute-and-consume case,
+    ///   desugared through `extend` + `project` + `rename` at lowering).
     ///
-    /// The general (expression) forms desugar through `extend` (not yet built),
-    /// so today the value `e` is restricted to a **bare attribute reference** —
-    /// exactly the former `rename`. Dispatch on the value's kind:
-    /// - a bare `NameRef` `old`: `old` must exist in `H` (T0029); the replace
-    ///   must stay a bijection — no source removed twice, no target colliding
-    ///   with a surviving attribute (T0031);
-    /// - a constant (it references no attribute, so it removes nothing): use
-    ///   `extend` instead (T0042);
-    /// - any other expression: not yet supported, awaits `extend` (T0030).
-    ///
-    /// The result heading is `H` with the renamed names, canonically re-sorted.
+    /// The result heading is `(H minus the removed attributes) plus each added
+    /// `(new, type)``, canonically re-sorted. A new name colliding with a
+    /// surviving attribute or another target is T0031.
     fn check_replace_expr(&mut self, re: &ReplaceExpr, scope: &mut Scope) -> Type {
         let input_ty = match re.input() {
             Some(e) => self.check_expr(&e, scope),
@@ -974,9 +975,17 @@ impl TypeChecker {
                 return Type::Unknown;
             }
         };
-        // Validate each `new: e` pair, collecting the valid `(old, new)` renames
-        // (today, the bare-reference value case).
-        let mut renames: Vec<(String, String)> = Vec::new();
+        // Inject the operand's attributes so each general value expression
+        // resolves against the heading first (the same scope rule as `where`).
+        scope.push();
+        for (name, ty) in heading.attrs() {
+            scope.insert(name.clone(), ty.clone(), Span::default(), BindingOrigin::WhereAttr);
+        }
+        // Classify each pair into a removed-attribute set and an added
+        // `(name, type)`. Bare-ref pairs rename (remove `old`, add `new`);
+        // general pairs add `c` and remove the attributes they read.
+        let mut removed: HashSet<String> = HashSet::new();
+        let mut added: Vec<(String, Type)> = Vec::new();
         let mut seen_src: HashSet<String> = HashSet::new();
         for (new_tok, value) in re.pairs() {
             let Some(new_tok) = new_tok else { continue }; // parse recovery
@@ -984,18 +993,18 @@ impl TypeChecker {
             let Some(value) = value else { continue };
             let value_span = self.node_span(value.syntax());
             match value {
-                // Bare attribute reference → the rename case: `old` → `new`.
+                // Bare attribute reference → rename `old` → `new` (type-agnostic).
                 Expr::NameRef(n) => {
                     let Some(old_tok) = n.ident() else { continue };
                     let old = old_tok.text();
-                    if heading.lookup(old).is_none() {
+                    let Some(ty) = heading.lookup(old).cloned() else {
                         self.error(
                             self.token_span(&old_tok),
                             "T0029",
                             format!("unknown attribute `{old}` in replace of {heading}"),
                         );
                         continue;
-                    }
+                    };
                     if !seen_src.insert(old.to_string()) {
                         self.error(
                             self.token_span(&old_tok),
@@ -1004,7 +1013,8 @@ impl TypeChecker {
                         );
                         continue;
                     }
-                    renames.push((old.to_string(), new.to_string()));
+                    removed.insert(old.to_string());
+                    added.push((new.to_string(), ty));
                 }
                 // A constant references no attribute, so it removes nothing —
                 // that's `extend`, not `replace`.
@@ -1018,39 +1028,58 @@ impl TypeChecker {
                         ),
                     );
                 }
-                // General expressions (`a * b`, `x + 1`, …) are the intended
-                // replace forms but desugar through `extend`, which isn't built
-                // yet; for now the value must be a bare attribute reference.
-                _ => {
-                    self.error(
-                        value_span,
-                        "T0030",
-                        format!(
-                            "general-expression `replace` is not yet supported (awaits `extend`); \
-                             the value for `{new}` must be a bare attribute reference"
-                        ),
-                    );
+                // General expression → add `new`, remove the attributes it reads.
+                other => {
+                    let vty = self.check_expr(&other, scope);
+                    // The operand attributes the value references (the removed set).
+                    let mut refs: HashSet<String> = HashSet::new();
+                    attr_refs(&other, &mut refs);
+                    refs.retain(|r| heading.lookup(r).is_some());
+                    if refs.is_empty() {
+                        self.error(
+                            value_span,
+                            "T0042",
+                            format!(
+                                "`replace` value for `{new}` references no operand attribute, so it \
+                                 removes nothing — use `extend` to add without removing"
+                            ),
+                        );
+                        continue;
+                    }
+                    if !matches!(vty, Type::Integer | Type::Text | Type::Unknown) {
+                        self.error(
+                            value_span,
+                            "T0046",
+                            format!("`replace` value for `{new}` must be Integer or Text, got {vty}"),
+                        );
+                        continue;
+                    }
+                    removed.extend(refs);
+                    added.push((new.to_string(), vty));
                 }
             }
         }
-        // Remap names; a target colliding with another surviving attribute (the
-        // replace isn't a bijection) is T0031.
+        scope.pop();
+        // Result = surviving operand attributes (not removed) plus the added
+        // ones; a new name colliding with a survivor or another target is T0031.
         let mut result: Vec<(String, Type)> = Vec::new();
         let mut result_names: HashSet<String> = HashSet::new();
         for (name, ty) in heading.attrs() {
-            let new_name = renames
-                .iter()
-                .find(|(old, _)| old == name)
-                .map(|(_, new)| new.clone())
-                .unwrap_or_else(|| name.clone());
-            if !result_names.insert(new_name.clone()) {
+            if removed.contains(name) {
+                continue;
+            }
+            result_names.insert(name.clone());
+            result.push((name.clone(), ty.clone()));
+        }
+        for (name, ty) in added {
+            if !result_names.insert(name.clone()) {
                 self.error(
                     self.node_span(re.syntax()),
                     "T0031",
-                    format!("replace produces a duplicate attribute `{new_name}`"),
+                    format!("replace produces a duplicate attribute `{name}`"),
                 );
             }
-            result.push((new_name, ty.clone()));
+            result.push((name, ty));
         }
         Type::Relation(Heading::new(result))
     }
@@ -1996,6 +2025,35 @@ impl TypeChecker {
                 );
             }
         }
+    }
+}
+
+/// Collect the attribute names a scalar expression references into `into` — the
+/// "removed set" of a general-expression `replace`. Walks `NameRef` (a leaf
+/// attribute ref), `Binary` (both operands), and `Unary` (its operand); other
+/// shapes contribute nothing. Names not in the operand heading are filtered by
+/// the caller.
+fn attr_refs(expr: &Expr, into: &mut HashSet<String>) {
+    match expr {
+        Expr::NameRef(n) => {
+            if let Some(tok) = n.ident() {
+                into.insert(tok.text().to_string());
+            }
+        }
+        Expr::Binary(b) => {
+            if let Some(lhs) = b.lhs() {
+                attr_refs(&lhs, into);
+            }
+            if let Some(rhs) = b.rhs() {
+                attr_refs(&rhs, into);
+            }
+        }
+        Expr::Unary(u) => {
+            if let Some(operand) = u.operand() {
+                attr_refs(&operand, into);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -3133,13 +3191,55 @@ mod tests {
     }
 
     #[test]
-    fn replace_general_expression_diagnoses_t0030() {
-        // General expressions await `extend`; the value must be a bare reference.
+    fn replace_boolean_value_diagnoses_t0046() {
+        // A general value's type is restricted to Integer/Text; a comparison
+        // (Boolean) is rejected — same rule as `extend`.
         let src = "oper main {} [ \
                    let r = Relation { {a: 1, b: 2} }; \
                    let s = r replace {t: a = b}; \
                    ];";
-        assert!(codes(src).contains(&"T0030"));
+        assert!(codes(src).contains(&"T0046"));
+    }
+
+    #[test]
+    fn replace_general_collapse_adds_and_consumes() {
+        // `replace { c: a + b }` adds `c` and removes `a`, `b`. `extract(...).c`
+        // resolves (c added); accessing the consumed `a` is T0017 (proving it
+        // was removed).
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1, b: 2} } replace {c: a + b}; \
+                   let t = extract r; \
+                   let _c = t.c; \
+                   ];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+        let gone = "oper main {} [ \
+                    let r = Relation { {a: 1, b: 2} } replace {c: a + b}; \
+                    let t = extract r; \
+                    let _a = t.a; \
+                    ];";
+        assert!(codes(gone).contains(&"T0017"));
+    }
+
+    #[test]
+    fn replace_in_place_keeps_attribute() {
+        // `replace { a: a + 1 }` updates `a` in place — `a` survives.
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1, b: 2} } replace {a: a + 1}; \
+                   let t = extract r; \
+                   let _a = t.a; \
+                   let _b = t.b; \
+                   ];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn replace_general_reading_no_attribute_diagnoses_t0042() {
+        // A general value that references no operand attribute removes nothing.
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1} }; \
+                   let s = r replace {c: 1 + 1}; \
+                   ];";
+        assert!(codes(src).contains(&"T0042"));
     }
 
     #[test]

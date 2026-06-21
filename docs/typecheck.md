@@ -319,17 +319,27 @@ each `parse_<x>` has a corresponding `check_<x>`.
 - **`check_replace_expr`** — `R replace { new: e, … }` (subsumes the former
   `rename`). Adds each `new` attribute bound to `e` and removes the operand
   attributes `e` references. The operand must be `Type::Relation(H)` (T0023).
-  The general expression forms desugar through `extend` (not yet built), so
-  today the value `e` is restricted to a **bare attribute reference** — the
-  rename case. Dispatch on the value: a bare name-ref `old` must exist in `H`
-  (T0029) and the replace must stay a bijection — no source removed twice, no
-  target colliding with a surviving attribute (T0031); a constant references no
-  attribute, so it removes nothing → use `extend` (T0042); any other expression
-  awaits `extend` (T0030). The result is `Type::Relation(H')` with the renamed
-  names, canonically re-sorted. A relvar-rooted replace (bare-ref) pushes to SQL
-  (each renamed attribute aliased `AS` its new name); an in-memory operand lowers
-  to the in-process `Inst::Rename` → `coddl_relation_rename`, which permutes
-  record bytes into the re-sorted layout and re-seals.
+  Dispatch on the value's shape. A **bare attribute reference** `old` is a pure
+  rename: `old` must exist in `H` (T0029) and the replace must stay a bijection —
+  no source removed twice, no target colliding with a surviving attribute
+  (T0031). A **general (compute) expression** is typechecked in a scope with
+  `H`'s attributes injected (the same machinery `where`/`extend` use), so it may
+  reference the operand's attributes; let `R = attr_refs(e) ∩ H` be the operand
+  attributes it reads. `R` must be non-empty (a constant or a value reading no
+  operand attribute removes nothing → use `extend`, T0042), and the value's type
+  is restricted to **Integer or Text** (T0046, the same cell-type restriction
+  `extend` enforces). The value adds `new` and consumes `R`. The result heading
+  `H'` = the survivors (`H` minus every consumed/renamed source) plus each added
+  `new`, with a new name colliding with a survivor or another target firing
+  T0031, canonically re-sorted. Lowering desugars a general pair through
+  `extend` + `project` (all-but the consumed attrs) + `rename` (only when the new
+  name collides with a surviving attribute, via an internal `__coddl_replace_tmp_*`
+  temp); bare-ref pairs stay pure renames even in a mixed `replace`. A
+  relvar-rooted replace pushes to SQL — bare-ref as `SELECT old AS new`, a
+  general pair as `SELECT (e) AS new` with the consumed columns absent (see the
+  sqlemit peel-chain); an in-memory operand lowers to the in-process
+  `Inst::Extend`/`Inst::Project`/`Inst::Rename` chain (bare-ref alone →
+  `Inst::Rename` → `coddl_relation_rename`).
 - **`check_extend_expr`** — `R extend { c: e, … }`. Adds each new attribute `c`
   bound to the computed value `e`, keeping every operand attribute (the dual of
   `replace`). The operand must be `Type::Relation(H)` (T0023). Each value `e` is
@@ -419,7 +429,7 @@ check script enforces that.
 | T0027 | Unknown attribute name in a `project` list                |
 | T0028 | Duplicate attribute name in a `project` list              |
 | T0029 | Unknown attribute name in a `replace` source (the value side) |
-| T0030 | `replace` value is a general expression (not a bare attribute reference) — awaits `extend` |
+| T0030 | *(retired)* general-expression `replace` is now supported — a value reading no attribute is T0042, a non-Integer/Text value is T0046; the code is reserved, not reused |
 | T0031 | `replace` is not a bijection (a source removed twice, or a target collides with a surviving attribute) |
 | T0032 | *(warning)* unused `let` binding or parameter — never referenced, not `_`-prefixed (a `self` parameter is exempt) |
 | T0033 | relational-assignment target is not an assignable (private) relvar (not a relvar name, or a read-only public relvar) |
@@ -435,4 +445,4 @@ check script enforces that.
 | T0043 | arithmetic operator (`+`, `-`, `*`, `/`) requires Integer operands |
 | T0044 | `||` requires Text or Character operands |
 | T0045 | `extend` attribute already exists / duplicate `extend` target |
-| T0046 | `extend` value must be Integer or Text (v1 relation-cell support) |
+| T0046 | computed `extend` / `replace` value must be Integer or Text (v1 relation-cell support) |

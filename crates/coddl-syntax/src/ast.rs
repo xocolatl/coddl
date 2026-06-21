@@ -833,12 +833,24 @@ impl ReplaceExpr {
             .unwrap_or_default()
     }
 
+    /// True when every pair's value is a bare attribute reference — the pure
+    /// rename case (`replace { new: old, … }`). False when any value is a
+    /// general expression (the compute-and-consume case, which desugars through
+    /// `extend`). An empty pair list counts as all-bare-ref. The single
+    /// dispatch test shared by the typechecker and both lowering paths.
+    pub fn is_all_bare_ref(&self) -> bool {
+        self.pairs()
+            .iter()
+            .all(|(_, value)| matches!(value, Some(Expr::NameRef(_))))
+    }
+
     /// The bare-reference (rename) view: `(old, new)` name tokens, where `old`
     /// is the value's bare-`NameRef` identifier (the source attribute) and
     /// `new` is the `NAMED_ARG` name (the target). `old` is `None` when the
-    /// value isn't a bare attribute name (not the rename case). Used by
-    /// lowering, which only runs after the typechecker has confirmed every
-    /// value is a bare reference.
+    /// value isn't a bare attribute name. **Valid only when
+    /// [`is_all_bare_ref`](Self::is_all_bare_ref) holds** — a general-expression
+    /// value collapses to `(None, new)` here, silently dropping its content, so
+    /// callers must gate on `is_all_bare_ref` first.
     pub fn renames(&self) -> Vec<(Option<SyntaxToken>, Option<SyntaxToken>)> {
         self.arg_list()
             .map(|al| {

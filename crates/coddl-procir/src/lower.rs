@@ -859,30 +859,98 @@ impl Lowerer {
     }
 
     /// Lower a `replace` whose operand the cut declined to push — an in-memory
-    /// relation. Today `replace`'s value is a bare attribute reference (the
-    /// rename case; `re.renames()` yields the `(old, new)` pairs), so this is
-    /// the rename lowering: the pushable case is served by `Inst::Query` with
-    /// the `AS`-aliased SELECT. Lower the operand, compute the renamed
-    /// (re-sorted) result heading and the source→dest permutation, and emit
-    /// `Inst::Rename`.
+    /// relation. An all-bare-ref `replace` is a pure rename (`Inst::Rename`); a
+    /// general-expression `replace` desugars to `extend → project all-but →
+    /// rename` — the in-process counterpart of the SQL desugar (compute the new
+    /// attribute, drop the operand attributes the value reads, rename a temp
+    /// back to the target when the new name collided).
     fn lower_replace_expr(&mut self, re: &ReplaceExpr) -> ValueId {
-        // 1. Lower the operand.
         let src = re
             .input()
             .map(|e| self.lower_expr(&e))
-            .expect("typechecked rename has a relation operand");
+            .expect("typechecked replace has a relation operand");
+
+        // Fast path: all-bare-ref → one rename.
+        if re.is_all_bare_ref() {
+            let renames: Vec<(String, String)> = re
+                .renames()
+                .into_iter()
+                .filter_map(|(old, new)| Some((old?.text().to_string(), new?.text().to_string())))
+                .collect();
+            let dst = self.emit_rename(src, renames);
+            self.release_if_unowned(src);
+            return dst;
+        }
+
+        // General case: classify pairs into extend values (general) and renames
+        // (bare-ref olds + temps), and the attributes the general values read.
+        let src_heading_id = match self.value_type(src) {
+            ProcType::Relation(id) => id,
+            other => unreachable!("replace on non-relation `{other}` survived typecheck"),
+        };
+        let in_heading = self.headings[src_heading_id.0 as usize].clone();
+        let mut extend_pairs: Vec<(String, Expr)> = Vec::new();
+        let mut removed: HashSet<String> = HashSet::new();
+        let mut renames: Vec<(String, String)> = Vec::new();
+        for (name_tok, value) in re.pairs() {
+            let new = name_tok.expect("typechecked replace pair has a name").text().to_string();
+            let value = value.expect("typechecked replace pair has a value");
+            match &value {
+                Expr::NameRef(n) => {
+                    let old = n.ident().expect("bare-ref value has an ident").text().to_string();
+                    renames.push((old, new));
+                }
+                _ => {
+                    let mut refs: HashSet<String> = HashSet::new();
+                    ast_attr_refs(&value, &mut refs);
+                    for r in refs {
+                        if in_heading.lookup(&r).is_some() {
+                            removed.insert(r);
+                        }
+                    }
+                    let extend_name = if in_heading.lookup(&new).is_some() {
+                        let t = format!("__coddl_replace_tmp_{new}");
+                        renames.push((t.clone(), new));
+                        t
+                    } else {
+                        new
+                    };
+                    extend_pairs.push((extend_name, value));
+                }
+            }
+        }
+        let keep: Vec<String> = in_heading
+            .attrs()
+            .iter()
+            .map(|(n, _)| n.clone())
+            .chain(extend_pairs.iter().map(|(n, _)| n.clone()))
+            .filter(|n| !removed.contains(n))
+            .collect();
+
+        // Compose: extend → project all-but → rename, releasing each consumed
+        // intermediate (the operand is released only when no local owns it).
+        let ext = self.emit_extend(src, extend_pairs);
+        self.release_if_unowned(src);
+        let proj = self.emit_project(ext, &keep);
+        self.release_if_unowned(ext);
+        if renames.is_empty() {
+            return proj;
+        }
+        let dst = self.emit_rename(proj, renames);
+        self.release_if_unowned(proj);
+        dst
+    }
+
+    /// Rename an already-lowered relation `src` and emit `Inst::Rename`. Computes
+    /// the renamed (re-sorted) result heading and the source→dest permutation.
+    /// Mint-and-return: the caller releases `src`. Reused by `lower_replace_expr`
+    /// and the general-expression `replace` desugar.
+    fn emit_rename(&mut self, src: ValueId, renames: Vec<(String, String)>) -> ValueId {
         let src_heading_id = match self.value_type(src) {
             ProcType::Relation(id) => id,
             other => unreachable!("rename on non-relation `{other}` survived typecheck"),
         };
         let src_heading = self.headings[src_heading_id.0 as usize].clone();
-
-        // 2. Renamed (re-sorted) result heading.
-        let renames: Vec<(String, String)> = re
-            .renames()
-            .into_iter()
-            .filter_map(|(old, new)| Some((old?.text().to_string(), new?.text().to_string())))
-            .collect();
         let renamed: Vec<(String, Type)> = src_heading
             .attrs()
             .iter()
@@ -897,11 +965,8 @@ impl Lowerer {
             .collect();
         let result_heading = Heading::new(renamed);
         let result_heading_id = self.intern_heading(&result_heading);
-
-        // 3. Permutation `perm[dst_i] = src index`. The source of a destination
-        //    attribute is the `old` whose `new` is the dst name (reverse rename),
-        //    else the dst name itself (pass-through). Both headings are in
-        //    canonical order, so positions are stable.
+        // perm[dst_i] = the src index whose name maps to dst_i (reverse rename),
+        // else the dst name itself. Both headings are canonically ordered.
         let perm: Vec<u32> = result_heading
             .attrs()
             .iter()
@@ -918,8 +983,6 @@ impl Lowerer {
                     .unwrap_or(0) as u32
             })
             .collect();
-
-        // 4. Emit Inst::Rename.
         let dst = self.fresh_value();
         self.record_type(dst, ProcType::Relation(result_heading_id));
         self.insts.push(Inst::Rename {
@@ -929,15 +992,6 @@ impl Lowerer {
             result_heading_id,
             perm,
         });
-
-        // 5. Release the source if no local owns it (same balancing as `where`).
-        let src_owned = self
-            .locals
-            .iter()
-            .any(|layer| layer.values().any(|(vid, _)| *vid == src));
-        if !src_owned {
-            self.insts.push(Inst::Release { src });
-        }
         dst
     }
 
@@ -950,11 +1004,31 @@ impl Lowerer {
     /// restricts extend values to Integer or Text (T0046), so every new cell
     /// has a supported relation-cell layout.
     fn lower_extend_expr(&mut self, e: &ExtendExpr) -> ValueId {
-        // 1. Lower the operand in the enclosing function's scope.
         let src = e
             .input()
             .map(|i| self.lower_expr(&i))
             .expect("typechecked extend has a relation operand");
+        let pairs: Vec<(String, Expr)> = e
+            .pairs()
+            .into_iter()
+            .map(|(name_tok, value)| {
+                (
+                    name_tok.expect("typechecked extend pair has a name").text().to_string(),
+                    value.expect("typechecked extend pair has a value"),
+                )
+            })
+            .collect();
+        let dst = self.emit_extend(src, pairs);
+        self.release_if_unowned(src);
+        dst
+    }
+
+    /// Synthesize an `extend` helper over an already-lowered relation `src` plus
+    /// `(new_name, value_expr)` pairs, and emit `Inst::Extend`. The helper loads
+    /// the operand cells, computes each value, and writes the whole widened
+    /// record. Mint-and-return: the caller releases `src`. Reused by
+    /// `lower_extend_expr` and the general-expression `replace` desugar.
+    fn emit_extend(&mut self, src: ValueId, pairs: Vec<(String, Expr)>) -> ValueId {
         let src_heading_id = match self.value_type(src) {
             ProcType::Relation(id) => id,
             other => unreachable!("extend on non-relation `{other}` survived typecheck"),
@@ -1003,14 +1077,8 @@ impl Lowerer {
 
         // 6. Lower each new value expression; collect its `(name, value, type)`.
         let mut result_attrs: Vec<(String, Type)> = src_heading.attrs().to_vec();
-        for (name_tok, value) in e.pairs() {
-            let name = name_tok
-                .expect("typechecked extend pair has a name")
-                .text()
-                .to_string();
-            let v = value
-                .map(|ve| self.lower_expr(&ve))
-                .expect("typechecked extend pair has a value");
+        for (name, value) in pairs {
+            let v = self.lower_expr(&value);
             let pt = self.value_type(v);
             result_attrs.push((name.clone(), type_from_proc(&pt)));
             cell_value.insert(name, (v, pt));
@@ -1062,7 +1130,7 @@ impl Lowerer {
         self.value_types = saved_value_types;
         self.outer_locals_for_capture = None;
 
-        // 11. Emit Inst::Extend in the enclosing function.
+        // 11. Emit Inst::Extend in the enclosing function (caller releases src).
         let dst = self.fresh_value();
         self.record_type(dst, ProcType::Relation(result_heading_id));
         self.insts.push(Inst::Extend {
@@ -1072,15 +1140,21 @@ impl Lowerer {
             src_heading_id,
             result_heading_id,
         });
-        // Release the source if no local owns it (same balancing as `where`).
-        let src_owned = self
+        dst
+    }
+
+    /// Release `v` if no local scope owns it — the refcount balancing the
+    /// in-process relational lowerings install for chained temporaries (a fresh
+    /// `RelvarRead`/relop result owned by no `let`). Idempotent in effect:
+    /// owned values keep their reference for the owning local to release.
+    fn release_if_unowned(&mut self, v: ValueId) {
+        let owned = self
             .locals
             .iter()
-            .any(|layer| layer.values().any(|(vid, _)| *vid == src));
-        if !src_owned {
-            self.insts.push(Inst::Release { src });
+            .any(|layer| layer.values().any(|(vid, _)| *vid == v));
+        if !owned {
+            self.insts.push(Inst::Release { src: v });
         }
-        dst
     }
 
     /// Lower a `project` whose operand the cut declined to push — i.e. an
@@ -1261,23 +1335,85 @@ impl Lowerer {
                 })
             }
             Expr::Replace(r) => {
-                // Today `replace`'s value is a bare attribute reference (the
-                // rename case), so it maps to the `Rename` node. A replace over
-                // a pushable subtree pushes too — origin propagates and the
-                // emitter resolves columns through the renames (aliasing `AS` the
-                // new name). On a clean typecheck every pair is a bare ref.
                 let input = self.build_rel_expr(&r.input()?)?;
-                let mut renames = Vec::new();
-                for (old, new) in r.renames() {
-                    let (Some(old), Some(new)) = (old, new) else {
-                        return None;
-                    };
-                    renames.push((old.text().to_string(), new.text().to_string()));
+                // Fast path: an all-bare-ref replace is a pure rename → one
+                // `Rename` node (pushes as `col AS new`).
+                if r.is_all_bare_ref() {
+                    let mut renames = Vec::new();
+                    for (old, new) in r.renames() {
+                        let (Some(old), Some(new)) = (old, new) else {
+                            return None;
+                        };
+                        renames.push((old.text().to_string(), new.text().to_string()));
+                    }
+                    return Some(RelExpr::Rename {
+                        input: Box::new(input),
+                        renames,
+                    });
                 }
-                Some(RelExpr::Rename {
-                    input: Box::new(input),
-                    renames,
-                })
+                // General case: desugar to `Rename{Project{Extend}}` — extend
+                // each general value (under a temp `__t` when the new name
+                // collides), project away the attributes the values read, and
+                // rename the temps (and bare-ref olds) to their targets.
+                let in_heading = input.heading();
+                let mut extends: Vec<(String, Type, ScalarExpr)> = Vec::new();
+                let mut removed: HashSet<String> = HashSet::new();
+                let mut renames: Vec<(String, String)> = Vec::new();
+                for (name_tok, value) in r.pairs() {
+                    let new = name_tok?.text().to_string();
+                    let value = value?;
+                    match &value {
+                        // Bare-ref pair stays a pure rename (type-agnostic); its
+                        // `old` is consumed by the rename, not the project.
+                        Expr::NameRef(n) => {
+                            let old = n.ident()?.text().to_string();
+                            renames.push((old, new));
+                        }
+                        // General value → extend (temp when `new` exists) +
+                        // remove the attributes it reads.
+                        _ => {
+                            let scalar = self.build_scalar_expr(&value)?;
+                            scalar_attr_refs(&scalar, &mut removed);
+                            let ty = scalar_result_type(&scalar, &in_heading);
+                            // A temp is needed only when `new` already exists
+                            // (in-place / replacing an attribute). Each pair's
+                            // `new` is unique within a `replace` (the typechecker
+                            // rejects duplicate targets), so a `new`-derived temp
+                            // name is unique; the `__` prefix can't collide with
+                            // user attributes (E0007).
+                            let extend_name = if in_heading.lookup(&new).is_some() {
+                                let t = format!("__coddl_replace_tmp_{new}");
+                                renames.push((t.clone(), new));
+                                t
+                            } else {
+                                new
+                            };
+                            extends.push((extend_name, ty, scalar));
+                        }
+                    }
+                }
+                // keep = (operand attrs ∪ extend-names) minus the read attrs.
+                let keep: Vec<String> = in_heading
+                    .attrs()
+                    .iter()
+                    .map(|(n, _)| n.clone())
+                    .chain(extends.iter().map(|(n, _, _)| n.clone()))
+                    .filter(|n| !removed.contains(n))
+                    .collect();
+                let mut node = RelExpr::Project {
+                    input: Box::new(RelExpr::Extend {
+                        input: Box::new(input),
+                        extends,
+                    }),
+                    keep,
+                };
+                if !renames.is_empty() {
+                    node = RelExpr::Rename {
+                        input: Box::new(node),
+                        renames,
+                    };
+                }
+                Some(node)
             }
             Expr::Tclose(t) => {
                 // `R tclose { a, b }` ≡ `(R project { a, b }) tclose` — wrap the
@@ -2527,6 +2663,52 @@ fn decode_string_literal(text: &str) -> Vec<u8> {
 /// checker is the type authority (a clean typecheck guarantees the `Attr`
 /// lookup succeeds); this just re-states the rule so the `Extend` node can
 /// carry the type without relir re-deriving it.
+/// Collect the attribute names an AST scalar `Expr` references — the in-process
+/// counterpart of the SQL `scalar_attr_refs` (which walks the built
+/// `ScalarExpr`). Used by the general-expression `replace` desugar to compute
+/// the removed set when the value isn't SQL-renderable. Mirrors the
+/// typechecker's `attr_refs`, so the three agree on which attributes a value
+/// reads. Walks `NameRef`/`Binary`/`Unary`.
+fn ast_attr_refs(expr: &Expr, into: &mut HashSet<String>) {
+    match expr {
+        Expr::NameRef(n) => {
+            if let Some(tok) = n.ident() {
+                into.insert(tok.text().to_string());
+            }
+        }
+        Expr::Binary(b) => {
+            if let Some(lhs) = b.lhs() {
+                ast_attr_refs(&lhs, into);
+            }
+            if let Some(rhs) = b.rhs() {
+                ast_attr_refs(&rhs, into);
+            }
+        }
+        Expr::Unary(u) => {
+            if let Some(operand) = u.operand() {
+                ast_attr_refs(&operand, into);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect the attribute names a `ScalarExpr` references — the "removed set" of
+/// a general-expression `replace`. Walks `Attr` (a leaf ref) and `Bin` (both
+/// operands); literals contribute nothing.
+fn scalar_attr_refs(e: &ScalarExpr, into: &mut HashSet<String>) {
+    match e {
+        ScalarExpr::Attr(name) => {
+            into.insert(name.clone());
+        }
+        ScalarExpr::Bin { lhs, rhs, .. } => {
+            scalar_attr_refs(lhs, into);
+            scalar_attr_refs(rhs, into);
+        }
+        _ => {}
+    }
+}
+
 fn scalar_result_type(e: &ScalarExpr, heading: &Heading) -> Type {
     match e {
         ScalarExpr::Attr(name) => heading.lookup(name).cloned().unwrap_or(Type::Unknown),

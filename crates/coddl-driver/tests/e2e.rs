@@ -1328,6 +1328,124 @@ fn extend_boolean_value_fails_with_t0046() {
     );
 }
 
+// ── general-expression replace (compute + consume) ────────────────────
+
+/// Run an in-memory general `replace` on `backend`: collapse (consume the read
+/// attrs), in-place (`x: f(x)`), and concat-collapse — all computed in-process.
+fn run_in_process_general_replace(backend: &str) -> Vec<u8> {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cd = tmp.path().join("gen-replace.cd");
+    std::fs::write(
+        &cd,
+        "program p;\n\
+         oper main {} [\n\
+             let s = Relation { {a: 1, b: 2}, {a: 3, b: 1} };\n\
+             write_relation { rel: s replace { c: a * b } };\n\
+             write_relation { rel: s replace { a: a + 1 } };\n\
+             let t = Relation { {x: \"wid\", y: \"get\"} };\n\
+             write_relation { rel: t replace { z: x || y } };\n\
+         ];\n",
+    )
+    .expect("write gen-replace.cd");
+    let out = coddl()
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "in-process general replace on {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+#[test]
+fn general_replace_in_process_computes_and_consumes() {
+    let expected = sorted_tuples(&[
+        "{c: 2}",  // a*b for {1,2}; a,b consumed
+        "{c: 3}",  // a*b for {3,1}
+        "{a: 2, b: 2}", // a+1 in place
+        "{a: 4, b: 1}",
+        r#"{z: "widget"}"#, // x||y; x,y consumed
+    ]);
+    for backend in ["llvm", "cranelift"] {
+        assert_eq!(
+            tuple_lines(&run_in_process_general_replace(backend)),
+            expected,
+            "in-process general replace output on {backend}"
+        );
+    }
+}
+
+/// Push a general `replace` over the seeded `sales` db on `backend`: assert the
+/// collapse output + that `CODDL_AUDIT_LOG` shows the computed column pushed
+/// with the consumed columns absent.
+fn assert_general_replace_pushdown(backend: &str) {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = seed_sales_fixtures(tmp.path());
+    let cd = tmp.path().join("rep.cd");
+    std::fs::write(
+        &cd,
+        "program sales_db;\n\
+         database sales;\n\
+         public relvar Sales { id: Integer, customer: Text, item: Text, unit_cents: Integer, qty: Integer } key { id };\n\
+         oper main {} [\n\
+             let p = transaction [ Sales replace { line_cents: unit_cents * qty } ];\n\
+             write_relation { rel: p };\n\
+         ];\n",
+    )
+    .expect("write rep.cd");
+    let log = tmp.path().join("audit.log");
+
+    let out = coddl()
+        .env("CODDL_AUDIT_LOG", &log)
+        .env("CODDL_SALES_FILE", &db)
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "general replace pushdown on {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    // unit_cents/qty consumed → only id, customer, item, line_cents survive.
+    assert_eq!(
+        tuple_lines(&out.stdout),
+        sorted_tuples(&[
+            r#"{customer: "ada", id: 1, item: "widget", line_cents: 1500}"#,
+            r#"{customer: "bo", id: 2, item: "gadget", line_cents: 1600}"#,
+        ]),
+        "general replace output on {backend}",
+    );
+    let contents = std::fs::read_to_string(&log).expect("read audit log");
+    let sqls: Vec<&str> = contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| audit_sql(l).unwrap_or_else(|| panic!("malformed audit line ({backend}): {l:?}")))
+        .collect();
+    assert!(
+        sqls.iter().any(|s| {
+            s.contains(r#"("unit_cents" * "qty") AS "line_cents""#)
+                && !s.contains(r#""unit_cents", "qty""#)
+        }),
+        "expected the pushed computed column with consumed cols absent on {backend}; got {sqls:?}",
+    );
+}
+
+#[test]
+fn general_replace_pushdown_llvm() {
+    assert_general_replace_pushdown("llvm");
+}
+
+#[test]
+fn general_replace_pushdown_cranelift() {
+    assert_general_replace_pushdown("cranelift");
+}
+
 // Helper-level checks proving the acceptance assertions are non-vacuous —
 // they reject the pre-pushdown world (a startup full scan) and a malformed
 // line — without needing a live runtime to regress.

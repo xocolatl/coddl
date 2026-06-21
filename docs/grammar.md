@@ -504,12 +504,13 @@ function that implements it.
                     -- references. The pairs reuse <arg-list> with field-init
                     -- shorthand DISABLED — the colon is required (P0017 on
                     -- `replace { new }`), since a shorthand would be the no-op
-                    -- identity `new -> new`. The value parses as a general
-                    -- <expr> (forward-compatible with the expression forms),
-                    -- but the typechecker restricts it to a bare attribute
-                    -- reference until `extend` lands — the bare-ref case. A
-                    -- constant value (it removes nothing) is T0042 (use
-                    -- `extend`). P0040 on a missing `{`.
+                    -- identity `new -> new`. The value is a general <expr>: a
+                    -- bare attribute reference is a pure rename; any other
+                    -- (compute) expression desugars through `extend` + `project`
+                    -- + `rename` (it adds `new` and removes the attributes it
+                    -- reads), restricted to Integer/Text (T0046). A constant or
+                    -- a value reading no operand attribute removes nothing →
+                    -- T0042 (use `extend`). P0040 on a missing `{`.
 <tclose-suffix> ::= 'tclose' [ '{' <ident> { ',' <ident> } '}' ] ; -- parse_tclose_suffix
                     -- Relational transitive closure. Postfix at pipeline
                     -- precedence (like <project-suffix> / <replace-suffix>);

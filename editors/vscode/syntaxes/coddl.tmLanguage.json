@@ -102,7 +102,7 @@
                 },
                 {
                     "name": "keyword.other.relational.coddl",
-                    "match": "\\b(join|times|union|intersect|minus|where|extend|summarize|rename|project|group|ungroup|wrap|unwrap|semijoin|semiminus|tclose)\\b"
+                    "match": "\\b(join|times|union|intersect|minus|where|extend|summarize|replace|project|group|ungroup|wrap|unwrap|semijoin|semiminus|tclose)\\b"
                 },
                 {
                     "comment": "`all but` projection-away, matched as a pair so a lone identifier named `all` or `but` (e.g. inside the brace list) stays uncolored",
