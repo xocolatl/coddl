@@ -121,8 +121,11 @@ runtime's materialization marshals each cell via
 (`docs/runtime.md`).
 
 Rational, Approximate, Character defer until the runtime adds per-cell
-codec entries. Nested Tuple and Relation cells in public relvars are
-out of scope for v1 (and don't make sense for a SQL-backed schema).
+codec entries. Nested **Tuple** cells are now representable in relation
+*values* (query results / intermediates) as inline sub-regions — see the
+heading-descriptor `sub` pointer in `docs/runtime.md` — but a tuple-valued
+*public-relvar column* stays out of scope (a SQL-backed base table has no
+composite column). Nested Relation cells remain out of scope for v1.
 
 ## Read-only policy
 

@@ -78,9 +78,10 @@ layouts (matched by both backends and by `coddl-runtime`):
 struct CoddlAttrDesc {
     const uint8_t* name;       // pointer to name bytes (not null-terminated)
     uint32_t       name_len;
-    uint32_t       kind;       // 0 = Integer, 1 = Boolean, 2 = Text
+    uint32_t       kind;       // 0 = Integer, 1 = Boolean, 2 = Text, 10 = Tuple
     uint32_t       offset;     // byte offset within a record
     // 4 bytes of natural trailing padding on 64-bit hosts
+    const CoddlHeadingDesc* sub; // Tuple cell: nested descriptor; else NULL
 };
 struct CoddlHeadingDesc {
     uint32_t                attr_count;
@@ -91,10 +92,22 @@ struct CoddlHeadingDesc {
 
 LLVM: each descriptor is three private unnamed-address constants —
 `@.attrname.<id>.<i>` (one per attribute), `@.attrs.<id>` (the
-attribute array), and `@.heading.<id>` (the descriptor struct).
-Cranelift: each descriptor is three `DataId`s declared with
-`Linkage::Local`, populated via `DataDescription::define` for the
-raw bytes and `write_data_addr` for the pointer relocations.
+attribute array of `{ ptr, i32, i32, i32, ptr }` elements), and
+`@.heading.<id>` (the descriptor struct). Cranelift: each descriptor is
+three `DataId`s declared with `Linkage::Local`, populated via
+`DataDescription::define` for the raw bytes and `write_data_addr` for
+the pointer relocations (the attr struct's stride is 32 bytes on 64-bit
+hosts, with `sub` at offset 24).
+
+A `Tuple`-valued attribute is an **inline nested cell**: its components
+lay out contiguously in a sub-region (`coddl-procir::layout` carries the
+nested `RecordLayout` on `AttrLayout::sub`, 0-based offsets). Both
+backends emit a **nested descriptor recursively** (symbol base
+`<id>.<i>`) and relocate the parent attr's `sub` field to it; scalar
+attrs leave `sub` null. The record-store path (`emit_attr_store` /
+`store_attr`) likewise recurses, writing each leaf at `base_offset +
+sub_offset`. So `wrap`/`unwrap` (later) and any tuple-valued result
+round-trip through one flat record buffer with no heap indirection.
 
 The `Inst::RelationLit` lowering, in both backends, has the same
 three-step shape:

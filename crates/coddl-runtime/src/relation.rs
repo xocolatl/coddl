@@ -55,9 +55,11 @@ pub enum CoddlAttrKind {
     Integer = 0,
     Boolean = 1,
     Text = 2,
-    // Reserved: Tuple = 10, Relation = 11. Not yet emitted; the
-    // printer / drop walker route on these will land when nested
-    // compound cells do.
+    /// Inline nested-tuple cell: a contiguous sub-region. The attribute's
+    /// `sub` descriptor describes the tuple's components (0-based offsets);
+    /// the printer / comparator recurse through it.
+    Tuple = 10,
+    // Reserved: Relation = 11. Not yet emitted.
 }
 
 /// One attribute in a heading descriptor.
@@ -71,6 +73,10 @@ pub struct CoddlAttrDesc {
     pub kind: u32,
     /// Byte offset within a record.
     pub offset: u32,
+    /// For a `Tuple` cell (`kind == Tuple`): pointer to the nested heading
+    /// descriptor for the inline sub-region (its attr offsets are 0-based
+    /// within the sub-region). Null for scalar cells.
+    pub sub: *const CoddlHeadingDesc,
 }
 
 /// One heading descriptor. Lives in read-only data; backends emit
@@ -575,7 +581,7 @@ pub unsafe extern "C" fn coddl_write_relation(ptr: *const u8, desc: *const Coddl
             let name_slice = std::slice::from_raw_parts(attr.name, attr.name_len as usize);
             let _ = w.write_all(name_slice);
             let _ = w.write_all(b": ");
-            print_cell(&mut w, attr, record);
+            print_cell(&mut w, attr, record, 0);
         }
         let _ = w.write_all(b"}\n");
     }
@@ -584,8 +590,8 @@ pub unsafe extern "C" fn coddl_write_relation(ptr: *const u8, desc: *const Coddl
 /// Format one cell within a record to `w`. Dispatches on
 /// `CoddlAttrKind`. Cells the printer doesn't recognize yet (Tuple,
 /// Relation) print as `{...}` so the printer remains total.
-unsafe fn print_cell<W: Write>(w: &mut W, attr: &CoddlAttrDesc, record: &[u8]) {
-    let offset = attr.offset as usize;
+unsafe fn print_cell<W: Write>(w: &mut W, attr: &CoddlAttrDesc, record: &[u8], base: usize) {
+    let offset = base + attr.offset as usize;
     if attr.kind == CoddlAttrKind::Integer as u32 {
         let bytes: [u8; 8] = record[offset..offset + 8].try_into().unwrap();
         let value = i64::from_ne_bytes(bytes);
@@ -605,8 +611,28 @@ unsafe fn print_cell<W: Write>(w: &mut W, attr: &CoddlAttrDesc, record: &[u8]) {
             let _ = w.write_all(slice);
         }
         let _ = w.write_all(b"\"");
+    } else if attr.kind == CoddlAttrKind::Tuple as u32 {
+        // Inline nested-tuple cell: recurse through the sub-descriptor at this
+        // cell's base offset, rendering `{name: val, …}` in its (name-sorted)
+        // order. The sub-attr offsets are 0-based within the sub-region, so the
+        // recursion's base is this cell's record position.
+        let _ = w.write_all(b"{");
+        if !attr.sub.is_null() {
+            let sub = &*attr.sub;
+            let sub_attrs = std::slice::from_raw_parts(sub.attrs, sub.attr_count as usize);
+            for (i, sa) in sub_attrs.iter().enumerate() {
+                if i > 0 {
+                    let _ = w.write_all(b", ");
+                }
+                let name_slice = std::slice::from_raw_parts(sa.name, sa.name_len as usize);
+                let _ = w.write_all(name_slice);
+                let _ = w.write_all(b": ");
+                print_cell(w, sa, record, offset);
+            }
+        }
+        let _ = w.write_all(b"}");
     } else {
-        // Tuple, Relation, or future cells.
+        // Relation or future cells.
         let _ = w.write_all(b"{...}");
     }
 }
@@ -882,9 +908,60 @@ unsafe fn read_text_cell(rec: *const u8, off: usize) -> (*const u8, usize) {
     )
 }
 
+/// Compare one cell of `ra` vs `rb`, the cell living at record offset
+/// `base + attr.offset`. `Text` compares by string *content* (not the
+/// `(ptr, len)` fat pointer); scalars by their fixed-width bytes; a `Tuple`
+/// cell recurses over its inline sub-region's components (so two tuple cells
+/// with equal Text content but different pointers compare `Equal`). The `base`
+/// is this cell's enclosing position — 0 at the record root, the parent tuple's
+/// record offset when recursing.
+///
+/// # Safety
+/// `ra`/`rb` must hold a record whose layout matches `attr` (and its `sub`);
+/// `Text` cells must describe `len` readable bytes (or `len == 0`).
+unsafe fn cmp_cell(
+    ra: &[u8],
+    rb: &[u8],
+    base: usize,
+    attr: &CoddlAttrDesc,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let off = base + attr.offset as usize;
+    if attr.kind == CoddlAttrKind::Text as u32 {
+        let (pa, la) = read_text_cell(ra.as_ptr(), off);
+        let (pb, lb) = read_text_cell(rb.as_ptr(), off);
+        let sa: &[u8] = if la == 0 {
+            &[]
+        } else {
+            std::slice::from_raw_parts(pa, la)
+        };
+        let sb: &[u8] = if lb == 0 {
+            &[]
+        } else {
+            std::slice::from_raw_parts(pb, lb)
+        };
+        sa.cmp(sb)
+    } else if attr.kind == CoddlAttrKind::Tuple as u32 {
+        if attr.sub.is_null() {
+            return Ordering::Equal;
+        }
+        let sub = &*attr.sub;
+        let sub_attrs = std::slice::from_raw_parts(sub.attrs, sub.attr_count as usize);
+        for sa in sub_attrs {
+            let ord = cmp_cell(ra, rb, off, sa);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    } else {
+        let w = cell_width(attr.kind);
+        ra[off..off + w].cmp(&rb[off..off + w])
+    }
+}
+
 /// Total order on two records (`ra`, `rb`, same `attrs` layout) by walking
-/// `attrs`: scalar cells compare by their fixed-width bytes, `Text` cells by
-/// string *content* (not the `(ptr, len)` fat pointer). Two records compare
+/// `attrs` and comparing each cell via [`cmp_cell`]. Two records compare
 /// `Equal` iff every cell is content-equal — the basis for [`coddl_relation_seal`]'s
 /// content-aware dedup. For an all-scalar record this is the old whole-record
 /// byte comparison.
@@ -895,25 +972,7 @@ unsafe fn read_text_cell(rec: *const u8, off: usize) -> (*const u8, usize) {
 unsafe fn record_cmp(ra: &[u8], rb: &[u8], attrs: &[CoddlAttrDesc]) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     for attr in attrs {
-        let off = attr.offset as usize;
-        let ord = if attr.kind == CoddlAttrKind::Text as u32 {
-            let (pa, la) = read_text_cell(ra.as_ptr(), off);
-            let (pb, lb) = read_text_cell(rb.as_ptr(), off);
-            let sa: &[u8] = if la == 0 {
-                &[]
-            } else {
-                std::slice::from_raw_parts(pa, la)
-            };
-            let sb: &[u8] = if lb == 0 {
-                &[]
-            } else {
-                std::slice::from_raw_parts(pb, lb)
-            };
-            sa.cmp(sb)
-        } else {
-            let w = cell_width(attr.kind);
-            ra[off..off + w].cmp(&rb[off..off + w])
-        };
+        let ord = cmp_cell(ra, rb, 0, attr);
         if ord != Ordering::Equal {
             return ord;
         }
@@ -1251,6 +1310,7 @@ mod tests {
             name_len: 1,
             kind: CoddlAttrKind::Integer as u32,
             offset: 0,
+            sub: std::ptr::null(),
         }];
         let desc = CoddlHeadingDesc {
             attr_count: 1,
@@ -1293,6 +1353,7 @@ mod tests {
             name_len: 4,
             kind: CoddlAttrKind::Text as u32,
             offset: 0,
+            sub: std::ptr::null(),
         }];
         let desc = CoddlHeadingDesc {
             attr_count: 1,
@@ -1337,12 +1398,14 @@ mod tests {
                 name_len: 2,
                 kind: CoddlAttrKind::Integer as u32,
                 offset: 0,
+                sub: std::ptr::null(),
             },
             CoddlAttrDesc {
                 name: b"name".as_ptr(),
                 name_len: 4,
                 kind: CoddlAttrKind::Text as u32,
                 offset: 8,
+                sub: std::ptr::null(),
             },
         ];
         let desc = CoddlHeadingDesc {
@@ -1409,12 +1472,14 @@ mod tests {
                 name_len: 2,
                 kind: CoddlAttrKind::Integer as u32,
                 offset: 0,
+                sub: std::ptr::null(),
             },
             CoddlAttrDesc {
                 name: b"name".as_ptr(),
                 name_len: 4,
                 kind: CoddlAttrKind::Text as u32,
                 offset: 8,
+                sub: std::ptr::null(),
             },
         ];
         let desc = CoddlHeadingDesc {
@@ -1466,12 +1531,14 @@ mod tests {
                 name_len: 4,
                 kind: CoddlAttrKind::Integer as u32,
                 offset: 0,
+                sub: std::ptr::null(),
             },
             CoddlAttrDesc {
                 name: b"to".as_ptr(),
                 name_len: 2,
                 kind: CoddlAttrKind::Integer as u32,
                 offset: 8,
+                sub: std::ptr::null(),
             },
         ];
         let desc = CoddlHeadingDesc {
@@ -1521,12 +1588,14 @@ mod tests {
                 name_len: 4,
                 kind: CoddlAttrKind::Text as u32,
                 offset: 0,
+                sub: std::ptr::null(),
             },
             CoddlAttrDesc {
                 name: b"to".as_ptr(),
                 name_len: 2,
                 kind: CoddlAttrKind::Text as u32,
                 offset: 16,
+                sub: std::ptr::null(),
             },
         ];
         let desc = CoddlHeadingDesc {
@@ -1591,6 +1660,7 @@ mod tests {
             name_len: 1,
             kind: CoddlAttrKind::Integer as u32,
             offset: 0,
+            sub: std::ptr::null(),
         }];
         let lhs_desc = CoddlHeadingDesc {
             attr_count: 1,
@@ -1602,6 +1672,7 @@ mod tests {
             name_len: 1,
             kind: CoddlAttrKind::Integer as u32,
             offset: 0,
+            sub: std::ptr::null(),
         }];
         let rhs_desc = CoddlHeadingDesc {
             attr_count: 1,
@@ -1615,12 +1686,14 @@ mod tests {
                 name_len: 1,
                 kind: CoddlAttrKind::Integer as u32,
                 offset: 0,
+                sub: std::ptr::null(),
             },
             CoddlAttrDesc {
                 name: b"b".as_ptr(),
                 name_len: 1,
                 kind: CoddlAttrKind::Integer as u32,
                 offset: 8,
+                sub: std::ptr::null(),
             },
         ];
         let res_desc = CoddlHeadingDesc {
@@ -1674,12 +1747,14 @@ mod tests {
                     name_len: 2,
                     kind: CoddlAttrKind::Integer as u32,
                     offset: 0,
+                    sub: std::ptr::null(),
                 },
                 CoddlAttrDesc {
                     name: b"name".as_ptr(),
                     name_len: 4,
                     kind: CoddlAttrKind::Text as u32,
                     offset: 8,
+                    sub: std::ptr::null(),
                 },
             ]
         };
@@ -1753,6 +1828,7 @@ mod tests {
             name_len: 1,
             kind: CoddlAttrKind::Integer as u32,
             offset: 0,
+            sub: std::ptr::null(),
         }];
         let desc = CoddlHeadingDesc {
             attr_count: 1,
@@ -1790,12 +1866,14 @@ mod tests {
                 name_len: 1,
                 kind: CoddlAttrKind::Integer as u32,
                 offset: 0,
+                sub: std::ptr::null(),
             },
             CoddlAttrDesc {
                 name: b"b".as_ptr(),
                 name_len: 1,
                 kind: CoddlAttrKind::Integer as u32,
                 offset: 8,
+                sub: std::ptr::null(),
             },
         ];
         // `attrs.as_ptr()` would dangle once the array moves out of this
@@ -1818,6 +1896,7 @@ mod tests {
             name_len: 1,
             kind: CoddlAttrKind::Integer as u32,
             offset: 0,
+            sub: std::ptr::null(),
         }];
         let dst_desc = CoddlHeadingDesc {
             attr_count: 1,
@@ -1857,6 +1936,7 @@ mod tests {
             name_len: 1,
             kind: CoddlAttrKind::Integer as u32,
             offset: 0,
+            sub: std::ptr::null(),
         }];
         let dst_desc = CoddlHeadingDesc {
             attr_count: 1,
@@ -1893,12 +1973,14 @@ mod tests {
                 name_len: 1,
                 kind: CoddlAttrKind::Integer as u32,
                 offset: 0,
+                sub: std::ptr::null(),
             },
             CoddlAttrDesc {
                 name: b"b".as_ptr(),
                 name_len: 1,
                 kind: CoddlAttrKind::Integer as u32,
                 offset: 8,
+                sub: std::ptr::null(),
             },
         ];
         let src_desc = CoddlHeadingDesc {
@@ -1913,12 +1995,14 @@ mod tests {
                 name_len: 1,
                 kind: CoddlAttrKind::Integer as u32,
                 offset: 0,
+                sub: std::ptr::null(),
             },
             CoddlAttrDesc {
                 name: b"z".as_ptr(),
                 name_len: 1,
                 kind: CoddlAttrKind::Integer as u32,
                 offset: 8,
+                sub: std::ptr::null(),
             },
         ];
         let dst_desc = CoddlHeadingDesc {
@@ -1970,15 +2054,15 @@ mod tests {
         // {a, b} extend {c: a + b} → {a, b, c}. The helper fills each widened
         // record; the runtime allocates, loops, and re-seals.
         let src_attrs = [
-            CoddlAttrDesc { name: b"a".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 0 },
-            CoddlAttrDesc { name: b"b".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 8 },
+            CoddlAttrDesc { name: b"a".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 0, sub: std::ptr::null() },
+            CoddlAttrDesc { name: b"b".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 8, sub: std::ptr::null() },
         ];
         let src_desc = CoddlHeadingDesc { attr_count: 2, record_size: 16, attrs: src_attrs.as_ptr() };
         // result {a, b, c}: a@0, b@8, c@16.
         let res_attrs = [
-            CoddlAttrDesc { name: b"a".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 0 },
-            CoddlAttrDesc { name: b"b".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 8 },
-            CoddlAttrDesc { name: b"c".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 16 },
+            CoddlAttrDesc { name: b"a".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 0, sub: std::ptr::null() },
+            CoddlAttrDesc { name: b"b".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 8, sub: std::ptr::null() },
+            CoddlAttrDesc { name: b"c".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 16, sub: std::ptr::null() },
         ];
         let res_desc = CoddlHeadingDesc { attr_count: 3, record_size: 24, attrs: res_attrs.as_ptr() };
         unsafe {
@@ -2043,6 +2127,7 @@ mod tests {
             name_len: 1,
             kind: CoddlAttrKind::Integer as u32,
             offset: 0,
+            sub: std::ptr::null(),
         }];
         let desc = CoddlHeadingDesc {
             attr_count: 1,
@@ -2074,6 +2159,7 @@ mod tests {
             name_len: 1,
             kind: CoddlAttrKind::Integer as u32,
             offset: 0,
+            sub: std::ptr::null(),
         }];
         let desc = CoddlHeadingDesc {
             attr_count: 1,
@@ -2091,6 +2177,86 @@ mod tests {
             std::ptr::write(payload.add(8) as *mut i64, 2);
             coddl_write_relation(payload, &desc as *const CoddlHeadingDesc);
             coddl_rc_release(payload);
+        }
+    }
+
+    // ── inline nested-tuple cells ────────────────────────────────────
+
+    /// Heading `{id: Integer, pt: Tuple{x: Integer, y: Integer}}` descriptor.
+    /// Returns the (sub_attrs, sub_desc, top_attrs) so the caller keeps them
+    /// alive; build the top `CoddlHeadingDesc` from `top_attrs`.
+    fn nested_attrs() -> ([CoddlAttrDesc; 2], CoddlHeadingDesc, [CoddlAttrDesc; 2]) {
+        // NOTE: sub_desc.attrs points at sub_attrs; the caller must keep the
+        // returned tuple alive for as long as the descriptor is used.
+        let sub_attrs = [
+            CoddlAttrDesc { name: b"x".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 0, sub: std::ptr::null() },
+            CoddlAttrDesc { name: b"y".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 8, sub: std::ptr::null() },
+        ];
+        // sub_desc.attrs is filled in by the caller after the array settles.
+        let sub_desc = CoddlHeadingDesc { attr_count: 2, record_size: 16, attrs: std::ptr::null() };
+        let top_attrs = [
+            CoddlAttrDesc { name: b"id".as_ptr(), name_len: 2, kind: CoddlAttrKind::Integer as u32, offset: 0, sub: std::ptr::null() },
+            CoddlAttrDesc { name: b"pt".as_ptr(), name_len: 2, kind: CoddlAttrKind::Tuple as u32, offset: 8, sub: std::ptr::null() },
+        ];
+        (sub_attrs, sub_desc, top_attrs)
+    }
+
+    #[test]
+    fn print_cell_renders_nested_tuple() {
+        let (sub_attrs, mut sub_desc, _top) = nested_attrs();
+        sub_desc.attrs = sub_attrs.as_ptr();
+        let pt_attr = CoddlAttrDesc {
+            name: b"pt".as_ptr(),
+            name_len: 2,
+            kind: CoddlAttrKind::Tuple as u32,
+            offset: 8,
+            sub: &sub_desc as *const CoddlHeadingDesc,
+        };
+        // record: id@0 = 7, pt.x@8 = 1, pt.y@16 = 2 (24 bytes).
+        let mut record = vec![0u8; 24];
+        record[0..8].copy_from_slice(&7i64.to_ne_bytes());
+        record[8..16].copy_from_slice(&1i64.to_ne_bytes());
+        record[16..24].copy_from_slice(&2i64.to_ne_bytes());
+        let mut buf: Vec<u8> = Vec::new();
+        unsafe { print_cell(&mut buf, &pt_attr, &record, 0) };
+        assert_eq!(buf, b"{x: 1, y: 2}");
+    }
+
+    #[test]
+    fn seal_compares_full_tuple_cell_not_just_first_word() {
+        // {id:1, pt:{x:1,y:2}} and {id:1, pt:{x:1,y:9}} differ ONLY in pt.y (the
+        // tuple's 2nd word). A naive 8-byte cell compare would treat the pt cells
+        // as equal and wrongly dedup; the recursive cmp must keep both records.
+        let (sub_attrs, mut sub_desc, mut top_attrs) = nested_attrs();
+        sub_desc.attrs = sub_attrs.as_ptr();
+        top_attrs[1].sub = &sub_desc as *const CoddlHeadingDesc;
+        let desc = CoddlHeadingDesc { attr_count: 2, record_size: 24, attrs: top_attrs.as_ptr() };
+        unsafe {
+            let payload = coddl_rc_alloc(2 * 24, 2, CoddlKind::Relation as u32, &desc);
+            let write = |rec: usize, id: i64, x: i64, y: i64| {
+                std::ptr::write(payload.add(rec * 24) as *mut i64, id);
+                std::ptr::write(payload.add(rec * 24 + 8) as *mut i64, x);
+                std::ptr::write(payload.add(rec * 24 + 16) as *mut i64, y);
+            };
+            write(0, 1, 1, 2);
+            write(1, 1, 1, 9);
+            coddl_relation_seal(payload, &desc);
+            let header = payload.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*header).length, 2, "records differing inside the tuple must not dedup");
+            coddl_rc_release(payload);
+
+            // Identical tuple cells → dedup to one.
+            let payload2 = coddl_rc_alloc(2 * 24, 2, CoddlKind::Relation as u32, &desc);
+            std::ptr::write(payload2.add(0) as *mut i64, 1);
+            std::ptr::write(payload2.add(8) as *mut i64, 1);
+            std::ptr::write(payload2.add(16) as *mut i64, 2);
+            std::ptr::write(payload2.add(24) as *mut i64, 1);
+            std::ptr::write(payload2.add(32) as *mut i64, 1);
+            std::ptr::write(payload2.add(40) as *mut i64, 2);
+            coddl_relation_seal(payload2, &desc);
+            let header2 = payload2.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*header2).length, 1, "identical tuple records must dedup");
+            coddl_rc_release(payload2);
         }
     }
 }

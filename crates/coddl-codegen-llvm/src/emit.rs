@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 
 use coddl_procir::{
     record_layout, BasicBlock, Codegen, Const, Function, HeadingId, Inst, Module, ProcType,
-    ScalarOp, Terminator, Type, ValueId,
+    RecordLayout, ScalarOp, Terminator, Type, ValueId,
 };
 
 use crate::error::LlvmEmitError;
@@ -413,24 +413,38 @@ impl Emitter {
         Ok(())
     }
 
-    /// Emit the three globals that describe one heading: a per-attr
-    /// name string each (`@.attrname.<id>.<i>`), the attribute array
-    /// (`@.attrs.<id>`), and the descriptor struct (`@.heading.<id>`).
-    /// Layout matches `coddl_runtime::CoddlHeadingDesc` /
-    /// `CoddlAttrDesc`.
+    /// Emit the globals that describe one heading, keyed by `HeadingId`:
+    /// `@.attrname.<id>.<i>`, `@.attrs.<id>`, `@.heading.<id>`. Instructions
+    /// reference `@.heading.<id>`. Recurses into nested-tuple sub-layouts.
     fn emit_heading_descriptor(
         &mut self,
         id: HeadingId,
         heading: &coddl_procir::Heading,
     ) -> Result<(), LlvmEmitError> {
         let layout = record_layout(heading);
+        self.emit_layout_descriptor(&id.0.to_string(), &layout);
+        Ok(())
+    }
+
+    /// Emit the globals describing one record layout under symbol `base`
+    /// (`@.attrname.<base>.<i>`, `@.attrs.<base>`, `@.heading.<base>`), recursing
+    /// into a `Tuple` attr's sub-layout under `<base>.<i>`. Layout matches
+    /// `coddl_runtime::{CoddlHeadingDesc, CoddlAttrDesc}`; the attr struct's
+    /// trailing `ptr` is `sub` — the nested descriptor for a Tuple cell, else null.
+    fn emit_layout_descriptor(&mut self, base: &str, layout: &RecordLayout) {
+        // Nested sub-descriptors first (the parent attrs array references them).
+        for (i, attr) in layout.attrs.iter().enumerate() {
+            if let Some(sub) = &attr.sub {
+                self.emit_layout_descriptor(&format!("{base}.{i}"), sub);
+            }
+        }
         // Per-attribute name strings.
         for (i, attr) in layout.attrs.iter().enumerate() {
             let name_bytes = attr.name.as_bytes();
             writeln!(
                 self.globals,
                 "@.attrname.{}.{} = private unnamed_addr constant [{} x i8] c\"{}\"",
-                id.0,
+                base,
                 i,
                 name_bytes.len(),
                 escape_ir_bytes(name_bytes),
@@ -438,13 +452,12 @@ impl Emitter {
             .unwrap();
         }
         // Attribute array. Each element matches `CoddlAttrDesc`:
-        // { ptr, i32, i32, i32 } — name, name_len, kind, offset.
-        // Natural padding on the host adds 4 bytes after the last
-        // i32; LLVM struct layout matches.
+        // { ptr name, i32 name_len, i32 kind, i32 offset, ptr sub }. Natural
+        // padding on the host puts `sub` at offset 24 (64-bit); LLVM matches.
         write!(
             self.globals,
-            "@.attrs.{} = private unnamed_addr constant [{} x {{ ptr, i32, i32, i32 }}] [",
-            id.0,
+            "@.attrs.{} = private unnamed_addr constant [{} x {{ ptr, i32, i32, i32, ptr }}] [",
+            base,
             layout.attrs.len()
         )
         .unwrap();
@@ -453,10 +466,16 @@ impl Emitter {
                 self.globals.push_str(", ");
             }
             let name_len = attr.name.as_bytes().len();
+            // `sub` points at the nested descriptor for a Tuple cell, else null.
+            let sub = if attr.sub.is_some() {
+                format!("ptr @.heading.{base}.{i}")
+            } else {
+                "ptr null".to_string()
+            };
             write!(
                 self.globals,
-                "{{ ptr, i32, i32, i32 }} {{ ptr @.attrname.{}.{}, i32 {}, i32 {}, i32 {} }}",
-                id.0, i, name_len, attr.kind, attr.offset,
+                "{{ ptr, i32, i32, i32, ptr }} {{ ptr @.attrname.{}.{}, i32 {}, i32 {}, i32 {}, {} }}",
+                base, i, name_len, attr.kind, attr.offset, sub,
             )
             .unwrap();
         }
@@ -466,13 +485,12 @@ impl Emitter {
         writeln!(
             self.globals,
             "@.heading.{} = private unnamed_addr constant {{ i32, i32, ptr }} {{ i32 {}, i32 {}, ptr @.attrs.{} }}",
-            id.0,
+            base,
             layout.attrs.len(),
             layout.record_size,
-            id.0,
+            base,
         )
         .unwrap();
-        Ok(())
     }
 
     fn finish(self) -> String {
@@ -767,7 +785,8 @@ impl Emitter {
                         LlvmEmitError::UnsupportedInst(format!("undefined value {value:?} in AttrStore"))
                     })?
                     .clone();
-                self.emit_attr_store(&base, *offset as usize, &repr)
+                // The extend/where store path is scalar/Text only (no sub-layout).
+                self.emit_attr_store(&base, *offset as usize, &repr, None)
             }
             Inst::Where {
                 dst,
@@ -1788,7 +1807,7 @@ impl Emitter {
                         ))
                     })?;
                 let byte_offset = record_idx * record_size + attr.offset as usize;
-                self.emit_attr_store(&dst_name, byte_offset, field_repr)?;
+                self.emit_attr_store(&dst_name, byte_offset, field_repr, attr.sub.as_ref())?;
             }
         }
         // 3. Seal.
@@ -1817,6 +1836,7 @@ impl Emitter {
         base: &str,
         byte_offset: usize,
         repr: &ValueRepr,
+        sub: Option<&RecordLayout>,
     ) -> Result<(), LlvmEmitError> {
         match repr {
             ValueRepr::Scalar { ty, op } if ty == "i64" => {
@@ -1834,9 +1854,35 @@ impl Emitter {
                 writeln!(self.body, "    store i64 {len_op}, ptr {slot_len}").unwrap();
                 Ok(())
             }
-            ValueRepr::Tuple { .. } => Err(LlvmEmitError::UnsupportedInst(
-                "nested Tuple cells not yet supported in relation records".into(),
-            )),
+            // Inline nested-tuple cell: store each component into the sub-region
+            // at `byte_offset + sub_attr.offset`, recursing (the sub-layout gives
+            // offsets; the `ValueRepr::Tuple` gives values, both name-canonical).
+            ValueRepr::Tuple { fields } => {
+                let sub = sub.ok_or_else(|| {
+                    LlvmEmitError::UnsupportedInst(
+                        "tuple cell store without a sub-layout".into(),
+                    )
+                })?;
+                for sub_attr in &sub.attrs {
+                    let field = fields
+                        .iter()
+                        .find(|(n, _)| n == &sub_attr.name)
+                        .map(|(_, r)| r.clone())
+                        .ok_or_else(|| {
+                            LlvmEmitError::UnsupportedInst(format!(
+                                "tuple value missing field `{}` for cell layout",
+                                sub_attr.name
+                            ))
+                        })?;
+                    self.emit_attr_store(
+                        base,
+                        byte_offset + sub_attr.offset as usize,
+                        &field,
+                        sub_attr.sub.as_ref(),
+                    )?;
+                }
+                Ok(())
+            }
         }
     }
 

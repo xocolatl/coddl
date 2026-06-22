@@ -726,30 +726,58 @@ fn declare_perm_data(obj: &mut ObjectModule, perm: &[u32]) -> Result<DataId, Cra
     Ok(id)
 }
 
-/// Emit the per-heading descriptor data: per-attribute name bytes,
-/// the attribute array, and the descriptor struct itself. Layout
-/// matches `coddl_runtime::CoddlHeadingDesc` / `CoddlAttrDesc`.
-///
-/// CoddlAttrDesc bytes (24 on 64-bit, 16 on 32-bit):
-///   ptr name            (ptr_bytes)
-///   u32 name_len        (4)
-///   u32 kind            (4)
-///   u32 offset          (4)
-///   u32 _pad            (4 on 64-bit for natural alignment)
-/// CoddlHeadingDesc bytes (16 on 64-bit, 12 on 32-bit):
-///   u32 attr_count      (4)
-///   u32 record_size     (4)
-///   ptr attrs           (ptr_bytes)
+/// Emit the per-heading descriptor data keyed by `HeadingId`, recursing into
+/// nested-tuple sub-layouts. Returns the top descriptor's `DataId`.
 fn emit_heading_descriptor(
     obj: &mut ObjectModule,
     id: HeadingId,
     layout: &RecordLayout,
     ptr_bytes: usize,
 ) -> Result<DataId, CraneliftEmitError> {
+    emit_layout_descriptor(obj, &id.0.to_string(), layout, ptr_bytes)
+}
+
+/// Emit the descriptor data for one record layout under symbol `base`:
+/// per-attribute name bytes (`.attrname.<base>.<i>`), the attribute array
+/// (`.attrs.<base>`), and the descriptor struct (`.heading.<base>`). A `Tuple`
+/// attr recurses under `<base>.<i>`, and its descriptor `DataId` is relocated
+/// into the parent attr's `sub` field. Layout matches
+/// `coddl_runtime::CoddlHeadingDesc` / `CoddlAttrDesc`.
+///
+/// CoddlAttrDesc bytes (32 on 64-bit, 20 on 32-bit):
+///   ptr name            (ptr_bytes)
+///   u32 name_len        (4)
+///   u32 kind            (4)
+///   u32 offset          (4)
+///   u32 _pad            (4 on 64-bit for natural alignment)
+///   ptr sub             (ptr_bytes; null for scalar cells)
+/// CoddlHeadingDesc bytes (16 on 64-bit, 12 on 32-bit):
+///   u32 attr_count      (4)
+///   u32 record_size     (4)
+///   ptr attrs           (ptr_bytes)
+fn emit_layout_descriptor(
+    obj: &mut ObjectModule,
+    base: &str,
+    layout: &RecordLayout,
+    ptr_bytes: usize,
+) -> Result<DataId, CraneliftEmitError> {
+    // Nested sub-descriptors first (Tuple attrs); the parent attr's `sub` field
+    // relocates to these. `None` for scalar cells.
+    let mut sub_ids: Vec<Option<DataId>> = Vec::with_capacity(layout.attrs.len());
+    for (i, attr) in layout.attrs.iter().enumerate() {
+        match &attr.sub {
+            Some(sub) => {
+                let sid = emit_layout_descriptor(obj, &format!("{base}.{i}"), sub, ptr_bytes)?;
+                sub_ids.push(Some(sid));
+            }
+            None => sub_ids.push(None),
+        }
+    }
+
     // Per-attribute name byte arrays.
     let mut name_ids: Vec<DataId> = Vec::with_capacity(layout.attrs.len());
     for (i, attr) in layout.attrs.iter().enumerate() {
-        let sym = format!(".attrname.{}.{}", id.0, i);
+        let sym = format!(".attrname.{}.{}", base, i);
         let nid = obj
             .declare_data(&sym, Linkage::Local, false, false)
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
@@ -760,10 +788,11 @@ fn emit_heading_descriptor(
         name_ids.push(nid);
     }
 
-    // Attribute array. We compute element stride to match the host's
-    // natural alignment for the struct (ptr_bytes-aligned).
-    let attr_stride = if ptr_bytes == 8 { 24 } else { 16 };
-    let attrs_sym = format!(".attrs.{}", id.0);
+    // Attribute array. The `sub` pointer sits after the (padded) u32 block —
+    // i.e. at the old stride offset; the new stride adds one pointer.
+    let sub_off = if ptr_bytes == 8 { 24 } else { 16 };
+    let attr_stride = sub_off + ptr_bytes;
+    let attrs_sym = format!(".attrs.{}", base);
     let attrs_id = obj
         .declare_data(&attrs_sym, Linkage::Local, false, false)
         .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
@@ -771,8 +800,6 @@ fn emit_heading_descriptor(
     let mut attrs_dd = DataDescription::new();
     attrs_dd.set_align(ptr_bytes as u64);
     attrs_dd.define(vec![0u8; attrs_bytes_len].into_boxed_slice());
-    // Relocate the name pointer field of each entry to its
-    // corresponding name DataId.
     for (i, _attr) in layout.attrs.iter().enumerate() {
         let name_gv = obj.declare_data_in_data(name_ids[i], &mut attrs_dd);
         let offset_in_attrs = (i * attr_stride) as u32;
@@ -785,13 +812,18 @@ fn emit_heading_descriptor(
         attrs_write_u32(&mut attrs_dd, offset_in_attrs as usize + ptr_bytes, name_bytes_len);
         attrs_write_u32(&mut attrs_dd, offset_in_attrs as usize + ptr_bytes + 4, kind);
         attrs_write_u32(&mut attrs_dd, offset_in_attrs as usize + ptr_bytes + 8, off);
+        // `sub` pointer for a Tuple cell; scalars leave it null (zeroed).
+        if let Some(sid) = sub_ids[i] {
+            let sub_gv = obj.declare_data_in_data(sid, &mut attrs_dd);
+            attrs_dd.write_data_addr(offset_in_attrs + sub_off as u32, sub_gv, 0);
+        }
     }
     obj.define_data(attrs_id, &attrs_dd)
         .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
 
     // The descriptor struct itself.
     let desc_size = 8 + ptr_bytes; // u32 attr_count, u32 record_size, ptr attrs
-    let desc_sym = format!(".heading.{}", id.0);
+    let desc_sym = format!(".heading.{}", base);
     let desc_id = obj
         .declare_data(&desc_sym, Linkage::Local, false, false)
         .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
@@ -1286,7 +1318,7 @@ fn emit_inst(
                         })?;
                     let byte_offset =
                         record_idx as i32 * layout.record_size as i32 + attr.offset as i32;
-                    store_attr(builder, payload, byte_offset, &field_repr)?;
+                    store_attr(builder, payload, byte_offset, &field_repr, attr.sub.as_ref())?;
                 }
             }
 
@@ -1502,7 +1534,8 @@ fn emit_inst(
             let repr = values.get(value).cloned().ok_or_else(|| {
                 CraneliftEmitError::UnsupportedInst(format!("undefined value {value:?} in AttrStore"))
             })?;
-            store_attr(builder, payload, *offset as i32, &repr)
+            // The extend/where store path is scalar/Text only (no sub-layout).
+            store_attr(builder, payload, *offset as i32, &repr, None)
         }
         Inst::Extend {
             dst,
@@ -2080,6 +2113,7 @@ fn store_attr(
     payload: CrValue,
     byte_offset: i32,
     repr: &ValueRepr,
+    sub: Option<&RecordLayout>,
 ) -> Result<(), CraneliftEmitError> {
     let flags = MemFlags::trusted();
     match repr {
@@ -2094,9 +2128,34 @@ fn store_attr(
             builder.ins().store(flags, *len, payload, byte_offset + 8);
             Ok(())
         }
-        ValueRepr::Tuple { .. } => Err(CraneliftEmitError::UnsupportedInst(
-            "nested Tuple cells not yet supported in relation records".into(),
-        )),
+        // Inline nested-tuple cell: store each component into the sub-region at
+        // `byte_offset + sub_attr.offset`, recursing (sub-layout gives offsets,
+        // the `ValueRepr::Tuple` gives values, both name-canonical).
+        ValueRepr::Tuple { fields } => {
+            let sub = sub.ok_or_else(|| {
+                CraneliftEmitError::UnsupportedInst("tuple cell store without a sub-layout".into())
+            })?;
+            for sub_attr in &sub.attrs {
+                let field = fields
+                    .iter()
+                    .find(|(n, _)| n == &sub_attr.name)
+                    .map(|(_, r)| r.clone())
+                    .ok_or_else(|| {
+                        CraneliftEmitError::UnsupportedInst(format!(
+                            "tuple value missing field `{}` for cell layout",
+                            sub_attr.name
+                        ))
+                    })?;
+                store_attr(
+                    builder,
+                    payload,
+                    byte_offset + sub_attr.offset as i32,
+                    &field,
+                    sub_attr.sub.as_ref(),
+                )?;
+            }
+            Ok(())
+        }
     }
 }
 

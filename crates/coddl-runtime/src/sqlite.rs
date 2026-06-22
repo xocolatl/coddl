@@ -790,12 +790,14 @@ mod tests {
                 name_len: 2,
                 kind: CoddlAttrKind::Integer as u32,
                 offset: 0,
+                sub: std::ptr::null(),
             },
             CoddlAttrDesc {
                 name: b"message".as_ptr(),
                 name_len: 7,
                 kind: CoddlAttrKind::Text as u32,
                 offset: 8,
+                sub: std::ptr::null(),
             },
         ]
     }
@@ -906,12 +908,14 @@ mod tests {
                 name_len: id_name.len() as u32,
                 kind: CoddlAttrKind::Integer as u32,
                 offset: 0,
+                sub: std::ptr::null(),
             },
             crate::relation::CoddlAttrDesc {
                 name: message_name.as_ptr(),
                 name_len: message_name.len() as u32,
                 kind: CoddlAttrKind::Text as u32,
                 offset: 8, // Integer = 8 bytes
+                sub: std::ptr::null(),
             },
         ];
         let record_size = 8 /*id*/ + 16 /*text*/;

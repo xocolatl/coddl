@@ -172,12 +172,15 @@ drop walker iterates each record, reads the descriptor for the
 per-attribute kind, and recurses into any nested heap cells before
 freeing the block.
 
-Phase 19 has no nested heap cells in practice — relation records
-hold scalars (Integer / Boolean) or pointers to immortal Text bytes
-(string literals are placed in read-only data segments by codegen),
-all of which are no-op-drop. The hook is in place so that future
-phases (relation-of-relations, Tuple-of-Text-owners) slot in
-without re-plumbing.
+There are no nested *heap* cells in practice yet — relation records
+hold scalars (Integer / Boolean), pointers to immortal Text bytes
+(string literals are placed in read-only data segments by codegen), or
+inline `Tuple` cells whose leaves are those same no-op-drop scalars/Text.
+Tuple cells are inline (no heap pointer), so the drop walker stays a
+no-op: `Text` inside a tuple leaks exactly as top-level `Text` does
+today, and the recursion to release tuple-of-`Text`-owners lands when
+scalar-`Text` refcounting does. The hook is in place so future phases
+(relation-of-relations, owned-`Text` tuples) slot in without re-plumbing.
 
 ## Heading descriptors
 
@@ -191,6 +194,7 @@ struct CoddlAttrDesc {
     uint32_t       kind;       // CoddlAttrKind discriminant
     uint32_t       offset;     // byte offset within a record
     // natural padding to multiple of pointer alignment
+    const CoddlHeadingDesc* sub; // Tuple cell: nested descriptor; else NULL
 };
 
 struct CoddlHeadingDesc {
@@ -207,10 +211,17 @@ struct CoddlHeadingDesc {
 | 0     | `Integer` | 8                  | `i64` host-endian                   |
 | 1     | `Boolean` | 8                  | `i64`; 0 = false, 1 = true          |
 | 2     | `Text`    | 16                 | `(ptr: *const u8, len: usize)`      |
+| 10    | `Tuple`   | Σ components       | inline sub-region; `sub` → nested descriptor (0-based offsets) |
 
-Sub-word packing (Boolean → 1 bit, Byte → 1 byte) is deferred to a
-later layout optimisation phase. Tuple-as-cell and Relation-as-cell
-encodings are also reserved (kinds 10/11) but not yet emitted.
+A `Tuple` cell is an **inline nested cell**: its components occupy a
+contiguous sub-region whose width is the sum of their widths, and the
+attribute's `sub` pointer carries the nested `CoddlHeadingDesc` (with
+0-based offsets within the sub-region). The printer and the
+content-aware record comparator both recurse through `sub`, adding the
+parent cell's base offset — so two tuple cells with equal `Text`
+content but different pointers still dedup (RM Pro 3). Sub-word packing
+(Boolean → 1 bit, Byte → 1 byte) is deferred. Relation-as-cell (kind 11)
+is reserved but not yet emitted.
 
 The `coddl-procir::layout` module owns the layout computation that
 backends consume. Both backends and the runtime must agree on:

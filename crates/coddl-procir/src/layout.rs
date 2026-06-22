@@ -12,12 +12,15 @@
 //! | `Integer`      | 8             | i64 host-endian                |
 //! | `Boolean`      | 8             | i64 (0 / 1); sub-word later    |
 //! | `Text`         | 16            | (ptr: usize, len: usize)       |
+//! | `Tuple H`      | Σ components  | inline sub-region (recursive)  |
 //!
-//! Other Phase-15 surface types (`Rational`, `Approximate`,
-//! `Character`, `Binary`, `Byte`, `Tuple`, `Relation`) are reserved.
-//! Hitting one in `record_layout` today is a "future phase will
-//! widen this" `unreachable!` — the typechecker keeps them out of
-//! relation cells in Phase 19's tests.
+//! A `Tuple`-valued attribute is an inline nested cell: a contiguous
+//! sub-region whose width is the sum of its components' widths, with
+//! the sub-layout carried on [`AttrLayout::sub`] (0-based offsets).
+//! The remaining surface types (`Rational`, `Approximate`,
+//! `Character`, `Binary`, `Byte`, nested `Relation`) are reserved —
+//! hitting one in `record_layout` is a "future phase will widen this"
+//! `unreachable!`; the typechecker keeps them out of relation cells.
 //!
 //! See `docs/runtime.md` for the kind-tag → cell-encoding contract
 //! the runtime relies on (and which this module must match).
@@ -31,7 +34,10 @@ pub mod kind_tag {
     pub const INTEGER: u32 = 0;
     pub const BOOLEAN: u32 = 1;
     pub const TEXT: u32 = 2;
-    // Reserved (not yet emitted): TUPLE = 10, RELATION = 11.
+    /// Inline nested-tuple cell: a contiguous sub-region; the descriptor
+    /// attribute carries a pointer to the tuple's own heading descriptor.
+    pub const TUPLE: u32 = 10;
+    // Reserved (not yet emitted): RELATION = 11.
 }
 
 /// One attribute's slot inside a record.
@@ -41,6 +47,10 @@ pub struct AttrLayout {
     pub kind: u32,
     pub offset: u32,
     pub width: u32,
+    /// For a `Tuple`-valued attribute (`kind == kind_tag::TUPLE`): the layout
+    /// of its inline sub-region, with offsets **0-based within the sub-region**
+    /// (add this attr's `offset` to reach the record). `None` for scalar cells.
+    pub sub: Option<RecordLayout>,
 }
 
 /// Full record layout for a heading: per-attribute slot information
@@ -59,6 +69,16 @@ pub fn cell_width(ty: &Type) -> Option<u32> {
         Type::Integer => Some(8),
         Type::Boolean => Some(8),
         Type::Text => Some(16),
+        // Inline nested-tuple cell: the sum of its components' widths,
+        // recursively (`Tuple {}` → 0). `None` propagates if any component
+        // is an as-yet-unsupported cell type.
+        Type::Tuple(h) => {
+            let mut total = 0u32;
+            for (_, fty) in h.attrs() {
+                total += cell_width(fty)?;
+            }
+            Some(total)
+        }
         _ => None,
     }
 }
@@ -70,31 +90,44 @@ pub fn cell_kind(ty: &Type) -> Option<u32> {
         Type::Integer => Some(kind_tag::INTEGER),
         Type::Boolean => Some(kind_tag::BOOLEAN),
         Type::Text => Some(kind_tag::TEXT),
+        Type::Tuple(_) => Some(kind_tag::TUPLE),
         _ => None,
     }
 }
 
-/// Compute the layout for `heading`. Panics if any attribute uses a
-/// type Phase 19's runtime layout doesn't cover (Rational, Approximate,
-/// Character, Binary, Byte, nested Tuple, nested Relation). The
-/// typechecker doesn't reject those — they just don't reach codegen
-/// inside a relation cell in Phase 19's e2e program. When Phase 20+
-/// widens the cell layout, add cases here.
+/// Compute the layout for `heading`. A `Tuple`-valued attribute lays out as a
+/// contiguous inline sub-region (recursively), carried on `AttrLayout.sub` with
+/// 0-based offsets. Panics if any attribute uses a type the runtime layout
+/// doesn't cover yet (Rational, Approximate, Character, Binary, Byte, nested
+/// Relation). The typechecker doesn't reject those — they just don't reach
+/// codegen inside a relation cell yet. When the cell layout widens, add cases
+/// to `cell_width`/`cell_kind`.
 pub fn record_layout(heading: &Heading) -> RecordLayout {
     let mut offset: u32 = 0;
     let mut attrs: Vec<AttrLayout> = Vec::with_capacity(heading.len());
     for (name, ty) in heading.attrs() {
-        let width = cell_width(ty).unwrap_or_else(|| {
-            unreachable!("cell type {ty} not yet supported in relation layout")
-        });
         let kind = cell_kind(ty).unwrap_or_else(|| {
             unreachable!("cell kind for {ty} not yet supported")
         });
+        // A `Tuple` attribute is an inline nested cell: lay its components out
+        // in a self-contained sub-region (0-based) and keep that sub-layout so
+        // codegen can emit a nested descriptor and the runtime can recurse.
+        let sub = match ty {
+            Type::Tuple(h) => Some(record_layout(h)),
+            _ => None,
+        };
+        let width = match &sub {
+            Some(s) => s.record_size,
+            None => cell_width(ty).unwrap_or_else(|| {
+                unreachable!("cell type {ty} not yet supported in relation layout")
+            }),
+        };
         attrs.push(AttrLayout {
             name: name.clone(),
             kind,
             offset,
             width,
+            sub,
         });
         offset += width;
     }
@@ -142,5 +175,41 @@ mod tests {
         assert_eq!(l.attrs[0].width, 8);
         assert_eq!(l.attrs[1].offset, 8);
         assert_eq!(l.attrs[1].width, 16);
+    }
+
+    #[test]
+    fn tuple_attr_lays_out_as_inline_sub_region() {
+        // {id: Integer, pt: Tuple {x: Integer, y: Text}} — `id` (8) then `pt`
+        // (a 24-byte sub-region: x at sub-offset 0, y at sub-offset 8). The
+        // sub-layout's offsets are 0-based within the region.
+        let pt = Type::Tuple(heading(&[("x", Type::Integer), ("y", Type::Text)]));
+        let h = heading(&[("id", Type::Integer), ("pt", pt)]);
+        let l = record_layout(&h);
+        assert_eq!(l.record_size, 8 + 24);
+        let names: Vec<&str> = l.attrs.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "pt"]);
+        assert_eq!(l.attrs[0].offset, 0);
+        let pt_attr = &l.attrs[1];
+        assert_eq!(pt_attr.kind, kind_tag::TUPLE);
+        assert_eq!(pt_attr.offset, 8);
+        assert_eq!(pt_attr.width, 24);
+        let sub = pt_attr.sub.as_ref().expect("tuple attr has a sub-layout");
+        assert_eq!(sub.record_size, 24);
+        assert_eq!(sub.attrs[0].name, "x");
+        assert_eq!(sub.attrs[0].offset, 0);
+        assert_eq!(sub.attrs[0].kind, kind_tag::INTEGER);
+        assert_eq!(sub.attrs[1].name, "y");
+        assert_eq!(sub.attrs[1].offset, 8);
+        assert_eq!(sub.attrs[1].kind, kind_tag::TEXT);
+    }
+
+    #[test]
+    fn empty_tuple_attr_is_zero_width() {
+        let h = heading(&[("u", Type::Tuple(Heading::empty()))]);
+        let l = record_layout(&h);
+        assert_eq!(l.record_size, 0);
+        assert_eq!(l.attrs[0].kind, kind_tag::TUPLE);
+        assert_eq!(l.attrs[0].width, 0);
+        assert_eq!(l.attrs[0].sub.as_ref().unwrap().record_size, 0);
     }
 }

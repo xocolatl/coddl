@@ -2543,3 +2543,65 @@ fn tclose_pushdown_audit_llvm() {
 fn tclose_pushdown_audit_cranelift() {
     assert_tclose_pushdown_audit("cranelift");
 }
+
+// ── inline nested-tuple cells (relation literal with a tuple-valued attr) ──
+
+/// Print a relation literal whose tuples carry tuple-valued attributes — an
+/// integer pair `pt: {x, y}` and a Text-bearing `who: {name, age}` — including a
+/// duplicate record. Exercises the inline nested-tuple cell layout, the nested
+/// descriptor, recursive store, recursive print, and content-aware dedup that
+/// recurses into the Text-in-tuple cell.
+const NESTED_TUPLE_SRC: &str = "\
+program nested_tuple;
+oper main {} [
+    let r = Relation {
+        { id: 1, pt: { x: 10, y: 20 }, who: { name: \"ada\", age: 30 } },
+        { id: 2, pt: { x: 30, y: 40 }, who: { name: \"bo\", age: 25 } },
+        { id: 2, pt: { x: 30, y: 40 }, who: { name: \"bo\", age: 25 } },
+    };
+    write_relation { rel: r };
+];
+";
+
+fn run_nested_tuple_lit(backend: &str) -> Vec<u8> {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("nested-tuple.cd");
+    std::fs::write(&src, NESTED_TUPLE_SRC).expect("write src");
+    let out = coddl()
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&src)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "nested-tuple literal on {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+#[test]
+fn nested_tuple_literal_prints_and_dedups() {
+    // Nested attrs render name-sorted (`age` before `name`); the duplicate id=2
+    // record collapses (dedup recurses into the Text-in-tuple cell, content-aware).
+    let expected = sorted_tuples(&[
+        r#"{id: 1, pt: {x: 10, y: 20}, who: {age: 30, name: "ada"}}"#,
+        r#"{id: 2, pt: {x: 30, y: 40}, who: {age: 25, name: "bo"}}"#,
+    ]);
+    for backend in ["llvm", "cranelift"] {
+        assert_eq!(
+            tuple_lines(&run_nested_tuple_lit(backend)),
+            expected,
+            "nested-tuple output on {backend}"
+        );
+    }
+}
+
+#[test]
+fn nested_tuple_literal_byte_identical_across_backends() {
+    assert_eq!(
+        run_nested_tuple_lit("llvm"),
+        run_nested_tuple_lit("cranelift")
+    );
+}
