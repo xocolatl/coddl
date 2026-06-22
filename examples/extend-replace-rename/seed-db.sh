@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# examples/extend-replace/seed-db.sh
+# examples/extend-replace-rename/seed-db.sh
 #
 # Recreates sales.sqlite with the demo data shared with the in-process
 # extend/replace example. The .sqlite file is gitignored; this script is the

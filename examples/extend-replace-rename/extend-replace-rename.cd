@@ -1,19 +1,22 @@
-// extend-replace.cd
+// extend-replace-rename.cd
 //
-// In-process twin of extend-replace-db.cd: the same `extend` and `replace`
-// operations, but over a `private relvar` populated in-process (no database),
-// so each query runs through the in-process engine instead of pushing to SQL.
-// Side by side, the two files show one surface language driving both engines.
+// In-process twin of extend-replace-rename-db.cd: the same `extend`, `replace`, and
+// `rename` operations, but over a `private relvar` populated in-process (no
+// database), so each query runs through the in-process engine instead of
+// pushing to SQL. Side by side, the two files show one surface language driving
+// both engines.
 //
-//   R extend  { c: <expr> }   adds `c`, KEEPING every operand attribute
-//   R replace { c: <expr> }   adds `c`, CONSUMING the attributes <expr> reads
+// The three attribute operators partition cleanly by what the value is:
+//   R extend  { c: <expr> }    adds `c`, KEEPING every operand attribute
+//   R replace { c: <expr> }    adds `c`, CONSUMING the attributes <expr> reads
+//   R rename  { new: old }     relabels `old` to `new` (value is a bare ref)
 //
 // A `private` relvar is local program state (RM Pre 14), so it is populated by
 // relational assignment (`R := <relation literal>`) — no transaction needed.
 // Money is integer cents. A relation is a set, so the printed tuple order is
 // unspecified.
 
-program extend_replace;
+program extend_replace_rename;
 
 private relvar Sales {
     id: Integer,
@@ -52,8 +55,8 @@ oper main {} [
     let handled = Sales replace { handle: customer || '-' || item };
     write_relation { rel: handled };
 
-    // replace RENAME: id -> ref. The bare-attribute-reference form (the simplest
-    // end of the spectrum) removes `id` and adds `ref`.
-    let reffed = Sales replace { ref: id };
+    // rename: id -> ref. The strict relabel-only operator — the value must be a
+    // bare attribute reference; a computed value here would be a `replace`.
+    let reffed = Sales rename { ref: id };
     write_relation { rel: reffed };
 ];

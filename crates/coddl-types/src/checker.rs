@@ -13,8 +13,8 @@ use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, Expr, ExprStmt, ExtendExpr,
     FieldAccess, Heading as AstHeading, Item, KeyClause, LetStmt, NamedArg, OperDecl,
-    PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, ReplaceExpr, Root,
-    Stmt, TcloseExpr, TransactionExpr, TupleLit, UnaryExpr, UnaryOp,
+    PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr,
+    ReplaceExpr, Root, Stmt, TcloseExpr, TransactionExpr, TupleLit, UnaryExpr, UnaryOp,
 };
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
@@ -868,6 +868,7 @@ impl TypeChecker {
             Expr::Replace(r) => self.check_replace_expr(r, scope),
             Expr::Extend(e) => self.check_extend_expr(e, scope),
             Expr::Tclose(t) => self.check_tclose_expr(t, scope),
+            Expr::Rename(r) => self.check_rename_expr(r, scope),
         }
     }
 
@@ -939,10 +940,11 @@ impl TypeChecker {
     }
 
     /// Walk `R replace { new: e, … }` — relational replace: add each `new`
-    /// attribute bound to `e` and remove the operand attributes `e` references.
-    /// The operand must be `Relation H` (T0023). Dispatch on each value:
-    /// - a bare `NameRef` `old` → the rename case: `old` must exist in `H`
-    ///   (T0029), no source removed twice (T0031). Type-agnostic.
+    /// attribute bound to the computed value `e` and remove the operand
+    /// attributes `e` references. The operand must be `Relation H` (T0023).
+    /// `replace` requires every value to compute; dispatch on each value:
+    /// - a bare `NameRef` → a pure relabel, not a computation: that's `rename`
+    ///   (T0047).
     /// - a constant (or a general expression that reads no operand attribute):
     ///   it removes nothing → use `extend` (T0042).
     /// - any other (general) expression `e`: typechecked in a scope with `H`'s
@@ -982,39 +984,27 @@ impl TypeChecker {
             scope.insert(name.clone(), ty.clone(), Span::default(), BindingOrigin::WhereAttr);
         }
         // Classify each pair into a removed-attribute set and an added
-        // `(name, type)`. Bare-ref pairs rename (remove `old`, add `new`);
-        // general pairs add `c` and remove the attributes they read.
+        // `(name, type)`. Every value computes: it adds `new` and removes the
+        // operand attributes it reads (a bare-ref relabel is rejected → rename).
         let mut removed: HashSet<String> = HashSet::new();
         let mut added: Vec<(String, Type)> = Vec::new();
-        let mut seen_src: HashSet<String> = HashSet::new();
         for (new_tok, value) in re.pairs() {
             let Some(new_tok) = new_tok else { continue }; // parse recovery
             let new = new_tok.text();
             let Some(value) = value else { continue };
             let value_span = self.node_span(value.syntax());
             match value {
-                // Bare attribute reference → rename `old` → `new` (type-agnostic).
-                Expr::NameRef(n) => {
-                    let Some(old_tok) = n.ident() else { continue };
-                    let old = old_tok.text();
-                    let Some(ty) = heading.lookup(old).cloned() else {
-                        self.error(
-                            self.token_span(&old_tok),
-                            "T0029",
-                            format!("unknown attribute `{old}` in replace of {heading}"),
-                        );
-                        continue;
-                    };
-                    if !seen_src.insert(old.to_string()) {
-                        self.error(
-                            self.token_span(&old_tok),
-                            "T0031",
-                            format!("attribute `{old}` is replaced more than once"),
-                        );
-                        continue;
-                    }
-                    removed.insert(old.to_string());
-                    added.push((new.to_string(), ty));
+                // A bare attribute reference only relabels — it computes
+                // nothing — so it belongs to `rename`, not `replace`.
+                Expr::NameRef(_) => {
+                    self.error(
+                        value_span,
+                        "T0047",
+                        format!(
+                            "`replace` value for `{new}` is a bare attribute reference, so it only \
+                             relabels — use `rename` to relabel an attribute"
+                        ),
+                    );
                 }
                 // A constant references no attribute, so it removes nothing —
                 // that's `extend`, not `replace`.
@@ -1077,6 +1067,105 @@ impl TypeChecker {
                     self.node_span(re.syntax()),
                     "T0031",
                     format!("replace produces a duplicate attribute `{name}`"),
+                );
+            }
+            result.push((name, ty));
+        }
+        Type::Relation(Heading::new(result))
+    }
+
+    /// Walk `R rename { new: old, … }` — relational rename (relabel): replace
+    /// each `old` attribute name with `new`, type- and cardinality-preserving.
+    /// The strict relabel-only partition of `replace`. The operand must be
+    /// `Relation H` (T0023). Each value must be a bare `NameRef` `old` that
+    /// exists in `H` (T0029), with no source relabeled twice and no target
+    /// collision (T0031); a computed value belongs to `replace` (T0030). The
+    /// result heading is `H` with each `old` renamed to `new`, canonically
+    /// re-sorted.
+    fn check_rename_expr(&mut self, re: &RenameExpr, scope: &mut Scope) -> Type {
+        let input_ty = match re.input() {
+            Some(e) => self.check_expr(&e, scope),
+            None => return Type::Unknown,
+        };
+        let heading = match &input_ty {
+            Type::Relation(h) => h.clone(),
+            Type::Unknown => return Type::Unknown,
+            other => {
+                let span = re
+                    .input()
+                    .map(|e| self.node_span(e.syntax()))
+                    .unwrap_or_else(|| self.node_span(re.syntax()));
+                self.error(
+                    span,
+                    "T0023",
+                    format!("`rename` expects a Relation on the left, got {other}"),
+                );
+                return Type::Unknown;
+            }
+        };
+        // Each pair relabels `old` → `new`: remove `old`, add `new` with the
+        // same type. A non-bare-ref value computes → that's `replace` (T0030).
+        let mut removed: HashSet<String> = HashSet::new();
+        let mut added: Vec<(String, Type)> = Vec::new();
+        let mut seen_src: HashSet<String> = HashSet::new();
+        for (new_tok, value) in re.pairs() {
+            let Some(new_tok) = new_tok else { continue }; // parse recovery
+            let new = new_tok.text();
+            let Some(value) = value else { continue };
+            match value {
+                Expr::NameRef(n) => {
+                    let Some(old_tok) = n.ident() else { continue };
+                    let old = old_tok.text();
+                    let Some(ty) = heading.lookup(old).cloned() else {
+                        self.error(
+                            self.token_span(&old_tok),
+                            "T0029",
+                            format!("unknown attribute `{old}` in rename of {heading}"),
+                        );
+                        continue;
+                    };
+                    if !seen_src.insert(old.to_string()) {
+                        self.error(
+                            self.token_span(&old_tok),
+                            "T0031",
+                            format!("attribute `{old}` is renamed more than once"),
+                        );
+                        continue;
+                    }
+                    removed.insert(old.to_string());
+                    added.push((new.to_string(), ty));
+                }
+                // Anything other than a bare attribute reference is a
+                // computation, not a relabel — that's `replace`, not `rename`.
+                other => {
+                    self.error(
+                        self.node_span(other.syntax()),
+                        "T0030",
+                        format!(
+                            "`rename` value for `{new}` must be a bare attribute reference — \
+                             use `replace` for computed values"
+                        ),
+                    );
+                }
+            }
+        }
+        // Result = surviving operand attributes (not relabeled) plus the renamed
+        // ones; a new name colliding with a survivor or another target is T0031.
+        let mut result: Vec<(String, Type)> = Vec::new();
+        let mut result_names: HashSet<String> = HashSet::new();
+        for (name, ty) in heading.attrs() {
+            if removed.contains(name) {
+                continue;
+            }
+            result_names.insert(name.clone());
+            result.push((name.clone(), ty.clone()));
+        }
+        for (name, ty) in added {
+            if !result_names.insert(name.clone()) {
+                self.error(
+                    self.node_span(re.syntax()),
+                    "T0031",
+                    format!("rename produces a duplicate attribute `{name}`"),
                 );
             }
             result.push((name, ty));
@@ -3154,30 +3243,14 @@ mod tests {
     // ── replace ───────────────────────────────────────────────────────
 
     #[test]
-    fn replace_remaps_the_heading() {
-        // {a, b} replace {x: a}: `x` is accessible, `a` is gone (T0017).
-        let ok = "oper main {} [ \
-                  let r = Relation { {a: 1, b: 2} }; \
-                  let t = extract (r replace {x: a}); \
-                  let _v = t.x; let _w = t.b; \
-                  ];";
-        assert!(diagnostics(ok).is_empty(), "{:?}", diagnostics(ok));
-        let gone = "oper main {} [ \
-                    let r = Relation { {a: 1, b: 2} }; \
-                    let t = extract (r replace {x: a}); \
-                    let v = t.a; \
-                    ];";
-        assert!(codes(gone).contains(&"T0017"));
-    }
-
-    #[test]
-    fn replace_unknown_source_diagnoses_t0029() {
-        // The value (source) `nope` doesn't exist in the heading.
+    fn replace_bare_ref_diagnoses_t0047() {
+        // A bare attribute reference only relabels — that's `rename`, not
+        // `replace`.
         let src = "oper main {} [ \
-                   let r = Relation { {a: 1} }; \
-                   let s = r replace {x: nope}; \
+                   let r = Relation { {a: 1, b: 2} }; \
+                   let s = r replace {x: a}; \
                    ];";
-        assert!(codes(src).contains(&"T0029"));
+        assert!(codes(src).contains(&"T0047"));
     }
 
     #[test]
@@ -3243,39 +3316,84 @@ mod tests {
     }
 
     #[test]
-    fn replace_target_collision_diagnoses_t0031() {
+    fn replace_non_relation_diagnoses_t0023() {
+        let src = "oper main {} [ let s = 1 replace {c: a + b}; ];";
+        assert!(codes(src).contains(&"T0023"));
+    }
+
+    // ── rename ────────────────────────────────────────────────────────
+
+    #[test]
+    fn rename_remaps_the_heading() {
+        // {a, b} rename {x: a}: `x` is accessible, `a` is gone (T0017).
+        let ok = "oper main {} [ \
+                  let r = Relation { {a: 1, b: 2} }; \
+                  let t = extract (r rename {x: a}); \
+                  let _v = t.x; let _w = t.b; \
+                  ];";
+        assert!(diagnostics(ok).is_empty(), "{:?}", diagnostics(ok));
+        let gone = "oper main {} [ \
+                    let r = Relation { {a: 1, b: 2} }; \
+                    let t = extract (r rename {x: a}); \
+                    let v = t.a; \
+                    ];";
+        assert!(codes(gone).contains(&"T0017"));
+    }
+
+    #[test]
+    fn rename_unknown_source_diagnoses_t0029() {
+        // The value (source) `nope` doesn't exist in the heading.
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1} }; \
+                   let s = r rename {x: nope}; \
+                   ];";
+        assert!(codes(src).contains(&"T0029"));
+    }
+
+    #[test]
+    fn rename_computed_value_diagnoses_t0030() {
+        // A computed value isn't a relabel — that's `replace`, not `rename`.
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1} }; \
+                   let s = r rename {x: a + 1}; \
+                   ];";
+        assert!(codes(src).contains(&"T0030"));
+    }
+
+    #[test]
+    fn rename_target_collision_diagnoses_t0031() {
         // b ← a, but b already exists → not a bijection.
         let src = "oper main {} [ \
                    let r = Relation { {a: 1, b: 2} }; \
-                   let s = r replace {b: a}; \
+                   let s = r rename {b: a}; \
                    ];";
         assert!(codes(src).contains(&"T0031"));
     }
 
     #[test]
-    fn replace_duplicate_source_diagnoses_t0031() {
-        // `a` is the source for both `x` and `y` → replaced more than once.
+    fn rename_duplicate_source_diagnoses_t0031() {
+        // `a` is the source for both `x` and `y` → renamed more than once.
         let src = "oper main {} [ \
                    let r = Relation { {a: 1} }; \
-                   let s = r replace {x: a, y: a}; \
+                   let s = r rename {x: a, y: a}; \
                    ];";
         assert!(codes(src).contains(&"T0031"));
     }
 
     #[test]
-    fn replace_swap_is_a_valid_bijection() {
-        // {a, b} replace {b: a, a: b} swaps names — no collision.
+    fn rename_swap_is_a_valid_bijection() {
+        // {a, b} rename {b: a, a: b} swaps names — no collision.
         let src = "oper main {} [ \
                    let r = Relation { {a: 1, b: 2} }; \
-                   let _s = r replace {b: a, a: b}; \
+                   let _s = r rename {b: a, a: b}; \
                    ];";
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]
-    fn replace_non_relation_diagnoses_t0023() {
-        let src = "oper main {} [ let s = 1 replace {a: b}; ];";
+    fn rename_non_relation_diagnoses_t0023() {
+        let src = "oper main {} [ let s = 1 rename {a: b}; ];";
         assert!(codes(src).contains(&"T0023"));
     }
 

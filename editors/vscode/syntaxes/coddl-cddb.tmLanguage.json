@@ -57,7 +57,7 @@
                 },
                 {
                     "name": "keyword.other.relational.coddl",
-                    "match": "\\b(where|project|replace|join|union|intersect|minus|extend|summarize)\\b"
+                    "match": "\\b(where|project|replace|rename|join|union|intersect|minus|extend|summarize)\\b"
                 }
             ]
         },

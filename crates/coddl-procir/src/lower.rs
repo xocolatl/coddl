@@ -17,8 +17,8 @@ use coddl_plan::Plan;
 use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, Expr, ExprStmt,
     ExtendExpr, FieldAccess, Item,
-    LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, ReplaceExpr,
-    Root, Stmt, TcloseExpr, TransactionExpr, TupleLit, UnaryExpr, UnaryOp,
+    LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, RenameExpr,
+    ReplaceExpr, Root, Stmt, TcloseExpr, TransactionExpr, TupleLit, UnaryExpr, UnaryOp,
 };
 use coddl_syntax::SyntaxKind;
 use coddl_types::{check, Heading, RelvarKind, RelvarTable, Type};
@@ -852,6 +852,7 @@ impl Lowerer {
             Expr::Unary(u) => self.lower_unary_expr(u),
             Expr::Project(p) => self.lower_project_expr(p),
             Expr::Replace(r) => self.lower_replace_expr(r),
+            Expr::Rename(r) => self.lower_rename_expr(r),
             Expr::Extend(e) => self.lower_extend_expr(e),
             Expr::Tclose(t) => self.lower_tclose_expr(t),
             Expr::NameRef(n) => self.lower_name_ref(n),
@@ -859,8 +860,8 @@ impl Lowerer {
     }
 
     /// Lower a `replace` whose operand the cut declined to push — an in-memory
-    /// relation. An all-bare-ref `replace` is a pure rename (`Inst::Rename`); a
-    /// general-expression `replace` desugars to `extend → project all-but →
+    /// relation. Every `replace` value computes (a bare-ref relabel is rejected
+    /// by typecheck → `rename`), so it desugars to `extend → project all-but →
     /// rename` — the in-process counterpart of the SQL desugar (compute the new
     /// attribute, drop the operand attributes the value reads, rename a temp
     /// back to the target when the new name collided).
@@ -870,20 +871,9 @@ impl Lowerer {
             .map(|e| self.lower_expr(&e))
             .expect("typechecked replace has a relation operand");
 
-        // Fast path: all-bare-ref → one rename.
-        if re.is_all_bare_ref() {
-            let renames: Vec<(String, String)> = re
-                .renames()
-                .into_iter()
-                .filter_map(|(old, new)| Some((old?.text().to_string(), new?.text().to_string())))
-                .collect();
-            let dst = self.emit_rename(src, renames);
-            self.release_if_unowned(src);
-            return dst;
-        }
-
-        // General case: classify pairs into extend values (general) and renames
-        // (bare-ref olds + temps), and the attributes the general values read.
+        // Classify pairs into extend values and temp renames (a temp is needed
+        // only when the new name collides with a surviving attribute), plus the
+        // attributes the values read (the removed set).
         let src_heading_id = match self.value_type(src) {
             ProcType::Relation(id) => id,
             other => unreachable!("replace on non-relation `{other}` survived typecheck"),
@@ -895,29 +885,21 @@ impl Lowerer {
         for (name_tok, value) in re.pairs() {
             let new = name_tok.expect("typechecked replace pair has a name").text().to_string();
             let value = value.expect("typechecked replace pair has a value");
-            match &value {
-                Expr::NameRef(n) => {
-                    let old = n.ident().expect("bare-ref value has an ident").text().to_string();
-                    renames.push((old, new));
-                }
-                _ => {
-                    let mut refs: HashSet<String> = HashSet::new();
-                    ast_attr_refs(&value, &mut refs);
-                    for r in refs {
-                        if in_heading.lookup(&r).is_some() {
-                            removed.insert(r);
-                        }
-                    }
-                    let extend_name = if in_heading.lookup(&new).is_some() {
-                        let t = format!("__coddl_replace_tmp_{new}");
-                        renames.push((t.clone(), new));
-                        t
-                    } else {
-                        new
-                    };
-                    extend_pairs.push((extend_name, value));
+            let mut refs: HashSet<String> = HashSet::new();
+            ast_attr_refs(&value, &mut refs);
+            for r in refs {
+                if in_heading.lookup(&r).is_some() {
+                    removed.insert(r);
                 }
             }
+            let extend_name = if in_heading.lookup(&new).is_some() {
+                let t = format!("__coddl_replace_tmp_{new}");
+                renames.push((t.clone(), new));
+                t
+            } else {
+                new
+            };
+            extend_pairs.push((extend_name, value));
         }
         let keep: Vec<String> = in_heading
             .attrs()
@@ -941,10 +923,28 @@ impl Lowerer {
         dst
     }
 
+    /// Lower a `rename` whose operand the cut declined to push — an in-memory
+    /// relation. Every value is a bare attribute reference (typecheck enforces
+    /// it), so this is a pure relabel: one `Inst::Rename`.
+    fn lower_rename_expr(&mut self, re: &RenameExpr) -> ValueId {
+        let src = re
+            .input()
+            .map(|e| self.lower_expr(&e))
+            .expect("typechecked rename has a relation operand");
+        let renames: Vec<(String, String)> = re
+            .renames()
+            .into_iter()
+            .filter_map(|(old, new)| Some((old?.text().to_string(), new?.text().to_string())))
+            .collect();
+        let dst = self.emit_rename(src, renames);
+        self.release_if_unowned(src);
+        dst
+    }
+
     /// Rename an already-lowered relation `src` and emit `Inst::Rename`. Computes
     /// the renamed (re-sorted) result heading and the source→dest permutation.
-    /// Mint-and-return: the caller releases `src`. Reused by `lower_replace_expr`
-    /// and the general-expression `replace` desugar.
+    /// Mint-and-return: the caller releases `src`. Reused by `lower_rename_expr`
+    /// and the general-expression `replace` desugar (temp → target renames).
     fn emit_rename(&mut self, src: ValueId, renames: Vec<(String, String)>) -> ValueId {
         let src_heading_id = match self.value_type(src) {
             ProcType::Relation(id) => id,
@@ -1336,25 +1336,11 @@ impl Lowerer {
             }
             Expr::Replace(r) => {
                 let input = self.build_rel_expr(&r.input()?)?;
-                // Fast path: an all-bare-ref replace is a pure rename → one
-                // `Rename` node (pushes as `col AS new`).
-                if r.is_all_bare_ref() {
-                    let mut renames = Vec::new();
-                    for (old, new) in r.renames() {
-                        let (Some(old), Some(new)) = (old, new) else {
-                            return None;
-                        };
-                        renames.push((old.text().to_string(), new.text().to_string()));
-                    }
-                    return Some(RelExpr::Rename {
-                        input: Box::new(input),
-                        renames,
-                    });
-                }
-                // General case: desugar to `Rename{Project{Extend}}` — extend
-                // each general value (under a temp `__t` when the new name
+                // Every value computes (a bare-ref relabel is rejected by
+                // typecheck → `rename`): desugar to `Rename{Project{Extend}}` —
+                // extend each value (under a temp `__t` when the new name
                 // collides), project away the attributes the values read, and
-                // rename the temps (and bare-ref olds) to their targets.
+                // rename the temps back to their targets.
                 let in_heading = input.heading();
                 let mut extends: Vec<(String, Type, ScalarExpr)> = Vec::new();
                 let mut removed: HashSet<String> = HashSet::new();
@@ -1362,35 +1348,22 @@ impl Lowerer {
                 for (name_tok, value) in r.pairs() {
                     let new = name_tok?.text().to_string();
                     let value = value?;
-                    match &value {
-                        // Bare-ref pair stays a pure rename (type-agnostic); its
-                        // `old` is consumed by the rename, not the project.
-                        Expr::NameRef(n) => {
-                            let old = n.ident()?.text().to_string();
-                            renames.push((old, new));
-                        }
-                        // General value → extend (temp when `new` exists) +
-                        // remove the attributes it reads.
-                        _ => {
-                            let scalar = self.build_scalar_expr(&value)?;
-                            scalar_attr_refs(&scalar, &mut removed);
-                            let ty = scalar_result_type(&scalar, &in_heading);
-                            // A temp is needed only when `new` already exists
-                            // (in-place / replacing an attribute). Each pair's
-                            // `new` is unique within a `replace` (the typechecker
-                            // rejects duplicate targets), so a `new`-derived temp
-                            // name is unique; the `__` prefix can't collide with
-                            // user attributes (E0007).
-                            let extend_name = if in_heading.lookup(&new).is_some() {
-                                let t = format!("__coddl_replace_tmp_{new}");
-                                renames.push((t.clone(), new));
-                                t
-                            } else {
-                                new
-                            };
-                            extends.push((extend_name, ty, scalar));
-                        }
-                    }
+                    let scalar = self.build_scalar_expr(&value)?;
+                    scalar_attr_refs(&scalar, &mut removed);
+                    let ty = scalar_result_type(&scalar, &in_heading);
+                    // A temp is needed only when `new` already exists (in-place /
+                    // replacing an attribute). Each pair's `new` is unique within
+                    // a `replace` (the typechecker rejects duplicate targets), so
+                    // a `new`-derived temp name is unique; the `__` prefix can't
+                    // collide with user attributes (E0007).
+                    let extend_name = if in_heading.lookup(&new).is_some() {
+                        let t = format!("__coddl_replace_tmp_{new}");
+                        renames.push((t.clone(), new));
+                        t
+                    } else {
+                        new
+                    };
+                    extends.push((extend_name, ty, scalar));
                 }
                 // keep = (operand attrs ∪ extend-names) minus the read attrs.
                 let keep: Vec<String> = in_heading
@@ -1414,6 +1387,21 @@ impl Lowerer {
                     };
                 }
                 Some(node)
+            }
+            Expr::Rename(r) => {
+                // A pure relabel → one `Rename` node (pushes as `col AS new`).
+                let input = self.build_rel_expr(&r.input()?)?;
+                let mut renames = Vec::new();
+                for (old, new) in r.renames() {
+                    let (Some(old), Some(new)) = (old, new) else {
+                        return None;
+                    };
+                    renames.push((old.text().to_string(), new.text().to_string()));
+                }
+                Some(RelExpr::Rename {
+                    input: Box::new(input),
+                    renames,
+                })
             }
             Expr::Tclose(t) => {
                 // `R tclose { a, b }` ≡ `(R project { a, b }) tclose` — wrap the
@@ -3293,15 +3281,15 @@ oper main {}\n\
     }
 
     #[test]
-    fn relvar_replace_pushes_aliased_sql() {
-        // `Greetings where id=1 replace {identifier: id, msg: message}` pushes
-        // to one query with the rename expressed via `AS`.
+    fn relvar_rename_pushes_aliased_sql() {
+        // `Greetings where id=1 rename {identifier: id, msg: message}` pushes
+        // to one query with the relabel expressed via `AS`.
         let src = "\
 program hello_world_db;
 database greetings;
 public relvar Greetings { id: Integer, message: Text } key { id };
 oper main {} [
-    let g = transaction [ extract (Greetings where id = 1 replace {identifier: id, msg: message}) ];
+    let g = transaction [ extract (Greetings where id = 1 rename {identifier: id, msg: message}) ];
     write_line { message: g.msg };
 ];
 ";
@@ -3381,11 +3369,11 @@ oper main {} [
     }
 
     #[test]
-    fn replace_over_relation_literal_lowers_to_inst_rename() {
-        // `Relation {{a, b}} replace {z: a}` lowers in-process to `Inst::Rename`
+    fn rename_over_relation_literal_lowers_to_inst_rename() {
+        // `Relation {{a, b}} rename {z: a}` lowers in-process to `Inst::Rename`
         // with the renamed (re-sorted) result heading {b, z} and perm [1, 0]
         // (dst b ← src 1, dst z ← src 0).
-        let src = "oper main {} [ let _s = Relation { {a: 1, b: 2} } replace {z: a}; ];";
+        let src = "oper main {} [ let _s = Relation { {a: 1, b: 2} } rename {z: a}; ];";
         let out = lower(src, FileId(0));
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
         let m = out.module.expect("module");

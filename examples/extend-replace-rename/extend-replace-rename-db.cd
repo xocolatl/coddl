@@ -1,30 +1,30 @@
-// extend-replace-db.cd
+// extend-replace-rename-db.cd
 //
-// `extend` and `replace`, the two postfix operators that reshape a relation's
-// heading by computing new attributes — shown SQL-backed, so each query pushes
-// DOWN to SQLite.
+// `extend`, `replace`, and `rename`, the postfix operators that reshape a
+// relation's heading — shown SQL-backed, so each query pushes DOWN to SQLite.
 //
-//   R extend  { c: <expr> }   adds `c`, KEEPING every operand attribute
-//   R replace { c: <expr> }   adds `c`, CONSUMING the attributes <expr> reads
+//   R extend  { c: <expr> }    adds `c`, KEEPING every operand attribute
+//   R replace { c: <expr> }    adds `c`, CONSUMING the attributes <expr> reads
+//   R rename  { new: old }     relabels `old` to `new` (value is a bare ref)
 //
 // `extend` and `replace` over the same expression differ only in what they keep
-// vs. consume — the spine of this example. This `-db` twin shows two cases that
-// push as one `SELECT … AS …` each: `extend` with a computed column, and the
-// `replace` rename (a bare attribute reference — id -> ref). The compute-and-
-// consume `replace` forms land alongside the in-process twin.
+// vs. consume — the spine of this example; `rename` is the strict relabel-only
+// partition. This `-db` twin shows two cases that push as one `SELECT … AS …`
+// each: `extend` with a computed column, and a `rename` (id -> ref). The
+// compute-and-consume `replace` forms land alongside the in-process twin.
 //
 // The .cd-family (storage stays out of D):
-//   extend-replace-db.cd  — this program: the external schema + queries
-//   sales.cddb            — database catalog (conceptual schema)
-//   sales.cdstore         — conceptual -> physical (SQLite) binding
-//   seed-db.sh            — recreates sales.sqlite with the demo data
+//   extend-replace-rename-db.cd  — this program: the external schema + queries
+//   sales.cddb                   — database catalog (conceptual schema)
+//   sales.cdstore                — conceptual -> physical (SQLite) binding
+//   seed-db.sh                   — recreates sales.sqlite with the demo data
 //
 // `public` relvars are read-only, so there is no `:=` — the data lives in the
 // seeded database. A public-relvar read must sit inside a `transaction [...]`.
 // Money is integer cents (Coddl has no nulls and v1 has no Rational arithmetic
 // in `extend` yet; cents keep the totals exact).
 
-program extend_replace_db;
+program extend_replace_rename_db;
 database sales;
 
 public relvar Sales {
@@ -65,10 +65,10 @@ oper main {} [
     ];
     write_relation { rel: handled };
 
-    // replace RENAME: id -> ref. The bare-attribute-reference form (the simplest
-    // end of the spectrum) pushes `SELECT "id" AS "ref", … FROM "sales"`.
+    // rename: id -> ref. The strict relabel-only operator (value is a bare
+    // attribute reference) pushes `SELECT "id" AS "ref", … FROM "sales"`.
     let reffed = transaction [
-        Sales replace { ref: id }
+        Sales rename { ref: id }
     ];
     write_relation { rel: reffed };
 ];

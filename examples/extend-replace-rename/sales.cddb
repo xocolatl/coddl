@@ -2,7 +2,7 @@
 //
 // Conceptual schema for the `sales` database — the SQL-backed twin of the
 // in-process extend/replace example. Database-side `base relvar` declarations;
-// the heading mirrors the `public relvar Sales` in extend-replace-db.cd.
+// the heading mirrors the `public relvar Sales` in extend-replace-rename-db.cd.
 
 database sales;
 

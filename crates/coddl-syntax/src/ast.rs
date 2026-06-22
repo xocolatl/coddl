@@ -412,6 +412,7 @@ pub enum Expr {
     Replace(ReplaceExpr),
     Extend(ExtendExpr),
     Tclose(TcloseExpr),
+    Rename(RenameExpr),
 }
 
 impl Expr {
@@ -431,6 +432,7 @@ impl Expr {
             SyntaxKind::REPLACE_EXPR => Expr::Replace(ReplaceExpr { syntax }),
             SyntaxKind::EXTEND_EXPR => Expr::Extend(ExtendExpr { syntax }),
             SyntaxKind::TCLOSE_EXPR => Expr::Tclose(TcloseExpr { syntax }),
+            SyntaxKind::RENAME_EXPR => Expr::Rename(RenameExpr { syntax }),
             // Parenthesized expressions are transparent — recurse to
             // the inner `Expr` so the typechecker / lowerer never see
             // the wrapper. Used purely for precedence grouping.
@@ -455,6 +457,7 @@ impl Expr {
             Expr::Replace(r) => r.syntax(),
             Expr::Extend(e) => e.syntax(),
             Expr::Tclose(t) => t.syntax(),
+            Expr::Rename(r) => r.syntax(),
         }
     }
 }
@@ -823,34 +826,47 @@ impl ReplaceExpr {
     }
 
     /// The pairs in source order as `(new_name, value_expr)`: the `NAMED_ARG`
+    /// name (the new/target attribute) and its value expression. The typechecker
+    /// requires every value to compute (read ≥1 attribute); a bare `NameRef` is
+    /// a pure relabel and belongs to `rename` (T0047).
+    pub fn pairs(&self) -> Vec<(Option<SyntaxToken>, Option<Expr>)> {
+        self.arg_list()
+            .map(|al| al.args().map(|na| (na.name(), na.value())).collect())
+            .unwrap_or_default()
+    }
+}
+
+ast_node!(pub RenameExpr, RENAME_EXPR);
+
+impl RenameExpr {
+    /// The relation operand being renamed — the single `Expr` child (the
+    /// `new: old` pairs live in the `ARG_LIST` node, which isn't an `Expr`).
+    pub fn input(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// The `{ new: old }` pair list — an `ARG_LIST` of `NAMED_ARG`s. The left
+    /// of each colon is the new attribute name; the right is the source
+    /// attribute (a bare attribute reference).
+    pub fn arg_list(&self) -> Option<ArgList> {
+        child(&self.syntax)
+    }
+
+    /// The pairs in source order as `(new_name, value_expr)`: the `NAMED_ARG`
     /// name (the new/target attribute) and its value expression. The
-    /// typechecker dispatches on the value's kind (a bare `NameRef` is the
-    /// rename case; a constant suggests `extend`; any other expression awaits
-    /// `extend`).
+    /// typechecker requires every value to be a bare `NameRef` (the source
+    /// attribute) and emits T0030 otherwise.
     pub fn pairs(&self) -> Vec<(Option<SyntaxToken>, Option<Expr>)> {
         self.arg_list()
             .map(|al| al.args().map(|na| (na.name(), na.value())).collect())
             .unwrap_or_default()
     }
 
-    /// True when every pair's value is a bare attribute reference — the pure
-    /// rename case (`replace { new: old, … }`). False when any value is a
-    /// general expression (the compute-and-consume case, which desugars through
-    /// `extend`). An empty pair list counts as all-bare-ref. The single
-    /// dispatch test shared by the typechecker and both lowering paths.
-    pub fn is_all_bare_ref(&self) -> bool {
-        self.pairs()
-            .iter()
-            .all(|(_, value)| matches!(value, Some(Expr::NameRef(_))))
-    }
-
-    /// The bare-reference (rename) view: `(old, new)` name tokens, where `old`
-    /// is the value's bare-`NameRef` identifier (the source attribute) and
-    /// `new` is the `NAMED_ARG` name (the target). `old` is `None` when the
-    /// value isn't a bare attribute name. **Valid only when
-    /// [`is_all_bare_ref`](Self::is_all_bare_ref) holds** — a general-expression
-    /// value collapses to `(None, new)` here, silently dropping its content, so
-    /// callers must gate on `is_all_bare_ref` first.
+    /// The relabel view: `(old, new)` name tokens, where `old` is the value's
+    /// bare-`NameRef` identifier (the source attribute) and `new` is the
+    /// `NAMED_ARG` name (the target). `old` is `None` when the value isn't a
+    /// bare attribute name — which the typechecker has already rejected (T0030),
+    /// so by lowering time every pair is a clean relabel.
     pub fn renames(&self) -> Vec<(Option<SyntaxToken>, Option<SyntaxToken>)> {
         self.arg_list()
             .map(|al| {

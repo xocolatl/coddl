@@ -53,7 +53,7 @@ Reason: the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-
 - **Scope injection.** Identifiers in the predicate resolve against the left operand's heading first, the enclosing scope second. `SP where s# = supplier` reads as: `s#` is the `SP` attribute; `supplier` is a parameter from the enclosing `oper`. The parser and typechecker inject the left operand's heading into the predicate's name-resolution scope automatically. This is the first construct with a non-uniform scoping rule; every later construct that takes a predicate (`extend`, `summarize`'s aggregate expressions, possrep constraints) reuses the same machinery.
 - **Precedence.** `where` binds looser than `=`, `<`, `+`, `and`, `or` — the predicate is expected to be a full scalar expression. `R where x = 1 and y > 0` parses as `R where ((x = 1) and (y > 0))` without parentheses. Practically `where` sits at the bottom of the infix precedence ladder, alongside `union`/`minus`. Full precedence table lands when the parser does — exact order is deferred until then.
 
-**`project` (projection) is a *postfix* operator, not infix.** `R project { a, b }` narrows the relation's heading to the named attributes — the right operand is a brace-list of bare attribute names (structurally identical to a `key { … }` clause), not another expression, so it doesn't fit the infix `<lhs> op <rhs>` shape. It is parsed as a postfix suffix at *pipeline precedence* — the same altitude as `where`, and gated to the top level so it binds to the whole pipeline rather than to a higher-precedence operand such as a `where` predicate. `R where p project { a }` reads as `(R where p) project { a }`; the reverse order `R project { a } where p` also parses, nesting left. It is the first postfix relational operator; later ones (`replace`, `extend`, `summarize`) can reuse the same pipeline slot. `project` remains a contextual keyword — a valid identifier everywhere else (no reserved words).
+**`project` (projection) is a *postfix* operator, not infix.** `R project { a, b }` narrows the relation's heading to the named attributes — the right operand is a brace-list of bare attribute names (structurally identical to a `key { … }` clause), not another expression, so it doesn't fit the infix `<lhs> op <rhs>` shape. It is parsed as a postfix suffix at *pipeline precedence* — the same altitude as `where`, and gated to the top level so it binds to the whole pipeline rather than to a higher-precedence operand such as a `where` predicate. `R where p project { a }` reads as `(R where p) project { a }`; the reverse order `R project { a } where p` also parses, nesting left. It is the first postfix relational operator; later ones (`replace`, `extend`, `rename`, `tclose`, and future `summarize`) reuse the same pipeline slot. `project` remains a contextual keyword — a valid identifier everywhere else (no reserved words).
 
 ### Parenthesized positional for monadic operators
 
@@ -427,13 +427,14 @@ function that implements it.
 <expr-prec>     ::= <primary-expr> { <postfix> }
                     { <infix-op> <expr-prec> | <project-suffix>
                       | <replace-suffix> | <tclose-suffix>
-                      | <extend-suffix> } ;
+                      | <extend-suffix> | <rename-suffix> } ;
                                                                -- parse_expr_prec
                     -- Pratt precedence ladder; left-associative.
                     -- min_prec drives which operators may be
                     -- consumed; the parser recurses with `prec + 1`
                     -- for each rhs. The <project-suffix> / <replace-suffix>
-                    -- / <tclose-suffix> / <extend-suffix> postfix forms are
+                    -- / <tclose-suffix> / <extend-suffix> / <rename-suffix>
+                    -- postfix forms are
                     -- consumed only at pipeline level (min_prec 0),
                     -- interleaved with infix ops, so they bind to the whole
                     -- pipeline.
@@ -496,21 +497,19 @@ function that implements it.
                     -- contextual keywords, valid identifiers elsewhere.
                     -- See the projection rationale above.
 <replace-suffix> ::= 'replace' <arg-list> ;                    -- parse_replace_suffix
-                    -- Relational replace (subsumes the former `rename`).
-                    -- Postfix at pipeline precedence (like <project-suffix>);
-                    -- wraps the operand in REPLACE_EXPR. Each `new: e` pair
-                    -- binds a new attribute name (left) to a value expression
-                    -- (right) and removes the operand attributes the value
-                    -- references. The pairs reuse <arg-list> with field-init
-                    -- shorthand DISABLED — the colon is required (P0017 on
-                    -- `replace { new }`), since a shorthand would be the no-op
-                    -- identity `new -> new`. The value is a general <expr>: a
-                    -- bare attribute reference is a pure rename; any other
-                    -- (compute) expression desugars through `extend` + `project`
-                    -- + `rename` (it adds `new` and removes the attributes it
-                    -- reads), restricted to Integer/Text (T0046). A constant or
-                    -- a value reading no operand attribute removes nothing →
-                    -- T0042 (use `extend`). P0040 on a missing `{`.
+                    -- Relational replace (compute-and-consume). Postfix at
+                    -- pipeline precedence (like <project-suffix>); wraps the
+                    -- operand in REPLACE_EXPR. Each `new: e` pair binds a new
+                    -- attribute name (left) to a value expression (right) and
+                    -- removes the operand attributes the value references. The
+                    -- pairs reuse <arg-list> with field-init shorthand DISABLED
+                    -- — the colon is required (P0017 on `replace { new }`).
+                    -- Every value must COMPUTE (read ≥1 operand attribute via an
+                    -- operator), restricted to Integer/Text (T0046); it desugars
+                    -- through `extend` + `project` + `rename`. A bare attribute
+                    -- reference only relabels → use `rename` (T0047). A constant
+                    -- or a value reading no operand attribute removes nothing →
+                    -- use `extend` (T0042). P0040 on a missing `{`.
 <tclose-suffix> ::= 'tclose' [ '{' <ident> { ',' <ident> } '}' ] ; -- parse_tclose_suffix
                     -- Relational transitive closure. Postfix at pipeline
                     -- precedence (like <project-suffix> / <replace-suffix>);
@@ -538,6 +537,19 @@ function that implements it.
                     -- would be the no-op identity `new: new`. P0043 on a missing
                     -- `{`. `extend` is a contextual keyword, a valid identifier
                     -- elsewhere (no reserved words).
+<rename-suffix> ::= 'rename' <arg-list> ;                     -- parse_rename_suffix
+                    -- Relational rename (relabel). Postfix at pipeline
+                    -- precedence (like <replace-suffix>); wraps the operand in
+                    -- RENAME_EXPR. Each `new: old` pair relabels the source
+                    -- attribute `old` (right, a bare attribute reference) to
+                    -- `new` (left); type- and cardinality-preserving. The strict
+                    -- relabel-only partition of `replace`: a computed value is
+                    -- rejected → use `replace` (T0030). The pairs reuse <arg-list>
+                    -- with field-init shorthand DISABLED — the colon is required
+                    -- (P0017 on `rename { new }`). `old` must exist (T0029) and
+                    -- the result must stay a bijection (T0031). P0034 on a
+                    -- missing `{`. `rename` is a contextual keyword, a valid
+                    -- identifier elsewhere (no reserved words).
 <transaction-expr> ::= 'transaction' <block> ;                 -- parse_transaction_expr
 <name-ref>      ::= <identifier> ;
 <arg-list>      ::= '{' [ <named-arg> commalist ] '}' ;        -- parse_arg_list
@@ -649,6 +661,7 @@ enforces that.
 | P0031 | Expected `{` after `Relation`                           |
 | P0032 | Expected `{` to start a tuple in a relation literal     |
 | P0033 | Expected `}` to close relation literal                  |
+| P0034 | Expected `{` to start rename list                       |
 | P0035 | Expected `)` to close parenthesized expression          |
 | P0036 | Expected `{` to start project list                      |
 | P0037 | Expected project attribute name                         |

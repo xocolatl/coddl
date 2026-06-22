@@ -203,8 +203,9 @@ pub enum SyntaxKind {
     /// expression node wrapping its relation operand; the `new: e` pairs
     /// (an `ARG_LIST` of `NAMED_ARG`) follow the `replace` keyword. Adds each
     /// `new` attribute and removes the operand attributes its value references.
-    /// Subsumes the former `rename` (the bare-attribute-reference value case).
-    /// Placed at the end of the enum to keep existing discriminants stable.
+    /// Each value must compute (read ≥1 attribute); a bare attribute reference
+    /// is a pure relabel and belongs to `rename` (T0047). Placed at the end of
+    /// the enum to keep existing discriminants stable.
     REPLACE_EXPR,
 
     /// `<relExpr> tclose [ { a, b } ]` — relational transitive closure. A
@@ -221,6 +222,15 @@ pub enum SyntaxKind {
     /// attribute. Placed at the end of the enum to keep existing discriminants
     /// stable.
     EXTEND_EXPR,
+
+    /// `<relExpr> rename { new: old, … }` — relational rename (relabel). A
+    /// postfix expression node wrapping its relation operand; the `new: old`
+    /// pairs (an `ARG_LIST` of `NAMED_ARG`) follow the `rename` keyword. Each
+    /// value must be a bare attribute reference (the source attribute); a
+    /// computed value belongs to `replace` (T0030). The strict relabel-only
+    /// partition of `replace`. Placed at the end of the enum to keep existing
+    /// discriminants stable.
+    RENAME_EXPR,
 
     /// A range of source whose intended structure couldn't be
     /// recovered. The parser still wraps the tokens so the tree stays
@@ -372,6 +382,7 @@ mod tests {
             SyntaxKind::PROJECT_EXPR,
             SyntaxKind::REPLACE_EXPR,
             SyntaxKind::TCLOSE_EXPR,
+            SyntaxKind::RENAME_EXPR,
             SyntaxKind::PARSE_ERROR,
         ] {
             assert!(!sk.is_token(), "{sk:?} should be a node kind");

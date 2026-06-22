@@ -624,6 +624,12 @@ impl<'a> Parser<'a> {
                 self.finish_node();
                 continue;
             }
+            if min_prec == 0 && self.at_keyword("rename") {
+                self.start_node_at(cp, SyntaxKind::RENAME_EXPR);
+                self.parse_rename_suffix();
+                self.finish_node();
+                continue;
+            }
             let Some(prec) = self.peek_infix_prec() else {
                 break;
             };
@@ -1045,9 +1051,9 @@ impl<'a> Parser<'a> {
     /// this consumes the `replace` keyword and the `{ new: e }` pair list. Each
     /// pair binds a new attribute name (left of the colon) to a value
     /// expression (right). The pairs reuse the `ARG_LIST` / `NAMED_ARG`
-    /// production, so the value parses as a general `Expr` — forward-compatible
-    /// with the expression forms; the typechecker restricts it to a bare
-    /// attribute reference until `extend` lands (the rename case).
+    /// production, so the value parses as a general `Expr`; the typechecker
+    /// requires each value to compute (read ≥1 attribute) — a bare attribute
+    /// reference is a pure relabel and belongs to `rename` (T0047).
     ///
     /// Diagnostics: P0040 (no `{`); the pair-list reuses the arg-list codes
     /// P0015 (no `}`), P0016 (no name), P0017 (no `:`).
@@ -1059,6 +1065,28 @@ impl<'a> Parser<'a> {
             self.parse_arg_list(false); // replace keeps the colon required (no shorthand)
         } else {
             self.error("P0040", "expected `{` to start replace list");
+        }
+    }
+
+    /// `rename { new: old, … }` — relational rename suffix. The enclosing
+    /// `RENAME_EXPR` node (wrapping the operand) is opened by the caller, so
+    /// this consumes the `rename` keyword and the `{ new: old }` pair list. Each
+    /// pair binds a new attribute name (left of the colon) to a source attribute
+    /// (right). The pairs reuse the `ARG_LIST` / `NAMED_ARG` production, so the
+    /// value parses as a general `Expr`; the typechecker requires each value to
+    /// be a bare attribute reference — a computed value belongs to `replace`
+    /// (T0030). The strict relabel-only partition of `replace`.
+    ///
+    /// Diagnostics: P0034 (no `{`); the pair-list reuses the arg-list codes
+    /// P0015 (no `}`), P0016 (no name), P0017 (no `:`).
+    pub(crate) fn parse_rename_suffix(&mut self) {
+        debug_assert!(self.at_keyword("rename"));
+        self.bump_trivia();
+        self.bump(); // `rename`
+        if self.at(SyntaxKind::L_BRACE) {
+            self.parse_arg_list(false); // rename keeps the colon required (no shorthand)
+        } else {
+            self.error("P0034", "expected `{` to start rename list");
         }
     }
 
@@ -2398,7 +2426,7 @@ mod tests {
     #[test]
     fn missing_rhs_after_operator_diagnoses_p0014() {
         // `1 = ;` — the rhs's `parse_primary_expr` sees `;`, emits
-        // P0014 "expected expression". A dedicated P0034 was
+        // P0014 "expected expression". A dedicated missing-rhs code was
         // considered but deduped per the same logic as Phase 11's
         // P0011-vs-P0020/P0021 dedup.
         let out = parse_str("oper f {} [ let b = 1 = ; ];");
@@ -2751,11 +2779,75 @@ mod tests {
 
     #[test]
     fn replace_is_contextual_not_reserved() {
-        // `replace` remains a valid identifier elsewhere; the retired `rename`
-        // is now an ordinary identifier too.
+        // `replace` and `rename` are contextual keywords — valid identifiers
+        // outside the postfix-suffix position.
         let out = parse_str(
             "oper f {} [ let replace = 1; let rename = 2; let s = R where replace = rename; ];",
         );
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    // ── rename ───────────────────────────────────────────────────────
+
+    #[test]
+    fn rename_parses_as_rename_expr() {
+        let out = parse_str("oper f {} [ let s = R rename {a: b, c: d}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let re = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::RENAME_EXPR)
+            .expect("RENAME_EXPR in tree");
+        // Operand is the NAME_REF `R`; the pairs are an ARG_LIST.
+        assert!(re.children().any(|n| n.kind() == SyntaxKind::NAME_REF));
+        assert!(re.children().any(|n| n.kind() == SyntaxKind::ARG_LIST));
+    }
+
+    #[test]
+    fn rename_binds_looser_than_where() {
+        // `R where a = 1 rename {b: a}` => RENAME(WHERE(R, a = 1), {b: a}).
+        let out = parse_str("oper f {} [ let s = R where a = 1 rename {b: a}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let re = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::RENAME_EXPR)
+            .expect("RENAME_EXPR in tree");
+        let inner = re
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("operand BINARY_EXPR (the where)");
+        assert!(inner.text().to_string().contains(" where "));
+    }
+
+    #[test]
+    fn rename_interleaves_with_extend() {
+        // `R extend {c: a * b} rename {ref: id}` nests left: RENAME(EXTEND(R)).
+        let out = parse_str("oper f {} [ let s = R extend {c: a * b} rename {ref: id}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let re = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::RENAME_EXPR)
+            .expect("RENAME_EXPR at the top");
+        assert!(re
+            .children()
+            .any(|n| n.kind() == SyntaxKind::EXTEND_EXPR));
+    }
+
+    #[test]
+    fn rename_missing_brace_diagnoses_p0034() {
+        let out = parse_str("oper f {} [ let s = R rename a; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0034"),
+            "expected P0034, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn rename_is_contextual_not_reserved() {
+        let out = parse_str("oper f {} [ let rename = 1; let s = R where rename = 2; ];");
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }
 
