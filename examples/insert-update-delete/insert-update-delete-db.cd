@@ -37,6 +37,11 @@ oper main {} [
     // (idempotent): an `INSERT INTO greetings ... WHERE NOT EXISTS (...)`.
     transaction [ Greetings := Greetings union NewArrivals; ];
 
+    // Add a literal tuple. The right operand isn't SQL-backed, so its rows are
+    // shipped from the process into greetings as a batched `VALUES` insert
+    // (still idempotent, still no temp table).
+    transaction [ Greetings := Greetings union Relation { { id: 6, message: "hi there" } }; ];
+
     let after = transaction [ Greetings ];
     write_relation { rel: after };
 ];

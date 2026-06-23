@@ -483,6 +483,20 @@ pub enum Inst {
         plan_id: u32,
         params: Vec<(ValueId, ProcType)>,
     },
+    /// Insert the rows of an **in-memory** relation `src` into a public relvar,
+    /// idempotently. `plan_id` is a registered *insert template* — an
+    /// `INSERT … SELECT … FROM (VALUES {{ROWS}}) … WHERE NOT EXISTS (…)` whose
+    /// `{{ROWS}}` marker the runtime expands to a batch of `(?,…)` row-groups.
+    /// Backends pass `src`'s relation pointer + its static heading descriptor
+    /// (like [`Inst::WriteRelation`]) to `coddl_exec_insert`, which iterates the
+    /// relation, binds each row's cells, and runs the template in batches. Used
+    /// for `t := t union <literal-or-private>` where the source can't be pushed
+    /// to SQL. Fires inside the enclosing `transaction [...]`.
+    InsertFrom {
+        plan_id: u32,
+        src: ValueId,
+        heading_id: HeadingId,
+    },
 }
 
 /// Scalar binary operator kinds. The comparison ops (`Eq`…`GtEq`) and the
@@ -830,6 +844,15 @@ impl fmt::Display for Inst {
                 }
                 f.write_str(")")
             }
+            Inst::InsertFrom {
+                plan_id,
+                src,
+                heading_id,
+            } => write!(
+                f,
+                "insert_from plan_{plan_id} {src} heading_{}",
+                heading_id.0
+            ),
         }
     }
 }

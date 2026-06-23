@@ -40,5 +40,8 @@ oper main {} [
 
     // Add every tuple in NewArrivals not already present (set union — idempotent).
     Greetings := Greetings union NewArrivals;
+
+    // Add a literal tuple (same union, an in-memory right operand).
+    Greetings := Greetings union Relation { { id: 6, message: "hi there" } };
     write_relation { rel: Greetings };
 ];

@@ -331,6 +331,7 @@ impl Emitter {
         .unwrap();
         writeln!(self.body, "declare ptr @coddl_query(i32, ptr, i64)").unwrap();
         writeln!(self.body, "declare i32 @coddl_exec(i32, ptr, i64)").unwrap();
+        writeln!(self.body, "declare i32 @coddl_exec_insert(i32, ptr, ptr)").unwrap();
     }
 
     /// Emit the static byte constants the pushdown prologue references: the
@@ -888,6 +889,26 @@ impl Emitter {
                 heading_id,
             } => self.lower_query(*dst, *plan_id, params, *heading_id),
             Inst::Dml { plan_id, params } => self.lower_dml(*plan_id, params),
+            Inst::InsertFrom {
+                plan_id,
+                src,
+                heading_id,
+            } => {
+                // Ship `src`'s in-memory rows into the target via the registered
+                // insert template — pass the relation pointer + its heading
+                // descriptor (like `coddl_write_relation`) plus the plan id. The
+                // returned status is discarded (the runtime aborts on failure).
+                let op = self.scalar_op(src)?;
+                let status = format!("%v_insert_status.{}", self.next_str);
+                self.next_str += 1;
+                writeln!(
+                    self.body,
+                    "    {status} = call i32 @coddl_exec_insert(i32 {plan_id}, ptr {op}, ptr @.heading.{})",
+                    heading_id.0,
+                )
+                .unwrap();
+                Ok(())
+            }
         }
     }
 

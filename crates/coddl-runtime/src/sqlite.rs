@@ -896,6 +896,154 @@ pub unsafe extern "C" fn coddl_exec(
     }
 }
 
+/// Conservative ceiling on bind variables per statement — under SQLite's
+/// historical `SQLITE_MAX_VARIABLE_NUMBER` floor (999). Batches of insert rows
+/// are sized so `rows × arity` stays below it.
+const INSERT_PARAM_BUDGET: usize = 900;
+
+/// Insert the rows of an **in-memory** relation `src` into a public relvar,
+/// idempotently, via the registered insert template `plan_id` (an
+/// `INSERT … SELECT … FROM (VALUES <marker>) … WHERE NOT EXISTS (…)`). Mirrors
+/// [`coddl_write_relation`]'s record iteration to decode each row's cells, then
+/// expands the template's [`coddl_sqlemit::INSERT_ROWS_MARKER`] to a batch of
+/// `(?,…)` groups and binds the cells — a bulk multi-row `INSERT`, **no temp
+/// table** (so no catalog churn) and no per-row round-trip. Batched so
+/// `rows × arity` stays under the bind-variable limit; `prepare_cached` reuses
+/// the full-batch statement. Runs inside the current transaction; the
+/// `NOT EXISTS` keeps it idempotent and a key-clash hits the `PRIMARY KEY` (the
+/// Golden Rule). Aborts on prepare/execute failure.
+///
+/// # Safety
+/// `plan_id` must be a registered insert template. `src`/`desc` must describe a
+/// valid relation payload (as for [`coddl_write_relation`]).
+#[no_mangle]
+pub unsafe extern "C" fn coddl_exec_insert(
+    plan_id: PlanId,
+    src: *const u8,
+    desc: *const CoddlHeadingDesc,
+) -> CoddlStatus {
+    use crate::rc::{CoddlRcHeader, HEADER_SIZE};
+    use rusqlite::types::Value;
+
+    let (db_name, template) = {
+        let registry = plan_registry().lock().expect("plan registry poisoned");
+        match registry.get(&plan_id.0) {
+            Some(entry) => (entry.db_name.clone(), entry.sql.clone()),
+            None => {
+                eprintln!(
+                    "coddl: exec_insert: no plan registered for plan_id {}",
+                    plan_id.0
+                );
+                std::process::abort();
+            }
+        }
+    };
+
+    // An empty (or null) relation inserts nothing.
+    if src.is_null() || desc.is_null() {
+        return CoddlStatus::Ok;
+    }
+    let header = src.sub(HEADER_SIZE) as *const CoddlRcHeader;
+    let count = (*header).length as usize;
+    let arity = (*desc).attr_count as usize;
+    if count == 0 || arity == 0 {
+        return CoddlStatus::Ok;
+    }
+    let record_size = (*desc).record_size as usize;
+    let attrs = std::slice::from_raw_parts((*desc).attrs, arity);
+    let payload = std::slice::from_raw_parts(src, count * record_size);
+
+    // Decode every row's cells into owned bind values (row-major), reusing the
+    // same record layout `coddl_write_relation` reads.
+    let mut rows: Vec<Value> = Vec::with_capacity(count * arity);
+    for record_idx in 0..count {
+        let record = &payload[record_idx * record_size..(record_idx + 1) * record_size];
+        for attr in attrs {
+            let offset = attr.offset as usize;
+            if attr.kind == CoddlAttrKind::Integer as u32
+                || attr.kind == CoddlAttrKind::Boolean as u32
+            {
+                let bytes: [u8; 8] = record[offset..offset + 8].try_into().unwrap();
+                rows.push(Value::Integer(i64::from_ne_bytes(bytes)));
+            } else if attr.kind == CoddlAttrKind::Text as u32 {
+                let ptr_bytes: [u8; 8] = record[offset..offset + 8].try_into().unwrap();
+                let len_bytes: [u8; 8] = record[offset + 8..offset + 16].try_into().unwrap();
+                let cptr = usize::from_ne_bytes(ptr_bytes) as *const u8;
+                let len = usize::from_ne_bytes(len_bytes);
+                let s = if cptr.is_null() {
+                    String::new()
+                } else {
+                    match std::str::from_utf8(std::slice::from_raw_parts(cptr, len)) {
+                        Ok(s) => s.to_string(),
+                        Err(err) => {
+                            eprintln!("coddl: exec_insert: non-UTF-8 Text cell: {err}");
+                            std::process::abort();
+                        }
+                    }
+                };
+                rows.push(Value::Text(s));
+            } else {
+                eprintln!(
+                    "coddl: exec_insert: unsupported cell kind {} (only Integer/Boolean/Text)",
+                    attr.kind
+                );
+                std::process::abort();
+            }
+        }
+    }
+
+    // Resolve the plan's database to its connection path (as `coddl_exec`).
+    let path = {
+        let registry = database_registry()
+            .lock()
+            .expect("database registry poisoned");
+        match registry.get(&db_name) {
+            Some(entry) => entry.path.clone(),
+            None => {
+                eprintln!(
+                    "coddl: exec_insert: plan {} references unregistered database `{db_name}`",
+                    plan_id.0
+                );
+                std::process::abort();
+            }
+        }
+    };
+    ensure_connection(&path);
+
+    // One `(?, …)` group per row; substitute the template marker for a batch's
+    // worth of groups. Batch so `rows × arity` stays under the bind limit.
+    let one_group = format!("({})", vec!["?"; arity].join(", "));
+    let batch_rows = (INSERT_PARAM_BUDGET / arity).max(1);
+
+    let conn_guard = db_connections().lock().expect("conn map poisoned");
+    let conn = conn_guard
+        .get(&path)
+        .expect("connection inserted by ensure_connection");
+    for batch in rows.chunks(batch_rows * arity) {
+        let n_groups = batch.len() / arity;
+        let groups = vec![one_group.as_str(); n_groups].join(", ");
+        let sql = template.replace(coddl_sqlemit::INSERT_ROWS_MARKER, &groups);
+        let mut stmt = match conn.prepare_cached(&sql) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!(
+                    "coddl: exec_insert: prepare failed for plan {}: {err}",
+                    plan_id.0
+                );
+                std::process::abort();
+            }
+        };
+        if let Err(err) = stmt.execute(params_from_iter(batch.iter())) {
+            eprintln!(
+                "coddl: exec_insert: execution failed for plan {}: {err}",
+                plan_id.0
+            );
+            std::process::abort();
+        }
+    }
+    CoddlStatus::Ok
+}
+
 /// Lower one [`CoddlParam`] to an owned rusqlite bind value. Boolean binds as
 /// the 0/1 integer SQLite stores it as; Text copies its bytes so the bound
 /// value owns them. Aborts on an unsupported kind or non-UTF-8 Text.

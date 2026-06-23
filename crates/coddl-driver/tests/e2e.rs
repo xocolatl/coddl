@@ -1503,6 +1503,48 @@ fn dml_union_relvar_inserts_idempotently_cranelift() {
     assert_union_relvar_inserts_idempotently("cranelift");
 }
 
+/// `R := R union Relation { … }` — the right operand is an in-memory relation
+/// literal (not SQL-backed), so its rows are shipped from the process into the
+/// table via a batched `VALUES` insert (`coddl_exec_insert`). The literal here
+/// has one already-present tuple (id 2, a no-op) and one new (id 3).
+fn assert_union_literal_inserts_idempotently(backend: &str) {
+    // `run_greetings_dml` seeds greetings with ids 1 ('hello world') and 2
+    // ('goodbye'); the union literal repeats id 2 and adds id 3.
+    let rows = run_greetings_dml(
+        backend,
+        "program insert_update_delete;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             transaction [\n\
+                 Greetings := Greetings union Relation {\n\
+                     { id: 2, message: \"goodbye\" },\n\
+                     { id: 3, message: \"farewell\" },\n\
+                 };\n\
+             ];\n\
+         ];\n",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            "1|hello world".to_string(),
+            "2|goodbye".to_string(),
+            "3|farewell".to_string(),
+        ],
+        "backend={backend}"
+    );
+}
+
+#[test]
+fn dml_union_literal_inserts_idempotently_llvm() {
+    assert_union_literal_inserts_idempotently("llvm");
+}
+
+#[test]
+fn dml_union_literal_inserts_idempotently_cranelift() {
+    assert_union_literal_inserts_idempotently("cranelift");
+}
+
 // ── extend pushdown ───────────────────────────────────────────────────
 
 /// Write the `sales` database companions and seed a SQLite db with two rows.

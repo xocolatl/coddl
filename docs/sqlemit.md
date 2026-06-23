@@ -105,15 +105,24 @@ while a tuple sharing a key but differing elsewhere is *not* skipped, so `t`'s
 `PRIMARY KEY` rejects it — the Golden Rule (RM Pre 23): a key-violating update
 fails rather than silently dropping the tuple (so never `INSERT OR IGNORE`).
 
-A non-pushable operand (an in-memory `MaterializedRelvar` or a relation literal)
-makes `emit_select` decline, so the assignment surfaces a "not a supported write
-shape" diagnostic (T0049). The recognition set will grow to cover the in-memory
-`union` path (shipping those rows at runtime), `UPDATE` from a restricted replace
-chain, and the replace-all fallback.
+When the `union` operand is **not** pushable (an in-memory `MaterializedRelvar`,
+or a relation literal — its rows live in the process, not SQL), the assignment
+still inserts, but the rows are shipped at runtime rather than via a sub-SELECT.
+`emit_insert_template` bakes a fixed merge `INSERT INTO t (…) SELECT v.columnN…
+FROM (VALUES <marker>) AS v WHERE NOT EXISTS (…)`, where `<marker>`
+([`INSERT_ROWS_MARKER`]) is a placeholder the runtime expands to one `(?,…)`
+group per source row (in batches, sized under the bind-variable limit). Same
+set / Golden-Rule semantics as the pushable insert — only the row source differs
+(a bound `VALUES` list vs. a pushed sub-SELECT), and it uses **no temp table**
+(so no catalog churn). Any *other* unrecognized shape surfaces a "not a supported
+write shape" diagnostic (T0049). The recognition set will still grow to cover
+`UPDATE` from a restricted replace chain and the replace-all fallback.
 
-The recognized assignment is registered as a DML plan and fired by the runtime's
-`coddl_exec` (the write sibling of `coddl_query`) inside the enclosing
-transaction's `BEGIN`/`COMMIT` (see [storage.md](storage.md)).
+A recognized pushable assignment is registered as a DML plan and fired by the
+runtime's `coddl_exec` (the write sibling of `coddl_query`); an in-memory `union`
+fires `coddl_exec_insert` (which iterates the relation and runs the batched
+template). Both run inside the enclosing transaction's `BEGIN`/`COMMIT` (see
+[storage.md](storage.md)).
 
 ## Dialect surface
 

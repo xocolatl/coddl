@@ -25,7 +25,7 @@ use coddl_syntax::SyntaxKind;
 use coddl_types::{check, Heading, RelvarKind, RelvarTable, Type};
 
 use coddl_relir::{Literal as RelLiteral, Predicate, RelExpr, ScalarBinOp, ScalarExpr};
-use coddl_sqlemit::{emit_assignment, Dialect, SqlQuery, Value};
+use coddl_sqlemit::{emit_assignment, emit_insert_template, Dialect, SqlQuery, Value};
 
 use crate::ir::{
     BasicBlock, BlockId, Const, Function, HeadingId, Inst, Module, PlanEntry, ProcType,
@@ -823,21 +823,80 @@ impl Lowerer {
         };
         // Recognize the RHS shape: build both operands' RelIR (the target is a
         // bare `RelvarRef`; the RHS pushes only if `build_rel_expr` accepts it),
-        // then `emit_assignment`. Any decline lands on the unsupported-shape arm.
+        // then `emit_assignment`. A pushable shape becomes a single surgical
+        // statement (`Inst::Dml`).
         let recognized = self
             .build_rel_expr(target_expr)
             .zip(self.build_rel_expr(value_expr))
             .and_then(|(t, r)| emit_assignment(&t, &r, dialect).ok());
-        match recognized {
-            Some(query) => self.emit_dml(query),
-            None => self.diagnostics.push(Diagnostic::error(
-                self.node_span(value_expr.syntax()),
-                "T0049",
-                format!(
-                    "assignment to public relvar `{name}` is not a supported write shape \
-                     (the right-hand side must be a `minus` whose left operand is `{name}`)"
-                ),
-            )),
+        if let Some(query) = recognized {
+            self.emit_dml(query);
+            return;
+        }
+
+        // Not pushable: `R := R union <in-memory e>` (a relation literal, or a
+        // private relvar) ships `e`'s rows from the process into `R` at runtime —
+        // an idempotent batched-`VALUES` insert (`Inst::InsertFrom`).
+        if let Some(e) = self.union_insert_source(name, value_expr) {
+            if let Some(target_rel) = self.build_rel_expr(target_expr) {
+                if let Ok(template) = emit_insert_template(&target_rel, dialect) {
+                    let result_heading_id = self.intern_heading(&template.result_heading);
+                    let plan_id = self.register_plan(&template, result_heading_id);
+                    let src = self.lower_expr(&e);
+                    if let ProcType::Relation(heading_id) = self.value_type(src) {
+                        self.insts.push(Inst::InsertFrom {
+                            plan_id,
+                            src,
+                            heading_id,
+                        });
+                        // `e` is an anonymous sub-expression (not bound to a
+                        // local), so its relation payload is a temporary — release
+                        // it once the insert has shipped its rows (same fresh-
+                        // source discipline as `extract` / `write_relation`).
+                        let is_owned = self
+                            .locals
+                            .iter()
+                            .any(|layer| layer.values().any(|(vid, _)| *vid == src));
+                        if !is_owned {
+                            self.insts.push(Inst::Release { src });
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+
+        self.diagnostics.push(Diagnostic::error(
+            self.node_span(value_expr.syntax()),
+            "T0049",
+            format!(
+                "assignment to public relvar `{name}` is not a supported write shape \
+                 (the right-hand side must be a `minus` or `union` with `{name}`)"
+            ),
+        ));
+    }
+
+    /// For `R := R union e`, return the *other* operand `e` when the RHS is a
+    /// `union` with the target relvar `name` as one operand (union is
+    /// commutative). `None` otherwise. Used to route a non-pushable union (a
+    /// relation literal, or a private relvar) to the runtime row-shipping insert.
+    fn union_insert_source(&self, name: &str, value_expr: &Expr) -> Option<Expr> {
+        let Expr::Binary(b) = value_expr else {
+            return None;
+        };
+        if b.op_kind() != Some(BinaryOp::Union) {
+            return None;
+        }
+        let (lhs, rhs) = (b.lhs()?, b.rhs()?);
+        let is_target = |e: &Expr| {
+            matches!(e, Expr::NameRef(n) if n.ident().is_some_and(|t| t.text() == name))
+        };
+        if is_target(&lhs) {
+            Some(rhs)
+        } else if is_target(&rhs) {
+            Some(lhs)
+        } else {
+            None
         }
     }
 

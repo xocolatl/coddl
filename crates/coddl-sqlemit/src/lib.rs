@@ -363,6 +363,68 @@ fn emit_idempotent_insert(target: &RelExpr, e: &RelExpr, dialect: Dialect) -> Re
     })
 }
 
+/// Placeholder the runtime replaces with a batch of `VALUES` row-groups in an
+/// insert template (see [`emit_insert_template`]). A token that cannot occur in
+/// real SQL, so the substitution is unambiguous.
+pub const INSERT_ROWS_MARKER: &str = "__CODDL_ROW_VALUES__";
+
+/// Emit the **insert template** for the in-memory `union` path: `t := t union
+/// <in-memory e>`, where `e`'s rows are shipped from the process at runtime
+/// rather than pushed as SQL (a relation literal, or a private relvar). The
+/// template carries the [`INSERT_ROWS_MARKER`] inside `(VALUES …)`, which the
+/// runtime expands to one `(?,…)` group per source row (in batches); the
+/// idempotent `NOT EXISTS` merge and the column projection are fixed here at
+/// compile time. Same set / Golden-Rule semantics as [`emit_idempotent_insert`]
+/// — only the row source differs (a bound `VALUES` list vs. a pushed sub-SELECT).
+///
+/// The `(VALUES …) AS v` derived table exposes positional columns `column1…N`
+/// on both SQLite and Postgres; the projection and correlation reference those.
+pub fn emit_insert_template(target: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
+    let RelExpr::RelvarRef {
+        table_name,
+        columns,
+        ..
+    } = target
+    else {
+        return Err(BackendError::Other(
+            "insert target is not a base relvar".to_string(),
+        ));
+    };
+    let insert_cols: Vec<String> = columns.iter().map(|(_, phys)| quote_ident(phys)).collect();
+    let select_cols: Vec<String> = (1..=columns.len()).map(|i| format!("v.column{i}")).collect();
+    let conjuncts: Vec<String> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, (_, phys))| {
+            format!(
+                "{}.{} = v.column{}",
+                quote_ident(table_name),
+                quote_ident(phys),
+                i + 1
+            )
+        })
+        .collect();
+    let text = format!(
+        "INSERT INTO {} ({}) SELECT {} FROM (VALUES {}) AS v WHERE NOT EXISTS (SELECT 1 FROM {} WHERE {})",
+        quote_ident(table_name),
+        insert_cols.join(", "),
+        select_cols.join(", "),
+        INSERT_ROWS_MARKER,
+        quote_ident(table_name),
+        conjuncts.join(" AND ")
+    );
+    let plan_id = PlanId(fnv1a(dialect, &text));
+    Ok(SqlQuery {
+        sql: SqlString {
+            param_count: 0,
+            text,
+        },
+        params: Vec::new(),
+        result_heading: target.heading(),
+        plan_id,
+    })
+}
+
 /// Emit the anti-join `DELETE` for `t := t minus X` where `X` is a pushable,
 /// same-heading relation that is *not* rooted in `t` (the
 /// `t := t minus other_relvar` shape). Deletes every tuple of `t` that also
@@ -1160,6 +1222,19 @@ mod tests {
         };
         let rhs = union(greetings(), priv_rel);
         assert!(emit_assignment(&greetings(), &rhs, Dialect::SQLite).is_err());
+    }
+
+    #[test]
+    fn insert_template_marks_the_values_rows() {
+        // The in-memory `union` template: a fixed idempotent merge whose VALUES
+        // rows the runtime substitutes for the marker, projecting/correlating the
+        // derived table's positional columns.
+        let q = emit_insert_template(&greetings(), Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"INSERT INTO "greetings" ("id", "message") SELECT v.column1, v.column2 FROM (VALUES __CODDL_ROW_VALUES__) AS v WHERE NOT EXISTS (SELECT 1 FROM "greetings" WHERE "greetings"."id" = v.column1 AND "greetings"."message" = v.column2)"#
+        );
+        assert!(q.sql.text.contains(INSERT_ROWS_MARKER));
     }
 
     #[test]

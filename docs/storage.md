@@ -139,6 +139,11 @@ assignment to such a target (T0050).
 A relational assignment to a writable public relvar is recognized and
 emitted as surgical DML — the relvar is never hydrated and written back
 (see [sqlemit.md](sqlemit.md#surgical-writes-assignment-rhs-recognition)).
+When a `union` inserts rows that live **in the process** (a relation
+literal, or a private relvar) rather than in SQL, the runtime ships them
+into the table with a batched multi-row `VALUES` insert (`coddl_exec_insert`)
+— **no temp table**, so no catalog churn — sized in batches under the
+backend's bind-variable limit.
 
 ## Transactions
 

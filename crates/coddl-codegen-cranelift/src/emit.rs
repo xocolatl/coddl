@@ -518,6 +518,18 @@ fn declare_runtime_plan_externs(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert("coddl_exec".into(), id);
     }
+    // coddl_exec_insert(plan_id: i32, src: ptr, desc: ptr) -> i32 (CoddlStatus)
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(types::I32));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.returns.push(AbiParam::new(types::I32));
+        let id = obj
+            .declare_function("coddl_exec_insert", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_exec_insert".into(), id);
+    }
     Ok(())
 }
 
@@ -2058,6 +2070,24 @@ fn emit_inst(
             let n_v = builder.ins().iconst(types::I64, params.len() as i64);
             let exec_local = obj.declare_func_in_func(funcs["coddl_exec"], builder.func);
             builder.ins().call(exec_local, &[plan_id_v, params_arg, n_v]);
+            Ok(())
+        }
+        Inst::InsertFrom {
+            plan_id,
+            src,
+            heading_id,
+        } => {
+            // Ship `src`'s in-memory rows into the target via the insert template
+            // — pass the relation pointer + its heading descriptor (like
+            // `coddl_write_relation`) plus the plan id; the status is discarded.
+            let ptr_ty = obj.target_config().pointer_type();
+            let src_v = scalar_value(values, src)?;
+            let desc_id = heading_desc_ids[heading_id.0 as usize];
+            let desc_gv = obj.declare_data_in_func(desc_id, builder.func);
+            let desc_val = builder.ins().symbol_value(ptr_ty, desc_gv);
+            let plan_id_v = builder.ins().iconst(types::I32, *plan_id as i64);
+            let local = obj.declare_func_in_func(funcs["coddl_exec_insert"], builder.func);
+            builder.ins().call(local, &[plan_id_v, src_v, desc_val]);
             Ok(())
         }
     }
