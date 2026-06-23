@@ -19,3 +19,7 @@ relvar Greetings: table "greetings" {
 relvar Stale: table "stale" {
     columns: { id, message }
 };
+
+relvar NewArrivals: table "new_arrivals" {
+    columns: { id, message }
+};

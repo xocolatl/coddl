@@ -87,20 +87,29 @@ emitted SQL:
 | `Minus{ RelvarRef(t), Restrict*(RelvarRef(t), preds) }` | `DELETE FROM t WHERE <preds>` |
 | `Minus{ RelvarRef(t), RelvarRef(t) }` (self-subtraction) | `DELETE FROM t` (whole-table delete) |
 | `Minus{ RelvarRef(t), X }` (X same-heading, pushable, not rooted in `t`) | `DELETE FROM t WHERE EXISTS (SELECT 1 FROM (<X>) AS a WHERE t.col = a.attr AND …)` |
+| `Or{ RelvarRef(t), e }` (e same-heading, pushable; union is commutative) | `INSERT INTO t (…) SELECT … FROM (<e>) AS a WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.col = a.attr AND …)` |
 
-The first two delegate to a shared `emit_delete` on the `minus` subtrahend, which
-bottoms out in the target base relvar; the `WHERE` reuses the same
+The two delete rows delegate to a shared `emit_delete` on the `minus` subtrahend,
+which bottoms out in the target base relvar; the `WHERE` reuses the same
 `(column, literal)` collection a `SELECT … WHERE` builds for the equivalent
 restriction, so a delete predicate is byte-identical to the matching read
-predicate. The third (`emit_anti_join_delete`, e.g. `t := t minus other_relvar`)
-renders `X` via `emit_select` as a derived table whose columns are the Coddl
-attribute names, then correlates every attribute (`t`'s physical column against
-the derived table's attribute column) — full tuple equality (RM Pre 8) inside an
-`EXISTS`, never an outer join (RM Pro 4); a non-pushable `X` (an in-memory
-relation) declines. Any other shape is declined — the lowerer surfaces a "not a
-supported write shape" diagnostic (T0049). The recognition set will grow to cover
-`INSERT` from a `union`, `UPDATE` from a restricted replace chain, and the
-replace-all fallback.
+predicate. The anti-join delete (`emit_anti_join_delete`, e.g. `t := t minus
+other_relvar`) renders `X` via `emit_select` as a derived table whose columns are
+the Coddl attribute names, then correlates every attribute (`t`'s physical column
+against the derived table's attribute column) — full tuple equality (RM Pre 8)
+inside an `EXISTS`, never an outer join (RM Pro 4). The union insert
+(`emit_idempotent_insert`, e.g. `t := t union other_relvar`) is the mirror image:
+the same derived table + all-attribute correlation, but `INSERT … SELECT …
+WHERE NOT EXISTS`. The `NOT EXISTS` makes re-inserting an identical tuple a no-op
+while a tuple sharing a key but differing elsewhere is *not* skipped, so `t`'s
+`PRIMARY KEY` rejects it — the Golden Rule (RM Pre 23): a key-violating update
+fails rather than silently dropping the tuple (so never `INSERT OR IGNORE`).
+
+A non-pushable operand (an in-memory `MaterializedRelvar` or a relation literal)
+makes `emit_select` decline, so the assignment surfaces a "not a supported write
+shape" diagnostic (T0049). The recognition set will grow to cover the in-memory
+`union` path (shipping those rows at runtime), `UPDATE` from a restricted replace
+chain, and the replace-all fallback.
 
 The recognized assignment is registered as a DML plan and fired by the runtime's
 `coddl_exec` (the write sibling of `coddl_query`) inside the enclosing

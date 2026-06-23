@@ -253,14 +253,17 @@ fn emit_delete(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
 /// assignment is the write primitive (RM Pre 21); the surgical equivalent is
 /// shape-recognition on the RHS rather than a hydrate-mutate-writeback.
 ///
-/// The recognized shapes are all `t := t minus <subtrahend>` (the minuend is the
-/// bare target relvar):
-/// - subtrahend bottoms out in `t` (a `where`-restriction, or the bare relvar) →
-///   delete exactly its rows via [`emit_delete`]: `DELETE FROM t WHERE p…`, or a
-///   whole-table `DELETE FROM t` for the self-subtraction `t minus t`;
-/// - subtrahend is any other pushable, same-heading relation `X` → an anti-join
-///   `DELETE FROM t WHERE EXISTS (… X … AND t.col = X.attr …)` removing every
-///   tuple of `t` that also appears in `X` (e.g. `t := t minus other_relvar`).
+/// The recognized shapes all have the target relvar as one operand:
+/// - `t := t minus <subtrahend>` where the subtrahend bottoms out in `t` (a
+///   `where`-restriction, or the bare relvar) → delete exactly its rows via
+///   [`emit_delete`]: `DELETE FROM t WHERE p…`, or a whole-table `DELETE FROM t`
+///   for the self-subtraction `t minus t`;
+/// - `t := t minus X` where `X` is any other pushable, same-heading relation →
+///   an anti-join `DELETE FROM t WHERE EXISTS (… X … AND t.col = X.attr …)`;
+/// - `t := t union e` where `e` is a pushable, same-heading relation → an
+///   idempotent `INSERT INTO t … SELECT … FROM e WHERE NOT EXISTS (…)`, inserting
+///   every tuple of `e` not already in `t` (union is commutative, so `t` may be
+///   either operand).
 ///
 /// Any other shape is declined with `Err`.
 pub fn emit_assignment(target: &RelExpr, rhs: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
@@ -269,10 +272,9 @@ pub fn emit_assignment(target: &RelExpr, rhs: &RelExpr, dialect: Dialect) -> Res
             "assignment target does not resolve to a base relvar".to_string(),
         ));
     };
+    let is_target = |e: &RelExpr| matches!(e, RelExpr::RelvarRef { table_name, .. } if table_name == t);
     match rhs {
-        RelExpr::Minus { lhs, rhs: subtrahend }
-            if matches!(lhs.as_ref(), RelExpr::RelvarRef { table_name, .. } if table_name == t) =>
-        {
+        RelExpr::Minus { lhs, rhs: subtrahend } if is_target(lhs) => {
             if delete_base_table(subtrahend) == Some(t.as_str()) {
                 // Subtrahend is the target relvar, optionally `where`-restricted:
                 // delete exactly its rows (or every row, for `t minus t`).
@@ -282,10 +284,83 @@ pub fn emit_assignment(target: &RelExpr, rhs: &RelExpr, dialect: Dialect) -> Res
                 emit_anti_join_delete(target, subtrahend, dialect)
             }
         }
+        // `t := t union e` — union is commutative, so the target may be the left
+        // or right operand; `e` is the other one.
+        RelExpr::Or { lhs, rhs } if is_target(lhs) => {
+            emit_idempotent_insert(target, rhs, dialect)
+        }
+        RelExpr::Or { lhs, rhs } if is_target(rhs) => {
+            emit_idempotent_insert(target, lhs, dialect)
+        }
         _ => Err(BackendError::Other(
-            "unrecognized assignment RHS shape (not a `minus` over the target relvar)".to_string(),
+            "unrecognized assignment RHS shape (not a `minus`/`union` over the target relvar)"
+                .to_string(),
         )),
     }
+}
+
+/// Emit the idempotent `INSERT` for `t := t union e` where `e` is a pushable,
+/// same-heading relation → insert every tuple of `e` not already in `t`. Set
+/// union keeps `t` a set, so the `NOT EXISTS` makes re-inserting an identical
+/// tuple a no-op; a tuple sharing a key but differing elsewhere is *not* skipped,
+/// so `t`'s `PRIMARY KEY` rejects it — the Golden Rule (RM Pre 23): a
+/// key-violating update fails rather than silently dropping the tuple. Tuple
+/// equality on all attributes (RM Pre 8), no outer join (RM Pro 4) — the insert
+/// mirror of [`emit_anti_join_delete`].
+///
+/// `e` renders via [`emit_select`] as a derived table with attribute-named
+/// columns; the INSERT column list and the `NOT EXISTS` correlation use `t`'s
+/// physical columns (canonical order). A non-pushable `e` (e.g. an in-memory
+/// `MaterializedRelvar` or a relation literal) makes `emit_select` `Err`, which
+/// propagates so the assignment declines (the in-memory path ships those rows at
+/// runtime instead).
+fn emit_idempotent_insert(target: &RelExpr, e: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
+    let RelExpr::RelvarRef {
+        table_name,
+        columns,
+        ..
+    } = target
+    else {
+        return Err(BackendError::Other(
+            "insert target is not a base relvar".to_string(),
+        ));
+    };
+    let src = emit_select(e, dialect)?;
+    let insert_cols: Vec<String> = columns.iter().map(|(_, phys)| quote_ident(phys)).collect();
+    let select_cols: Vec<String> = columns
+        .iter()
+        .map(|(attr, _)| format!("coddl_src.{}", quote_ident(attr)))
+        .collect();
+    let conjuncts: Vec<String> = columns
+        .iter()
+        .map(|(attr, phys)| {
+            format!(
+                "{}.{} = coddl_src.{}",
+                quote_ident(table_name),
+                quote_ident(phys),
+                quote_ident(attr)
+            )
+        })
+        .collect();
+    let text = format!(
+        "INSERT INTO {} ({}) SELECT {} FROM ({}) AS coddl_src WHERE NOT EXISTS (SELECT 1 FROM {} WHERE {})",
+        quote_ident(table_name),
+        insert_cols.join(", "),
+        select_cols.join(", "),
+        src.sql.text,
+        quote_ident(table_name),
+        conjuncts.join(" AND ")
+    );
+    let plan_id = PlanId(fnv1a(dialect, &text));
+    Ok(SqlQuery {
+        sql: SqlString {
+            param_count: src.params.len() as u32,
+            text,
+        },
+        params: src.params,
+        result_heading: target.heading(),
+        plan_id,
+    })
 }
 
 /// Emit the anti-join `DELETE` for `t := t minus X` where `X` is a pushable,
@@ -925,11 +1000,11 @@ mod tests {
 
     #[test]
     fn assignment_declines_unrecognized_rhs() {
-        // Only the two DELETE-family shapes are recognized; a `union` RHS (an
-        // insert) is not, so it declines here.
-        let rhs = RelExpr::Or {
+        // Recognized shapes are `minus`/`union` with the target as an operand; a
+        // `join` (`And`) RHS is neither, so it declines.
+        let rhs = RelExpr::And {
             lhs: Box::new(greetings()),
-            rhs: Box::new(greetings()),
+            rhs: Box::new(employees()),
         };
         assert!(emit_assignment(&greetings(), &rhs, Dialect::SQLite).is_err());
     }
@@ -1005,6 +1080,85 @@ mod tests {
             heading: greetings_heading(),
         };
         let rhs = minus(greetings(), priv_rel);
+        assert!(emit_assignment(&greetings(), &rhs, Dialect::SQLite).is_err());
+    }
+
+    /// A second relvar with the same heading as `greetings`, bound to table
+    /// `new_arrivals` — the right operand of a `union` insert.
+    fn new_arrivals() -> RelExpr {
+        RelExpr::RelvarRef {
+            name: "NewArrivals".to_string(),
+            database: "greetings".to_string(),
+            heading: greetings_heading(),
+            table_name: "new_arrivals".to_string(),
+            columns: vec![
+                ("id".to_string(), "id".to_string()),
+                ("message".to_string(), "message".to_string()),
+            ],
+            keys: vec![vec!["id".to_string()]],
+        }
+    }
+
+    fn union(a: RelExpr, b: RelExpr) -> RelExpr {
+        RelExpr::Or {
+            lhs: Box::new(a),
+            rhs: Box::new(b),
+        }
+    }
+
+    #[test]
+    fn assignment_union_other_relvar_emits_idempotent_insert() {
+        // `Greetings := Greetings union NewArrivals` inserts every NewArrivals
+        // tuple not already in Greetings — NOT EXISTS on all attributes keeps it
+        // a set (identical tuple is a no-op; a key-clash hits the PK and errors).
+        let rhs = union(greetings(), new_arrivals());
+        let q = emit_assignment(&greetings(), &rhs, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"INSERT INTO "greetings" ("id", "message") SELECT coddl_src."id", coddl_src."message" FROM (SELECT "id", "message" FROM "new_arrivals") AS coddl_src WHERE NOT EXISTS (SELECT 1 FROM "greetings" WHERE "greetings"."id" = coddl_src."id" AND "greetings"."message" = coddl_src."message")"#
+        );
+        assert_eq!(q.sql.param_count, 0);
+        assert!(q.params.is_empty());
+    }
+
+    #[test]
+    fn assignment_union_is_commutative_target_on_right() {
+        // Union is commutative, so `Greetings := NewArrivals union Greetings`
+        // recognizes identically (target is the right operand).
+        let rhs = union(new_arrivals(), greetings());
+        let q = emit_assignment(&greetings(), &rhs, Dialect::SQLite).unwrap();
+        assert!(
+            q.sql.text.starts_with(r#"INSERT INTO "greetings" ("id", "message")"#),
+            "got: {}",
+            q.sql.text
+        );
+    }
+
+    #[test]
+    fn assignment_union_restricted_relvar_binds_param() {
+        let x = RelExpr::Restrict {
+            input: Box::new(new_arrivals()),
+            pred: Predicate::AttrEq {
+                attr: "id".to_string(),
+                value: Literal::Integer(5),
+            },
+        };
+        let rhs = union(greetings(), x);
+        let q = emit_assignment(&greetings(), &rhs, Dialect::SQLite).unwrap();
+        assert!(q.sql.text.contains(r#"WHERE "id" = ?) AS coddl_src"#), "got: {}", q.sql.text);
+        assert_eq!(q.sql.param_count, 1);
+        assert_eq!(q.params, vec![Value::Integer(5)]);
+    }
+
+    #[test]
+    fn assignment_union_declines_non_pushable_operand() {
+        // A relation literal / private relation isn't pushable — declines here
+        // (the in-memory path ships those rows at runtime).
+        let priv_rel = RelExpr::MaterializedRelvar {
+            name: "Local".to_string(),
+            heading: greetings_heading(),
+        };
+        let rhs = union(greetings(), priv_rel);
         assert!(emit_assignment(&greetings(), &rhs, Dialect::SQLite).is_err());
     }
 

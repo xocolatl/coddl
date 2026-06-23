@@ -1406,6 +1406,103 @@ fn dml_anti_join_minus_relvar_cranelift() {
     assert_anti_join_minus_relvar_persists("cranelift");
 }
 
+/// Seed `greetings` (ids 1,2) and a same-heading `new_arrivals` (id 2 — already
+/// present — and id 3 — new), declare both relvars, run `program`, and return
+/// the surviving `greetings` rows. The suite owns its source.
+fn run_union_dml(backend: &str, program: &str) -> Vec<String> {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("greetings.cddb"),
+        "database greetings;\n\
+         base relvar Greetings { id: Integer, message: Text } key { id };\n\
+         base relvar NewArrivals { id: Integer, message: Text } key { id };\n",
+    )
+    .expect("write greetings.cddb");
+    std::fs::write(
+        dir.join("greetings.cdstore"),
+        "store for greetings;\n\
+         backend sqlite { file: \"greetings.sqlite\" };\n\
+         relvar Greetings: table \"greetings\" { columns: { id: \"id\", message: \"message\" } };\n\
+         relvar NewArrivals: table \"new_arrivals\" { columns: { id: \"id\", message: \"message\" } };\n",
+    )
+    .expect("write greetings.cdstore");
+    let db = dir.join("greetings.sqlite");
+    let seed = Command::new("sqlite3")
+        .arg(&db)
+        .arg(
+            "CREATE TABLE greetings (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
+             CREATE TABLE new_arrivals (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
+             INSERT INTO greetings (id, message) VALUES (1, 'hello world'), (2, 'goodbye'); \
+             INSERT INTO new_arrivals (id, message) VALUES (2, 'goodbye'), (3, 'farewell');",
+        )
+        .status()
+        .expect("invoke sqlite3");
+    assert!(seed.success(), "union DML fixture seed failed");
+
+    let cd = dir.join("dml.cd");
+    std::fs::write(&cd, program).expect("write dml.cd");
+
+    let out = coddl()
+        .env("CODDL_GREETINGS_FILE", &db)
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend={backend} {:?} failed: stderr=\n{}",
+        cd,
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let q = Command::new("sqlite3")
+        .arg(&db)
+        .arg("SELECT id || '|' || message FROM greetings ORDER BY id")
+        .output()
+        .expect("sqlite3 read-back");
+    assert!(q.status.success(), "sqlite3 read-back failed");
+    String::from_utf8_lossy(&q.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// `R := R union S` emits an idempotent `INSERT … WHERE NOT EXISTS`: the new
+/// tuple (id 3) is added, the already-present one (id 2) is a no-op.
+fn assert_union_relvar_inserts_idempotently(backend: &str) {
+    let rows = run_union_dml(
+        backend,
+        "program insert_update_delete;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         public relvar NewArrivals { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             transaction [ Greetings := Greetings union NewArrivals; ];\n\
+         ];\n",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            "1|hello world".to_string(),
+            "2|goodbye".to_string(),
+            "3|farewell".to_string(),
+        ],
+        "backend={backend}"
+    );
+}
+
+#[test]
+fn dml_union_relvar_inserts_idempotently_llvm() {
+    assert_union_relvar_inserts_idempotently("llvm");
+}
+
+#[test]
+fn dml_union_relvar_inserts_idempotently_cranelift() {
+    assert_union_relvar_inserts_idempotently("cranelift");
+}
+
 // ── extend pushdown ───────────────────────────────────────────────────
 
 /// Write the `sales` database companions and seed a SQLite db with two rows.

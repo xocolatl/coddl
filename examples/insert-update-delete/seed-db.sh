@@ -24,6 +24,12 @@ CREATE TABLE stale (
     PRIMARY KEY (id)
 );
 
+CREATE TABLE new_arrivals (
+    id      INTEGER NOT NULL,
+    message TEXT NOT NULL,
+    PRIMARY KEY (id)
+);
+
 INSERT INTO greetings (id, message) VALUES
     (1, 'hello world'),
     (2, 'goodbye'),
@@ -34,6 +40,12 @@ INSERT INTO greetings (id, message) VALUES
 INSERT INTO stale (id, message) VALUES
     (2, 'goodbye'),
     (3, 'farewell');
+
+-- Tuples to add. (4, 'so long') is already present, so the union is a no-op
+-- for it (idempotent); (5, 'howdy') is genuinely new.
+INSERT INTO new_arrivals (id, message) VALUES
+    (4, 'so long'),
+    (5, 'howdy');
 SQL
 
 echo "seeded greetings.sqlite"

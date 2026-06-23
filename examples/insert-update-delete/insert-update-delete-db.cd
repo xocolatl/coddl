@@ -4,9 +4,9 @@
 // the same algebra, but the relvars are bound to SQLite tables — the backend
 // recognizes the right-hand-side shape and emits the surgical SQL.
 //
-//   greetings.cddb    declares the base relvars (Greetings, Stale)
+//   greetings.cddb    declares the base relvars (Greetings, Stale, NewArrivals)
 //   greetings.cdstore binds them to SQLite tables
-//   seed-db.sh        creates greetings.sqlite (Greetings id 1..4, Stale 2,3)
+//   seed-db.sh        creates greetings.sqlite (Greetings 1..4, Stale 2,3, NewArrivals 4,5)
 //
 // Run:  ./seed-db.sh && coddl run insert-update-delete-db.cd
 
@@ -15,6 +15,7 @@ database greetings;
 
 public relvar Greetings { id: Integer, message: Text } key { id };
 public relvar Stale { id: Integer, message: Text } key { id };
+public relvar NewArrivals { id: Integer, message: Text } key { id };
 
 oper main {} [
     // Every database access sits inside a transaction.
@@ -30,6 +31,11 @@ oper main {} [
     // attribute (id and message). Assigning `Greetings minus Stale` back is an
     // anti-join delete: `DELETE FROM greetings WHERE EXISTS (... AND ... )`.
     transaction [ Greetings := Greetings minus Stale; ];
+
+    // Add every NewArrivals tuple not already present. `Greetings union
+    // NewArrivals` keeps Greetings a set, so an already-present tuple is a no-op
+    // (idempotent): an `INSERT INTO greetings ... WHERE NOT EXISTS (...)`.
+    transaction [ Greetings := Greetings union NewArrivals; ];
 
     let after = transaction [ Greetings ];
     write_relation { rel: after };

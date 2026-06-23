@@ -11,6 +11,7 @@ program insert_update_delete;
 
 private relvar Greetings { id: Integer, message: Text } key { id };
 private relvar Stale { id: Integer, message: Text } key { id };
+private relvar NewArrivals { id: Integer, message: Text } key { id };
 
 oper main {} [
     Greetings := Relation {
@@ -24,6 +25,11 @@ oper main {} [
         { id: 2, message: "goodbye" },
         { id: 3, message: "farewell" },
     };
+    // Tuples to add — (4, "so long") is already present (idempotent), (5, "howdy") is new.
+    NewArrivals := Relation {
+        { id: 4, message: "so long" },
+        { id: 5, message: "howdy" },
+    };
     write_relation { rel: Greetings };
 
     // Remove one tuple by predicate: the rows except the one with id 1.
@@ -31,5 +37,8 @@ oper main {} [
 
     // Remove every tuple that also appears in Stale (matched on every attribute).
     Greetings := Greetings minus Stale;
+
+    // Add every tuple in NewArrivals not already present (set union — idempotent).
+    Greetings := Greetings union NewArrivals;
     write_relation { rel: Greetings };
 ];

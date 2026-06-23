@@ -13,3 +13,10 @@ base relvar Stale {
     message: Text,
 }
 key { id };
+
+// Tuples to add — same heading again, so it can be unioned into Greetings.
+base relvar NewArrivals {
+    id: Integer,
+    message: Text,
+}
+key { id };
