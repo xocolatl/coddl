@@ -29,7 +29,7 @@ private relvar Sales {
 oper main {} [
     Sales := Relation {
         { id: 1, customer: "ada", item: "widget", unit_cents: 500, qty: 3 },
-        { id: 2, customer: "bo",  item: "gadget", unit_cents: 800, qty: 2 },
+        { id: 2, customer: "bo", item: "gadget", unit_cents: 800, qty: 2 },
     };
 
     // extend: add a computed `line_cents = unit_cents * qty`, KEEPING the

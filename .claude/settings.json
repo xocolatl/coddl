@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "statusMessage": "Formatting .cd",
+            "command": "f=$(jq -r '.tool_input.file_path // empty'); case \"$f\" in *.cd) bin=\"${CLAUDE_PROJECT_DIR:-.}/target/debug/coddl\"; if [ -x \"$bin\" ] && [ -f \"$f\" ]; then t=$(mktemp); if \"$bin\" fmt \"$f\" >\"$t\" 2>/dev/null; then mv \"$t\" \"$f\"; else rm -f \"$t\"; fi; fi ;; esac"
+          }
+        ]
+      }
+    ]
+  }
+}
