@@ -86,15 +86,21 @@ emitted SQL:
 |---|---|
 | `Minus{ RelvarRef(t), Restrict*(RelvarRef(t), preds) }` | `DELETE FROM t WHERE <preds>` |
 | `Minus{ RelvarRef(t), RelvarRef(t) }` (self-subtraction) | `DELETE FROM t` (whole-table delete) |
+| `Minus{ RelvarRef(t), X }` (X same-heading, pushable, not rooted in `t`) | `DELETE FROM t WHERE EXISTS (SELECT 1 FROM (<X>) AS a WHERE t.col = a.attr AND …)` |
 
-Both delegate to a shared `emit_delete` on the `minus` subtrahend, which bottoms
-out in the target base relvar; the `WHERE` reuses the same `(column, literal)`
-collection a `SELECT … WHERE` builds for the equivalent restriction, so a delete
-predicate is byte-identical to the matching read predicate. Any other shape is
-declined — the lowerer surfaces a "not a supported write shape" diagnostic
-(T0049). The recognition set will grow to cover anti-join `DELETE` against
-another relvar, `INSERT` from a `union`, `UPDATE` from a restricted replace
-chain, and the replace-all fallback.
+The first two delegate to a shared `emit_delete` on the `minus` subtrahend, which
+bottoms out in the target base relvar; the `WHERE` reuses the same
+`(column, literal)` collection a `SELECT … WHERE` builds for the equivalent
+restriction, so a delete predicate is byte-identical to the matching read
+predicate. The third (`emit_anti_join_delete`, e.g. `t := t minus other_relvar`)
+renders `X` via `emit_select` as a derived table whose columns are the Coddl
+attribute names, then correlates every attribute (`t`'s physical column against
+the derived table's attribute column) — full tuple equality (RM Pre 8) inside an
+`EXISTS`, never an outer join (RM Pro 4); a non-pushable `X` (an in-memory
+relation) declines. Any other shape is declined — the lowerer surfaces a "not a
+supported write shape" diagnostic (T0049). The recognition set will grow to cover
+`INSERT` from a `union`, `UPDATE` from a restricted replace chain, and the
+replace-all fallback.
 
 The recognized assignment is registered as a DML plan and fired by the runtime's
 `coddl_exec` (the write sibling of `coddl_query`) inside the enclosing

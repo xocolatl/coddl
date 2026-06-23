@@ -5,3 +5,11 @@ base relvar Greetings {
     message: Text,
 }
 key { id };
+
+// Tuples slated for removal — same heading as Greetings, so it can be
+// subtracted from it.
+base relvar Stale {
+    id: Integer,
+    message: Text,
+}
+key { id };

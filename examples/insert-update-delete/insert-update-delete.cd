@@ -2,24 +2,34 @@
 //
 // Writing a relvar, in process. The twin of insert-update-delete-db.cd: the
 // same algebra (assignment is the write primitive — the right-hand side's shape
-// is the operation), but here Greetings is a private in-memory relvar seeded
-// from a relation literal instead of a SQL-backed table.
+// is the operation), but here the relvars are private in-memory values seeded
+// from relation literals instead of SQL-backed tables.
 //
 // Run:  coddl run insert-update-delete.cd
 
 program insert_update_delete;
 
 private relvar Greetings { id: Integer, message: Text } key { id };
+private relvar Stale { id: Integer, message: Text } key { id };
 
 oper main {} [
     Greetings := Relation {
         { id: 1, message: "hello world" },
         { id: 2, message: "goodbye" },
         { id: 3, message: "farewell" },
+        { id: 4, message: "so long" },
+    };
+    // Exact tuples to purge from Greetings (matched on id AND message).
+    Stale := Relation {
+        { id: 2, message: "goodbye" },
+        { id: 3, message: "farewell" },
     };
     write_relation { rel: Greetings };
 
-    // Remove one tuple: the rows of Greetings except the one with id 1.
+    // Remove one tuple by predicate: the rows except the one with id 1.
     Greetings := Greetings minus (Greetings where id = 1);
+
+    // Remove every tuple that also appears in Stale (matched on every attribute).
+    Greetings := Greetings minus Stale;
     write_relation { rel: Greetings };
 ];

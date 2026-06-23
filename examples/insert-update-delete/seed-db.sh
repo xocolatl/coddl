@@ -18,8 +18,20 @@ CREATE TABLE greetings (
     PRIMARY KEY (id)
 );
 
+CREATE TABLE stale (
+    id      INTEGER NOT NULL,
+    message TEXT NOT NULL,
+    PRIMARY KEY (id)
+);
+
 INSERT INTO greetings (id, message) VALUES
     (1, 'hello world'),
+    (2, 'goodbye'),
+    (3, 'farewell'),
+    (4, 'so long');
+
+-- Exact tuples to purge from greetings (matched on id AND message).
+INSERT INTO stale (id, message) VALUES
     (2, 'goodbye'),
     (3, 'farewell');
 SQL

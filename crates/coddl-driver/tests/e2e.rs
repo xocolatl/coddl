@@ -1305,6 +1305,107 @@ fn dml_delete_via_binding_transparency_cranelift() {
     assert_delete_via_binding("cranelift");
 }
 
+/// Seed a fresh db with two same-heading tables — `greetings` (ids 1..4) and
+/// `stale` (ids 2,3, the tuples to purge) — plus a `.cddb`/`.cdstore` declaring
+/// both relvars, run `program` on `backend`, and return the surviving
+/// `greetings` rows as `"id|message"` lines sorted by id. The suite owns its
+/// source — it never reads `examples/`.
+fn run_two_relvar_dml(backend: &str, program: &str) -> Vec<String> {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("greetings.cddb"),
+        "database greetings;\n\
+         base relvar Greetings { id: Integer, message: Text } key { id };\n\
+         base relvar Stale { id: Integer, message: Text } key { id };\n",
+    )
+    .expect("write greetings.cddb");
+    std::fs::write(
+        dir.join("greetings.cdstore"),
+        "store for greetings;\n\
+         backend sqlite { file: \"greetings.sqlite\" };\n\
+         relvar Greetings: table \"greetings\" { columns: { id: \"id\", message: \"message\" } };\n\
+         relvar Stale: table \"stale\" { columns: { id: \"id\", message: \"message\" } };\n",
+    )
+    .expect("write greetings.cdstore");
+    let db = dir.join("greetings.sqlite");
+    let seed = Command::new("sqlite3")
+        .arg(&db)
+        .arg(
+            "CREATE TABLE greetings (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
+             CREATE TABLE stale (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
+             INSERT INTO greetings (id, message) VALUES \
+               (1, 'hello world'), (2, 'goodbye'), (3, 'farewell'), (4, 'so long'); \
+             INSERT INTO stale (id, message) VALUES (2, 'goodbye'), (3, 'farewell');",
+        )
+        .status()
+        .expect("invoke sqlite3");
+    assert!(seed.success(), "two-relvar DML fixture seed failed");
+
+    let cd = dir.join("dml.cd");
+    std::fs::write(&cd, program).expect("write dml.cd");
+
+    let out = coddl()
+        .env("CODDL_GREETINGS_FILE", &db)
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend={backend} {:?} failed: stderr=\n{}",
+        cd,
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let q = Command::new("sqlite3")
+        .arg(&db)
+        .arg("SELECT id || '|' || message FROM greetings ORDER BY id")
+        .output()
+        .expect("sqlite3 read-back");
+    assert!(
+        q.status.success(),
+        "sqlite3 read-back failed: {}",
+        String::from_utf8_lossy(&q.stderr)
+    );
+    String::from_utf8_lossy(&q.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// `R := R minus S` (two same-heading relvars) emits an anti-join
+/// `DELETE FROM greetings WHERE EXISTS (... stale ...)` that persists — every
+/// greetings tuple also in stale (ids 2, 3) is removed, leaving ids 1 and 4.
+fn assert_anti_join_minus_relvar_persists(backend: &str) {
+    let rows = run_two_relvar_dml(
+        backend,
+        "program insert_update_delete;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         public relvar Stale { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             transaction [ Greetings := Greetings minus Stale; ];\n\
+         ];\n",
+    );
+    assert_eq!(
+        rows,
+        vec!["1|hello world".to_string(), "4|so long".to_string()],
+        "backend={backend}"
+    );
+}
+
+#[test]
+fn dml_anti_join_minus_relvar_llvm() {
+    assert_anti_join_minus_relvar_persists("llvm");
+}
+
+#[test]
+fn dml_anti_join_minus_relvar_cranelift() {
+    assert_anti_join_minus_relvar_persists("cranelift");
+}
+
 // ── extend pushdown ───────────────────────────────────────────────────
 
 /// Write the `sales` database companions and seed a SQLite db with two rows.

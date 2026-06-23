@@ -835,7 +835,7 @@ impl Lowerer {
                 "T0049",
                 format!(
                     "assignment to public relvar `{name}` is not a supported write shape \
-                     (only `R minus (R where …)` and `R minus R` are emitted as surgical DML)"
+                     (the right-hand side must be a `minus` whose left operand is `{name}`)"
                 ),
             )),
         }

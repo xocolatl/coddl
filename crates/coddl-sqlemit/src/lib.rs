@@ -253,10 +253,14 @@ fn emit_delete(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
 /// assignment is the write primitive (RM Pre 21); the surgical equivalent is
 /// shape-recognition on the RHS rather than a hydrate-mutate-writeback.
 ///
-/// Two DELETE-family shapes are recognized — both delegate to [`emit_delete`]
-/// on the subtrahend, which bottoms out in the same base relvar:
-/// - `t := t minus (t where p…)` → `DELETE FROM t WHERE p…`
-/// - `t := t minus t` (self-subtraction) → `DELETE FROM t` (truncate)
+/// The recognized shapes are all `t := t minus <subtrahend>` (the minuend is the
+/// bare target relvar):
+/// - subtrahend bottoms out in `t` (a `where`-restriction, or the bare relvar) →
+///   delete exactly its rows via [`emit_delete`]: `DELETE FROM t WHERE p…`, or a
+///   whole-table `DELETE FROM t` for the self-subtraction `t minus t`;
+/// - subtrahend is any other pushable, same-heading relation `X` → an anti-join
+///   `DELETE FROM t WHERE EXISTS (… X … AND t.col = X.attr …)` removing every
+///   tuple of `t` that also appears in `X` (e.g. `t := t minus other_relvar`).
 ///
 /// Any other shape is declined with `Err`.
 pub fn emit_assignment(target: &RelExpr, rhs: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
@@ -266,22 +270,77 @@ pub fn emit_assignment(target: &RelExpr, rhs: &RelExpr, dialect: Dialect) -> Res
         ));
     };
     match rhs {
-        // `t := t minus <subtrahend>` where the minuend is the bare target
-        // relvar and the subtrahend bottoms out in that same relvar (a
-        // `where`-restriction, or the bare relvar for a self-truncate) → delete
-        // exactly the subtrahend's rows.
-        RelExpr::Minus {
-            lhs,
-            rhs: subtrahend,
-        } if matches!(lhs.as_ref(), RelExpr::RelvarRef { table_name, .. } if table_name == t)
-            && delete_base_table(subtrahend) == Some(t.as_str()) =>
+        RelExpr::Minus { lhs, rhs: subtrahend }
+            if matches!(lhs.as_ref(), RelExpr::RelvarRef { table_name, .. } if table_name == t) =>
         {
-            emit_delete(subtrahend, dialect)
+            if delete_base_table(subtrahend) == Some(t.as_str()) {
+                // Subtrahend is the target relvar, optionally `where`-restricted:
+                // delete exactly its rows (or every row, for `t minus t`).
+                emit_delete(subtrahend, dialect)
+            } else {
+                // Subtrahend is some other same-heading relation: anti-join.
+                emit_anti_join_delete(target, subtrahend, dialect)
+            }
         }
         _ => Err(BackendError::Other(
-            "unrecognized assignment RHS shape (not a delete or self-truncate)".to_string(),
+            "unrecognized assignment RHS shape (not a `minus` over the target relvar)".to_string(),
         )),
     }
+}
+
+/// Emit the anti-join `DELETE` for `t := t minus X` where `X` is a pushable,
+/// same-heading relation that is *not* rooted in `t` (the
+/// `t := t minus other_relvar` shape). Deletes every tuple of `t` that also
+/// appears in `X`. Tuple equality is on **all** attributes (RM Pre 8) and there
+/// are no nulls (RM Pro 4), so the correlation compares every column with `=`
+/// inside an `EXISTS` — never an outer join.
+///
+/// `X` is rendered by [`emit_select`] as a derived table whose output columns
+/// are the Coddl attribute names; the target side correlates its own physical
+/// columns. A non-pushable `X` (e.g. an in-memory `MaterializedRelvar`) makes
+/// `emit_select` `Err`, which propagates so the assignment declines.
+fn emit_anti_join_delete(target: &RelExpr, x: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
+    let RelExpr::RelvarRef {
+        table_name,
+        columns,
+        ..
+    } = target
+    else {
+        return Err(BackendError::Other(
+            "anti-join delete target is not a base relvar".to_string(),
+        ));
+    };
+    let sub = emit_select(x, dialect)?;
+    // Correlate every attribute: the target's physical column against the
+    // derived table's attribute-named column. `columns` is `(attr, phys)` in
+    // canonical (name-sorted) order, so the conjunction is deterministic.
+    let conjuncts: Vec<String> = columns
+        .iter()
+        .map(|(attr, phys)| {
+            format!(
+                "{}.{} = coddl_anti.{}",
+                quote_ident(table_name),
+                quote_ident(phys),
+                quote_ident(attr)
+            )
+        })
+        .collect();
+    let text = format!(
+        "DELETE FROM {} WHERE EXISTS (SELECT 1 FROM ({}) AS coddl_anti WHERE {})",
+        quote_ident(table_name),
+        sub.sql.text,
+        conjuncts.join(" AND ")
+    );
+    let plan_id = PlanId(fnv1a(dialect, &text));
+    Ok(SqlQuery {
+        sql: SqlString {
+            param_count: sub.params.len() as u32,
+            text,
+        },
+        params: sub.params,
+        result_heading: target.heading(),
+        plan_id,
+    })
 }
 
 /// The base relvar a DELETE subtrahend targets — `RelvarRef`, optionally under
@@ -875,11 +934,77 @@ mod tests {
         assert!(emit_assignment(&greetings(), &rhs, Dialect::SQLite).is_err());
     }
 
+    /// A second relvar with the *same* heading as `greetings`, bound to table
+    /// `stale` — the right operand of an anti-join `minus`.
+    fn stale() -> RelExpr {
+        RelExpr::RelvarRef {
+            name: "Stale".to_string(),
+            database: "greetings".to_string(),
+            heading: greetings_heading(),
+            table_name: "stale".to_string(),
+            columns: vec![
+                ("id".to_string(), "id".to_string()),
+                ("message".to_string(), "message".to_string()),
+            ],
+            keys: vec![vec!["id".to_string()]],
+        }
+    }
+
     #[test]
-    fn assignment_declines_minus_against_other_relvar() {
-        // The minuend must be the *target* relvar. `Greetings := Greetings minus
-        // Employees` is an anti-join delete (not recognized here).
-        let rhs = minus(greetings(), employees());
+    fn assignment_minus_other_relvar_emits_anti_join() {
+        // `Greetings := Greetings minus Stale` deletes every Greetings tuple that
+        // also appears in Stale — correlated on *all* attributes (RM Pre 8), via
+        // EXISTS (RM Pro 4: no outer join).
+        let rhs = minus(greetings(), stale());
+        let q = emit_assignment(&greetings(), &rhs, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"DELETE FROM "greetings" WHERE EXISTS (SELECT 1 FROM (SELECT "id", "message" FROM "stale") AS coddl_anti WHERE "greetings"."id" = coddl_anti."id" AND "greetings"."message" = coddl_anti."message")"#
+        );
+        assert_eq!(q.sql.param_count, 0);
+        assert!(q.params.is_empty());
+    }
+
+    #[test]
+    fn assignment_anti_join_against_restricted_relvar_binds_param() {
+        // The right operand can be any pushable same-heading relation; a
+        // restricted one threads its bind param through the derived table.
+        let x = RelExpr::Restrict {
+            input: Box::new(stale()),
+            pred: Predicate::AttrEq {
+                attr: "id".to_string(),
+                value: Literal::Integer(2),
+            },
+        };
+        let rhs = minus(greetings(), x);
+
+        let q = emit_assignment(&greetings(), &rhs, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"DELETE FROM "greetings" WHERE EXISTS (SELECT 1 FROM (SELECT "id", "message" FROM "stale" WHERE "id" = ?) AS coddl_anti WHERE "greetings"."id" = coddl_anti."id" AND "greetings"."message" = coddl_anti."message")"#
+        );
+        assert_eq!(q.sql.param_count, 1);
+        assert_eq!(q.params, vec![Value::Integer(2)]);
+
+        // Postgres numbers the derived table's placeholder from $1 (nothing
+        // precedes it in the DELETE).
+        let pg = emit_assignment(&greetings(), &rhs, Dialect::Postgres).unwrap();
+        assert!(
+            pg.sql.text.contains(r#"WHERE "id" = $1"#),
+            "expected $1 placeholder, got: {}",
+            pg.sql.text
+        );
+    }
+
+    #[test]
+    fn assignment_anti_join_declines_non_pushable_operand() {
+        // An in-memory (private) relation has no SQL source, so the anti-join
+        // can't be pushed — the assignment declines.
+        let priv_rel = RelExpr::MaterializedRelvar {
+            name: "Local".to_string(),
+            heading: greetings_heading(),
+        };
+        let rhs = minus(greetings(), priv_rel);
         assert!(emit_assignment(&greetings(), &rhs, Dialect::SQLite).is_err());
     }
 

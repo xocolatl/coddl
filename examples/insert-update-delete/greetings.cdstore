@@ -15,3 +15,7 @@ backend sqlite {
 relvar Greetings: table "greetings" {
     columns: { id, message }
 };
+
+relvar Stale: table "stale" {
+    columns: { id, message }
+};

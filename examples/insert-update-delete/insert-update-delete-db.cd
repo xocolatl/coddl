@@ -1,12 +1,12 @@
 // insert-update-delete-db.cd
 //
 // Writing a SQL-backed public relvar. The twin of insert-update-delete.cd:
-// the same algebra, but Greetings is bound to a SQLite table — the backend
+// the same algebra, but the relvars are bound to SQLite tables — the backend
 // recognizes the right-hand-side shape and emits the surgical SQL.
 //
-//   greetings.cddb    declares the base relvar
-//   greetings.cdstore binds it to the SQLite table
-//   seed-db.sh        creates greetings.sqlite (id 1..3)
+//   greetings.cddb    declares the base relvars (Greetings, Stale)
+//   greetings.cdstore binds them to SQLite tables
+//   seed-db.sh        creates greetings.sqlite (Greetings id 1..4, Stale 2,3)
 //
 // Run:  ./seed-db.sh && coddl run insert-update-delete-db.cd
 
@@ -14,16 +14,22 @@ program insert_update_delete_db;
 database greetings;
 
 public relvar Greetings { id: Integer, message: Text } key { id };
+public relvar Stale { id: Integer, message: Text } key { id };
 
 oper main {} [
     // Every database access sits inside a transaction.
     let before = transaction [ Greetings ];
     write_relation { rel: before };
 
-    // Remove one tuple. `Greetings minus (Greetings where id = 1)` is the rows
-    // of Greetings except the one with id 1 — assigning it back deletes that
-    // row: a single `DELETE FROM greetings WHERE id = ?`, no full-table read.
+    // Remove one tuple by predicate. `Greetings minus (Greetings where id = 1)`
+    // is the rows of Greetings except the one with id 1 — assigning it back
+    // deletes that row: a single `DELETE FROM greetings WHERE id = ?`.
     transaction [ Greetings := Greetings minus (Greetings where id = 1); ];
+
+    // Remove every tuple that also appears in Stale, matched on *every*
+    // attribute (id and message). Assigning `Greetings minus Stale` back is an
+    // anti-join delete: `DELETE FROM greetings WHERE EXISTS (... AND ... )`.
+    transaction [ Greetings := Greetings minus Stale; ];
 
     let after = transaction [ Greetings ];
     write_relation { rel: after };
