@@ -43,5 +43,10 @@ oper main {} [
 
     // Add a literal tuple (same union, an in-memory right operand).
     Greetings := Greetings union Relation { { id: 6, message: "hi there" } };
+
+    // Update one tuple: keep the rows that don't match, replace the value of the
+    // one that does. (A future `update` statement will be sugar for this union.)
+    Greetings := (Greetings where id <> 5)
+        union ((Greetings where id = 5) replace { message: message || " (seen)" });
     write_relation { rel: Greetings };
 ];

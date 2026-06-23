@@ -252,6 +252,22 @@ impl CmpOp {
             CmpOp::GtEq => CmpOp::LtEq,
         }
     }
+
+    /// The logical negation — `NOT (a OP b)` ≡ `a negate(OP) b`. With no nulls
+    /// (RM Pro 4, two-valued logic) the negation is total, so it's used to test
+    /// that an UPDATE's "unchanged rows" operand is the exact complement
+    /// `R where ¬p` of its "changed rows" `R where p`. Distinct from `flip`
+    /// (which swaps operands): `negate(Lt)` is `GtEq`, not `Gt`.
+    pub fn negate(self) -> CmpOp {
+        match self {
+            CmpOp::Eq => CmpOp::Ne,
+            CmpOp::Ne => CmpOp::Eq,
+            CmpOp::Lt => CmpOp::GtEq,
+            CmpOp::GtEq => CmpOp::Lt,
+            CmpOp::Gt => CmpOp::LtEq,
+            CmpOp::LtEq => CmpOp::Gt,
+        }
+    }
 }
 
 /// A scalar literal usable in a predicate. Grows alongside the scalar types
@@ -641,6 +657,29 @@ impl RelExpr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cmpop_negate_is_logical_complement() {
+        // `negate` is logical NOT (for the UPDATE complement), distinct from
+        // `flip` (operand swap): negate(Lt) is GtEq, flip(Lt) is Gt.
+        assert_eq!(CmpOp::Eq.negate(), CmpOp::Ne);
+        assert_eq!(CmpOp::Ne.negate(), CmpOp::Eq);
+        assert_eq!(CmpOp::Lt.negate(), CmpOp::GtEq);
+        assert_eq!(CmpOp::GtEq.negate(), CmpOp::Lt);
+        assert_eq!(CmpOp::Gt.negate(), CmpOp::LtEq);
+        assert_eq!(CmpOp::LtEq.negate(), CmpOp::Gt);
+        // Negation is an involution.
+        for op in [
+            CmpOp::Eq,
+            CmpOp::Ne,
+            CmpOp::Lt,
+            CmpOp::LtEq,
+            CmpOp::Gt,
+            CmpOp::GtEq,
+        ] {
+            assert_eq!(op.negate().negate(), op);
+        }
+    }
 
     fn greetings_heading() -> Heading {
         Heading::new(vec![

@@ -1642,6 +1642,74 @@ fn comparison_lt_pushes_cranelift() {
     assert_comparison_pushes("cranelift", "id < 2", "hello world", "<");
 }
 
+// ── surgical UPDATE (substitute-union recognition) ────────────────────
+
+/// `R := (R where id <> 1) union ((R where id = 1) replace { message: message
+/// || "!" })` — TTM's UPDATE expansion — emits `UPDATE greetings SET message =
+/// (message || '!') WHERE id = ?`. Only the matching row (id 1) changes. Written
+/// explicitly here (the `update` surface sugar lands later); `replace` on a
+/// self-referential value produces the heading-preserving substitute chain the
+/// UPDATE recognition matches.
+fn assert_update_where_persists(backend: &str) {
+    let rows = run_greetings_dml(
+        backend,
+        "program insert_update_delete;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             transaction [\n\
+                 Greetings := (Greetings where id <> 1)\n\
+                     union ((Greetings where id = 1) replace { message: message || \"!\" });\n\
+             ];\n\
+         ];\n",
+    );
+    assert_eq!(
+        rows,
+        vec!["1|hello world!".to_string(), "2|goodbye".to_string()],
+        "backend={backend}"
+    );
+}
+
+#[test]
+fn dml_update_where_persists_llvm() {
+    assert_update_where_persists("llvm");
+}
+
+#[test]
+fn dml_update_where_persists_cranelift() {
+    assert_update_where_persists("cranelift");
+}
+
+/// A bare substitute (no complement/union) updates every row —
+/// `R := R replace { message: message || "!" }` → `UPDATE greetings SET … `
+/// (no WHERE).
+fn assert_update_all_persists(backend: &str) {
+    let rows = run_greetings_dml(
+        backend,
+        "program insert_update_delete;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             transaction [ Greetings := Greetings replace { message: message || \"!\" }; ];\n\
+         ];\n",
+    );
+    assert_eq!(
+        rows,
+        vec!["1|hello world!".to_string(), "2|goodbye!".to_string()],
+        "backend={backend}"
+    );
+}
+
+#[test]
+fn dml_update_all_persists_llvm() {
+    assert_update_all_persists("llvm");
+}
+
+#[test]
+fn dml_update_all_persists_cranelift() {
+    assert_update_all_persists("cranelift");
+}
+
 // ── extend pushdown ───────────────────────────────────────────────────
 
 /// Write the `sales` database companions and seed a SQLite db with two rows.

@@ -263,7 +263,9 @@ fn emit_delete(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
 /// - `t := t union e` where `e` is a pushable, same-heading relation → an
 ///   idempotent `INSERT INTO t … SELECT … FROM e WHERE NOT EXISTS (…)`, inserting
 ///   every tuple of `e` not already in `t` (union is commutative, so `t` may be
-///   either operand).
+///   either operand);
+/// - `t := (t where ¬p) union ((t where p) «substitute»)` (or a bare substitute
+///   over `t`, update-all) → `UPDATE t SET … [WHERE p]` (see [`emit_update`]).
 ///
 /// Any other shape is declined with `Err`.
 pub fn emit_assignment(target: &RelExpr, rhs: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
@@ -292,10 +294,11 @@ pub fn emit_assignment(target: &RelExpr, rhs: &RelExpr, dialect: Dialect) -> Res
         RelExpr::Or { lhs, rhs } if is_target(rhs) => {
             emit_idempotent_insert(target, lhs, dialect)
         }
-        _ => Err(BackendError::Other(
-            "unrecognized assignment RHS shape (not a `minus`/`union` over the target relvar)"
-                .to_string(),
-        )),
+        // Otherwise try the UPDATE shape: a `union` of the unchanged rows and the
+        // substituted matching rows (`t := (t where ¬p) union ((t where p)
+        // «substitute»)`), or a bare substitute over `t` (update-all). Anything
+        // `emit_update` doesn't recognize declines with `Err`.
+        _ => emit_update(target, rhs, dialect),
     }
 }
 
@@ -358,6 +361,164 @@ fn emit_idempotent_insert(target: &RelExpr, e: &RelExpr, dialect: Dialect) -> Re
             text,
         },
         params: src.params,
+        result_heading: target.heading(),
+        plan_id,
+    })
+}
+
+/// Peel a **substitute** chain — `Rename?( Project?( Extend( inner ) ) )`, the
+/// heading-preserving shape `R replace { c: e }` desugars to — into its `inner`
+/// relation and the `(target_attr, value)` assignments. Each `Extend` value is
+/// paired with its `Rename` target (`rename temp → target` × `extend temp = e`
+/// → `target ← e`); an un-renamed extend keeps its own name. `None` when there's
+/// no `Extend` (e.g. a plain `Restrict` — the unchanged-rows operand of an
+/// UPDATE union). Mirrors the peel in [`emit_select_offset`].
+fn peel_substitute(expr: &RelExpr) -> Option<(&RelExpr, Vec<(&str, &ScalarExpr)>)> {
+    let mut n = expr;
+    let mut renames: &[(String, String)] = &[];
+    if let RelExpr::Rename { input, renames: r } = n {
+        renames = r;
+        n = input;
+    }
+    if let RelExpr::Project { input, .. } = n {
+        n = input;
+    }
+    let RelExpr::Extend { input, extends } = n else {
+        return None;
+    };
+    let sets = extends
+        .iter()
+        .map(|(name, _ty, scalar)| {
+            let target = renames
+                .iter()
+                .find(|(old, _)| old == name)
+                .map(|(_, new)| new.as_str())
+                .unwrap_or(name.as_str());
+            (target, scalar)
+        })
+        .collect();
+    Some((input, sets))
+}
+
+/// Emit a surgical `UPDATE` for the TTM update expansion
+/// `t := (t where ¬p) union ((t where p) «substitute»)` (or a bare substitute
+/// over `t`, update-all). The substitute is the heading-preserving
+/// `Extend → Project(all but targets) → Rename` chain (what `replace` produces
+/// when the value reads the attribute it sets). Emits `UPDATE t SET c = e, … [WHERE p]`.
+///
+/// The "unchanged rows" operand must be the exact complement `t where ¬p` — same
+/// attribute and value, the negated operator ([`CmpOp::negate`]) — over the same
+/// `t`; otherwise this isn't an update and declines. The SET values render via
+/// [`render_scalar`] (constants inline, like `extend`); the `WHERE` predicate's
+/// literal is the one bound parameter.
+fn emit_update(target: &RelExpr, rhs: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
+    let RelExpr::RelvarRef { table_name, .. } = target else {
+        return Err(BackendError::Other(
+            "update target is not a base relvar".to_string(),
+        ));
+    };
+    let t = table_name.as_str();
+
+    // The substitute's `inner` (`Restrict(t, p)` with a WHERE, or bare
+    // `RelvarRef(t)` for update-all) and its SET assignments.
+    let (inner, sets): (&RelExpr, Vec<(&str, &ScalarExpr)>) = match rhs {
+        RelExpr::Or { lhs, rhs: r } => {
+            // Exactly one operand is the substitute (changed rows); the other is
+            // the unchanged-rows complement `t where ¬p`.
+            let (sub, complement) = match (peel_substitute(lhs), peel_substitute(r)) {
+                (Some(sub), None) => (sub, r.as_ref()),
+                (None, Some(sub)) => (sub, lhs.as_ref()),
+                _ => {
+                    return Err(BackendError::Other(
+                        "unrecognized assignment RHS shape (not a recognized update union)"
+                            .to_string(),
+                    ))
+                }
+            };
+            let (inner, sets) = sub;
+            // Changed rows must be `Restrict(t, p)`; complement `Restrict(t, ¬p)`.
+            let RelExpr::Restrict { input: si, pred: p } = inner else {
+                return Err(BackendError::Other(
+                    "update: changed-rows operand is not a restriction".to_string(),
+                ));
+            };
+            let RelExpr::Restrict {
+                input: ci,
+                pred: q,
+            } = complement
+            else {
+                return Err(BackendError::Other(
+                    "update: unchanged-rows operand is not a restriction".to_string(),
+                ));
+            };
+            if delete_base_table(si) != Some(t) || delete_base_table(ci) != Some(t) {
+                return Err(BackendError::Other(
+                    "update: operands are not rooted in the target relvar".to_string(),
+                ));
+            }
+            // `q` must be `¬p`: same attribute and value, negated operator.
+            let Predicate::AttrCmp {
+                attr: pa,
+                op: po,
+                value: pv,
+            } = p;
+            let Predicate::AttrCmp {
+                attr: qa,
+                op: qo,
+                value: qv,
+            } = q;
+            if pa != qa || pv != qv || *qo != po.negate() {
+                return Err(BackendError::Other(
+                    "update: the union operand is not the complement of the changed rows"
+                        .to_string(),
+                ));
+            }
+            (inner, sets)
+        }
+        // Bare substitute over `t` → update every row (no WHERE).
+        _ => {
+            let (inner, sets) = peel_substitute(rhs).ok_or_else(|| {
+                BackendError::Other(
+                    "unrecognized assignment RHS shape (not a minus/union/update over the target)"
+                        .to_string(),
+                )
+            })?;
+            if delete_base_table(inner) != Some(t) {
+                return Err(BackendError::Other(
+                    "update: substitute is not rooted in the target relvar".to_string(),
+                ));
+            }
+            (inner, sets)
+        }
+    };
+
+    // Resolve the inner to its table + column map, collecting the WHERE predicate
+    // (`p`, or none for update-all).
+    let mut wheres: Vec<(String, CmpOp, Literal)> = Vec::new();
+    let (from_clause, cols) = resolve(inner, &mut wheres)?;
+
+    let mut set_sql = Vec::with_capacity(sets.len());
+    for &(target_attr, scalar) in &sets {
+        set_sql.push(format!(
+            "{} = {}",
+            quote_ident(column_for(&cols, target_attr)?),
+            render_scalar(scalar, &cols)?
+        ));
+    }
+    if set_sql.is_empty() {
+        return Err(BackendError::Other("update: empty SET list".to_string()));
+    }
+
+    let mut params: Vec<Value> = Vec::new();
+    let where_sql = render_where_clause(&wheres, dialect, 0, &mut params);
+    let text = format!("UPDATE {from_clause} SET {}{where_sql}", set_sql.join(", "));
+    let plan_id = PlanId(fnv1a(dialect, &text));
+    Ok(SqlQuery {
+        sql: SqlString {
+            param_count: params.len() as u32,
+            text,
+        },
+        params,
         result_heading: target.heading(),
         plan_id,
     })
@@ -1319,6 +1480,85 @@ mod tests {
             r#"INSERT INTO "greetings" ("id", "message") SELECT v.column1, v.column2 FROM (VALUES __CODDL_ROW_VALUES__) AS v WHERE NOT EXISTS (SELECT 1 FROM "greetings" WHERE "greetings"."id" = v.column1 AND "greetings"."message" = v.column2)"#
         );
         assert!(q.sql.text.contains(INSERT_ROWS_MARKER));
+    }
+
+    /// `(inner) replace { message: message || "!" }` desugar shape — the
+    /// heading-preserving substitute chain `Rename(Project(Extend(inner)))` that
+    /// sets `message` in place (extend a temp, drop `message`, rename temp back).
+    fn substitute_message_bang(inner: RelExpr) -> RelExpr {
+        let tmp = "__coddl_replace_tmp_message".to_string();
+        RelExpr::Rename {
+            input: Box::new(RelExpr::Project {
+                input: Box::new(RelExpr::Extend {
+                    input: Box::new(inner),
+                    extends: vec![(
+                        tmp.clone(),
+                        Type::Text,
+                        ScalarExpr::Bin {
+                            op: ScalarBinOp::Concat,
+                            lhs: Box::new(ScalarExpr::Attr("message".to_string())),
+                            rhs: Box::new(ScalarExpr::Str("!".to_string())),
+                        },
+                    )],
+                }),
+                keep: vec!["id".to_string(), tmp.clone()],
+            }),
+            renames: vec![(tmp, "message".to_string())],
+        }
+    }
+
+    #[test]
+    fn assignment_update_with_where_emits_update() {
+        // `Greetings := (Greetings where id <> 1) union ((Greetings where id = 1)
+        // replace { message: message || "!" })` → an UPDATE of the matching row.
+        let rhs = union(
+            restrict_cmp("id", CmpOp::Ne, Literal::Integer(1)),
+            substitute_message_bang(restrict_cmp("id", CmpOp::Eq, Literal::Integer(1))),
+        );
+        let q = emit_assignment(&greetings(), &rhs, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"UPDATE "greetings" SET "message" = ("message" || '!') WHERE "id" = ?"#
+        );
+        assert_eq!(q.sql.param_count, 1);
+        assert_eq!(q.params, vec![Value::Integer(1)]);
+    }
+
+    #[test]
+    fn assignment_update_with_where_uses_postgres_placeholder() {
+        let rhs = union(
+            restrict_cmp("id", CmpOp::Ne, Literal::Integer(1)),
+            substitute_message_bang(restrict_cmp("id", CmpOp::Eq, Literal::Integer(1))),
+        );
+        let q = emit_assignment(&greetings(), &rhs, Dialect::Postgres).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"UPDATE "greetings" SET "message" = ("message" || '!') WHERE "id" = $1"#
+        );
+    }
+
+    #[test]
+    fn assignment_update_all_has_no_where() {
+        // A bare substitute over the relvar (no complement/union) updates every
+        // row — `Greetings := Greetings replace { message: message || "!" }`.
+        let q = emit_assignment(&greetings(), &substitute_message_bang(greetings()), Dialect::SQLite)
+            .unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"UPDATE "greetings" SET "message" = ("message" || '!')"#
+        );
+        assert!(q.params.is_empty());
+    }
+
+    #[test]
+    fn assignment_update_declines_non_complementary_union() {
+        // The "unchanged" operand must be the exact complement: `id < 1` is not
+        // `¬(id = 1)` (that's `id <> 1`), so this is not a recognized update.
+        let rhs = union(
+            restrict_cmp("id", CmpOp::Lt, Literal::Integer(1)),
+            substitute_message_bang(restrict_cmp("id", CmpOp::Eq, Literal::Integer(1))),
+        );
+        assert!(emit_assignment(&greetings(), &rhs, Dialect::SQLite).is_err());
     }
 
     #[test]

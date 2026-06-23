@@ -88,6 +88,7 @@ emitted SQL:
 | `Minus{ RelvarRef(t), RelvarRef(t) }` (self-subtraction) | `DELETE FROM t` (whole-table delete) |
 | `Minus{ RelvarRef(t), X }` (X same-heading, pushable, not rooted in `t`) | `DELETE FROM t WHERE EXISTS (SELECT 1 FROM (<X>) AS a WHERE t.col = a.attr AND …)` |
 | `Or{ RelvarRef(t), e }` (e same-heading, pushable; union is commutative) | `INSERT INTO t (…) SELECT … FROM (<e>) AS a WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.col = a.attr AND …)` |
+| `Or{ Restrict(t, ¬p), «substitute»(Restrict(t, p)) }`, or a bare «substitute» over `t` | `UPDATE t SET c = e, … WHERE <p>` (no `WHERE` for the bare update-all form) |
 
 The two delete rows delegate to a shared `emit_delete` on the `minus` subtrahend,
 which bottoms out in the target base relvar; the `WHERE` reuses the same
@@ -115,8 +116,20 @@ group per source row (in batches, sized under the bind-variable limit). Same
 set / Golden-Rule semantics as the pushable insert — only the row source differs
 (a bound `VALUES` list vs. a pushed sub-SELECT), and it uses **no temp table**
 (so no catalog churn). Any *other* unrecognized shape surfaces a "not a supported
-write shape" diagnostic (T0049). The recognition set will still grow to cover
-`UPDATE` from a restricted replace chain and the replace-all fallback.
+write shape" diagnostic (T0049). The recognition set will still grow to cover the
+replace-all fallback.
+
+The UPDATE shape (`emit_update`) recognizes TTM's update expansion — keep the
+non-matching rows, substitute the matching ones. The "changed rows" operand is a
+**heading-preserving substitute chain** `Rename(Project(Extend(Restrict(t, p))))`
+(what `R replace { c: e }` desugars to when the value reads the attribute it
+sets); `peel_substitute` recovers the `(target ← value)` pairs (pairing each
+`Extend` value with its `Rename` target). The "unchanged rows" operand must be
+the exact complement `Restrict(t, ¬p)` — same attribute and value, the negated
+operator (`CmpOp::negate`) — over the same `t`; otherwise it isn't an update and
+declines. It emits `UPDATE t SET c = render_scalar(e), … WHERE <p>` (SET values
+inline like `extend`; the `WHERE` literal is the one bound param). A bare
+substitute over `t` (no complement/union) is the update-all form (no `WHERE`).
 
 A recognized pushable assignment is registered as a DML plan and fired by the
 runtime's `coddl_exec` (the write sibling of `coddl_query`); an in-memory `union`
