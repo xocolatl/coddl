@@ -294,10 +294,40 @@ struct MarshalCtx {
     of_subject: String,
 }
 
+/// Flatten a heading descriptor to its leaf cells as `(attr, absolute_offset)`,
+/// recursing into `Tuple` cells (a pushed `wrap` result) and accumulating the
+/// base offset. Scalar/Text cells are leaves. The order is depth-first in the
+/// descriptor's (name-sorted) attr order — matching `record_layout`'s leaf order
+/// and the pushed SELECT's column order, so the positional column→cell mapping
+/// holds.
+///
+/// # Safety
+/// `attrs` must be a valid attr slice; any `Tuple` cell's `sub` must be null or a
+/// valid descriptor pointer.
+unsafe fn flatten_query_leaves<'a>(
+    attrs: &'a [CoddlAttrDesc],
+    base: usize,
+    out: &mut Vec<(&'a CoddlAttrDesc, usize)>,
+) {
+    for a in attrs {
+        let off = base + a.offset as usize;
+        if a.kind == CoddlAttrKind::Tuple as u32 {
+            if !a.sub.is_null() {
+                let sub = &*a.sub;
+                let sub_attrs = std::slice::from_raw_parts(sub.attrs, sub.attr_count as usize);
+                flatten_query_leaves(sub_attrs, off, out);
+            }
+        } else {
+            out.push((a, off));
+        }
+    }
+}
+
 /// Step every row of `rows` and decode its cells into fixed-stride record
-/// buffers, driven by the result heading's per-attribute kind. Shared by
-/// `coddl_sqlite_relvar_init` and [`coddl_query`] so the canonical record
-/// layout lives in one place. Aborts on a row-step error, a per-cell type
+/// buffers, driven by the result heading's per-attribute kind (flattened to
+/// leaves, so a `Tuple` cell's components are read from consecutive columns).
+/// Shared by `coddl_sqlite_relvar_init` and [`coddl_query`] so the canonical
+/// record layout lives in one place. Aborts on a row-step error, a per-cell type
 /// mismatch, a NULL cell (RM Pro 4 — D has no nulls), or an unsupported kind;
 /// these are schema/codegen bugs, not recoverable conditions.
 ///
@@ -311,6 +341,13 @@ unsafe fn marshal_rows(
     record_size: usize,
     ctx: &MarshalCtx,
 ) -> Vec<Vec<u8>> {
+    // Flatten the descriptor to leaf cells once. The SELECT returns the flat
+    // leaf columns in `record_layout`'s depth-first order, so the i-th result
+    // column is the i-th leaf, written at its absolute record offset. A `Tuple`
+    // cell (from a pushed `wrap`) is an inline sub-region — recurse into its
+    // sub-descriptor, accumulating the base offset.
+    let mut leaves: Vec<(&CoddlAttrDesc, usize)> = Vec::new();
+    flatten_query_leaves(attrs, 0, &mut leaves);
     let mut row_buffers: Vec<Vec<u8>> = Vec::new();
     loop {
         let row = match rows.next() {
@@ -325,9 +362,8 @@ unsafe fn marshal_rows(
             }
         };
         let mut buf = vec![0u8; record_size];
-        for (i, attr) in attrs.iter().enumerate() {
+        for (i, &(attr, offset)) in leaves.iter().enumerate() {
             let kind = attr.kind;
-            let offset = attr.offset as usize;
             if kind == CoddlAttrKind::Integer as u32 {
                 let v: i64 = match row.get(i) {
                     Ok(v) => v,

@@ -226,7 +226,15 @@ operator is tuple-aware: per-cell *copies* (`project`/`rename`/`join`/
 tclose edge match, seal/dedup) goes through one `cmp_cell(ra, off_a, rb,
 off_b, attr)` that recurses content-aware. `wrap`/`unwrap` themselves are
 `coddl_relation_restructure`: flatten both descriptors to leaf cells,
-match by name, permute each record into the destination layout. Sub-word packing
+match by name, permute each record into the destination layout.
+
+A **pushed** wrap/unwrap needs no restructure pass: the SQL returns the
+flat leaf columns and the query marshaller (`marshal_rows`, sqlite.rs)
+flattens the result descriptor to leaf cells (recursing into `Tuple`
+cells, accumulating the base offset) and writes the i-th SQL column into
+the i-th leaf's offset — the same depth-first leaf order `record_layout`
+and the pushed SELECT use, so the positional mapping reconstructs the
+inline nested cell directly. Sub-word packing
 (Boolean → 1 bit, Byte → 1 byte) is deferred. Relation-as-cell (kind 11)
 is reserved but not yet emitted.
 

@@ -2672,3 +2672,67 @@ fn wrap_unwrap_restructures_and_composes() {
 fn wrap_unwrap_byte_identical_across_backends() {
     assert_eq!(run_wrap_unwrap("llvm"), run_wrap_unwrap("cranelift"));
 }
+
+// ── wrap/unwrap SQL pushdown (relvar-rooted → flat leaf-column SELECT) ──
+
+/// A relvar-rooted `wrap` pushes to SQL: the heading restructure is free, the
+/// SQL selects the flat leaf columns (depth-first order of the wrapped heading),
+/// and the runtime materializes them into the nested record. The audit log shows
+/// the pushed leaf-column SELECT — no in-process restructure query.
+fn assert_wrap_pushdown(backend: &str) {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = seed_greetings_fixtures(tmp.path());
+    let cd = tmp.path().join("wp.cd");
+    std::fs::write(
+        &cd,
+        "program wp;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [ let g = transaction [ Greetings wrap { t: {id, message} } ]; write_relation { rel: g }; ];\n",
+    )
+    .expect("write wp.cd");
+    let log = tmp.path().join("audit.log");
+    let out = coddl()
+        .env("CODDL_GREETINGS_FILE", &db)
+        .env("CODDL_AUDIT_LOG", &log)
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "pushed wrap on {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // `id`/`message` grouped into the tuple-valued attribute `t`; nested print.
+    assert_eq!(
+        tuple_lines(&out.stdout),
+        sorted_tuples(&[r#"{t: {id: 1, message: "hello world"}}"#]),
+        "wrap output on {backend}",
+    );
+    // Pushed as flat leaf columns (the tuple has no SQL column); the nesting is
+    // reconstructed at materialization. No separate restructure query.
+    let contents = std::fs::read_to_string(&log).expect("read audit log");
+    let sqls: Vec<&str> = contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| audit_sql(l).unwrap_or_else(|| panic!("malformed audit line ({backend}): {l:?}")))
+        .collect();
+    assert!(
+        sqls.iter().any(|s| *s == EXPECTED_PUSHED_WRAP_SQL),
+        "audit log on {backend} missing the pushed wrap query:\n{EXPECTED_PUSHED_WRAP_SQL}\ngot:\n{sqls:#?}",
+    );
+}
+
+const EXPECTED_PUSHED_WRAP_SQL: &str = r#"SELECT DISTINCT "id", "message" FROM "greetings""#;
+
+#[test]
+fn wrap_pushdown_llvm() {
+    assert_wrap_pushdown("llvm");
+}
+
+#[test]
+fn wrap_pushdown_cranelift() {
+    assert_wrap_pushdown("cranelift");
+}

@@ -1,0 +1,14 @@
+// points.cddb
+//
+// Conceptual schema for the `points` database — the SQL-backed twin of the
+// in-process wrap/unwrap example. Database-side `base relvar` declaration; the
+// heading mirrors the `public relvar Points` in wrap-unwrap-db.cd.
+
+database points;
+
+base relvar Points {
+    id: Integer,
+    x: Integer,
+    y: Integer,
+}
+key { id };

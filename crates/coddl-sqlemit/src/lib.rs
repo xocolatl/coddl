@@ -14,7 +14,7 @@
 
 use std::fmt;
 
-use coddl_relir::{Heading, Literal, Predicate, RelExpr, ScalarBinOp, ScalarExpr};
+use coddl_relir::{Heading, Literal, Predicate, RelExpr, ScalarBinOp, ScalarExpr, Type};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Dialect {
@@ -328,16 +328,16 @@ fn emit_select_offset(expr: &RelExpr, dialect: Dialect, param_offset: u32) -> Re
     // are named by the Coddl attributes).
     let heading = expr.heading();
     let mut select_cols = Vec::with_capacity(heading.attrs().len());
-    for (attr, _ty) in heading.attrs() {
+    for (attr, ty) in heading.attrs() {
         if let Some((_, sql)) = computed.iter().find(|(a, _)| a == attr) {
             select_cols.push(format!("{sql} AS {}", quote_ident(attr)));
         } else {
-            let col = column_for(&output_cols, attr)?;
-            if col == attr.as_str() {
-                select_cols.push(quote_ident(col));
-            } else {
-                select_cols.push(format!("{} AS {}", quote_ident(col), quote_ident(attr)));
-            }
+            // A `Tuple`-valued attribute (from `wrap`) flattens to its leaf
+            // columns — the SQL has no composite column; the nesting lives in
+            // the result descriptor, which the runtime reconstructs. Depth-first
+            // name-sorted, matching `record_layout`'s leaf order (the runtime
+            // maps result columns to record cells by position).
+            push_leaf_cols(attr, ty, &output_cols, &mut select_cols)?;
         }
     }
     // A nullary projection (`project {}`) has an empty heading, and SQL has no
@@ -492,15 +492,12 @@ fn resolve(
         RelExpr::Extend { .. } => Err(BackendError::Other(
             "extend nested under another operator does not push to SQL".to_string(),
         )),
-        // v1 has no `wrap`/`unwrap` SQL emission (a flat-column push is a
-        // deferred follow-up), so they decline: a relvar-rooted wrap/unwrap
-        // fetches its operand via SQL then restructures in-process.
-        RelExpr::Wrap { .. } => Err(BackendError::Other(
-            "wrap does not push to SQL (restructures in-process)".to_string(),
-        )),
-        RelExpr::Unwrap { .. } => Err(BackendError::Other(
-            "unwrap does not push to SQL (restructures in-process)".to_string(),
-        )),
+        // wrap/unwrap restructure the heading only — the underlying SQL columns
+        // are the flat leaf columns, unchanged. Pass the operand's (from, cols)
+        // through; `emit_select` reads the restructured (nested) heading from
+        // `expr.heading()` and flattens its Tuple attrs to leaf columns, and the
+        // result descriptor carries the nesting for the runtime to reconstruct.
+        RelExpr::Wrap { input, .. } | RelExpr::Unwrap { input, .. } => resolve(input, wheres),
         // Never reached: a materialized leaf fails the cut's `RelvarRooted`
         // gate before SQL emission. Defensive only.
         RelExpr::MaterializedRelvar { name, .. } => Err(BackendError::Other(format!(
@@ -548,6 +545,38 @@ fn column_for<'a>(columns: &'a [(String, String)], attr: &str) -> Result<&'a str
         .find(|(a, _)| a == attr)
         .map(|(_, c)| c.as_str())
         .ok_or_else(|| BackendError::Other(format!("no column mapping for attribute `{attr}`")))
+}
+
+/// Push the SELECT column(s) for one result attribute. A scalar/`Text` attribute
+/// emits one column (bare `"col"`, or `"col" AS "attr"` when they differ — a
+/// rename). A `Tuple`-valued attribute (from `wrap`) has no SQL column of its
+/// own; it flattens to its components' leaf columns, recursing depth-first in
+/// the sub-heading's canonical (name-sorted) order. This matches `record_layout`'s
+/// leaf order, so the runtime's positional column→cell mapping reconstructs the
+/// inline nested cell.
+fn push_leaf_cols(
+    attr: &str,
+    ty: &Type,
+    columns: &[(String, String)],
+    out: &mut Vec<String>,
+) -> Result<()> {
+    match ty {
+        Type::Tuple(sub) => {
+            for (name, sub_ty) in sub.attrs() {
+                push_leaf_cols(name, sub_ty, columns, out)?;
+            }
+            Ok(())
+        }
+        _ => {
+            let col = column_for(columns, attr)?;
+            if col == attr {
+                out.push(quote_ident(col));
+            } else {
+                out.push(format!("{} AS {}", quote_ident(col), quote_ident(attr)));
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Double-quote a SQL identifier, doubling any embedded quote.

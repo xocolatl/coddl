@@ -1,0 +1,42 @@
+// wrap-unwrap-db.cd
+//
+// SQL-backed twin of wrap-unwrap.cd: `wrap` and `unwrap` over a SQLite-backed
+// `public relvar`. A relvar-rooted wrap/unwrap pushes to SQL — the heading
+// restructure is free, the query selects the flat leaf columns, and the runtime
+// materializes them into the nested record. (Run with CODDL_AUDIT_LOG to see the
+// pushed flat-column SELECT; there is no separate in-process restructure.)
+//
+//   R wrap   { t: {a, b} }   group `a`, `b` into a tuple-valued attribute `t`
+//   R unwrap { t }           expand `t` back into its component attributes
+//
+// The .cd-family (storage stays out of D):
+//   wrap-unwrap-db.cd  — this program: the external schema + queries
+//   points.cddb        — database catalog (conceptual schema)
+//   points.cdstore     — conceptual -> physical (SQLite) binding
+//   seed-db.sh         — recreates points.sqlite with the demo data
+//
+// `public` relvars are read-only, so each read sits inside a `transaction [...]`.
+
+program wrap_unwrap_db;
+database points;
+
+public relvar Points {
+    id: Integer,
+    x: Integer,
+    y: Integer,
+} key { id };
+
+oper main {} [
+    // wrap: group `x` and `y` into a tuple-valued attribute `pt`. Pushes to SQL
+    // as a flat leaf-column SELECT; the result materializes nested.
+    let wrapped = transaction [
+        Points wrap { pt: { x, y } }
+    ];
+    write_relation { rel: wrapped };
+
+    // round-trip: `unwrap` recovers the original heading.
+    let back = transaction [
+        Points wrap { pt: { x, y } } unwrap { pt }
+    ];
+    write_relation { rel: back };
+];
