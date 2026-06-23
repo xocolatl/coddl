@@ -22,7 +22,7 @@ This doc describes the **target** RelIR. The code implements a thin slice of it;
 **Designed, not yet built**
 
 - The remaining **A-core nodes** (`AND`, `OR`, `NOT`, `TCLOSE`) and the **sugar → A-core desugaring**. The four nodes above are consumed as-is; nothing is rewritten into A-core form yet. (`REMOVE` and `RENAME` already exist, as `Project` and `Rename`.)
-- The rest of the **sugar layer**: `Join`, `Union`, `Minus`, `Intersect`, `Compose`, `SemiJoin`, `SemiMinus`, `Extend`, `Summarize`, `Group`, `Ungroup`, `Wrap`, `Unwrap`.
+- The rest of the **sugar layer**: `Intersect`, `Compose`, `SemiJoin`, `SemiMinus`, `Summarize`, `Group`, `Ungroup`. (`Join`/`Union`/`Minus`/`Extend`/`Rename`/`Wrap`/`Unwrap` are built — the last two as `RelExpr::Wrap`/`Unwrap`, lowering to `Inst::Restructure` → `coddl_relation_restructure`, in-process; SQL push deferred.)
 - The **optimizer** and **cost model**, the `MaterializeAtBoundary` node, and mixed-origin handling beyond the `StorageOrigin::Mixed` flag.
 - The per-node **FD set** and **constraint set** (only heading, origin, and leaf keys exist today).
 - `coddl-execlocal` (an empty stub) as the RelIR→ProcIR consumer, and the runtime RelIR interpreter (the dynamic path).

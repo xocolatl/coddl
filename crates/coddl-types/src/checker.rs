@@ -14,7 +14,8 @@ use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, Expr, ExprStmt, ExtendExpr,
     FieldAccess, Heading as AstHeading, Item, KeyClause, LetStmt, NamedArg, OperDecl,
     PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr,
-    ReplaceExpr, Root, Stmt, TcloseExpr, TransactionExpr, TupleLit, UnaryExpr, UnaryOp,
+    ReplaceExpr, Root, Stmt, TcloseExpr, TransactionExpr, TupleLit, UnaryExpr, UnaryOp, UnwrapExpr,
+    WrapExpr,
 };
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
@@ -869,6 +870,8 @@ impl TypeChecker {
             Expr::Extend(e) => self.check_extend_expr(e, scope),
             Expr::Tclose(t) => self.check_tclose_expr(t, scope),
             Expr::Rename(r) => self.check_rename_expr(r, scope),
+            Expr::Wrap(w) => self.check_wrap_expr(w, scope),
+            Expr::Unwrap(u) => self.check_unwrap_expr(u, scope),
         }
     }
 
@@ -936,6 +939,174 @@ impl TypeChecker {
             .filter(|(name, _)| listed.contains(name) != all_but)
             .cloned()
             .collect();
+        Type::Relation(Heading::new(result))
+    }
+
+    /// Walk `R wrap { t: { a, b }, … }` — group attributes into tuple-valued
+    /// attributes. The operand must be `Relation H` (T0023). Each wrapped attr
+    /// must exist in `H` (T0027) and be wrapped at most once across all pairs
+    /// (T0028). Each new name must be fresh vs. surviving attributes and other
+    /// new names (T0031). Result heading = the attributes not wrapped, plus each
+    /// `new : Tuple(<components with their H types>)`.
+    fn check_wrap_expr(&mut self, we: &WrapExpr, scope: &mut Scope) -> Type {
+        let input_ty = match we.input() {
+            Some(e) => self.check_expr(&e, scope),
+            None => return Type::Unknown,
+        };
+        let heading = match &input_ty {
+            Type::Relation(h) => h.clone(),
+            Type::Unknown => return Type::Unknown,
+            other => {
+                let span = we
+                    .input()
+                    .map(|e| self.node_span(e.syntax()))
+                    .unwrap_or_else(|| self.node_span(we.syntax()));
+                self.error(
+                    span,
+                    "T0023",
+                    format!("`wrap` expects a Relation on the left, got {other}"),
+                );
+                return Type::Unknown;
+            }
+        };
+        // Collect each pair's new name + its wrapped components (as a TVA), and
+        // the set of all wrapped (consumed) attributes.
+        let mut wrapped: HashSet<String> = HashSet::new();
+        let mut added: Vec<(String, Type)> = Vec::new();
+        for pair in we.pairs() {
+            let Some(new_tok) = pair.name() else { continue };
+            let new = new_tok.text();
+            let mut components: Vec<(String, Type)> = Vec::new();
+            for tok in pair.wrapped() {
+                let name = tok.text();
+                let Some(ty) = heading.lookup(name).cloned() else {
+                    self.error(
+                        self.token_span(&tok),
+                        "T0027",
+                        format!("unknown attribute `{name}` in wrap of {heading}"),
+                    );
+                    continue;
+                };
+                if !wrapped.insert(name.to_string()) {
+                    self.error(
+                        self.token_span(&tok),
+                        "T0028",
+                        format!("attribute `{name}` is wrapped more than once"),
+                    );
+                    continue;
+                }
+                components.push((name.to_string(), ty));
+            }
+            added.push((new.to_string(), Type::Tuple(Heading::new(components))));
+        }
+        // Result = surviving (non-wrapped) attributes + the new TVAs; a new name
+        // colliding with a survivor or another new name is T0031.
+        let mut result: Vec<(String, Type)> = Vec::new();
+        let mut result_names: HashSet<String> = HashSet::new();
+        for (name, ty) in heading.attrs() {
+            if wrapped.contains(name) {
+                continue;
+            }
+            result_names.insert(name.clone());
+            result.push((name.clone(), ty.clone()));
+        }
+        for (name, ty) in added {
+            if !result_names.insert(name.clone()) {
+                self.error(
+                    self.node_span(we.syntax()),
+                    "T0031",
+                    format!("wrap produces a duplicate attribute `{name}`"),
+                );
+            }
+            result.push((name, ty));
+        }
+        Type::Relation(Heading::new(result))
+    }
+
+    /// Walk `R unwrap { t, … }` — expand tuple-valued attributes back to their
+    /// components, lifted to top level. The operand must be `Relation H`
+    /// (T0023). Each named attr must exist (T0027), be listed once (T0028), and
+    /// be `Type::Tuple(_)` (T0048). Result heading = the attributes not unwrapped,
+    /// plus each unwrapped tuple's components; a lifted component colliding with
+    /// a survivor or another lifted component is T0031.
+    fn check_unwrap_expr(&mut self, ue: &UnwrapExpr, scope: &mut Scope) -> Type {
+        let input_ty = match ue.input() {
+            Some(e) => self.check_expr(&e, scope),
+            None => return Type::Unknown,
+        };
+        let heading = match &input_ty {
+            Type::Relation(h) => h.clone(),
+            Type::Unknown => return Type::Unknown,
+            other => {
+                let span = ue
+                    .input()
+                    .map(|e| self.node_span(e.syntax()))
+                    .unwrap_or_else(|| self.node_span(ue.syntax()));
+                self.error(
+                    span,
+                    "T0023",
+                    format!("`unwrap` expects a Relation on the left, got {other}"),
+                );
+                return Type::Unknown;
+            }
+        };
+        // Each listed name: exists (T0027), unique in the list (T0028), and is a
+        // tuple-valued attribute (T0048). Collect the unwrapped set + the lifted
+        // components.
+        let mut unwrapped: HashSet<String> = HashSet::new();
+        let mut lifted: Vec<(String, Type)> = Vec::new();
+        for tok in ue.attrs() {
+            let name = tok.text();
+            let Some(ty) = heading.lookup(name).cloned() else {
+                self.error(
+                    self.token_span(&tok),
+                    "T0027",
+                    format!("unknown attribute `{name}` in unwrap of {heading}"),
+                );
+                continue;
+            };
+            if !unwrapped.insert(name.to_string()) {
+                self.error(
+                    self.token_span(&tok),
+                    "T0028",
+                    format!("duplicate attribute `{name}` in unwrap list"),
+                );
+                continue;
+            }
+            match ty {
+                Type::Tuple(sub) => {
+                    for (cn, ct) in sub.attrs() {
+                        lifted.push((cn.clone(), ct.clone()));
+                    }
+                }
+                other => self.error(
+                    self.token_span(&tok),
+                    "T0048",
+                    format!("`unwrap` target `{name}` is not a tuple-valued attribute (got {other})"),
+                ),
+            }
+        }
+        // Result = surviving (non-unwrapped) attributes + the lifted components;
+        // a collision (component vs survivor or vs another component) is T0031.
+        let mut result: Vec<(String, Type)> = Vec::new();
+        let mut result_names: HashSet<String> = HashSet::new();
+        for (name, ty) in heading.attrs() {
+            if unwrapped.contains(name) {
+                continue;
+            }
+            result_names.insert(name.clone());
+            result.push((name.clone(), ty.clone()));
+        }
+        for (name, ty) in lifted {
+            if !result_names.insert(name.clone()) {
+                self.error(
+                    self.node_span(ue.syntax()),
+                    "T0031",
+                    format!("unwrap produces a duplicate attribute `{name}`"),
+                );
+            }
+            result.push((name, ty));
+        }
         Type::Relation(Heading::new(result))
     }
 
@@ -3394,6 +3565,97 @@ mod tests {
     #[test]
     fn rename_non_relation_diagnoses_t0023() {
         let src = "oper main {} [ let s = 1 rename {a: b}; ];";
+        assert!(codes(src).contains(&"T0023"));
+    }
+
+    // ── wrap / unwrap ───────────────────────────────────────────────────
+
+    #[test]
+    fn wrap_groups_attrs_into_a_tuple_valued_attribute() {
+        // {a, b, c} wrap {t: {a, b}}: `t` is accessible (a tuple), `a`/`b` are
+        // gone (consumed), `c` survives.
+        let ok = "oper main {} [ \
+                  let r = Relation { {a: 1, b: 2, c: 3} }; \
+                  let s = r wrap {t: {a, b}}; \
+                  let u = extract s; let _t = u.t; let _c = u.c; \
+                  ];";
+        assert!(diagnostics(ok).is_empty(), "{:?}", diagnostics(ok));
+        let gone = "oper main {} [ \
+                    let r = Relation { {a: 1, b: 2, c: 3} }; \
+                    let s = r wrap {t: {a, b}}; \
+                    let u = extract s; let _a = u.a; \
+                    ];";
+        assert!(codes(gone).contains(&"T0017"));
+    }
+
+    #[test]
+    fn wrap_unknown_attr_diagnoses_t0027() {
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1} }; \
+                   let s = r wrap {t: {nope}}; \
+                   ];";
+        assert!(codes(src).contains(&"T0027"));
+    }
+
+    #[test]
+    fn wrap_same_attr_twice_diagnoses_t0028() {
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1, b: 2} }; \
+                   let s = r wrap {t: {a}, u: {a}}; \
+                   ];";
+        assert!(codes(src).contains(&"T0028"));
+    }
+
+    #[test]
+    fn wrap_new_name_collides_diagnoses_t0031() {
+        // new name `c` collides with a surviving attribute `c`.
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1, b: 2, c: 3} }; \
+                   let s = r wrap {c: {a, b}}; \
+                   ];";
+        assert!(codes(src).contains(&"T0031"));
+    }
+
+    #[test]
+    fn unwrap_expands_a_tuple_valued_attribute() {
+        // wrap then unwrap round-trips: after unwrap, `a`/`b` are back, `t` gone.
+        let ok = "oper main {} [ \
+                  let r = Relation { {a: 1, b: 2, c: 3} }; \
+                  let s = r wrap {t: {a, b}} unwrap {t}; \
+                  let u = extract s; let _a = u.a; let _b = u.b; let _c = u.c; \
+                  ];";
+        assert!(diagnostics(ok).is_empty(), "{:?}", diagnostics(ok));
+    }
+
+    #[test]
+    fn unwrap_non_tuple_diagnoses_t0048() {
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1, b: 2} }; \
+                   let s = r unwrap {a}; \
+                   ];";
+        assert!(codes(src).contains(&"T0048"));
+    }
+
+    #[test]
+    fn unwrap_component_collision_diagnoses_t0031() {
+        // {a, t: Tuple{a, b}} unwrap {t}: lifting `a` collides with the surviving
+        // top-level `a`.
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1, t: {a: 9, b: 8}} }; \
+                   let s = r unwrap {t}; \
+                   ];";
+        assert!(codes(src).contains(&"T0031"));
+    }
+
+    #[test]
+    fn wrap_non_relation_diagnoses_t0023() {
+        let src = "oper main {} [ let s = 1 wrap {t: {a}}; ];";
+        assert!(codes(src).contains(&"T0023"));
+    }
+
+    #[test]
+    fn unwrap_non_relation_diagnoses_t0023() {
+        let src = "oper main {} [ let s = 1 unwrap {t}; ];";
         assert!(codes(src).contains(&"T0023"));
     }
 

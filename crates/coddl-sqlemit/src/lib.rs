@@ -492,6 +492,15 @@ fn resolve(
         RelExpr::Extend { .. } => Err(BackendError::Other(
             "extend nested under another operator does not push to SQL".to_string(),
         )),
+        // v1 has no `wrap`/`unwrap` SQL emission (a flat-column push is a
+        // deferred follow-up), so they decline: a relvar-rooted wrap/unwrap
+        // fetches its operand via SQL then restructures in-process.
+        RelExpr::Wrap { .. } => Err(BackendError::Other(
+            "wrap does not push to SQL (restructures in-process)".to_string(),
+        )),
+        RelExpr::Unwrap { .. } => Err(BackendError::Other(
+            "unwrap does not push to SQL (restructures in-process)".to_string(),
+        )),
         // Never reached: a materialized leaf fails the cut's `RelvarRooted`
         // gate before SQL emission. Defensive only.
         RelExpr::MaterializedRelvar { name, .. } => Err(BackendError::Other(format!(

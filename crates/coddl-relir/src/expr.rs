@@ -132,6 +132,25 @@ pub enum RelExpr {
     TClose {
         input: Box<RelExpr>,
     },
+    /// Wrap (surface `wrap`) — group attributes into tuple-valued attributes.
+    /// **Unary.** Each `(new, components)` removes the component attributes from
+    /// the top level and adds `new : Tuple(components)`. Cardinality- and
+    /// data-preserving (a leaf-cell re-layout). v1 has no SQL emission (a
+    /// flat-column push is a deferred follow-up), so a relvar-rooted `wrap`
+    /// fetches its operand via SQL then restructures in-process.
+    Wrap {
+        input: Box<RelExpr>,
+        /// `(new_name, components_heading)` pairs, in source order.
+        wraps: Vec<(String, Heading)>,
+    },
+    /// Unwrap (surface `unwrap`) — expand tuple-valued attributes back to their
+    /// components, lifted to top level. **Unary.** The inverse of `Wrap`; same
+    /// data-preserving re-layout and same SQL-deferral.
+    Unwrap {
+        input: Box<RelExpr>,
+        /// The tuple-valued attribute names to expand.
+        names: Vec<String>,
+    },
     /// An in-memory (`private`) relvar read — the materialized counterpart of
     /// the relvar-rooted `RelvarRef` leaf. No SQL source, so any subtree
     /// containing it is `Materialized` and lowers in-process.
@@ -303,6 +322,44 @@ impl RelExpr {
                 attrs.extend(extends.iter().map(|(name, ty, _)| (name.clone(), ty.clone())));
                 Heading::new(attrs)
             }
+            // Survivors (attributes not consumed by any wrap) plus each new
+            // `Tuple(components)`; `Heading::new` re-canonicalizes.
+            RelExpr::Wrap { input, wraps } => {
+                let consumed: std::collections::HashSet<&str> = wraps
+                    .iter()
+                    .flat_map(|(_, h)| h.attrs().iter().map(|(n, _)| n.as_str()))
+                    .collect();
+                let mut attrs: Vec<(String, Type)> = input
+                    .heading()
+                    .attrs()
+                    .iter()
+                    .filter(|(n, _)| !consumed.contains(n.as_str()))
+                    .cloned()
+                    .collect();
+                attrs.extend(
+                    wraps
+                        .iter()
+                        .map(|(new, h)| (new.clone(), Type::Tuple(h.clone()))),
+                );
+                Heading::new(attrs)
+            }
+            // Survivors (attributes not unwrapped) plus each unwrapped tuple's
+            // components lifted to top level.
+            RelExpr::Unwrap { input, names } => {
+                let in_heading = input.heading();
+                let mut attrs: Vec<(String, Type)> = in_heading
+                    .attrs()
+                    .iter()
+                    .filter(|(n, _)| !names.contains(n))
+                    .cloned()
+                    .collect();
+                for name in names {
+                    if let Some(Type::Tuple(sub)) = in_heading.lookup(name) {
+                        attrs.extend(sub.attrs().iter().cloned());
+                    }
+                }
+                Heading::new(attrs)
+            }
             RelExpr::MaterializedRelvar { heading, .. } => heading.clone(),
         }
     }
@@ -330,6 +387,11 @@ impl RelExpr {
             RelExpr::TClose { input } => input.origin(),
             // A scalar extend doesn't change what the data is rooted in.
             RelExpr::Extend { input, .. } => input.origin(),
+            // Unary re-layouts inherit their input's origin (like TClose); v1 has
+            // no `wrap`/`unwrap` SQL emission, so a relvar-rooted one declines
+            // the push (sqlemit errs) and restructures in-process.
+            RelExpr::Wrap { input, .. } => input.origin(),
+            RelExpr::Unwrap { input, .. } => input.origin(),
             RelExpr::MaterializedRelvar { .. } => StorageOrigin::Materialized,
         }
     }
@@ -409,6 +471,27 @@ impl RelExpr {
                 let _ = writeln!(out, "{pad}Extend {{ {pairs} }}");
                 input.render_into(out, depth + 1);
             }
+            RelExpr::Wrap { input, wraps } => {
+                let pairs = wraps
+                    .iter()
+                    .map(|(new, h)| {
+                        let comps = h
+                            .attrs()
+                            .iter()
+                            .map(|(n, _)| n.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("{new}: {{ {comps} }}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(out, "{pad}Wrap {{ {pairs} }}");
+                input.render_into(out, depth + 1);
+            }
+            RelExpr::Unwrap { input, names } => {
+                let _ = writeln!(out, "{pad}Unwrap {{ {} }}", names.join(", "));
+                input.render_into(out, depth + 1);
+            }
         }
     }
 
@@ -448,6 +531,11 @@ impl RelExpr {
             // and removes nothing, so every input key still uniquely
             // identifies a row.
             RelExpr::Extend { input, .. } => input.surviving_keys(),
+            // Conservative: wrap/unwrap restructure the heading (attributes a
+            // key names may now be nested or lifted), so key tracking through
+            // them is deferred; keyless.
+            RelExpr::Wrap { .. } => Vec::new(),
+            RelExpr::Unwrap { .. } => Vec::new(),
             RelExpr::MaterializedRelvar { .. } => Vec::new(),
         }
     }
@@ -480,6 +568,9 @@ impl RelExpr {
             RelExpr::TClose { .. } => false,
             // Extend is cardinality-preserving (one input tuple → one output).
             RelExpr::Extend { input, .. } => input.card_le_one(),
+            // wrap/unwrap are cardinality-preserving (one tuple → one tuple).
+            RelExpr::Wrap { input, .. } => input.card_le_one(),
+            RelExpr::Unwrap { input, .. } => input.card_le_one(),
             RelExpr::MaterializedRelvar { .. } => false,
         }
     }

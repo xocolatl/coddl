@@ -328,6 +328,18 @@ pub enum Inst {
         result_heading_id: HeadingId,
         perm: Vec<u32>,
     },
+    /// Restructure a relation between two layouts that hold the same leaf cells
+    /// (surface `wrap` / `unwrap`). Backends emit a call to
+    /// `coddl_relation_restructure(src, &src_descriptor, &result_descriptor)`,
+    /// which flattens both descriptors to leaves, matches them by name, permutes
+    /// each record into the destination layout, and re-seals. `dst` carries the
+    /// restructured heading at `result_heading_id`.
+    Restructure {
+        dst: ValueId,
+        src: ValueId,
+        src_heading_id: HeadingId,
+        result_heading_id: HeadingId,
+    },
     /// Natural join two in-memory relations (surface `join`, Algebra-A AND).
     /// Backends emit a call to `coddl_relation_join(lhs, &lhs_descriptor, rhs,
     /// &rhs_descriptor, &result_descriptor)`, which matches records on the
@@ -719,6 +731,16 @@ impl fmt::Display for Inst {
             } => write!(
                 f,
                 "{dst} = rename {src} heading_{} -> heading_{} perm{perm:?}",
+                src_heading_id.0, result_heading_id.0
+            ),
+            Inst::Restructure {
+                dst,
+                src,
+                src_heading_id,
+                result_heading_id,
+            } => write!(
+                f,
+                "{dst} = restructure {src} heading_{} -> heading_{}",
                 src_heading_id.0, result_heading_id.0
             ),
             Inst::Join {

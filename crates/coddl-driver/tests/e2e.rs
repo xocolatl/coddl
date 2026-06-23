@@ -2605,3 +2605,70 @@ fn nested_tuple_literal_byte_identical_across_backends() {
         run_nested_tuple_lit("cranelift")
     );
 }
+
+// ── wrap / unwrap (in-process restructure) ────────────────────────────
+
+/// `wrap` groups attributes into a tuple-valued attribute; `unwrap` expands it.
+/// Exercises: wrap (prints nested), the wrap∘unwrap round-trip (= the original),
+/// wrap-then-`project { t }` (the tuple cell copies whole, not truncated — the
+/// `cell_width_desc` fix), and a `join` on a Text-bearing tuple key (content-
+/// aware equality — the unified `cmp_cell` fix).
+const WRAP_UNWRAP_SRC: &str = "\
+program wrap_unwrap;
+oper main {} [
+    let r = Relation { {a: 1, n: \"x\", c: 7}, {a: 2, n: \"y\", c: 8} };
+    write_relation { rel: r wrap { t: {a, n} } };
+    write_relation { rel: r wrap { t: {a, n} } unwrap { t } };
+    write_relation { rel: r wrap { t: {a, n} } project { t } };
+    let s = Relation { {a: 1, n: \"x\", w: 100}, {a: 2, n: \"y\", w: 200} };
+    write_relation { rel: (r wrap { k: {a, n} }) join (s wrap { k: {a, n} }) };
+];
+";
+
+fn run_wrap_unwrap(backend: &str) -> Vec<u8> {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("wrap-unwrap.cd");
+    std::fs::write(&src, WRAP_UNWRAP_SRC).expect("write src");
+    let out = coddl()
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&src)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "wrap/unwrap on {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+#[test]
+fn wrap_unwrap_restructures_and_composes() {
+    let expected = sorted_tuples(&[
+        // wrap: `a`/`n` grouped into `t`, `c` survives (nested attrs name-sorted).
+        r#"{c: 7, t: {a: 1, n: "x"}}"#,
+        r#"{c: 8, t: {a: 2, n: "y"}}"#,
+        // wrap ∘ unwrap = the original.
+        r#"{a: 1, c: 7, n: "x"}"#,
+        r#"{a: 2, c: 8, n: "y"}"#,
+        // wrap then project { t }: the whole tuple cell survives.
+        r#"{t: {a: 1, n: "x"}}"#,
+        r#"{t: {a: 2, n: "y"}}"#,
+        // join on the Text-bearing tuple key `k` (content-aware match).
+        r#"{c: 7, k: {a: 1, n: "x"}, w: 100}"#,
+        r#"{c: 8, k: {a: 2, n: "y"}, w: 200}"#,
+    ]);
+    for backend in ["llvm", "cranelift"] {
+        assert_eq!(
+            tuple_lines(&run_wrap_unwrap(backend)),
+            expected,
+            "wrap/unwrap output on {backend}"
+        );
+    }
+}
+
+#[test]
+fn wrap_unwrap_byte_identical_across_backends() {
+    assert_eq!(run_wrap_unwrap("llvm"), run_wrap_unwrap("cranelift"));
+}

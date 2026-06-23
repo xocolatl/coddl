@@ -255,6 +255,7 @@ impl Emitter {
         // `project`: takes (src, src_desc, result_desc) and returns a
         // fresh narrowed + sealed relation pointer (rc=1).
         writeln!(self.body, "declare ptr @coddl_relation_project(ptr, ptr, ptr)").unwrap();
+        writeln!(self.body, "declare ptr @coddl_relation_restructure(ptr, ptr, ptr)").unwrap();
         // `join`: (lhs, lhs_desc, rhs, rhs_desc, result_desc) -> rc=1 ptr.
         writeln!(
             self.body,
@@ -813,6 +814,12 @@ impl Emitter {
                 src_heading_id,
                 result_heading_id,
             } => self.lower_project_inst(*dst, src, *src_heading_id, *result_heading_id),
+            Inst::Restructure {
+                dst,
+                src,
+                src_heading_id,
+                result_heading_id,
+            } => self.lower_restructure_inst(*dst, src, *src_heading_id, *result_heading_id),
             Inst::Rename {
                 dst,
                 src,
@@ -1454,6 +1461,35 @@ impl Emitter {
         writeln!(
             self.body,
             "    {name} = call ptr @coddl_relation_project(ptr {src_op}, ptr @.heading.{}, ptr @.heading.{})",
+            src_heading_id.0, result_heading_id.0,
+        )
+        .unwrap();
+        self.values.insert(
+            dst,
+            ValueRepr::Scalar {
+                ty: "ptr".to_string(),
+                op: name,
+            },
+        );
+        Ok(())
+    }
+
+    /// Emit `call ptr @coddl_relation_restructure(src, &src_desc, &result_desc)`
+    /// (surface `wrap`/`unwrap`). The runtime permutes each record's leaf cells
+    /// into the destination layout and re-seals; `dst` carries the restructured
+    /// heading.
+    fn lower_restructure_inst(
+        &mut self,
+        dst: ValueId,
+        src: &ValueId,
+        src_heading_id: HeadingId,
+        result_heading_id: HeadingId,
+    ) -> Result<(), LlvmEmitError> {
+        let src_op = self.scalar_op(src)?;
+        let name = format!("%v{}", dst.0);
+        writeln!(
+            self.body,
+            "    {name} = call ptr @coddl_relation_restructure(ptr {src_op}, ptr @.heading.{}, ptr @.heading.{})",
             src_heading_id.0, result_heading_id.0,
         )
         .unwrap();

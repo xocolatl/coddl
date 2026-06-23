@@ -347,6 +347,21 @@ each `parse_<x>` has a corresponding `check_<x>`.
   `SELECT old AS new` (the `Rename` peel-chain); an in-memory operand lowers to
   `Inst::Rename` → `coddl_relation_rename`. (`rename`/`replace`/`extend` form a
   clean trichotomy: relabel / compute-and-consume / compute-and-keep.)
+- **`check_wrap_expr`** — `R wrap { t: { a, b }, … }` — group attributes into
+  tuple-valued attributes. The operand must be `Type::Relation(H)` (T0023). Each
+  wrapped attribute must exist in `H` (T0027) and be wrapped at most once across
+  all pairs (T0028); each new name must be fresh vs. survivors and other new
+  names (T0031). Result heading = the un-wrapped survivors plus each
+  `new : Tuple(<components with their H types>)`. (`wrap { t: {} }` → `t : Tuple {}`
+  is allowed.) A relvar-rooted wrap declines the SQL push (Chunk-2: no emission)
+  and restructures in-process via `Inst::Restructure` → `coddl_relation_restructure`.
+- **`check_unwrap_expr`** — `R unwrap { t, … }` — expand tuple-valued attributes
+  back to their components, lifted to top level (the inverse of `wrap`). The
+  operand must be `Type::Relation(H)` (T0023). Each named attribute must exist
+  (T0027), be listed once (T0028), and be `Type::Tuple(_)` (**T0048**); a lifted
+  component colliding with a survivor or another lifted component is T0031.
+  Result heading = the survivors plus each unwrapped tuple's components. Same
+  in-process lowering as `wrap`.
 - **`check_extend_expr`** — `R extend { c: e, … }`. Adds each new attribute `c`
   bound to the computed value `e`, keeping every operand attribute (the dual of
   `replace`). The operand must be `Type::Relation(H)` (T0023). Each value `e` is
@@ -454,3 +469,4 @@ check script enforces that.
 | T0045 | `extend` attribute already exists / duplicate `extend` target |
 | T0046 | computed `extend` / `replace` value must be Integer or Text (v1 relation-cell support) |
 | T0047 | `replace` value is a bare attribute reference (only relabels) — use `rename` |
+| T0048 | `unwrap` target is not a tuple-valued attribute                    |

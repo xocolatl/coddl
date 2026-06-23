@@ -20,7 +20,7 @@ LLVM IR calls these exports as plain C functions. The runtime is where SQLite vs
 The runtime hosts two execution engines side-by-side:
 
 - **SQL backend** — runs any subplan rooted in relvars. Subplans become SQL strings via [`coddl-sqlemit`](sqlemit.md) (at compile time for static plans, loaded as a library at runtime for dynamic ones).
-- **In-process runtime library** — compiled relational primitives (`coddl_relation_where`, `coddl_relation_extend`, `coddl_relation_join`, `coddl_relation_project`, …) operating over materialized relations. Tight specialized loops; volcano-style where it pays off (hash joins, sort-merge). Tests and the REPL exercise the same primitives the compiled binary does.
+- **In-process runtime library** — compiled relational primitives (`coddl_relation_where`, `coddl_relation_extend`, `coddl_relation_join`, `coddl_relation_project`, `coddl_relation_restructure` (surface `wrap`/`unwrap`), …) operating over materialized relations. Tight specialized loops; volcano-style where it pays off (hash joins, sort-merge). Tests and the REPL exercise the same primitives the compiled binary does.
 
 The RelIR optimizer draws the cut between them as close to the leaves as possible: push everything that touches a relvar into SQL, do the rest in-process. See [relir.md](relir.md) "The cut: SQL vs in-process."
 
@@ -219,7 +219,14 @@ attribute's `sub` pointer carries the nested `CoddlHeadingDesc` (with
 0-based offsets within the sub-region). The printer and the
 content-aware record comparator both recurse through `sub`, adding the
 parent cell's base offset — so two tuple cells with equal `Text`
-content but different pointers still dedup (RM Pro 3). Sub-word packing
+content but different pointers still dedup (RM Pro 3). Every in-process
+operator is tuple-aware: per-cell *copies* (`project`/`rename`/`join`/
+`tclose`) size a cell with `cell_width_desc` (a `Tuple` is its whole
+`sub.record_size` blob, not 8 bytes), and *equality* (join shared key,
+tclose edge match, seal/dedup) goes through one `cmp_cell(ra, off_a, rb,
+off_b, attr)` that recurses content-aware. `wrap`/`unwrap` themselves are
+`coddl_relation_restructure`: flatten both descriptors to leaf cells,
+match by name, permute each record into the destination layout. Sub-word packing
 (Boolean → 1 bit, Byte → 1 byte) is deferred. Relation-as-cell (kind 11)
 is reserved but not yet emitted.
 

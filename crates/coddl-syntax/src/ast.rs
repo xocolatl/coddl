@@ -413,6 +413,8 @@ pub enum Expr {
     Extend(ExtendExpr),
     Tclose(TcloseExpr),
     Rename(RenameExpr),
+    Wrap(WrapExpr),
+    Unwrap(UnwrapExpr),
 }
 
 impl Expr {
@@ -433,6 +435,8 @@ impl Expr {
             SyntaxKind::EXTEND_EXPR => Expr::Extend(ExtendExpr { syntax }),
             SyntaxKind::TCLOSE_EXPR => Expr::Tclose(TcloseExpr { syntax }),
             SyntaxKind::RENAME_EXPR => Expr::Rename(RenameExpr { syntax }),
+            SyntaxKind::WRAP_EXPR => Expr::Wrap(WrapExpr { syntax }),
+            SyntaxKind::UNWRAP_EXPR => Expr::Unwrap(UnwrapExpr { syntax }),
             // Parenthesized expressions are transparent — recurse to
             // the inner `Expr` so the typechecker / lowerer never see
             // the wrapper. Used purely for precedence grouping.
@@ -458,6 +462,8 @@ impl Expr {
             Expr::Extend(e) => e.syntax(),
             Expr::Tclose(t) => t.syntax(),
             Expr::Rename(r) => r.syntax(),
+            Expr::Wrap(w) => w.syntax(),
+            Expr::Unwrap(u) => u.syntax(),
         }
     }
 }
@@ -882,6 +888,82 @@ impl RenameExpr {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+ast_node!(pub WrapExpr, WRAP_EXPR);
+
+impl WrapExpr {
+    /// The relation operand being wrapped — the single `Expr` child (the
+    /// `new: { … }` pairs are `WRAP_PAIR` nodes, not `Expr`s).
+    pub fn input(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// The `new: { a, b }` pairs in source order.
+    pub fn pairs(&self) -> impl Iterator<Item = WrapPair> + '_ {
+        children(&self.syntax)
+    }
+}
+
+ast_node!(pub WrapPair, WRAP_PAIR);
+
+impl WrapPair {
+    /// The new tuple-valued attribute name — the IDENT token before the `{`.
+    pub fn name(&self) -> Option<SyntaxToken> {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .take_while(|t| t.kind() != SyntaxKind::L_BRACE)
+            .find(|t| t.kind() == SyntaxKind::IDENT)
+    }
+
+    /// The existing attribute names to group into the tuple — the IDENT tokens
+    /// after the `{` (same shape as `ProjectExpr::attrs`).
+    pub fn wrapped(&self) -> impl Iterator<Item = SyntaxToken> + '_ {
+        let mut after_brace = false;
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .filter_map(move |t| {
+                if t.kind() == SyntaxKind::L_BRACE {
+                    after_brace = true;
+                    None
+                } else if after_brace && t.kind() == SyntaxKind::IDENT {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+    }
+}
+
+ast_node!(pub UnwrapExpr, UNWRAP_EXPR);
+
+impl UnwrapExpr {
+    /// The relation operand being unwrapped — the single `Expr` child (the
+    /// attribute names are bare tokens, not child nodes).
+    pub fn input(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// The tuple-valued attribute names to expand, in source order — the IDENT
+    /// tokens after the `{` (same shape as `ProjectExpr::attrs`).
+    pub fn attrs(&self) -> impl Iterator<Item = SyntaxToken> + '_ {
+        let mut after_brace = false;
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .filter_map(move |t| {
+                if t.kind() == SyntaxKind::L_BRACE {
+                    after_brace = true;
+                    None
+                } else if after_brace && t.kind() == SyntaxKind::IDENT {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
     }
 }
 

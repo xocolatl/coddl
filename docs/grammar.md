@@ -53,7 +53,7 @@ Reason: the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-
 - **Scope injection.** Identifiers in the predicate resolve against the left operand's heading first, the enclosing scope second. `SP where s# = supplier` reads as: `s#` is the `SP` attribute; `supplier` is a parameter from the enclosing `oper`. The parser and typechecker inject the left operand's heading into the predicate's name-resolution scope automatically. This is the first construct with a non-uniform scoping rule; every later construct that takes a predicate (`extend`, `summarize`'s aggregate expressions, possrep constraints) reuses the same machinery.
 - **Precedence.** `where` binds looser than `=`, `<`, `+`, `and`, `or` — the predicate is expected to be a full scalar expression. `R where x = 1 and y > 0` parses as `R where ((x = 1) and (y > 0))` without parentheses. Practically `where` sits at the bottom of the infix precedence ladder, alongside `union`/`minus`. Full precedence table lands when the parser does — exact order is deferred until then.
 
-**`project` (projection) is a *postfix* operator, not infix.** `R project { a, b }` narrows the relation's heading to the named attributes — the right operand is a brace-list of bare attribute names (structurally identical to a `key { … }` clause), not another expression, so it doesn't fit the infix `<lhs> op <rhs>` shape. It is parsed as a postfix suffix at *pipeline precedence* — the same altitude as `where`, and gated to the top level so it binds to the whole pipeline rather than to a higher-precedence operand such as a `where` predicate. `R where p project { a }` reads as `(R where p) project { a }`; the reverse order `R project { a } where p` also parses, nesting left. It is the first postfix relational operator; later ones (`replace`, `extend`, `rename`, `tclose`, and future `summarize`) reuse the same pipeline slot. `project` remains a contextual keyword — a valid identifier everywhere else (no reserved words).
+**`project` (projection) is a *postfix* operator, not infix.** `R project { a, b }` narrows the relation's heading to the named attributes — the right operand is a brace-list of bare attribute names (structurally identical to a `key { … }` clause), not another expression, so it doesn't fit the infix `<lhs> op <rhs>` shape. It is parsed as a postfix suffix at *pipeline precedence* — the same altitude as `where`, and gated to the top level so it binds to the whole pipeline rather than to a higher-precedence operand such as a `where` predicate. `R where p project { a }` reads as `(R where p) project { a }`; the reverse order `R project { a } where p` also parses, nesting left. It is the first postfix relational operator; later ones (`replace`, `extend`, `rename`, `tclose`, `wrap`, `unwrap`, and future `summarize`) reuse the same pipeline slot. `project` remains a contextual keyword — a valid identifier everywhere else (no reserved words).
 
 ### Parenthesized positional for monadic operators
 
@@ -427,14 +427,15 @@ function that implements it.
 <expr-prec>     ::= <primary-expr> { <postfix> }
                     { <infix-op> <expr-prec> | <project-suffix>
                       | <replace-suffix> | <tclose-suffix>
-                      | <extend-suffix> | <rename-suffix> } ;
+                      | <extend-suffix> | <rename-suffix>
+                      | <wrap-suffix> | <unwrap-suffix> } ;
                                                                -- parse_expr_prec
                     -- Pratt precedence ladder; left-associative.
                     -- min_prec drives which operators may be
                     -- consumed; the parser recurses with `prec + 1`
                     -- for each rhs. The <project-suffix> / <replace-suffix>
-                    -- / <tclose-suffix> / <extend-suffix> / <rename-suffix>
-                    -- postfix forms are
+                    -- / <tclose-suffix> / <extend-suffix> / <rename-suffix> /
+                    -- <wrap-suffix> / <unwrap-suffix> postfix forms are
                     -- consumed only at pipeline level (min_prec 0),
                     -- interleaved with infix ops, so they bind to the whole
                     -- pipeline.
@@ -550,6 +551,32 @@ function that implements it.
                     -- the result must stay a bijection (T0031). P0034 on a
                     -- missing `{`. `rename` is a contextual keyword, a valid
                     -- identifier elsewhere (no reserved words).
+<wrap-suffix>   ::= 'wrap' '{' <wrap-pair> { ',' <wrap-pair> } '}' ; -- parse_wrap_suffix
+<wrap-pair>     ::= <identifier> ':' <ident-brace-list> ;       -- (a WRAP_PAIR node)
+                    -- Relational wrap (group attributes into tuple-valued
+                    -- attributes). Postfix at pipeline precedence; wraps the
+                    -- operand in WRAP_EXPR. Each pair binds a new tuple-valued
+                    -- attribute name (left) to an UNORDERED brace-list of
+                    -- existing attribute names (right) — NOT an expression. The
+                    -- listed attributes are removed from the top level and
+                    -- become the new attribute's tuple components. Each wrapped
+                    -- attribute must exist (T0027), be wrapped at most once
+                    -- (T0028); each new name must be fresh (T0031). P0044 on a
+                    -- missing outer `{`, P0045 on a missing new name, P0046 on a
+                    -- missing `:`, P0047/P0048/P0049 on the inner brace-list's
+                    -- `{`/name/`}`, P0050 on a missing outer `}`. v1 declines the
+                    -- SQL push (restructures in-process). `wrap` is a contextual
+                    -- keyword (no reserved words).
+<unwrap-suffix> ::= 'unwrap' <ident-brace-list> ;              -- parse_unwrap_suffix
+                    -- Relational unwrap (expand tuple-valued attributes back to
+                    -- their components, lifted to top level — the inverse of
+                    -- `wrap`). Postfix at pipeline precedence; wraps the operand
+                    -- in UNWRAP_EXPR. The unordered brace-list names the
+                    -- tuple-valued attributes to expand: each must exist (T0027),
+                    -- be listed once (T0028), and be tuple-valued (T0048); a
+                    -- lifted component colliding with a survivor is T0031. P0051
+                    -- on a missing `{`, P0052 on a missing name, P0053 on a
+                    -- missing `}`. v1 declines the SQL push. Contextual keyword.
 <transaction-expr> ::= 'transaction' <block> ;                 -- parse_transaction_expr
 <name-ref>      ::= <identifier> ;
 <arg-list>      ::= '{' [ <named-arg> commalist ] '}' ;        -- parse_arg_list
@@ -671,6 +698,16 @@ enforces that.
 | P0041 | Expected attribute name in tclose list                  |
 | P0042 | Expected `}` to close tclose list                       |
 | P0043 | Expected `{` to start extend list                       |
+| P0044 | Expected `{` to start wrap list                         |
+| P0045 | Expected new attribute name in wrap                     |
+| P0046 | Expected `:` after wrap attribute name                  |
+| P0047 | Expected `{` to start wrapped-attribute list            |
+| P0048 | Expected attribute name in wrapped-attribute list       |
+| P0049 | Expected `}` to close wrapped-attribute list            |
+| P0050 | Expected `}` to close wrap list                         |
+| P0051 | Expected `{` to start unwrap list                       |
+| P0052 | Expected attribute name in unwrap list                  |
+| P0053 | Expected `}` to close unwrap list                       |
 
 Note: missing-type-after-`:` (let annotation) and missing-type-
 after-`->` (operator return clause) both surface as `P0011`

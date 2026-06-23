@@ -232,6 +232,24 @@ pub enum SyntaxKind {
     /// discriminants stable.
     RENAME_EXPR,
 
+    /// `<relExpr> wrap { t: { a, b }, … }` — relational wrap (group attributes
+    /// into a tuple-valued attribute). A postfix expression node wrapping its
+    /// relation operand; each `WRAP_PAIR` follows the `wrap` keyword. Placed at
+    /// the end of the enum to keep existing discriminants stable.
+    WRAP_EXPR,
+
+    /// One `new: { a, b }` pair inside a `WRAP_EXPR`: the new tuple-valued
+    /// attribute name (an `IDENT`) and the unordered brace-list of existing
+    /// attribute names to group into it (bare `IDENT` tokens after `{`).
+    WRAP_PAIR,
+
+    /// `<relExpr> unwrap { t, … }` — relational unwrap (expand a tuple-valued
+    /// attribute back to its components). A postfix expression node wrapping its
+    /// relation operand; the unordered brace-list of tuple-valued attribute
+    /// names follows the `unwrap` keyword. Placed at the end of the enum to keep
+    /// existing discriminants stable.
+    UNWRAP_EXPR,
+
     /// A range of source whose intended structure couldn't be
     /// recovered. The parser still wraps the tokens so the tree stays
     /// well-formed and downstream passes can keep going.
@@ -383,6 +401,9 @@ mod tests {
             SyntaxKind::REPLACE_EXPR,
             SyntaxKind::TCLOSE_EXPR,
             SyntaxKind::RENAME_EXPR,
+            SyntaxKind::WRAP_EXPR,
+            SyntaxKind::WRAP_PAIR,
+            SyntaxKind::UNWRAP_EXPR,
             SyntaxKind::PARSE_ERROR,
         ] {
             assert!(!sk.is_token(), "{sk:?} should be a node kind");

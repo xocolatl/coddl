@@ -266,7 +266,12 @@ fn declare_runtime_rc_externs(
     }
     // coddl_relation_where(src: ptr, desc: ptr, pred_fn: ptr) -> ptr
     // coddl_relation_project(src: ptr, src_desc: ptr, result_desc: ptr) -> ptr
-    for name in ["coddl_relation_where", "coddl_relation_project"] {
+    // coddl_relation_restructure(src: ptr, src_desc: ptr, result_desc: ptr) -> ptr
+    for name in [
+        "coddl_relation_where",
+        "coddl_relation_project",
+        "coddl_relation_restructure",
+    ] {
         let mut sig = obj.make_signature();
         sig.params.push(AbiParam::new(ptr_ty));
         sig.params.push(AbiParam::new(ptr_ty));
@@ -1589,6 +1594,30 @@ fn emit_inst(
                 builder
                     .ins()
                     .call(project_local, &[src_v, src_desc_val, res_desc_val]);
+            let result = builder.inst_results(call)[0];
+            values.insert(*dst, ValueRepr::Scalar(result));
+            Ok(())
+        }
+        Inst::Restructure {
+            dst,
+            src,
+            src_heading_id,
+            result_heading_id,
+        } => {
+            let src_v = scalar_value(values, src)?;
+            let ptr_ty = obj.target_config().pointer_type();
+            let src_desc_id = heading_desc_ids[src_heading_id.0 as usize];
+            let src_desc_gv = obj.declare_data_in_func(src_desc_id, builder.func);
+            let src_desc_val = builder.ins().symbol_value(ptr_ty, src_desc_gv);
+            let res_desc_id = heading_desc_ids[result_heading_id.0 as usize];
+            let res_desc_gv = obj.declare_data_in_func(res_desc_id, builder.func);
+            let res_desc_val = builder.ins().symbol_value(ptr_ty, res_desc_gv);
+            let restructure_id = funcs["coddl_relation_restructure"];
+            let restructure_local = obj.declare_func_in_func(restructure_id, builder.func);
+            let call =
+                builder
+                    .ins()
+                    .call(restructure_local, &[src_v, src_desc_val, res_desc_val]);
             let result = builder.inst_results(call)[0];
             values.insert(*dst, ValueRepr::Scalar(result));
             Ok(())

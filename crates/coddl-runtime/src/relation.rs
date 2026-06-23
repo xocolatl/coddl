@@ -259,24 +259,18 @@ pub unsafe extern "C" fn coddl_relation_join(
     let res_attrs =
         std::slice::from_raw_parts((*result_desc).attrs, (*result_desc).attr_count as usize);
 
-    // Shared attributes → equality test pairs (lhs_off, rhs_off, width, is_text).
-    // `is_text` selects content comparison over raw bytes: a Text cell is a
-    // 16-byte (ptr, len) fat pointer, and equal text from two different string
-    // constants has different pointers — so the shared cells must be compared by
-    // content, not by their fat-pointer bytes.
-    let mut shared: Vec<(usize, usize, usize, bool)> = Vec::new();
-    for la in lhs_attrs {
+    // Shared attributes → equality test triples (lhs_off, rhs_off, lhs_attr_idx).
+    // `cmp_cell` compares each shared cell content-aware: a Text cell is a
+    // 16-byte (ptr, len) fat pointer and equal text from two string constants has
+    // different pointers, and a tuple cell recurses into its components — so
+    // shared cells are compared by content, not by their raw bytes.
+    let mut shared: Vec<(usize, usize, usize)> = Vec::new();
+    for (li, la) in lhs_attrs.iter().enumerate() {
         let lname = std::slice::from_raw_parts(la.name, la.name_len as usize);
         for ra in rhs_attrs {
             let rname = std::slice::from_raw_parts(ra.name, ra.name_len as usize);
             if lname == rname {
-                let is_text = la.kind == CoddlAttrKind::Text as u32;
-                shared.push((
-                    la.offset as usize,
-                    ra.offset as usize,
-                    cell_width(la.kind),
-                    is_text,
-                ));
+                shared.push((la.offset as usize, ra.offset as usize, li));
                 break;
             }
         }
@@ -291,7 +285,7 @@ pub unsafe extern "C" fn coddl_relation_join(
         for la in lhs_attrs {
             let lname = std::slice::from_raw_parts(la.name, la.name_len as usize);
             if lname == dname {
-                moves.push((d.offset as usize, true, la.offset as usize, cell_width(d.kind)));
+                moves.push((d.offset as usize, true, la.offset as usize, cell_width_desc(d)));
                 placed = true;
                 break;
             }
@@ -302,7 +296,7 @@ pub unsafe extern "C" fn coddl_relation_join(
         for ra in rhs_attrs {
             let rname = std::slice::from_raw_parts(ra.name, ra.name_len as usize);
             if rname == dname {
-                moves.push((d.offset as usize, false, ra.offset as usize, cell_width(d.kind)));
+                moves.push((d.offset as usize, false, ra.offset as usize, cell_width_desc(d)));
                 break;
             }
         }
@@ -324,18 +318,15 @@ pub unsafe extern "C" fn coddl_relation_join(
         let lrec = lhs.add(li * lhs_rec);
         for ri in 0..rhs_count {
             let rrec = rhs.add(ri * rhs_rec);
+            let lrec_s = std::slice::from_raw_parts(lrec, lhs_rec);
+            let rrec_s = std::slice::from_raw_parts(rrec, rhs_rec);
             let mut matched = true;
-            for &(loff, roff, w, is_text) in &shared {
-                let eq = if is_text {
-                    let (lptr, llen) = read_text_cell(lrec, loff);
-                    let (rptr, rlen) = read_text_cell(rrec, roff);
-                    coddl_text_eq(lptr, llen, rptr, rlen) != 0
-                } else {
-                    let a = std::slice::from_raw_parts(lrec.add(loff), w);
-                    let b = std::slice::from_raw_parts(rrec.add(roff), w);
-                    a == b
-                };
-                if !eq {
+            for &(loff, roff, li_attr) in &shared {
+                // Same-named shared attrs have identical type; `lhs_attrs[li_attr]`
+                // supplies the kind + sub-descriptor for the content-aware compare.
+                if cmp_cell(lrec_s, loff, rrec_s, roff, &lhs_attrs[li_attr])
+                    != std::cmp::Ordering::Equal
+                {
                     matched = false;
                     break;
                 }
@@ -504,8 +495,9 @@ pub unsafe extern "C" fn coddl_relation_tclose(
     }
     let off_a = attrs[0].offset as usize; // source cell
     let off_b = attrs[1].offset as usize; // target cell
-    let kind = attrs[0].kind; // identical to attrs[1].kind (typechecked)
-    let w = cell_width(kind);
+    // Both key attributes have identical type (typechecked); `attrs[0]` supplies
+    // the kind + sub-descriptor for both the width and the content-aware match.
+    let w = cell_width_desc(&attrs[0]);
 
     // The accumulating edge set, seeded with a copy of the input records.
     let mut result: Vec<u8> = std::slice::from_raw_parts(rel, count * record_size).to_vec();
@@ -519,8 +511,9 @@ pub unsafe extern "C" fn coddl_relation_tclose(
             let r = &result[ri * record_size..(ri + 1) * record_size];
             for ei in 0..count {
                 let e = std::slice::from_raw_parts(rel.add(ei * record_size), record_size);
-                // r's target (off_b) == e's source (off_a)?
-                if cell_eq(r.as_ptr(), off_b, e.as_ptr(), off_a, kind) {
+                // r's target (off_b) == e's source (off_a)? (content-aware,
+                // tuple-aware via `cmp_cell`).
+                if cmp_cell(r, off_b, e, off_a, &attrs[0]) == std::cmp::Ordering::Equal {
                     // New pair (x → z): r's source cell + e's target cell, into
                     // a zeroed record (padding bytes are never read by
                     // `record_cmp`, which walks only the two attribute cells).
@@ -889,6 +882,26 @@ fn cell_width(kind: u32) -> usize {
     }
 }
 
+/// Byte width of the cell described by `attr` — tuple-aware. A `Tuple` cell
+/// occupies its inline sub-region (`sub.record_size`); every other cell uses
+/// the scalar [`cell_width`]. Per-cell *copy* move-lists (project / rename /
+/// join / tclose) must use this so a tuple cell copies as a whole blob rather
+/// than being truncated to 8 bytes.
+///
+/// # Safety
+/// For a `Tuple` cell, `attr.sub` must be null or a valid descriptor pointer.
+unsafe fn cell_width_desc(attr: &CoddlAttrDesc) -> usize {
+    if attr.kind == CoddlAttrKind::Tuple as u32 {
+        if attr.sub.is_null() {
+            0
+        } else {
+            (*attr.sub).record_size as usize
+        }
+    } else {
+        cell_width(attr.kind)
+    }
+}
+
 /// Read a `Text` cell — a 16-byte `(ptr, len)` fat pointer — from `rec` at
 /// `off`, returning `(ptr, len)`. Mirrors the layout `print_cell` reads;
 /// byte-copies via `from_ne_bytes` so it's safe regardless of record alignment.
@@ -908,28 +921,31 @@ unsafe fn read_text_cell(rec: *const u8, off: usize) -> (*const u8, usize) {
     )
 }
 
-/// Compare one cell of `ra` vs `rb`, the cell living at record offset
-/// `base + attr.offset`. `Text` compares by string *content* (not the
-/// `(ptr, len)` fat pointer); scalars by their fixed-width bytes; a `Tuple`
-/// cell recurses over its inline sub-region's components (so two tuple cells
-/// with equal Text content but different pointers compare `Equal`). The `base`
-/// is this cell's enclosing position — 0 at the record root, the parent tuple's
-/// record offset when recursing.
+/// Compare a cell of `ra` (at absolute record offset `off_a`) against a cell of
+/// `rb` (at `off_b`), where `attr` supplies the cell's kind (and sub-descriptor
+/// for a `Tuple`). The two offsets may differ — the same attribute sits at
+/// different offsets in two operands of a `join`. `Text` compares by string
+/// *content* (not the `(ptr, len)` fat pointer); scalars by their fixed-width
+/// bytes; a `Tuple` cell recurses over its inline sub-region's components,
+/// advancing each side's offset (so two tuple cells with equal Text content but
+/// different pointers compare `Equal`). Unifies the equality logic for
+/// `record_cmp` (same offset both sides), `join` (shared key at differing
+/// offsets), and `tclose` (edge match).
 ///
 /// # Safety
-/// `ra`/`rb` must hold a record whose layout matches `attr` (and its `sub`);
-/// `Text` cells must describe `len` readable bytes (or `len == 0`).
+/// `ra`/`rb` must hold a record whose layout matches `attr` (and its `sub`) at
+/// the given offsets; `Text` cells must describe `len` readable bytes (or 0).
 unsafe fn cmp_cell(
     ra: &[u8],
+    off_a: usize,
     rb: &[u8],
-    base: usize,
+    off_b: usize,
     attr: &CoddlAttrDesc,
 ) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    let off = base + attr.offset as usize;
     if attr.kind == CoddlAttrKind::Text as u32 {
-        let (pa, la) = read_text_cell(ra.as_ptr(), off);
-        let (pb, lb) = read_text_cell(rb.as_ptr(), off);
+        let (pa, la) = read_text_cell(ra.as_ptr(), off_a);
+        let (pb, lb) = read_text_cell(rb.as_ptr(), off_b);
         let sa: &[u8] = if la == 0 {
             &[]
         } else {
@@ -948,7 +964,8 @@ unsafe fn cmp_cell(
         let sub = &*attr.sub;
         let sub_attrs = std::slice::from_raw_parts(sub.attrs, sub.attr_count as usize);
         for sa in sub_attrs {
-            let ord = cmp_cell(ra, rb, off, sa);
+            let sub_off = sa.offset as usize;
+            let ord = cmp_cell(ra, off_a + sub_off, rb, off_b + sub_off, sa);
             if ord != Ordering::Equal {
                 return ord;
             }
@@ -956,7 +973,7 @@ unsafe fn cmp_cell(
         Ordering::Equal
     } else {
         let w = cell_width(attr.kind);
-        ra[off..off + w].cmp(&rb[off..off + w])
+        ra[off_a..off_a + w].cmp(&rb[off_b..off_b + w])
     }
 }
 
@@ -972,46 +989,13 @@ unsafe fn cmp_cell(
 unsafe fn record_cmp(ra: &[u8], rb: &[u8], attrs: &[CoddlAttrDesc]) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     for attr in attrs {
-        let ord = cmp_cell(ra, rb, 0, attr);
+        let off = attr.offset as usize;
+        let ord = cmp_cell(ra, off, rb, off, attr);
         if ord != Ordering::Equal {
             return ord;
         }
     }
     Ordering::Equal
-}
-
-/// Content-aware equality of one cell from each of two records: `ra` at `off_a`
-/// vs `rb` at `off_b`, both of kind `kind`. `Text` compares by string content
-/// (via `read_text_cell`); scalars compare their fixed-width bytes — the same
-/// basis as `record_cmp`, but for a single cell across (possibly) different
-/// offsets. Used by [`coddl_relation_tclose`] to test whether one edge's target
-/// matches another edge's source.
-///
-/// # Safety
-/// `ra.add(off_a)` and `rb.add(off_b)` must each point at one readable cell of
-/// `kind` (8 bytes scalar, or a 16-byte `(ptr, len)` Text fat pointer whose
-/// `len` bytes are readable, or `len == 0`).
-unsafe fn cell_eq(ra: *const u8, off_a: usize, rb: *const u8, off_b: usize, kind: u32) -> bool {
-    if kind == CoddlAttrKind::Text as u32 {
-        let (pa, la) = read_text_cell(ra, off_a);
-        let (pb, lb) = read_text_cell(rb, off_b);
-        let sa: &[u8] = if la == 0 {
-            &[]
-        } else {
-            std::slice::from_raw_parts(pa, la)
-        };
-        let sb: &[u8] = if lb == 0 {
-            &[]
-        } else {
-            std::slice::from_raw_parts(pb, lb)
-        };
-        sa == sb
-    } else {
-        let w = cell_width(kind);
-        let a = std::slice::from_raw_parts(ra.add(off_a), w);
-        let b = std::slice::from_raw_parts(rb.add(off_b), w);
-        a == b
-    }
 }
 
 /// Project a relation onto a subset of its attributes. Returns a fresh
@@ -1065,7 +1049,7 @@ pub unsafe extern "C" fn coddl_relation_project(
         // A well-typed projection always finds the attribute; skip
         // defensively if a malformed descriptor pair ever doesn't.
         if let Some(s) = s {
-            moves.push((s.offset as usize, d.offset as usize, cell_width(d.kind)));
+            moves.push((s.offset as usize, d.offset as usize, cell_width_desc(d)));
         }
     }
 
@@ -1151,7 +1135,7 @@ pub unsafe extern "C" fn coddl_relation_rename(
     for (dst_i, d) in dst_attrs.iter().enumerate() {
         let src_i = perm.get(dst_i).copied().unwrap_or(0) as usize;
         if let Some(s) = src_attrs.get(src_i) {
-            moves.push((s.offset as usize, d.offset as usize, cell_width(d.kind)));
+            moves.push((s.offset as usize, d.offset as usize, cell_width_desc(d)));
         }
     }
 
@@ -1176,6 +1160,100 @@ pub unsafe extern "C" fn coddl_relation_rename(
     if dst_record_size == 0 {
         // Renaming an empty heading: collapse to reltrue/relfalse (seal can't
         // dedup zero-width records).
+        let out_header = out.sub(HEADER_SIZE) as *mut CoddlRcHeader;
+        (*out_header).length = u32::from(count > 0);
+    } else {
+        coddl_relation_seal(out, dst_desc);
+    }
+    out
+}
+
+/// One flattened leaf cell: `(name_ptr, name_len, absolute_offset, width)`.
+type LeafCell = (*const u8, usize, usize, usize);
+
+/// Flatten a heading descriptor to its leaf (scalar / Text) cells, recursing
+/// into `Tuple` cells and adding each tuple's base offset. The offset returned
+/// is absolute within a record; the width is the scalar/Text cell width.
+///
+/// # Safety
+/// `desc` must be a valid heading descriptor (and its `sub` pointers valid).
+unsafe fn flatten_leaves(desc: *const CoddlHeadingDesc, base: usize, out: &mut Vec<LeafCell>) {
+    let attrs = std::slice::from_raw_parts((*desc).attrs, (*desc).attr_count as usize);
+    for a in attrs {
+        let off = base + a.offset as usize;
+        if a.kind == CoddlAttrKind::Tuple as u32 {
+            if !a.sub.is_null() {
+                flatten_leaves(a.sub, off, out);
+            }
+        } else {
+            out.push((a.name, a.name_len as usize, off, cell_width(a.kind)));
+        }
+    }
+}
+
+/// Restructure a relation from `src_desc`'s layout to `dst_desc`'s — the runtime
+/// for surface `wrap` / `unwrap`. Both layouts hold the **same leaf cells**
+/// (wrap/unwrap only regroup attributes into / out of tuple-valued attributes,
+/// preserving every scalar value); the leaves are matched **by name** (names are
+/// globally unique across the operation) and each is copied to its destination
+/// offset. Returns a fresh RC-managed relation (rc=1); `src` is unchanged.
+/// Mirrors `coddl_relation_project`, but at leaf granularity so a leaf that
+/// moves into or out of a tuple sub-region is placed correctly.
+///
+/// # Safety
+/// `src` must point to a `Relation` payload from `coddl_rc_alloc` whose header
+/// carries `src_desc`; `src_desc`/`dst_desc` must outlive this call.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_relation_restructure(
+    src: *const u8,
+    src_desc: *const CoddlHeadingDesc,
+    dst_desc: *const CoddlHeadingDesc,
+) -> *mut u8 {
+    if src.is_null() || src_desc.is_null() || dst_desc.is_null() {
+        return std::ptr::null_mut();
+    }
+    let header = src.sub(HEADER_SIZE) as *const CoddlRcHeader;
+    let count = (*header).length as usize;
+    let src_record_size = (*src_desc).record_size as usize;
+    let dst_record_size = (*dst_desc).record_size as usize;
+
+    let mut src_leaves: Vec<LeafCell> = Vec::new();
+    flatten_leaves(src_desc, 0, &mut src_leaves);
+    let mut dst_leaves: Vec<LeafCell> = Vec::new();
+    flatten_leaves(dst_desc, 0, &mut dst_leaves);
+
+    // Per-leaf byte move `(src_offset, dst_offset, width)`, matching by name.
+    let mut moves: Vec<(usize, usize, usize)> = Vec::with_capacity(dst_leaves.len());
+    for &(dname, dlen, doff, dwidth) in &dst_leaves {
+        let dn = std::slice::from_raw_parts(dname, dlen);
+        if let Some(&(_, _, soff, _)) = src_leaves
+            .iter()
+            .find(|&&(sname, slen, _, _)| std::slice::from_raw_parts(sname, slen) == dn)
+        {
+            moves.push((soff, doff, dwidth));
+        }
+    }
+
+    let out = crate::rc::coddl_rc_alloc(
+        dst_record_size * count,
+        count as u32,
+        crate::rc::CoddlKind::Relation as u32,
+        dst_desc,
+    );
+    if out.is_null() {
+        return std::ptr::null_mut();
+    }
+    for i in 0..count {
+        let src_rec = src.add(i * src_record_size);
+        let dst_rec = out.add(i * dst_record_size);
+        for &(soff, doff, w) in &moves {
+            std::ptr::copy_nonoverlapping(src_rec.add(soff), dst_rec.add(doff), w);
+        }
+    }
+
+    if dst_record_size == 0 {
+        // All-empty result (e.g. wrap of everything into `Tuple {}`): seal can't
+        // dedup zero-width records, so collapse to reltrue/relfalse by hand.
         let out_header = out.sub(HEADER_SIZE) as *mut CoddlRcHeader;
         (*out_header).length = u32::from(count > 0);
     } else {
@@ -2257,6 +2335,50 @@ mod tests {
             let header2 = payload2.sub(HEADER_SIZE) as *const CoddlRcHeader;
             assert_eq!((*header2).length, 1, "identical tuple records must dedup");
             coddl_rc_release(payload2);
+        }
+    }
+
+    #[test]
+    fn restructure_wrap_then_unwrap_round_trips() {
+        // flat {a@0, b@8, c@16} (size 24).
+        let flat_attrs = [
+            CoddlAttrDesc { name: b"a".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 0, sub: std::ptr::null() },
+            CoddlAttrDesc { name: b"b".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 8, sub: std::ptr::null() },
+            CoddlAttrDesc { name: b"c".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 16, sub: std::ptr::null() },
+        ];
+        let flat_desc = CoddlHeadingDesc { attr_count: 3, record_size: 24, attrs: flat_attrs.as_ptr() };
+        // wrapped {c@0, t: Tuple{a@0, b@8}@8} (size 24) — name-sorted: c, t.
+        let t_sub_attrs = [
+            CoddlAttrDesc { name: b"a".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 0, sub: std::ptr::null() },
+            CoddlAttrDesc { name: b"b".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 8, sub: std::ptr::null() },
+        ];
+        let t_sub_desc = CoddlHeadingDesc { attr_count: 2, record_size: 16, attrs: t_sub_attrs.as_ptr() };
+        let wrapped_attrs = [
+            CoddlAttrDesc { name: b"c".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 0, sub: std::ptr::null() },
+            CoddlAttrDesc { name: b"t".as_ptr(), name_len: 1, kind: CoddlAttrKind::Tuple as u32, offset: 8, sub: &t_sub_desc as *const CoddlHeadingDesc },
+        ];
+        let wrapped_desc = CoddlHeadingDesc { attr_count: 2, record_size: 24, attrs: wrapped_attrs.as_ptr() };
+        unsafe {
+            let flat = coddl_rc_alloc(24, 1, CoddlKind::Relation as u32, &flat_desc);
+            std::ptr::write(flat.add(0) as *mut i64, 1); // a
+            std::ptr::write(flat.add(8) as *mut i64, 2); // b
+            std::ptr::write(flat.add(16) as *mut i64, 3); // c
+
+            // wrap: leaves a→t.a (off 8), b→t.b (off 16), c→c (off 0).
+            let wrapped = coddl_relation_restructure(flat, &flat_desc, &wrapped_desc);
+            assert_eq!(std::ptr::read(wrapped.add(0) as *const i64), 3, "c at front");
+            assert_eq!(std::ptr::read(wrapped.add(8) as *const i64), 1, "t.a");
+            assert_eq!(std::ptr::read(wrapped.add(16) as *const i64), 2, "t.b");
+
+            // unwrap: back to the flat layout.
+            let back = coddl_relation_restructure(wrapped, &wrapped_desc, &flat_desc);
+            assert_eq!(std::ptr::read(back.add(0) as *const i64), 1, "a");
+            assert_eq!(std::ptr::read(back.add(8) as *const i64), 2, "b");
+            assert_eq!(std::ptr::read(back.add(16) as *const i64), 3, "c");
+
+            coddl_rc_release(flat);
+            coddl_rc_release(wrapped);
+            coddl_rc_release(back);
         }
     }
 }

@@ -18,7 +18,8 @@ use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, Expr, ExprStmt,
     ExtendExpr, FieldAccess, Item,
     LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, RenameExpr,
-    ReplaceExpr, Root, Stmt, TcloseExpr, TransactionExpr, TupleLit, UnaryExpr, UnaryOp,
+    ReplaceExpr, Root, Stmt, TcloseExpr, TransactionExpr, TupleLit, UnaryExpr, UnaryOp, UnwrapExpr,
+    WrapExpr,
 };
 use coddl_syntax::SyntaxKind;
 use coddl_types::{check, Heading, RelvarKind, RelvarTable, Type};
@@ -853,6 +854,8 @@ impl Lowerer {
             Expr::Project(p) => self.lower_project_expr(p),
             Expr::Replace(r) => self.lower_replace_expr(r),
             Expr::Rename(r) => self.lower_rename_expr(r),
+            Expr::Wrap(w) => self.lower_wrap_expr(w),
+            Expr::Unwrap(u) => self.lower_unwrap_expr(u),
             Expr::Extend(e) => self.lower_extend_expr(e),
             Expr::Tclose(t) => self.lower_tclose_expr(t),
             Expr::NameRef(n) => self.lower_name_ref(n),
@@ -938,6 +941,82 @@ impl Lowerer {
             .collect();
         let dst = self.emit_rename(src, renames);
         self.release_if_unowned(src);
+        dst
+    }
+
+    /// Lower a `wrap` whose operand the cut declined to push — an in-memory
+    /// relation. Group attributes into tuple-valued attributes via one
+    /// `Inst::Restructure` (a leaf-cell re-layout).
+    fn lower_wrap_expr(&mut self, we: &WrapExpr) -> ValueId {
+        let src = we
+            .input()
+            .map(|e| self.lower_expr(&e))
+            .expect("typechecked wrap has a relation operand");
+        let in_heading = self.relation_heading(src, "wrap");
+        let wraps = wrap_spec(&in_heading, we);
+        // Reuse `RelExpr::Wrap::heading()` as the single source of truth for the
+        // result heading (a dummy materialized input supplies `in_heading`).
+        let dst_heading = RelExpr::Wrap {
+            input: Box::new(RelExpr::MaterializedRelvar {
+                name: String::new(),
+                heading: in_heading,
+            }),
+            wraps,
+        }
+        .heading();
+        let dst = self.emit_restructure(src, dst_heading);
+        self.release_if_unowned(src);
+        dst
+    }
+
+    /// Lower an `unwrap` whose operand the cut declined to push — an in-memory
+    /// relation. Expand tuple-valued attributes to their components via one
+    /// `Inst::Restructure`.
+    fn lower_unwrap_expr(&mut self, ue: &UnwrapExpr) -> ValueId {
+        let src = ue
+            .input()
+            .map(|e| self.lower_expr(&e))
+            .expect("typechecked unwrap has a relation operand");
+        let in_heading = self.relation_heading(src, "unwrap");
+        let names: Vec<String> = ue.attrs().map(|t| t.text().to_string()).collect();
+        let dst_heading = RelExpr::Unwrap {
+            input: Box::new(RelExpr::MaterializedRelvar {
+                name: String::new(),
+                heading: in_heading,
+            }),
+            names,
+        }
+        .heading();
+        let dst = self.emit_restructure(src, dst_heading);
+        self.release_if_unowned(src);
+        dst
+    }
+
+    /// The heading of an already-lowered relation value.
+    fn relation_heading(&self, src: ValueId, op: &str) -> Heading {
+        match self.value_type(src) {
+            ProcType::Relation(id) => self.headings[id.0 as usize].clone(),
+            other => unreachable!("{op} on non-relation `{other}` survived typecheck"),
+        }
+    }
+
+    /// Restructure an already-lowered relation `src` into `dst_heading` (which
+    /// must hold the same leaf cells) and emit `Inst::Restructure`. Mint-and-
+    /// return: the caller releases `src`. Shared by `wrap`/`unwrap`.
+    fn emit_restructure(&mut self, src: ValueId, dst_heading: Heading) -> ValueId {
+        let src_heading_id = match self.value_type(src) {
+            ProcType::Relation(id) => id,
+            other => unreachable!("restructure on non-relation `{other}` survived typecheck"),
+        };
+        let result_heading_id = self.intern_heading(&dst_heading);
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Relation(result_heading_id));
+        self.insts.push(Inst::Restructure {
+            dst,
+            src,
+            src_heading_id,
+            result_heading_id,
+        });
         dst
     }
 
@@ -1441,6 +1520,26 @@ impl Lowerer {
                 Some(RelExpr::Extend {
                     input: Box::new(input),
                     extends,
+                })
+            }
+            Expr::Wrap(w) => {
+                // Build the operand + the `(new, components)` spec. v1 has no
+                // `wrap` SQL emission (sqlemit's `resolve` errs), so a
+                // relvar-rooted wrap declines the push and restructures
+                // in-process; building the RelExpr lets `explain` render it.
+                let input = self.build_rel_expr(&w.input()?)?;
+                let wraps = wrap_spec(&input.heading(), w);
+                Some(RelExpr::Wrap {
+                    input: Box::new(input),
+                    wraps,
+                })
+            }
+            Expr::Unwrap(u) => {
+                let input = self.build_rel_expr(&u.input()?)?;
+                let names: Vec<String> = u.attrs().map(|t| t.text().to_string()).collect();
+                Some(RelExpr::Unwrap {
+                    input: Box::new(input),
+                    names,
                 })
             }
             _ => None,
@@ -1988,6 +2087,12 @@ impl Lowerer {
             RelExpr::TClose { input } => {
                 let src = self.lower_relexpr_inprocess(input)?;
                 Some(self.emit_tclose(src))
+            }
+            // wrap/unwrap restructure into the node's (already-computed) heading.
+            RelExpr::Wrap { input, .. } | RelExpr::Unwrap { input, .. } => {
+                let src = self.lower_relexpr_inprocess(input)?;
+                let dst_heading = rel.heading();
+                Some(self.emit_restructure(src, dst_heading))
             }
             _ => None,
         }
@@ -2651,6 +2756,26 @@ fn decode_string_literal(text: &str) -> Vec<u8> {
 /// checker is the type authority (a clean typecheck guarantees the `Attr`
 /// lookup succeeds); this just re-states the rule so the `Extend` node can
 /// carry the type without relir re-deriving it.
+/// The `(new_name, components_heading)` spec for a `wrap`, gathering each
+/// component's type from the operand heading. Unknown components are dropped —
+/// the typechecker has already reported them (T0027). Shared by `lower_wrap_expr`
+/// (AST/in-process) and `build_rel_expr` (the RelIR/pushable path).
+fn wrap_spec(in_heading: &Heading, we: &WrapExpr) -> Vec<(String, Heading)> {
+    we.pairs()
+        .filter_map(|pair| {
+            let new = pair.name()?.text().to_string();
+            let comps: Vec<(String, Type)> = pair
+                .wrapped()
+                .filter_map(|t| {
+                    let n = t.text().to_string();
+                    in_heading.lookup(&n).map(|ty| (n, ty.clone()))
+                })
+                .collect();
+            Some((new, Heading::new(comps)))
+        })
+        .collect()
+}
+
 /// Collect the attribute names an AST scalar `Expr` references — the in-process
 /// counterpart of the SQL `scalar_attr_refs` (which walks the built
 /// `ScalarExpr`). Used by the general-expression `replace` desugar to compute

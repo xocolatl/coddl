@@ -1,0 +1,45 @@
+// wrap-unwrap.cd
+//
+// `wrap` and `unwrap` — the tuple-valued-attribute operators. `wrap` groups
+// attributes into a single tuple-valued attribute; `unwrap` expands one back
+// into its component attributes. They are cardinality- and data-preserving
+// heading rewrites: `R wrap { t: {a, b} } unwrap { t }` is `R` again.
+//
+//   R wrap   { t: {a, b} }   group `a`, `b` into a tuple-valued attribute `t`
+//   R unwrap { t }           expand `t` back into its component attributes
+//
+// A tuple-valued attribute is a first-class relation cell: it prints nested and
+// flows through the other operators (here, `project`) intact. A `private` relvar
+// is local program state (RM Pre 14), populated by relational assignment — no
+// transaction needed. A relation is a set, so the printed tuple order is
+// unspecified.
+
+program wrap_unwrap;
+
+private relvar Points {
+    id: Integer,
+    x: Integer,
+    y: Integer,
+} key { id };
+
+oper main {} [
+    Points := Relation {
+        { id: 1, x: 10, y: 20 },
+        { id: 2, x: 30, y: 40 },
+    };
+
+    // wrap: group `x` and `y` into a tuple-valued attribute `pt`. `id` survives;
+    // `x`/`y` are consumed into `pt`, which prints nested as `pt: {x: .., y: ..}`.
+    let wrapped = Points wrap { pt: { x, y } };
+    write_relation { rel: wrapped };
+
+    // round-trip: `unwrap` recovers the original heading — `wrap` then `unwrap`
+    // of the same attribute is the identity.
+    let back = Points wrap { pt: { x, y } } unwrap { pt };
+    write_relation { rel: back };
+
+    // the tuple-valued attribute flows through `project` intact (the whole tuple
+    // cell is kept, not truncated).
+    let just_pt = Points wrap { pt: { x, y } } project { pt };
+    write_relation { rel: just_pt };
+];

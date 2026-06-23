@@ -630,6 +630,18 @@ impl<'a> Parser<'a> {
                 self.finish_node();
                 continue;
             }
+            if min_prec == 0 && self.at_keyword("wrap") {
+                self.start_node_at(cp, SyntaxKind::WRAP_EXPR);
+                self.parse_wrap_suffix();
+                self.finish_node();
+                continue;
+            }
+            if min_prec == 0 && self.at_keyword("unwrap") {
+                self.start_node_at(cp, SyntaxKind::UNWRAP_EXPR);
+                self.parse_unwrap_suffix();
+                self.finish_node();
+                continue;
+            }
             let Some(prec) = self.peek_infix_prec() else {
                 break;
             };
@@ -1088,6 +1100,73 @@ impl<'a> Parser<'a> {
         } else {
             self.error("P0034", "expected `{` to start rename list");
         }
+    }
+
+    /// `wrap { t: { a, b }, … }` — relational wrap suffix. The enclosing
+    /// `WRAP_EXPR` node (wrapping the operand) is opened by the caller, so this
+    /// consumes the `wrap` keyword and the `{ new: { idents } }` pair list. Each
+    /// pair is a `WRAP_PAIR` node: the new tuple-valued attribute name, a colon,
+    /// then an unordered brace-list of existing attribute names (NOT an
+    /// expression — wrap groups attributes, it does not compute).
+    ///
+    /// Diagnostics: P0044 (no outer `{`), P0050 (no outer `}`); per pair P0045
+    /// (no new name), P0046 (no `:`); the inner brace-list emits P0047 (no `{`),
+    /// P0048 (no attribute name), P0049 (no `}`).
+    pub(crate) fn parse_wrap_suffix(&mut self) {
+        debug_assert!(self.at_keyword("wrap"));
+        self.bump_trivia();
+        self.bump(); // `wrap`
+        if !self.eat(SyntaxKind::L_BRACE) {
+            self.error("P0044", "expected `{` to start wrap list");
+            return;
+        }
+        if self.eat(SyntaxKind::R_BRACE) {
+            return;
+        }
+        loop {
+            self.bump_trivia();
+            self.start_node(SyntaxKind::WRAP_PAIR);
+            if !self.eat(SyntaxKind::IDENT) {
+                self.error("P0045", "expected new attribute name in wrap");
+            }
+            if !self.eat(SyntaxKind::COLON) {
+                self.error("P0046", "expected `:` after wrap attribute name");
+            }
+            self.parse_ident_brace_list(
+                ("P0047", "expected `{` to start wrapped-attribute list"),
+                ("P0048", "expected attribute name in wrapped-attribute list"),
+                ("P0049", "expected `}` to close wrapped-attribute list"),
+            );
+            self.finish_node();
+            if !self.eat(SyntaxKind::COMMA) {
+                break;
+            }
+            // Trailing comma ok.
+            if self.at(SyntaxKind::R_BRACE) {
+                break;
+            }
+        }
+        if !self.eat(SyntaxKind::R_BRACE) {
+            self.error("P0050", "expected `}` to close wrap list");
+        }
+    }
+
+    /// `unwrap { t, … }` — relational unwrap suffix. The enclosing
+    /// `UNWRAP_EXPR` node (wrapping the operand) is opened by the caller, so
+    /// this consumes the `unwrap` keyword and the unordered brace-list of
+    /// tuple-valued attribute names to expand. Reuses `parse_ident_brace_list`
+    /// (the same shape as `project`).
+    ///
+    /// Diagnostics: P0051 (no `{`), P0052 (no attribute name), P0053 (no `}`).
+    pub(crate) fn parse_unwrap_suffix(&mut self) {
+        debug_assert!(self.at_keyword("unwrap"));
+        self.bump_trivia();
+        self.bump(); // `unwrap`
+        self.parse_ident_brace_list(
+            ("P0051", "expected `{` to start unwrap list"),
+            ("P0052", "expected attribute name in unwrap list"),
+            ("P0053", "expected `}` to close unwrap list"),
+        );
     }
 
     /// `extend { new: e, … }` — relational extend suffix. The enclosing
@@ -2848,6 +2927,103 @@ mod tests {
     #[test]
     fn rename_is_contextual_not_reserved() {
         let out = parse_str("oper f {} [ let rename = 1; let s = R where rename = 2; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    // ── wrap / unwrap ─────────────────────────────────────────────────
+
+    #[test]
+    fn wrap_parses_as_wrap_expr_with_pairs() {
+        let out = parse_str("oper f {} [ let s = R wrap {t: {a, b}, u: {c}}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let we = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::WRAP_EXPR)
+            .expect("WRAP_EXPR in tree");
+        assert!(we.children().any(|n| n.kind() == SyntaxKind::NAME_REF));
+        let pairs = we
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::WRAP_PAIR)
+            .count();
+        assert_eq!(pairs, 2, "two WRAP_PAIR nodes");
+    }
+
+    #[test]
+    fn unwrap_parses_as_unwrap_expr() {
+        let out = parse_str("oper f {} [ let s = R unwrap {t, u}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let ue = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::UNWRAP_EXPR)
+            .expect("UNWRAP_EXPR in tree");
+        assert!(ue.children().any(|n| n.kind() == SyntaxKind::NAME_REF));
+    }
+
+    #[test]
+    fn wrap_binds_looser_than_where() {
+        // `R where a = 1 wrap {t: {a}}` => WRAP(WHERE(R, a = 1), …).
+        let out = parse_str("oper f {} [ let s = R where a = 1 wrap {t: {a}}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let we = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::WRAP_EXPR)
+            .expect("WRAP_EXPR in tree");
+        let inner = we
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("operand BINARY_EXPR (the where)");
+        assert!(inner.text().to_string().contains(" where "));
+    }
+
+    #[test]
+    fn unwrap_interleaves_with_wrap() {
+        // `R wrap {t: {a, b}} unwrap {t}` nests left: UNWRAP(WRAP(R)).
+        let out = parse_str("oper f {} [ let s = R wrap {t: {a, b}} unwrap {t}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let ue = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::UNWRAP_EXPR)
+            .expect("UNWRAP_EXPR at the top");
+        assert!(ue.children().any(|n| n.kind() == SyntaxKind::WRAP_EXPR));
+    }
+
+    #[test]
+    fn wrap_missing_outer_brace_diagnoses_p0044() {
+        let out = parse_str("oper f {} [ let s = R wrap a; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0044"),
+            "expected P0044, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn wrap_missing_inner_brace_diagnoses_p0047() {
+        let out = parse_str("oper f {} [ let s = R wrap {t: a}; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0047"),
+            "expected P0047, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn unwrap_missing_brace_diagnoses_p0051() {
+        let out = parse_str("oper f {} [ let s = R unwrap t; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0051"),
+            "expected P0051, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn wrap_unwrap_are_contextual_not_reserved() {
+        let out = parse_str("oper f {} [ let wrap = 1; let unwrap = 2; let s = R where wrap = unwrap; ];");
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }
 

@@ -106,8 +106,14 @@ backends emit a **nested descriptor recursively** (symbol base
 `<id>.<i>`) and relocate the parent attr's `sub` field to it; scalar
 attrs leave `sub` null. The record-store path (`emit_attr_store` /
 `store_attr`) likewise recurses, writing each leaf at `base_offset +
-sub_offset`. So `wrap`/`unwrap` (later) and any tuple-valued result
-round-trip through one flat record buffer with no heap indirection.
+sub_offset`. So `wrap`/`unwrap` and any tuple-valued result round-trip
+through one flat record buffer with no heap indirection.
+
+`Inst::Restructure` (surface `wrap`/`unwrap`) lowers like `Inst::Project`:
+`call coddl_relation_restructure(src, &src_desc, &result_desc)`. The
+runtime flattens both descriptors to leaf cells, matches them by name,
+and permutes each record into the destination layout — a leaf moving
+into or out of a tuple sub-region lands at its new offset.
 
 The `Inst::RelationLit` lowering, in both backends, has the same
 three-step shape:
