@@ -260,6 +260,10 @@ fn emit_delete(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
 ///   for the self-subtraction `t minus t`;
 /// - `t := t minus X` where `X` is any other pushable, same-heading relation →
 ///   an anti-join `DELETE FROM t WHERE EXISTS (… X … AND t.col = X.attr …)`;
+/// - `t := t where p` → keep the matching rows by deleting the complement:
+///   `DELETE FROM t WHERE ¬p`;
+/// - `t := t intersect X` → keep `t ∩ X` by deleting the rows with no match in
+///   `X`: `DELETE FROM t WHERE NOT EXISTS (… X …)`;
 /// - `t := t union e` where `e` is a pushable, same-heading relation → an
 ///   idempotent `INSERT INTO t … SELECT … FROM e WHERE NOT EXISTS (…)`, inserting
 ///   every tuple of `e` not already in `t` (union is commutative, so `t` may be
@@ -283,8 +287,28 @@ pub fn emit_assignment(target: &RelExpr, rhs: &RelExpr, dialect: Dialect) -> Res
                 emit_delete(subtrahend, dialect)
             } else {
                 // Subtrahend is some other same-heading relation: anti-join.
-                emit_anti_join_delete(target, subtrahend, dialect)
+                emit_anti_join_delete(target, subtrahend, dialect, false)
             }
+        }
+        // `t := t where p` — keep the matching rows = delete the complement
+        // (`DELETE FROM t WHERE ¬p`). Only a single restriction over the bare
+        // target; a deeper chain's negation is a disjunction the single-predicate
+        // model can't push, so it declines.
+        RelExpr::Restrict { input, pred } if is_target(input) => {
+            let complement = RelExpr::Restrict {
+                input: input.clone(),
+                pred: negate_predicate(pred),
+            };
+            emit_delete(&complement, dialect)
+        }
+        // `t := t intersect S` — keep `t ∩ S` = delete the `t`-rows with no match
+        // in `S` (the `NOT EXISTS` mirror of the anti-join delete). `intersect`
+        // requires identical headings (typechecked), and is commutative.
+        RelExpr::And { lhs, rhs } if is_target(lhs) => {
+            emit_anti_join_delete(target, rhs, dialect, true)
+        }
+        RelExpr::And { lhs, rhs } if is_target(rhs) => {
+            emit_anti_join_delete(target, lhs, dialect, true)
         }
         // `t := t union e` — union is commutative, so the target may be the left
         // or right operand; `e` is the other one.
@@ -586,18 +610,24 @@ pub fn emit_insert_template(target: &RelExpr, dialect: Dialect) -> Result<SqlQue
     })
 }
 
-/// Emit the anti-join `DELETE` for `t := t minus X` where `X` is a pushable,
-/// same-heading relation that is *not* rooted in `t` (the
-/// `t := t minus other_relvar` shape). Deletes every tuple of `t` that also
-/// appears in `X`. Tuple equality is on **all** attributes (RM Pre 8) and there
-/// are no nulls (RM Pro 4), so the correlation compares every column with `=`
-/// inside an `EXISTS` — never an outer join.
+/// Emit the anti-join `DELETE` for `t := t minus X` (`negated == false`, deletes
+/// every `t`-tuple that **does** appear in `X` — `EXISTS`) or `t := t intersect
+/// X` (`negated == true`, deletes every `t`-tuple that **does not** appear in `X`
+/// — `NOT EXISTS`, keeping `t ∩ X`). `X` is a pushable, same-heading relation.
+/// Tuple equality is on **all** attributes (RM Pre 8) and there are no nulls
+/// (RM Pro 4), so the correlation compares every column with `=` inside the
+/// `[NOT] EXISTS` — never an outer join.
 ///
 /// `X` is rendered by [`emit_select`] as a derived table whose output columns
 /// are the Coddl attribute names; the target side correlates its own physical
 /// columns. A non-pushable `X` (e.g. an in-memory `MaterializedRelvar`) makes
 /// `emit_select` `Err`, which propagates so the assignment declines.
-fn emit_anti_join_delete(target: &RelExpr, x: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
+fn emit_anti_join_delete(
+    target: &RelExpr,
+    x: &RelExpr,
+    dialect: Dialect,
+    negated: bool,
+) -> Result<SqlQuery> {
     let RelExpr::RelvarRef {
         table_name,
         columns,
@@ -623,8 +653,9 @@ fn emit_anti_join_delete(target: &RelExpr, x: &RelExpr, dialect: Dialect) -> Res
             )
         })
         .collect();
+    let exists = if negated { "NOT EXISTS" } else { "EXISTS" };
     let text = format!(
-        "DELETE FROM {} WHERE EXISTS (SELECT 1 FROM ({}) AS coddl_anti WHERE {})",
+        "DELETE FROM {} WHERE {exists} (SELECT 1 FROM ({}) AS coddl_anti WHERE {})",
         quote_ident(table_name),
         sub.sql.text,
         conjuncts.join(" AND ")
@@ -636,6 +667,65 @@ fn emit_anti_join_delete(target: &RelExpr, x: &RelExpr, dialect: Dialect) -> Res
             text,
         },
         params: sub.params,
+        result_heading: target.heading(),
+        plan_id,
+    })
+}
+
+/// `NOT p` for a single comparison predicate — same attribute and value, the
+/// negated operator. Used by the `t := t where p` keep-filter to delete the
+/// complement.
+fn negate_predicate(pred: &Predicate) -> Predicate {
+    let Predicate::AttrCmp { attr, op, value } = pred;
+    Predicate::AttrCmp {
+        attr: attr.clone(),
+        op: op.negate(),
+        value: value.clone(),
+    }
+}
+
+/// Emit `DELETE FROM t` — empties the relvar (the truncate half of a replace-all
+/// assignment). A thin wrapper over [`emit_delete`] on the bare target relvar.
+pub fn emit_truncate(target: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
+    emit_delete(target, dialect)
+}
+
+/// Emit `INSERT INTO t (<cols>) SELECT … FROM (<X>)` — the refill half of a
+/// replace-all `t := X` where `X` is a pushable relation **not** rooted in `t`
+/// (the truncate ran first, so `t` is empty and no `NOT EXISTS` guard is needed).
+/// The `emit_idempotent_insert` shape minus the anti-join. A non-pushable `X`
+/// (`MaterializedRelvar`) makes `emit_select` `Err` so the caller ships instead.
+pub fn emit_replace_insert(target: &RelExpr, x: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
+    let RelExpr::RelvarRef {
+        table_name,
+        columns,
+        ..
+    } = target
+    else {
+        return Err(BackendError::Other(
+            "replace-insert target is not a base relvar".to_string(),
+        ));
+    };
+    let src = emit_select(x, dialect)?;
+    let insert_cols: Vec<String> = columns.iter().map(|(_, phys)| quote_ident(phys)).collect();
+    let select_cols: Vec<String> = columns
+        .iter()
+        .map(|(attr, _)| format!("coddl_src.{}", quote_ident(attr)))
+        .collect();
+    let text = format!(
+        "INSERT INTO {} ({}) SELECT {} FROM ({}) AS coddl_src",
+        quote_ident(table_name),
+        insert_cols.join(", "),
+        select_cols.join(", "),
+        src.sql.text
+    );
+    let plan_id = PlanId(fnv1a(dialect, &text));
+    Ok(SqlQuery {
+        sql: SqlString {
+            param_count: src.params.len() as u32,
+            text,
+        },
+        params: src.params,
         result_heading: target.heading(),
         plan_id,
     })
@@ -1307,13 +1397,10 @@ mod tests {
 
     #[test]
     fn assignment_declines_unrecognized_rhs() {
-        // Recognized shapes are `minus`/`union` with the target as an operand; a
-        // `join` (`And`) RHS is neither, so it declines.
-        let rhs = RelExpr::And {
-            lhs: Box::new(greetings()),
-            rhs: Box::new(employees()),
-        };
-        assert!(emit_assignment(&greetings(), &rhs, Dialect::SQLite).is_err());
+        // `emit_assignment` handles only shapes with the target as an operand. A
+        // bare *other* relvar (`Greetings := Stale`) is a replace-all the lowerer
+        // handles separately — `emit_assignment` itself declines it.
+        assert!(emit_assignment(&greetings(), &stale(), Dialect::SQLite).is_err());
     }
 
     /// A second relvar with the *same* heading as `greetings`, bound to table
@@ -1559,6 +1646,52 @@ mod tests {
             substitute_message_bang(restrict_cmp("id", CmpOp::Eq, Literal::Integer(1))),
         );
         assert!(emit_assignment(&greetings(), &rhs, Dialect::SQLite).is_err());
+    }
+
+    #[test]
+    fn assignment_keep_filter_deletes_the_complement() {
+        // `Greetings := Greetings where id = 1` keeps the matching rows by
+        // deleting the rest — `DELETE FROM greetings WHERE id <> ?`.
+        let rhs = restrict_cmp("id", CmpOp::Eq, Literal::Integer(1));
+        let q = emit_assignment(&greetings(), &rhs, Dialect::SQLite).unwrap();
+        assert_eq!(q.sql.text, r#"DELETE FROM "greetings" WHERE "id" <> ?"#);
+        assert_eq!(q.params, vec![Value::Integer(1)]);
+    }
+
+    #[test]
+    fn assignment_intersect_emits_semi_minus_delete() {
+        // `Greetings := Greetings intersect Stale` keeps Greetings ∩ Stale by
+        // deleting the rows with no match in Stale — a `NOT EXISTS` anti-join.
+        let rhs = RelExpr::And {
+            lhs: Box::new(greetings()),
+            rhs: Box::new(stale()),
+        };
+        let q = emit_assignment(&greetings(), &rhs, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"DELETE FROM "greetings" WHERE NOT EXISTS (SELECT 1 FROM (SELECT "id", "message" FROM "stale") AS coddl_anti WHERE "greetings"."id" = coddl_anti."id" AND "greetings"."message" = coddl_anti."message")"#
+        );
+        assert!(q.params.is_empty());
+    }
+
+    #[test]
+    fn truncate_and_replace_insert_for_replace_all() {
+        // The two halves of a replace-all `Greetings := Stale`.
+        let trunc = emit_truncate(&greetings(), Dialect::SQLite).unwrap();
+        assert_eq!(trunc.sql.text, r#"DELETE FROM "greetings""#);
+
+        let insert = emit_replace_insert(&greetings(), &stale(), Dialect::SQLite).unwrap();
+        assert_eq!(
+            insert.sql.text,
+            r#"INSERT INTO "greetings" ("id", "message") SELECT coddl_src."id", coddl_src."message" FROM (SELECT "id", "message" FROM "stale") AS coddl_src"#
+        );
+
+        // A non-pushable source declines (the lowerer ships it instead).
+        let private = RelExpr::MaterializedRelvar {
+            name: "Local".to_string(),
+            heading: greetings_heading(),
+        };
+        assert!(emit_replace_insert(&greetings(), &private, Dialect::SQLite).is_err());
     }
 
     #[test]

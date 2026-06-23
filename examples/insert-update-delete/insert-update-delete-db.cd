@@ -59,12 +59,36 @@ oper main {} [
     // `UPDATE greetings SET message = … WHERE id = ?`. (A future `update`
     // statement will be sugar for exactly this expansion.)
     transaction [
-        Greetings := (Greetings where id <> 5)
-            union ((Greetings where id = 5) replace { message: message || " (seen)" });
+        Greetings := (Greetings where id <> 5) union ((Greetings where id = 5) replace { message: message || " (seen)" });
     ];
 
     let after = transaction [
         Greetings
     ];
     write_relation { rel: after };
+
+    // Keep only the rows that *don't* match a predicate by deleting their
+    // complement. `Greetings where id <> 5` keeps every row but id 5 — assigning
+    // it back is a single `DELETE FROM greetings WHERE id = ?` (the negated
+    // filter): a surgical delete, not a table wipe. Greetings is on both sides,
+    // so the change is incremental.
+    transaction [
+        Greetings := Greetings where id <> 5;
+    ];
+    let kept = transaction [
+        Greetings
+    ];
+    write_relation { rel: kept };
+
+    // Replace the whole relvar. The right-hand side doesn't mention Greetings, so
+    // this isn't an incremental change — it's a reset: `DELETE FROM greetings`
+    // then refill from the literal's rows, two statements in one transaction
+    // (atomic — a failed refill rolls the truncate back).
+    transaction [
+        Greetings := Relation { { id: 1, message: "fresh start" } };
+    ];
+    let reset = transaction [
+        Greetings
+    ];
+    write_relation { rel: reset };
 ];

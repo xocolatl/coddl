@@ -49,4 +49,14 @@ oper main {} [
     Greetings := (Greetings where id <> 5)
         union ((Greetings where id = 5) replace { message: message || " (seen)" });
     write_relation { rel: Greetings };
+
+    // Keep only the rows that don't match a predicate — `Greetings where id <> 5`
+    // drops id 5. Greetings is on both sides, so it's an incremental change.
+    Greetings := Greetings where id <> 5;
+    write_relation { rel: Greetings };
+
+    // Replace the whole relvar. The right-hand side doesn't mention Greetings, so
+    // it's a reset, not an incremental change.
+    Greetings := Relation { { id: 1, message: "fresh start" } };
+    write_relation { rel: Greetings };
 ];

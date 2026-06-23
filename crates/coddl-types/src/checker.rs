@@ -730,6 +730,18 @@ impl TypeChecker {
         };
         scope.mark_used(name);
 
+        // `R := R` is dead code — it never does anything (it's elided at
+        // lowering). Warn so the redundancy is reported rather than vanishing.
+        if let Some(Expr::NameRef(v)) = stmt.value() {
+            if v.ident().is_some_and(|t| t.text() == name) {
+                self.warn(
+                    self.node_span(v.syntax()),
+                    "T0051",
+                    format!("assignment of `{name}` to itself has no effect"),
+                );
+            }
+        }
+
         // The RHS heading must match the relvar's.
         let target_ty = Type::Relation(heading);
         if !rhs_ty.assignable_to(&target_ty) {
@@ -2431,6 +2443,23 @@ mod tests {
     fn assignment_to_undeclared_name_diagnoses_t0033() {
         let src = "program p; oper main {} [ Nope := Relation { {a: 1} }; ];";
         assert!(codes(src).contains(&"T0033"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn self_assignment_warns_t0051() {
+        // `R := R` does nothing — warn (it's elided at lowering).
+        let src = "program p; private relvar R { a: Integer } key { a }; \
+                   oper main {} [ R := R; ];";
+        assert!(codes(src).contains(&"T0051"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn non_identity_assignment_does_not_warn_t0051() {
+        let src = "program p; \
+                   private relvar R { a: Integer } key { a }; \
+                   private relvar S { a: Integer } key { a }; \
+                   oper main {} [ R := S; ];";
+        assert!(!codes(src).contains(&"T0051"), "{:?}", codes(src));
     }
 
     #[test]

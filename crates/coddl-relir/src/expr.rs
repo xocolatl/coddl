@@ -652,6 +652,28 @@ impl RelExpr {
     pub fn needs_distinct(&self) -> bool {
         !(self.card_le_one() || !self.surviving_keys().is_empty())
     }
+
+    /// Whether any `RelvarRef` leaf in this tree reads the physical `table`. Used
+    /// by the assignment lowerer to tell a *self-referential* `R := <… R …>`
+    /// (which must be surgical, e.g. `R := R where p`) from an independent
+    /// `R := X` (which can be a truncate-and-refill replace-all). A private
+    /// `MaterializedRelvar` has no SQL table, so it never matches.
+    pub fn references_table(&self, table: &str) -> bool {
+        match self {
+            RelExpr::RelvarRef { table_name, .. } => table_name == table,
+            RelExpr::Restrict { input, .. }
+            | RelExpr::Project { input, .. }
+            | RelExpr::Rename { input, .. }
+            | RelExpr::Extend { input, .. }
+            | RelExpr::TClose { input }
+            | RelExpr::Wrap { input, .. }
+            | RelExpr::Unwrap { input, .. } => input.references_table(table),
+            RelExpr::And { lhs, rhs } | RelExpr::Or { lhs, rhs } | RelExpr::Minus { lhs, rhs } => {
+                lhs.references_table(table) || rhs.references_table(table)
+            }
+            RelExpr::MaterializedRelvar { .. } => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -679,6 +701,30 @@ mod tests {
         ] {
             assert_eq!(op.negate().negate(), op);
         }
+    }
+
+    #[test]
+    fn references_table_walks_to_the_relvar_leaf() {
+        // The bare leaf, and through `Restrict`/`Or`.
+        assert!(greetings().references_table("greetings"));
+        assert!(!greetings().references_table("other"));
+        let restricted = RelExpr::Restrict {
+            input: Box::new(greetings()),
+            pred: id_eq_1(),
+        };
+        assert!(restricted.references_table("greetings"));
+        // A private relvar has no SQL table — never matches.
+        let private = RelExpr::MaterializedRelvar {
+            name: "Local".to_string(),
+            heading: greetings_heading(),
+        };
+        assert!(!private.references_table("greetings"));
+        // One branch of an `Or` references it.
+        let mixed = RelExpr::Or {
+            lhs: Box::new(private),
+            rhs: Box::new(restricted),
+        };
+        assert!(mixed.references_table("greetings"));
     }
 
     fn greetings_heading() -> Heading {

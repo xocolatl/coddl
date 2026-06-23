@@ -1710,6 +1710,122 @@ fn dml_update_all_persists_cranelift() {
     assert_update_all_persists("cranelift");
 }
 
+// ── keep-filter delete, semi-minus intersect, replace-all ─────────────
+
+/// `R := R where id <> 1` keeps the matching rows by deleting their complement:
+/// a surgical `DELETE FROM greetings WHERE id = ?` (the negation of the filter),
+/// not a wipe. The kept row (id 2) survives; the filtered-out row (id 1) is gone.
+fn assert_keep_filter_deletes_complement(backend: &str) {
+    let rows = run_greetings_dml(
+        backend,
+        "program insert_update_delete;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             transaction [ Greetings := Greetings where id <> 1; ];\n\
+         ];\n",
+    );
+    assert_eq!(rows, vec!["2|goodbye".to_string()], "backend={backend}");
+}
+
+#[test]
+fn dml_keep_filter_deletes_complement_llvm() {
+    assert_keep_filter_deletes_complement("llvm");
+}
+
+#[test]
+fn dml_keep_filter_deletes_complement_cranelift() {
+    assert_keep_filter_deletes_complement("cranelift");
+}
+
+/// `R := R intersect S` keeps the tuples present in both by deleting the
+/// `R`-rows with no match in `S`: a semi-minus `DELETE FROM greetings WHERE NOT
+/// EXISTS (… stale …)`. greetings (ids 1..4) ∩ stale (ids 2,3) leaves ids 2, 3.
+fn assert_intersect_semi_minus_persists(backend: &str) {
+    let rows = run_two_relvar_dml(
+        backend,
+        "program insert_update_delete;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         public relvar Stale { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             transaction [ Greetings := Greetings intersect Stale; ];\n\
+         ];\n",
+    );
+    assert_eq!(
+        rows,
+        vec!["2|goodbye".to_string(), "3|farewell".to_string()],
+        "backend={backend}"
+    );
+}
+
+#[test]
+fn dml_intersect_semi_minus_persists_llvm() {
+    assert_intersect_semi_minus_persists("llvm");
+}
+
+#[test]
+fn dml_intersect_semi_minus_persists_cranelift() {
+    assert_intersect_semi_minus_persists("cranelift");
+}
+
+/// `R := S` (target absent from the RHS) is a replace-all: truncate `greetings`,
+/// then `INSERT … SELECT` from the pushable source. greetings (ids 1,2) becomes
+/// new_arrivals (ids 2,3) — a pure-SQL two-statement transaction, no hydration.
+fn assert_replace_all_pushable_persists(backend: &str) {
+    let rows = run_union_dml(
+        backend,
+        "program insert_update_delete;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         public relvar NewArrivals { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             transaction [ Greetings := NewArrivals; ];\n\
+         ];\n",
+    );
+    assert_eq!(
+        rows,
+        vec!["2|goodbye".to_string(), "3|farewell".to_string()],
+        "backend={backend}"
+    );
+}
+
+#[test]
+fn dml_replace_all_pushable_persists_llvm() {
+    assert_replace_all_pushable_persists("llvm");
+}
+
+#[test]
+fn dml_replace_all_pushable_persists_cranelift() {
+    assert_replace_all_pushable_persists("cranelift");
+}
+
+/// `R := Relation { … }` (a literal, target absent) is a replace-all by shipping:
+/// truncate `greetings`, then ship the literal's rows from the process (the empty
+/// table makes the idempotent template always insert). Only the reset row remains.
+fn assert_replace_all_ship_persists(backend: &str) {
+    let rows = run_greetings_dml(
+        backend,
+        "program insert_update_delete;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             transaction [ Greetings := Relation { { id: 9, message: \"reset\" } }; ];\n\
+         ];\n",
+    );
+    assert_eq!(rows, vec!["9|reset".to_string()], "backend={backend}");
+}
+
+#[test]
+fn dml_replace_all_ship_persists_llvm() {
+    assert_replace_all_ship_persists("llvm");
+}
+
+#[test]
+fn dml_replace_all_ship_persists_cranelift() {
+    assert_replace_all_ship_persists("cranelift");
+}
+
 // ── extend pushdown ───────────────────────────────────────────────────
 
 /// Write the `sales` database companions and seed a SQLite db with two rows.

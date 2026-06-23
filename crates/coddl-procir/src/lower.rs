@@ -25,7 +25,10 @@ use coddl_syntax::SyntaxKind;
 use coddl_types::{check, Heading, RelvarKind, RelvarTable, Type};
 
 use coddl_relir::{CmpOp, Literal as RelLiteral, Predicate, RelExpr, ScalarBinOp, ScalarExpr};
-use coddl_sqlemit::{emit_assignment, emit_insert_template, Dialect, SqlQuery, Value};
+use coddl_sqlemit::{
+    emit_assignment, emit_insert_template, emit_replace_insert, emit_truncate, Dialect, SqlQuery,
+    Value,
+};
 
 use crate::ir::{
     BasicBlock, BlockId, Const, Function, HeadingId, Inst, Module, PlanEntry, ProcType,
@@ -786,6 +789,12 @@ impl Lowerer {
         let name = name_tok.text().to_string();
         let Some(value_expr) = stmt.value() else { return };
 
+        // `R := R` does nothing — elide it entirely (the typechecker already
+        // warned, T0051). This holds for both a public and a private target.
+        if matches!(&value_expr, Expr::NameRef(v) if v.ident().is_some_and(|t| t.text() == name)) {
+            return;
+        }
+
         // Public target → surgical DML via assignment-RHS recognition.
         if self.public_relvars.contains_key(&name) {
             self.lower_public_assign(&name, &target_expr, &value_expr);
@@ -866,13 +875,80 @@ impl Lowerer {
             }
         }
 
+        // Replace-all fallback. `R` is absent from a recognized surgical shape;
+        // empty `R` and refill it from the RHS (two `Inst::Dml` in the
+        // transaction — atomic).
+        let Some(target_rel) = self.build_rel_expr(target_expr) else {
+            return;
+        };
+        let RelExpr::RelvarRef { table_name: t, .. } = &target_rel else {
+            return;
+        };
+        let t = t.clone();
+
+        let x = self.build_rel_expr(value_expr);
+
+        // Self-referential but unrecognized (e.g. a compound-predicate keep-filter
+        // whose negation is a disjunction the single-predicate model can't push):
+        // it should be surgical, so decline rather than do a non-surgical,
+        // hydrating replace-all.
+        if x.as_ref().is_some_and(|x| x.references_table(&t)) {
+            self.diagnostics.push(Diagnostic::error(
+                self.node_span(value_expr.syntax()),
+                "T0049",
+                format!(
+                    "assignment to public relvar `{name}` is self-referential but not a \
+                     recognized surgical shape"
+                ),
+            ));
+            return;
+        }
+
+        // Independent **pushable** `X` → pure-SQL replace-all: truncate, then
+        // `INSERT INTO t SELECT <X>` (no hydration).
+        if let Some(insert) = x
+            .as_ref()
+            .and_then(|x| emit_replace_insert(&target_rel, x, dialect).ok())
+        {
+            if let Ok(truncate) = emit_truncate(&target_rel, dialect) {
+                self.emit_dml(truncate);
+                self.emit_dml(insert);
+                return;
+            }
+        }
+
+        // Independent **in-memory** `X` (a relation literal, or a private relvar)
+        // → truncate, then ship its rows (reuses the batched-`VALUES` insert; the
+        // empty table makes the template's `NOT EXISTS` always insert).
+        if let Ok(template) = emit_insert_template(&target_rel, dialect) {
+            if let Ok(truncate) = emit_truncate(&target_rel, dialect) {
+                self.emit_dml(truncate);
+                let result_heading_id = self.intern_heading(&template.result_heading);
+                let plan_id = self.register_plan(&template, result_heading_id);
+                let src = self.lower_expr(value_expr);
+                if let ProcType::Relation(heading_id) = self.value_type(src) {
+                    self.insts.push(Inst::InsertFrom {
+                        plan_id,
+                        src,
+                        heading_id,
+                    });
+                    let is_owned = self
+                        .locals
+                        .iter()
+                        .any(|layer| layer.values().any(|(vid, _)| *vid == src));
+                    if !is_owned {
+                        self.insts.push(Inst::Release { src });
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Unreachable for a well-typed relation RHS, but stay total.
         self.diagnostics.push(Diagnostic::error(
             self.node_span(value_expr.syntax()),
             "T0049",
-            format!(
-                "assignment to public relvar `{name}` is not a supported write shape \
-                 (the right-hand side must be a `minus` or `union` with `{name}`)"
-            ),
+            format!("assignment to public relvar `{name}` is not a supported write shape"),
         ));
     }
 
@@ -3609,6 +3685,46 @@ oper main {} [
         assert_eq!(
             m.plans[0].sql,
             r#"SELECT "id", "message", ("id" + "id") AS "twice" FROM "greetings" WHERE "id" = ?"#
+        );
+    }
+
+    #[test]
+    fn self_assignment_private_relvar_emits_nothing() {
+        // `R := R` on a private relvar is dead code: it lowers to no
+        // instruction at all (no slot store). The typechecker already warned.
+        let src = "program p; private relvar R { a: Integer } key { a }; \
+                   oper main {} [ R := R; ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            main.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .all(|i| !matches!(i, Inst::RelvarSlotStore { .. })),
+            "R := R must emit no slot store"
+        );
+    }
+
+    #[test]
+    fn self_assignment_public_relvar_emits_nothing() {
+        // `Greetings := Greetings` is elided before the write-policy check, so
+        // it emits no DML and reports no error even on a read-only relvar.
+        let src = "\
+program hello_world_db;
+database greetings;
+public relvar Greetings { id: Integer, message: Text } key { id };
+oper main {} [
+    transaction [ Greetings := Greetings; ];
+];
+";
+        let m = lower_ok_with_plan(src, &greetings_plan());
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            main.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .all(|i| !matches!(i, Inst::Dml { .. } | Inst::InsertFrom { .. })),
+            "Greetings := Greetings must emit no DML"
         );
     }
 

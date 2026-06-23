@@ -85,20 +85,33 @@ emitted SQL:
 | RHS `RelExpr` shape | Emitted SQL |
 |---|---|
 | `Minus{ RelvarRef(t), Restrict*(RelvarRef(t), preds) }` | `DELETE FROM t WHERE <preds>` |
+| `Restrict{ RelvarRef(t), p }` (keep-filter — a single restrict over the bare target) | `DELETE FROM t WHERE <¬p>` (the negated predicate) |
 | `Minus{ RelvarRef(t), RelvarRef(t) }` (self-subtraction) | `DELETE FROM t` (whole-table delete) |
 | `Minus{ RelvarRef(t), X }` (X same-heading, pushable, not rooted in `t`) | `DELETE FROM t WHERE EXISTS (SELECT 1 FROM (<X>) AS a WHERE t.col = a.attr AND …)` |
+| `And{ RelvarRef(t), X }` (`intersect`; X same-heading, pushable) | `DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM (<X>) AS a WHERE t.col = a.attr AND …)` |
 | `Or{ RelvarRef(t), e }` (e same-heading, pushable; union is commutative) | `INSERT INTO t (…) SELECT … FROM (<e>) AS a WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.col = a.attr AND …)` |
 | `Or{ Restrict(t, ¬p), «substitute»(Restrict(t, p)) }`, or a bare «substitute» over `t` | `UPDATE t SET c = e, … WHERE <p>` (no `WHERE` for the bare update-all form) |
+| anything with `t` **absent** from the RHS (an independent value) | replace-all: `DELETE FROM t` then `INSERT INTO t (…) SELECT … FROM (<X>) AS a` (pushable `X`) or a row-shipping insert (in-memory `X`) |
 
-The two delete rows delegate to a shared `emit_delete` on the `minus` subtrahend,
-which bottoms out in the target base relvar; the `WHERE` reuses the same
-`(column, literal)` collection a `SELECT … WHERE` builds for the equivalent
-restriction, so a delete predicate is byte-identical to the matching read
-predicate. The anti-join delete (`emit_anti_join_delete`, e.g. `t := t minus
-other_relvar`) renders `X` via `emit_select` as a derived table whose columns are
-the Coddl attribute names, then correlates every attribute (`t`'s physical column
-against the derived table's attribute column) — full tuple equality (RM Pre 8)
-inside an `EXISTS`, never an outer join (RM Pro 4). The union insert
+The `minus`-restrict and whole-table delete rows delegate to a shared
+`emit_delete` on the `minus` subtrahend, which bottoms out in the target base
+relvar; the `WHERE` reuses the same `(column, literal)` collection a
+`SELECT … WHERE` builds for the equivalent restriction, so a delete predicate is
+byte-identical to the matching read predicate. The **keep-filter** row
+(`t := t where p` — keep the matching rows) is the same machinery with the
+predicate flipped: `emit_delete` runs over `Restrict(t, ¬p)`, the negated
+restriction (`CmpOp::negate` complements the comparison — `=`↔`<>`, `<`↔`>=`,
+…), so keeping `p` deletes its complement. Only a *single* restrict over the
+bare target matches; a deeper keep-filter chain's negation is a disjunction the
+single-predicate model can't push, so it declines (below). The anti-join delete
+(`emit_anti_join_delete`, e.g. `t := t minus other_relvar`) renders `X` via
+`emit_select` as a derived table whose columns are the Coddl attribute names,
+then correlates every attribute (`t`'s physical column against the derived
+table's attribute column) — full tuple equality (RM Pre 8) inside an `EXISTS`,
+never an outer join (RM Pro 4). The **intersect** delete (`t := t intersect X` —
+keep the rows present in both) is the same helper with a `negated` flag: `NOT
+EXISTS` instead of `EXISTS`, deleting the `t`-rows with no match in `X`. The
+union insert
 (`emit_idempotent_insert`, e.g. `t := t union other_relvar`) is the mirror image:
 the same derived table + all-attribute correlation, but `INSERT … SELECT …
 WHERE NOT EXISTS`. The `NOT EXISTS` makes re-inserting an identical tuple a no-op
@@ -115,9 +128,27 @@ FROM (VALUES <marker>) AS v WHERE NOT EXISTS (…)`, where `<marker>`
 group per source row (in batches, sized under the bind-variable limit). Same
 set / Golden-Rule semantics as the pushable insert — only the row source differs
 (a bound `VALUES` list vs. a pushed sub-SELECT), and it uses **no temp table**
-(so no catalog churn). Any *other* unrecognized shape surfaces a "not a supported
-write shape" diagnostic (T0049). The recognition set will still grow to cover the
-replace-all fallback.
+(so no catalog churn).
+
+**The self-reference principle.** Whether the target `t` appears on the RHS
+decides the kind of write. If `t` *is* on the RHS, the assignment is an
+incremental transform of `t` and must be surgical — one of the `DELETE` / `INSERT`
+/ `UPDATE` shapes above. A self-referential shape the single-predicate model can't
+yet express surgically (e.g. a compound keep-filter `t where p1 where p2`, whose
+negation is a disjunction) **declines** with the "not a recognized surgical shape"
+diagnostic (T0049) rather than falling through to a hydrating replace-all — it
+*should* be surgery, just not one v1 can push. If `t` is **absent** from the RHS,
+the assignment sets `t` to an independent value: a **replace-all**. The lowerer
+(not `emit_assignment`) drives it — `emit_truncate(t)` (`DELETE FROM t`) followed
+by `emit_replace_insert(t, X)` (`INSERT INTO t (…) SELECT … FROM (<X>) AS a`, no
+`NOT EXISTS` — `t` is empty post-truncate) for a pushable `X`, or the same
+row-shipping insert as the in-memory `union` for a literal / `MaterializedRelvar`.
+The two statements run in the enclosing transaction (atomic — a failed refill
+rolls the truncate back). `X` can't read `t` (that's what "absent" means), so
+truncate-then-refill needs no snapshot. The `RelExpr::references_table` walk makes
+the surgical-vs-replace-all split; replace-all is taken only when it returns
+`false`. The identity `t := t` is dead code: the typechecker warns (T0051) and the
+lowerer elides it entirely (no instruction, public or private).
 
 The UPDATE shape (`emit_update`) recognizes TTM's update expansion — keep the
 non-matching rows, substitute the matching ones. The "changed rows" operand is a

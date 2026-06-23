@@ -501,3 +501,4 @@ check script enforces that.
 | T0048 | `unwrap` target is not a tuple-valued attribute                    |
 | T0049 | assignment to a public relvar has an RHS shape the backend cannot emit as surgical DML (lowering) |
 | T0050 | assignment target is a public relvar mapped to a non-writable view (lowering) |
+| T0051 | _(warning)_ `R := R` self-assignment has no effect (elided) |
