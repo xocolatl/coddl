@@ -181,10 +181,12 @@ fn apply_rename(renames: &[(String, String)], name: &str) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
-/// Render a restriction predicate for `RelExpr::render` (e.g. `id = 1`).
+/// Render a restriction predicate for `RelExpr::render` (e.g. `id <> 1`).
 fn render_predicate(pred: &Predicate) -> String {
     match pred {
-        Predicate::AttrEq { attr, value } => format!("{attr} = {}", render_literal(value)),
+        Predicate::AttrCmp { attr, op, value } => {
+            format!("{attr} {} {}", op.sql(), render_literal(value))
+        }
     }
 }
 
@@ -198,13 +200,58 @@ fn render_literal(lit: &Literal) -> String {
     }
 }
 
-/// A restriction predicate. Currently a single attribute-equals-literal test;
-/// this grows to comparisons, conjunction/disjunction, and attribute-vs-
-/// attribute tests as the surface `where` support grows.
+/// A restriction predicate: a single `<attr> <cmp> <literal>` test. This grows
+/// to conjunction/disjunction and attribute-vs-attribute tests as the surface
+/// `where` support grows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Predicate {
-    /// `<attr> = <literal>`.
-    AttrEq { attr: String, value: Literal },
+    /// `<attr> <op> <literal>`.
+    AttrCmp {
+        attr: String,
+        op: CmpOp,
+        value: Literal,
+    },
+}
+
+/// A scalar comparison operator in a pushable restriction. Equality (`Eq`/`Ne`)
+/// applies to Integer/Text/Boolean; the ordering ops are Integer-only (enforced
+/// by the typechecker, not here).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
+impl CmpOp {
+    /// The SQL spelling — identical across SQLite and Postgres.
+    pub fn sql(self) -> &'static str {
+        match self {
+            CmpOp::Eq => "=",
+            CmpOp::Ne => "<>",
+            CmpOp::Lt => "<",
+            CmpOp::LtEq => "<=",
+            CmpOp::Gt => ">",
+            CmpOp::GtEq => ">=",
+        }
+    }
+
+    /// The operator with its operands swapped — `a OP b` ≡ `b flip(OP) a`. Used
+    /// when the attribute is the right operand (`5 < id` ⇒ `id > 5`). Equality
+    /// is symmetric (`Eq`/`Ne` map to themselves).
+    pub fn flip(self) -> CmpOp {
+        match self {
+            CmpOp::Eq => CmpOp::Eq,
+            CmpOp::Ne => CmpOp::Ne,
+            CmpOp::Lt => CmpOp::Gt,
+            CmpOp::Gt => CmpOp::Lt,
+            CmpOp::LtEq => CmpOp::GtEq,
+            CmpOp::GtEq => CmpOp::LtEq,
+        }
+    }
 }
 
 /// A scalar literal usable in a predicate. Grows alongside the scalar types
@@ -546,18 +593,22 @@ impl RelExpr {
     ///
     /// A `Restrict` that pins every attribute of some candidate key to a
     /// constant bounds cardinality to ≤ 1. v1 restrictions are a single
-    /// `AttrEq`, so this holds iff the pinned attribute is itself a candidate
-    /// key of the input.
+    /// `AttrCmp`, and only an **equality** (`=`) pins a value, so this holds iff
+    /// the test is `Eq` and the pinned attribute is itself a candidate key of
+    /// the input (a `<>`/`<`/`>` test bounds nothing).
     pub fn card_le_one(&self) -> bool {
         match self {
             RelExpr::RelvarRef { .. } => false,
             RelExpr::Restrict { input, pred } => {
                 input.card_le_one() || {
-                    let Predicate::AttrEq { attr, .. } = pred;
-                    input
-                        .surviving_keys()
-                        .iter()
-                        .any(|k| k.len() == 1 && &k[0] == attr)
+                    // Only equality *pins* an attribute to a single value; a
+                    // range/exclusion (`<>`, `<`, `>`, …) bounds nothing.
+                    let Predicate::AttrCmp { attr, op, .. } = pred;
+                    *op == CmpOp::Eq
+                        && input
+                            .surviving_keys()
+                            .iter()
+                            .any(|k| k.len() == 1 && &k[0] == attr)
                 }
             }
             RelExpr::Project { input, .. } => input.card_le_one(),
@@ -613,8 +664,9 @@ mod tests {
     }
 
     fn id_eq_1() -> Predicate {
-        Predicate::AttrEq {
+        Predicate::AttrCmp {
             attr: "id".to_string(),
+            op: CmpOp::Eq,
             value: Literal::Integer(1),
         }
     }
@@ -690,8 +742,9 @@ mod tests {
     fn render_quotes_text_predicate_literals() {
         let r = RelExpr::Restrict {
             input: Box::new(greetings()),
-            pred: Predicate::AttrEq {
+            pred: Predicate::AttrCmp {
                 attr: "message".to_string(),
+                op: CmpOp::Eq,
                 value: Literal::Text("hi".to_string()),
             },
         };
@@ -721,6 +774,32 @@ mod tests {
         };
         assert!(r.card_le_one());
         assert!(!r.needs_distinct());
+    }
+
+    #[test]
+    fn non_equality_on_key_does_not_bound_cardinality() {
+        // `id <> 1` (or any range op) excludes/ranges over the key but pins no
+        // single value — so it does NOT bound cardinality. The difference only
+        // shows once a projection drops the key: then `<>` needs `DISTINCT`
+        // whereas `=` does not.
+        let ne = |op| RelExpr::Project {
+            input: Box::new(RelExpr::Restrict {
+                input: Box::new(greetings()),
+                pred: Predicate::AttrCmp {
+                    attr: "id".to_string(),
+                    op,
+                    value: Literal::Integer(1),
+                },
+            }),
+            keep: vec!["message".to_string()],
+        };
+        assert!(!ne(CmpOp::Ne).card_le_one());
+        assert!(ne(CmpOp::Ne).needs_distinct());
+        assert!(!ne(CmpOp::Lt).card_le_one());
+        assert!(ne(CmpOp::Gt).needs_distinct());
+        // Equality on the key still bounds it even after the projection.
+        assert!(ne(CmpOp::Eq).card_le_one());
+        assert!(!ne(CmpOp::Eq).needs_distinct());
     }
 
     #[test]

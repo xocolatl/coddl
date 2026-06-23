@@ -17,7 +17,10 @@ This doc describes the **target** RelIR. The code implements a thin slice of it;
 - **The cut** as a trivial origin gate — *not* a cost model: push a subtree iff every leaf is relvar-rooted and SQL emission succeeds (`coddl-procir/src/cut.rs`).
 - **SQL pushdown** of relvar-rooted `RelvarRef` / `Restrict` / `Project` / `Rename` via `coddl-sqlemit`.
 - An **in-process path** for non-pushable subtrees — currently lowered to ProcIR within `coddl-procir` itself (not yet through `coddl-execlocal`).
-- Restriction predicates limited to a single `attr = literal` (`Predicate::AttrEq`).
+- Restriction predicates limited to a single `attr <cmp> literal`
+  (`Predicate::AttrCmp { attr, op: CmpOp, value }`), where `<cmp>` is `=`/`<>`
+  (Integer/Text/Boolean) or `<`/`<=`/`>`/`>=` (Integer). Only `=` pins a value,
+  so only it bounds cardinality for `DISTINCT`-elision.
 
 **Designed, not yet built**
 
@@ -26,7 +29,7 @@ This doc describes the **target** RelIR. The code implements a thin slice of it;
 - The **optimizer** and **cost model**, the `MaterializeAtBoundary` node, and mixed-origin handling beyond the `StorageOrigin::Mixed` flag.
 - The per-node **FD set** and **constraint set** (only heading, origin, and leaf keys exist today).
 - `coddl-execlocal` (an empty stub) as the RelIR→ProcIR consumer, and the runtime RelIR interpreter (the dynamic path).
-- Pushdown / predicate surface beyond `attr = literal` — comparisons, arithmetic, subset/superset.
+- Pushdown / predicate surface beyond a single `attr <cmp> literal` — conjunction/disjunction, attribute-vs-attribute, arithmetic in predicates, subset/superset. (Scalar comparisons `=`/`<>`/`<`/`<=`/`>`/`>=` already push.)
 
 ## Why Algebra A
 

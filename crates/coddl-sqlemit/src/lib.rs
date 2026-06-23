@@ -14,7 +14,7 @@
 
 use std::fmt;
 
-use coddl_relir::{Heading, Literal, Predicate, RelExpr, ScalarBinOp, ScalarExpr, Type};
+use coddl_relir::{CmpOp, Heading, Literal, Predicate, RelExpr, ScalarBinOp, ScalarExpr, Type};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Dialect {
@@ -228,7 +228,7 @@ fn emit_delete(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
             "delete operand does not resolve to a single base relvar".to_string(),
         ));
     }
-    let mut wheres: Vec<(String, Literal)> = Vec::new();
+    let mut wheres: Vec<(String, CmpOp, Literal)> = Vec::new();
     let (from_clause, _cols) = resolve(expr, &mut wheres)?;
     let mut params: Vec<Value> = Vec::new();
     let where_sql = render_where_clause(&wheres, dialect, 0, &mut params);
@@ -570,7 +570,7 @@ fn emit_select_offset(expr: &RelExpr, dialect: Dialect, param_offset: u32) -> Re
     // Resolve the core to its physical table and output `(attr, column)` map —
     // renames remap the attr side, projects narrow it — collecting each
     // restriction as a resolved `(column, value)` conjunct along the way.
-    let mut wheres: Vec<(String, Literal)> = Vec::new();
+    let mut wheres: Vec<(String, CmpOp, Literal)> = Vec::new();
     let (from_clause, mut output_cols) = resolve(core, &mut wheres)?;
 
     // Computed columns: each extend value rendered to SQL against the resolved
@@ -662,7 +662,7 @@ fn emit_select_offset(expr: &RelExpr, dialect: Dialect, param_offset: u32) -> Re
 /// `(column, value)` onto `wheres`; `And` joins two FROM expressions.
 fn resolve(
     expr: &RelExpr,
-    wheres: &mut Vec<(String, Literal)>,
+    wheres: &mut Vec<(String, CmpOp, Literal)>,
 ) -> Result<(String, Vec<(String, String)>)> {
     match expr {
         RelExpr::RelvarRef {
@@ -672,9 +672,9 @@ fn resolve(
         } => Ok((quote_ident(table_name), columns.clone())),
         RelExpr::Restrict { input, pred } => {
             let (from, cols) = resolve(input, wheres)?;
-            let Predicate::AttrEq { attr, value } = pred;
+            let Predicate::AttrCmp { attr, op, value } = pred;
             let col = column_for(&cols, attr)?.to_string();
-            wheres.push((col, value.clone()));
+            wheres.push((col, *op, value.clone()));
             Ok((from, cols))
         }
         RelExpr::Project { input, keep } => {
@@ -822,14 +822,15 @@ fn column_for<'a>(columns: &'a [(String, String)], attr: &str) -> Result<&'a str
 /// the sub-heading's canonical (name-sorted) order. This matches `record_layout`'s
 /// leaf order, so the runtime's positional column→cell mapping reconstructs the
 /// inline nested cell.
-/// Render a `WHERE col = ? AND …` clause (leading space included) from the
-/// collected `(column, literal)` equality tests, appending each bind value to
-/// `params`. `param_offset` is the Postgres `$N` base (SQLite uses `?` and
-/// ignores it). Returns the empty string when there are no tests — so a
+/// Render a `WHERE col <op> ? AND …` clause (leading space included) from the
+/// collected `(column, op, literal)` comparison tests, appending each bind value
+/// to `params`. Each test renders its own comparison operator (`=`, `<>`, `<`,
+/// `<=`, `>`, `>=`). `param_offset` is the Postgres `$N` base (SQLite uses `?`
+/// and ignores it). Returns the empty string when there are no tests — so a
 /// caller can unconditionally append the result. Shared by `emit_select_offset`
 /// (SELECT) and `emit_delete` (DELETE); the conjunction shape is identical.
 fn render_where_clause(
-    wheres: &[(String, Literal)],
+    wheres: &[(String, CmpOp, Literal)],
     dialect: Dialect,
     param_offset: u32,
     params: &mut Vec<Value>,
@@ -838,12 +839,12 @@ fn render_where_clause(
         return String::new();
     }
     let mut conjuncts = Vec::with_capacity(wheres.len());
-    for (col, value) in wheres {
+    for (col, op, value) in wheres {
         let placeholder = match dialect {
             Dialect::SQLite => "?".to_string(),
             Dialect::Postgres => format!("${}", param_offset as usize + params.len() + 1),
         };
-        conjuncts.push(format!("{} = {placeholder}", quote_ident(col)));
+        conjuncts.push(format!("{} {} {placeholder}", quote_ident(col), op.sql()));
         params.push(Value::from(value.clone()));
     }
     format!(" WHERE {}", conjuncts.join(" AND "))
@@ -970,11 +971,94 @@ mod tests {
     fn where_id_1(input: RelExpr) -> RelExpr {
         RelExpr::Restrict {
             input: Box::new(input),
-            pred: Predicate::AttrEq {
+            pred: Predicate::AttrCmp {
+                op: CmpOp::Eq,
                 attr: "id".to_string(),
                 value: Literal::Integer(1),
             },
         }
+    }
+
+    /// `Greetings where <attr> <op> <value>`.
+    fn restrict_cmp(attr: &str, op: CmpOp, value: Literal) -> RelExpr {
+        RelExpr::Restrict {
+            input: Box::new(greetings()),
+            pred: Predicate::AttrCmp {
+                attr: attr.to_string(),
+                op,
+                value,
+            },
+        }
+    }
+
+    #[test]
+    fn restrict_comparison_ops_render_their_symbols() {
+        // Every scalar comparison pushes; the WHERE renders its own operator.
+        // A full-heading read keeps the key `id`, so the result is already a set
+        // (no `DISTINCT`) regardless of the operator.
+        for (op, sym) in [
+            (CmpOp::Ne, "<>"),
+            (CmpOp::Lt, "<"),
+            (CmpOp::LtEq, "<="),
+            (CmpOp::Gt, ">"),
+            (CmpOp::GtEq, ">="),
+        ] {
+            let q = emit_select(&restrict_cmp("id", op, Literal::Integer(3)), Dialect::SQLite)
+                .unwrap();
+            assert_eq!(
+                q.sql.text,
+                format!(r#"SELECT "id", "message" FROM "greetings" WHERE "id" {sym} ?"#),
+                "op {op:?}"
+            );
+            assert_eq!(q.params, vec![Value::Integer(3)], "op {op:?}");
+        }
+    }
+
+    #[test]
+    fn restrict_ne_uses_postgres_placeholder() {
+        let q = emit_select(&restrict_cmp("id", CmpOp::Ne, Literal::Integer(1)), Dialect::Postgres)
+            .unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" <> $1"#
+        );
+    }
+
+    #[test]
+    fn delete_with_ne_predicate_renders() {
+        // The WHERE renderer is shared, so surgical DELETE gets `<>` for free.
+        let q = emit_delete(&restrict_cmp("id", CmpOp::Ne, Literal::Integer(1)), Dialect::SQLite)
+            .unwrap();
+        assert_eq!(q.sql.text, r#"DELETE FROM "greetings" WHERE "id" <> ?"#);
+    }
+
+    #[test]
+    fn ordering_keeps_distinct_when_projection_drops_the_key() {
+        // Project away the key `id`: `=` pins the key (card ≤ 1) so the
+        // projection is still a set (no DISTINCT); `<>`/`<`/`>` bound nothing, so
+        // DISTINCT is required.
+        let project_message = |r: RelExpr| RelExpr::Project {
+            input: Box::new(r),
+            keep: vec!["message".to_string()],
+        };
+        let eq = emit_select(
+            &project_message(restrict_cmp("id", CmpOp::Eq, Literal::Integer(1))),
+            Dialect::SQLite,
+        )
+        .unwrap();
+        assert_eq!(
+            eq.sql.text,
+            r#"SELECT "message" FROM "greetings" WHERE "id" = ?"#
+        );
+        let lt = emit_select(
+            &project_message(restrict_cmp("id", CmpOp::Lt, Literal::Integer(3))),
+            Dialect::SQLite,
+        )
+        .unwrap();
+        assert_eq!(
+            lt.sql.text,
+            r#"SELECT DISTINCT "message" FROM "greetings" WHERE "id" < ?"#
+        );
     }
 
     #[test]
@@ -998,7 +1082,7 @@ mod tests {
         // no `DISTINCT`.
         let expr = RelExpr::Restrict {
             input: Box::new(greetings()),
-            pred: Predicate::AttrEq {
+            pred: Predicate::AttrCmp { op: CmpOp::Eq,
                 attr: "message".to_string(),
                 value: Literal::Text("hello world".to_string()),
             },
@@ -1108,7 +1192,7 @@ mod tests {
         // restricted one threads its bind param through the derived table.
         let x = RelExpr::Restrict {
             input: Box::new(stale()),
-            pred: Predicate::AttrEq {
+            pred: Predicate::AttrCmp { op: CmpOp::Eq,
                 attr: "id".to_string(),
                 value: Literal::Integer(2),
             },
@@ -1200,7 +1284,7 @@ mod tests {
     fn assignment_union_restricted_relvar_binds_param() {
         let x = RelExpr::Restrict {
             input: Box::new(new_arrivals()),
-            pred: Predicate::AttrEq {
+            pred: Predicate::AttrCmp { op: CmpOp::Eq,
                 attr: "id".to_string(),
                 value: Literal::Integer(5),
             },
@@ -1606,7 +1690,7 @@ mod tests {
         // both as SQLite `?` and Postgres `$1`.
         let restricted = RelExpr::Restrict {
             input: Box::new(edges()),
-            pred: Predicate::AttrEq {
+            pred: Predicate::AttrCmp { op: CmpOp::Eq,
                 attr: "from".to_string(),
                 value: Literal::Integer(1),
             },
@@ -1705,7 +1789,7 @@ mod tests {
                     lhs: Box::new(employees()),
                     rhs: Box::new(departments()),
                 }),
-                pred: Predicate::AttrEq {
+                pred: Predicate::AttrCmp { op: CmpOp::Eq,
                     attr: "dept_name".to_string(),
                     value: Literal::Text("Engineering".to_string()),
                 },
@@ -1970,7 +2054,7 @@ mod tests {
         };
         let expr = RelExpr::Restrict {
             input: Box::new(renamed),
-            pred: Predicate::AttrEq {
+            pred: Predicate::AttrCmp { op: CmpOp::Eq,
                 attr: "identifier".to_string(),
                 value: Literal::Integer(1),
             },

@@ -42,7 +42,7 @@ The **set invariant** above is non-negotiable and enforced by construction. The 
 `coddl-relir` carries each relvar's declared candidate keys on its `RelvarRef` leaf and exposes `RelExpr::needs_distinct()`; `emit_select` drops `DISTINCT` when it returns false. A query needs no `DISTINCT` when either:
 
 - a **candidate key survives** into the projected heading (`surviving_keys()` non-empty) — no two distinct rows can collide on the kept columns; or
-- a restriction **bounds cardinality to ≤ 1** (`card_le_one()`) — an equality on a full candidate key (v1: a single-attribute key pinned by `attr = literal`), so any projection is trivially duplicate-free.
+- a restriction **bounds cardinality to ≤ 1** (`card_le_one()`) — an equality on a full candidate key (v1: a single-attribute key pinned by `attr = literal`), so any projection is trivially duplicate-free. Only `=` *pins* a value: a `<>`/`<`/`<=`/`>`/`>=` restriction pushes and renders its operator in the `WHERE`, but it bounds nothing, so a key-dropping projection over it keeps `DISTINCT`.
 
 Otherwise (a projection that drops below every candidate key with unbounded cardinality) `DISTINCT` stays. A keyless or not-yet-analyzable leaf is conservative — it keeps `DISTINCT`. This is a compile-time down payment on candidate-key inference (VSS 3): today only declared keys propagate; inferred FDs extend `surviving_keys()`/`card_le_one()` later without touching `emit_select`.
 

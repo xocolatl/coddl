@@ -24,7 +24,7 @@ use coddl_syntax::ast::{
 use coddl_syntax::SyntaxKind;
 use coddl_types::{check, Heading, RelvarKind, RelvarTable, Type};
 
-use coddl_relir::{Literal as RelLiteral, Predicate, RelExpr, ScalarBinOp, ScalarExpr};
+use coddl_relir::{CmpOp, Literal as RelLiteral, Predicate, RelExpr, ScalarBinOp, ScalarExpr};
 use coddl_sqlemit::{emit_assignment, emit_insert_template, Dialect, SqlQuery, Value};
 
 use crate::ir::{
@@ -1715,20 +1715,32 @@ impl Lowerer {
             Expr::Binary(b) => b,
             _ => return None,
         };
-        if !matches!(b.op_kind(), Some(BinaryOp::Eq)) {
-            return None;
-        }
+        // A pushable restriction is a single `attr <cmp> literal`. Map the
+        // surface comparison operator to a RelIR `CmpOp`; any other operator
+        // (logical, arithmetic, …) declines the push and runs in-process.
+        let op = match b.op_kind()? {
+            BinaryOp::Eq => CmpOp::Eq,
+            BinaryOp::NotEq => CmpOp::Ne,
+            BinaryOp::Lt => CmpOp::Lt,
+            BinaryOp::LtEq => CmpOp::LtEq,
+            BinaryOp::Gt => CmpOp::Gt,
+            BinaryOp::GtEq => CmpOp::GtEq,
+            _ => return None,
+        };
         let lhs = b.lhs()?;
         let rhs = b.rhs()?;
-        let (attr, lit_expr) = match (attr_ref_name(&lhs), attr_ref_name(&rhs)) {
-            (Some(a), None) => (a, rhs),
-            (None, Some(a)) => (a, lhs),
-            // attr-vs-attr or literal-vs-literal: not a pushable AttrEq.
+        // The attribute may be either operand. With it on the right
+        // (`literal OP attr`) the operator is flipped so the stored predicate is
+        // always `attr OP' literal` (`5 < id` ⇒ `id > 5`).
+        let (attr, op, lit_expr) = match (attr_ref_name(&lhs), attr_ref_name(&rhs)) {
+            (Some(a), None) => (a, op, rhs),
+            (None, Some(a)) => (a, op.flip(), lhs),
+            // attr-vs-attr or literal-vs-literal: not a pushable comparison.
             _ => return None,
         };
         heading.lookup(&attr)?;
         let value = self.literal_value(&lit_expr)?;
-        Some(Predicate::AttrEq { attr, value })
+        Some(Predicate::AttrCmp { attr, op, value })
     }
 
     /// Convert a literal AST node to a RelIR `Literal`, or `None` for forms

@@ -1545,6 +1545,103 @@ fn dml_union_literal_inserts_idempotently_cranelift() {
     assert_union_literal_inserts_idempotently("cranelift");
 }
 
+// ── comparison-predicate pushdown (`<>` `<` `<=` `>` `>=`) ─────────────
+
+/// Read `Greetings where <pred> project {message}` (a predicate matching
+/// exactly one of the two seeded rows), and assert (a) it printed `expect_msg`
+/// and (b) the comparison **pushed** — the audit log shows one filtered
+/// `greetings` query carrying `expect_op`, and no full-table scan. Proves the
+/// operator goes typecheck → push → run, not just that the result is correct.
+fn assert_comparison_pushes(backend: &str, pred: &str, expect_msg: &str, expect_op: &str) {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let db = seed_greetings_fixtures(dir); // companions + (1, 'hello world')
+    let add = Command::new("sqlite3")
+        .arg(&db)
+        .arg("INSERT INTO greetings (id, message) VALUES (2, 'goodbye');")
+        .status()
+        .expect("invoke sqlite3");
+    assert!(add.success(), "add second greetings row");
+
+    let cd = dir.join("cmp.cd");
+    std::fs::write(
+        &cd,
+        format!(
+            "program p;\n\
+             database greetings;\n\
+             public relvar Greetings {{ id: Integer, message: Text }} key {{ id }};\n\
+             oper main {{}} [\n\
+                 let g = transaction [ extract (Greetings where {pred} project {{ message }}) ];\n\
+                 write_line {{ message: g.message }};\n\
+             ];\n"
+        ),
+    )
+    .expect("write cmp.cd");
+
+    let log = dir.join("audit.log");
+    let out = coddl()
+        .env("CODDL_AUDIT_LOG", &log)
+        .env("CODDL_GREETINGS_FILE", &db)
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend={backend} (pred {pred}) failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(
+        out.stdout,
+        format!("{expect_msg}\n").into_bytes(),
+        "pred {pred} on {backend}: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let contents = std::fs::read_to_string(&log).expect("read audit log");
+    let sqls: Vec<&str> = contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| audit_sql(l).unwrap_or_else(|| panic!("malformed audit line: {l:?}")))
+        .collect();
+    // No unfiltered scan of greetings.
+    assert!(
+        !sqls.iter().any(|s| s.contains("greetings") && !s.contains("WHERE")),
+        "unexpected full scan (pred {pred}, {backend}): {sqls:?}"
+    );
+    // Exactly one pushed query, carrying the comparison operator.
+    let pushed: Vec<&&str> = sqls
+        .iter()
+        .filter(|s| s.contains("greetings") && s.contains(expect_op))
+        .collect();
+    assert_eq!(
+        pushed.len(),
+        1,
+        "expected one pushed `{expect_op}` query (pred {pred}, {backend}), got {sqls:?}"
+    );
+}
+
+#[test]
+fn comparison_ne_pushes_llvm() {
+    assert_comparison_pushes("llvm", "id <> 1", "goodbye", "<>");
+}
+
+#[test]
+fn comparison_ne_pushes_cranelift() {
+    assert_comparison_pushes("cranelift", "id <> 1", "goodbye", "<>");
+}
+
+#[test]
+fn comparison_lt_pushes_llvm() {
+    assert_comparison_pushes("llvm", "id < 2", "hello world", "<");
+}
+
+#[test]
+fn comparison_lt_pushes_cranelift() {
+    assert_comparison_pushes("cranelift", "id < 2", "hello world", "<");
+}
+
 // ── extend pushdown ───────────────────────────────────────────────────
 
 /// Write the `sales` database companions and seed a SQLite db with two rows.

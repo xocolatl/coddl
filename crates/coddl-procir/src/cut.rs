@@ -24,7 +24,7 @@ pub fn try_push(expr: &RelExpr, dialect: Dialect) -> Option<SqlQuery> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coddl_relir::{Heading, Literal, Predicate, Type};
+    use coddl_relir::{CmpOp, Heading, Literal, Predicate, Type};
 
     fn greetings() -> RelExpr {
         RelExpr::RelvarRef {
@@ -47,8 +47,9 @@ mod tests {
     fn pushes_relvar_rooted_restrict() {
         let expr = RelExpr::Restrict {
             input: Box::new(greetings()),
-            pred: Predicate::AttrEq {
+            pred: Predicate::AttrCmp {
                 attr: "id".to_string(),
+                op: CmpOp::Eq,
                 value: Literal::Integer(1),
             },
         };
