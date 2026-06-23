@@ -413,6 +413,35 @@ that isn't the materialized SQLite payload) is unsafe inside.
   blocks (they only ever increase depth) and will extend to user-
   defined `oper`s once those callees carry a derived purity flag.
 
+A relational assignment to a public relvar (`R := …`) is a DML statement and is
+**not** caught by this ban. The T0026 purity rule targets side-effecting
+*operator calls* (`Expr::Call` to a `SideEffecting` builtin) — non-transactional
+I/O that can't be rolled back or replayed. A write to a public relvar is the
+*legitimate, transactional* effect a `transaction [...]` exists to commit; it is
+rolled back cleanly on conflict and replayed with the block. So it is allowed
+inside a transaction (and, like any public-relvar access, is *required* to sit
+inside one by T0025).
+
+## Writing public relvars
+
+Relational assignment `R := <expr>;` (`check_assignment_stmt`) accepts a public
+*or* private relvar as its target. A private target stores into an in-memory
+slot; a public target is a write to its SQL-backed table. The checker enforces
+that the target is a bare name bound to an assignable relvar (**T0033**
+otherwise) and that the RHS heading matches the target's (**T0034**). A
+public-relvar reference on the RHS forces a `transaction [...]` (**T0025**).
+
+The checker does not constrain the RHS *shape*: which assignments become
+surgical DML — and which are rejected as not-yet-writable — is decided in the
+lowering layer, where the RHS `RelExpr` is recognized (`R minus (R where …)`
+→ `DELETE … WHERE …`; `R minus R` → a whole-table delete). Two checks live there
+because they need information the `.cd` checker lacks:
+
+- a public relvar mapped to a catalog **view** is not directly writable (the
+  base-vs-virtual `WritePolicy` distinction; the checker only knows `Public` vs
+  `Private`) — **T0050**;
+- an RHS shape the backend cannot emit as surgical DML — **T0049**.
+
 
 ## Typecheck diagnostics
 
@@ -470,3 +499,5 @@ check script enforces that.
 | T0046 | computed `extend` / `replace` value must be Integer or Text (v1 relation-cell support) |
 | T0047 | `replace` value is a bare attribute reference (only relabels) — use `rename` |
 | T0048 | `unwrap` target is not a tuple-valued attribute                    |
+| T0049 | assignment to a public relvar has an RHS shape the backend cannot emit as surgical DML (lowering) |
+| T0050 | assignment target is a public relvar mapped to a non-writable view (lowering) |

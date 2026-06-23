@@ -281,9 +281,13 @@ pub fn discover_and_validate_with_overrides(
             columns,
             // The catalog is the truth about the database's keys.
             keys: catalog.keys.clone(),
-            // v1 SQLite is read-only; the discrimination will land
-            // when Phase 21 supports write-through view updates.
-            write_policy: WritePolicy::ReadOnly,
+            // A base catalog relvar maps 1:1 onto a SQL table and is
+            // directly writable; a virtual (view) relvar stays read-only
+            // until view-updating (`WriteThrough`) lands.
+            write_policy: match catalog.kind {
+                RelvarKind::Base => WritePolicy::ReadWrite,
+                _ => WritePolicy::ReadOnly,
+            },
         });
     }
 
@@ -562,7 +566,8 @@ relvar Greetings: table \"greetings\" {
         assert_eq!(r.app_name, "Greetings");
         assert_eq!(r.catalog_name, "Greetings");
         assert_eq!(r.table_name, "greetings");
-        assert_eq!(r.write_policy, WritePolicy::ReadOnly);
+        // A base catalog relvar is directly writable.
+        assert_eq!(r.write_policy, WritePolicy::ReadWrite);
         // Heading-canonical (sorted) order: id, message.
         let col_attrs: Vec<&str> = r.columns.iter().map(|(a, _)| a.as_str()).collect();
         assert!(col_attrs.contains(&"id"));

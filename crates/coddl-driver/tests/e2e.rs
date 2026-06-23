@@ -1157,6 +1157,154 @@ fn relvar_pushdown_audit_cranelift() {
     assert_pushdown_audit("cranelift");
 }
 
+// ── surgical writes (relational assignment → DML) ─────────────────────
+
+/// Seed a fresh two-row `greetings` db + its `.cddb`/`.cdstore` companions,
+/// compile and run `program` on `backend`, then return the rows left in the
+/// table afterwards as `"id|message"` lines sorted by id. Querying the
+/// persisted file directly (via the `sqlite3` CLI) proves the write reached the
+/// table, independent of any in-process read path. The suite owns its source —
+/// it never reads `examples/`.
+fn run_greetings_dml(backend: &str, program: &str) -> Vec<String> {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("greetings.cddb"),
+        "database greetings;\n\
+         base relvar Greetings { id: Integer, message: Text } key { id };\n",
+    )
+    .expect("write greetings.cddb");
+    std::fs::write(
+        dir.join("greetings.cdstore"),
+        "store for greetings;\n\
+         backend sqlite { file: \"greetings.sqlite\" };\n\
+         relvar Greetings: table \"greetings\" { columns: { id: \"id\", message: \"message\" } };\n",
+    )
+    .expect("write greetings.cdstore");
+    let db = dir.join("greetings.sqlite");
+    let seed = Command::new("sqlite3")
+        .arg(&db)
+        .arg(
+            "CREATE TABLE greetings (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
+             INSERT INTO greetings (id, message) VALUES (1, 'hello world'), (2, 'goodbye');",
+        )
+        .status()
+        .expect("invoke sqlite3");
+    assert!(seed.success(), "greetings DML fixture seed failed");
+
+    let cd = dir.join("dml.cd");
+    std::fs::write(&cd, program).expect("write dml.cd");
+
+    let out = coddl()
+        .env("CODDL_GREETINGS_FILE", &db)
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend={backend} {:?} failed: stderr=\n{}",
+        cd,
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let q = Command::new("sqlite3")
+        .arg(&db)
+        .arg("SELECT id || '|' || message FROM greetings ORDER BY id")
+        .output()
+        .expect("sqlite3 read-back");
+    assert!(
+        q.status.success(),
+        "sqlite3 read-back failed: {}",
+        String::from_utf8_lossy(&q.stderr)
+    );
+    String::from_utf8_lossy(&q.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// `R := R minus (R where id = 1)` inside a transaction emits a surgical
+/// `DELETE FROM greetings WHERE id = ?` that persists — only the id=2 row
+/// survives. Same result on both backends.
+fn assert_delete_where_persists(backend: &str) {
+    let rows = run_greetings_dml(
+        backend,
+        "program insert_update_delete;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             transaction [ Greetings := Greetings minus (Greetings where id = 1); ];\n\
+         ];\n",
+    );
+    assert_eq!(rows, vec!["2|goodbye".to_string()], "backend={backend}");
+}
+
+#[test]
+fn dml_delete_where_persists_llvm() {
+    assert_delete_where_persists("llvm");
+}
+
+#[test]
+fn dml_delete_where_persists_cranelift() {
+    assert_delete_where_persists("cranelift");
+}
+
+/// `R := R minus R` empties the relvar with a whole-table `DELETE FROM
+/// greetings`. No rows survive.
+fn assert_self_truncate_empties(backend: &str) {
+    let rows = run_greetings_dml(
+        backend,
+        "program insert_update_delete;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             transaction [ Greetings := Greetings minus Greetings; ];\n\
+         ];\n",
+    );
+    assert!(rows.is_empty(), "expected empty table on {backend}, got {rows:?}");
+}
+
+#[test]
+fn dml_self_truncate_empties_llvm() {
+    assert_self_truncate_empties("llvm");
+}
+
+#[test]
+fn dml_self_truncate_empties_cranelift() {
+    assert_self_truncate_empties("cranelift");
+}
+
+/// Binding transparency: `let r = R where id = 1; R := R minus r` folds to the
+/// same `DELETE … WHERE id = ?` as the inline form — the alias is substituted
+/// before recognition, so it persists identically.
+fn assert_delete_via_binding(backend: &str) {
+    let rows = run_greetings_dml(
+        backend,
+        "program insert_update_delete;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             transaction [\n\
+                 let r = Greetings where id = 1;\n\
+                 Greetings := Greetings minus r;\n\
+             ];\n\
+         ];\n",
+    );
+    assert_eq!(rows, vec!["2|goodbye".to_string()], "backend={backend}");
+}
+
+#[test]
+fn dml_delete_via_binding_transparency_llvm() {
+    assert_delete_via_binding("llvm");
+}
+
+#[test]
+fn dml_delete_via_binding_transparency_cranelift() {
+    assert_delete_via_binding("cranelift");
+}
+
 // ── extend pushdown ───────────────────────────────────────────────────
 
 /// Write the `sales` database companions and seed a SQLite db with two rows.

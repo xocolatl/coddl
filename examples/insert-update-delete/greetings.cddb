@@ -1,0 +1,7 @@
+database greetings;
+
+base relvar Greetings {
+    id: Integer,
+    message: Text,
+}
+key { id };

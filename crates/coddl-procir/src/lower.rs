@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use coddl_diagnostics::{Diagnostic, FileId, Severity, Span};
-use coddl_plan::Plan;
+use coddl_plan::{Plan, WritePolicy};
 use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, Expr, ExprStmt,
     ExtendExpr, FieldAccess, Item,
@@ -25,7 +25,7 @@ use coddl_syntax::SyntaxKind;
 use coddl_types::{check, Heading, RelvarKind, RelvarTable, Type};
 
 use coddl_relir::{Literal as RelLiteral, Predicate, RelExpr, ScalarBinOp, ScalarExpr};
-use coddl_sqlemit::{Dialect, SqlQuery, Value};
+use coddl_sqlemit::{emit_assignment, Dialect, SqlQuery, Value};
 
 use crate::ir::{
     BasicBlock, BlockId, Const, Function, HeadingId, Inst, Module, PlanEntry, ProcType,
@@ -207,6 +207,11 @@ struct Lowerer {
     /// init emission. Empty when the program declares no public
     /// relvars (or no plan was supplied).
     public_relvars: HashMap<String, PublicRelvarBinding>,
+    /// Write policy per public relvar, keyed by surface name. A lowering-time
+    /// authorization concern only (reject an assignment to a view), kept out of
+    /// the IR's `PublicRelvarBinding` so the IR stays plan-independent. Base
+    /// relvars are `ReadWrite`; relvars mapped to a catalog view are `ReadOnly`.
+    public_relvar_write_policy: HashMap<String, WritePolicy>,
     /// Source-declaration order of public-relvar names. The lowerer
     /// emits `RelvarSlotInit` / `RelvarSlotRelease` in this order so
     /// the slot-global emission matches across both backends and
@@ -269,6 +274,7 @@ impl Lowerer {
             value_types: HashMap::new(),
             outer_locals_for_capture: None,
             public_relvars: HashMap::new(),
+            public_relvar_write_policy: HashMap::new(),
             public_relvar_order: Vec::new(),
             db_name: None,
             db_path_default: None,
@@ -308,6 +314,8 @@ impl Lowerer {
             };
             self.public_relvar_order.push(r.app_name.clone());
             self.public_relvars.insert(r.app_name.clone(), binding);
+            self.public_relvar_write_policy
+                .insert(r.app_name.clone(), r.write_policy);
         }
     }
 
@@ -764,24 +772,73 @@ impl Lowerer {
         }
     }
 
-    /// Lower a relational assignment `R := <expr>;` — store the RHS relation
-    /// value into the target private relvar's slot (move semantics; the slot
-    /// owns the value, the runtime releases the previous one).
+    /// Lower a relational assignment `R := <expr>;`. A **private** target stores
+    /// the RHS relation value into its in-memory slot (move semantics; the slot
+    /// owns the value, the runtime releases the previous one). A **public**
+    /// target is a write to the SQL-backed relvar: the RHS is recognized as an
+    /// assignment shape and emitted as surgical DML, never hydrated.
     fn lower_assign_stmt(&mut self, stmt: &AssignStmt) {
-        // Target: a private relvar name (the typechecker enforced this — T0033).
-        let Some(Expr::NameRef(target)) = stmt.target() else {
-            return;
+        let Some(target_expr) = stmt.target() else { return };
+        let Expr::NameRef(target) = &target_expr else {
+            return; // typechecker rejected a non-name target (T0033)
         };
         let Some(name_tok) = target.ident() else { return };
         let name = name_tok.text().to_string();
-        // Lower the RHS to a relation value.
-        let value = match stmt.value() {
-            Some(v) => self.lower_expr(&v),
-            None => return,
-        };
-        // Mark the slot live and store the value.
+        let Some(value_expr) = stmt.value() else { return };
+
+        // Public target → surgical DML via assignment-RHS recognition.
+        if self.public_relvars.contains_key(&name) {
+            self.lower_public_assign(&name, &target_expr, &value_expr);
+            return;
+        }
+
+        // Private target → in-memory slot store.
+        let value = self.lower_expr(&value_expr);
         self.used_private_relvars.insert(name.clone());
         self.insts.push(Inst::RelvarSlotStore { name, value });
+    }
+
+    /// Lower `R := <rhs>;` where `R` is a public relvar: recognize the RHS shape
+    /// and emit surgical DML (`Inst::Dml`). The RHS is **never materialized** —
+    /// `build_rel_expr` pushes it, `emit_assignment` recognizes it, and the SQL
+    /// runs server-side.
+    fn lower_public_assign(&mut self, name: &str, target_expr: &Expr, value_expr: &Expr) {
+        // A relvar mapped to a catalog view isn't directly writable.
+        if self.public_relvar_write_policy.get(name) != Some(&WritePolicy::ReadWrite) {
+            self.diagnostics.push(Diagnostic::error(
+                self.node_span(target_expr.syntax()),
+                "T0050",
+                format!("cannot assign to public relvar `{name}`: it maps to a non-writable view"),
+            ));
+            return;
+        }
+        // Surgical DML needs a SQL dialect to emit against.
+        let Some(dialect) = self.dialect else {
+            self.diagnostics.push(Diagnostic::error(
+                self.node_span(target_expr.syntax()),
+                "T0049",
+                format!("cannot assign to public relvar `{name}`: backend does not support SQL writes"),
+            ));
+            return;
+        };
+        // Recognize the RHS shape: build both operands' RelIR (the target is a
+        // bare `RelvarRef`; the RHS pushes only if `build_rel_expr` accepts it),
+        // then `emit_assignment`. Any decline lands on the unsupported-shape arm.
+        let recognized = self
+            .build_rel_expr(target_expr)
+            .zip(self.build_rel_expr(value_expr))
+            .and_then(|(t, r)| emit_assignment(&t, &r, dialect).ok());
+        match recognized {
+            Some(query) => self.emit_dml(query),
+            None => self.diagnostics.push(Diagnostic::error(
+                self.node_span(value_expr.syntax()),
+                "T0049",
+                format!(
+                    "assignment to public relvar `{name}` is not a supported write shape \
+                     (only `R minus (R where …)` and `R minus R` are emitted as surgical DML)"
+                ),
+            )),
+        }
     }
 
     fn lower_let_stmt(&mut self, stmt: &LetStmt) {
@@ -1640,9 +1697,13 @@ impl Lowerer {
     /// Lower a baked `SqlQuery` to an `Inst::Query`: dedup the plan by its
     /// text-stable id, emit one `Inst::Const` per bind value, and return the
     /// SSA value holding the (relation) result.
-    fn emit_query(&mut self, query: SqlQuery) -> ValueId {
-        let result_heading_id = self.intern_heading(&query.result_heading);
-        let plan_id = if let Some(id) = self.plan_ids.get(&query.plan_id.0) {
+    /// Register a baked `SqlQuery` as a module plan, deduping by its text-stable
+    /// id, and return the dense per-module plan id. `result_heading_id` is the
+    /// interned heading the runtime marshals rows into (unused for DML, which
+    /// returns no rows — pass the operand heading). Shared by `emit_query` and
+    /// `emit_dml`.
+    fn register_plan(&mut self, query: &SqlQuery, result_heading_id: HeadingId) -> u32 {
+        if let Some(id) = self.plan_ids.get(&query.plan_id.0) {
             *id
         } else {
             let id = self.next_plan_id;
@@ -1656,7 +1717,13 @@ impl Lowerer {
             });
             self.plan_ids.insert(query.plan_id.0, id);
             id
-        };
+        }
+    }
+
+    /// Emit one `Inst::Const` per bind value and return the `(ValueId, ProcType)`
+    /// param list a `Query`/`Dml` instruction passes to the runtime. Shared by
+    /// `emit_query` and `emit_dml`.
+    fn emit_params(&mut self, query: &SqlQuery) -> Vec<(ValueId, ProcType)> {
         let mut params: Vec<(ValueId, ProcType)> = Vec::with_capacity(query.params.len());
         for v in &query.params {
             let (value, ty) = match v {
@@ -1673,6 +1740,13 @@ impl Lowerer {
             });
             params.push((dst, ty));
         }
+        params
+    }
+
+    fn emit_query(&mut self, query: SqlQuery) -> ValueId {
+        let result_heading_id = self.intern_heading(&query.result_heading);
+        let plan_id = self.register_plan(&query, result_heading_id);
+        let params = self.emit_params(&query);
         let dst = self.fresh_value();
         self.record_type(dst, ProcType::Relation(result_heading_id));
         self.insts.push(Inst::Query {
@@ -1682,6 +1756,17 @@ impl Lowerer {
             heading_id: result_heading_id,
         });
         dst
+    }
+
+    /// Register a baked DML `SqlQuery` and emit an `Inst::Dml` to fire it for
+    /// effect (no result bound). Mirrors `emit_query` minus the result value.
+    fn emit_dml(&mut self, query: SqlQuery) {
+        // The DML plan returns no rows; its registered heading is unused but
+        // `PlanEntry` carries one, so intern the operand heading honestly.
+        let result_heading_id = self.intern_heading(&query.result_heading);
+        let plan_id = self.register_plan(&query, result_heading_id);
+        let params = self.emit_params(&query);
+        self.insts.push(Inst::Dml { plan_id, params });
     }
 
     /// Lower a unary prefix expression. Phase 21 handles `Extract`:

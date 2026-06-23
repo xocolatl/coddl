@@ -12,17 +12,17 @@
 //! and falls back to the compile-time default. Bundled `rusqlite` means
 //! the binary needs no system libsqlite3.
 //!
-//! ## Transactions (v1: no-ops)
+//! ## Transactions
 //!
-//! TTM OO Pre 4 forbids autocommit at the language surface; the
-//! compiler enforces this by wrapping every `transaction [...]` body
-//! in synthetic [`coddl_begin_tx`] / [`coddl_commit_tx`] calls. In v1
-//! all public-relvar reads are served from the in-memory slot, so
-//! these calls don't touch SQLite — they return Ok without doing
-//! anything. The shape becomes load-bearing when write-through
-//! arrives (Phase 22 successor): a real BEGIN/COMMIT round-trips to
-//! the connection, and serialization-conflict replay reuses the same
-//! externs.
+//! TTM OO Pre 4 forbids autocommit at the language surface; the compiler
+//! enforces this by wrapping every `transaction [...]` body in synthetic
+//! [`coddl_begin_tx`] / [`coddl_commit_tx`] calls. These issue real `BEGIN` /
+//! `COMMIT` (and [`coddl_rollback_tx`] a `ROLLBACK`) on every open connection,
+//! guarded by a process-global depth counter so nested blocks don't
+//! double-`BEGIN`. Connections are opened read-write and kept live, so a write
+//! made inside a transaction (via [`coddl_exec`]) is visible to a later read
+//! ([`coddl_query`]) in the same transaction — read-after-write on one shared
+//! connection. Serialization-conflict replay will reuse the same externs.
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -492,10 +492,11 @@ unsafe fn bytes_to_str<'a>(label: &str, ptr: *const u8, len: usize) -> &'a str {
 }
 
 /// Get a connection for `path`, opening one if not yet present.
-/// Connections are opened read-only via `SQLITE_OPEN_READ_ONLY` so
-/// hand-edits to the database between materialization and reads can't
-/// corrupt the in-memory snapshot. Aborts on open failure with a
-/// message naming the path.
+/// Connections are opened **read-write** (`SQLITE_OPEN_READ_WRITE`) so surgical
+/// DML inside a transaction can write through them, and kept live so a read
+/// later in the same transaction sees the uncommitted write (read-after-write
+/// on one shared connection). Aborts on open failure with a message naming the
+/// path.
 fn ensure_connection(path: &str) -> () {
     let mut guard = db_connections().lock().expect("conn map poisoned");
     if guard.contains_key(path) {
@@ -503,7 +504,7 @@ fn ensure_connection(path: &str) -> () {
     }
     let mut conn = match Connection::open_with_flags(
         path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ) {
         Ok(c) => c,
         Err(err) => {
@@ -528,25 +529,79 @@ fn audit_sqlite_trace(sql: &str) {
     crate::audit::record("sqlite", sql);
 }
 
-/// Begin a transaction. v1 is a no-op: the materialized in-memory
-/// slot is the source of truth for reads, and SQLite isn't touched
-/// inside the transaction body. Real BEGIN ships with write-through.
+/// Process-global transaction-nesting depth. The compiler wraps each
+/// `transaction [...]` body in begin/commit, and those can nest; SQLite has no
+/// nested `BEGIN`, so only the outermost begin issues a real `BEGIN` and the
+/// outermost commit/rollback the real `COMMIT`/`ROLLBACK`.
+fn tx_depth() -> &'static std::sync::atomic::AtomicUsize {
+    static DEPTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    &DEPTH
+}
+
+/// Run a transaction-control statement (`BEGIN`/`COMMIT`/`ROLLBACK`) on every
+/// registered database's connection, opening it if needed. Aborts on failure —
+/// a control statement that can't run is a runtime/codegen bug, not a user
+/// error. An empty registry (a pure in-process program) is a clean no-op.
+fn tx_broadcast(verb: &str) -> CoddlStatus {
+    // Snapshot the registered paths, dropping the registry lock before taking
+    // the connection-pool lock (no lock-order coupling; mirrors `coddl_query`).
+    let paths: Vec<String> = {
+        let registry = database_registry()
+            .lock()
+            .expect("database registry poisoned");
+        registry.values().map(|e| e.path.clone()).collect()
+    };
+    for path in &paths {
+        ensure_connection(path);
+    }
+    let guard = db_connections().lock().expect("conn map poisoned");
+    for path in &paths {
+        if let Some(conn) = guard.get(path) {
+            if let Err(err) = conn.execute_batch(verb) {
+                eprintln!("coddl: transaction: `{verb}` failed on `{path}`: {err}");
+                std::process::abort();
+            }
+        }
+    }
+    CoddlStatus::Ok
+}
+
+/// Begin a transaction. Issues a real `BEGIN` on every open connection — but
+/// only at the outermost nesting level (the depth counter guards against
+/// SQLite's lack of nested `BEGIN`). The shared read-write connection means a
+/// later read in the same transaction sees writes made here.
 #[no_mangle]
 pub unsafe extern "C" fn coddl_begin_tx() -> CoddlStatus {
+    use std::sync::atomic::Ordering;
+    if tx_depth().fetch_add(1, Ordering::SeqCst) == 0 {
+        return tx_broadcast("BEGIN");
+    }
     CoddlStatus::Ok
 }
 
-/// Commit a transaction. v1 no-op (see [`coddl_begin_tx`]).
+/// Commit the current transaction (a real `COMMIT` at the outermost level).
 #[no_mangle]
 pub unsafe extern "C" fn coddl_commit_tx() -> CoddlStatus {
+    use std::sync::atomic::Ordering;
+    let prev = tx_depth().fetch_sub(1, Ordering::SeqCst);
+    debug_assert!(prev > 0, "commit_tx without a matching begin_tx");
+    if prev == 1 {
+        return tx_broadcast("COMMIT");
+    }
     CoddlStatus::Ok
 }
 
-/// Roll back a transaction. v1 no-op; reserved for the
-/// serialization-replay loop that lands with write-through and sum
-/// types in the language.
+/// Roll back the current transaction (a real `ROLLBACK` at the outermost
+/// level). Reserved for the serialization-replay loop; explicit today for
+/// tests and future write-through conflict handling.
 #[no_mangle]
 pub unsafe extern "C" fn coddl_rollback_tx() -> CoddlStatus {
+    use std::sync::atomic::Ordering;
+    let prev = tx_depth().fetch_sub(1, Ordering::SeqCst);
+    debug_assert!(prev > 0, "rollback_tx without a matching begin_tx");
+    if prev == 1 {
+        return tx_broadcast("ROLLBACK");
+    }
     CoddlStatus::Ok
 }
 
@@ -749,6 +804,98 @@ pub unsafe extern "C" fn coddl_query(
     finalize_relation(&row_buffers, record_size, desc, &ctx)
 }
 
+/// Execute a registered **DML** plan (`DELETE`/`INSERT`/`UPDATE`) for its
+/// effect only. Mirrors [`coddl_query`] but runs `execute` — there are no
+/// result rows to marshal — and returns a [`CoddlStatus`]. The write lands on
+/// the shared read-write connection inside the enclosing transaction's
+/// BEGIN/COMMIT pair, so a later read in the same transaction sees it
+/// (read-after-write).
+///
+/// Aborts on prepare/execute failure (the same loud-failure discipline as
+/// `coddl_query`) — a DML plan that won't run is a codegen/schema bug, and the
+/// status channel is reserved for future conflict handling.
+///
+/// # Safety
+/// `plan_id` must have been registered by [`coddl_register_plan`]. `params`
+/// must point to `n` valid [`CoddlParam`] values (or be null when `n == 0`).
+#[no_mangle]
+pub unsafe extern "C" fn coddl_exec(
+    plan_id: PlanId,
+    params: *const CoddlParam,
+    n: usize,
+) -> CoddlStatus {
+    // Look up the plan; clone what we need and drop the registry lock before
+    // taking any other lock (no lock-order coupling).
+    let (db_name, sql, param_count) = {
+        let registry = plan_registry().lock().expect("plan registry poisoned");
+        match registry.get(&plan_id.0) {
+            Some(entry) => (entry.db_name.clone(), entry.sql.clone(), entry.param_count),
+            None => {
+                eprintln!("coddl: exec: no plan registered for plan_id {}", plan_id.0);
+                std::process::abort();
+            }
+        }
+    };
+
+    if n != param_count as usize {
+        eprintln!(
+            "coddl: exec: plan {} expects {param_count} param(s), got {n}",
+            plan_id.0
+        );
+        std::process::abort();
+    }
+
+    // Resolve the plan's logical database to its connection path.
+    let path = {
+        let registry = database_registry()
+            .lock()
+            .expect("database registry poisoned");
+        match registry.get(&db_name) {
+            Some(entry) => entry.path.clone(),
+            None => {
+                eprintln!(
+                    "coddl: exec: plan {} references unregistered database `{db_name}`",
+                    plan_id.0
+                );
+                std::process::abort();
+            }
+        }
+    };
+
+    // Open (or reuse) the connection before re-locking the pool (the Mutex is
+    // not reentrant), then bind params: CoddlParam -> owned rusqlite Value.
+    ensure_connection(&path);
+    let param_slice: &[CoddlParam] = if params.is_null() || n == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(params, n)
+    };
+    let bindings: Vec<rusqlite::types::Value> = param_slice
+        .iter()
+        .map(|p| param_to_sqlite(p, plan_id.0))
+        .collect();
+
+    // Fire the prepared statement for effect under one pool guard.
+    let conn_guard = db_connections().lock().expect("conn map poisoned");
+    let conn = conn_guard
+        .get(&path)
+        .expect("connection inserted by ensure_connection");
+    let mut stmt = match conn.prepare_cached(&sql) {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("coddl: exec: prepare failed for plan {}: {err}", plan_id.0);
+            std::process::abort();
+        }
+    };
+    match stmt.execute(params_from_iter(bindings.iter())) {
+        Ok(_) => CoddlStatus::Ok,
+        Err(err) => {
+            eprintln!("coddl: exec: execution failed for plan {}: {err}", plan_id.0);
+            std::process::abort();
+        }
+    }
+}
+
 /// Lower one [`CoddlParam`] to an owned rusqlite bind value. Boolean binds as
 /// the 0/1 integer SQLite stores it as; Text copies its bytes so the bound
 /// value owns them. Aborts on an unsupported kind or non-UTF-8 Text.
@@ -899,12 +1046,98 @@ mod tests {
     }
 
     #[test]
-    fn tx_externs_are_no_ops_returning_ok() {
+    fn coddl_exec_and_transactions_round_trip() {
+        // The sole test that drives the process-global transaction-depth
+        // counter (serialized by `test_guard`); it exercises `coddl_exec`
+        // (DELETE), read-after-write on the shared connection, ROLLBACK
+        // restoring rows, and COMMIT persisting them.
+        use crate::rc::{coddl_rc_release, CoddlRcHeader};
+        use rusqlite::params;
+
+        let _g = test_guard();
+        let (_tmp, path_str) = seed_two_row_greetings();
+        let attrs = greetings_attrs();
+        let desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 24,
+            attrs: attrs.as_ptr(),
+        };
+        let db = b"greetings";
+        let select_sql = br#"SELECT "id", "message" FROM "greetings""#;
+        let delete_sql = br#"DELETE FROM "greetings" WHERE "id" = ?"#;
+
+        // The number of rows a fresh read returns.
+        let read_len = |plan: u32| -> usize {
+            unsafe {
+                let rel = coddl_query(PlanId(plan), ptr::null(), 0);
+                assert!(!rel.is_null());
+                let header = &*(rel.sub(crate::rc::HEADER_SIZE) as *const CoddlRcHeader);
+                let len = header.length as usize;
+                coddl_rc_release(rel);
+                len
+            }
+        };
+
         unsafe {
+            assert_eq!(
+                coddl_register_database(db.as_ptr(), db.len(), path_str.as_ptr(), path_str.len()),
+                CoddlStatus::Ok
+            );
+            // Plan 0: read-all. Plan 1: surgical DELETE of one row.
+            assert_eq!(
+                coddl_register_plan(
+                    PlanId(0),
+                    db.as_ptr(),
+                    db.len(),
+                    select_sql.as_ptr(),
+                    select_sql.len(),
+                    0,
+                    &desc,
+                ),
+                CoddlStatus::Ok
+            );
+            assert_eq!(
+                coddl_register_plan(
+                    PlanId(1),
+                    db.as_ptr(),
+                    db.len(),
+                    delete_sql.as_ptr(),
+                    delete_sql.len(),
+                    1,
+                    &desc,
+                ),
+                CoddlStatus::Ok
+            );
+
+            let id1 = CoddlParam {
+                i: 1,
+                ptr: ptr::null(),
+                len: 0,
+                kind: CoddlAttrKind::Integer as u32,
+            };
+
+            // ── DELETE then read-after-write, then ROLLBACK ──
             assert_eq!(coddl_begin_tx(), CoddlStatus::Ok);
-            assert_eq!(coddl_commit_tx(), CoddlStatus::Ok);
+            assert_eq!(read_len(0), 2, "two rows before delete");
+            assert_eq!(coddl_exec(PlanId(1), &id1, 1), CoddlStatus::Ok);
+            assert_eq!(read_len(0), 1, "read-after-write sees the delete");
             assert_eq!(coddl_rollback_tx(), CoddlStatus::Ok);
+
+            // ── ROLLBACK restored the row; a second tx COMMITs the delete ──
+            assert_eq!(coddl_begin_tx(), CoddlStatus::Ok);
+            assert_eq!(read_len(0), 2, "rollback restored the deleted row");
+            assert_eq!(coddl_exec(PlanId(1), &id1, 1), CoddlStatus::Ok);
+            assert_eq!(coddl_commit_tx(), CoddlStatus::Ok);
+
+            shutdown_storage();
         }
+
+        // The COMMIT persisted: a fresh connection sees exactly one row.
+        let conn = Connection::open(&path_str).unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM greetings", params![], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1, "commit persisted the delete");
     }
 
     #[test]

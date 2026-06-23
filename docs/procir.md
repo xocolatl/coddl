@@ -110,6 +110,7 @@ Key invariants the lowering pass and the backends both rely on:
 | `RegisterDatabase`   | —                                                                          | —                     | Bind the logical database to its env-resolved connection path so `Query` can reach it. Backend resolves `CODDL_<DB>_FILE` (env override → baked default) via `coddl_resolve_op_field`, then calls `coddl_register_database(name, path)` reading `Module::db_name` / `db_path_default`. Emitted once in `main`'s prologue when the module pushed any plan. |
 | `RegisterPlan`       | `plan_id: u32`                                                             | —                     | Register one baked plan (looked up by id in `Module::plans`). Backend calls `coddl_register_plan(plan_id, db_name, sql, param_count, &@.heading.<result>)`. Emitted once per `Module::plans` entry in `main`'s prologue, after `RegisterDatabase`. |
 | `Query`              | `plan_id: u32`, `params: Vec<(ValueId, ProcType)>`, `heading_id: HeadingId` | `dst: ValueId`       | Execute a registered plan, fire-on-call (the lazy force point), and bind the returned sealed `Relation` (rc=1) to `dst`. Backend builds a `CoddlParam` array from the bound params (each param's `ProcType` selects the kind tag + value/ptr field) and calls `coddl_query(plan_id, params, n)`. `dst` carries `ProcType::Relation(heading_id)` — the plan's result heading. |
+| `Dml`                | `plan_id: u32`, `params: Vec<(ValueId, ProcType)>`                          | —                     | Execute a registered **DML** plan (`DELETE`/`INSERT`/`UPDATE`) for effect only — no result bound. Same `CoddlParam` marshaling as `Query`, but the backend calls `coddl_exec(plan_id, params, n)` (which runs `execute`, not `query`) and discards the returned status. Fires inside the enclosing `transaction [...]`'s begin/commit pair. |
 
 ## Terminator table
 
@@ -194,14 +195,19 @@ either side.
 
 ## Lowering diagnostics
 
-The lowering pass is currently *infallible* on a diagnostic-free
-typecheck — every reachable case has a deterministic mapping, and
-typechecker-impossible cases reach `unreachable!()`. No `L####`
-codes exist today.
+Most lowering is *infallible* on a diagnostic-free typecheck — every
+reachable case has a deterministic mapping, and typechecker-impossible
+cases reach `unreachable!()`. The exceptions are checks that need
+information only the lowering layer has (a relvar's `WritePolicy`, an RHS
+`RelExpr`'s pushable shape, a `where`-predicate's captures). These reuse
+the `T####` typecheck namespace (full descriptions in
+[typecheck.md](typecheck.md)) rather than minting `L####` codes:
 
 | Code  | Trigger |
 |-------|---------|
-| _(none yet)_ | |
+| T0022 | a `where`-predicate captures an identifier from an outer scope (not yet supported) |
+| T0049 | assignment to a public relvar has an RHS shape the backend cannot emit as surgical DML |
+| T0050 | assignment target is a public relvar mapped to a non-writable view |
 
-The `L####` namespace is reserved. Codes appear here in the same
-commit that emits them.
+The `L####` namespace is reserved for lowering-specific codes; none
+exist yet.

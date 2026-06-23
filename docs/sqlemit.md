@@ -27,7 +27,7 @@ These are not optimizations; they're correctness requirements imposed by TTM's P
 | Outer joins are forbidden in lowered SQL. Coddl source has no construct that compiles to one; the type system can't express "this attribute might not have a value" as an attribute property. | RM Pro 4. |
 | Joins name their key explicitly: `INNER JOIN … USING (k, …)` over the shared attributes the **typechecker** computed; disjoint headings (`times`) emit `CROSS JOIN`. Never `NATURAL JOIN`. | The `.cddb`, not the live schema, is the source of truth; see the note below. |
 | Aggregates: wrap to honor identity (OO Pre 6). Emit `COALESCE(SUM(x), 0)`, `COALESCE(MAX(x), CAST(<lowest> AS T))`, etc. AVG over empty is undefined — emit a guarded expression that signals an error if the result would be queried. | OO Pre 6. |
-| Relational assignment `R := expr` compiles inside a transaction to `DELETE FROM R; INSERT INTO R (…) SELECT … FROM (…)` (or `TRUNCATE` + `INSERT` on Postgres). Single-tuple INSERT/UPDATE/DELETE in source desugars to a relational-assignment expression first; the backend never sees the singular form. | RM Pre 21, RM Pro 7. |
+| Relational assignment `R := expr` is the write primitive. The backend **recognizes the RHS `RelExpr` shape** and emits the surgical equivalent (`DELETE` / `INSERT` / `UPDATE` / whole-table delete), falling back to replace-all (`DELETE FROM R; INSERT INTO R (…) SELECT … FROM (…)`) for an unrecognized shape — never hydrating the relvar. Single-tuple `INSERT`/`UPDATE`/`DELETE` in source desugars to a relational-assignment expression first; the backend never sees the singular form. See [Surgical writes](#surgical-writes-assignment-rhs-recognition) below. | RM Pre 21, RM Pro 7. |
 | Always emit explicit `BEGIN` / `COMMIT`. Never rely on SQL's implicit transaction start. Set constraints `IMMEDIATE` at session start; never `INITIALLY DEFERRED`. | OO Pre 4; RM Pre 23 (statement-boundary check). |
 | Avoid SQL `CHARACTER` / `CHAR(n)` entirely; use `VARCHAR`/`TEXT`. SQL's `CHAR` pads with trailing blanks under equality — violates RM Pre 8. | RM Pre 8. |
 | Every base table emitted from a relvar has a `PRIMARY KEY` from the relvar's declared candidate key (RM Pre 15). The candidate key with the fewest attributes wins ties; the rest become `UNIQUE`. The compiler verifies minimality before emission. | RM Pre 15. |
@@ -73,6 +73,32 @@ In every drift case the two handle differently, `USING` either stays correct or 
 ### `wrap` / `unwrap`: flat leaf columns, nesting in the descriptor
 
 `wrap`/`unwrap` are pure **heading** restructures — they group attributes into a tuple-valued attribute (an inline nested cell — see [runtime.md](runtime.md)) or expand one — but the underlying SQL columns are always the flat **leaf** columns. SQLite has no composite column, so a pushed wrap emits no `$`-mangled aliases and no `JSON`: it selects the plain leaf columns, and the nesting lives entirely in the **result descriptor** (which the runtime reconstructs at materialization). `resolve` passes a `Wrap`/`Unwrap` straight through to its input (the `attr → column` map is keyed by the stable leaf names; the restructure changes only `expr.heading()`). `emit_select`'s column-list builder then **flattens** each `Tuple` attribute of the result heading to its component leaf columns, recursing depth-first in the sub-heading's canonical order — which is exactly `record_layout`'s leaf order, so the runtime's positional column→cell mapping reconstructs the inline nested cell. Net SQL for `Greetings wrap { t: {id, message} }`: `SELECT DISTINCT "id", "message" FROM "greetings"` — the wrap is invisible in the SQL; the result heading `{t: Tuple{id, message}}` and its (nested) descriptor carry it. A `wrap … unwrap` round-trip pushes as the plain flat select of the surviving columns.
+
+### Surgical writes: assignment-RHS recognition
+
+`emit_assignment(target, rhs, dialect)` turns a relational assignment to a
+public **base** relvar into surgical DML by recognizing the RHS `RelExpr`
+shape — the relvar is never read into the process and written back. `target` is
+the assignment LHS lowered to its `RelvarRef`. The recognized shapes and their
+emitted SQL:
+
+| RHS `RelExpr` shape | Emitted SQL |
+|---|---|
+| `Minus{ RelvarRef(t), Restrict*(RelvarRef(t), preds) }` | `DELETE FROM t WHERE <preds>` |
+| `Minus{ RelvarRef(t), RelvarRef(t) }` (self-subtraction) | `DELETE FROM t` (whole-table delete) |
+
+Both delegate to a shared `emit_delete` on the `minus` subtrahend, which bottoms
+out in the target base relvar; the `WHERE` reuses the same `(column, literal)`
+collection a `SELECT … WHERE` builds for the equivalent restriction, so a delete
+predicate is byte-identical to the matching read predicate. Any other shape is
+declined — the lowerer surfaces a "not a supported write shape" diagnostic
+(T0049). The recognition set will grow to cover anti-join `DELETE` against
+another relvar, `INSERT` from a `union`, `UPDATE` from a restricted replace
+chain, and the replace-all fallback.
+
+The recognized assignment is registered as a DML plan and fired by the runtime's
+`coddl_exec` (the write sibling of `coddl_query`) inside the enclosing
+transaction's `BEGIN`/`COMMIT` (see [storage.md](storage.md)).
 
 ## Dialect surface
 

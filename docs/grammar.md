@@ -418,8 +418,10 @@ function that implements it.
 <assign-stmt>   ::= <expr> ':=' <expr> ';' ;                   -- parse_stmt (ASSIGN_STMT)
                     -- Relational assignment. The parser accepts any
                     -- expression as the target (LHS); the typechecker
-                    -- restricts it to a name bound to a private relvar
-                    -- (T0033 otherwise; public relvars are read-only in v1).
+                    -- restricts it to a name bound to an assignable relvar
+                    -- (public or private; T0033 otherwise). A public target
+                    -- is a write to its SQL table — the RHS shape is recognized
+                    -- and emitted as surgical DML at lowering.
 <let-stmt>      ::= 'let' <identifier> [ ':' <type-ref> ]
                     '=' <expr> ';' ;                           -- parse_let_stmt
 

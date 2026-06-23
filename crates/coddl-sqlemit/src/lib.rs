@@ -211,6 +211,90 @@ fn emit_tclose(input: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
     })
 }
 
+/// Emit a surgical `DELETE` for the subtrahend of a recognized relational
+/// assignment (see [`emit_assignment`]). Not a public entry point — it is the
+/// shared body of both DELETE-family arms.
+///
+/// `expr` is the subtrahend — a `RelvarRef`, optionally wrapped in `Restrict`
+/// layers (the `where` predicate). It must bottom out in a single base relvar:
+/// a composed FROM (a `Project`/`Rename`/`And`/set-op) is not a surgical DELETE
+/// target, so this declines. The predicate reuses `resolve`'s
+/// `(column, literal)` collection, so the WHERE is identical to the one a
+/// `SELECT … WHERE` would emit for the same restriction. A bare `RelvarRef`
+/// (the self-truncate arm) emits no WHERE.
+fn emit_delete(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
+    if delete_base_table(expr).is_none() {
+        return Err(BackendError::Other(
+            "delete operand does not resolve to a single base relvar".to_string(),
+        ));
+    }
+    let mut wheres: Vec<(String, Literal)> = Vec::new();
+    let (from_clause, _cols) = resolve(expr, &mut wheres)?;
+    let mut params: Vec<Value> = Vec::new();
+    let where_sql = render_where_clause(&wheres, dialect, 0, &mut params);
+    let text = format!("DELETE FROM {from_clause}{where_sql}");
+    let plan_id = PlanId(fnv1a(dialect, &text));
+    Ok(SqlQuery {
+        sql: SqlString {
+            param_count: params.len() as u32,
+            text,
+        },
+        params,
+        // Unused for DML (no rows returned), but the operand heading is the
+        // honest descriptor of what was matched.
+        result_heading: expr.heading(),
+        plan_id,
+    })
+}
+
+/// Emit surgical DML for a relational assignment `t := <rhs>` to a public base
+/// relvar, by recognizing the RHS [`RelExpr`] shape. `target` is the assignment
+/// LHS lowered to its `RelvarRef`; `rhs` is the lowered RHS. Relational
+/// assignment is the write primitive (RM Pre 21); the surgical equivalent is
+/// shape-recognition on the RHS rather than a hydrate-mutate-writeback.
+///
+/// Two DELETE-family shapes are recognized — both delegate to [`emit_delete`]
+/// on the subtrahend, which bottoms out in the same base relvar:
+/// - `t := t minus (t where p…)` → `DELETE FROM t WHERE p…`
+/// - `t := t minus t` (self-subtraction) → `DELETE FROM t` (truncate)
+///
+/// Any other shape is declined with `Err`.
+pub fn emit_assignment(target: &RelExpr, rhs: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
+    let RelExpr::RelvarRef { table_name: t, .. } = target else {
+        return Err(BackendError::Other(
+            "assignment target does not resolve to a base relvar".to_string(),
+        ));
+    };
+    match rhs {
+        // `t := t minus <subtrahend>` where the minuend is the bare target
+        // relvar and the subtrahend bottoms out in that same relvar (a
+        // `where`-restriction, or the bare relvar for a self-truncate) → delete
+        // exactly the subtrahend's rows.
+        RelExpr::Minus {
+            lhs,
+            rhs: subtrahend,
+        } if matches!(lhs.as_ref(), RelExpr::RelvarRef { table_name, .. } if table_name == t)
+            && delete_base_table(subtrahend) == Some(t.as_str()) =>
+        {
+            emit_delete(subtrahend, dialect)
+        }
+        _ => Err(BackendError::Other(
+            "unrecognized assignment RHS shape (not a delete or self-truncate)".to_string(),
+        )),
+    }
+}
+
+/// The base relvar a DELETE subtrahend targets — `RelvarRef`, optionally under
+/// `Restrict` layers. `None` for any other shape (`Project`/`Rename`/`And`/
+/// set-op), which is not a surgical single-table DELETE.
+fn delete_base_table(expr: &RelExpr) -> Option<&str> {
+    match expr {
+        RelExpr::RelvarRef { table_name, .. } => Some(table_name),
+        RelExpr::Restrict { input, .. } => delete_base_table(input),
+        _ => None,
+    }
+}
+
 /// `emit_select` with a bind-parameter start offset, threaded so a set-op's
 /// right operand numbers its Postgres `$N` placeholders after the left's. The
 /// public entry passes `0`.
@@ -360,19 +444,7 @@ fn emit_select_offset(expr: &RelExpr, dialect: Dialect, param_offset: u32) -> Re
     // predicate was resolved to its physical column at its own level in the
     // tree (so a `where` above a `rename` resolves through the rename).
     let mut params: Vec<Value> = Vec::new();
-    if !wheres.is_empty() {
-        let mut conjuncts = Vec::with_capacity(wheres.len());
-        for (col, value) in &wheres {
-            let placeholder = match dialect {
-                Dialect::SQLite => "?".to_string(),
-                Dialect::Postgres => format!("${}", param_offset as usize + params.len() + 1),
-            };
-            conjuncts.push(format!("{} = {placeholder}", quote_ident(col)));
-            params.push(Value::from(value.clone()));
-        }
-        text.push_str(" WHERE ");
-        text.push_str(&conjuncts.join(" AND "));
-    }
+    text.push_str(&render_where_clause(&wheres, dialect, param_offset, &mut params));
 
     let plan_id = PlanId(fnv1a(dialect, &text));
     Ok(SqlQuery {
@@ -554,6 +626,33 @@ fn column_for<'a>(columns: &'a [(String, String)], attr: &str) -> Result<&'a str
 /// the sub-heading's canonical (name-sorted) order. This matches `record_layout`'s
 /// leaf order, so the runtime's positional column→cell mapping reconstructs the
 /// inline nested cell.
+/// Render a `WHERE col = ? AND …` clause (leading space included) from the
+/// collected `(column, literal)` equality tests, appending each bind value to
+/// `params`. `param_offset` is the Postgres `$N` base (SQLite uses `?` and
+/// ignores it). Returns the empty string when there are no tests — so a
+/// caller can unconditionally append the result. Shared by `emit_select_offset`
+/// (SELECT) and `emit_delete` (DELETE); the conjunction shape is identical.
+fn render_where_clause(
+    wheres: &[(String, Literal)],
+    dialect: Dialect,
+    param_offset: u32,
+    params: &mut Vec<Value>,
+) -> String {
+    if wheres.is_empty() {
+        return String::new();
+    }
+    let mut conjuncts = Vec::with_capacity(wheres.len());
+    for (col, value) in wheres {
+        let placeholder = match dialect {
+            Dialect::SQLite => "?".to_string(),
+            Dialect::Postgres => format!("${}", param_offset as usize + params.len() + 1),
+        };
+        conjuncts.push(format!("{} = {placeholder}", quote_ident(col)));
+        params.push(Value::from(value.clone()));
+    }
+    format!(" WHERE {}", conjuncts.join(" AND "))
+}
+
 fn push_leaf_cols(
     attr: &str,
     ty: &Type,
@@ -724,6 +823,76 @@ mod tests {
         assert_eq!(q.sql.text, r#"SELECT "id", "message" FROM "greetings""#);
         assert_eq!(q.sql.param_count, 0);
         assert!(q.params.is_empty());
+    }
+
+    /// `t := t minus <subtrahend>` builder — the shape `emit_assignment`
+    /// recognizes. `minuend` is always the bare target relvar.
+    fn minus(minuend: RelExpr, subtrahend: RelExpr) -> RelExpr {
+        RelExpr::Minus {
+            lhs: Box::new(minuend),
+            rhs: Box::new(subtrahend),
+        }
+    }
+
+    #[test]
+    fn assignment_minus_where_emits_surgical_delete_sqlite() {
+        // `Greetings := Greetings minus (Greetings where id = 1)` → a single-row
+        // DELETE; the WHERE is identical to the one `SELECT … WHERE` builds for
+        // the same restriction.
+        let rhs = minus(greetings(), where_id_1(greetings()));
+        let q = emit_assignment(&greetings(), &rhs, Dialect::SQLite).unwrap();
+        assert_eq!(q.sql.text, r#"DELETE FROM "greetings" WHERE "id" = ?"#);
+        assert_eq!(q.sql.param_count, 1);
+        assert_eq!(q.params, vec![Value::Integer(1)]);
+    }
+
+    #[test]
+    fn assignment_minus_where_uses_postgres_placeholder() {
+        let rhs = minus(greetings(), where_id_1(greetings()));
+        let q = emit_assignment(&greetings(), &rhs, Dialect::Postgres).unwrap();
+        assert_eq!(q.sql.text, r#"DELETE FROM "greetings" WHERE "id" = $1"#);
+        assert_eq!(q.sql.param_count, 1);
+    }
+
+    #[test]
+    fn assignment_self_subtraction_truncates() {
+        // `Greetings := Greetings minus Greetings` → DELETE every row.
+        let rhs = minus(greetings(), greetings());
+        let q = emit_assignment(&greetings(), &rhs, Dialect::SQLite).unwrap();
+        assert_eq!(q.sql.text, r#"DELETE FROM "greetings""#);
+        assert_eq!(q.sql.param_count, 0);
+        assert!(q.params.is_empty());
+    }
+
+    #[test]
+    fn assignment_declines_unrecognized_rhs() {
+        // Only the two DELETE-family shapes are recognized; a `union` RHS (an
+        // insert) is not, so it declines here.
+        let rhs = RelExpr::Or {
+            lhs: Box::new(greetings()),
+            rhs: Box::new(greetings()),
+        };
+        assert!(emit_assignment(&greetings(), &rhs, Dialect::SQLite).is_err());
+    }
+
+    #[test]
+    fn assignment_declines_minus_against_other_relvar() {
+        // The minuend must be the *target* relvar. `Greetings := Greetings minus
+        // Employees` is an anti-join delete (not recognized here).
+        let rhs = minus(greetings(), employees());
+        assert!(emit_assignment(&greetings(), &rhs, Dialect::SQLite).is_err());
+    }
+
+    #[test]
+    fn assignment_declines_non_relvar_target() {
+        // A composed target (not a single base table) can never be a surgical
+        // write target.
+        let target = RelExpr::And {
+            lhs: Box::new(greetings()),
+            rhs: Box::new(employees()),
+        };
+        let rhs = minus(greetings(), where_id_1(greetings()));
+        assert!(emit_assignment(&target, &rhs, Dialect::SQLite).is_err());
     }
 
     fn employees() -> RelExpr {

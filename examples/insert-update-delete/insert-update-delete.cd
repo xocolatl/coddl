@@ -1,0 +1,25 @@
+// insert-update-delete.cd
+//
+// Writing a relvar, in process. The twin of insert-update-delete-db.cd: the
+// same algebra (assignment is the write primitive — the right-hand side's shape
+// is the operation), but here Greetings is a private in-memory relvar seeded
+// from a relation literal instead of a SQL-backed table.
+//
+// Run:  coddl run insert-update-delete.cd
+
+program insert_update_delete;
+
+private relvar Greetings { id: Integer, message: Text } key { id };
+
+oper main {} [
+    Greetings := Relation {
+        { id: 1, message: "hello world" },
+        { id: 2, message: "goodbye" },
+        { id: 3, message: "farewell" },
+    };
+    write_relation { rel: Greetings };
+
+    // Remove one tuple: the rows of Greetings except the one with id 1.
+    Greetings := Greetings minus (Greetings where id = 1);
+    write_relation { rel: Greetings };
+];

@@ -315,8 +315,9 @@ impl Emitter {
     }
 
     /// Declare the SQL-pushdown runtime externs: database/plan registration
-    /// (program prologue) and `coddl_query` (the lazy force point). Emitted
-    /// only when the module pushed at least one plan.
+    /// (program prologue), `coddl_query` (the lazy read force point), and
+    /// `coddl_exec` (the DML force point). Emitted only when the module pushed
+    /// at least one plan.
     fn emit_runtime_plan_externs(&mut self) {
         writeln!(
             self.body,
@@ -329,6 +330,7 @@ impl Emitter {
         )
         .unwrap();
         writeln!(self.body, "declare ptr @coddl_query(i32, ptr, i64)").unwrap();
+        writeln!(self.body, "declare i32 @coddl_exec(i32, ptr, i64)").unwrap();
     }
 
     /// Emit the static byte constants the pushdown prologue references: the
@@ -885,6 +887,7 @@ impl Emitter {
                 params,
                 heading_id,
             } => self.lower_query(*dst, *plan_id, params, *heading_id),
+            Inst::Dml { plan_id, params } => self.lower_dml(*plan_id, params),
         }
     }
 
@@ -929,6 +932,61 @@ impl Emitter {
         Ok(())
     }
 
+    /// Build the `CoddlParam` array on the stack for a `query`/`exec` call and
+    /// return the `ptr` argument string (`ptr null` when there are no params).
+    /// `CoddlParam` is `{ i64 i, ptr, i64 len, i32 kind }` (32-byte stride; the
+    /// runtime owns this layout). Shared by `lower_query` and `lower_dml`.
+    fn build_coddl_param_array(
+        &mut self,
+        params: &[(ValueId, ProcType)],
+    ) -> Result<String, LlvmEmitError> {
+        let n = params.len();
+        if n == 0 {
+            return Ok("ptr null".to_string());
+        }
+        let arr = format!("%qparams.{}", self.next_str);
+        self.next_str += 1;
+        writeln!(
+            self.body,
+            "    {arr} = alloca [{n} x {{ i64, ptr, i64, i32 }}], align 8"
+        )
+        .unwrap();
+        for (i, (vid, ty)) in params.iter().enumerate() {
+            let base = i * 32;
+            let kind = kind_tag_for(ty)?;
+            match ty {
+                ProcType::Integer => {
+                    let op = self.scalar_op(vid)?;
+                    let slot = self.gep_byte(&arr, base);
+                    writeln!(self.body, "    store i64 {op}, ptr {slot}").unwrap();
+                }
+                ProcType::Boolean => {
+                    let op = self.scalar_op(vid)?;
+                    let z = format!("%qb.{}", self.next_str);
+                    self.next_str += 1;
+                    writeln!(self.body, "    {z} = zext i1 {op} to i64").unwrap();
+                    let slot = self.gep_byte(&arr, base);
+                    writeln!(self.body, "    store i64 {z}, ptr {slot}").unwrap();
+                }
+                ProcType::Text => {
+                    let (ptr_op, len_op) = self.text_ops(vid)?;
+                    let ptr_slot = self.gep_byte(&arr, base + 8);
+                    let len_slot = self.gep_byte(&arr, base + 16);
+                    writeln!(self.body, "    store ptr {ptr_op}, ptr {ptr_slot}").unwrap();
+                    writeln!(self.body, "    store i64 {len_op}, ptr {len_slot}").unwrap();
+                }
+                other => {
+                    return Err(LlvmEmitError::UnsupportedInst(format!(
+                        "query bind param of type {other:?} not supported"
+                    )));
+                }
+            }
+            let kind_slot = self.gep_byte(&arr, base + 24);
+            writeln!(self.body, "    store i32 {kind}, ptr {kind_slot}").unwrap();
+        }
+        Ok(format!("ptr {arr}"))
+    }
+
     /// Execute a registered plan: build the `CoddlParam` array on the stack,
     /// call `coddl_query`, and bind the returned relation pointer to `dst`.
     fn lower_query(
@@ -940,53 +998,7 @@ impl Emitter {
     ) -> Result<(), LlvmEmitError> {
         let n = params.len();
         let dst_name = format!("%v{}", dst.0);
-        let params_arg = if n == 0 {
-            "ptr null".to_string()
-        } else {
-            // `CoddlParam` is `{ i64 i, ptr, i64 len, i32 kind }` (32-byte
-            // stride; the runtime owns this layout).
-            let arr = format!("%qparams.{}", self.next_str);
-            self.next_str += 1;
-            writeln!(
-                self.body,
-                "    {arr} = alloca [{n} x {{ i64, ptr, i64, i32 }}], align 8"
-            )
-            .unwrap();
-            for (i, (vid, ty)) in params.iter().enumerate() {
-                let base = i * 32;
-                let kind = kind_tag_for(ty)?;
-                match ty {
-                    ProcType::Integer => {
-                        let op = self.scalar_op(vid)?;
-                        let slot = self.gep_byte(&arr, base);
-                        writeln!(self.body, "    store i64 {op}, ptr {slot}").unwrap();
-                    }
-                    ProcType::Boolean => {
-                        let op = self.scalar_op(vid)?;
-                        let z = format!("%qb.{}", self.next_str);
-                        self.next_str += 1;
-                        writeln!(self.body, "    {z} = zext i1 {op} to i64").unwrap();
-                        let slot = self.gep_byte(&arr, base);
-                        writeln!(self.body, "    store i64 {z}, ptr {slot}").unwrap();
-                    }
-                    ProcType::Text => {
-                        let (ptr_op, len_op) = self.text_ops(vid)?;
-                        let ptr_slot = self.gep_byte(&arr, base + 8);
-                        let len_slot = self.gep_byte(&arr, base + 16);
-                        writeln!(self.body, "    store ptr {ptr_op}, ptr {ptr_slot}").unwrap();
-                        writeln!(self.body, "    store i64 {len_op}, ptr {len_slot}").unwrap();
-                    }
-                    other => {
-                        return Err(LlvmEmitError::UnsupportedInst(format!(
-                            "query bind param of type {other:?} not supported"
-                        )));
-                    }
-                }
-                let kind_slot = self.gep_byte(&arr, base + 24);
-                writeln!(self.body, "    store i32 {kind}, ptr {kind_slot}").unwrap();
-            }
-            format!("ptr {arr}")
-        };
+        let params_arg = self.build_coddl_param_array(params)?;
         writeln!(
             self.body,
             "    {dst_name} = call ptr @coddl_query(i32 {plan_id}, {params_arg}, i64 {n})"
@@ -999,6 +1011,26 @@ impl Emitter {
                 op: dst_name,
             },
         );
+        Ok(())
+    }
+
+    /// Execute a registered DML plan for effect: build the `CoddlParam` array
+    /// and call `coddl_exec`. No result is bound (DML returns no rows); the
+    /// `CoddlStatus` is discarded (the runtime aborts on a hard failure).
+    fn lower_dml(
+        &mut self,
+        plan_id: u32,
+        params: &[(ValueId, ProcType)],
+    ) -> Result<(), LlvmEmitError> {
+        let n = params.len();
+        let params_arg = self.build_coddl_param_array(params)?;
+        let status = format!("%v_dml_status.{}", self.next_str);
+        self.next_str += 1;
+        writeln!(
+            self.body,
+            "    {status} = call i32 @coddl_exec(i32 {plan_id}, {params_arg}, i64 {n})"
+        )
+        .unwrap();
         Ok(())
     }
 

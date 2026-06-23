@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 
 use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{
-    AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, Expr, ExprStmt, ExtendExpr,
-    FieldAccess, Heading as AstHeading, Item, KeyClause, LetStmt, NamedArg, OperDecl,
+    AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, Expr, ExprStmt,
+    ExtendExpr, FieldAccess, Heading as AstHeading, Item, KeyClause, LetStmt, NamedArg, OperDecl,
     PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr,
     ReplaceExpr, Root, Stmt, TcloseExpr, TransactionExpr, TupleLit, UnaryExpr, UnaryOp, UnwrapExpr,
     WrapExpr,
@@ -687,9 +687,14 @@ impl TypeChecker {
         }
     }
 
-    /// Check a relational assignment `R := <expr>;`. The target must be a
-    /// bare name bound to a *private* relvar (public relvars are read-only in
-    /// v1); the RHS must be a relation whose heading matches the relvar's.
+    /// Check a relational assignment `R := <expr>;`. The target must be a bare
+    /// name bound to a public or private relvar; the RHS must be a relation
+    /// whose heading matches the relvar's. A **private** target stores into an
+    /// in-memory slot; a **public** target is a write to its SQL-backed table —
+    /// the RHS shape is recognized and emitted as surgical DML at lowering,
+    /// which is where a non-writable view (T0050) or an unsupported RHS shape
+    /// (T0049) is caught. A public-relvar reference forces a transaction
+    /// (T0025) via the (self-referencing) RHS, checked below.
     fn check_assignment_stmt(&mut self, stmt: &AssignStmt, scope: &mut Scope) {
         // Check the RHS first so its own diagnostics surface regardless of
         // the target's validity.
@@ -704,33 +709,25 @@ impl TypeChecker {
                 .target()
                 .map(|t| self.node_span(t.syntax()))
                 .unwrap_or_else(|| self.node_span(stmt.syntax()));
-            self.error(span, "T0033", "assignment target must be a private relvar name");
+            self.error(span, "T0033", "assignment target must be a relvar name");
             return;
         };
         let Some(ident) = target.ident() else { return };
         let name = ident.text();
 
-        // … bound to a private relvar.
-        let lookup = self
-            .relvars
-            .get(name)
-            .map(|i| (matches!(i.kind, RelvarKind::Private), i.heading.clone()));
-        let Some((is_private, heading)) = lookup else {
+        // … bound to an assignable relvar (public or private).
+        let lookup = self.relvars.get(name).and_then(|i| {
+            matches!(i.kind, RelvarKind::Public | RelvarKind::Private)
+                .then(|| i.heading.clone())
+        });
+        let Some(heading) = lookup else {
             self.error(
                 self.token_span(&ident),
                 "T0033",
-                format!("cannot assign to `{name}`: not an assignable (private) relvar"),
+                format!("cannot assign to `{name}`: not an assignable relvar"),
             );
             return;
         };
-        if !is_private {
-            self.error(
-                self.token_span(&ident),
-                "T0033",
-                format!("cannot assign to `{name}`: only private relvars are assignable (public relvars are read-only in v1)"),
-            );
-            return;
-        }
         scope.mark_used(name);
 
         // The RHS heading must match the relvar's.
@@ -2401,11 +2398,33 @@ mod tests {
     }
 
     #[test]
-    fn assignment_to_public_relvar_diagnoses_t0033() {
-        // Public relvars are read-only in v1.
-        let src = "program p; public relvar R { a: Integer } key { a }; \
-                   oper main {} [ R := Relation { {a: 1} }; ];";
-        assert!(codes(src).contains(&"T0033"), "{:?}", codes(src));
+    fn assignment_to_public_relvar_is_an_allowed_target() {
+        // A public relvar is a write target now (surgical DML at lowering); a
+        // recognized self-referencing shape inside a transaction typechecks
+        // clean. (Whether the RHS shape is *emittable* is a lowering concern.)
+        let src = "program p; database greetings; \
+                   public relvar R { a: Integer } key { a }; \
+                   oper main {} [ transaction [ R := R minus (R where a = 1); ] ];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn assignment_to_public_relvar_outside_transaction_diagnoses_t0025() {
+        // The self-referencing RHS references the public relvar, so the
+        // transaction-scope rule still fires outside any `transaction [...]`.
+        let src = "program p; database greetings; \
+                   public relvar R { a: Integer } key { a }; \
+                   oper main {} [ R := R minus (R where a = 1); ];";
+        assert!(codes(src).contains(&"T0025"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn assignment_to_public_relvar_heading_mismatch_diagnoses_t0034() {
+        // Heading-match still applies to a public target.
+        let src = "program p; database greetings; \
+                   public relvar R { a: Integer, b: Text } key { a }; \
+                   oper main {} [ transaction [ R := Relation { {a: 1} }; ] ];";
+        assert!(codes(src).contains(&"T0034"), "{:?}", codes(src));
     }
 
     #[test]

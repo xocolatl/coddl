@@ -472,6 +472,17 @@ pub enum Inst {
         params: Vec<(ValueId, ProcType)>,
         heading_id: HeadingId,
     },
+    /// Execute a registered **DML** plan (a `DELETE`/`INSERT`/`UPDATE`) with the
+    /// given bind parameters, for its effect only — no result is bound. Like
+    /// [`Inst::Query`] it fires at this point (inside the enclosing
+    /// `transaction [...]`'s begin/commit pair), and each param pairs the bind
+    /// SSA value with its scalar `ProcType`. Backends build a `CoddlParam` array
+    /// and call `coddl_exec`. The plan's registered result heading is unused
+    /// (DML returns no rows).
+    Dml {
+        plan_id: u32,
+        params: Vec<(ValueId, ProcType)>,
+    },
 }
 
 /// Scalar binary operator kinds. The comparison ops (`Eq`…`GtEq`) and the
@@ -801,6 +812,16 @@ impl fmt::Display for Inst {
                 heading_id,
             } => {
                 write!(f, "{dst} = query plan_{plan_id} heading_{} (", heading_id.0)?;
+                for (i, (v, _ty)) in params.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{v}")?;
+                }
+                f.write_str(")")
+            }
+            Inst::Dml { plan_id, params } => {
+                write!(f, "dml plan_{plan_id} (")?;
                 for (i, (v, _ty)) in params.iter().enumerate() {
                     if i > 0 {
                         f.write_str(", ")?;

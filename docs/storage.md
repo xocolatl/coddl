@@ -1,6 +1,6 @@
 # Storage abstraction
 
-Coddl talks to persistent storage through a pair of Rust traits — `Backend` (pure, SQL-emitting half) and `Conn` (effectful, connection half) — so that the rest of the compiler stays backend-agnostic. SQLite is v1 (read-only public relvars hydrated at startup, no-op transactions); Postgres lands later.
+Coddl talks to persistent storage through a pair of Rust traits — `Backend` (pure, SQL-emitting half) and `Conn` (effectful, connection half) — so that the rest of the compiler stays backend-agnostic. SQLite is v1 (public relvars pushed/read through the connection, base relvars writable via surgical DML, real transactions); Postgres lands later.
 
 This doc covers the **abstraction** (the traits, the design rationale, the `database` declaration) and the **concrete v1 SQLite implementation** (Phase 22: public relvars, materialization, transaction stubs). For the SQL emission rules that govern *what* the backend sees, see [sqlemit.md](sqlemit.md). For the broader runtime architecture (the SQL engine plus the in-process runtime library) see [runtime.md](runtime.md). For the surface typing rules around public relvars, see [typecheck.md](typecheck.md); for the IR shape, [procir.md](procir.md); for the per-backend emission, [codegen.md](codegen.md).
 
@@ -127,16 +127,20 @@ heading-descriptor `sub` pointer in `docs/runtime.md` — but a tuple-valued
 *public-relvar column* stays out of scope (a SQL-backed base table has no
 composite column). Nested Relation cells remain out of scope for v1.
 
-## Read-only policy
+## Write policy
 
-v1 SQLite-backed public relvars are read-only:
-`ResolvedPublicRelvar::write_policy == WritePolicy::ReadOnly`. Writes
-against them are a codegen error until view-updating semantics land
-(later phase). The plan layer always populates `ReadOnly` for
-SQLite-backed relvars today; the discrimination becomes load-bearing
-when write-through arrives.
+A public relvar mapped 1:1 onto a **base** catalog relvar is directly
+writable: `ResolvedPublicRelvar::write_policy == WritePolicy::ReadWrite`.
+The plan layer sets this from the catalog kind (`RelvarKind::Base`). A
+relvar mapped to a catalog **view** stays `WritePolicy::ReadOnly` until
+view-updating (`WriteThrough`) semantics land; the lowerer rejects an
+assignment to such a target (T0050).
 
-## Transactions (Phase 22)
+A relational assignment to a writable public relvar is recognized and
+emitted as surgical DML — the relvar is never hydrated and written back
+(see [sqlemit.md](sqlemit.md#surgical-writes-assignment-rhs-recognition)).
+
+## Transactions
 
 TTM OO Pre 4 forbids autocommit: every database access happens inside
 an explicit `transaction [...]` block. The typechecker enforces this
@@ -144,13 +148,14 @@ at every public-relvar reference (T0025); the lowerer wraps every
 `transaction [...]` body in synthetic `coddl_begin_tx` /
 `coddl_commit_tx` calls.
 
-For v1, transaction tx-externs are **no-ops**. All public-relvar reads
-are served from the in-memory slot materialized at startup; SQLite
-isn't touched inside the transaction body. The shape exists because:
-
-- The conformance rule (T0025) needs somewhere to land.
-- Future write-through reuses the same surface — only the runtime
-  bodies grow real BEGIN/COMMIT.
+The tx-externs issue real `BEGIN` / `COMMIT` (and `coddl_rollback_tx` a
+`ROLLBACK`) on the backing connection, guarded by a process-global depth
+counter so nested `transaction [...]` blocks don't issue a nested
+`BEGIN` (SQLite has none). Connections are opened **read-write** and
+kept live for the program, so a write made inside a transaction
+(`coddl_exec`) is visible to a later read (`coddl_query`) in the same
+transaction — read-after-write on one shared connection. A pure
+in-process transaction (no database registered) is a clean no-op.
 
 ### Transaction purity (T0026)
 
@@ -173,15 +178,17 @@ oper main {} [
 ];
 ```
 
-## Rollback discipline (v1)
+## Rollback discipline
 
-Runtime errors mid-materialization (SQLite open / prepare failures,
-NULL columns, type mismatches) `eprintln!` + `abort()` — same trap
-discipline Phase 21 used for `extract` cardinality.
+Runtime errors mid-materialization or mid-DML (SQLite open / prepare /
+execute failures, NULL columns, type mismatches) `eprintln!` + `abort()`
+— the same trap discipline `extract` cardinality uses. An aborting
+process leaves any open transaction uncommitted, so SQLite discards it.
 
-User-level rollback (and the serialization-replay loop) lands when sum
-types exist in the language and write-through arrives. The
-`coddl_rollback_tx` extern is reserved for that.
+`coddl_rollback_tx` issues a real `ROLLBACK` (at the outermost nesting
+level). The automatic serialization-replay loop — re-running a
+conflicted transaction body — lands when sum types exist in the language
+and write-through arrives; it reuses this same extern.
 
 ## Slot ownership
 

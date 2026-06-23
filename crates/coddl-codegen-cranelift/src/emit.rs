@@ -455,8 +455,8 @@ fn declare_runtime_relvar_externs(
 }
 
 /// SQL-pushdown runtime externs: database/plan registration (program
-/// prologue) and `coddl_query` (the lazy force point). Mirrors the LLVM
-/// backend's `emit_runtime_plan_externs`.
+/// prologue), `coddl_query` (the lazy read force point), and `coddl_exec` (the
+/// DML force point). Mirrors the LLVM backend's `emit_runtime_plan_externs`.
 fn declare_runtime_plan_externs(
     obj: &mut ObjectModule,
     funcs: &mut HashMap<String, FuncId>,
@@ -505,6 +505,18 @@ fn declare_runtime_plan_externs(
             .declare_function("coddl_query", Linkage::Import, &sig)
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert("coddl_query".into(), id);
+    }
+    // coddl_exec(plan_id: i32, params: ptr, n: i64) -> i32 (CoddlStatus)
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(types::I32));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I32));
+        let id = obj
+            .declare_function("coddl_exec", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_exec".into(), id);
     }
     Ok(())
 }
@@ -2026,51 +2038,9 @@ fn emit_inst(
             params,
             heading_id: _,
         } => {
-            let ptr_ty = obj.target_config().pointer_type();
-            let n = params.len();
-            // Build the CoddlParam array on the stack:
-            // `{ i64 i, ptr, i64 len, i32 kind }`, 32-byte stride.
-            let params_arg = if n == 0 {
-                builder.ins().iconst(ptr_ty, 0)
-            } else {
-                let slot = builder.create_sized_stack_slot(
-                    cranelift_codegen::ir::StackSlotData::new(
-                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                        (n * 32) as u32,
-                        3,
-                    ),
-                );
-                for (i, (vid, ty)) in params.iter().enumerate() {
-                    let base = (i * 32) as i32;
-                    let kind = kind_tag_for_cl(ty)?;
-                    match ty {
-                        ProcType::Integer => {
-                            let v = scalar_value(values, vid)?;
-                            builder.ins().stack_store(v, slot, base);
-                        }
-                        ProcType::Boolean => {
-                            let v = scalar_value(values, vid)?; // I8
-                            let ext = builder.ins().uextend(types::I64, v);
-                            builder.ins().stack_store(ext, slot, base);
-                        }
-                        ProcType::Text => {
-                            let (ptr, len) = text_value(values, vid)?;
-                            builder.ins().stack_store(ptr, slot, base + 8);
-                            builder.ins().stack_store(len, slot, base + 16);
-                        }
-                        other => {
-                            return Err(CraneliftEmitError::UnsupportedInst(format!(
-                                "query bind param of type {other:?} not supported"
-                            )));
-                        }
-                    }
-                    let kind_v = builder.ins().iconst(types::I32, kind as i64);
-                    builder.ins().stack_store(kind_v, slot, base + 24);
-                }
-                builder.ins().stack_addr(ptr_ty, slot, 0)
-            };
+            let params_arg = build_coddl_param_array_cl(obj, builder, values, params)?;
             let plan_id_v = builder.ins().iconst(types::I32, *plan_id as i64);
-            let n_v = builder.ins().iconst(types::I64, n as i64);
+            let n_v = builder.ins().iconst(types::I64, params.len() as i64);
             let query_local = obj.declare_func_in_func(funcs["coddl_query"], builder.func);
             let call = builder
                 .ins()
@@ -2079,7 +2049,68 @@ fn emit_inst(
             values.insert(*dst, ValueRepr::Scalar(result));
             Ok(())
         }
+        Inst::Dml { plan_id, params } => {
+            // Fire a registered DML plan for effect — same param marshaling as a
+            // query, but `coddl_exec` returns a status that is discarded (the
+            // runtime aborts on a hard failure).
+            let params_arg = build_coddl_param_array_cl(obj, builder, values, params)?;
+            let plan_id_v = builder.ins().iconst(types::I32, *plan_id as i64);
+            let n_v = builder.ins().iconst(types::I64, params.len() as i64);
+            let exec_local = obj.declare_func_in_func(funcs["coddl_exec"], builder.func);
+            builder.ins().call(exec_local, &[plan_id_v, params_arg, n_v]);
+            Ok(())
+        }
     }
+}
+
+/// Build the `CoddlParam` array on the stack for a `query`/`exec` call —
+/// `{ i64 i, ptr, i64 len, i32 kind }`, 32-byte stride — and return the pointer
+/// argument value (a null pointer when there are no params). Shared by the
+/// `Query` and `Dml` instruction arms.
+fn build_coddl_param_array_cl(
+    obj: &ObjectModule,
+    builder: &mut FunctionBuilder<'_>,
+    values: &HashMap<ValueId, ValueRepr>,
+    params: &[(ValueId, ProcType)],
+) -> Result<CrValue, CraneliftEmitError> {
+    let ptr_ty = obj.target_config().pointer_type();
+    let n = params.len();
+    if n == 0 {
+        return Ok(builder.ins().iconst(ptr_ty, 0));
+    }
+    let slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+        (n * 32) as u32,
+        3,
+    ));
+    for (i, (vid, ty)) in params.iter().enumerate() {
+        let base = (i * 32) as i32;
+        let kind = kind_tag_for_cl(ty)?;
+        match ty {
+            ProcType::Integer => {
+                let v = scalar_value(values, vid)?;
+                builder.ins().stack_store(v, slot, base);
+            }
+            ProcType::Boolean => {
+                let v = scalar_value(values, vid)?; // I8
+                let ext = builder.ins().uextend(types::I64, v);
+                builder.ins().stack_store(ext, slot, base);
+            }
+            ProcType::Text => {
+                let (ptr, len) = text_value(values, vid)?;
+                builder.ins().stack_store(ptr, slot, base + 8);
+                builder.ins().stack_store(len, slot, base + 16);
+            }
+            other => {
+                return Err(CraneliftEmitError::UnsupportedInst(format!(
+                    "query bind param of type {other:?} not supported"
+                )));
+            }
+        }
+        let kind_v = builder.ins().iconst(types::I32, kind as i64);
+        builder.ins().stack_store(kind_v, slot, base + 24);
+    }
+    Ok(builder.ins().stack_addr(ptr_ty, slot, 0))
 }
 
 /// Map a `record_layout` attribute kind to its `ProcType`. Same

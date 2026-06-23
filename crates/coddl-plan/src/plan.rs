@@ -64,14 +64,22 @@ pub struct ResolvedPublicRelvar {
     /// can prove a read is already a set and elide `DISTINCT`.
     pub keys: Vec<Vec<String>>,
     /// What kinds of statements the runtime may issue against this
-    /// relvar. v1 SQLite forces every public relvar to read-only;
-    /// `WriteThrough` lights up when view-updating semantics land.
+    /// relvar. A public relvar mapped to a **base** catalog relvar is
+    /// directly writable (`ReadWrite`); one mapped to a **virtual**
+    /// (view) relvar stays `ReadOnly` until `WriteThrough` view-updating
+    /// semantics land.
     pub write_policy: WritePolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WritePolicy {
+    /// No writes — a view without write-through, or a non-writable backend.
     ReadOnly,
+    /// Directly writable: the relvar maps 1:1 onto a base SQL table, so
+    /// surgical DML (`delete`/`insert`/`update`, relational assignment)
+    /// goes straight to that table.
+    ReadWrite,
+    /// Writable via view-updating translation. Reserved — not yet emitted.
     WriteThrough,
 }
 
