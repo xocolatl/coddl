@@ -19,29 +19,41 @@ public relvar NewArrivals { id: Integer, message: Text } key { id };
 
 oper main {} [
     // Every database access sits inside a transaction.
-    let before = transaction [ Greetings ];
+    let before = transaction [
+        Greetings
+    ];
     write_relation { rel: before };
 
     // Remove one tuple by predicate. `Greetings minus (Greetings where id = 1)`
     // is the rows of Greetings except the one with id 1 — assigning it back
     // deletes that row: a single `DELETE FROM greetings WHERE id = ?`.
-    transaction [ Greetings := Greetings minus (Greetings where id = 1); ];
+    transaction [
+        Greetings := Greetings minus (Greetings where id = 1);
+    ];
 
     // Remove every tuple that also appears in Stale, matched on *every*
     // attribute (id and message). Assigning `Greetings minus Stale` back is an
     // anti-join delete: `DELETE FROM greetings WHERE EXISTS (... AND ... )`.
-    transaction [ Greetings := Greetings minus Stale; ];
+    transaction [
+        Greetings := Greetings minus Stale;
+    ];
 
     // Add every NewArrivals tuple not already present. `Greetings union
     // NewArrivals` keeps Greetings a set, so an already-present tuple is a no-op
     // (idempotent): an `INSERT INTO greetings ... WHERE NOT EXISTS (...)`.
-    transaction [ Greetings := Greetings union NewArrivals; ];
+    transaction [
+        Greetings := Greetings union NewArrivals;
+    ];
 
     // Add a literal tuple. The right operand isn't SQL-backed, so its rows are
     // shipped from the process into greetings as a batched `VALUES` insert
     // (still idempotent, still no temp table).
-    transaction [ Greetings := Greetings union Relation { { id: 6, message: "hi there" } }; ];
+    transaction [
+        Greetings := Greetings union Relation { { id: 6, message: "hi there" } };
+    ];
 
-    let after = transaction [ Greetings ];
+    let after = transaction [
+        Greetings
+    ];
     write_relation { rel: after };
 ];
