@@ -14,8 +14,8 @@ use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, Expr, ExprStmt,
     ExtendExpr, FieldAccess, Heading as AstHeading, Item, KeyClause, LetStmt, NamedArg, OperDecl,
     PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr,
-    ReplaceExpr, Root, Stmt, TcloseExpr, TransactionExpr, TupleLit, UnaryExpr, UnaryOp, UnwrapExpr,
-    WrapExpr,
+    ReplaceExpr, Root, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit, UnaryExpr, UnaryOp,
+    UnwrapExpr, WrapExpr,
 };
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
@@ -678,6 +678,7 @@ impl TypeChecker {
             match stmt {
                 Stmt::Let(l) => self.check_let_stmt(&l, scope),
                 Stmt::Assign(a) => self.check_assignment_stmt(&a, scope),
+                Stmt::Truncate(t) => self.check_truncate_stmt(&t, scope),
                 Stmt::ExprStmt(e) => self.check_expr_stmt(&e, scope),
             }
         }
@@ -753,6 +754,53 @@ impl TypeChecker {
                 span,
                 "T0034",
                 format!("cannot assign {rhs_ty} to relvar `{name}` (heading mismatch)"),
+            );
+        }
+    }
+
+    /// Check `truncate R;` — clear every tuple from a relvar. It desugars to
+    /// `R := R minus R`, so the operand must be a bare name bound to an
+    /// assignable relvar (public or private); a restricted or compound operand
+    /// is a different operation (`R where p` → delete) and is rejected (T0033).
+    /// A **public** relvar is a write to its SQL table, so it requires a
+    /// transaction (T0025), exactly as the desugared self-reference would.
+    fn check_truncate_stmt(&mut self, stmt: &TruncateStmt, scope: &mut Scope) {
+        // The operand must be a bare name reference — truncate clears the whole
+        // relvar; a `where`-restriction or any compound expression isn't a relvar.
+        let Some(Expr::NameRef(target)) = stmt.operand() else {
+            let span = stmt
+                .operand()
+                .map(|o| self.node_span(o.syntax()))
+                .unwrap_or_else(|| self.node_span(stmt.syntax()));
+            self.error(span, "T0033", "truncate operand must be a relvar name");
+            return;
+        };
+        let Some(ident) = target.ident() else { return };
+        let name = ident.text();
+
+        // … bound to an assignable relvar (public or private).
+        let assignable = self
+            .relvars
+            .get(name)
+            .is_some_and(|i| matches!(i.kind, RelvarKind::Public | RelvarKind::Private));
+        if !assignable {
+            self.error(
+                self.token_span(&ident),
+                "T0033",
+                format!("cannot truncate `{name}`: not an assignable relvar"),
+            );
+            return;
+        }
+        scope.mark_used(name);
+
+        // A public relvar is written only inside a `transaction [...]` block
+        // (T0025), the same rule the desugared `R := R minus R` self-reference
+        // would enforce.
+        if self.public_relvars.contains(name) && self.transaction_depth == 0 {
+            self.error(
+                self.token_span(&ident),
+                "T0025",
+                format!("public relvar `{name}` referenced outside any `transaction [...]` block"),
             );
         }
     }
@@ -2460,6 +2508,45 @@ mod tests {
                    private relvar S { a: Integer } key { a }; \
                    oper main {} [ R := S; ];";
         assert!(!codes(src).contains(&"T0051"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn truncate_private_relvar_checks_clean() {
+        let src = "program p; private relvar R { a: Integer } key { a }; \
+                   oper main {} [ truncate R; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn truncate_public_relvar_in_transaction_checks_clean() {
+        let src = "program p; database greetings; \
+                   public relvar R { a: Integer } key { a }; \
+                   oper main {} [ transaction [ truncate R; ] ];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn truncate_public_relvar_outside_transaction_diagnoses_t0025() {
+        let src = "program p; database greetings; \
+                   public relvar R { a: Integer } key { a }; \
+                   oper main {} [ truncate R; ];";
+        assert!(codes(src).contains(&"T0025"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn truncate_undeclared_name_diagnoses_t0033() {
+        let src = "program p; oper main {} [ truncate Nope; ];";
+        assert!(codes(src).contains(&"T0033"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn truncate_non_relvar_operand_diagnoses_t0033() {
+        // A restricted operand (`R where p`) isn't a bare relvar — that's a
+        // delete, not a truncate.
+        let src = "program p; private relvar R { a: Integer } key { a }; \
+                   oper main {} [ truncate R where a = 1; ];";
+        assert!(codes(src).contains(&"T0033"), "{:?}", codes(src));
     }
 
     #[test]

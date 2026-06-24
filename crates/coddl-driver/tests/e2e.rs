@@ -1276,6 +1276,31 @@ fn dml_self_truncate_empties_cranelift() {
     assert_self_truncate_empties("cranelift");
 }
 
+/// `truncate R;` is sugar for `R := R minus R` — it desugars to the same
+/// whole-table `DELETE FROM greetings` and empties the relvar. No rows survive.
+fn assert_truncate_stmt_empties(backend: &str) {
+    let rows = run_greetings_dml(
+        backend,
+        "program insert_update_delete;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             transaction [ truncate Greetings; ];\n\
+         ];\n",
+    );
+    assert!(rows.is_empty(), "expected empty table on {backend}, got {rows:?}");
+}
+
+#[test]
+fn dml_truncate_stmt_empties_llvm() {
+    assert_truncate_stmt_empties("llvm");
+}
+
+#[test]
+fn dml_truncate_stmt_empties_cranelift() {
+    assert_truncate_stmt_empties("cranelift");
+}
+
 /// Binding transparency: `let r = R where id = 1; R := R minus r` folds to the
 /// same `DELETE … WHERE id = ?` as the inline form — the alias is substituted
 /// before recognition, so it persists identically.

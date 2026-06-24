@@ -413,8 +413,9 @@ function that implements it.
                     -- the block's value. Statements terminated by ';'
                     -- have their results discarded.
 <stmt>          ::= <let-stmt>
+                  | <truncate-stmt>
                   | <assign-stmt>
-                  | <expr> ';' ;                               -- parse_stmt (LET_STMT, ASSIGN_STMT, or EXPR_STMT)
+                  | <expr> ';' ;                               -- parse_stmt (LET_STMT, TRUNCATE_STMT, ASSIGN_STMT, or EXPR_STMT)
 <assign-stmt>   ::= <expr> ':=' <expr> ';' ;                   -- parse_stmt (ASSIGN_STMT)
                     -- Relational assignment. The parser accepts any
                     -- expression as the target (LHS); the typechecker
@@ -422,6 +423,16 @@ function that implements it.
                     -- (public or private; T0033 otherwise). A public target
                     -- is a write to its SQL table — the RHS shape is recognized
                     -- and emitted as surgical DML at lowering.
+<truncate-stmt> ::= 'truncate' <expr> ';' ;                    -- parse_truncate_stmt
+                    -- Clear every tuple from a relvar — sugar for the
+                    -- relational assignment `R := R minus R` (the surgical
+                    -- whole-table delete shape). The operand is parsed as an
+                    -- <expr> (P0014 if absent); the typechecker restricts it
+                    -- to a bare assignable relvar name (T0033) and requires a
+                    -- transaction for a public relvar (T0025). `truncate` is a
+                    -- contextual keyword recognized only as the leading token
+                    -- of a statement (the `let` precedent) — it stays a usable
+                    -- identifier everywhere else (no reserved words).
 <let-stmt>      ::= 'let' <identifier> [ ':' <type-ref> ]
                     '=' <expr> ';' ;                           -- parse_let_stmt
 
@@ -633,8 +644,9 @@ is explicit, not implied:
   user-defined types.
 - **Type generators** in `<type-ref>` — `Tuple H`, `Relation H`,
   `Sequence T`.
-- **Statement forms** other than `<let-stmt>`, `<assign-stmt>`, and
-  `<expr> ';'` — `mut`, `return`, `insert`, `delete`, `update`.
+- **Statement forms** other than `<let-stmt>`, `<assign-stmt>`,
+  `<truncate-stmt>`, and `<expr> ';'` — `mut`, `return`, `insert`,
+  `delete`, `update`.
 - **Type / relvar / constraint declarations** at the top level.
 - **Literals**: sequence `[ … ]` in expression position. (Tuple
   `{ … }` literals and dot-prefix field access landed in Phase 18.

@@ -91,4 +91,15 @@ oper main {} [
         Greetings
     ];
     write_relation { rel: reset };
+
+    // Clear the relvar entirely. `truncate Greetings` is sugar for
+    // `Greetings := Greetings minus Greetings`, recognized as a whole-table
+    // `DELETE FROM greetings` — a surgical clear, not a row-by-row hydrate.
+    transaction [
+        truncate Greetings;
+    ];
+    let cleared = transaction [
+        Greetings
+    ];
+    write_relation { rel: cleared };
 ];

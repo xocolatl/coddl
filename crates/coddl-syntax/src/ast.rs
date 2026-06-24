@@ -312,13 +312,15 @@ impl Block {
 }
 
 /// Statement variants. `let` is a binding; `Assign` is relational
-/// assignment to a relvar (`R := <expr>;`); `ExprStmt` evaluates an
+/// assignment to a relvar (`R := <expr>;`); `Truncate` clears a relvar
+/// (`truncate R;`, sugar for `R := R minus R`); `ExprStmt` evaluates an
 /// expression and discards the result. `mut` / `return` / `insert` /
 /// `delete` / `update` arrive when their semantics are settled.
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Let(LetStmt),
     Assign(AssignStmt),
+    Truncate(TruncateStmt),
     ExprStmt(ExprStmt),
 }
 
@@ -327,6 +329,7 @@ impl Stmt {
         Some(match syntax.kind() {
             SyntaxKind::LET_STMT => Stmt::Let(LetStmt { syntax }),
             SyntaxKind::ASSIGN_STMT => Stmt::Assign(AssignStmt { syntax }),
+            SyntaxKind::TRUNCATE_STMT => Stmt::Truncate(TruncateStmt { syntax }),
             SyntaxKind::EXPR_STMT => Stmt::ExprStmt(ExprStmt { syntax }),
             _ => return None,
         })
@@ -336,6 +339,7 @@ impl Stmt {
         match self {
             Stmt::Let(s) => s.syntax(),
             Stmt::Assign(s) => s.syntax(),
+            Stmt::Truncate(s) => s.syntax(),
             Stmt::ExprStmt(s) => s.syntax(),
         }
     }
@@ -386,6 +390,17 @@ impl AssignStmt {
     /// The assigned value — the RHS, the second `Expr` child (after `:=`).
     pub fn value(&self) -> Option<Expr> {
         self.syntax.children().filter_map(Expr::cast).nth(1)
+    }
+}
+
+ast_node!(pub TruncateStmt, TRUNCATE_STMT);
+
+impl TruncateStmt {
+    /// The relvar to clear — the sole `Expr` child after `truncate`. The
+    /// parser accepts any expression; the typechecker requires a bare name
+    /// reference bound to an assignable relvar (T0033).
+    pub fn operand(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
     }
 }
 

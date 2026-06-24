@@ -18,8 +18,8 @@ use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, Expr, ExprStmt,
     ExtendExpr, FieldAccess, Item,
     LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, RenameExpr,
-    ReplaceExpr, Root, Stmt, TcloseExpr, TransactionExpr, TupleLit, UnaryExpr, UnaryOp, UnwrapExpr,
-    WrapExpr,
+    ReplaceExpr, Root, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit, UnaryExpr, UnaryOp,
+    UnwrapExpr, WrapExpr,
 };
 use coddl_syntax::SyntaxKind;
 use coddl_types::{check, Heading, RelvarKind, RelvarTable, Type};
@@ -762,6 +762,7 @@ impl Lowerer {
             match stmt {
                 Stmt::Let(l) => self.lower_let_stmt(&l),
                 Stmt::Assign(a) => self.lower_assign_stmt(&a),
+                Stmt::Truncate(t) => self.lower_truncate_stmt(&t),
                 Stmt::ExprStmt(e) => self.lower_expr_stmt(&e),
             }
         }
@@ -807,27 +808,84 @@ impl Lowerer {
         self.insts.push(Inst::RelvarSlotStore { name, value });
     }
 
+    /// Lower `truncate R;` — clear every tuple. It desugars to `R := R minus R`:
+    /// a **public** relvar hits the self-subtraction arm of `emit_assignment`
+    /// (a whole-table `DELETE FROM t`, never hydrated); a **private** relvar
+    /// stores the empty `R minus R` value back into its in-memory slot.
+    fn lower_truncate_stmt(&mut self, stmt: &TruncateStmt) {
+        let Some(operand) = stmt.operand() else { return };
+        let Expr::NameRef(target) = &operand else {
+            return; // typechecker rejected a non-name operand (T0033)
+        };
+        let Some(name_tok) = target.ident() else { return };
+        let name = name_tok.text().to_string();
+
+        // Public target → surgical whole-table delete via the `R := R minus R`
+        // self-subtraction shape.
+        if self.public_relvars.contains_key(&name) {
+            let Some(dialect) = self.require_public_write(&name, &operand) else {
+                return;
+            };
+            let Some(target_rel) = self.build_rel_expr(&operand) else {
+                return;
+            };
+            let value_rel = RelExpr::Minus {
+                lhs: Box::new(target_rel.clone()),
+                rhs: Box::new(target_rel.clone()),
+            };
+            if let Ok(query) = emit_assignment(&target_rel, &value_rel, dialect) {
+                self.emit_dml(query);
+            }
+            return;
+        }
+
+        // Private target → `R minus R` is the empty relation; store it into the
+        // slot (the two reads lower exactly as the literal `R minus R` would).
+        let lhs = self.lower_expr(&operand);
+        let rhs = self.lower_expr(&operand);
+        let value = self.emit_minus(lhs, rhs);
+        self.used_private_relvars.insert(name.clone());
+        self.insts.push(Inst::RelvarSlotStore { name, value });
+    }
+
+    /// Public-write preflight shared by relational assignment and the verb
+    /// statements (`truncate`/`delete`/`insert`/`update`): a public relvar is
+    /// writable only when it maps to a base table (`WritePolicy::ReadWrite`, not
+    /// a view → T0050) and the backend offers a SQL dialect to emit against
+    /// (T0049). Pushes the diagnostic and returns `None` if either fails;
+    /// otherwise the dialect to emit with. `span_node` locates the diagnostic.
+    fn require_public_write(&mut self, name: &str, span_node: &Expr) -> Option<Dialect> {
+        if self.public_relvar_write_policy.get(name) != Some(&WritePolicy::ReadWrite) {
+            self.diagnostics.push(Diagnostic::error(
+                self.node_span(span_node.syntax()),
+                "T0050",
+                format!("cannot assign to public relvar `{name}`: it maps to a non-writable view"),
+            ));
+            return None;
+        }
+        match self.dialect {
+            Some(dialect) => Some(dialect),
+            None => {
+                self.diagnostics.push(Diagnostic::error(
+                    self.node_span(span_node.syntax()),
+                    "T0049",
+                    format!(
+                        "cannot assign to public relvar `{name}`: backend does not support SQL writes"
+                    ),
+                ));
+                None
+            }
+        }
+    }
+
     /// Lower `R := <rhs>;` where `R` is a public relvar: recognize the RHS shape
     /// and emit surgical DML (`Inst::Dml`). The RHS is **never materialized** —
     /// `build_rel_expr` pushes it, `emit_assignment` recognizes it, and the SQL
     /// runs server-side.
     fn lower_public_assign(&mut self, name: &str, target_expr: &Expr, value_expr: &Expr) {
-        // A relvar mapped to a catalog view isn't directly writable.
-        if self.public_relvar_write_policy.get(name) != Some(&WritePolicy::ReadWrite) {
-            self.diagnostics.push(Diagnostic::error(
-                self.node_span(target_expr.syntax()),
-                "T0050",
-                format!("cannot assign to public relvar `{name}`: it maps to a non-writable view"),
-            ));
-            return;
-        }
-        // Surgical DML needs a SQL dialect to emit against.
-        let Some(dialect) = self.dialect else {
-            self.diagnostics.push(Diagnostic::error(
-                self.node_span(target_expr.syntax()),
-                "T0049",
-                format!("cannot assign to public relvar `{name}`: backend does not support SQL writes"),
-            ));
+        // A writable base relvar plus a SQL dialect to emit against (else
+        // T0050 / T0049). Shared with the verb statements (`truncate`, …).
+        let Some(dialect) = self.require_public_write(name, target_expr) else {
             return;
         };
         // Recognize the RHS shape: build both operands' RelIR (the target is a
@@ -3219,6 +3277,17 @@ oper main {}\n\
         }
     }
 
+    /// `greetings_plan` with the base relvar marked writable — the shape a
+    /// SQL-backed write target has (surgical DML lowering exercises this).
+    fn greetings_rw_plan() -> Plan {
+        use coddl_plan::WritePolicy;
+        let mut plan = greetings_plan();
+        for r in &mut plan.resolved {
+            r.write_policy = WritePolicy::ReadWrite;
+        }
+        plan
+    }
+
     fn lower_ok_with_plan(src: &str, plan: &Plan) -> Module {
         let out = lower_with_plan(src, FileId(0), Some(plan));
         // Only errors block lowering; T0032 unused-binding warnings don't.
@@ -3725,6 +3794,50 @@ oper main {} [
                 .flat_map(|b| &b.insts)
                 .all(|i| !matches!(i, Inst::Dml { .. } | Inst::InsertFrom { .. })),
             "Greetings := Greetings must emit no DML"
+        );
+    }
+
+    #[test]
+    fn truncate_public_relvar_emits_dml() {
+        // `truncate Greetings` desugars to `Greetings := Greetings minus
+        // Greetings` → a whole-table delete, emitted as surgical DML.
+        let src = "\
+program hello_world_db;
+database greetings;
+public relvar Greetings { id: Integer, message: Text } key { id };
+oper main {} [
+    transaction [ truncate Greetings; ];
+];
+";
+        let m = lower_ok_with_plan(src, &greetings_rw_plan());
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            main.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i, Inst::Dml { .. })),
+            "truncate Greetings must emit surgical DML"
+        );
+    }
+
+    #[test]
+    fn truncate_private_relvar_emits_minus_and_store() {
+        // `truncate R` on a private relvar lowers to the empty `R minus R`
+        // value stored back into the slot.
+        let src = "program p; private relvar R { a: Integer } key { a }; \
+                   oper main {} [ truncate R; ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let insts: Vec<_> = main.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::Minus { .. })),
+            "truncate R must compute R minus R"
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|i| matches!(i, Inst::RelvarSlotStore { .. })),
+            "truncate R must store the empty result into the slot"
         );
     }
 

@@ -168,6 +168,25 @@ fires `coddl_exec_insert` (which iterates the relation and runs the batched
 template). Both run inside the enclosing transaction's `BEGIN`/`COMMIT` (see
 [storage.md](storage.md)).
 
+### Statement-verb sugar
+
+Relational assignment is the write primitive; the ergonomic statement verbs are
+thin sugar that **desugar in the lowerer to a recognized RHS shape**, so they add
+no SQL-emission code — the desugared value flows through `emit_assignment` (public
+relvars) or the in-memory slot store (private relvars) unchanged.
+
+| Statement | Desugars to `:=` | Recognized arm |
+|---|---|---|
+| `truncate R` | `R := R minus R` | self-subtraction → whole-table `DELETE FROM t` |
+
+`truncate R` clears every tuple. Its operand must be a bare assignable relvar
+(the typechecker rejects a restricted or compound operand, T0033, and requires a
+transaction for a public relvar, T0025); the lowerer builds
+`Minus{ RelvarRef(t), RelvarRef(t) }` and routes it through the same
+`emit_assignment` self-subtraction arm a literal `R := R minus R` would hit (a
+private relvar instead stores the empty `R minus R` value back into its slot).
+`delete` / `insert` / `update` join this table as their chunks land.
+
 ## Dialect surface
 
 Keep emitted SQL to a **portable subset** (CTEs, window functions, standard joins). Isolate dialect divergence behind backend methods — `emit_select` returns dialect-specific text, but the same RelIR plan should produce semantically equivalent results across backends.

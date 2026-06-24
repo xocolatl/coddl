@@ -104,6 +104,7 @@ pub enum SyntaxKind {
     INSERT_STMT,
     DELETE_STMT,
     UPDATE_STMT,
+    TRUNCATE_STMT,
     RETURN_STMT,
     EXPR_STMT,
 

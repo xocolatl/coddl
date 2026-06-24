@@ -480,6 +480,27 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
+    /// `truncate <relvar> ;` — clear every tuple from a relvar. The operand
+    /// is parsed permissively (`parse_expr`); the typechecker restricts it to
+    /// a bare assignable relvar name (T0033) and the lowerer desugars it to
+    /// `R := R minus R` (the surgical whole-table delete shape). `truncate` is
+    /// a contextual keyword recognized only at statement-leading position (the
+    /// `let` precedent) — it stays a usable identifier everywhere else.
+    fn parse_truncate_stmt(&mut self) {
+        debug_assert!(self.at_keyword("truncate"));
+        self.start_node(SyntaxKind::TRUNCATE_STMT);
+        self.bump(); // `truncate`
+        let before = self.pos;
+        self.parse_expr();
+        if self.pos == before {
+            self.error("P0014", "expected relvar name after `truncate`");
+        }
+        if !self.eat(SyntaxKind::SEMICOLON) {
+            self.error("P0013", "expected `;` after `truncate`");
+        }
+        self.finish_node();
+    }
+
     /// One statement, *or* the block's trailing tail expression. The
     /// `let` form is recognized first; otherwise an expression is
     /// parsed and either wrapped in `EXPR_STMT` (terminated by `;`)
@@ -491,6 +512,10 @@ impl<'a> Parser<'a> {
         }
         if self.at_keyword("let") {
             self.parse_let_stmt();
+            return;
+        }
+        if self.at_keyword("truncate") {
+            self.parse_truncate_stmt();
             return;
         }
 
@@ -1903,6 +1928,59 @@ mod tests {
             out.diagnostics.iter().any(|d| d.code == "P0013"),
             "expected P0013, got {:?}",
             out.diagnostics
+        );
+    }
+
+    #[test]
+    fn truncate_stmt_parses() {
+        let out = parse_str("oper main {} [ truncate R; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.tree.text(), "oper main {} [ truncate R; ];");
+        let truncate = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::TRUNCATE_STMT)
+            .expect("TRUNCATE_STMT in tree");
+        // The operand is a single NAME_REF child.
+        let names: Vec<_> = truncate
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::NAME_REF)
+            .map(|n| n.text().to_string())
+            .collect();
+        assert_eq!(names, vec!["R".to_string()]);
+    }
+
+    #[test]
+    fn truncate_stmt_missing_operand_diagnoses_p0014() {
+        let out = parse_str("oper main {} [ truncate ; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0014"),
+            "expected P0014, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn truncate_stmt_missing_semicolon_diagnoses_p0013() {
+        let out = parse_str("oper main {} [ truncate R ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0013"),
+            "expected P0013, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn truncate_remains_a_usable_identifier() {
+        // `truncate` is a contextual keyword only at statement-leading position;
+        // as an attribute name (or anywhere else) it stays an ordinary IDENT.
+        let out = parse_str("oper main {} [ let _t = Relation { {truncate: 1} }; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert!(
+            out.tree
+                .descendants()
+                .all(|n| n.kind() != SyntaxKind::TRUNCATE_STMT),
+            "`truncate` as an attribute name must not parse as TRUNCATE_STMT"
         );
     }
 
