@@ -459,6 +459,12 @@ and transaction rule (**T0025**):
   `where` is *mandatory* — a bare `delete R;` would clear the whole relvar, so it
   is **T0052** (pointing at `truncate`), keeping the verbs a clean partition
   (`truncate` = all, `delete` = matching).
+- **`insert R <source>;`** → `R := R union <source>`. The target must be a bare
+  assignable relvar (**T0033**) and the source a relation whose heading matches
+  the relvar's (**T0034**). The two surface forms — a brace `<tuple-set>` (a
+  keyword-less relation literal) or a relation `<expr>` — are a single `source`
+  expression to the checker, so one `check_expr` validates either (an empty
+  tuple-set is the empty-relation-literal error, **T0018**).
 
 
 ## Typecheck diagnostics

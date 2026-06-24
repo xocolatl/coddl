@@ -16,6 +16,7 @@ use coddl_diagnostics::{Diagnostic, FileId, Severity, Span};
 use coddl_plan::{Plan, WritePolicy};
 use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, DeleteStmt, Expr, ExprStmt,
+    InsertStmt,
     ExtendExpr, FieldAccess, Item,
     LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, RenameExpr,
     ReplaceExpr, Root, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit, UnaryExpr, UnaryOp,
@@ -764,6 +765,7 @@ impl Lowerer {
                 Stmt::Assign(a) => self.lower_assign_stmt(&a),
                 Stmt::Truncate(t) => self.lower_truncate_stmt(&t),
                 Stmt::Delete(d) => self.lower_delete_stmt(&d),
+                Stmt::Insert(i) => self.lower_insert_stmt(&i),
                 Stmt::ExprStmt(e) => self.lower_expr_stmt(&e),
             }
         }
@@ -907,6 +909,91 @@ impl Lowerer {
         self.insts.push(Inst::RelvarSlotStore { name, value });
     }
 
+    /// Lower `insert R <source>;` — add tuples. It desugars to `R := R union
+    /// <source>`: a **public** relvar pushes `Or{ RelvarRef(t), source }` through
+    /// `emit_assignment` (an idempotent `INSERT … WHERE NOT EXISTS`) when the
+    /// source is SQL-backed, else ships its rows (`ship_union_insert`); a
+    /// **private** relvar stores the in-process union back into its slot.
+    fn lower_insert_stmt(&mut self, stmt: &InsertStmt) {
+        let Some(target_expr) = stmt.target() else { return };
+        let Expr::NameRef(target) = &target_expr else { return };
+        let Some(name_tok) = target.ident() else { return };
+        let name = name_tok.text().to_string();
+        let Some(source_expr) = stmt.source() else { return };
+
+        // Public target → idempotent INSERT via the `R := R union source` shape.
+        if self.public_relvars.contains_key(&name) {
+            let Some(dialect) = self.require_public_write(&name, &target_expr) else {
+                return;
+            };
+            let Some(target_rel) = self.build_rel_expr(&target_expr) else {
+                return;
+            };
+            // Pushable source → a single pushed idempotent INSERT.
+            let pushed = self.build_rel_expr(&source_expr).and_then(|s| {
+                let value = RelExpr::Or {
+                    lhs: Box::new(target_rel.clone()),
+                    rhs: Box::new(s),
+                };
+                emit_assignment(&target_rel, &value, dialect).ok()
+            });
+            if let Some(query) = pushed {
+                self.emit_dml(query);
+                return;
+            }
+            // In-memory source (a relation literal / private relvar) → row-ship.
+            self.ship_union_insert(&target_rel, &source_expr, dialect);
+            return;
+        }
+
+        // Private target → the in-process union `R union source` stored back.
+        let lhs_val = self.lower_expr(&target_expr);
+        let rhs_val = self.lower_expr(&source_expr);
+        let value = self.emit_union(lhs_val, rhs_val);
+        self.used_private_relvars.insert(name.clone());
+        self.insts.push(Inst::RelvarSlotStore { name, value });
+    }
+
+    /// Ship an in-memory relation's rows into a public base relvar as an
+    /// idempotent batched-`VALUES` insert (`Inst::InsertFrom`) — the runtime
+    /// fallback for `R := R union <in-memory e>` / `insert R <in-memory source>`
+    /// when the source can't be pushed (a relation literal or a private relvar).
+    /// `target_rel` is the destination `RelvarRef`; `source_expr` is lowered to
+    /// the relation value whose rows are shipped. Returns `true` if it emitted.
+    fn ship_union_insert(
+        &mut self,
+        target_rel: &RelExpr,
+        source_expr: &Expr,
+        dialect: Dialect,
+    ) -> bool {
+        let Ok(template) = emit_insert_template(target_rel, dialect) else {
+            return false;
+        };
+        let result_heading_id = self.intern_heading(&template.result_heading);
+        let plan_id = self.register_plan(&template, result_heading_id);
+        let src = self.lower_expr(source_expr);
+        let ProcType::Relation(heading_id) = self.value_type(src) else {
+            return false;
+        };
+        self.insts.push(Inst::InsertFrom {
+            plan_id,
+            src,
+            heading_id,
+        });
+        // `source` is an anonymous sub-expression (not bound to a local), so its
+        // relation payload is a temporary — release it once the insert has
+        // shipped its rows (the fresh-source discipline `extract` /
+        // `write_relation` use).
+        let is_owned = self
+            .locals
+            .iter()
+            .any(|layer| layer.values().any(|(vid, _)| *vid == src));
+        if !is_owned {
+            self.insts.push(Inst::Release { src });
+        }
+        true
+    }
+
     /// Public-write preflight shared by relational assignment and the verb
     /// statements (`truncate`/`delete`/`insert`/`update`): a public relvar is
     /// writable only when it maps to a base table (`WritePolicy::ReadWrite`, not
@@ -965,29 +1052,8 @@ impl Lowerer {
         // an idempotent batched-`VALUES` insert (`Inst::InsertFrom`).
         if let Some(e) = self.union_insert_source(name, value_expr) {
             if let Some(target_rel) = self.build_rel_expr(target_expr) {
-                if let Ok(template) = emit_insert_template(&target_rel, dialect) {
-                    let result_heading_id = self.intern_heading(&template.result_heading);
-                    let plan_id = self.register_plan(&template, result_heading_id);
-                    let src = self.lower_expr(&e);
-                    if let ProcType::Relation(heading_id) = self.value_type(src) {
-                        self.insts.push(Inst::InsertFrom {
-                            plan_id,
-                            src,
-                            heading_id,
-                        });
-                        // `e` is an anonymous sub-expression (not bound to a
-                        // local), so its relation payload is a temporary — release
-                        // it once the insert has shipped its rows (same fresh-
-                        // source discipline as `extract` / `write_relation`).
-                        let is_owned = self
-                            .locals
-                            .iter()
-                            .any(|layer| layer.values().any(|(vid, _)| *vid == src));
-                        if !is_owned {
-                            self.insts.push(Inst::Release { src });
-                        }
-                        return;
-                    }
+                if self.ship_union_insert(&target_rel, &e, dialect) {
+                    return;
                 }
             }
         }
@@ -3941,6 +4007,50 @@ oper main {} [
                 .iter()
                 .any(|i| matches!(i, Inst::RelvarSlotStore { .. })),
             "delete must store the kept rows into the slot"
+        );
+    }
+
+    #[test]
+    fn insert_tuple_set_public_ships_rows() {
+        // `insert Greetings { {…} }` ships the literal's rows — the tuple-set
+        // isn't SQL-backed, so an idempotent batched-VALUES InsertFrom.
+        let src = "\
+program hello_world_db;
+database greetings;
+public relvar Greetings { id: Integer, message: Text } key { id };
+oper main {} [
+    transaction [ insert Greetings { {id: 7, message: \"x\"} }; ];
+];
+";
+        let m = lower_ok_with_plan(src, &greetings_rw_plan());
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            main.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i, Inst::InsertFrom { .. })),
+            "insert of a tuple-set must ship rows via InsertFrom"
+        );
+    }
+
+    #[test]
+    fn insert_private_relvar_emits_union_and_store() {
+        // `insert R { {a: 1} }` on a private relvar lowers to `R union <lit>`
+        // stored back into the slot.
+        let src = "program p; private relvar R { a: Integer } key { a }; \
+                   oper main {} [ insert R { {a: 1} }; ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let insts: Vec<_> = main.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::Union { .. })),
+            "insert R must compute R union source"
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|i| matches!(i, Inst::RelvarSlotStore { .. })),
+            "insert must store the union into the slot"
         );
     }
 

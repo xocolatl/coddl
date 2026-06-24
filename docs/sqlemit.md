@@ -179,6 +179,7 @@ relvars) or the in-memory slot store (private relvars) unchanged.
 |---|---|---|
 | `truncate R` | `R := R minus R` | self-subtraction → whole-table `DELETE FROM t` |
 | `delete R where p` | `R := R minus (R where p)` | `Minus{ t, Restrict(t, p) }` → `DELETE FROM t WHERE p` |
+| `insert R { … }` / `insert R S` | `R := R union <source>` | `Or{ t, source }` → idempotent INSERT (pushed for a SQL-backed source, row-shipped for a literal / private source) |
 
 `truncate R` clears every tuple. Its operand must be a bare assignable relvar
 (the typechecker rejects a restricted or compound operand, T0033, and requires a
@@ -194,7 +195,17 @@ Restrict(RelvarRef(t), p) }` and routes it through the `emit_assignment` DELETE
 arm a literal `R := R minus (R where p)` would hit (a private relvar stores the
 kept rows `R minus (R where p)` into its slot). A predicate the single-predicate
 model can't push declines with **T0049** rather than a hydrating partial delete —
-never a silent wipe. `insert` / `update` join this table as their chunks land.
+never a silent wipe.
+
+`insert R <source>` adds tuples. Both surface forms — the brace tuple-set
+`insert R { {…}, {…} }` (a keyword-less relation literal) and the relation-expr
+`insert R S` — are a single relation `source`, so the lowerer builds
+`Or{ RelvarRef(t), source }` and routes it through the same `emit_assignment`
+idempotent-INSERT arm a literal `R := R union <source>` would hit: a SQL-backed
+source pushes (`INSERT … SELECT … WHERE NOT EXISTS`), a literal / private source
+ships its rows via the shared `ship_union_insert` (the batched-`VALUES`
+`Inst::InsertFrom`). A private relvar stores the in-process union into its slot.
+`update` joins this table as its chunk lands.
 
 ## Dialect surface
 

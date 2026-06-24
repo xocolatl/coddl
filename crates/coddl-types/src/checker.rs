@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, DeleteStmt, Expr, ExprStmt,
+    InsertStmt,
     ExtendExpr, FieldAccess, Heading as AstHeading, Item, KeyClause, LetStmt, NamedArg, OperDecl,
     PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr,
     ReplaceExpr, Root, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit, UnaryExpr, UnaryOp,
@@ -680,6 +681,7 @@ impl TypeChecker {
                 Stmt::Assign(a) => self.check_assignment_stmt(&a, scope),
                 Stmt::Truncate(t) => self.check_truncate_stmt(&t, scope),
                 Stmt::Delete(d) => self.check_delete_stmt(&d, scope),
+                Stmt::Insert(i) => self.check_insert_stmt(&i, scope),
                 Stmt::ExprStmt(e) => self.check_expr_stmt(&e, scope),
             }
         }
@@ -868,6 +870,72 @@ impl TypeChecker {
         // force a transaction for a public relvar (T0025) — exactly as the
         // desugared `R := R minus (R where p)` self-reference would.
         let _ = self.check_expr(&operand, scope);
+    }
+
+    /// Check `insert R <source>;` — add tuples. It desugars to `R := R union
+    /// <source>`, so the source must be a relation whose heading matches the
+    /// target relvar's (T0034), and the target a bare assignable relvar (T0033).
+    /// A public relvar requires a transaction (T0025). The `source` is a single
+    /// relation expression regardless of surface form (the tuple-set is a
+    /// keyword-less relation literal), so one `check_expr` validates both.
+    fn check_insert_stmt(&mut self, stmt: &InsertStmt, scope: &mut Scope) {
+        // Check the source first so its own diagnostics surface regardless of
+        // the target's validity (mirrors `check_assignment_stmt`).
+        let source_ty = match stmt.source() {
+            Some(s) => self.check_expr(&s, scope),
+            None => return, // parser recovery already emitted a diagnostic
+        };
+
+        // The target must be a bare name reference …
+        let Some(Expr::NameRef(target)) = stmt.target() else {
+            let span = stmt
+                .target()
+                .map(|t| self.node_span(t.syntax()))
+                .unwrap_or_else(|| self.node_span(stmt.syntax()));
+            self.error(span, "T0033", "insert target must be a relvar name");
+            return;
+        };
+        let Some(ident) = target.ident() else { return };
+        let name = ident.text();
+
+        // … bound to an assignable relvar (public or private).
+        let lookup = self.relvars.get(name).and_then(|i| {
+            matches!(i.kind, RelvarKind::Public | RelvarKind::Private).then(|| i.heading.clone())
+        });
+        let Some(heading) = lookup else {
+            self.error(
+                self.token_span(&ident),
+                "T0033",
+                format!("cannot insert into `{name}`: not an assignable relvar"),
+            );
+            return;
+        };
+        scope.mark_used(name);
+
+        // A public relvar is written only inside a `transaction [...]` block
+        // (T0025) — the desugared `R union source` references `R`.
+        if self.public_relvars.contains(name) && self.transaction_depth == 0 {
+            self.error(
+                self.token_span(&ident),
+                "T0025",
+                format!("public relvar `{name}` referenced outside any `transaction [...]` block"),
+            );
+        }
+
+        // The source heading must match the relvar's (union requires identical
+        // headings; assigning the union back keeps the relvar's heading).
+        let target_ty = Type::Relation(heading);
+        if !source_ty.assignable_to(&target_ty) {
+            let span = stmt
+                .source()
+                .map(|s| self.node_span(s.syntax()))
+                .unwrap_or_else(|| self.token_span(&ident));
+            self.error(
+                span,
+                "T0034",
+                format!("cannot insert {source_ty} into relvar `{name}` (heading mismatch)"),
+            );
+        }
     }
 
     fn check_let_stmt(&mut self, stmt: &LetStmt, scope: &mut Scope) {
@@ -2667,6 +2735,62 @@ mod tests {
         let src = "program p; private relvar R { a: Integer } key { a }; \
                    oper main {} [ delete R where a; ];";
         assert!(codes(src).contains(&"T0020"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn insert_tuple_set_private_checks_clean() {
+        let src = "program p; private relvar R { a: Integer } key { a }; \
+                   oper main {} [ insert R { {a: 1}, {a: 2} }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn insert_relexpr_private_checks_clean() {
+        let src = "program p; \
+                   private relvar R { a: Integer } key { a }; \
+                   private relvar S { a: Integer } key { a }; \
+                   oper main {} [ insert R S; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn insert_public_in_transaction_checks_clean() {
+        let src = "program p; database greetings; \
+                   public relvar R { a: Integer } key { a }; \
+                   oper main {} [ transaction [ insert R { {a: 1} }; ] ];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn insert_public_outside_transaction_diagnoses_t0025() {
+        let src = "program p; database greetings; \
+                   public relvar R { a: Integer } key { a }; \
+                   oper main {} [ insert R { {a: 1} }; ];";
+        assert!(codes(src).contains(&"T0025"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn insert_undeclared_target_diagnoses_t0033() {
+        let src = "program p; oper main {} [ insert Nope { {a: 1} }; ];";
+        assert!(codes(src).contains(&"T0033"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn insert_heading_mismatch_diagnoses_t0034() {
+        let src = "program p; private relvar R { a: Integer } key { a }; \
+                   oper main {} [ insert R { {b: 1} }; ];";
+        assert!(codes(src).contains(&"T0034"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn insert_empty_tuple_set_diagnoses_t0018() {
+        // An empty `{}` is a zero-tuple relation literal — rejected like any
+        // empty relation literal (no heading to infer).
+        let src = "program p; private relvar R { a: Integer } key { a }; \
+                   oper main {} [ insert R {}; ];";
+        assert!(codes(src).contains(&"T0018"), "{:?}", codes(src));
     }
 
     #[test]

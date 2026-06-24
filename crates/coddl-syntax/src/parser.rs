@@ -524,6 +524,84 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
+    /// `insert <relvar> ( <tuple-set> | <expr> ) ;` — add tuples to a relvar.
+    /// After the target name, a `{` starts a brace **tuple-set**
+    /// (`{ {…}, {…} }`, parsed as a keyword-less relation literal); anything
+    /// else is a relation **expression** source (`insert R Priv`). Both forms
+    /// expose a single relation `source`, so `insert R { … }` and `insert R e`
+    /// desugar identically to `R := R union <source>` (the idempotent INSERT
+    /// shape). `insert` is a contextual keyword (the `let` precedent).
+    fn parse_insert_stmt(&mut self) {
+        debug_assert!(self.at_keyword("insert"));
+        self.start_node(SyntaxKind::INSERT_STMT);
+        self.bump(); // `insert`
+
+        // Target relvar name (a bare `NAME_REF`).
+        if self.at(SyntaxKind::IDENT) {
+            self.bump_trivia();
+            self.start_node(SyntaxKind::NAME_REF);
+            self.bump();
+            self.finish_node();
+        } else {
+            self.error("P0014", "expected relvar name after `insert`");
+        }
+
+        // Source: `{` → brace tuple-set; otherwise a relation expression.
+        if self.at(SyntaxKind::L_BRACE) {
+            self.parse_tuple_set();
+        } else {
+            let before = self.pos;
+            self.parse_expr();
+            if self.pos == before {
+                self.error("P0014", "expected a relation or `{ … }` tuple-set to insert");
+            }
+        }
+
+        if !self.eat(SyntaxKind::SEMICOLON) {
+            self.error("P0013", "expected `;` after `insert`");
+        }
+        self.finish_node();
+    }
+
+    /// `{ <tuple-lit> , … }` — a brace tuple-set, the keyword-less spelling of a
+    /// relation literal (the body is identical to `parse_relation_lit`'s, and it
+    /// builds the same `RELATION_LIT` node so the checker/lowerer treat it as a
+    /// relation source uniformly). Reuses the relation-literal tuple-body codes
+    /// (P0032 / P0033). An empty `{}` yields a zero-tuple relation literal (the
+    /// typechecker rejects it, T0018).
+    fn parse_tuple_set(&mut self) {
+        debug_assert!(self.at(SyntaxKind::L_BRACE));
+        self.bump_trivia();
+        self.start_node(SyntaxKind::RELATION_LIT);
+        self.bump(); // {
+
+        if self.eat(SyntaxKind::R_BRACE) {
+            self.finish_node();
+            return;
+        }
+
+        loop {
+            if self.at(SyntaxKind::L_BRACE) {
+                self.parse_tuple_lit();
+            } else {
+                self.error("P0032", "expected `{` to start tuple in relation literal");
+                break;
+            }
+            if !self.eat(SyntaxKind::COMMA) {
+                break;
+            }
+            // Trailing comma: `{ {a:1}, }` is the same as `{ {a:1} }`.
+            if self.at(SyntaxKind::R_BRACE) {
+                break;
+            }
+        }
+
+        if !self.eat(SyntaxKind::R_BRACE) {
+            self.error("P0033", "expected `}` to close relation literal");
+        }
+        self.finish_node();
+    }
+
     /// One statement, *or* the block's trailing tail expression. The
     /// `let` form is recognized first; otherwise an expression is
     /// parsed and either wrapped in `EXPR_STMT` (terminated by `;`)
@@ -543,6 +621,10 @@ impl<'a> Parser<'a> {
         }
         if self.at_keyword("delete") {
             self.parse_delete_stmt();
+            return;
+        }
+        if self.at_keyword("insert") {
+            self.parse_insert_stmt();
             return;
         }
 
@@ -2059,6 +2141,86 @@ mod tests {
                 .descendants()
                 .all(|n| n.kind() != SyntaxKind::DELETE_STMT),
             "`delete` as an attribute name must not parse as DELETE_STMT"
+        );
+    }
+
+    #[test]
+    fn insert_stmt_tuple_set_parses() {
+        let out = parse_str("oper main {} [ insert R { {a: 1}, {a: 2} }; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.tree.text(), "oper main {} [ insert R { {a: 1}, {a: 2} }; ];");
+        let insert = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::INSERT_STMT)
+            .expect("INSERT_STMT in tree");
+        // Target NAME_REF + the tuple-set as a (keyword-less) RELATION_LIT.
+        let kinds: Vec<_> = insert.children().map(|n| n.kind()).collect();
+        assert!(kinds.contains(&SyntaxKind::NAME_REF), "target NAME_REF in {kinds:?}");
+        assert!(
+            kinds.contains(&SyntaxKind::RELATION_LIT),
+            "tuple-set RELATION_LIT in {kinds:?}"
+        );
+        // The tuple-set has two tuple children and no `Relation` keyword token.
+        let rel = insert
+            .children()
+            .find(|n| n.kind() == SyntaxKind::RELATION_LIT)
+            .unwrap();
+        assert_eq!(
+            rel.children().filter(|n| n.kind() == SyntaxKind::TUPLE_LIT).count(),
+            2
+        );
+        assert!(!rel.text().to_string().contains("Relation"));
+    }
+
+    #[test]
+    fn insert_stmt_relexpr_parses() {
+        let out = parse_str("oper main {} [ insert R S; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let insert = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::INSERT_STMT)
+            .expect("INSERT_STMT in tree");
+        // Target then source, both NAME_REF nodes, in order.
+        let names: Vec<_> = insert
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::NAME_REF)
+            .map(|n| n.text().to_string())
+            .collect();
+        assert_eq!(names, vec!["R".to_string(), "S".to_string()]);
+    }
+
+    #[test]
+    fn insert_stmt_missing_source_diagnoses_p0014() {
+        let out = parse_str("oper main {} [ insert R ; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0014"),
+            "expected P0014, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn insert_stmt_missing_semicolon_diagnoses_p0013() {
+        let out = parse_str("oper main {} [ insert R S ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0013"),
+            "expected P0013, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn insert_remains_a_usable_identifier() {
+        // `insert` is a contextual keyword only at statement-leading position.
+        let out = parse_str("oper main {} [ let _t = Relation { {insert: 1} }; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert!(
+            out.tree
+                .descendants()
+                .all(|n| n.kind() != SyntaxKind::INSERT_STMT),
+            "`insert` as an attribute name must not parse as INSERT_STMT"
         );
     }
 

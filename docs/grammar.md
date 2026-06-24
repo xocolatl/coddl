@@ -415,8 +415,9 @@ function that implements it.
 <stmt>          ::= <let-stmt>
                   | <truncate-stmt>
                   | <delete-stmt>
+                  | <insert-stmt>
                   | <assign-stmt>
-                  | <expr> ';' ;                               -- parse_stmt (LET_STMT, TRUNCATE_STMT, DELETE_STMT, ASSIGN_STMT, or EXPR_STMT)
+                  | <expr> ';' ;                               -- parse_stmt (LET_STMT, TRUNCATE_STMT, DELETE_STMT, INSERT_STMT, ASSIGN_STMT, or EXPR_STMT)
 <assign-stmt>   ::= <expr> ':=' <expr> ';' ;                   -- parse_stmt (ASSIGN_STMT)
                     -- Relational assignment. The parser accepts any
                     -- expression as the target (LHS); the typechecker
@@ -445,6 +446,25 @@ function that implements it.
                     -- transaction for a public relvar (T0025). `delete` is a
                     -- contextual keyword (the `let` precedent), usable as an
                     -- identifier elsewhere.
+<insert-stmt>   ::= 'insert' <identifier> ( <tuple-set> | <expr> ) ';' ;
+                                                               -- parse_insert_stmt
+                    -- Add tuples to a relvar — sugar for the relational
+                    -- assignment `R := R union <source>` (the idempotent
+                    -- INSERT shape). After the target name, a `{` starts a
+                    -- brace <tuple-set>; otherwise a relation <expr> source.
+                    -- Missing target/source is P0014, missing `;` is P0013.
+                    -- The typechecker requires a bare assignable relvar
+                    -- (T0033), a transaction for a public relvar (T0025), and
+                    -- the source heading to match the relvar's (T0034).
+                    -- `insert` is a contextual keyword (the `let` precedent).
+<tuple-set>     ::= '{' [ <tuple-lit> { ',' <tuple-lit> } [ ',' ] ] '}' ;
+                                                               -- parse_tuple_set
+                    -- A brace tuple-set — the keyword-less spelling of a
+                    -- relation literal. It builds the same RELATION_LIT node
+                    -- (the body is identical to <relation-lit>'s and reuses its
+                    -- tuple-body codes P0032 / P0033), so the checker and
+                    -- lowerer treat it as a relation source uniformly. An empty
+                    -- `{}` is a zero-tuple relation literal (rejected, T0018).
 <let-stmt>      ::= 'let' <identifier> [ ':' <type-ref> ]
                     '=' <expr> ';' ;                           -- parse_let_stmt
 
@@ -657,8 +677,8 @@ is explicit, not implied:
 - **Type generators** in `<type-ref>` — `Tuple H`, `Relation H`,
   `Sequence T`.
 - **Statement forms** other than `<let-stmt>`, `<assign-stmt>`,
-  `<truncate-stmt>`, `<delete-stmt>`, and `<expr> ';'` — `mut`,
-  `return`, `insert`, `update`.
+  `<truncate-stmt>`, `<delete-stmt>`, `<insert-stmt>`, and `<expr> ';'`
+  — `mut`, `return`, `update`.
 - **Type / relvar / constraint declarations** at the top level.
 - **Literals**: sequence `[ … ]` in expression position. (Tuple
   `{ … }` literals and dot-prefix field access landed in Phase 18.

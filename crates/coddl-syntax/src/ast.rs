@@ -315,14 +315,16 @@ impl Block {
 /// assignment to a relvar (`R := <expr>;`); `Truncate` clears a relvar
 /// (`truncate R;`, sugar for `R := R minus R`); `Delete` removes matching
 /// tuples (`delete R where p;`, sugar for `R := R minus (R where p)`);
-/// `ExprStmt` evaluates an expression and discards the result. `mut` /
-/// `return` / `insert` / `update` arrive when their semantics are settled.
+/// `Insert` adds tuples (`insert R <source>;`, sugar for `R := R union
+/// <source>`); `ExprStmt` evaluates an expression and discards the result.
+/// `mut` / `return` / `update` arrive when their semantics are settled.
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Let(LetStmt),
     Assign(AssignStmt),
     Truncate(TruncateStmt),
     Delete(DeleteStmt),
+    Insert(InsertStmt),
     ExprStmt(ExprStmt),
 }
 
@@ -333,6 +335,7 @@ impl Stmt {
             SyntaxKind::ASSIGN_STMT => Stmt::Assign(AssignStmt { syntax }),
             SyntaxKind::TRUNCATE_STMT => Stmt::Truncate(TruncateStmt { syntax }),
             SyntaxKind::DELETE_STMT => Stmt::Delete(DeleteStmt { syntax }),
+            SyntaxKind::INSERT_STMT => Stmt::Insert(InsertStmt { syntax }),
             SyntaxKind::EXPR_STMT => Stmt::ExprStmt(ExprStmt { syntax }),
             _ => return None,
         })
@@ -344,6 +347,7 @@ impl Stmt {
             Stmt::Assign(s) => s.syntax(),
             Stmt::Truncate(s) => s.syntax(),
             Stmt::Delete(s) => s.syntax(),
+            Stmt::Insert(s) => s.syntax(),
             Stmt::ExprStmt(s) => s.syntax(),
         }
     }
@@ -417,6 +421,24 @@ impl DeleteStmt {
     /// mandatory (T0052 otherwise — use `truncate`).
     pub fn operand(&self) -> Option<Expr> {
         self.syntax.children().find_map(Expr::cast)
+    }
+}
+
+ast_node!(pub InsertStmt, INSERT_STMT);
+
+impl InsertStmt {
+    /// The target relvar — the first `Expr` child (a bare `NAME_REF`). The
+    /// typechecker requires a name bound to an assignable relvar (T0033).
+    pub fn target(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// The relation source — the second `Expr` child. For the brace tuple-set
+    /// form it is a (keyword-less) `RELATION_LIT`; for the relexpr form it is
+    /// the relation expression. Either way it must match the target's heading
+    /// (T0034).
+    pub fn source(&self) -> Option<Expr> {
+        self.syntax.children().filter_map(Expr::cast).nth(1)
     }
 }
 

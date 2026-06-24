@@ -40,11 +40,14 @@ oper main {} [
     // Remove every tuple that also appears in Stale (matched on every attribute).
     Greetings := Greetings minus Stale;
 
-    // Add every tuple in NewArrivals not already present (set union — idempotent).
-    Greetings := Greetings union NewArrivals;
+    // Add every tuple in NewArrivals not already present. `insert Greetings
+    // NewArrivals` is the relation-source form, sugar for `Greetings :=
+    // Greetings union NewArrivals` (a set union — idempotent).
+    insert Greetings NewArrivals;
 
-    // Add a literal tuple (same union, an in-memory right operand).
-    Greetings := Greetings union Relation { { id: 6, message: "hi there" } };
+    // Add a literal tuple. `insert Greetings { … }` is the brace tuple-set
+    // form, sugar for `Greetings := Greetings union Relation { … }`.
+    insert Greetings { { id: 6, message: "hi there" } };
 
     // Update one tuple: keep the rows that don't match, replace the value of the
     // one that does. (A future `update` statement will be sugar for this union.)

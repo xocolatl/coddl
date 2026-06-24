@@ -38,18 +38,20 @@ oper main {} [
         Greetings := Greetings minus Stale;
     ];
 
-    // Add every NewArrivals tuple not already present. `Greetings union
-    // NewArrivals` keeps Greetings a set, so an already-present tuple is a no-op
-    // (idempotent): an `INSERT INTO greetings ... WHERE NOT EXISTS (...)`.
+    // Add every NewArrivals tuple not already present. `insert Greetings
+    // NewArrivals` is the relation-source form, sugar for `Greetings :=
+    // Greetings union NewArrivals` — NewArrivals is SQL-backed, so its rows push
+    // as an `INSERT INTO greetings ... WHERE NOT EXISTS (...)` (idempotent).
     transaction [
-        Greetings := Greetings union NewArrivals;
+        insert Greetings NewArrivals;
     ];
 
-    // Add a literal tuple. The right operand isn't SQL-backed, so its rows are
-    // shipped from the process into greetings as a batched `VALUES` insert
-    // (still idempotent, still no temp table).
+    // Add a literal tuple. `insert Greetings { … }` is the brace tuple-set
+    // form (sugar for `Greetings := Greetings union Relation { … }`); the rows
+    // aren't SQL-backed, so they ship from the process as a batched `VALUES`
+    // insert (still idempotent, still no temp table).
     transaction [
-        Greetings := Greetings union Relation { { id: 6, message: "hi there" } };
+        insert Greetings { { id: 6, message: "hi there" } };
     ];
 
     // Update one tuple: keep the rows that don't match, and replace the value of
