@@ -110,6 +110,11 @@
                     "match": "\\ball\\s+but\\b"
                 },
                 {
+                    "comment": "DML statement verbs — sugar for relational assignment (truncate R; delete R where p; insert R …; update R …). Contextual keywords (statement-leading only), coloured unconditionally like the relational keywords above.",
+                    "name": "keyword.other.dml.coddl",
+                    "match": "\\b(insert|update|delete|truncate)\\b"
+                },
+                {
                     "name": "keyword.operator.logical.coddl",
                     "match": "\\b(and|or|not)\\b"
                 },
