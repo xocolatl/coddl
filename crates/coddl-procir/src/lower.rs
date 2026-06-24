@@ -25,7 +25,9 @@ use coddl_syntax::ast::{
 use coddl_syntax::SyntaxKind;
 use coddl_types::{check, Heading, RelvarKind, RelvarTable, Type};
 
-use coddl_relir::{CmpOp, Literal as RelLiteral, Predicate, RelExpr, ScalarBinOp, ScalarExpr};
+use coddl_relir::{
+    CmpOp, Literal as RelLiteral, Predicate, RelExpr, ScalarBinOp, ScalarExpr, StorageOrigin,
+};
 use coddl_sqlemit::{
     emit_assignment, emit_insert_template, emit_replace_insert, emit_truncate, Dialect, SqlQuery,
     Value,
@@ -1362,6 +1364,7 @@ impl Lowerer {
         if let Some(v) = self.try_lower_pushed(expr) {
             return v;
         }
+        self.guard_no_full_relvar_pull(expr);
         match expr {
             Expr::Literal(lit) => self.lower_literal(lit),
             Expr::Call(call) => self.lower_call(call),
@@ -1380,6 +1383,74 @@ impl Lowerer {
             Expr::Extend(e) => self.lower_extend_expr(e),
             Expr::Tclose(t) => self.lower_tclose_expr(t),
             Expr::NameRef(n) => self.lower_name_ref(n),
+        }
+    }
+
+    /// Development tripwire for the scalability gap S1 in `.local/optimizations.md`.
+    ///
+    /// `expr` is a relational expression the cut just *declined* to push (we're
+    /// past the `try_lower_pushed` miss). If one of its relational operands is an
+    /// **unfiltered public-relvar scan** — relvar-rooted with no pushed
+    /// restriction, i.e. a `SELECT … FROM t` over the whole table — then lowering
+    /// this operator in-process pulls every row of that relvar into memory to do
+    /// work the backend should have done. That doesn't scale, so panic to surface
+    /// the gap.
+    ///
+    /// Deliberately narrow, matching the rule "pulling a whole *query* is fine,
+    /// pulling a whole *public relvar* to process in-process is not":
+    /// - `transaction [ Greetings ]` never reaches here — a bare relvar pushes as
+    ///   a query (the result *is* the whole relvar; that's the user's query).
+    /// - `Greetings where <nonpushable p>` fires — the `where` declined, but the
+    ///   operand `Greetings` is a full-table scan feeding an in-process filter.
+    /// - `(Greetings where <pushable p>) where <nonpushable q>` does *not* fire —
+    ///   the operand carries a pushed `Restrict`, so a filtered subset (a query),
+    ///   not the whole relvar, is pulled.
+    /// - Genuinely in-memory operands (relation literals, `private` relvars,
+    ///   prior in-process results) are not relvar-rooted, so they never fire.
+    ///
+    /// Becomes a proper partial-pushdown / `MaterializeAtBoundary` decision once
+    /// that lands (`docs/relir.md`); until then it's a loud "needs pushdown work".
+    fn guard_no_full_relvar_pull(&self, expr: &Expr) {
+        let operands: Vec<Expr> = match expr {
+            Expr::Binary(b) => match b.op_kind() {
+                // `where`'s relational operand is the lhs (rhs is the predicate).
+                Some(BinaryOp::Where) => b.lhs().into_iter().collect(),
+                // The AND/OR-family binaries take two relational operands.
+                Some(
+                    BinaryOp::Join
+                    | BinaryOp::Times
+                    | BinaryOp::Intersect
+                    | BinaryOp::Compose
+                    | BinaryOp::Union
+                    | BinaryOp::Minus,
+                ) => b.lhs().into_iter().chain(b.rhs()).collect(),
+                // A scalar binary (arithmetic / comparison / logical) is not a
+                // relational operator — nothing to guard.
+                _ => return,
+            },
+            Expr::Project(p) => p.input().into_iter().collect(),
+            Expr::Replace(r) => r.input().into_iter().collect(),
+            Expr::Rename(r) => r.input().into_iter().collect(),
+            Expr::Wrap(w) => w.input().into_iter().collect(),
+            Expr::Unwrap(u) => u.input().into_iter().collect(),
+            Expr::Extend(e) => e.input().into_iter().collect(),
+            Expr::Tclose(t) => t.input().into_iter().collect(),
+            _ => return,
+        };
+        for operand in operands {
+            let Some(rel) = self.build_rel_expr(&operand) else {
+                continue;
+            };
+            if rel.origin() == StorageOrigin::RelvarRooted && !contains_restrict(&rel) {
+                panic!(
+                    "pushdown gap (S1): an in-process relational operator would pull the \
+                     whole public relvar `{}` into memory (an unfiltered `SELECT … FROM` \
+                     feeding in-process work). The cut could not push this subtree — it \
+                     needs pushdown / partial-materialization work. See \
+                     .local/optimizations.md S1.",
+                    relvar_root_name(&rel).unwrap_or("?"),
+                );
+            }
         }
     }
 
@@ -3257,6 +3328,48 @@ fn attr_ref_name(expr: &Expr) -> Option<String> {
     }
 }
 
+/// Whether a RelIR subtree contains any `Restrict` — a pushed `where` that
+/// reduces cardinality. Used by [`Lowerer::guard_no_full_relvar_pull`] to tell a
+/// full-relvar scan (no `Restrict`, the whole table) from a filtered query
+/// (a `Restrict` pushed). `Restrict` is the only row-reducing node today;
+/// `Project`/`Rename`/`Extend`/`Wrap`/`Unwrap`/`TClose` only reshape, and the
+/// set-ops/join recurse into both operands.
+fn contains_restrict(rel: &RelExpr) -> bool {
+    match rel {
+        RelExpr::Restrict { .. } => true,
+        RelExpr::Project { input, .. }
+        | RelExpr::Rename { input, .. }
+        | RelExpr::Extend { input, .. }
+        | RelExpr::TClose { input }
+        | RelExpr::Wrap { input, .. }
+        | RelExpr::Unwrap { input, .. } => contains_restrict(input),
+        RelExpr::And { lhs, rhs } | RelExpr::Or { lhs, rhs } | RelExpr::Minus { lhs, rhs } => {
+            contains_restrict(lhs) || contains_restrict(rhs)
+        }
+        RelExpr::RelvarRef { .. } | RelExpr::MaterializedRelvar { .. } => false,
+    }
+}
+
+/// The application-level name of the public relvar a RelIR subtree is rooted in
+/// (following the `lhs` of binary nodes), for the [`Lowerer::guard_no_full_relvar_pull`]
+/// panic message. `None` for a materialized root.
+fn relvar_root_name(rel: &RelExpr) -> Option<&str> {
+    match rel {
+        RelExpr::RelvarRef { name, .. } => Some(name),
+        RelExpr::Restrict { input, .. }
+        | RelExpr::Project { input, .. }
+        | RelExpr::Rename { input, .. }
+        | RelExpr::Extend { input, .. }
+        | RelExpr::TClose { input }
+        | RelExpr::Wrap { input, .. }
+        | RelExpr::Unwrap { input, .. } => relvar_root_name(input),
+        RelExpr::And { lhs, .. } | RelExpr::Or { lhs, .. } | RelExpr::Minus { lhs, .. } => {
+            relvar_root_name(lhs)
+        }
+        RelExpr::MaterializedRelvar { .. } => None,
+    }
+}
+
 /// Convert a `record_layout` attribute kind tag to its machine-level
 /// `ProcType`. Mirrors the runtime's `CoddlAttrKind`. Used by the
 /// predicate-function synthesis to type the per-attribute `AttrLoad`
@@ -3692,6 +3805,59 @@ oper main {}\n\
     ];\n\
     write_line { message: g.message };\n\
 ];\n";
+
+    const HELLO_WORLD_DB_OR_WHERE: &str = "\
+program hello_world_db;\n\
+database greetings;\n\
+\n\
+public relvar Greetings {\n\
+    id: Integer,\n\
+    message: Text,\n\
+}\n\
+key { id };\n\
+\n\
+oper main {}\n\
+[\n\
+    let g = transaction [\n\
+        Greetings where id = 1 or id = 2\n\
+    ];\n\
+];\n";
+
+    #[test]
+    #[should_panic(expected = "pushdown gap")]
+    fn nonpushable_where_over_whole_public_relvar_trips_the_guard() {
+        // `Greetings where (id = 1 or id = 2)` — the disjunction doesn't push, so
+        // the whole `where` declines and its operand `Greetings` is an unfiltered
+        // full-table scan feeding an in-process filter: pulling the whole relvar
+        // into memory. The S1 tripwire fires.
+        let _ = lower_ok_with_plan(HELLO_WORLD_DB_OR_WHERE, &greetings_plan());
+    }
+
+    const HELLO_WORLD_DB_PARTIAL_WHERE: &str = "\
+program hello_world_db;\n\
+database greetings;\n\
+\n\
+public relvar Greetings {\n\
+    id: Integer,\n\
+    message: Text,\n\
+}\n\
+key { id };\n\
+\n\
+oper main {}\n\
+[\n\
+    let g = transaction [\n\
+        Greetings where id = 1 where id = 2 or id = 3\n\
+    ];\n\
+];\n";
+
+    #[test]
+    fn pushed_filter_then_residual_does_not_trip_the_guard() {
+        // `(Greetings where id = 1) where (id = 2 or id = 3)` — the inner `where`
+        // pushes (`WHERE id = 1`), so only a filtered subset (a query) is pulled;
+        // the residual disjunction runs in-process over it. Not a whole-relvar
+        // pull, so the guard stays quiet (it would panic if it fired).
+        let _ = lower_ok_with_plan(HELLO_WORLD_DB_PARTIAL_WHERE, &greetings_plan());
+    }
 
     #[test]
     fn conjunctive_where_pushes_as_one_select_with_and() {
