@@ -1348,6 +1348,33 @@ mod tests {
     }
 
     #[test]
+    fn nested_restricts_coalesce_into_one_where_with_and() {
+        // `Greetings where id = 1 where message = "hi"` is two stacked
+        // `Restrict`s; `resolve` walks both and pushes each predicate into one
+        // `WHERE`, joined by `AND` — a single `SELECT`, never a subquery per
+        // `where`. (The conjunction `where id = 1 and message = "hi"` lowers to
+        // this exact tree, so the two spellings emit identical SQL.)
+        let expr = RelExpr::Restrict {
+            input: Box::new(where_id_1(greetings())),
+            pred: Predicate::AttrCmp {
+                op: CmpOp::Eq,
+                attr: "message".to_string(),
+                value: Literal::Text("hi".to_string()),
+            },
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ? AND "message" = ?"#
+        );
+        assert_eq!(q.sql.param_count, 2);
+        assert_eq!(
+            q.params,
+            vec![Value::Integer(1), Value::Text("hi".to_string())]
+        );
+    }
+
+    #[test]
     fn bare_relvar_drops_distinct() {
         // A full relvar read keeps its key → already a set → no `DISTINCT`.
         let q = emit_select(&greetings(), Dialect::SQLite).unwrap();

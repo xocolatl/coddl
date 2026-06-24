@@ -2147,6 +2147,35 @@ impl Lowerer {
         }
     }
 
+    /// Flatten a `where` predicate into pushable conjuncts, in left-to-right
+    /// order. A top-level `and` chain (`p and q and …`) splits into its operands
+    /// recursively; each leaf must be a pushable `attr <cmp> literal`
+    /// ([`build_predicate`]). Returns `false` as soon as any leaf isn't pushable
+    /// (leaving `out` partially filled — the caller discards it and declines the
+    /// whole push, so the restriction runs in-process where arbitrary Boolean
+    /// predicates are evaluated per tuple). `where` is heading-preserving, so all
+    /// conjuncts resolve against the same `heading`. The resulting one-`Restrict`-
+    /// per-conjunct tree is exactly what stacked `R where p where q` builds, so
+    /// the two spellings emit identical SQL (`resolve` ANDs them in one `WHERE`).
+    fn collect_conjuncts(&self, expr: &Expr, heading: &Heading, out: &mut Vec<Predicate>) -> bool {
+        if let Expr::Binary(b) = expr {
+            if matches!(b.op_kind(), Some(BinaryOp::And)) {
+                let (Some(lhs), Some(rhs)) = (b.lhs(), b.rhs()) else {
+                    return false;
+                };
+                return self.collect_conjuncts(&lhs, heading, out)
+                    && self.collect_conjuncts(&rhs, heading, out);
+            }
+        }
+        match self.build_predicate(expr, heading) {
+            Some(p) => {
+                out.push(p);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Recognize a single `attr = literal` (or `literal = attr`) restriction
     /// predicate over `heading`. Anything else (conjunctions, attr-vs-attr,
     /// non-literal operands, comparisons other than `=`) returns `None` so
@@ -2522,11 +2551,28 @@ impl Lowerer {
         match b.op_kind() {
             Some(BinaryOp::Where) => {
                 let input = self.build_rel_expr(&b.lhs()?)?;
-                let pred = self.build_predicate(&b.rhs()?, &input.heading())?;
-                Some(RelExpr::Restrict {
-                    input: Box::new(input),
-                    pred,
-                })
+                let heading = input.heading();
+                // Decompose a conjunctive predicate `p and q and …` into one
+                // `Restrict` per conjunct — the identical RelIR `R where p where
+                // q` produces, which `coddl-sqlemit`'s `resolve` then coalesces
+                // into a single `WHERE p AND q`. So the two surface spellings
+                // converge on one pushed query. Declines the whole push (→ the
+                // in-process `where` path, which evaluates arbitrary Boolean
+                // predicates per tuple) if any conjunct isn't a pushable
+                // `attr <cmp> literal`. `where` is heading-preserving, so every
+                // conjunct resolves against the same operand `heading`.
+                let mut preds = Vec::new();
+                if !self.collect_conjuncts(&b.rhs()?, &heading, &mut preds) {
+                    return None;
+                }
+                let mut expr = input;
+                for pred in preds {
+                    expr = RelExpr::Restrict {
+                        input: Box::new(expr),
+                        pred,
+                    };
+                }
+                Some(expr)
             }
             // `join` / `times` / `intersect` all lower to the A-core `AND`
             // node: `intersect` is `AND` on identical headings (a join on every
@@ -3627,6 +3673,57 @@ oper main {}\n\
         // The compile path never clones a RelExpr — `relir` stays empty.
         let out = lower_with_plan(HELLO_WORLD_DB, FileId(0), Some(&greetings_plan()));
         assert!(out.relir.is_empty());
+    }
+
+    const HELLO_WORLD_DB_CONJUNCT: &str = "\
+program hello_world_db;\n\
+database greetings;\n\
+\n\
+public relvar Greetings {\n\
+    id: Integer,\n\
+    message: Text,\n\
+}\n\
+key { id };\n\
+\n\
+oper main {}\n\
+[\n\
+    let g = transaction [\n\
+        extract (Greetings where id = 1 and message = \"hi\")\n\
+    ];\n\
+    write_line { message: g.message };\n\
+];\n";
+
+    #[test]
+    fn conjunctive_where_pushes_as_one_select_with_and() {
+        // `R where p and q` decomposes into one `Restrict` per conjunct — the
+        // same tree `R where p where q` builds — and `resolve` coalesces them
+        // into a single `WHERE p AND q`. So the conjunction form pushes (it used
+        // to decline and run in-process) and matches the stacked spelling.
+        let out = explain_with_plan(HELLO_WORLD_DB_CONJUNCT, FileId(0), Some(&greetings_plan()));
+        assert_eq!(out.relir.len(), 1, "one pushed query expected");
+        let entry = &out.relir[0];
+        assert_eq!(
+            entry.sql,
+            // Conjuncts in source order; full heading keeps key `id` → no DISTINCT.
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ? AND "message" = ?"#
+        );
+        assert_eq!(
+            entry.expr.render(),
+            "Restrict { message = \"hi\" }\n  \
+             Restrict { id = 1 }\n    \
+             RelvarRef Greetings { db: greetings, table: greetings }"
+        );
+
+        // It really pushed: no in-process predicate helper was synthesized.
+        let m = lower_ok_with_plan(HELLO_WORLD_DB_CONJUNCT, &greetings_plan());
+        assert!(
+            !m.functions
+                .iter()
+                .any(|f| f.name.starts_with("__coddl_where_")),
+            "conjunctive where should push, not synthesize a predicate helper:\n{m}"
+        );
+        assert_eq!(m.plans.len(), 1, "exactly one baked plan");
+        assert_eq!(m.plans[0].param_count, 2, "two bound conjunct literals");
     }
 
     #[test]

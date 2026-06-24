@@ -17,10 +17,17 @@ This doc describes the **target** RelIR. The code implements a thin slice of it;
 - **The cut** as a trivial origin gate — *not* a cost model: push a subtree iff every leaf is relvar-rooted and SQL emission succeeds (`coddl-procir/src/cut.rs`).
 - **SQL pushdown** of relvar-rooted `RelvarRef` / `Restrict` / `Project` / `Rename` via `coddl-sqlemit`.
 - An **in-process path** for non-pushable subtrees — currently lowered to ProcIR within `coddl-procir` itself (not yet through `coddl-execlocal`).
-- Restriction predicates limited to a single `attr <cmp> literal`
+- Restriction predicates are an `attr <cmp> literal` comparison
   (`Predicate::AttrCmp { attr, op: CmpOp, value }`), where `<cmp>` is `=`/`<>`
   (Integer/Text/Boolean) or `<`/`<=`/`>`/`>=` (Integer). Only `=` pins a value,
   so only it bounds cardinality for `DISTINCT`-elision.
+- A **conjunctive `where`** (`R where p and q and …`) of pushable comparisons
+  pushes: the lowerer (`collect_conjuncts`) splits it into one `Restrict` per
+  conjunct — the identical tree the stacked spelling `R where p where q` builds —
+  and SQL emission's `resolve` coalesces stacked `Restrict`s into a single
+  `WHERE p AND q …`. So the two spellings emit one identical `SELECT`; if *any*
+  conjunct isn't pushable the whole restriction declines and runs in-process.
+  (Disjunction is not yet a predicate; an `or` still declines the push.)
 
 **Designed, not yet built**
 
@@ -29,7 +36,7 @@ This doc describes the **target** RelIR. The code implements a thin slice of it;
 - The **optimizer** and **cost model**, the `MaterializeAtBoundary` node, and mixed-origin handling beyond the `StorageOrigin::Mixed` flag.
 - The per-node **FD set** and **constraint set** (only heading, origin, and leaf keys exist today).
 - `coddl-execlocal` (an empty stub) as the RelIR→ProcIR consumer, and the runtime RelIR interpreter (the dynamic path).
-- Pushdown / predicate surface beyond a single `attr <cmp> literal` — conjunction/disjunction, attribute-vs-attribute, arithmetic in predicates, subset/superset. (Scalar comparisons `=`/`<>`/`<`/`<=`/`>`/`>=` already push.)
+- Pushdown / predicate surface beyond `attr <cmp> literal` comparisons and their conjunctions — disjunction, attribute-vs-attribute, arithmetic in predicates, subset/superset. (Scalar comparisons `=`/`<>`/`<`/`<=`/`>`/`>=` and `and`-chains of them already push.)
 
 ## Why Algebra A
 
