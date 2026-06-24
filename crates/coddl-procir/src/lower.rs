@@ -20,7 +20,7 @@ use coddl_syntax::ast::{
     ExtendExpr, FieldAccess, Item,
     LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, RenameExpr,
     ReplaceExpr, Root, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit, UnaryExpr, UnaryOp,
-    UnwrapExpr, WrapExpr,
+    UnwrapExpr, UpdateStmt, WrapExpr,
 };
 use coddl_syntax::SyntaxKind;
 use coddl_types::{check, Heading, RelvarKind, RelvarTable, Type};
@@ -766,6 +766,7 @@ impl Lowerer {
                 Stmt::Truncate(t) => self.lower_truncate_stmt(&t),
                 Stmt::Delete(d) => self.lower_delete_stmt(&d),
                 Stmt::Insert(i) => self.lower_insert_stmt(&i),
+                Stmt::Update(u) => self.lower_update_stmt(&u),
                 Stmt::ExprStmt(e) => self.lower_expr_stmt(&e),
             }
         }
@@ -992,6 +993,151 @@ impl Lowerer {
             self.insts.push(Inst::Release { src });
         }
         true
+    }
+
+    /// Lower `update R where p { c: e };` — overwrite named attributes of the
+    /// matching tuples. It desugars to `R := (R where ¬p) union ((R where p)
+    /// «sub»)` (`UPDATE t SET … WHERE p`), or a bare substitute over `R` for
+    /// update-all. A **public** relvar pushes through `emit_assignment`'s update
+    /// arm; a **private** relvar computes the union (or the bare substitute) in
+    /// process and stores it back into its slot.
+    fn lower_update_stmt(&mut self, stmt: &UpdateStmt) {
+        let Some(operand) = stmt.operand() else { return };
+        // Root relvar + the `where`-restriction, if any. The operand is `R` or
+        // `R where p` (typecheck guaranteed the shape).
+        let (root_expr, has_where) = match &operand {
+            Expr::NameRef(_) => (operand.clone(), false),
+            Expr::Binary(b) if matches!(b.op_kind(), Some(BinaryOp::Where)) => {
+                let Some(lhs) = b.lhs() else { return };
+                (lhs, true)
+            }
+            _ => return,
+        };
+        let Expr::NameRef(target) = &root_expr else { return };
+        let Some(name_tok) = target.ident() else { return };
+        let name = name_tok.text().to_string();
+
+        // Collect the `{ target: value }` pairs (typecheck guaranteed each side).
+        let mut pairs: Vec<(String, Expr)> = Vec::new();
+        for (nt, v) in stmt.pairs() {
+            let (Some(nt), Some(v)) = (nt, v) else { return };
+            pairs.push((nt.text().to_string(), v));
+        }
+        // `update` overwrites the target attributes — drop them (regardless of
+        // what the values read), unlike `replace` which drops the read attrs.
+        let removed: HashSet<String> = pairs.iter().map(|(n, _)| n.clone()).collect();
+
+        // Public target → surgical UPDATE via the substitute-union shape.
+        if self.public_relvars.contains_key(&name) {
+            self.lower_public_update(&name, &root_expr, &operand, has_where, &pairs, &removed);
+            return;
+        }
+
+        // Private target → compute the result in process. The substitute runs
+        // over the matching rows `R where p` (or all rows `R` for update-all).
+        let matching = if has_where {
+            self.lower_expr(&operand)
+        } else {
+            self.lower_expr(&root_expr)
+        };
+        let changed = self.emit_substitute(matching, pairs, removed);
+        let result = if has_where {
+            // unchanged = R minus (R where p) ≡ R where ¬p (no AST-level negation).
+            let r = self.lower_expr(&root_expr);
+            let matching_again = self.lower_expr(&operand);
+            let unchanged = self.emit_minus(r, matching_again);
+            self.emit_union(unchanged, changed)
+        } else {
+            changed
+        };
+        self.used_private_relvars.insert(name.clone());
+        self.insts.push(Inst::RelvarSlotStore { name, value: result });
+    }
+
+    /// Lower the public (SQL-backed) `update`: build `Or{ Restrict(t, ¬p),
+    /// «sub»(Restrict(t, p)) }` (update-where) or a bare `«sub»(RelvarRef(t))`
+    /// (update-all) and route it through `emit_assignment` → `emit_update`. A
+    /// `where`-predicate that isn't a single pushable comparison, or a value the
+    /// SQL renderer can't express, declines with T0049 (never a silent wipe).
+    fn lower_public_update(
+        &mut self,
+        name: &str,
+        root_expr: &Expr,
+        operand: &Expr,
+        has_where: bool,
+        pairs: &[(String, Expr)],
+        removed: &HashSet<String>,
+    ) {
+        let Some(dialect) = self.require_public_write(name, root_expr) else {
+            return;
+        };
+        let Some(target_rel) = self.build_rel_expr(root_expr) else {
+            return;
+        };
+
+        // The substitute input (`Restrict(t, p)` or `RelvarRef(t)`) and, for
+        // update-where, the complement `Restrict(t, ¬p)`.
+        let (sub_input, complement) = if has_where {
+            let Some(restrict) = self.build_rel_expr(operand) else {
+                self.decline_public_update(name, operand);
+                return;
+            };
+            let RelExpr::Restrict { input: base, pred } = &restrict else {
+                self.decline_public_update(name, operand);
+                return;
+            };
+            // The only `Predicate` form is a single comparison; negate it.
+            let Predicate::AttrCmp { attr, op, value } = pred;
+            let complement = RelExpr::Restrict {
+                input: base.clone(),
+                pred: Predicate::AttrCmp {
+                    attr: attr.clone(),
+                    op: op.negate(),
+                    value: value.clone(),
+                },
+            };
+            (restrict, Some(complement))
+        } else {
+            (target_rel.clone(), None)
+        };
+
+        // Build the substitute pairs (scalar + type); a non-pushable value
+        // declines. `removed` = the target attrs.
+        let in_heading = sub_input.heading();
+        let mut sub_pairs: Vec<(String, Type, ScalarExpr)> = Vec::new();
+        for (attr, value) in pairs {
+            let Some(scalar) = self.build_scalar_expr(value) else {
+                self.decline_public_update(name, operand);
+                return;
+            };
+            let ty = scalar_result_type(&scalar, &in_heading);
+            sub_pairs.push((attr.clone(), ty, scalar));
+        }
+        let substitute = self.build_substitute_chain(sub_input, sub_pairs, removed.clone());
+
+        let value_rel = match complement {
+            Some(c) => RelExpr::Or {
+                lhs: Box::new(c),
+                rhs: Box::new(substitute),
+            },
+            None => substitute,
+        };
+
+        match emit_assignment(&target_rel, &value_rel, dialect) {
+            Ok(query) => self.emit_dml(query),
+            Err(_) => self.decline_public_update(name, operand),
+        }
+    }
+
+    /// Decline a public `update` that isn't a recognized surgical shape (a
+    /// compound/unpushable predicate, or a value the SQL renderer can't express)
+    /// — surface T0049 rather than a hydrating rewrite.
+    fn decline_public_update(&mut self, name: &str, span_node: &Expr) {
+        self.diagnostics.push(Diagnostic::error(
+            self.node_span(span_node.syntax()),
+            "T0049",
+            format!("cannot update public relvar `{name}`: not a recognized surgical shape"),
+        ));
     }
 
     /// Public-write preflight shared by relational assignment and the verb
@@ -1249,17 +1395,15 @@ impl Lowerer {
             .map(|e| self.lower_expr(&e))
             .expect("typechecked replace has a relation operand");
 
-        // Classify pairs into extend values and temp renames (a temp is needed
-        // only when the new name collides with a surviving attribute), plus the
-        // attributes the values read (the removed set).
+        // `replace` removes the attributes each value *reads* (compute-and-
+        // consume); collect that set, then emit the shared substitute chain.
         let src_heading_id = match self.value_type(src) {
             ProcType::Relation(id) => id,
             other => unreachable!("replace on non-relation `{other}` survived typecheck"),
         };
         let in_heading = self.headings[src_heading_id.0 as usize].clone();
-        let mut extend_pairs: Vec<(String, Expr)> = Vec::new();
+        let mut pairs: Vec<(String, Expr)> = Vec::new();
         let mut removed: HashSet<String> = HashSet::new();
-        let mut renames: Vec<(String, String)> = Vec::new();
         for (name_tok, value) in re.pairs() {
             let new = name_tok.expect("typechecked replace pair has a name").text().to_string();
             let value = value.expect("typechecked replace pair has a value");
@@ -1270,6 +1414,31 @@ impl Lowerer {
                     removed.insert(r);
                 }
             }
+            pairs.push((new, value));
+        }
+        self.emit_substitute(src, pairs, removed)
+    }
+
+    /// Emit the in-process substitute chain over `src` (`extend → project all-but
+    /// → rename`), overwriting each `(new, value)` pair and dropping the
+    /// attributes in `removed`. A pair whose `new` already exists is extended
+    /// under a temp and renamed back. Shared by `replace` (removed = the attrs
+    /// the values read) and `update` (removed = the target attrs). Releases each
+    /// consumed intermediate (and `src` when no local owns it).
+    fn emit_substitute(
+        &mut self,
+        src: ValueId,
+        pairs: Vec<(String, Expr)>,
+        removed: HashSet<String>,
+    ) -> ValueId {
+        let src_heading_id = match self.value_type(src) {
+            ProcType::Relation(id) => id,
+            other => unreachable!("substitute on non-relation `{other}` survived typecheck"),
+        };
+        let in_heading = self.headings[src_heading_id.0 as usize].clone();
+        let mut extend_pairs: Vec<(String, Expr)> = Vec::new();
+        let mut renames: Vec<(String, String)> = Vec::new();
+        for (new, value) in pairs {
             let extend_name = if in_heading.lookup(&new).is_some() {
                 let t = format!("__coddl_replace_tmp_{new}");
                 renames.push((t.clone(), new));
@@ -1791,56 +1960,20 @@ impl Lowerer {
             Expr::Replace(r) => {
                 let input = self.build_rel_expr(&r.input()?)?;
                 // Every value computes (a bare-ref relabel is rejected by
-                // typecheck → `rename`): desugar to `Rename{Project{Extend}}` —
-                // extend each value (under a temp `__t` when the new name
-                // collides), project away the attributes the values read, and
-                // rename the temps back to their targets.
+                // typecheck → `rename`): build the substitute chain, removing the
+                // attributes each value *reads* (compute-and-consume).
                 let in_heading = input.heading();
-                let mut extends: Vec<(String, Type, ScalarExpr)> = Vec::new();
+                let mut pairs: Vec<(String, Type, ScalarExpr)> = Vec::new();
                 let mut removed: HashSet<String> = HashSet::new();
-                let mut renames: Vec<(String, String)> = Vec::new();
                 for (name_tok, value) in r.pairs() {
                     let new = name_tok?.text().to_string();
                     let value = value?;
                     let scalar = self.build_scalar_expr(&value)?;
                     scalar_attr_refs(&scalar, &mut removed);
                     let ty = scalar_result_type(&scalar, &in_heading);
-                    // A temp is needed only when `new` already exists (in-place /
-                    // replacing an attribute). Each pair's `new` is unique within
-                    // a `replace` (the typechecker rejects duplicate targets), so
-                    // a `new`-derived temp name is unique; the `__` prefix can't
-                    // collide with user attributes (E0007).
-                    let extend_name = if in_heading.lookup(&new).is_some() {
-                        let t = format!("__coddl_replace_tmp_{new}");
-                        renames.push((t.clone(), new));
-                        t
-                    } else {
-                        new
-                    };
-                    extends.push((extend_name, ty, scalar));
+                    pairs.push((new, ty, scalar));
                 }
-                // keep = (operand attrs ∪ extend-names) minus the read attrs.
-                let keep: Vec<String> = in_heading
-                    .attrs()
-                    .iter()
-                    .map(|(n, _)| n.clone())
-                    .chain(extends.iter().map(|(n, _, _)| n.clone()))
-                    .filter(|n| !removed.contains(n))
-                    .collect();
-                let mut node = RelExpr::Project {
-                    input: Box::new(RelExpr::Extend {
-                        input: Box::new(input),
-                        extends,
-                    }),
-                    keep,
-                };
-                if !renames.is_empty() {
-                    node = RelExpr::Rename {
-                        input: Box::new(node),
-                        renames,
-                    };
-                }
-                Some(node)
+                Some(self.build_substitute_chain(input, pairs, removed))
             }
             Expr::Rename(r) => {
                 // A pure relabel → one `Rename` node (pushes as `col AS new`).
@@ -1919,6 +2052,55 @@ impl Lowerer {
             }
             _ => None,
         }
+    }
+
+    /// Build the substitute chain `Rename?(Project(Extend(input)))` that
+    /// overwrites each `(new, type, scalar)` pair, dropping the attributes in
+    /// `removed`. A pair whose `new` already exists in the heading is extended
+    /// under a temp `__coddl_replace_tmp_<new>` and renamed back (so the Extend
+    /// never collides). Shared by `replace` (removed = the attributes the values
+    /// *read*) and `update` (removed = the *target* attributes); `peel_substitute`
+    /// recovers the SET pairs regardless of what `Project` drops.
+    fn build_substitute_chain(
+        &self,
+        input: RelExpr,
+        pairs: Vec<(String, Type, ScalarExpr)>,
+        removed: HashSet<String>,
+    ) -> RelExpr {
+        let in_heading = input.heading();
+        let mut extends: Vec<(String, Type, ScalarExpr)> = Vec::new();
+        let mut renames: Vec<(String, String)> = Vec::new();
+        for (new, ty, scalar) in pairs {
+            let extend_name = if in_heading.lookup(&new).is_some() {
+                let t = format!("__coddl_replace_tmp_{new}");
+                renames.push((t.clone(), new));
+                t
+            } else {
+                new
+            };
+            extends.push((extend_name, ty, scalar));
+        }
+        let keep: Vec<String> = in_heading
+            .attrs()
+            .iter()
+            .map(|(n, _)| n.clone())
+            .chain(extends.iter().map(|(n, _, _)| n.clone()))
+            .filter(|n| !removed.contains(n))
+            .collect();
+        let mut node = RelExpr::Project {
+            input: Box::new(RelExpr::Extend {
+                input: Box::new(input),
+                extends,
+            }),
+            keep,
+        };
+        if !renames.is_empty() {
+            node = RelExpr::Rename {
+                input: Box::new(node),
+                renames,
+            };
+        }
+        node
     }
 
     /// Walk an `extend` value expression into a RelIR [`ScalarExpr`], or `None`
@@ -4051,6 +4233,88 @@ oper main {} [
                 .iter()
                 .any(|i| matches!(i, Inst::RelvarSlotStore { .. })),
             "insert must store the union into the slot"
+        );
+    }
+
+    #[test]
+    fn update_public_where_emits_dml() {
+        // `update Greetings where id = 1 { message: … }` desugars to the
+        // substitute-union shape → a surgical `UPDATE … SET … WHERE id = ?`.
+        let src = "\
+program hello_world_db;
+database greetings;
+public relvar Greetings { id: Integer, message: Text } key { id };
+oper main {} [
+    transaction [ update Greetings where id = 1 { message: \"hi\" }; ];
+];
+";
+        let m = lower_ok_with_plan(src, &greetings_rw_plan());
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            main.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i, Inst::Dml { .. })),
+            "update must emit surgical DML"
+        );
+    }
+
+    #[test]
+    fn update_public_all_emits_dml() {
+        // Update-all (no `where`) → a bare substitute → `UPDATE … SET …`.
+        let src = "\
+program hello_world_db;
+database greetings;
+public relvar Greetings { id: Integer, message: Text } key { id };
+oper main {} [
+    transaction [ update Greetings { message: \"hi\" }; ];
+];
+";
+        let m = lower_ok_with_plan(src, &greetings_rw_plan());
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            main.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i, Inst::Dml { .. })),
+            "update-all must emit surgical DML"
+        );
+    }
+
+    #[test]
+    fn update_private_where_emits_minus_union_store() {
+        // `update R where a = 1 { b: … }` private → (R minus (R where a=1)) union
+        // ((R where a=1) «sub»), stored back.
+        let src = "program p; private relvar R { a: Integer, b: Text } key { a }; \
+                   oper main {} [ update R where a = 1 { b: \"x\" }; ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let insts: Vec<_> = main.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(insts.iter().any(|i| matches!(i, Inst::Minus { .. })), "unchanged = R minus matching");
+        assert!(insts.iter().any(|i| matches!(i, Inst::Union { .. })), "result = unchanged union changed");
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::RelvarSlotStore { .. })),
+            "update stores the result into the slot"
+        );
+    }
+
+    #[test]
+    fn update_private_all_emits_substitute_store_no_union() {
+        // Update-all private → a bare substitute (Extend → …) stored back, with
+        // no minus/union (there are no unchanged rows to preserve).
+        let src = "program p; private relvar R { a: Integer, b: Text } key { a }; \
+                   oper main {} [ update R { b: \"x\" }; ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let insts: Vec<_> = main.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(insts.iter().any(|i| matches!(i, Inst::Extend { .. })), "substitute extends the new value");
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::RelvarSlotStore { .. })),
+            "update-all stores the substituted relation"
+        );
+        assert!(
+            !insts.iter().any(|i| matches!(i, Inst::Union { .. } | Inst::Minus { .. })),
+            "update-all has no unchanged-rows union"
         );
     }
 

@@ -1364,6 +1364,36 @@ fn dml_insert_stmt_persists_cranelift() {
     assert_insert_stmt_persists("cranelift");
 }
 
+/// `update R where p { c: e };` is sugar for the substitute-union shape — a
+/// surgical `UPDATE greetings SET message = ? WHERE id = ?`. Only the id=1 row's
+/// message changes; id=2 is untouched. Same result on both backends.
+fn assert_update_stmt_persists(backend: &str) {
+    let rows = run_greetings_dml(
+        backend,
+        "program insert_update_delete;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             transaction [ update Greetings where id = 1 { message: \"hi!\" }; ];\n\
+         ];\n",
+    );
+    assert_eq!(
+        rows,
+        vec!["1|hi!".to_string(), "2|goodbye".to_string()],
+        "backend={backend}"
+    );
+}
+
+#[test]
+fn dml_update_stmt_persists_llvm() {
+    assert_update_stmt_persists("llvm");
+}
+
+#[test]
+fn dml_update_stmt_persists_cranelift() {
+    assert_update_stmt_persists("cranelift");
+}
+
 /// Binding transparency: `let r = R where id = 1; R := R minus r` folds to the
 /// same `DELETE … WHERE id = ?` as the inline form — the alias is substituted
 /// before recognition, so it persists identically.
@@ -1734,10 +1764,9 @@ fn comparison_lt_pushes_cranelift() {
 
 /// `R := (R where id <> 1) union ((R where id = 1) replace { message: message
 /// || "!" })` — TTM's UPDATE expansion — emits `UPDATE greetings SET message =
-/// (message || '!') WHERE id = ?`. Only the matching row (id 1) changes. Written
-/// explicitly here (the `update` surface sugar lands later); `replace` on a
-/// self-referential value produces the heading-preserving substitute chain the
-/// UPDATE recognition matches.
+/// (message || '!') WHERE id = ?`. Only the matching row (id 1) changes. The
+/// `update` sugar desugars to the heading-preserving substitute-union the UPDATE
+/// recognition matches (a computed value that reads the target attribute).
 fn assert_update_where_persists(backend: &str) {
     let rows = run_greetings_dml(
         backend,
@@ -1745,10 +1774,7 @@ fn assert_update_where_persists(backend: &str) {
          database greetings;\n\
          public relvar Greetings { id: Integer, message: Text } key { id };\n\
          oper main {} [\n\
-             transaction [\n\
-                 Greetings := (Greetings where id <> 1)\n\
-                     union ((Greetings where id = 1) replace { message: message || \"!\" });\n\
-             ];\n\
+             transaction [ update Greetings where id = 1 { message: message || \"!\" }; ];\n\
          ];\n",
     );
     assert_eq!(
@@ -1768,9 +1794,8 @@ fn dml_update_where_persists_cranelift() {
     assert_update_where_persists("cranelift");
 }
 
-/// A bare substitute (no complement/union) updates every row —
-/// `R := R replace { message: message || "!" }` → `UPDATE greetings SET … `
-/// (no WHERE).
+/// Update-all (no `where`) updates every row — a bare substitute → `UPDATE
+/// greetings SET …` (no WHERE). The `update` sugar without a `where` clause.
 fn assert_update_all_persists(backend: &str) {
     let rows = run_greetings_dml(
         backend,
@@ -1778,7 +1803,7 @@ fn assert_update_all_persists(backend: &str) {
          database greetings;\n\
          public relvar Greetings { id: Integer, message: Text } key { id };\n\
          oper main {} [\n\
-             transaction [ Greetings := Greetings replace { message: message || \"!\" }; ];\n\
+             transaction [ update Greetings { message: message || \"!\" }; ];\n\
          ];\n",
     );
     assert_eq!(

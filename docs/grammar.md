@@ -416,8 +416,9 @@ function that implements it.
                   | <truncate-stmt>
                   | <delete-stmt>
                   | <insert-stmt>
+                  | <update-stmt>
                   | <assign-stmt>
-                  | <expr> ';' ;                               -- parse_stmt (LET_STMT, TRUNCATE_STMT, DELETE_STMT, INSERT_STMT, ASSIGN_STMT, or EXPR_STMT)
+                  | <expr> ';' ;                               -- parse_stmt (LET_STMT, TRUNCATE_STMT, DELETE_STMT, INSERT_STMT, UPDATE_STMT, ASSIGN_STMT, or EXPR_STMT)
 <assign-stmt>   ::= <expr> ':=' <expr> ';' ;                   -- parse_stmt (ASSIGN_STMT)
                     -- Relational assignment. The parser accepts any
                     -- expression as the target (LHS); the typechecker
@@ -465,6 +466,23 @@ function that implements it.
                     -- tuple-body codes P0032 / P0033), so the checker and
                     -- lowerer treat it as a relation source uniformly. An empty
                     -- `{}` is a zero-tuple relation literal (rejected, T0018).
+<update-stmt>   ::= 'update' <expr> <arg-list> ';' ;           -- parse_update_stmt
+                    -- Overwrite named attributes of the matching tuples — sugar
+                    -- for `R := (R where ¬p) union ((R where p) «substitute»)`
+                    -- (the `UPDATE … SET … WHERE p` shape), or a bare substitute
+                    -- for update-all. The operand (`R` or `R where p`) is parsed
+                    -- with brace-call **suppressed** so the trailing `{ … }` is
+                    -- the update clause, not a `CALL_EXPR` on the operand (P0014
+                    -- if the operand is absent, P0054 if the clause `{` is). The
+                    -- clause is an <arg-list> (colon required, like `replace`).
+                    -- A brace-call *inside* the predicate must be parenthesized
+                    -- (`update R where (f { x: 1 }) > 0 { … }`) — parentheses
+                    -- re-enable the brace-call. The typechecker requires a bare
+                    -- assignable relvar (T0033), a transaction for a public
+                    -- relvar (T0025), each target attribute to exist (T0053) with
+                    -- a type-matching value (T0034); unlike `replace`, constant
+                    -- and bare-reference values are allowed. `update` is a
+                    -- contextual keyword (the `let` precedent).
 <let-stmt>      ::= 'let' <identifier> [ ':' <type-ref> ]
                     '=' <expr> ';' ;                           -- parse_let_stmt
 
@@ -677,8 +695,8 @@ is explicit, not implied:
 - **Type generators** in `<type-ref>` — `Tuple H`, `Relation H`,
   `Sequence T`.
 - **Statement forms** other than `<let-stmt>`, `<assign-stmt>`,
-  `<truncate-stmt>`, `<delete-stmt>`, `<insert-stmt>`, and `<expr> ';'`
-  — `mut`, `return`, `update`.
+  `<truncate-stmt>`, `<delete-stmt>`, `<insert-stmt>`, `<update-stmt>`,
+  and `<expr> ';'` — `mut`, `return`.
 - **Type / relvar / constraint declarations** at the top level.
 - **Literals**: sequence `[ … ]` in expression position. (Tuple
   `{ … }` literals and dot-prefix field access landed in Phase 18.
@@ -754,6 +772,7 @@ enforces that.
 | P0051 | Expected `{` to start unwrap list                       |
 | P0052 | Expected attribute name in unwrap list                  |
 | P0053 | Expected `}` to close unwrap list                       |
+| P0054 | Expected `{ … }` clause after the `update` target        |
 
 Note: missing-type-after-`:` (let annotation) and missing-type-
 after-`->` (operator return clause) both surface as `P0011`

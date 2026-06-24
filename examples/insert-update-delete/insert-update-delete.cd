@@ -49,9 +49,11 @@ oper main {} [
     // form, sugar for `Greetings := Greetings union Relation { … }`.
     insert Greetings { { id: 6, message: "hi there" } };
 
-    // Update one tuple: keep the rows that don't match, replace the value of the
-    // one that does. (A future `update` statement will be sugar for this union.)
-    Greetings := (Greetings where id <> 5) union ((Greetings where id = 5) replace { message: message || " (seen)" });
+    // Update one tuple. `update Greetings where id = 5 { message: … }` is sugar
+    // for keeping the rows that don't match and recomputing the one that does —
+    // `Greetings := (Greetings where id <> 5) union ((Greetings where id = 5)
+    // replace { message: … })`.
+    update Greetings where id = 5 { message: message || " (seen)" };
     write_relation { rel: Greetings };
 
     // Keep only the rows that don't match a predicate — `Greetings where id <> 5`

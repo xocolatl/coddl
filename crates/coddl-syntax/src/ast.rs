@@ -316,8 +316,10 @@ impl Block {
 /// (`truncate R;`, sugar for `R := R minus R`); `Delete` removes matching
 /// tuples (`delete R where p;`, sugar for `R := R minus (R where p)`);
 /// `Insert` adds tuples (`insert R <source>;`, sugar for `R := R union
-/// <source>`); `ExprStmt` evaluates an expression and discards the result.
-/// `mut` / `return` / `update` arrive when their semantics are settled.
+/// <source>`); `Update` overwrites attributes (`update R where p { c: e };`,
+/// sugar for `R := (R where ¬p) union ((R where p) «sub»)`); `ExprStmt`
+/// evaluates an expression and discards the result. `mut` / `return` arrive
+/// when their semantics are settled.
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Let(LetStmt),
@@ -325,6 +327,7 @@ pub enum Stmt {
     Truncate(TruncateStmt),
     Delete(DeleteStmt),
     Insert(InsertStmt),
+    Update(UpdateStmt),
     ExprStmt(ExprStmt),
 }
 
@@ -336,6 +339,7 @@ impl Stmt {
             SyntaxKind::TRUNCATE_STMT => Stmt::Truncate(TruncateStmt { syntax }),
             SyntaxKind::DELETE_STMT => Stmt::Delete(DeleteStmt { syntax }),
             SyntaxKind::INSERT_STMT => Stmt::Insert(InsertStmt { syntax }),
+            SyntaxKind::UPDATE_STMT => Stmt::Update(UpdateStmt { syntax }),
             SyntaxKind::EXPR_STMT => Stmt::ExprStmt(ExprStmt { syntax }),
             _ => return None,
         })
@@ -348,6 +352,7 @@ impl Stmt {
             Stmt::Truncate(s) => s.syntax(),
             Stmt::Delete(s) => s.syntax(),
             Stmt::Insert(s) => s.syntax(),
+            Stmt::Update(s) => s.syntax(),
             Stmt::ExprStmt(s) => s.syntax(),
         }
     }
@@ -439,6 +444,34 @@ impl InsertStmt {
     /// (T0034).
     pub fn source(&self) -> Option<Expr> {
         self.syntax.children().filter_map(Expr::cast).nth(1)
+    }
+}
+
+ast_node!(pub UpdateStmt, UPDATE_STMT);
+
+impl UpdateStmt {
+    /// The operand — the sole `Expr` child after `update`: a bare relvar `R`
+    /// (`NAME_REF`, update-all) or a restriction `R where p` (`BINARY_EXPR`).
+    /// The typechecker requires the root to be a bare assignable relvar (T0033).
+    /// (The `{ c: e }` clause lives in the `ARG_LIST` node, which isn't an
+    /// `Expr`, so it never collides with this.)
+    pub fn operand(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// The `{ c: e }` clause — an `ARG_LIST` of `NAMED_ARG`s, the attributes to
+    /// overwrite and their values.
+    pub fn clause(&self) -> Option<ArgList> {
+        child(&self.syntax)
+    }
+
+    /// The clause pairs in source order as `(target_name, value_expr)`. Unlike
+    /// `replace`, a value may be a constant or a bare reference; each overwrites
+    /// its (existing) named attribute (T0053 if it doesn't exist).
+    pub fn pairs(&self) -> Vec<(Option<SyntaxToken>, Option<Expr>)> {
+        self.clause()
+            .map(|al| al.args().map(|na| (na.name(), na.value())).collect())
+            .unwrap_or_default()
     }
 }
 

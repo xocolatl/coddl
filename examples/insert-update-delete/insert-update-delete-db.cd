@@ -54,14 +54,13 @@ oper main {} [
         insert Greetings { { id: 6, message: "hi there" } };
     ];
 
-    // Update one tuple: keep the rows that don't match, and replace the value of
-    // the one that does. `(Greetings where id <> 5)` is the unchanged rows;
-    // `(Greetings where id = 5) replace { message: … }` recomputes that row's
-    // message — assigning their union back is a single
-    // `UPDATE greetings SET message = … WHERE id = ?`. (A future `update`
-    // statement will be sugar for exactly this expansion.)
+    // Update one tuple. `update Greetings where id = 5 { message: … }` is sugar
+    // for keeping the rows that don't match and recomputing the one that does —
+    // `(Greetings where id <> 5) union ((Greetings where id = 5) replace
+    // { message: … })` — recognized as a single
+    // `UPDATE greetings SET message = … WHERE id = ?`.
     transaction [
-        Greetings := (Greetings where id <> 5) union ((Greetings where id = 5) replace { message: message || " (seen)" });
+        update Greetings where id = 5 { message: message || " (seen)" };
     ];
 
     let after = transaction [

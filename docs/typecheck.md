@@ -465,6 +465,15 @@ and transaction rule (**T0025**):
   keyword-less relation literal) or a relation `<expr>` — are a single `source`
   expression to the checker, so one `check_expr` validates either (an empty
   tuple-set is the empty-relation-literal error, **T0018**).
+- **`update R where p { c: e };`** → `R := (R where ¬p) union ((R where p)
+  «sub»)`. The operand must be relvar-rooted (a bare relvar, or `R where p`) over
+  a bare assignable relvar (**T0033**); the predicate is validated like any
+  `where` (Boolean, **T0020**; heading scope-injected). Each `{ c: e }` target
+  must be an **existing** attribute (**T0053** — `update` overwrites, it doesn't
+  add) whose type the value matches (**T0034**), and no target is named twice
+  (**T0031**). Unlike `replace`, the values may be constants or bare references —
+  T0042/T0047 are *not* applied (the scope-injection and per-pair checks reuse
+  `check_replace_expr`'s, minus those two surface lints).
 
 
 ## Typecheck diagnostics
@@ -527,3 +536,4 @@ check script enforces that.
 | T0050 | assignment target is a public relvar mapped to a non-writable view (lowering) |
 | T0051 | _(warning)_ `R := R` self-assignment has no effect (elided) |
 | T0052 | `delete` without a `where` clause (a bare `delete R;`) — use `truncate` to clear the whole relvar |
+| T0053 | `update` clause names an attribute not in the relvar's heading (the target must already exist) |

@@ -16,7 +16,7 @@ use coddl_syntax::ast::{
     ExtendExpr, FieldAccess, Heading as AstHeading, Item, KeyClause, LetStmt, NamedArg, OperDecl,
     PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr,
     ReplaceExpr, Root, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit, UnaryExpr, UnaryOp,
-    UnwrapExpr, WrapExpr,
+    UnwrapExpr, UpdateStmt, WrapExpr,
 };
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
@@ -682,6 +682,7 @@ impl TypeChecker {
                 Stmt::Truncate(t) => self.check_truncate_stmt(&t, scope),
                 Stmt::Delete(d) => self.check_delete_stmt(&d, scope),
                 Stmt::Insert(i) => self.check_insert_stmt(&i, scope),
+                Stmt::Update(u) => self.check_update_stmt(&u, scope),
                 Stmt::ExprStmt(e) => self.check_expr_stmt(&e, scope),
             }
         }
@@ -936,6 +937,102 @@ impl TypeChecker {
                 format!("cannot insert {source_ty} into relvar `{name}` (heading mismatch)"),
             );
         }
+    }
+
+    /// Check `update R where p { c: e };` — overwrite named attributes of the
+    /// matching tuples. It desugars to `R := (R where ¬p) union ((R where p)
+    /// «sub»)`, so the operand must be relvar-rooted (a bare relvar, or
+    /// `R where p`) over a bare assignable relvar (T0033). Unlike `replace`, the
+    /// `{ c: e }` values may be constants or bare references (T0042/T0047 are
+    /// *not* applied); but each target must be an **existing** attribute (T0053)
+    /// whose type the value matches (T0034), and no target is named twice
+    /// (T0031). A public relvar requires a transaction (T0025), the predicate
+    /// must be Boolean (T0020) — both via the operand's own `check_expr`.
+    fn check_update_stmt(&mut self, stmt: &UpdateStmt, scope: &mut Scope) {
+        let Some(operand) = stmt.operand() else { return };
+
+        // The operand must be relvar-rooted: a bare relvar `R` (update-all) or
+        // a restriction `R where p`. Extract the root relvar name.
+        let root = match &operand {
+            Expr::NameRef(n) => Some(n.clone()),
+            Expr::Binary(b) if matches!(b.op_kind(), Some(BinaryOp::Where)) => match b.lhs() {
+                Some(Expr::NameRef(n)) => Some(n),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(target) = root else {
+            self.error(
+                self.node_span(operand.syntax()),
+                "T0033",
+                "update operand must be a relvar, optionally restricted by `where`",
+            );
+            return;
+        };
+        let Some(ident) = target.ident() else { return };
+        let name = ident.text();
+
+        // … bound to an assignable relvar (public or private).
+        let lookup = self.relvars.get(name).and_then(|i| {
+            matches!(i.kind, RelvarKind::Public | RelvarKind::Private).then(|| i.heading.clone())
+        });
+        let Some(heading) = lookup else {
+            self.error(
+                self.token_span(&ident),
+                "T0033",
+                format!("cannot update `{name}`: not an assignable relvar"),
+            );
+            return;
+        };
+
+        // Typecheck the operand — validates the predicate (Boolean T0020, heading
+        // scope-injected) and forces a transaction for a public relvar (T0025),
+        // exactly as the desugared `R where p` self-reference would.
+        let _ = self.check_expr(&operand, scope);
+
+        // The `{ c: e }` clause: inject the relvar's attributes so each value
+        // resolves against the heading first (the same scope rule as `replace`).
+        scope.push();
+        for (n, ty) in heading.attrs() {
+            scope.insert(n.clone(), ty.clone(), Span::default(), BindingOrigin::WhereAttr);
+        }
+        let mut seen: HashSet<String> = HashSet::new();
+        for (name_tok, value) in stmt.pairs() {
+            let Some(name_tok) = name_tok else { continue }; // parse recovery
+            let attr = name_tok.text();
+            let Some(value) = value else { continue };
+            // The target attribute must already exist — `update` overwrites it
+            // (adding a new attribute is `extend`; relabelling is `rename`).
+            let Some(target_ty) = heading.lookup(attr).cloned() else {
+                self.error(
+                    self.token_span(&name_tok),
+                    "T0053",
+                    format!("update target attribute `{attr}` does not exist in {heading}"),
+                );
+                continue;
+            };
+            if !seen.insert(attr.to_string()) {
+                self.error(
+                    self.token_span(&name_tok),
+                    "T0031",
+                    format!("update assigns attribute `{attr}` more than once"),
+                );
+                continue;
+            }
+            // The value must match the target's type (a mismatch would make the
+            // desugared union/assignment a heading mismatch).
+            let vty = self.check_expr(&value, scope);
+            if !vty.assignable_to(&target_ty) {
+                self.error(
+                    self.node_span(value.syntax()),
+                    "T0034",
+                    format!(
+                        "cannot update attribute `{attr}`: value type {vty} does not match {target_ty}"
+                    ),
+                );
+            }
+        }
+        scope.pop();
     }
 
     fn check_let_stmt(&mut self, stmt: &LetStmt, scope: &mut Scope) {
@@ -2791,6 +2888,89 @@ mod tests {
         let src = "program p; private relvar R { a: Integer } key { a }; \
                    oper main {} [ insert R {}; ];";
         assert!(codes(src).contains(&"T0018"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn update_private_relvar_checks_clean() {
+        let src = "program p; private relvar R { a: Integer, b: Text } key { a }; \
+                   oper main {} [ update R where a = 1 { b: \"x\" }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn update_all_checks_clean() {
+        let src = "program p; private relvar R { a: Integer, b: Text } key { a }; \
+                   oper main {} [ update R { b: \"x\" }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn update_public_in_transaction_checks_clean() {
+        let src = "program p; database greetings; \
+                   public relvar R { a: Integer, b: Text } key { a }; \
+                   oper main {} [ transaction [ update R where a = 1 { b: \"x\" }; ] ];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn update_public_outside_transaction_diagnoses_t0025() {
+        let src = "program p; database greetings; \
+                   public relvar R { a: Integer, b: Text } key { a }; \
+                   oper main {} [ update R where a = 1 { b: \"x\" }; ];";
+        assert!(codes(src).contains(&"T0025"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn update_nonexistent_target_diagnoses_t0053() {
+        let src = "program p; private relvar R { a: Integer, b: Text } key { a }; \
+                   oper main {} [ update R { nope: 1 }; ];";
+        assert!(codes(src).contains(&"T0053"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn update_type_mismatch_diagnoses_t0034() {
+        // `a` is Integer; a Text value doesn't match.
+        let src = "program p; private relvar R { a: Integer, b: Text } key { a }; \
+                   oper main {} [ update R { a: \"text\" }; ];";
+        assert!(codes(src).contains(&"T0034"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn update_allows_constant_value_no_t0042() {
+        // Unlike `replace`, a constant value is fine (overwrite with a literal).
+        let src = "program p; private relvar R { a: Integer, b: Text } key { a }; \
+                   oper main {} [ update R { b: \"const\" }; ];";
+        assert!(!codes(src).contains(&"T0042"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn update_allows_bare_reference_value_no_t0047() {
+        // Unlike `replace`, a bare attribute reference is fine (copy a value).
+        let src = "program p; private relvar R { a: Integer, b: Integer } key { a }; \
+                   oper main {} [ update R { a: b }; ];";
+        assert!(!codes(src).contains(&"T0047"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn update_predicate_must_be_boolean_t0020() {
+        let src = "program p; private relvar R { a: Integer, b: Text } key { a }; \
+                   oper main {} [ update R where a { b: \"x\" }; ];";
+        assert!(codes(src).contains(&"T0020"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn update_undeclared_target_diagnoses_t0033() {
+        let src = "program p; oper main {} [ update Nope { a: 1 }; ];";
+        assert!(codes(src).contains(&"T0033"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn update_duplicate_target_diagnoses_t0031() {
+        let src = "program p; private relvar R { a: Integer, b: Text } key { a }; \
+                   oper main {} [ update R { b: \"x\", b: \"y\" }; ];";
+        assert!(codes(src).contains(&"T0031"), "{:?}", codes(src));
     }
 
     #[test]

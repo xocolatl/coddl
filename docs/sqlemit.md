@@ -180,6 +180,8 @@ relvars) or the in-memory slot store (private relvars) unchanged.
 | `truncate R` | `R := R minus R` | self-subtraction → whole-table `DELETE FROM t` |
 | `delete R where p` | `R := R minus (R where p)` | `Minus{ t, Restrict(t, p) }` → `DELETE FROM t WHERE p` |
 | `insert R { … }` / `insert R S` | `R := R union <source>` | `Or{ t, source }` → idempotent INSERT (pushed for a SQL-backed source, row-shipped for a literal / private source) |
+| `update R where p { c: e }` | `R := (R where ¬p) union ((R where p) «sub»)` | `Or{ Restrict(t,¬p), «sub»(Restrict(t,p)) }` → `UPDATE t SET c=e WHERE p` |
+| `update R { c: e }` | `R := R «sub»` | bare `«sub»(t)` → `UPDATE t SET c=e` (no `WHERE`) |
 
 `truncate R` clears every tuple. Its operand must be a bare assignable relvar
 (the typechecker rejects a restricted or compound operand, T0033, and requires a
@@ -205,7 +207,21 @@ idempotent-INSERT arm a literal `R := R union <source>` would hit: a SQL-backed
 source pushes (`INSERT … SELECT … WHERE NOT EXISTS`), a literal / private source
 ships its rows via the shared `ship_union_insert` (the batched-`VALUES`
 `Inst::InsertFrom`). A private relvar stores the in-process union into its slot.
-`update` joins this table as its chunk lands.
+
+`update R where p { c: e }` overwrites named attributes of the matching tuples.
+The `{ c: e }` clause builds a **substitute chain** `Rename(Project(Extend(input,
+[__tmp := e]), keep), [__tmp → c])` — the same construction `replace` uses, but
+`update`'s `Project` drops the **target** attribute `c` (replace drops the attrs
+the value reads), and constant / bare-reference values are allowed. The lowerer
+wraps it as `Or{ Restrict(t, ¬p), «sub»(Restrict(t, p)) }` (update-with-`where`)
+or a bare `«sub»(RelvarRef(t))` (update-all), which `emit_assignment` routes to
+`emit_update` — Form A (`UPDATE … WHERE p`) or Form B (no `WHERE`). `peel_substitute`
+recovers the SET pairs regardless of what `Project` drops, pairing each `Extend`
+value with its `Rename` target. A private relvar instead computes `(R minus
+(R where p)) union ((R where p) «sub»)` (or a bare substitute) in process and
+stores it. A predicate that isn't a single pushable comparison, or a value the
+SQL renderer can't express, declines with **T0049** rather than a hydrating
+rewrite — never a silent wipe.
 
 ## Dialect surface
 

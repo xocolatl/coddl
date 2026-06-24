@@ -602,6 +602,41 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
+    /// `update <relvar> [ where <p> ] { c: e, … } ;` — overwrite named
+    /// attributes of the matching tuples. The operand (`R` or `R where p`) is
+    /// parsed with brace-call suppressed (`parse_expr_prec(_, false)`) so the
+    /// trailing `{ … }` is the update clause, not a `CALL_EXPR` on the operand;
+    /// a brace-call *inside* the predicate must be parenthesized. The clause is
+    /// `parse_arg_list(false)` (colon required, no shorthand — same as
+    /// `replace`). It desugars to `R := (R where ¬p) union ((R where p) «sub»)`
+    /// (the `UPDATE … SET … WHERE p` shape), or a bare substitute for
+    /// update-all. `update` is a contextual keyword (the `let` precedent).
+    fn parse_update_stmt(&mut self) {
+        debug_assert!(self.at_keyword("update"));
+        self.start_node(SyntaxKind::UPDATE_STMT);
+        self.bump(); // `update`
+
+        // Operand: a bare relvar `R` or `R where p`, brace-call suppressed so it
+        // stops at the clause `{`.
+        let before = self.pos;
+        self.parse_expr_prec(0, false);
+        if self.pos == before {
+            self.error("P0014", "expected relvar name after `update`");
+        }
+
+        // The `{ c: e, … }` clause.
+        if self.at(SyntaxKind::L_BRACE) {
+            self.parse_arg_list(false);
+        } else {
+            self.error("P0054", "expected `{ … }` clause after the `update` target");
+        }
+
+        if !self.eat(SyntaxKind::SEMICOLON) {
+            self.error("P0013", "expected `;` after `update`");
+        }
+        self.finish_node();
+    }
+
     /// One statement, *or* the block's trailing tail expression. The
     /// `let` form is recognized first; otherwise an expression is
     /// parsed and either wrapped in `EXPR_STMT` (terminated by `;`)
@@ -625,6 +660,10 @@ impl<'a> Parser<'a> {
         }
         if self.at_keyword("insert") {
             self.parse_insert_stmt();
+            return;
+        }
+        if self.at_keyword("update") {
+            self.parse_update_stmt();
             return;
         }
 
@@ -680,13 +719,21 @@ impl<'a> Parser<'a> {
     /// < comparison(3) < additive `+`/`-`/`||`(4) < multiplicative
     /// `*`/`/`(5). All infix operators are left-associative.
     fn parse_expr(&mut self) {
-        self.parse_expr_prec(0);
+        self.parse_expr_prec(0, true);
     }
 
     /// Parse an expression, only consuming operators whose precedence
     /// is `>= min_prec`. The caller picks `min_prec` to control how
     /// far an operator's right operand is allowed to extend.
-    fn parse_expr_prec(&mut self, min_prec: u8) {
+    ///
+    /// `allow_brace_call` gates the postfix brace-call `name { args }`. It is
+    /// `true` everywhere except a statement operand that is itself followed by a
+    /// brace clause — `update R { c: e }` parses the operand with it `false` so
+    /// the trailing `{ c: e }` stays the update clause rather than a call on
+    /// `R`. It propagates down the infix chain (so `R where x = 5 { … }`
+    /// suppresses the brace on `5`) but resets to `true` inside parentheses,
+    /// which is the escape hatch for a brace-call in a suppressed predicate.
+    fn parse_expr_prec(&mut self, min_prec: u8, allow_brace_call: bool) {
         // Flush any leading trivia into the parent node before the
         // checkpoint — otherwise a retroactive `start_node_at(cp, …)`
         // for CALL_EXPR / FIELD_ACCESS / BINARY_EXPR would wrap the
@@ -701,7 +748,7 @@ impl<'a> Parser<'a> {
         // are independent of precedence.
         loop {
             match self.current() {
-                SyntaxKind::L_BRACE => {
+                SyntaxKind::L_BRACE if allow_brace_call => {
                     self.start_node_at(cp, SyntaxKind::CALL_EXPR);
                     self.parse_arg_list(true); // operator calls allow field-init shorthand
                     self.finish_node();
@@ -787,7 +834,7 @@ impl<'a> Parser<'a> {
             self.bump(); // operator token or keyword IDENT
             // Missing-rhs (e.g. `1 = ;`) surfaces as P0014 from the
             // inner `parse_primary_expr` — no dedicated code needed.
-            self.parse_expr_prec(prec + 1);
+            self.parse_expr_prec(prec + 1, allow_brace_call);
             self.finish_node();
         }
     }
@@ -885,7 +932,7 @@ impl<'a> Parser<'a> {
                 self.bump_trivia();
                 self.start_node(SyntaxKind::PAREN_EXPR);
                 self.bump(); // `(`
-                self.parse_expr_prec(0);
+                self.parse_expr_prec(0, true);
                 if !self.eat(SyntaxKind::R_PAREN) {
                     self.error("P0035", "expected `)` to close parenthesized expression");
                 }
@@ -994,7 +1041,7 @@ impl<'a> Parser<'a> {
         // Operand parses at the lowest precedence so `where`, `and`,
         // `or`, comparisons all bind inside. Missing operand surfaces
         // as P0014 from the inner `parse_primary_expr`.
-        self.parse_expr_prec(0);
+        self.parse_expr_prec(0, true);
         self.finish_node();
     }
 
@@ -2221,6 +2268,112 @@ mod tests {
                 .descendants()
                 .all(|n| n.kind() != SyntaxKind::INSERT_STMT),
             "`insert` as an attribute name must not parse as INSERT_STMT"
+        );
+    }
+
+    #[test]
+    fn update_stmt_with_where_parses() {
+        let out = parse_str("oper main {} [ update R where a = 1 { b: 2 }; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.tree.text(), "oper main {} [ update R where a = 1 { b: 2 }; ];");
+        let update = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::UPDATE_STMT)
+            .expect("UPDATE_STMT in tree");
+        // Operand is the `where` BINARY_EXPR; clause is a separate ARG_LIST — the
+        // brace was NOT swallowed into the predicate.
+        let kinds: Vec<_> = update.children().map(|n| n.kind()).collect();
+        assert!(kinds.contains(&SyntaxKind::BINARY_EXPR), "operand BINARY_EXPR in {kinds:?}");
+        assert!(kinds.contains(&SyntaxKind::ARG_LIST), "clause ARG_LIST in {kinds:?}");
+    }
+
+    #[test]
+    fn update_stmt_all_parses_operand_is_not_a_call() {
+        // The key boundary: `update R { b: 2 }` must parse `R` as the operand
+        // (a NAME_REF) and `{ b: 2 }` as the clause (ARG_LIST) — NOT as a
+        // brace-call `R { b: 2 }` (CALL_EXPR).
+        let out = parse_str("oper main {} [ update R { b: 2 }; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let update = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::UPDATE_STMT)
+            .expect("UPDATE_STMT in tree");
+        let kinds: Vec<_> = update.children().map(|n| n.kind()).collect();
+        assert!(kinds.contains(&SyntaxKind::NAME_REF), "operand NAME_REF in {kinds:?}");
+        assert!(kinds.contains(&SyntaxKind::ARG_LIST), "clause ARG_LIST in {kinds:?}");
+        assert!(
+            !kinds.contains(&SyntaxKind::CALL_EXPR),
+            "operand must not be a brace-call: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn update_predicate_brace_call_needs_parens() {
+        // A brace-call in the predicate is suppressed at the top level but
+        // re-enabled inside parentheses (the escape hatch): the parenthesized
+        // `(f { x: 1 })` parses as a CALL_EXPR, and `{ b: 3 }` stays the clause.
+        let out = parse_str("oper main {} [ update R where (f { x: 1 }) = 2 { b: 3 }; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let update = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::UPDATE_STMT)
+            .expect("UPDATE_STMT in tree");
+        // The clause ARG_LIST is a direct child; the call lives inside the operand.
+        assert!(
+            update.children().any(|n| n.kind() == SyntaxKind::ARG_LIST),
+            "clause ARG_LIST present"
+        );
+        assert!(
+            out.tree.descendants().any(|n| n.kind() == SyntaxKind::CALL_EXPR),
+            "parenthesized brace-call parses as CALL_EXPR"
+        );
+    }
+
+    #[test]
+    fn update_stmt_missing_clause_diagnoses_p0054() {
+        let out = parse_str("oper main {} [ update R ; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0054"),
+            "expected P0054, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn update_stmt_missing_semicolon_diagnoses_p0013() {
+        let out = parse_str("oper main {} [ update R { b: 2 } ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0013"),
+            "expected P0013, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn update_remains_a_usable_identifier() {
+        // `update` is a contextual keyword only at statement-leading position.
+        let out = parse_str("oper main {} [ let _t = Relation { {update: 1} }; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert!(
+            out.tree
+                .descendants()
+                .all(|n| n.kind() != SyntaxKind::UPDATE_STMT),
+            "`update` as an attribute name must not parse as UPDATE_STMT"
+        );
+    }
+
+    #[test]
+    fn brace_call_still_parses_outside_suppressed_context() {
+        // Regression: the default `allow_brace_call = true` path is unchanged —
+        // `f { a: 1 }` in ordinary expression position is still a CALL_EXPR.
+        let out = parse_str("oper main {} [ write_relation { rel: R }; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert!(
+            out.tree.descendants().any(|n| n.kind() == SyntaxKind::CALL_EXPR),
+            "brace-call still parses as CALL_EXPR"
         );
     }
 
