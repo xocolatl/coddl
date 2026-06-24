@@ -178,6 +178,7 @@ relvars) or the in-memory slot store (private relvars) unchanged.
 | Statement | Desugars to `:=` | Recognized arm |
 |---|---|---|
 | `truncate R` | `R := R minus R` | self-subtraction → whole-table `DELETE FROM t` |
+| `delete R where p` | `R := R minus (R where p)` | `Minus{ t, Restrict(t, p) }` → `DELETE FROM t WHERE p` |
 
 `truncate R` clears every tuple. Its operand must be a bare assignable relvar
 (the typechecker rejects a restricted or compound operand, T0033, and requires a
@@ -185,7 +186,15 @@ transaction for a public relvar, T0025); the lowerer builds
 `Minus{ RelvarRef(t), RelvarRef(t) }` and routes it through the same
 `emit_assignment` self-subtraction arm a literal `R := R minus R` would hit (a
 private relvar instead stores the empty `R minus R` value back into its slot).
-`delete` / `insert` / `update` join this table as their chunks land.
+
+`delete R where p` removes the matching tuples. Its operand is a `where`
+-restriction over a bare relvar (the predicate is mandatory — a bare `delete R;`
+is T0052, "use `truncate`"); the lowerer builds `Minus{ RelvarRef(t),
+Restrict(RelvarRef(t), p) }` and routes it through the `emit_assignment` DELETE
+arm a literal `R := R minus (R where p)` would hit (a private relvar stores the
+kept rows `R minus (R where p)` into its slot). A predicate the single-predicate
+model can't push declines with **T0049** rather than a hydrating partial delete —
+never a silent wipe. `insert` / `update` join this table as their chunks land.
 
 ## Dialect surface
 

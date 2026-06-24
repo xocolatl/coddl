@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{
-    AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, Expr, ExprStmt,
+    AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, DeleteStmt, Expr, ExprStmt,
     ExtendExpr, FieldAccess, Heading as AstHeading, Item, KeyClause, LetStmt, NamedArg, OperDecl,
     PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr,
     ReplaceExpr, Root, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit, UnaryExpr, UnaryOp,
@@ -679,6 +679,7 @@ impl TypeChecker {
                 Stmt::Let(l) => self.check_let_stmt(&l, scope),
                 Stmt::Assign(a) => self.check_assignment_stmt(&a, scope),
                 Stmt::Truncate(t) => self.check_truncate_stmt(&t, scope),
+                Stmt::Delete(d) => self.check_delete_stmt(&d, scope),
                 Stmt::ExprStmt(e) => self.check_expr_stmt(&e, scope),
             }
         }
@@ -803,6 +804,70 @@ impl TypeChecker {
                 format!("public relvar `{name}` referenced outside any `transaction [...]` block"),
             );
         }
+    }
+
+    /// Check `delete R where p;` — remove the matching tuples. It desugars to
+    /// `R := R minus (R where p)`, so the operand must be a `where`-restriction
+    /// over a bare assignable relvar. A bare `delete R;` would clear the whole
+    /// relvar — that's `truncate`, so it's rejected (T0052). The predicate is
+    /// validated (Boolean + heading scope) and the transaction requirement
+    /// (T0025) enforced by checking the `where`-operand once the structure is
+    /// known good.
+    fn check_delete_stmt(&mut self, stmt: &DeleteStmt, scope: &mut Scope) {
+        let Some(operand) = stmt.operand() else { return };
+
+        // The operand must be a `where`-restriction `R where p`.
+        let where_bin = match &operand {
+            Expr::Binary(bin) if matches!(bin.op_kind(), Some(BinaryOp::Where)) => bin,
+            Expr::NameRef(_) => {
+                self.error(
+                    self.node_span(operand.syntax()),
+                    "T0052",
+                    "`delete` requires a `where` clause; use `truncate` to clear the whole relvar",
+                );
+                return;
+            }
+            _ => {
+                self.error(
+                    self.node_span(operand.syntax()),
+                    "T0033",
+                    "delete operand must be a relvar restricted by `where`",
+                );
+                return;
+            }
+        };
+
+        // The restricted relation (the `where` lhs) must be a bare relvar name …
+        let Some(Expr::NameRef(target)) = where_bin.lhs() else {
+            let span = where_bin
+                .lhs()
+                .map(|l| self.node_span(l.syntax()))
+                .unwrap_or_else(|| self.node_span(operand.syntax()));
+            self.error(span, "T0033", "delete target must be a relvar name");
+            return;
+        };
+        let Some(ident) = target.ident() else { return };
+        let name = ident.text();
+
+        // … bound to an assignable relvar (public or private).
+        let assignable = self
+            .relvars
+            .get(name)
+            .is_some_and(|i| matches!(i.kind, RelvarKind::Public | RelvarKind::Private));
+        if !assignable {
+            self.error(
+                self.token_span(&ident),
+                "T0033",
+                format!("cannot delete from `{name}`: not an assignable relvar"),
+            );
+            return;
+        }
+
+        // Structure is valid: typecheck the `where`-operand to validate the
+        // predicate (Boolean, attribute scope via the heading injection) and
+        // force a transaction for a public relvar (T0025) — exactly as the
+        // desugared `R := R minus (R where p)` self-reference would.
+        let _ = self.check_expr(&operand, scope);
     }
 
     fn check_let_stmt(&mut self, stmt: &LetStmt, scope: &mut Scope) {
@@ -2547,6 +2612,61 @@ mod tests {
         let src = "program p; private relvar R { a: Integer } key { a }; \
                    oper main {} [ truncate R where a = 1; ];";
         assert!(codes(src).contains(&"T0033"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn delete_private_relvar_checks_clean() {
+        let src = "program p; private relvar R { a: Integer } key { a }; \
+                   oper main {} [ delete R where a = 1; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn delete_public_relvar_in_transaction_checks_clean() {
+        let src = "program p; database greetings; \
+                   public relvar R { a: Integer } key { a }; \
+                   oper main {} [ transaction [ delete R where a = 1; ] ];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn delete_public_relvar_outside_transaction_diagnoses_t0025() {
+        let src = "program p; database greetings; \
+                   public relvar R { a: Integer } key { a }; \
+                   oper main {} [ delete R where a = 1; ];";
+        assert!(codes(src).contains(&"T0025"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn delete_without_where_diagnoses_t0052() {
+        // A bare `delete R;` would clear the whole relvar — that's `truncate`.
+        let src = "program p; private relvar R { a: Integer } key { a }; \
+                   oper main {} [ delete R; ];";
+        assert!(codes(src).contains(&"T0052"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn delete_undeclared_name_diagnoses_t0033() {
+        let src = "program p; oper main {} [ delete Nope where a = 1; ];";
+        assert!(codes(src).contains(&"T0033"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn delete_where_over_non_relvar_diagnoses_t0033() {
+        // The `where` lhs is a relation literal, not a bare relvar name.
+        let src = "program p; oper main {} \
+                   [ delete Relation { {a: 1} } where a = 1; ];";
+        assert!(codes(src).contains(&"T0033"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn delete_predicate_is_typechecked_t0020() {
+        // The predicate is validated — a non-Boolean predicate fires T0020,
+        // confirming the `where`-operand is checked.
+        let src = "program p; private relvar R { a: Integer } key { a }; \
+                   oper main {} [ delete R where a; ];";
+        assert!(codes(src).contains(&"T0020"), "{:?}", codes(src));
     }
 
     #[test]

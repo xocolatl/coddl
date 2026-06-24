@@ -414,8 +414,9 @@ function that implements it.
                     -- have their results discarded.
 <stmt>          ::= <let-stmt>
                   | <truncate-stmt>
+                  | <delete-stmt>
                   | <assign-stmt>
-                  | <expr> ';' ;                               -- parse_stmt (LET_STMT, TRUNCATE_STMT, ASSIGN_STMT, or EXPR_STMT)
+                  | <expr> ';' ;                               -- parse_stmt (LET_STMT, TRUNCATE_STMT, DELETE_STMT, ASSIGN_STMT, or EXPR_STMT)
 <assign-stmt>   ::= <expr> ':=' <expr> ';' ;                   -- parse_stmt (ASSIGN_STMT)
                     -- Relational assignment. The parser accepts any
                     -- expression as the target (LHS); the typechecker
@@ -433,6 +434,17 @@ function that implements it.
                     -- contextual keyword recognized only as the leading token
                     -- of a statement (the `let` precedent) — it stays a usable
                     -- identifier everywhere else (no reserved words).
+<delete-stmt>   ::= 'delete' <expr> ';' ;                      -- parse_delete_stmt
+                    -- Remove the matching tuples from a relvar — sugar for the
+                    -- relational assignment `R := R minus (R where p)` (the
+                    -- `DELETE … WHERE p` shape). The operand is parsed as an
+                    -- <expr> (which consumes the `where`; P0014 if absent); the
+                    -- typechecker requires a `where`-restriction over a bare
+                    -- assignable relvar (T0033), the predicate *mandatory* — a
+                    -- bare `delete R;` is T0052 (use `truncate`) — and a
+                    -- transaction for a public relvar (T0025). `delete` is a
+                    -- contextual keyword (the `let` precedent), usable as an
+                    -- identifier elsewhere.
 <let-stmt>      ::= 'let' <identifier> [ ':' <type-ref> ]
                     '=' <expr> ';' ;                           -- parse_let_stmt
 
@@ -645,8 +657,8 @@ is explicit, not implied:
 - **Type generators** in `<type-ref>` — `Tuple H`, `Relation H`,
   `Sequence T`.
 - **Statement forms** other than `<let-stmt>`, `<assign-stmt>`,
-  `<truncate-stmt>`, and `<expr> ';'` — `mut`, `return`, `insert`,
-  `delete`, `update`.
+  `<truncate-stmt>`, `<delete-stmt>`, and `<expr> ';'` — `mut`,
+  `return`, `insert`, `update`.
 - **Type / relvar / constraint declarations** at the top level.
 - **Literals**: sequence `[ … ]` in expression position. (Tuple
   `{ … }` literals and dot-prefix field access landed in Phase 18.

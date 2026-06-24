@@ -442,6 +442,24 @@ because they need information the `.cd` checker lacks:
   `Private`) — **T0050**;
 - an RHS shape the backend cannot emit as surgical DML — **T0049**.
 
+### Statement-verb sugar
+
+The DML statement verbs are sugar over relational assignment; each desugars in
+the lowerer to a recognized RHS shape, so the checker only validates the surface
+and lets the lowering layer reuse the assignment machinery (`require_public_write`
+→ T0050/T0049, `emit_assignment`). The verb checks (`check_truncate_stmt`,
+`check_delete_stmt`) reuse the assignment's relvar-target resolution (**T0033**)
+and transaction rule (**T0025**):
+
+- **`truncate R;`** → `R := R minus R`. The operand must be a bare assignable
+  relvar; a restricted or compound operand is **T0033**.
+- **`delete R where p;`** → `R := R minus (R where p)`. The operand must be a
+  `where`-restriction over a bare assignable relvar (**T0033**); the predicate is
+  validated like any `where` (Boolean, **T0020**; heading scope-injected). The
+  `where` is *mandatory* — a bare `delete R;` would clear the whole relvar, so it
+  is **T0052** (pointing at `truncate`), keeping the verbs a clean partition
+  (`truncate` = all, `delete` = matching).
+
 
 ## Typecheck diagnostics
 
@@ -502,3 +520,4 @@ check script enforces that.
 | T0049 | assignment to a public relvar has an RHS shape the backend cannot emit as surgical DML (lowering) |
 | T0050 | assignment target is a public relvar mapped to a non-writable view (lowering) |
 | T0051 | _(warning)_ `R := R` self-assignment has no effect (elided) |
+| T0052 | `delete` without a `where` clause (a bare `delete R;`) — use `truncate` to clear the whole relvar |

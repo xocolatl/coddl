@@ -501,6 +501,29 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
+    /// `delete <relvar> where <p> ;` — remove the matching tuples from a relvar.
+    /// The operand is parsed permissively (`parse_expr`, which consumes the
+    /// `where`); the typechecker restricts it to a `where`-restriction over a
+    /// bare assignable relvar (T0033) with a *mandatory* predicate — a bare
+    /// `delete R;` is T0052 (use `truncate`). It desugars to the relational
+    /// assignment `R := R minus (R where p)` (the `DELETE … WHERE p` shape).
+    /// `delete` is a contextual keyword recognized only at statement-leading
+    /// position (the `let` precedent).
+    fn parse_delete_stmt(&mut self) {
+        debug_assert!(self.at_keyword("delete"));
+        self.start_node(SyntaxKind::DELETE_STMT);
+        self.bump(); // `delete`
+        let before = self.pos;
+        self.parse_expr();
+        if self.pos == before {
+            self.error("P0014", "expected relvar name after `delete`");
+        }
+        if !self.eat(SyntaxKind::SEMICOLON) {
+            self.error("P0013", "expected `;` after `delete`");
+        }
+        self.finish_node();
+    }
+
     /// One statement, *or* the block's trailing tail expression. The
     /// `let` form is recognized first; otherwise an expression is
     /// parsed and either wrapped in `EXPR_STMT` (terminated by `;`)
@@ -516,6 +539,10 @@ impl<'a> Parser<'a> {
         }
         if self.at_keyword("truncate") {
             self.parse_truncate_stmt();
+            return;
+        }
+        if self.at_keyword("delete") {
+            self.parse_delete_stmt();
             return;
         }
 
@@ -1981,6 +2008,57 @@ mod tests {
                 .descendants()
                 .all(|n| n.kind() != SyntaxKind::TRUNCATE_STMT),
             "`truncate` as an attribute name must not parse as TRUNCATE_STMT"
+        );
+    }
+
+    #[test]
+    fn delete_stmt_parses() {
+        let out = parse_str("oper main {} [ delete R where a = 1; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.tree.text(), "oper main {} [ delete R where a = 1; ];");
+        let delete = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::DELETE_STMT)
+            .expect("DELETE_STMT in tree");
+        // The operand is a single `where` BINARY_EXPR child.
+        let kinds: Vec<_> = delete.children().map(|n| n.kind()).collect();
+        assert!(
+            kinds.contains(&SyntaxKind::BINARY_EXPR),
+            "operand BINARY_EXPR in {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn delete_stmt_missing_operand_diagnoses_p0014() {
+        let out = parse_str("oper main {} [ delete ; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0014"),
+            "expected P0014, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn delete_stmt_missing_semicolon_diagnoses_p0013() {
+        let out = parse_str("oper main {} [ delete R where a = 1 ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0013"),
+            "expected P0013, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn delete_remains_a_usable_identifier() {
+        // `delete` is a contextual keyword only at statement-leading position.
+        let out = parse_str("oper main {} [ let _t = Relation { {delete: 1} }; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert!(
+            out.tree
+                .descendants()
+                .all(|n| n.kind() != SyntaxKind::DELETE_STMT),
+            "`delete` as an attribute name must not parse as DELETE_STMT"
         );
     }
 

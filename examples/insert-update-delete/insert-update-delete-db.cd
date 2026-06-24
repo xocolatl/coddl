@@ -24,11 +24,11 @@ oper main {} [
     ];
     write_relation { rel: before };
 
-    // Remove one tuple by predicate. `Greetings minus (Greetings where id = 1)`
-    // is the rows of Greetings except the one with id 1 — assigning it back
-    // deletes that row: a single `DELETE FROM greetings WHERE id = ?`.
+    // Remove one tuple by predicate. `delete Greetings where id = 1` is sugar
+    // for `Greetings := Greetings minus (Greetings where id = 1)` — the same
+    // surgical single `DELETE FROM greetings WHERE id = ?`.
     transaction [
-        Greetings := Greetings minus (Greetings where id = 1);
+        delete Greetings where id = 1;
     ];
 
     // Remove every tuple that also appears in Stale, matched on *every*

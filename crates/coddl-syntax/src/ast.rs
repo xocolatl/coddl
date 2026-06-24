@@ -313,14 +313,16 @@ impl Block {
 
 /// Statement variants. `let` is a binding; `Assign` is relational
 /// assignment to a relvar (`R := <expr>;`); `Truncate` clears a relvar
-/// (`truncate R;`, sugar for `R := R minus R`); `ExprStmt` evaluates an
-/// expression and discards the result. `mut` / `return` / `insert` /
-/// `delete` / `update` arrive when their semantics are settled.
+/// (`truncate R;`, sugar for `R := R minus R`); `Delete` removes matching
+/// tuples (`delete R where p;`, sugar for `R := R minus (R where p)`);
+/// `ExprStmt` evaluates an expression and discards the result. `mut` /
+/// `return` / `insert` / `update` arrive when their semantics are settled.
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Let(LetStmt),
     Assign(AssignStmt),
     Truncate(TruncateStmt),
+    Delete(DeleteStmt),
     ExprStmt(ExprStmt),
 }
 
@@ -330,6 +332,7 @@ impl Stmt {
             SyntaxKind::LET_STMT => Stmt::Let(LetStmt { syntax }),
             SyntaxKind::ASSIGN_STMT => Stmt::Assign(AssignStmt { syntax }),
             SyntaxKind::TRUNCATE_STMT => Stmt::Truncate(TruncateStmt { syntax }),
+            SyntaxKind::DELETE_STMT => Stmt::Delete(DeleteStmt { syntax }),
             SyntaxKind::EXPR_STMT => Stmt::ExprStmt(ExprStmt { syntax }),
             _ => return None,
         })
@@ -340,6 +343,7 @@ impl Stmt {
             Stmt::Let(s) => s.syntax(),
             Stmt::Assign(s) => s.syntax(),
             Stmt::Truncate(s) => s.syntax(),
+            Stmt::Delete(s) => s.syntax(),
             Stmt::ExprStmt(s) => s.syntax(),
         }
     }
@@ -399,6 +403,18 @@ impl TruncateStmt {
     /// The relvar to clear — the sole `Expr` child after `truncate`. The
     /// parser accepts any expression; the typechecker requires a bare name
     /// reference bound to an assignable relvar (T0033).
+    pub fn operand(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+}
+
+ast_node!(pub DeleteStmt, DELETE_STMT);
+
+impl DeleteStmt {
+    /// The operand — the sole `Expr` child after `delete`. The parser accepts
+    /// any expression; the typechecker requires a `where`-restriction
+    /// `R where p` over a bare assignable relvar (T0033), the predicate
+    /// mandatory (T0052 otherwise — use `truncate`).
     pub fn operand(&self) -> Option<Expr> {
         self.syntax.children().find_map(Expr::cast)
     }

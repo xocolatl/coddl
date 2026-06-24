@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use coddl_diagnostics::{Diagnostic, FileId, Severity, Span};
 use coddl_plan::{Plan, WritePolicy};
 use coddl_syntax::ast::{
-    AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, Expr, ExprStmt,
+    AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, DeleteStmt, Expr, ExprStmt,
     ExtendExpr, FieldAccess, Item,
     LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, RenameExpr,
     ReplaceExpr, Root, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit, UnaryExpr, UnaryOp,
@@ -763,6 +763,7 @@ impl Lowerer {
                 Stmt::Let(l) => self.lower_let_stmt(&l),
                 Stmt::Assign(a) => self.lower_assign_stmt(&a),
                 Stmt::Truncate(t) => self.lower_truncate_stmt(&t),
+                Stmt::Delete(d) => self.lower_delete_stmt(&d),
                 Stmt::ExprStmt(e) => self.lower_expr_stmt(&e),
             }
         }
@@ -844,6 +845,64 @@ impl Lowerer {
         let lhs = self.lower_expr(&operand);
         let rhs = self.lower_expr(&operand);
         let value = self.emit_minus(lhs, rhs);
+        self.used_private_relvars.insert(name.clone());
+        self.insts.push(Inst::RelvarSlotStore { name, value });
+    }
+
+    /// Lower `delete R where p;` — remove the matching tuples. It desugars to
+    /// `R := R minus (R where p)`: a **public** relvar hits the DELETE arm of
+    /// `emit_assignment` (`DELETE FROM t WHERE p`, never hydrated); a **private**
+    /// relvar stores the kept rows `R minus (R where p)` back into its slot.
+    fn lower_delete_stmt(&mut self, stmt: &DeleteStmt) {
+        let Some(operand) = stmt.operand() else { return };
+        // The operand is the `where`-restriction `R where p` (typecheck guarantees
+        // the shape); the relvar is the `where` lhs.
+        let Expr::Binary(bin) = &operand else { return };
+        let Some(lhs_expr) = bin.lhs() else { return };
+        let Expr::NameRef(target) = &lhs_expr else { return };
+        let Some(name_tok) = target.ident() else { return };
+        let name = name_tok.text().to_string();
+
+        // Public target → surgical `DELETE FROM t WHERE p` via the
+        // `R := R minus (R where p)` shape.
+        if self.public_relvars.contains_key(&name) {
+            let Some(dialect) = self.require_public_write(&name, &operand) else {
+                return;
+            };
+            // Build the target `RelvarRef` and the restriction `Restrict{t, p}`,
+            // then the `Minus{t, Restrict}` the DELETE arm recognizes.
+            let recognized = self
+                .build_rel_expr(&lhs_expr)
+                .zip(self.build_rel_expr(&operand))
+                .and_then(|(t, restrict)| {
+                    let value = RelExpr::Minus {
+                        lhs: Box::new(t.clone()),
+                        rhs: Box::new(restrict),
+                    };
+                    emit_assignment(&t, &value, dialect).ok()
+                });
+            match recognized {
+                Some(query) => self.emit_dml(query),
+                // The predicate didn't push (a restriction the single-predicate
+                // model can't express surgically): decline rather than hydrate —
+                // never a silent partial delete.
+                None => self.diagnostics.push(Diagnostic::error(
+                    self.node_span(operand.syntax()),
+                    "T0049",
+                    format!(
+                        "cannot delete from public relvar `{name}`: predicate is not a \
+                         recognized surgical shape"
+                    ),
+                )),
+            }
+            return;
+        }
+
+        // Private target → the kept rows `R minus (R where p)` stored back (the
+        // operands lower exactly as the literal `R minus (R where p)` would).
+        let lhs_val = self.lower_expr(&lhs_expr);
+        let rhs_val = self.lower_expr(&operand);
+        let value = self.emit_minus(lhs_val, rhs_val);
         self.used_private_relvars.insert(name.clone());
         self.insts.push(Inst::RelvarSlotStore { name, value });
     }
@@ -3838,6 +3897,50 @@ oper main {} [
                 .iter()
                 .any(|i| matches!(i, Inst::RelvarSlotStore { .. })),
             "truncate R must store the empty result into the slot"
+        );
+    }
+
+    #[test]
+    fn delete_public_relvar_emits_dml() {
+        // `delete Greetings where id = 1` desugars to `Greetings := Greetings
+        // minus (Greetings where id = 1)` → a surgical `DELETE … WHERE id = ?`.
+        let src = "\
+program hello_world_db;
+database greetings;
+public relvar Greetings { id: Integer, message: Text } key { id };
+oper main {} [
+    transaction [ delete Greetings where id = 1; ];
+];
+";
+        let m = lower_ok_with_plan(src, &greetings_rw_plan());
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            main.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i, Inst::Dml { .. })),
+            "delete must emit surgical DML"
+        );
+    }
+
+    #[test]
+    fn delete_private_relvar_emits_minus_and_store() {
+        // `delete R where a = 1` on a private relvar lowers to the kept rows
+        // `R minus (R where a = 1)` stored back into the slot.
+        let src = "program p; private relvar R { a: Integer } key { a }; \
+                   oper main {} [ delete R where a = 1; ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let insts: Vec<_> = main.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::Minus { .. })),
+            "delete R where p must compute R minus (R where p)"
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|i| matches!(i, Inst::RelvarSlotStore { .. })),
+            "delete must store the kept rows into the slot"
         );
     }
 

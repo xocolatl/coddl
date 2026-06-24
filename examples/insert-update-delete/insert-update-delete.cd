@@ -32,8 +32,10 @@ oper main {} [
     };
     write_relation { rel: Greetings };
 
-    // Remove one tuple by predicate: the rows except the one with id 1.
-    Greetings := Greetings minus (Greetings where id = 1);
+    // Remove one tuple by predicate. `delete Greetings where id = 1` is sugar
+    // for `Greetings := Greetings minus (Greetings where id = 1)` — the rows
+    // except the one with id 1.
+    delete Greetings where id = 1;
 
     // Remove every tuple that also appears in Stale (matched on every attribute).
     Greetings := Greetings minus Stale;

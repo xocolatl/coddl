@@ -1301,6 +1301,32 @@ fn dml_truncate_stmt_empties_cranelift() {
     assert_truncate_stmt_empties("cranelift");
 }
 
+/// `delete R where p;` is sugar for `R := R minus (R where p)` — it desugars to
+/// the same surgical `DELETE FROM greetings WHERE id = ?`, so only the id=2 row
+/// survives. Same result on both backends.
+fn assert_delete_stmt_persists(backend: &str) {
+    let rows = run_greetings_dml(
+        backend,
+        "program insert_update_delete;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             transaction [ delete Greetings where id = 1; ];\n\
+         ];\n",
+    );
+    assert_eq!(rows, vec!["2|goodbye".to_string()], "backend={backend}");
+}
+
+#[test]
+fn dml_delete_stmt_persists_llvm() {
+    assert_delete_stmt_persists("llvm");
+}
+
+#[test]
+fn dml_delete_stmt_persists_cranelift() {
+    assert_delete_stmt_persists("cranelift");
+}
+
 /// Binding transparency: `let r = R where id = 1; R := R minus r` folds to the
 /// same `DELETE … WHERE id = ?` as the inline form — the alias is substituted
 /// before recognition, so it persists identically.
