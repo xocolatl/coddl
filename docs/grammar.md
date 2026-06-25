@@ -55,13 +55,9 @@ Reason: the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-
 
 **`project` (projection) is a *postfix* operator, not infix.** `R project { a, b }` narrows the relation's heading to the named attributes — the right operand is a brace-list of bare attribute names (structurally identical to a `key { … }` clause), not another expression, so it doesn't fit the infix `<lhs> op <rhs>` shape. It is parsed as a postfix suffix at *pipeline precedence* — the same altitude as `where`, and gated to the top level so it binds to the whole pipeline rather than to a higher-precedence operand such as a `where` predicate. `R where p project { a }` reads as `(R where p) project { a }`; the reverse order `R project { a } where p` also parses, nesting left. It is the first postfix relational operator; later ones (`replace`, `extend`, `rename`, `tclose`, `wrap`, `unwrap`, and future `summarize`) reuse the same pipeline slot. `project` remains a contextual keyword — a valid identifier everywhere else (no reserved words).
 
-### Parenthesized positional for monadic operators
+### Named-prefix with braces — the only call form
 
-`count(R)`, `sin(x)`, `is_*(...)`, `not(p)`. Single argument, name-free, conventional shape.
-
-### Named-prefix with braces for everything else
-
-N-ary or structured operands: selectors, `oper` calls in general, `extend`, `summarize`, `replace`, `group`, `ungroup`, `wrap`, `unwrap`. These all have meaningful name slots that would be lost in a positional form. (The binary relational operators — `join`, `times`, `intersect`, `compose`, `union`, `minus`, `where` — are **infix only**; there is no named-prefix brace variant for them.)
+Every operator invocation is `name { … }` (or its dot-method sugar `R.method { … }`, see "Method-style call syntax"): selectors, `oper` calls, `extend`, `summarize`, `replace`, `group`, `ungroup`, `wrap`, `unwrap`, and so on. **There is no positional call form** — Coddl has no `f(x)` syntax; parentheses are for expression grouping only (see "Brackets vs braces encode ordering"). Arguments are named (`name: expr`); a brace may instead hold a bare list of attribute *names* where that is the operand shape (`project { a, b }`, `key { a, b }`). The binary relational operators — `join`, `times`, `intersect`, `compose`, `union`, `minus`, `where` — are **infix only**; there is no named-prefix brace variant for them.
 
 This eliminates the relational-algebra/scalar-op syntactic distinction the authors regret, and matches RM Pro 1 (no ordinal-position semantics) at the surface where it's easiest to enforce.
 
@@ -71,7 +67,7 @@ A consistent two-character distinction across the entire surface syntax:
 
 - **`{ ... }` (curly braces) — unordered.** A set-like collection where position is meaningless. Used for named-argument lists, `Tuple` and `Relation` literals, heading declarations, and parameter lists in `oper` declarations. Reordering the contents preserves meaning.
 - **`[ ... ]` (square brackets) — ordered.** A sequence where position is semantically significant. Used for `Sequence T` literals (`[1, 2, 3]`, `[tup1, tup2, tup3]`), operator bodies (statements run in order), `load` ordering specs, and any other context where the reader's expectation is "this is a sequence." Reordering changes meaning.
-- **`( ... )` (parentheses)** — kept for expression grouping and for the small set of monadic operators that retain parenthesized positional form (`count`, `sin`, `is_*`).
+- **`( ... )` (parentheses)** — expression grouping only. There is no positional call form; every operator invocation uses `name { … }` (see "Named-prefix with braces" above).
 
 This maps directly onto TTM: tuples, relations, and headings have no ordinal position semantics (RM Pro 1); they get `{ ... }`. Procedural code is sequential by nature; it gets `[ ... ]`. The punctuation tells the reader which kind of collection they're looking at without having to recall any context.
 
@@ -79,7 +75,7 @@ This maps directly onto TTM: tuples, relations, and headings have no ordinal pos
 
 Coddl is case-sensitive: `foo` and `Foo` are distinct identifiers. The language uses three case styles, applied consistently to built-ins and recommended for user code:
 
-- **lowercase / snake_case** — keywords (`program`, `oper`, `where`, `join`, `load`, `if`, `then`, `else`, …), built-in operators (`and`, `or`, `not`, `count`, `sum`, `extend`, …), built-in constants (`true`, `false`, `reltrue`, `relfalse`), and user-named operators, variables, attributes, and parameters.
+- **lowercase / snake_case** — keywords (`program`, `oper`, `where`, `join`, `load`, `if`, `then`, `else`, …), built-in operators (`and`, `or`, `join`, `union`, `extend`, …), built-in constants (`true`, `false`, `reltrue`, `relfalse`), and user-named operators, variables, attributes, and parameters.
 - **PascalCase** — type names, both built-in (`Integer`, `Rational`, `Text`, `Character`, `Boolean`, `Tuple`, `Relation`, `Sequence`) and user-defined (`Customer`, `OrderLine`, `EmailAddress`); and relvar names by convention (`Customer`, `Suppliers`, `OrderLines`).
 
 User code is not *required* to follow PascalCase for types and relvars — that's convention, not language. The language only enforces case sensitivity (so `customer` and `Customer` are different identifiers) and the canonical case of built-in identifiers (the `Integer` built-in is `Integer`, never `integer` or `INTEGER`).
