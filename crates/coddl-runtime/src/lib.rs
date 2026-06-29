@@ -118,6 +118,67 @@ pub unsafe extern "C" fn coddl_write_line(ptr: *const u8, len: usize) {
     let _ = w.write_all(b"\n");
 }
 
+/// Write `prompt` (a `Text` `(ptr, len)`) to stdout without a trailing
+/// newline, flush, then read one line from stdin. Returns the line as a
+/// freshly allocated heap `Text` payload with any trailing `\n` / `\r\n`
+/// stripped, and writes its byte length into `*len_out`. On EOF (no bytes
+/// read) the result is the empty `Text` (`*len_out == 0`).
+///
+/// The Coddl `read_line { prompt: ... }` operator lowers to a call to this
+/// symbol. Because the runtime can't return a fat pointer by value, the
+/// length crosses back through the `len_out` out-parameter — the same
+/// convention `coddl_resolve_op_field` uses. Codegen pairs the returned
+/// payload pointer with the stored length to form the `(ptr, len)` value.
+///
+/// KNOWN LEAK: like [`coddl_text_concat`](crate::coddl_text_concat), the
+/// allocated `Text` is never released — scalar-`Text` reference counting is
+/// not yet wired. Contained: the language has no loops, so it cannot
+/// accumulate, and the OS reclaims at exit.
+///
+/// # Safety
+/// `prompt_ptr` must point to at least `prompt_len` initialized bytes (or be
+/// null with `prompt_len == 0`); `len_out` must point to a writable `usize`.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_read_line(
+    prompt_ptr: *const u8,
+    prompt_len: usize,
+    len_out: *mut usize,
+) -> *mut u8 {
+    // Emit the prompt (no newline) and flush so it shows before the read.
+    {
+        let stdout = std::io::stdout();
+        let mut w = stdout.lock();
+        if prompt_len > 0 {
+            let prompt = std::slice::from_raw_parts(prompt_ptr, prompt_len);
+            let _ = w.write_all(prompt);
+        }
+        let _ = w.flush();
+    }
+
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    let bytes = strip_line_ending(line.as_bytes());
+    let n = bytes.len();
+
+    let out = crate::rc::coddl_rc_alloc(n, n as u32, crate::rc::CoddlKind::Text as u32, std::ptr::null());
+    if n > 0 {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, n);
+    }
+    *len_out = n;
+    out
+}
+
+/// Drop a single trailing line terminator — `\n` or `\r\n` — from `bytes`,
+/// leaving any interior or non-terminal CR/LF untouched. The slice the
+/// reader hands back has at most one terminator (one `read_line`).
+fn strip_line_ending(bytes: &[u8]) -> &[u8] {
+    match bytes {
+        [rest @ .., b'\r', b'\n'] => rest,
+        [rest @ .., b'\n'] => rest,
+        _ => bytes,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +200,18 @@ mod tests {
         // by the codegen e2e tests, which check the printed text.
         let bytes: &[u8] = b"";
         unsafe { coddl_write_line(bytes.as_ptr(), bytes.len()) };
+    }
+
+    #[test]
+    fn strip_line_ending_handles_lf_crlf_and_none() {
+        assert_eq!(strip_line_ending(b"Vik\n"), b"Vik");
+        assert_eq!(strip_line_ending(b"Vik\r\n"), b"Vik");
+        assert_eq!(strip_line_ending(b"Vik"), b"Vik");
+        assert_eq!(strip_line_ending(b""), b"");
+        assert_eq!(strip_line_ending(b"\n"), b"");
+        // A lone trailing CR is not a terminator; only `\r\n` is.
+        assert_eq!(strip_line_ending(b"Vik\r"), b"Vik\r");
+        // Interior newlines are untouched; only the final one is stripped.
+        assert_eq!(strip_line_ending(b"a\nb\n"), b"a\nb");
     }
 }

@@ -169,10 +169,17 @@ the single source of truth for the lowering pass.
 | Surface name | Linkage name        | Signature                          |
 |--------------|---------------------|------------------------------------|
 | `write_line` | `coddl_write_line`  | `(message: Text) -> Unit`          |
+| `read_line`  | `coddl_read_line`   | `(prompt: Text) -> Text`           |
 
 Every entry corresponds to a built-in the typechecker already knows
 about (`crates/coddl-types/src/builtins.rs`). Adding a built-in is
 two coordinated edits.
+
+ProcIR records each extern's *logical* signature — the clean
+`(prompt: Text) -> Text` above. How a `Text` return crosses the C ABI
+(it can't go back by value) is a codegen concern: each backend
+synthesizes a trailing len-out pointer at the call site. See
+`docs/codegen.md` "Fat-pointer returns".
 
 
 ## `Codegen` trait

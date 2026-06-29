@@ -160,6 +160,27 @@ The `Boolean` ABI:
 - **Cranelift**: `cranelift_value_type(Boolean) = I8` both as SSA and
   ABI — no conversion needed.
 
+### Fat-pointer returns
+
+A `Text`/`Binary` value is a `(ptr, len)` pair, and the runtime can't
+return a fat pointer by value. So an extern whose ProcIR return type is
+`Text`/`Binary` (e.g. `coddl_read_line`) uses an **out-parameter
+convention**, applied uniformly in both backends keyed on
+`returns_fat_pointer(return_type)`:
+
+- The **declaration / signature** gains a trailing `ptr` len-out
+  parameter (`emit_extern` in LLVM, `cranelift_signature` in Cranelift),
+  so `read_line`'s logical `(prompt: Text) -> Text` lowers to a C ABI
+  `(ptr, i64, ptr) -> ptr`.
+- The **call site** (`lower_call` / the `Inst::Call` arm) allocates an
+  `i64` len slot, appends its address as the last argument, takes the
+  call's returned payload `ptr`, loads the length back from the slot,
+  and binds the ProcIR `dst` to `ValueRepr::Text { ptr, len }`.
+
+This is the same idiom the relvar materializer already uses for
+`coddl_resolve_op_field`. ProcIR stays oblivious — it records the clean
+`-> Text` signature; the out-param is purely a codegen ABI detail.
+
 ### `Inst::Extract` (Phase 21)
 
 `Inst::Extract { dst, src, heading_id }` lowers in three steps in

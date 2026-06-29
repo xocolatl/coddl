@@ -814,6 +814,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn read_line_builtin_is_recognized() {
+        // The LSP runs the same `coddl_types::check` as the compiler, so a
+        // newly-registered builtin like `read_line` must resolve cleanly —
+        // no T0001 "unknown operator" squiggle. Guards against the builtin
+        // registry and the LSP analyzer drifting apart.
+        let analyzer = Analyzer::new();
+        let uri = url("file:///read_line_ok.cd");
+        analyzer
+            .put_document(
+                uri.clone(),
+                1,
+                "program p; oper main {} [ \
+                 let name = read_line { prompt: \"Name: \" }; \
+                 write_line { message: \"Hi, \" || name }; ];"
+                    .to_string(),
+            )
+            .await;
+        let snap = analyzer.snapshot(&uri).await.unwrap();
+        assert!(
+            snap.diagnostics.is_empty(),
+            "expected no diagnostics, got {:?}",
+            snap.diagnostics
+        );
+    }
+
     // ── project operator (frontend serves the LSP too) ──────────
 
     #[tokio::test]

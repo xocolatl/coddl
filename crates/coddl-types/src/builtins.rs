@@ -2,8 +2,8 @@
 //!
 //! A tiny table mapping operator names to their signatures. The
 //! typechecker consults it whenever a `Call` expression's callee is a
-//! `NameRef`. Today the only registered operator is `write_line`; more
-//! arrive as the runtime grows.
+//! `NameRef`. The current set is the I/O builtins — `write_line`,
+//! `write_relation`, and `read_line`; more arrive as the runtime grows.
 
 use std::collections::HashMap;
 
@@ -76,6 +76,17 @@ impl Builtins {
                 purity: Purity::SideEffecting,
             },
         );
+        // `read_line { prompt: Text } -> Text` — prints the prompt, reads
+        // one line from stdin (newline stripped). Side-effecting: it
+        // touches the outside world, so it's barred inside a transaction.
+        opers.insert(
+            "read_line",
+            OperSig {
+                params: vec![("prompt", ParamKind::Concrete(Type::Text))],
+                return_type: Type::Text,
+                purity: Purity::SideEffecting,
+            },
+        );
         Self { opers }
     }
 
@@ -122,6 +133,17 @@ mod tests {
         assert_eq!(sig.params[0].0, "rel");
         assert!(matches!(sig.params[0].1, ParamKind::AnyRelation));
         assert!(matches!(sig.return_type, Type::Tuple(ref h) if h.is_empty()));
+        assert_eq!(sig.purity, Purity::SideEffecting);
+    }
+
+    #[test]
+    fn read_line_returns_text() {
+        let b = Builtins::new();
+        let sig = b.oper("read_line").expect("read_line should exist");
+        assert_eq!(sig.params.len(), 1);
+        assert_eq!(sig.params[0].0, "prompt");
+        assert!(matches!(sig.params[0].1, ParamKind::Concrete(Type::Text)));
+        assert!(matches!(sig.return_type, Type::Text));
         assert_eq!(sig.purity, Purity::SideEffecting);
     }
 

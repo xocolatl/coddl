@@ -715,6 +715,76 @@ oper main {} [
     run_both_backends_expect(src, "concat.cd", b"Hi!\n");
 }
 
+/// Like [`run_both_backends_expect`], but feeds `stdin` to the child's
+/// standard input — for programs that call `read_line`.
+fn run_both_backends_with_stdin(src: &str, name: &str, stdin: &[u8], expected: &[u8]) {
+    use std::io::Write;
+    use std::process::Stdio;
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src_path = tmp.path().join(name);
+    std::fs::write(&src_path, src).expect("write source");
+    for backend in ["llvm", "cranelift"] {
+        let mut child = coddl()
+            .args(["run", &format!("--backend={backend}")])
+            .arg(&src_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn coddl");
+        child
+            .stdin
+            .take()
+            .expect("child stdin")
+            .write_all(stdin)
+            .expect("write stdin");
+        let out = child.wait_with_output().expect("wait coddl");
+        assert!(
+            out.status.success(),
+            "{name} {backend} run failed: stderr=\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            out.stdout,
+            expected,
+            "{name} {backend} stdout mismatch: got {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}
+
+#[test]
+fn read_line_echoes_into_greeting() {
+    // `read_line` prints the prompt (no newline), reads a stdin line with the
+    // trailing newline stripped, and the value flows back through `||`.
+    // Exercises the runtime `coddl_read_line` and the Text-return out-param
+    // ABI (a builtin Call binding a `(ptr, len)` result) end to end.
+    let src = "\
+program greet;
+oper main {} [
+    let name = read_line { prompt: \"Name: \" };
+    write_line { message: \"Hello, \" || name || \"!\" };
+];
+";
+    run_both_backends_with_stdin(src, "read-line.cd", b"Vik\n", b"Name: Hello, Vik!\n");
+}
+
+#[test]
+fn read_line_at_eof_yields_empty_text() {
+    // Closed stdin (no bytes) → `read_line` returns the empty Text, so the
+    // greeting collapses to just the bracketing literals. Confirms the
+    // zero-length payload path crosses the ABI cleanly.
+    let src = "\
+program greet_eof;
+oper main {} [
+    let name = read_line { prompt: \"Name: \" };
+    write_line { message: \"[\" || name || \"]\" };
+];
+";
+    run_both_backends_with_stdin(src, "read-line-eof.cd", b"", b"Name: []\n");
+}
+
 #[test]
 fn arithmetic_in_where_filters_in_process() {
     // `a + b > 4` over three rows keeps exactly `{a: 2, b: 3}` (sum 5). Runs

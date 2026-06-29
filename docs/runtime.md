@@ -150,6 +150,7 @@ calling convention works for both heap-managed and immortal values.
 | `coddl_rc_release`         | `(ptr) -> ()`                                       | Decrement `rc`. On zero: dispatch the drop walker by `kind`, then free the entire block (`header + payload`).            |
 | `coddl_relation_seal`      | `(payload, desc) -> ()`                             | Sort the relation's records by byte-wise comparison, then adjacent-dedup in place; updates the header's `length`.        |
 | `coddl_write_relation`     | `(payload, desc) -> ()`                             | Print the relation, one tuple per line, in canonical heading order. Empty relation writes zero bytes.                    |
+| `coddl_read_line`          | `(prompt_ptr, prompt_len, len_out) -> ptr`          | Write `prompt` (a `Text` `(ptr,len)`) to stdout without a newline, flush, then read one stdin line. Returns a fresh heap `Text` payload (trailing `\n`/`\r\n` stripped) and writes its length into `*len_out`. EOF → empty `Text`. The length crosses back through `len_out` because a fat pointer can't return by value (same idiom as `coddl_resolve_op_field`); inherits the scalar-`Text` leak (`docs/memory.md`). |
 | `coddl_relation_where`     | `(src, desc, pred_fn) -> ptr`                       | Restrict `src` by `pred_fn(record_ptr) != 0`. Returns a fresh RC-managed relation (rc=1) holding the matching rows in the input's original order. Worst-case alloc; header `length` trimmed to the actual count. No re-seal — restricting a duplicate-free relation can't introduce duplicates (RM Pro 3 preserved). |
 | `coddl_relation_extend`    | `(src, src_desc, result_desc, synth_fn) -> ptr`     | Extend `src` with computed attributes. For each source record, `synth_fn(src_record, dst_record)` fills the whole widened (result-heading) record — surviving cells permuted to their result offsets plus the new computed cells — so this stays oblivious to the layout (the synthesized per-tuple helper owns it). Allocates `result_record_size × count`, then **re-seals** (computing a column can change sort order and collapse formerly-distinct rows → RM Pro 3). Computed `Text` cells inherit the scalar-Text leak (`docs/memory.md`); surviving `Text` cells are shared by value, like `rename`. |
 | `coddl_extract_check_cardinality` | `(src, desc) -> ptr`                          | TTM RM Pre 10 cardinality check: if `src`'s header `length` is exactly 1, returns a pointer to the single record's bytes (which equals `src` itself, since records start at the payload base). Otherwise writes `"coddl: extract: expected exactly 1 tuple, got N"` to stderr and calls `std::process::abort()`. The caller reads each attribute via the descriptor before releasing the source — the lowering's "Extract then Release" order guarantees the buffer is live during attribute reads. |
@@ -161,8 +162,10 @@ calling convention works for both heap-managed and immortal values.
 
 The lowerer and both backends agree on the same set of symbol names
 and signatures; the `BUILTIN_EXTERNS` table in `coddl-procir::lower`
-maps the user-facing builtin (today: `write_relation`) to its
-linkage name.
+maps each generically-lowered user-facing builtin (`write_line`,
+`read_line`) to its linkage name. (`write_relation` is special-cased to
+`Inst::WriteRelation` rather than a generic `Inst::Call`, so it isn't in
+that table.)
 
 ### Drop walker
 

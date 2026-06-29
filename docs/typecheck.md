@@ -163,11 +163,15 @@ The `Builtins` table maps operator names to their `OperSig`. A call
 whose callee is a `NameRef` looks up its lexeme in this table; an
 unknown name produces `T0001`.
 
-| Name         | Heading                | Returns    |
-|--------------|------------------------|------------|
-| `write_line` | `{ message: Text }`    | `Tuple {}` |
+| Name             | Heading                | Returns    |
+|------------------|------------------------|------------|
+| `write_line`     | `{ message: Text }`    | `Tuple {}` |
+| `write_relation` | `{ rel: Relation H }`  | `Tuple {}` |
+| `read_line`      | `{ prompt: Text }`     | `Text`     |
 
-More operators arrive as the runtime grows.
+`write_relation` is polymorphic over the heading `H` (see
+"`write_relation` polymorphism" below). `read_line` is the first
+`Text`-returning builtin. More operators arrive as the runtime grows.
 
 
 ## Pass overview
@@ -403,7 +407,8 @@ that touches the outside world (stdout, stderr, the network, a file
 that isn't the materialized SQLite payload) is unsafe inside.
 
 - `Builtins::OperSig` carries a `Purity` field (`Pure | SideEffecting`).
-- Existing side-effecting builtins: `write_line`, `write_relation`.
+- Existing side-effecting builtins: `write_line`, `write_relation`,
+  `read_line` (reads stdin — also barred inside a transaction).
   All future builtins default to `Pure` in the registry and must
   opt in to `SideEffecting` explicitly — adding a printing operator
   is a forcing function on the conformance check.

@@ -526,6 +526,13 @@ impl Emitter {
         for (_, pty) in &func.params {
             push_param_types(&mut params, pty);
         }
+        // A `Text`/`Binary` return crosses the C ABI as the payload `ptr`
+        // plus a caller-supplied len-out pointer — the runtime can't return
+        // a fat pointer by value. Declare the trailing out-param so the
+        // `declare` matches the call site `lower_call` emits.
+        if returns_fat_pointer(&func.return_type) {
+            params.push("ptr".to_string());
+        }
         writeln!(
             self.body,
             "declare {ret} @{linkage}({args})",
@@ -2027,6 +2034,32 @@ impl Emitter {
             repr.push_call_operands(&mut call_args);
         }
 
+        // `Text`/`Binary` return: the runtime hands back the payload `ptr`
+        // and writes the length into a caller-allocated slot. Pass the slot
+        // address as a trailing arg, then load the length to rebuild the
+        // `(ptr, len)` value. (The runtime can't return a fat pointer; this
+        // is the same out-param convention `coddl_resolve_op_field` uses.)
+        if returns_fat_pointer(return_type) {
+            let v = dst.ok_or_else(|| {
+                LlvmEmitError::UnsupportedInst("Text-returning call must bind a dst".into())
+            })?;
+            let len_slot = format!("%v{}.lenslot", v.0);
+            writeln!(self.body, "    {len_slot} = alloca i64, align 8").unwrap();
+            call_args.push(format!("ptr {len_slot}"));
+            let ptr_op = format!("%v{}.ptr", v.0);
+            writeln!(
+                self.body,
+                "    {ptr_op} = call ptr @{callee}({args})",
+                args = call_args.join(", "),
+            )
+            .unwrap();
+            let len_op = format!("%v{}.len", v.0);
+            writeln!(self.body, "    {len_op} = load i64, ptr {len_slot}").unwrap();
+            self.values
+                .insert(v, ValueRepr::Text { ptr_op, len_op });
+            return Ok(());
+        }
+
         let ret_ty = llvm_return_type(return_type);
         let dst_prefix = match dst {
             Some(v) if !matches!(return_type, ProcType::Unit) => {
@@ -2138,6 +2171,14 @@ fn kind_tag_for(ty: &ProcType) -> Result<u32, LlvmEmitError> {
             "query param of type {other:?} has no CoddlParam kind"
         ))),
     }
+}
+
+/// Whether `ty` is returned as a fat pointer `(ptr, len)` — `Text` or
+/// `Binary`. Such returns can't cross the C ABI by value, so the runtime
+/// returns the payload `ptr` and writes the length into a caller-supplied
+/// out-parameter (see `emit_extern` / `lower_call`).
+fn returns_fat_pointer(ty: &ProcType) -> bool {
+    matches!(ty, ProcType::Text | ProcType::Binary)
 }
 
 fn llvm_return_type(ty: &ProcType) -> String {
@@ -2275,6 +2316,27 @@ mod tests {
         assert!(
             ir.contains("declare void @coddl_write_line(ptr, i64)"),
             "no extern declaration in:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn read_line_declares_len_out_param_and_rebuilds_text() {
+        // A Text-returning extern: the declaration carries the trailing
+        // len-out `ptr`, and the call site allocas the slot, passes it,
+        // then loads the length back to form the `(ptr, len)` value.
+        let src = "program p;\noper main {} [ let n = read_line{prompt: \"q\"}; write_line{message: n}; ];\n";
+        let ir = emit_ok(src);
+        assert!(
+            ir.contains("declare ptr @coddl_read_line(ptr, i64, ptr)"),
+            "len-out param missing from declaration:\n{ir}"
+        );
+        assert!(
+            ir.contains("alloca i64") && ir.contains("call ptr @coddl_read_line("),
+            "call-site out-param sequence missing:\n{ir}"
+        );
+        assert!(
+            ir.contains("load i64, ptr %v"),
+            "length load missing:\n{ir}"
         );
     }
 

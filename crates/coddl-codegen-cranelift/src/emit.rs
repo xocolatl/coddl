@@ -898,6 +898,13 @@ fn cranelift_signature(
     for (_, pty) in &func.params {
         push_param_types(&mut sig.params, pty, ptr_ty);
     }
+    // A `Text`/`Binary` return crosses the C ABI as the payload `ptr` plus a
+    // caller-supplied len-out pointer — the runtime can't return a fat
+    // pointer by value. Add the trailing out-param so the signature matches
+    // the call site `lower_call` synthesizes.
+    if returns_fat_pointer(&func.return_type) {
+        sig.params.push(AbiParam::new(ptr_ty));
+    }
     if func.name == "main" {
         sig.returns.push(AbiParam::new(types::I32));
     } else {
@@ -929,6 +936,14 @@ fn push_param_types(
         }
         other => out.push(AbiParam::new(cranelift_value_type(other, ptr_ty))),
     }
+}
+
+/// Whether `ty` is returned as a fat pointer `(ptr, len)` — `Text` or
+/// `Binary`. Such returns can't cross the C ABI by value, so the runtime
+/// returns the payload `ptr` and writes the length into a caller-supplied
+/// out-parameter (see `cranelift_signature` / the `Inst::Call` arm).
+fn returns_fat_pointer(ty: &ProcType) -> bool {
+    matches!(ty, ProcType::Text | ProcType::Binary)
 }
 
 fn push_return_types(
@@ -1232,6 +1247,31 @@ fn emit_inst(
                     CraneliftEmitError::UnsupportedInst(format!("undefined value {arg:?}"))
                 })?;
                 repr.push_call_operands(&mut call_args);
+            }
+
+            // `Text`/`Binary` return: the runtime hands back the payload
+            // `ptr` and writes the length into a caller-allocated slot. Pass
+            // the slot address as a trailing arg, then load the length to
+            // rebuild the `(ptr, len)` value. (Mirrors the LLVM backend and
+            // the `coddl_resolve_op_field` out-param convention.)
+            if returns_fat_pointer(return_type) {
+                let ptr_ty = obj.target_config().pointer_type();
+                let slot = builder.create_sized_stack_slot(
+                    cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                        8,
+                        3,
+                    ),
+                );
+                let len_addr = builder.ins().stack_addr(ptr_ty, slot, 0);
+                call_args.push(len_addr);
+                let call = builder.ins().call(local_callee, &call_args);
+                let ptr = builder.inst_results(call)[0];
+                let len = builder.ins().load(types::I64, MemFlags::trusted(), len_addr, 0);
+                if let Some(dst) = dst {
+                    values.insert(*dst, ValueRepr::Text { ptr, len });
+                }
+                return Ok(());
             }
 
             let call = builder.ins().call(local_callee, &call_args);

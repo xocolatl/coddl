@@ -41,12 +41,24 @@ use crate::ir::{
 /// Surface name → C-ABI linkage name for each runtime extern. The
 /// table is short by design; every entry corresponds to a built-in
 /// operator the typechecker already knows.
-const BUILTIN_EXTERNS: &[BuiltinExtern] = &[BuiltinExtern {
-    surface: "write_line",
-    linkage: "coddl_write_line",
-    params: &[("message", ProcType::Text)],
-    return_type: ProcType::Unit,
-}];
+const BUILTIN_EXTERNS: &[BuiltinExtern] = &[
+    BuiltinExtern {
+        surface: "write_line",
+        linkage: "coddl_write_line",
+        params: &[("message", ProcType::Text)],
+        return_type: ProcType::Unit,
+    },
+    // `read_line { prompt: Text } -> Text`. Returns a Text by value; at the
+    // C ABI the length crosses back through a trailing len-out pointer (the
+    // backends synthesize it — see their `lower_call`), since the runtime
+    // can't return a fat pointer.
+    BuiltinExtern {
+        surface: "read_line",
+        linkage: "coddl_read_line",
+        params: &[("prompt", ProcType::Text)],
+        return_type: ProcType::Text,
+    },
+];
 
 struct BuiltinExtern {
     surface: &'static str,
@@ -4824,6 +4836,57 @@ oper main {} [
         assert_eq!(ext.params[0].0, "message");
         assert_eq!(ext.params[0].1, ProcType::Text);
         assert_eq!(ext.return_type, ProcType::Unit);
+    }
+
+    #[test]
+    fn read_line_lowers_to_text_returning_call() {
+        // `read_line` registers a `coddl_read_line` extern returning Text,
+        // and its call's `dst` (the Text result) is the ValueId the let
+        // binding threads into the following `write_line`. The len-out
+        // ABI param is a codegen concern, so ProcIR keeps the clean
+        // `(prompt: Text) -> Text` signature.
+        let src = "oper main {} [ let n = read_line{prompt: \"p\"}; write_line{message: n}; ];";
+        let m = lower_ok(src);
+
+        let ext = m.functions.iter().find(|f| f.name == "read_line").unwrap();
+        assert!(ext.is_extern());
+        assert_eq!(ext.linkage_name, "coddl_read_line");
+        assert_eq!(ext.params.len(), 1);
+        assert_eq!(ext.params[0].0, "prompt");
+        assert_eq!(ext.params[0].1, ProcType::Text);
+        assert_eq!(ext.return_type, ProcType::Text);
+
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let insts = &main.blocks[0].insts;
+        let read_dst = insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::Call {
+                    callee,
+                    dst,
+                    return_type,
+                    ..
+                } if callee == "coddl_read_line" => {
+                    assert_eq!(*return_type, ProcType::Text);
+                    Some(dst.expect("read_line call binds a dst"))
+                }
+                _ => None,
+            })
+            .expect("read_line call present");
+        let write_arg = insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::Call { callee, args, .. } if callee == "coddl_write_line" => {
+                    Some(args.first().copied())
+                }
+                _ => None,
+            })
+            .expect("write_line call present")
+            .expect("write_line call has an arg");
+        assert_eq!(
+            write_arg, read_dst,
+            "read_line's Text result should thread into the write_line arg"
+        );
     }
 
     #[test]

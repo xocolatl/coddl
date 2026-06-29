@@ -1,0 +1,7 @@
+program hello_world;
+
+oper main {} [
+    let name = read_line { prompt: "Enter your name: " };
+    let message = "Hello, " || name || "!";
+    write_line { message };
+];
