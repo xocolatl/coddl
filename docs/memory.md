@@ -69,13 +69,19 @@ The two layers exist deliberately: the user reasons about *values*; the compiler
 
 **What we lose vs. Rust**: zero-cost moves. We always pay one atomic refcount op on heap-value assignment. **What we gain vs. tracing GC**: predictable, low-latency reclamation; no stop-the-world pauses; the runtime stays tiny.
 
-### Known gap: scalar `Text` reference counting (deferred)
+### `Text` reference counting
 
-The table above describes the **target**. Today the RC machinery is wired for `Relation` payloads only (`is_heap_managed` in `coddl-procir` returns `true` only for `Relation`); every `Text` the language could produce until now was an **immortal compile-time literal** (a rodata `(ptr, len)` with no header), so nothing needed freeing.
+Heap `Text` is fully reference-counted — both as a scalar (`||`, `read_line`) and as a relation record cell — alongside `Relation` payloads. The design rests on two facts and one invariant.
 
-Concatenation (`||`) introduces the **first heap-allocated scalar `Text`** — `coddl_text_concat` / `coddl_char_to_text` allocate via `coddl_rc_alloc` (kind `Text`), but no `Inst::Release` is ever emitted for a scalar `Text` value, so these **currently leak**. The leak is contained: the language has no loops, so it cannot accumulate within a run, and the OS reclaims at process exit.
+**Uniform headers.** Every `Text` value carries a `CoddlRcHeader`. The heap producers (`coddl_text_concat` / `coddl_char_to_text` / `coddl_read_line`, and SQLite text-column materialization) allocate one via `coddl_rc_alloc`; **string literals** are emitted by both codegen backends with an *immortal* header (`rc = IMMORTAL_RC`) ahead of their bytes, the payload pointer offset past it. So `coddl_rc_retain` / `coddl_rc_release` run safely on *any* `Text` — a literal sees the sentinel and no-ops.
 
-Closing this gap (teach `is_heap_managed` about `Text`, emit retain/release for `Text` locals, thread ownership through rebinds and record cells) is a dedicated follow-up — it is the `Text` row of the strategy table coming true. Until then, treat heap scalar `Text` as immortal-for-the-run.
+**Owned vs borrowed provenance (scalars).** A `Text` SSA value is *owned* (a heap producer's result, or a retained alias) or *borrowed* (a `(ptr,len)` loaded out of a relation/tuple cell via `AttrLoad` / `TupleField` / `Extract`). The lowerer tracks owned values in `owned_texts` and only auto-releases those — at scope exit for owned locals, and right after a borrowing consumer (`||`, `coddl_text_eq`, a builtin call) for owned temporaries. Releasing a borrowed `Text` would be a premature free, so it is never done.
+
+**One-reference-per-cell invariant (relations).** Every `Text` cell in a relation record holds exactly one reference owned by that relation. It is established at *production*: a scalar stored into a literal's cell is **retained on store** (backend); a cell copied from input relation(s) by a relop is **retained on copy** (`retain_text_cells`, before `seal`); a cell produced fresh at rc=1 (an `extend`-computed concat, a marshaled SQLite text) is **moved in**. Release is then **uniform** — the drop walker (`drop_relation_payload`) and `seal`'s dedup release every `Text` cell of a record they drop, no provenance needed. (Immortal-literal cells no-op throughout.) `tclose`'s intermediate dedups run over un-retained working copies, so they pass `release_dropped_text = false`; its final output is retained once.
+
+**`extract` defers its source.** `extract` copies a record's cells into a tuple as borrowed values, so the source relation's release is deferred to **function** scope exit (after every use of the borrowed fields, including uses past a `transaction [...]` the extract sat inside) rather than freed immediately — the drop walker would otherwise dangle the fields.
+
+The leak oracle (`crates/coddl-runtime/tests/leak_oracle.rs`) drives the relops + concat over heap `Text` and asserts the debug `LIVE_ALLOCATIONS` counter returns to zero. This is the `Text` row of the strategy table come true.
 
 ## Discipline (defaults — push back if a proposal conflicts)
 

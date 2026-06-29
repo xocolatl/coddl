@@ -130,10 +130,9 @@ pub unsafe extern "C" fn coddl_write_line(ptr: *const u8, len: usize) {
 /// convention `coddl_resolve_op_field` uses. Codegen pairs the returned
 /// payload pointer with the stored length to form the `(ptr, len)` value.
 ///
-/// KNOWN LEAK: like [`coddl_text_concat`](crate::coddl_text_concat), the
-/// allocated `Text` is never released — scalar-`Text` reference counting is
-/// not yet wired. Contained: the language has no loops, so it cannot
-/// accumulate, and the OS reclaims at exit.
+/// The result (rc=1) is reference-counted like
+/// [`coddl_text_concat`](crate::coddl_text_concat)'s — released at scope exit /
+/// consumption, or by the relation drop walker once stored into a cell.
 ///
 /// # Safety
 /// `prompt_ptr` must point to at least `prompt_len` initialized bytes (or be

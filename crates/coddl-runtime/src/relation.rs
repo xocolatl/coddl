@@ -118,7 +118,9 @@ pub unsafe extern "C" fn coddl_relation_seal(ptr: *mut u8, desc: *const CoddlHea
 
     let attrs = std::slice::from_raw_parts((*desc).attrs, (*desc).attr_count as usize);
     let payload = std::slice::from_raw_parts_mut(ptr, count * record_size);
-    let new_len = dedup_records(payload, record_size, attrs);
+    // The payload's cells are owned (retain-on-store / retain-on-copy ran before
+    // this seal), so release each dropped duplicate's `Text` cells.
+    let new_len = dedup_records(payload, record_size, attrs, true);
     (*header).length = new_len as u32;
 }
 
@@ -139,7 +141,18 @@ pub unsafe extern "C" fn coddl_relation_seal(ptr: *mut u8, desc: *const CoddlHea
 /// # Safety
 /// `payload.len()` must be a multiple of `record_size > 0`, and every `Text`
 /// cell's `(ptr, len)` must describe `len` readable bytes (or `len == 0`).
-unsafe fn dedup_records(payload: &mut [u8], record_size: usize, attrs: &[CoddlAttrDesc]) -> usize {
+/// `release_dropped_text`: release each discarded duplicate's `Text` cells.
+/// True from [`coddl_relation_seal`], where the payload's cells are *owned*
+/// (each holds a per-slot reference from retain-on-store / retain-on-copy or a
+/// fresh rc=1). False from [`coddl_relation_tclose`], whose intermediate
+/// dedups run over *un-retained* working copies — releasing there would be an
+/// over-release.
+unsafe fn dedup_records(
+    payload: &mut [u8],
+    record_size: usize,
+    attrs: &[CoddlAttrDesc],
+    release_dropped_text: bool,
+) -> usize {
     let count = payload.len() / record_size;
     if count <= 1 {
         return count;
@@ -166,15 +179,25 @@ unsafe fn dedup_records(payload: &mut [u8], record_size: usize, attrs: &[CoddlAt
             write_idx = 1;
             continue;
         }
-        let prev = &sorted[(write_idx - 1) * record_size..write_idx * record_size];
-        let cur = &sorted[read_idx * record_size..(read_idx + 1) * record_size];
-        if record_cmp(prev, cur, attrs) != std::cmp::Ordering::Equal {
+        let is_dup = {
+            let prev = &sorted[(write_idx - 1) * record_size..write_idx * record_size];
+            let cur = &sorted[read_idx * record_size..(read_idx + 1) * record_size];
+            record_cmp(prev, cur, attrs) == std::cmp::Ordering::Equal
+        };
+        if !is_dup {
             if read_idx != write_idx {
                 let (head, tail) = sorted.split_at_mut(read_idx * record_size);
                 let dest = &mut head[write_idx * record_size..(write_idx + 1) * record_size];
                 dest.copy_from_slice(&tail[..record_size]);
             }
             write_idx += 1;
+        } else if release_dropped_text {
+            // `cur` is a discarded duplicate — release the per-slot `Text`
+            // reference it holds (equal-content cells can be distinct pointers,
+            // so this releases `cur`'s own cells, not the survivor's). Survivor
+            // slots keep their references and are copied back into `payload`.
+            let rec = sorted[read_idx * record_size..].as_mut_ptr();
+            release_record_text_cells(rec, attrs);
         }
     }
 
@@ -347,6 +370,9 @@ pub unsafe extern "C" fn coddl_relation_join(
         }
     }
     (*(out.sub(HEADER_SIZE) as *mut CoddlRcHeader)).length = written as u32;
+    // Retain each copied `Text` cell before sealing — dedup's per-dropped-row
+    // release then keeps the count balanced.
+    retain_text_cells(out, written, result_desc);
     coddl_relation_seal(out, result_desc);
     out
 }
@@ -391,6 +417,9 @@ pub unsafe extern "C" fn coddl_relation_union(
     if rhs_count > 0 {
         std::ptr::copy_nonoverlapping(rhs, out.add(lhs_count * rec), rhs_count * rec);
     }
+    // Retain each copied `Text` cell (both operands) before sealing; dedup's
+    // per-dropped-row release balances the overlap it collapses.
+    retain_text_cells(out, total, desc);
     coddl_relation_seal(out, desc);
     out
 }
@@ -442,6 +471,8 @@ pub unsafe extern "C" fn coddl_relation_minus(
         }
     }
     (*(out.sub(HEADER_SIZE) as *mut CoddlRcHeader)).length = written as u32;
+    // Retain each surviving `Text` cell (no seal — a subset of sealed lhs).
+    retain_text_cells(out, written, desc);
     out
 }
 
@@ -528,7 +559,9 @@ pub unsafe extern "C" fn coddl_relation_tclose(
             break;
         }
         result.extend_from_slice(&round);
-        let new_count = dedup_records(&mut result, record_size, attrs);
+        // Working copies are un-retained, so dedup must not release dropped
+        // cells here; the final output's cells are retained once below.
+        let new_count = dedup_records(&mut result, record_size, attrs, false);
         result.truncate(new_count * record_size);
         if result.len() == prev_len {
             break; // fixpoint: the round added no pair that survived dedup
@@ -548,6 +581,9 @@ pub unsafe extern "C" fn coddl_relation_tclose(
     if n > 0 {
         std::ptr::copy_nonoverlapping(result.as_ptr(), out, n * record_size);
     }
+    // The output's `Text` cells are copies of the (un-retained) working set —
+    // retain each so the new relation co-owns it.
+    retain_text_cells(out, n, desc);
     out
 }
 
@@ -700,6 +736,10 @@ pub unsafe extern "C" fn coddl_relation_where(
     let out_header = out.sub(HEADER_SIZE) as *mut CoddlRcHeader;
     (*out_header).length = written as u32;
 
+    // Retain each copied `Text` cell so the new relation co-owns it (no seal,
+    // so the written count is final).
+    retain_text_cells(out, written, desc);
+
     out
 }
 
@@ -712,9 +752,12 @@ pub unsafe extern "C" fn coddl_relation_where(
 /// change sort order and can collapse formerly-distinct rows into duplicates
 /// (RM Pro 3). `src` is left unchanged.
 ///
-/// Computed `Text` cells written by `synth_fn` (e.g. from `coddl_text_concat`)
-/// inherit the scalar-Text leak documented in `docs/memory.md`; surviving
-/// source `Text` cells are shared by value (no retain), matching `rename`.
+/// `Text` cell ownership: a computed cell (`synth_fn`'s `coddl_text_concat`
+/// result) arrives at rc=1 and is moved into the record; a surviving source
+/// cell is retained by `synth_fn` so the new relation co-owns it. The re-seal's
+/// dedup releases any cell whose row it drops, and the drop walker releases the
+/// survivors — so the relation owns exactly one reference per cell slot. See
+/// `docs/memory.md`.
 ///
 /// # Safety
 /// `src` must point to a `Relation` payload whose header descriptor matches
@@ -796,11 +839,9 @@ pub unsafe extern "C" fn coddl_text_eq(
 /// can't return a fat pointer by value, so the length is recomputed at the
 /// call site).
 ///
-/// KNOWN LEAK: this is the first heap-allocated scalar `Text`. Scalar-Text
-/// reference counting is not yet wired (every prior `Text` was immortal
-/// rodata), so the result is never released. The leak is contained — the
-/// language has no loops, so it cannot accumulate, and the OS reclaims at
-/// exit. Tracked in `docs/memory.md`; a dedicated follow-up adds the RC path.
+/// The result (rc=1) is reference-counted: the lowerer releases it at scope
+/// exit / consumption, or, once stored into a relation cell, the relation drop
+/// walker frees it (see `docs/memory.md`).
 ///
 /// # Safety
 /// Each `(ptr, len)` pair must describe `len` readable bytes (or `len == 0`).
@@ -833,7 +874,7 @@ pub unsafe extern "C" fn coddl_text_concat(
 /// Used to normalize a `Character` operand of `||` to `Text`. No caller-side
 /// safety obligation — `cp` is a plain value — so this is a safe `extern "C"`.
 ///
-/// KNOWN LEAK: see [`coddl_text_concat`].
+/// Reference-counted like [`coddl_text_concat`]'s result.
 #[no_mangle]
 pub extern "C" fn coddl_char_to_text(cp: u32) -> *mut u8 {
     let mut buf = [0u8; 4];
@@ -919,6 +960,68 @@ unsafe fn read_text_cell(rec: *const u8, off: usize) -> (*const u8, usize) {
         usize::from_ne_bytes(ptr_bytes) as *const u8,
         usize::from_ne_bytes(len_bytes),
     )
+}
+
+/// Visit every `Text` leaf cell of the record at `rec`, recursing through
+/// `Tuple` sub-regions, invoking `f` on each cell's payload pointer. `base` is
+/// the record's absolute byte offset (0 for a top-level record; a tuple cell's
+/// offset when recursing). The shared traversal behind retain-on-copy and the
+/// drop / dedup release — mirrors the kind dispatch of [`print_cell`] /
+/// [`cmp_cell`]. Integer/Boolean cells carry no heap pointer and are skipped.
+///
+/// # Safety
+/// `rec` must hold a record whose layout matches `attrs` at `base`. The `Text`
+/// payload pointer is handed to `f`, not dereferenced here.
+unsafe fn walk_text_cells(
+    rec: *mut u8,
+    attrs: &[CoddlAttrDesc],
+    base: usize,
+    f: &mut impl FnMut(*mut u8),
+) {
+    for attr in attrs {
+        let off = base + attr.offset as usize;
+        if attr.kind == CoddlAttrKind::Text as u32 {
+            let (ptr, _len) = read_text_cell(rec, off);
+            f(ptr as *mut u8);
+        } else if attr.kind == CoddlAttrKind::Tuple as u32 && !attr.sub.is_null() {
+            let sub = &*attr.sub;
+            let sub_attrs = std::slice::from_raw_parts(sub.attrs, sub.attr_count as usize);
+            walk_text_cells(rec, sub_attrs, off, f);
+        }
+    }
+}
+
+/// Retain every `Text` cell across `count` records of `payload` (heading
+/// `desc`). Called after a relation operator copies cells from its input(s) so
+/// the freshly built relation co-owns each shared `Text` payload (immortal
+/// literals see `rc == IMMORTAL_RC` and no-op). Must run **before** any
+/// `coddl_relation_seal`, so dedup's per-dropped-row release stays balanced.
+///
+/// # Safety
+/// `payload` must hold `count` records of `desc`'s layout, each cell a valid
+/// `(ptr, len)` Text value.
+unsafe fn retain_text_cells(payload: *mut u8, count: usize, desc: *const CoddlHeadingDesc) {
+    if payload.is_null() || desc.is_null() {
+        return;
+    }
+    let record_size = (*desc).record_size as usize;
+    let attrs = std::slice::from_raw_parts((*desc).attrs, (*desc).attr_count as usize);
+    for i in 0..count {
+        walk_text_cells(payload.add(i * record_size), attrs, 0, &mut |p| {
+            crate::rc::coddl_rc_retain(p)
+        });
+    }
+}
+
+/// Release every `Text` cell of the single record at `rec` (layout `attrs`).
+/// Used by the relation drop walker and by [`dedup_records`] when discarding a
+/// duplicate row — each balances one per-slot reference the relation took at
+/// production (retain-on-copy / retain-on-store, or an rc=1 fresh cell).
+///
+/// # Safety
+/// `rec` must hold one record of `attrs`' layout; cells must be valid Text.
+unsafe fn release_record_text_cells(rec: *mut u8, attrs: &[CoddlAttrDesc]) {
+    walk_text_cells(rec, attrs, 0, &mut |p| crate::rc::coddl_rc_release(p));
 }
 
 /// Compare a cell of `ra` (at absolute record offset `off_a`) against a cell of
@@ -1072,6 +1175,10 @@ pub unsafe extern "C" fn coddl_relation_project(
         }
     }
 
+    // Retain each copied `Text` cell before sealing (no-op when the heading is
+    // empty — zero-width records carry no cells).
+    retain_text_cells(out, count, dst_desc);
+
     if dst_record_size == 0 {
         // Nullary projection (`project {}`): every record is the empty
         // tuple, so the result collapses to `reltrue` (one empty tuple)
@@ -1156,6 +1263,10 @@ pub unsafe extern "C" fn coddl_relation_rename(
             std::ptr::copy_nonoverlapping(src_rec.add(src_off), dst_rec.add(dst_off), width);
         }
     }
+
+    // Retain each copied `Text` cell before sealing (no-op when the heading is
+    // empty — zero-width records carry no cells).
+    retain_text_cells(out, count, dst_desc);
 
     if dst_record_size == 0 {
         // Renaming an empty heading: collapse to reltrue/relfalse (seal can't
@@ -1251,6 +1362,11 @@ pub unsafe extern "C" fn coddl_relation_restructure(
         }
     }
 
+    // Retain each copied `Text` cell before sealing — `restructure` only moves
+    // cells between flat and tuple-nested positions, so the leaf payloads (and
+    // their pointers) are preserved and the new relation co-owns them.
+    retain_text_cells(out, count, dst_desc);
+
     if dst_record_size == 0 {
         // All-empty result (e.g. wrap of everything into `Tuple {}`): seal can't
         // dedup zero-width records, so collapse to reltrue/relfalse by hand.
@@ -1293,17 +1409,63 @@ pub unsafe extern "C" fn coddl_extract_check_cardinality(
     src
 }
 
-pub(crate) unsafe fn drop_relation_payload(_payload: *mut u8, _header: &CoddlRcHeader) {
-    // Phase 19: no heap cells to release. Future phases iterate
-    // `header.length` records, look at the descriptor's per-attr
-    // kind, and release nested heap pointers (Text owned, Relation,
-    // Tuple-with-heap-content).
+pub(crate) unsafe fn drop_relation_payload(payload: *mut u8, header: &CoddlRcHeader) {
+    // Release each record's `Text` cells (recursing through tuple cells). Every
+    // cell holds exactly one reference owned by this relation — taken at
+    // production (retain-on-store for a literal, retain-on-copy for a relop, or
+    // an rc=1 fresh cell from `extend`/SQLite) — so one release per cell slot
+    // balances it. Immortal-literal cells see `rc == IMMORTAL_RC` and no-op.
+    let desc = header.desc;
+    if desc.is_null() {
+        return;
+    }
+    let record_size = (*desc).record_size as usize;
+    if record_size == 0 {
+        return;
+    }
+    let count = header.length as usize;
+    let attrs = std::slice::from_raw_parts((*desc).attrs, (*desc).attr_count as usize);
+    for i in 0..count {
+        release_record_text_cells(payload.add(i * record_size), attrs);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rc::{coddl_rc_alloc, coddl_rc_release, CoddlKind};
+    use crate::rc::{coddl_rc_alloc, coddl_rc_release, CoddlKind, IMMORTAL_RC};
+
+    /// Build an immortal-headed `Text` payload over `bytes` — exactly the shape
+    /// the codegen backends emit for a string literal (a `CoddlRcHeader` with
+    /// `rc = IMMORTAL_RC` ahead of the bytes). Returns the payload pointer.
+    /// Now that the runtime RC-manages `Text` cells (retain-on-copy, drop
+    /// walker, dedup release), a relation cell must point at a headered payload;
+    /// a bare `&[u8]`/`Vec` pointer would make those calls read a bogus header.
+    /// The backing block is leaked for the test's lifetime — immortal cells are
+    /// never freed by the RC machinery, so this matches production behavior.
+    ///
+    /// # Safety
+    /// The returned pointer is valid for the process lifetime (leaked).
+    unsafe fn immortal_text(bytes: &[u8]) -> *const u8 {
+        let total = HEADER_SIZE + bytes.len();
+        let block = vec![0u8; total].into_boxed_slice();
+        let raw = Box::leak(block).as_mut_ptr();
+        std::ptr::write(
+            raw as *mut CoddlRcHeader,
+            CoddlRcHeader {
+                rc: IMMORTAL_RC,
+                desc: std::ptr::null(),
+                kind: CoddlKind::Text as u32,
+                length: bytes.len() as u32,
+                capacity: bytes.len(),
+            },
+        );
+        let payload = raw.add(HEADER_SIZE);
+        if !bytes.is_empty() {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), payload, bytes.len());
+        }
+        payload
+    }
 
     #[test]
     fn text_eq_compares_bytes_not_pointers() {
@@ -1450,7 +1612,7 @@ mod tests {
             );
             assert!(!payload.is_null());
             let write_row = |rec: *mut u8, s: &[u8]| {
-                std::ptr::write(rec as *mut usize, s.as_ptr() as usize);
+                std::ptr::write(rec as *mut usize, immortal_text(s) as usize);
                 std::ptr::write(rec.add(8) as *mut usize, s.len());
             };
             write_row(payload, &grace_a);
@@ -1499,7 +1661,7 @@ mod tests {
         unsafe {
             let write_row = |rec: *mut u8, id: i64, s: &[u8]| {
                 std::ptr::write(rec as *mut i64, id);
-                std::ptr::write(rec.add(8) as *mut usize, s.as_ptr() as usize);
+                std::ptr::write(rec.add(8) as *mut usize, immortal_text(s) as usize);
                 std::ptr::write(rec.add(16) as *mut usize, s.len());
             };
             let lhs = coddl_rc_alloc(2 * 24, 2, CoddlKind::Relation as u32, &desc);
@@ -1573,7 +1735,7 @@ mod tests {
         unsafe {
             let write_row = |rec: *mut u8, id: i64, s: &[u8]| {
                 std::ptr::write(rec as *mut i64, id);
-                std::ptr::write(rec.add(8) as *mut usize, s.as_ptr() as usize);
+                std::ptr::write(rec.add(8) as *mut usize, immortal_text(s) as usize);
                 std::ptr::write(rec.add(16) as *mut usize, s.len());
             };
             let lhs = coddl_rc_alloc(2 * 24, 2, CoddlKind::Relation as u32, &desc);
@@ -1688,9 +1850,9 @@ mod tests {
         assert_ne!(b_src.as_ptr(), b_dst.as_ptr());
         unsafe {
             let write_edge = |rec: *mut u8, from: &[u8], to: &[u8]| {
-                std::ptr::write(rec as *mut usize, from.as_ptr() as usize);
+                std::ptr::write(rec as *mut usize, immortal_text(from) as usize);
                 std::ptr::write(rec.add(8) as *mut usize, from.len());
-                std::ptr::write(rec.add(16) as *mut usize, to.as_ptr() as usize);
+                std::ptr::write(rec.add(16) as *mut usize, immortal_text(to) as usize);
                 std::ptr::write(rec.add(24) as *mut usize, to.len());
             };
             let edges = coddl_rc_alloc(2 * 32, 2, CoddlKind::Relation as u32, &desc);
@@ -1858,7 +2020,7 @@ mod tests {
         unsafe {
             let write_row = |rec: *mut u8, id: i64, s: &[u8]| {
                 std::ptr::write(rec as *mut i64, id);
-                std::ptr::write(rec.add(8) as *mut usize, s.as_ptr() as usize);
+                std::ptr::write(rec.add(8) as *mut usize, immortal_text(s) as usize);
                 std::ptr::write(rec.add(16) as *mut usize, s.len());
             };
             // lhs { (2, grace_a) }; rhs { (2, grace_b), (5, zoe) }.

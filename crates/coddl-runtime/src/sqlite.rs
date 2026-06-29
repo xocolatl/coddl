@@ -403,11 +403,25 @@ unsafe fn marshal_rows(
                         std::process::abort();
                     }
                 };
-                let stored = intern_string(s);
-                let ptr = stored.as_ptr() as usize;
-                let len = stored.len();
-                buf[offset..offset + 8].copy_from_slice(&ptr.to_ne_bytes());
-                buf[offset + 8..offset + 16].copy_from_slice(&len.to_ne_bytes());
+                // Allocate the cell as a refcounted heap `Text` (kind=Text,
+                // rc=1) and copy the bytes in. The relation owns this rc=1
+                // reference; its drop walker releases the cell when the relvar
+                // slot drops. (Previously interned into a process-global static
+                // that leaked and had no RC header — unsafe once the drop walker
+                // releases `Text` cells.)
+                let bytes = s.as_bytes();
+                let n = bytes.len();
+                let payload = crate::rc::coddl_rc_alloc(
+                    n,
+                    n as u32,
+                    crate::rc::CoddlKind::Text as u32,
+                    std::ptr::null(),
+                );
+                if n > 0 {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), payload, n);
+                }
+                buf[offset..offset + 8].copy_from_slice(&(payload as usize).to_ne_bytes());
+                buf[offset + 8..offset + 16].copy_from_slice(&n.to_ne_bytes());
             } else {
                 let attr_name = read_attr_name(attr);
                 eprintln!(

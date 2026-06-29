@@ -247,10 +247,29 @@ extern declarations and the first `define` line.
 | `Tuple`   | `fields: Vec<(String, ValueRepr)>` | Compile-time grouping in canonical heading order; flattens recursively at ABI boundaries. |
 
 `Inst::Const { value: Text(bytes), ty: Text, dst }` emits a private
-unnamed-address constant for the bytes and records `Text { ptr_op:
-"@.str.N", len_op: "<literal length>" }` for `dst`. `Inst::Call`
-expands each `Text`-typed argument into two operands at the LLVM
-call site.
+unnamed-address constant for the bytes and records `Text { ptr_op,
+len_op }` for `dst`. `Inst::Call` expands each `Text`-typed argument
+into two operands at the LLVM call site.
+
+**Immortal-headed literals.** The literal global is *not* bare bytes: it
+carries a `CoddlRcHeader` ahead of the payload (`rc = IMMORTAL_RC`,
+`kind = Text`), so every `Text` value — literal or heap — uniformly has
+a header and `coddl_rc_retain`/`release` run safely on any of them (a
+literal sees the sentinel and no-ops). The LLVM global is a struct
+`{ i64, ptr, i32, i32, i64, [N x i8] }` matching `CoddlRcHeader` field
+order, `align 8`; `ptr_op` is a constant-expr GEP past the 32-byte
+header (`getelementptr inbounds (i8, ptr @.str.N, i64 32)`). Cranelift
+prepends the header bytes (host-endian) and offsets the symbol value by
+`RC_HEADER_SIZE`. A `#[cfg(test)]` layout assertion in `coddl-runtime`
+guards the hand-mirrored size/offsets. See `docs/memory.md`.
+
+**Retain-on-store.** When a `Text` value is stored into a relation
+record cell (`emit_attr_store` / `store_attr`, reached from `RelationLit`
+and the `extend`/`replace` synth helper), codegen emits a
+`coddl_rc_retain` on the cell pointer — the relation co-owns the cell,
+balanced by the drop walker / dedup release (see `docs/runtime.md`).
+Immortal literals no-op; the lowerer balances an owned temp's producer
+reference.
 
 **Worked example.** Hello-world lowers to (the `coddl_runtime_init`
 and `coddl_runtime_shutdown` calls are auto-injected by ProcIR
@@ -265,16 +284,19 @@ declare void @coddl_write_line(ptr, i64)
 declare i64 @coddl_runtime_init()
 declare i64 @coddl_runtime_shutdown()
 
-@.str.0 = private unnamed_addr constant [13 x i8] c"Hello, world!"
+@.str.0 = private unnamed_addr constant { i64, ptr, i32, i32, i64, [13 x i8] } { i64 -1, ptr null, i32 1, i32 13, i64 13, [13 x i8] c"Hello, world!" }, align 8
 
 define i32 @main() {
 block_0:
     %v0 = call i64 @coddl_runtime_init()
-    call void @coddl_write_line(ptr @.str.0, i64 13)
+    call void @coddl_write_line(ptr getelementptr inbounds (i8, ptr @.str.0, i64 32), i64 13)
     %v2 = call i64 @coddl_runtime_shutdown()
     ret i32 0
 }
 ```
+
+(`i64 -1` is `IMMORTAL_RC`; `i32 1` is `CoddlKind::Text`; the call passes
+the payload pointer 32 bytes past the header.)
 
 
 ## Cranelift backend
@@ -297,11 +319,14 @@ good practice on every modern target.
 | String-constant data | `Linkage::Local` |
 
 **Data section.** Each `Inst::Const { value: Text(bytes), ty: Text }`
-declares a local `DataId` named `.str.N`, defines its bytes, imports
-the symbol into the current function, materializes the pointer with
-`builder.ins().symbol_value(pointer_type, sym_value)`, and the length
-with `builder.ins().iconst(I64, bytes.len())`. The two values are
-tracked as the ProcIR `dst`'s `ValueRepr::Text { ptr, len }`.
+declares a local `DataId` named `.str.N` and defines a 32-byte immortal
+`CoddlRcHeader` (host-endian, `rc = IMMORTAL_RC`, `kind = Text`) followed
+by the bytes, `align 8` (see "Immortal-headed literals" above). It then
+materializes the base with `builder.ins().symbol_value(pointer_type,
+sym_value)`, offsets it past the header with `iadd_imm(base,
+RC_HEADER_SIZE)` for the payload pointer, and the length with
+`builder.ins().iconst(I64, bytes.len())`. The two values are tracked as
+the ProcIR `dst`'s `ValueRepr::Text { ptr, len }`.
 
 **Call sites.** The callee `FuncId` is looked up by linkage name in
 a `HashMap<String, FuncId>` built during the declaration pass.

@@ -54,9 +54,10 @@ pub enum CoddlKind {
     Relation = 0,
     /// A heap-allocated scalar `Text` payload — a flat run of UTF-8 bytes,
     /// `length` bytes long, with no nested RC pointers. Produced by `||`
-    /// (`coddl_text_concat` / `coddl_char_to_text`). The drop walker treats it
-    /// like any non-`Relation` kind (free the block, no recursion); scalar-Text
-    /// RC is not yet wired, so these currently leak — see `docs/memory.md`.
+    /// (`coddl_text_concat` / `coddl_char_to_text`), `read_line`, and SQLite
+    /// text-column materialization. The drop walker frees the block (no
+    /// recursion); string literals carry the same header with `rc =
+    /// IMMORTAL_RC` so retain/release are uniform. See `docs/memory.md`.
     Text = 1,
 }
 
@@ -243,6 +244,54 @@ mod tests {
         unsafe {
             coddl_rc_retain(std::ptr::null_mut());
             coddl_rc_release(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn header_layout_is_stable() {
+        // Both codegen backends hand-mirror this layout when they emit an
+        // immortal-headed string literal (a `{ i64, ptr, i32, i32, i64,
+        // [N x i8] }` struct). If the header ever changes size or field
+        // order, those mirrors break silently at runtime — pin it here.
+        use std::mem::offset_of;
+        assert_eq!(HEADER_SIZE, 32, "RC_HEADER_SIZE mirror in both backends");
+        assert_eq!(offset_of!(CoddlRcHeader, rc), 0);
+        assert_eq!(offset_of!(CoddlRcHeader, desc), 8);
+        assert_eq!(offset_of!(CoddlRcHeader, kind), 16);
+        assert_eq!(offset_of!(CoddlRcHeader, length), 20);
+        assert_eq!(offset_of!(CoddlRcHeader, capacity), 24);
+        assert_eq!(CoddlKind::Text as u32, 1, "RC_KIND_TEXT mirror");
+        assert_eq!(IMMORTAL_RC, u64::MAX, "RC_IMMORTAL mirror");
+    }
+
+    #[test]
+    fn immortal_header_is_inert_under_retain_release() {
+        // A literal-shaped payload: a real `CoddlRcHeader` with rc =
+        // IMMORTAL_RC sitting in front of the bytes. retain/release must be
+        // no-ops and must never free it (mirrors what the backends emit).
+        #[repr(C)]
+        struct Immortal {
+            header: CoddlRcHeader,
+            bytes: [u8; 3],
+        }
+        let mut obj = Immortal {
+            header: CoddlRcHeader {
+                rc: IMMORTAL_RC,
+                desc: std::ptr::null(),
+                kind: CoddlKind::Text as u32,
+                length: 3,
+                capacity: 3,
+            },
+            bytes: *b"abc",
+        };
+        unsafe {
+            let payload = obj.bytes.as_mut_ptr();
+            coddl_rc_retain(payload);
+            coddl_rc_release(payload);
+            coddl_rc_release(payload);
+            // Still untouched — release never decremented or freed it.
+            assert_eq!(obj.header.rc, IMMORTAL_RC);
+            assert_eq!(&obj.bytes, b"abc");
         }
     }
 }

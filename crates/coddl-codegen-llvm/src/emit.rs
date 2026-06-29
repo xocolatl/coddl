@@ -17,6 +17,18 @@ use coddl_procir::{
 
 use crate::error::LlvmEmitError;
 
+/// Mirror of `coddl_runtime::HEADER_SIZE` (the `CoddlRcHeader` byte size).
+/// Every heap `Text`/relation payload starts this many bytes past its
+/// header. A `#[cfg(test)]` layout assertion in `coddl-runtime::rc` guards
+/// the real value so this hand-mirror can't silently drift.
+const RC_HEADER_SIZE: usize = 32;
+/// Mirror of `coddl_runtime::CoddlKind::Text`.
+const RC_KIND_TEXT: u32 = 1;
+/// Mirror of `coddl_runtime::IMMORTAL_RC` (`u64::MAX`), written as a signed
+/// `i64 -1` in IR — the same all-ones bit pattern. Marks a payload immortal:
+/// `coddl_rc_retain`/`release` no-op on it.
+const RC_IMMORTAL_I64: &str = "-1";
+
 pub struct LlvmBackend;
 
 impl Default for LlvmBackend {
@@ -200,11 +212,14 @@ impl Emitter {
         Ok(())
     }
 
-    /// Declare the scalar `Text` concatenation runtime symbols (`||` and the
-    /// `Character`→`Text` normalization). These are needed independent of any
-    /// relation machinery, so they are declared unconditionally. (`coddl_text_eq`
-    /// stays with the relation externs since it predates this and is only used
-    /// from contexts that already pull those in.)
+    /// Declare the scalar `Text` runtime symbols: concatenation (`||` and the
+    /// `Character`→`Text` normalization) plus the RC lifecycle ops
+    /// (`coddl_rc_retain`/`coddl_rc_release`). These are needed independent of
+    /// any relation machinery — a pure-scalar program refcounts heap `Text`
+    /// (a `||` result released at scope exit) without ever interning a
+    /// heading — so they are declared unconditionally. (`coddl_text_eq` stays
+    /// with the relation externs since it predates this and is only used from
+    /// contexts that already pull those in.)
     fn emit_scalar_text_externs(&mut self) {
         // Text concatenation `||`: (a_ptr, a_len, b_ptr, b_len) -> payload ptr
         // (length is `a_len + b_len`, recomputed at the call site).
@@ -217,6 +232,10 @@ impl Emitter {
         // `coddl_utf8_len` for the length.
         writeln!(self.body, "declare ptr @coddl_char_to_text(i32)").unwrap();
         writeln!(self.body, "declare i64 @coddl_utf8_len(i32)").unwrap();
+        // RC retain/release — emitted for any heap `Text` (immortal literals
+        // see `rc == IMMORTAL_RC` and no-op) as well as relations.
+        writeln!(self.body, "declare void @coddl_rc_retain(ptr)").unwrap();
+        writeln!(self.body, "declare void @coddl_rc_release(ptr)").unwrap();
     }
 
     /// Declare the runtime symbols that `Inst::RelationLit`,
@@ -231,8 +250,9 @@ impl Emitter {
             "declare ptr @coddl_rc_alloc(i64, i32, i32, ptr)"
         )
         .unwrap();
-        writeln!(self.body, "declare void @coddl_rc_retain(ptr)").unwrap();
-        writeln!(self.body, "declare void @coddl_rc_release(ptr)").unwrap();
+        // `coddl_rc_retain`/`coddl_rc_release` are declared unconditionally in
+        // `emit_scalar_text_externs` (scalar `Text` RC needs them without any
+        // relations), so they are intentionally not repeated here.
         writeln!(self.body, "declare void @coddl_relation_seal(ptr, ptr)").unwrap();
         writeln!(self.body, "declare void @coddl_write_relation(ptr, ptr)").unwrap();
         // Private-relvar in-memory slots: empty-init a slot, and store (move)
@@ -749,12 +769,12 @@ impl Emitter {
                 heading_id,
             } => self.lower_relation_lit(*dst, tuples, *heading_id),
             Inst::Retain { src } => {
-                let op = self.scalar_op(src)?;
+                let op = self.rc_ptr(src)?;
                 writeln!(self.body, "    call void @coddl_rc_retain(ptr {op})").unwrap();
                 Ok(())
             }
             Inst::Release { src } => {
-                let op = self.scalar_op(src)?;
+                let op = self.rc_ptr(src)?;
                 writeln!(self.body, "    call void @coddl_rc_release(ptr {op})").unwrap();
                 Ok(())
             }
@@ -1836,6 +1856,23 @@ impl Emitter {
         }
     }
 
+    /// The heap payload pointer for a retain/release target. A relation is a
+    /// single `Scalar` pointer; a `Text` is a `(ptr, len)` pair whose `ptr`
+    /// half is the refcounted payload. Both feed `coddl_rc_retain`/`release`.
+    fn rc_ptr(&self, v: &ValueId) -> Result<String, LlvmEmitError> {
+        let repr = self
+            .values
+            .get(v)
+            .ok_or_else(|| LlvmEmitError::UnsupportedInst(format!("undefined value {v:?}")))?;
+        match repr {
+            ValueRepr::Scalar { op, .. } => Ok(op.clone()),
+            ValueRepr::Text { ptr_op, .. } => Ok(ptr_op.clone()),
+            other => Err(LlvmEmitError::UnsupportedInst(format!(
+                "retain/release expects a heap pointer value, got {other:?}"
+            ))),
+        }
+    }
+
     /// Lower `Inst::RelationLit` to a sequence of LLVM ops:
     ///
     /// 1. `call ptr @coddl_rc_alloc(record_size * count, count,
@@ -1948,6 +1985,11 @@ impl Emitter {
                 let slot_len = self.gep_byte(base, byte_offset + 8);
                 writeln!(self.body, "    store ptr {ptr_op}, ptr {slot_ptr}").unwrap();
                 writeln!(self.body, "    store i64 {len_op}, ptr {slot_len}").unwrap();
+                // Retain-on-store: the relation now co-owns this `Text` cell.
+                // Immortal literals no-op; the lowerer balances an owned temp's
+                // producer reference. The relation drop walker / dedup release
+                // the cell, keeping the count balanced. (See docs/codegen.md.)
+                writeln!(self.body, "    call void @coddl_rc_retain(ptr {ptr_op})").unwrap();
                 Ok(())
             }
             // Inline nested-tuple cell: store each component into the sub-region
@@ -2001,17 +2043,31 @@ impl Emitter {
         self.next_str += 1;
         let len = bytes.len();
 
+        // Emit the literal with an immortal RC header so every `Text` value
+        // uniformly carries a `CoddlRcHeader`. Retain/release can then run on
+        // any `Text` — literals see `rc == IMMORTAL_RC` and no-op. The struct
+        // field order mirrors `CoddlRcHeader` exactly (rc i64 @0, desc ptr @8,
+        // kind i32 @16, length i32 @20, capacity i64 @24, bytes @32), so the
+        // payload sits at byte `RC_HEADER_SIZE`. `align 8` keeps the payload
+        // 8-aligned so `payload - HEADER_SIZE` is a valid header pointer.
         writeln!(
             self.globals,
-            "{name} = private unnamed_addr constant [{len} x i8] c\"{}\"",
-            escape_ir_bytes(bytes),
+            "{name} = private unnamed_addr constant {{ i64, ptr, i32, i32, i64, [{len} x i8] }} \
+{{ i64 {rc}, ptr null, i32 {kind}, i32 {len}, i64 {len}, [{len} x i8] c\"{bytes}\" }}, align 8",
+            rc = RC_IMMORTAL_I64,
+            kind = RC_KIND_TEXT,
+            bytes = escape_ir_bytes(bytes),
         )
         .unwrap();
 
+        // The Text value's payload pointer is the global advanced past the
+        // header — a constant-expression GEP usable inline as any `ptr`
+        // operand (stores, calls, retain/release).
+        let ptr_op = format!("getelementptr inbounds (i8, ptr {name}, i64 {RC_HEADER_SIZE})");
         self.values.insert(
             dst,
             ValueRepr::Text {
-                ptr_op: name,
+                ptr_op,
                 len_op: format!("{len}"),
             },
         );
@@ -2353,17 +2409,25 @@ mod tests {
     #[test]
     fn hello_world_ir_contains_string_constant() {
         let ir = emit_ok(HELLO_WORLD);
+        // The literal carries an immortal RC header (rc = -1 = u64::MAX,
+        // kind = 1 = Text) ahead of its bytes.
         assert!(
-            ir.contains("@.str.0 = private unnamed_addr constant [13 x i8] c\"Hello, world!\""),
-            "string constant missing:\n{ir}"
+            ir.contains(
+                "@.str.0 = private unnamed_addr constant { i64, ptr, i32, i32, i64, [13 x i8] } \
+{ i64 -1, ptr null, i32 1, i32 13, i64 13, [13 x i8] c\"Hello, world!\" }, align 8"
+            ),
+            "immortal-headed string constant missing:\n{ir}"
         );
     }
 
     #[test]
     fn hello_world_ir_call_passes_ptr_and_len() {
         let ir = emit_ok(HELLO_WORLD);
+        // The Text pointer is the literal advanced past its 32-byte header.
         assert!(
-            ir.contains("call void @coddl_write_line(ptr @.str.0, i64 13)"),
+            ir.contains(
+                "call void @coddl_write_line(ptr getelementptr inbounds (i8, ptr @.str.0, i64 32), i64 13)"
+            ),
             "call site malformed:\n{ir}"
         );
     }
@@ -2400,7 +2464,9 @@ mod tests {
                    ];";
         let ir = emit_ok(src);
         assert!(
-            ir.contains("call void @coddl_write_line(ptr @.str.0, i64 2)"),
+            ir.contains(
+                "call void @coddl_write_line(ptr getelementptr inbounds (i8, ptr @.str.0, i64 32), i64 2)"
+            ),
             "expected flattened call site, got:\n{ir}"
         );
     }

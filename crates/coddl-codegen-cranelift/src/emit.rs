@@ -22,6 +22,16 @@ use coddl_procir::{
 
 use crate::error::CraneliftEmitError;
 
+/// Mirror of `coddl_runtime::HEADER_SIZE` (the `CoddlRcHeader` byte size).
+/// A `#[cfg(test)]` layout assertion in `coddl-runtime::rc` guards the real
+/// value so this hand-mirror can't silently drift.
+const RC_HEADER_SIZE: usize = 32;
+/// Mirror of `coddl_runtime::CoddlKind::Text`.
+const RC_KIND_TEXT: u32 = 1;
+/// Mirror of `coddl_runtime::IMMORTAL_RC` (`u64::MAX`). Marks a payload
+/// immortal: `coddl_rc_retain`/`release` no-op on it.
+const RC_IMMORTAL: u64 = u64::MAX;
+
 pub struct CraneliftBackend;
 
 impl CraneliftBackend {
@@ -217,6 +227,17 @@ fn declare_scalar_text_externs(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert("coddl_utf8_len".into(), id);
     }
+    // RC retain/release — needed for any heap `Text` (immortal literals
+    // no-op) as well as relations, so declared here unconditionally rather
+    // than in the relation-gated `declare_runtime_rc_externs`.
+    for name in ["coddl_rc_retain", "coddl_rc_release"] {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function(name, Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert(name.into(), id);
+    }
     Ok(())
 }
 
@@ -243,16 +264,9 @@ fn declare_runtime_rc_externs(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert("coddl_rc_alloc".into(), id);
     }
-    // coddl_rc_retain(ptr) -> ()
-    // coddl_rc_release(ptr) -> ()
-    for name in ["coddl_rc_retain", "coddl_rc_release"] {
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(ptr_ty));
-        let id = obj
-            .declare_function(name, Linkage::Import, &sig)
-            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
-        funcs.insert(name.into(), id);
-    }
+    // `coddl_rc_retain`/`coddl_rc_release` are declared unconditionally in
+    // `declare_scalar_text_externs` (scalar `Text` RC needs them without any
+    // relations), so they are intentionally not repeated here.
     // coddl_relation_seal(ptr, ptr) -> ()
     // coddl_write_relation(ptr, ptr) -> ()
     for name in ["coddl_relation_seal", "coddl_write_relation"] {
@@ -1187,14 +1201,32 @@ fn emit_inst(
             let data_id = obj
                 .declare_data(&name, Linkage::Local, false, false)
                 .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+            // Prepend an immortal `CoddlRcHeader` so every `Text` uniformly
+            // carries a header — retain/release can then run on any `Text`
+            // (literals see `rc == IMMORTAL_RC` and no-op). Header bytes are
+            // host-endian (`to_ne_bytes`): the runtime reads them back as an
+            // in-memory `CoddlRcHeader`. Field order mirrors that struct
+            // (rc@0, desc@8, kind@16, length@20, capacity@24, payload@32).
+            let n = bytes.len();
+            let mut buf = Vec::with_capacity(RC_HEADER_SIZE + n);
+            buf.extend_from_slice(&RC_IMMORTAL.to_ne_bytes()); // rc
+            buf.extend_from_slice(&(0usize).to_ne_bytes()); // desc = null
+            buf.extend_from_slice(&RC_KIND_TEXT.to_ne_bytes()); // kind
+            buf.extend_from_slice(&(n as u32).to_ne_bytes()); // length
+            buf.extend_from_slice(&n.to_ne_bytes()); // capacity
+            buf.extend_from_slice(bytes);
             let mut data_desc = DataDescription::new();
-            data_desc.define(bytes.clone().into_boxed_slice());
+            // 8-aligned so `payload - HEADER_SIZE` is a valid header pointer.
+            data_desc.set_align(8);
+            data_desc.define(buf.into_boxed_slice());
             obj.define_data(data_id, &data_desc)
                 .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
             let local_data = obj.declare_data_in_func(data_id, builder.func);
             let ptr_ty = obj.target_config().pointer_type();
-            let ptr = builder.ins().symbol_value(ptr_ty, local_data);
-            let len = builder.ins().iconst(types::I64, bytes.len() as i64);
+            let base = builder.ins().symbol_value(ptr_ty, local_data);
+            // The Text payload pointer is the global advanced past the header.
+            let ptr = builder.ins().iadd_imm(base, RC_HEADER_SIZE as i64);
+            let len = builder.ins().iconst(types::I64, n as i64);
             values.insert(*dst, ValueRepr::Text { ptr, len });
             Ok(())
         }
@@ -1387,7 +1419,9 @@ fn emit_inst(
                         })?;
                     let byte_offset =
                         record_idx as i32 * layout.record_size as i32 + attr.offset as i32;
-                    store_attr(builder, payload, byte_offset, &field_repr, attr.sub.as_ref())?;
+                    let retain_ref =
+                        obj.declare_func_in_func(funcs["coddl_rc_retain"], builder.func);
+                    store_attr(builder, payload, byte_offset, &field_repr, attr.sub.as_ref(), retain_ref)?;
                 }
             }
 
@@ -1400,14 +1434,14 @@ fn emit_inst(
             Ok(())
         }
         Inst::Retain { src } => {
-            let v = scalar_value(values, src)?;
+            let v = rc_ptr_value(values, src)?;
             let id = funcs["coddl_rc_retain"];
             let local = obj.declare_func_in_func(id, builder.func);
             builder.ins().call(local, &[v]);
             Ok(())
         }
         Inst::Release { src } => {
-            let v = scalar_value(values, src)?;
+            let v = rc_ptr_value(values, src)?;
             let id = funcs["coddl_rc_release"];
             let local = obj.declare_func_in_func(id, builder.func);
             builder.ins().call(local, &[v]);
@@ -1604,7 +1638,8 @@ fn emit_inst(
                 CraneliftEmitError::UnsupportedInst(format!("undefined value {value:?} in AttrStore"))
             })?;
             // The extend/where store path is scalar/Text only (no sub-layout).
-            store_attr(builder, payload, *offset as i32, &repr, None)
+            let retain_ref = obj.declare_func_in_func(funcs["coddl_rc_retain"], builder.func);
+            store_attr(builder, payload, *offset as i32, &repr, None, retain_ref)
         }
         Inst::Extend {
             dst,
@@ -2209,6 +2244,22 @@ fn scalar_value(
     }
 }
 
+/// The heap payload pointer for a retain/release target. A relation is a
+/// single `Scalar` pointer; a `Text` is a `(ptr, len)` pair whose `ptr` half
+/// is the refcounted payload. Both feed `coddl_rc_retain`/`release`.
+fn rc_ptr_value(
+    values: &HashMap<ValueId, ValueRepr>,
+    v: &ValueId,
+) -> Result<CrValue, CraneliftEmitError> {
+    match values.get(v) {
+        Some(ValueRepr::Scalar(val)) => Ok(*val),
+        Some(ValueRepr::Text { ptr, .. }) => Ok(*ptr),
+        _ => Err(CraneliftEmitError::UnsupportedInst(format!(
+            "retain/release expects a heap pointer value at {v:?}"
+        ))),
+    }
+}
+
 /// Extract the `(ptr, len)` pair of a `Text`-typed SSA value. Used when
 /// binding a Text query parameter into a `CoddlParam`.
 fn text_value(
@@ -2244,6 +2295,7 @@ fn store_attr(
     byte_offset: i32,
     repr: &ValueRepr,
     sub: Option<&RecordLayout>,
+    retain_ref: cranelift_codegen::ir::FuncRef,
 ) -> Result<(), CraneliftEmitError> {
     let flags = MemFlags::trusted();
     match repr {
@@ -2256,6 +2308,10 @@ fn store_attr(
         ValueRepr::Text { ptr, len } => {
             builder.ins().store(flags, *ptr, payload, byte_offset);
             builder.ins().store(flags, *len, payload, byte_offset + 8);
+            // Retain-on-store: the relation now co-owns this `Text` cell.
+            // Immortal literals no-op; the lowerer balances an owned temp's
+            // producer reference; the drop walker / dedup release the cell.
+            builder.ins().call(retain_ref, &[*ptr]);
             Ok(())
         }
         // Inline nested-tuple cell: store each component into the sub-region at
@@ -2282,6 +2338,7 @@ fn store_attr(
                     byte_offset + sub_attr.offset as i32,
                     &field,
                     sub_attr.sub.as_ref(),
+                    retain_ref,
                 )?;
             }
             Ok(())
@@ -2391,6 +2448,28 @@ mod tests {
         let needle = b"Hello, world!";
         let found = bytes.windows(needle.len()).any(|w| w == needle);
         assert!(found, "string bytes not present in object");
+    }
+
+    #[test]
+    fn string_literal_carries_immortal_header() {
+        // The 32 bytes immediately preceding the literal's payload are its
+        // immortal `CoddlRcHeader` (host-endian): rc = u64::MAX, desc = 0,
+        // kind = 1 (Text), length = 13, capacity = 13.
+        let bytes = emit_ok(HELLO_WORLD);
+        let needle = b"Hello, world!";
+        let at = bytes
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("string bytes present");
+        assert!(at >= RC_HEADER_SIZE, "no room for a header before the payload");
+        let header = &bytes[at - RC_HEADER_SIZE..at];
+        let mut want = Vec::new();
+        want.extend_from_slice(&RC_IMMORTAL.to_ne_bytes());
+        want.extend_from_slice(&(0usize).to_ne_bytes());
+        want.extend_from_slice(&RC_KIND_TEXT.to_ne_bytes());
+        want.extend_from_slice(&(needle.len() as u32).to_ne_bytes());
+        want.extend_from_slice(&needle.len().to_ne_bytes());
+        assert_eq!(header, want.as_slice(), "immortal header bytes mismatch");
     }
 
     #[test]

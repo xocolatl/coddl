@@ -268,6 +268,32 @@ struct Lowerer {
     /// Private relvars actually read or assigned; only these get a slot
     /// init/release in `main`.
     used_private_relvars: HashSet<String>,
+    /// SSA values that are *owned* heap `Text` payloads — produced by `||`
+    /// (`Concat`/`CharToText`), `read_line`, or a retained `Text` alias. Only
+    /// these are auto-released (at scope exit, or as consumed temporaries):
+    /// a `Text` loaded out of a relation/tuple cell (`AttrLoad`/`TupleField`/
+    /// `Extract`) is *borrowed* and must never be released here. Immortal
+    /// literals are safe to release but aren't tracked (release no-ops on
+    /// them). Function-global like `value_types` — must survive `pop_local_scope`
+    /// so a transaction-escaping owned `Text` stays owned.
+    owned_texts: HashSet<ValueId>,
+    /// For each `TupleLit` (by dst `ValueId`): the `Text` cell values consumed
+    /// directly into it — direct `Text` field values plus, recursively, the
+    /// temps of *fresh nested `TupleLit`* fields (not `NameRef`-aliased tuples).
+    /// `lower_relation_lit` drains the top-level tuples' entries and runs
+    /// `release_text_temp` on each, balancing the relation's retain-on-store of
+    /// an owned `Text` temp consumed into a cell. A standalone tuple's entry is
+    /// never drained (its temps flow out via `.field` and are released there).
+    tuple_cell_text_temps: HashMap<ValueId, Vec<ValueId>>,
+    /// Relation temporaries whose release is deferred to **function** scope
+    /// exit. `extract` copies a record's cells into a tuple as *borrowed*
+    /// `(ptr,len)` values, then the source relation would normally be released
+    /// at once — but the relation drop walker now frees its `Text` cells, which
+    /// the borrowed fields still point at. Deferring the source's release to the
+    /// function epilogue keeps those cells alive past every use (including after
+    /// a `transaction [...]` the extract sat inside), with no leak (it *is*
+    /// released, just last). Drained in `lower_oper_decl`.
+    deferred_relation_releases: Vec<ValueId>,
 }
 
 impl Lowerer {
@@ -304,6 +330,9 @@ impl Lowerer {
             private_relvars: HashMap::new(),
             private_relvar_order: Vec::new(),
             used_private_relvars: HashSet::new(),
+            owned_texts: HashSet::new(),
+            tuple_cell_text_temps: HashMap::new(),
+            deferred_relation_releases: Vec::new(),
         }
     }
 
@@ -434,6 +463,9 @@ impl Lowerer {
         self.relexpr_aliases.clear();
         self.relexpr_aliases.push(HashMap::new());
         self.value_types.clear();
+        self.owned_texts.clear();
+        self.tuple_cell_text_temps.clear();
+        self.deferred_relation_releases.clear();
     }
 
     /// Look up an SSA value's static type. Diagnostic-free input always
@@ -453,11 +485,54 @@ impl Lowerer {
         self.value_types.insert(v, ty);
     }
 
-    /// True iff `ty` describes a heap-managed value that needs RC
-    /// retain/release. Phase 19: relations only. Future phases add
-    /// sequences and possibly text owners.
+    /// True iff `ty` describes an always-heap-managed value that needs RC
+    /// retain/release regardless of provenance. Relations always allocate;
+    /// `Text` is provenance-dependent (owned vs borrowed) and handled
+    /// separately via `owned_texts` — see [`Self::needs_scope_release`].
     fn is_heap_managed(ty: &ProcType) -> bool {
         matches!(ty, ProcType::Relation(_))
+    }
+
+    /// Whether a *scope-bound local* `v` of type `ty` must be released at
+    /// scope exit: any relation, or an **owned** heap `Text` (a borrowed
+    /// `Text` loaded from a cell is excluded — releasing it would be a
+    /// premature free).
+    fn needs_scope_release(&self, v: ValueId, ty: &ProcType) -> bool {
+        Self::is_heap_managed(ty)
+            || (matches!(ty, ProcType::Text) && self.owned_texts.contains(&v))
+    }
+
+    /// Mark `v` as an owned heap `Text` (a `||` result, `read_line` result,
+    /// or retained alias). No-op for non-`Text`, but callers gate on type.
+    fn mark_text_owned(&mut self, v: ValueId) {
+        self.owned_texts.insert(v);
+    }
+
+    /// Emit a `Release` for each deferred `extract`-source relation into the
+    /// current instruction stream (the function/helper epilogue). The list is
+    /// drained, so it's safe to call once per function or helper body.
+    fn drain_deferred_relation_releases(&mut self) {
+        for src in std::mem::take(&mut self.deferred_relation_releases) {
+            self.insts.push(Inst::Release { src });
+        }
+    }
+
+    /// Release an owned heap `Text` *temporary* — one consumed by a borrowing
+    /// operator (`Concat`/`coddl_text_eq`/a builtin call) that no local owns.
+    /// A let-bound owned `Text` is left for scope-exit release; a borrowed
+    /// `Text` (literal or cell-loaded) is never in `owned_texts`. No-op for
+    /// any non-owned or non-`Text` value, so callers can invoke it blanketly.
+    fn release_text_temp(&mut self, v: ValueId) {
+        if !self.owned_texts.contains(&v) {
+            return;
+        }
+        let owned_by_local = self
+            .locals
+            .iter()
+            .any(|layer| layer.values().any(|(vid, _)| *vid == v));
+        if !owned_by_local {
+            self.insts.push(Inst::Release { src: v });
+        }
     }
 
     /// Emit `Inst::Release` for every heap-managed binding in the
@@ -465,16 +540,17 @@ impl Lowerer {
     /// before popping a scope (transaction exit) and at function
     /// epilogue, before any terminator or runtime-shutdown call.
     fn release_top_scope_heap_locals(&mut self) {
-        let releases: Vec<ValueId> = self
+        let candidates: Vec<(ValueId, ProcType)> = self
             .locals
             .last()
             .expect("scope stack empty")
             .values()
-            .filter(|(_, ty)| Self::is_heap_managed(ty))
-            .map(|(v, _)| *v)
+            .cloned()
             .collect();
-        for v in releases {
-            self.insts.push(Inst::Release { src: v });
+        for (v, ty) in candidates {
+            if self.needs_scope_release(v, &ty) {
+                self.insts.push(Inst::Release { src: v });
+            }
         }
     }
 
@@ -724,6 +800,9 @@ impl Lowerer {
         // Phase 19 doesn't yet return heap values from functions, so
         // we can release everything in the function scope here.
         self.release_top_scope_heap_locals();
+        // Then the deferred `extract`-source relations — released last, after
+        // every borrowed field they fed has been consumed.
+        self.drain_deferred_relation_releases();
 
         if is_main {
             // Per-relvar slot releases are inserted before this shutdown
@@ -1350,12 +1429,20 @@ impl Lowerer {
         // the new let creates a second owner of the same value —
         // emit a retain so the refcount reflects both bindings. Pure
         // `RelationLit` RHS produces a fresh allocation already at
-        // rc=1, so no retain is needed for that path.
+        // rc=1, so no retain is needed for that path. For `Text` this
+        // also covers a borrowed-source alias (`let s = g.message; let t = s;`):
+        // the retain is safe (immortal literal → no-op; cell-loaded → bumps
+        // the shared rc) and the new local is marked owned so its scope-exit
+        // release balances the retain.
         let rhs_is_existing_name = matches!(value_expr, Expr::NameRef(_));
         let id = self.lower_expr(&value_expr);
         let ty = self.value_type(id);
-        if rhs_is_existing_name && Self::is_heap_managed(&ty) {
+        let alias_of_heap_text = rhs_is_existing_name && matches!(ty, ProcType::Text);
+        if rhs_is_existing_name && (Self::is_heap_managed(&ty) || matches!(ty, ProcType::Text)) {
             self.insts.push(Inst::Retain { src: id });
+        }
+        if alias_of_heap_text {
+            self.mark_text_owned(id);
         }
         if let Some(name_tok) = stmt.name() {
             self.bind_local(name_tok.text().to_string(), id, ty);
@@ -1755,6 +1842,11 @@ impl Lowerer {
         let saved_locals = std::mem::replace(&mut self.locals, vec![HashMap::new()]);
         let saved_aliases = std::mem::replace(&mut self.relexpr_aliases, vec![HashMap::new()]);
         let saved_value_types = std::mem::take(&mut self.value_types);
+        // Isolate `owned_texts` like `value_types`: the helper resets `next_value`,
+        // so its ValueIds collide with the enclosing function's. Same for the
+        // deferred extract-source list (an `extract` in a computed value).
+        let saved_owned_texts = std::mem::take(&mut self.owned_texts);
+        let saved_deferred = std::mem::take(&mut self.deferred_relation_releases);
         self.outer_locals_for_capture = Some(saved_locals.clone());
 
         // 4. Helper params: `src_record` (ValueId 0), `dst_record` (ValueId 1).
@@ -1808,7 +1900,17 @@ impl Lowerer {
                 value,
                 attr_type: pt,
             });
+            // The store retains the cell (backend retain-on-store), so the new
+            // relation co-owns it. Release the producer reference of a *computed*
+            // owned `Text` (a per-row `||` result) now consumed into the cell —
+            // leaving the cell's retained ref the sole owner. A *surviving* cell
+            // is the AttrLoad'd value (borrowed, bound as a local) — not in
+            // `owned_texts`, so this no-ops and the source relation keeps its ref.
+            self.release_text_temp(value);
         }
+
+        // Release any deferred extract sources before the helper returns.
+        self.drain_deferred_relation_releases();
 
         // 9. Close the helper (void return, two pointer params).
         let block = BasicBlock {
@@ -1834,6 +1936,8 @@ impl Lowerer {
         self.locals = saved_locals;
         self.relexpr_aliases = saved_aliases;
         self.value_types = saved_value_types;
+        self.owned_texts = saved_owned_texts;
+        self.deferred_relation_releases = saved_deferred;
         self.outer_locals_for_capture = None;
 
         // 11. Emit Inst::Extend in the enclosing function (caller releases src).
@@ -2420,18 +2524,21 @@ impl Lowerer {
                     src,
                     heading_id,
                 });
-                // If the source ValueId isn't owned by any local, it's
-                // a temporary — release its heap payload now that
-                // extract has copied its content into scalar fields.
-                // Bound sources (e.g., `extract r` where `r` is a let
-                // binding) stay live; releasing here would
-                // double-free at the next use.
+                // If the source isn't owned by a local, it's a temporary that
+                // must be released — but NOT here. Extract copied the record's
+                // cells into the tuple as *borrowed* `(ptr,len)` values; the
+                // relation drop walker frees those `Text` cells, so releasing
+                // the source now would dangle them. Defer to function exit,
+                // after every use of the extracted fields (including uses past a
+                // `transaction [...]` this extract sat inside). A let-bound
+                // source is released at its own scope exit, which is likewise
+                // after the extracted fields are consumed.
                 let is_owned = self
                     .locals
                     .iter()
                     .any(|layer| layer.values().any(|(vid, _)| *vid == src));
                 if !is_owned {
-                    self.insts.push(Inst::Release { src });
+                    self.deferred_relation_releases.push(src);
                 }
                 dst
             }
@@ -2598,7 +2705,7 @@ impl Lowerer {
             | ScalarOp::Or => (self.value_type(lhs), ProcType::Boolean),
         };
         let dst = self.fresh_value();
-        self.record_type(dst, result_type);
+        self.record_type(dst, result_type.clone());
         self.insts.push(Inst::ScalarOp {
             dst,
             op: scalar_op,
@@ -2606,6 +2713,16 @@ impl Lowerer {
             lhs,
             rhs,
         });
+        // A `Concat` allocates a fresh heap `Text` — mark it owned. Then
+        // release any owned `Text` *operands* that no local owns: chained
+        // concats (`a||b||c` — the inner result), `Character`→`Text`
+        // coercions, and `coddl_text_eq` operands all borrow then drop here.
+        // No-op for Integer/Boolean operands and for let-bound owned locals.
+        if matches!(result_type, ProcType::Text) {
+            self.mark_text_owned(dst);
+        }
+        self.release_text_temp(lhs);
+        self.release_text_temp(rhs);
         dst
     }
 
@@ -2617,6 +2734,8 @@ impl Lowerer {
             let dst = self.fresh_value();
             self.record_type(dst, ProcType::Text);
             self.insts.push(Inst::CharToText { dst, src: v });
+            // `CharToText` allocates a fresh heap `Text` (`coddl_char_to_text`).
+            self.mark_text_owned(dst);
             dst
         } else {
             v
@@ -2973,6 +3092,12 @@ impl Lowerer {
         let saved_locals = std::mem::replace(&mut self.locals, vec![HashMap::new()]);
         let saved_aliases = std::mem::replace(&mut self.relexpr_aliases, vec![HashMap::new()]);
         let saved_value_types = std::mem::take(&mut self.value_types);
+        // The helper resets `next_value` to 0, so its ValueIds collide with the
+        // enclosing function's; `owned_texts` is keyed by ValueId, so isolate it
+        // too (a predicate may concat: `where g = "a" || s`). Same for the
+        // deferred extract-source list (an `extract` inside the predicate).
+        let saved_owned_texts = std::mem::take(&mut self.owned_texts);
+        let saved_deferred = std::mem::take(&mut self.deferred_relation_releases);
         self.outer_locals_for_capture = Some(saved_locals.clone());
 
         // 4. Build the predicate body. The function has a single
@@ -3001,6 +3126,10 @@ impl Lowerer {
             .map(|e| self.lower_expr(&e))
             .expect("typechecked where has a predicate rhs");
 
+        // Release any deferred extract sources before the predicate returns —
+        // `pred_value` (a Boolean) has already consumed the borrowed fields.
+        self.drain_deferred_relation_releases();
+
         // 6. Close the predicate function.
         let block = BasicBlock {
             id: block_id,
@@ -3022,6 +3151,8 @@ impl Lowerer {
         self.locals = saved_locals;
         self.relexpr_aliases = saved_aliases;
         self.value_types = saved_value_types;
+        self.owned_texts = saved_owned_texts;
+        self.deferred_relation_releases = saved_deferred;
         self.outer_locals_for_capture = None;
 
         // 8. Emit Inst::Where in the enclosing function.
@@ -3057,6 +3188,13 @@ impl Lowerer {
     /// typechecker already enforces match the surface declaration.
     fn lower_tuple_lit(&mut self, tup: &TupleLit) -> ValueId {
         let mut field_pairs: Vec<(String, ValueId, ProcType)> = Vec::new();
+        // `Text` cell values consumed directly into this tuple — collected so
+        // `lower_relation_lit` can release the producer ref if the tuple becomes
+        // a relation cell. A direct `Text` field contributes its value; a *fresh*
+        // nested `TupleLit` field contributes its own collected temps. A
+        // `NameRef`-aliased field (tuple or text) is skipped — its value may be
+        // referenced elsewhere, so releasing it here would double-free.
+        let mut cell_text_temps: Vec<ValueId> = Vec::new();
         for field in tup.fields() {
             let name_tok = match field.name() {
                 Some(t) => t,
@@ -3068,6 +3206,17 @@ impl Lowerer {
             };
             let id = self.lower_expr(&value_expr);
             let ty = self.value_type(id);
+            match &ty {
+                ProcType::Text if !matches!(value_expr, Expr::NameRef(_)) => {
+                    cell_text_temps.push(id);
+                }
+                ProcType::Tuple(_) if matches!(value_expr, Expr::TupleLit(_)) => {
+                    if let Some(sub) = self.tuple_cell_text_temps.get(&id) {
+                        cell_text_temps.extend(sub.iter().copied());
+                    }
+                }
+                _ => {}
+            }
             field_pairs.push((name_tok.text().to_string(), id, ty));
         }
         // Canonical order — `Heading::new` will sort the type-level
@@ -3092,6 +3241,9 @@ impl Lowerer {
             fields,
             heading,
         });
+        if !cell_text_temps.is_empty() {
+            self.tuple_cell_text_temps.insert(dst, cell_text_temps);
+        }
         dst
     }
 
@@ -3150,12 +3302,18 @@ impl Lowerer {
         // without this the local is freed before the caller can use it.) A
         // fresh tail value not bound to a local isn't in the release set, so it
         // survives without a retain.
-        let escapes = Self::is_heap_managed(&self.value_type(value))
-            && self
-                .locals
-                .last()
-                .map(|scope| scope.values().any(|(v, _)| *v == value))
-                .unwrap_or(false);
+        let val_ty = self.value_type(value);
+        let in_scope = self
+            .locals
+            .last()
+            .map(|scope| scope.values().any(|(v, _)| *v == value))
+            .unwrap_or(false);
+        // Owned `Text` escapes a transaction the same way a relation does
+        // (`let m = transaction [ let t = "a"||b; t ]`): retain before the
+        // scope release so the caller keeps a live reference. The escaped
+        // ValueId stays in `owned_texts` (function-global), so the outer
+        // binding's scope-exit release balances this retain.
+        let escapes = in_scope && self.needs_scope_release(value, &val_ty);
         if escapes {
             self.insts.push(Inst::Retain { src: value });
         }
@@ -3208,11 +3366,24 @@ impl Lowerer {
         let heading_id = self.intern_heading(&heading);
         let dst = self.fresh_value();
         self.record_type(dst, ProcType::Relation(heading_id));
+        // Backend `RelationLit` retain-on-store gives the relation its own
+        // reference to each `Text` cell. Release the producer reference of any
+        // owned `Text` *temporary* consumed directly into a cell so the cell's
+        // retained ref is the sole owner. `release_text_temp` no-ops on locals
+        // and literals; the collected temps are single-use fresh expressions.
+        let cell_temps: Vec<ValueId> = tuple_values
+            .iter()
+            .filter_map(|tv| self.tuple_cell_text_temps.remove(tv))
+            .flatten()
+            .collect();
         self.insts.push(Inst::RelationLit {
             dst,
             tuples: tuple_values,
             heading_id,
         });
+        for t in cell_temps {
+            self.release_text_temp(t);
+        }
         dst
     }
 
@@ -3280,6 +3451,7 @@ impl Lowerer {
 
         self.ensure_extern(ext);
 
+        let returns_text = matches!(return_type, ProcType::Text);
         let dst = if matches!(return_type, ProcType::Unit) {
             None
         } else {
@@ -3287,12 +3459,31 @@ impl Lowerer {
             self.record_type(v, return_type.clone());
             Some(v)
         };
+        // Snapshot the `Text` arguments before `arg_values` moves into the
+        // Call: a builtin borrows its `(ptr,len)` operands, so an *owned*
+        // `Text` temp passed inline (`write_line{message:"a"||name}`) must be
+        // released after the call. (Filtered to owned temps by `release_text_temp`.)
+        let text_args: Vec<ValueId> = arg_values
+            .iter()
+            .copied()
+            .filter(|v| matches!(self.value_type(*v), ProcType::Text))
+            .collect();
         self.insts.push(Inst::Call {
             dst,
             callee: linkage,
             args: arg_values,
             return_type,
         });
+        // `read_line` hands back a fresh heap `Text` — own it so scope exit
+        // (or a consuming temp-release) frees it.
+        if returns_text {
+            if let Some(v) = dst {
+                self.mark_text_owned(v);
+            }
+        }
+        for v in text_args {
+            self.release_text_temp(v);
+        }
         // For Unit-returning calls there is no real SSA value; return a
         // fresh id so the surrounding expression machinery has a place
         // to plug in once it grows real consumers. Today nothing reads
@@ -4889,6 +5080,112 @@ oper main {} [
         );
     }
 
+    // ── scalar Text refcounting (owned/borrowed provenance) ──────────
+
+    /// All `Inst::Release` source ValueIds in `main`'s entry block.
+    fn main_releases(m: &Module) -> Vec<ValueId> {
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        main.blocks[0]
+            .insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::Release { src } => Some(*src),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The dst of the first `ScalarOp::Concat` in `main`'s entry block.
+    fn first_concat_dst(m: &Module) -> ValueId {
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        main.blocks[0]
+            .insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::ScalarOp {
+                    dst,
+                    op: ScalarOp::Concat,
+                    ..
+                } => Some(*dst),
+                _ => None,
+            })
+            .expect("a Concat present")
+    }
+
+    #[test]
+    fn owned_text_local_released_at_scope_exit() {
+        // `let m = "a" || "b";` — the concat result is owned and bound to a
+        // local; it must be released exactly once at function epilogue. The
+        // immortal-literal operands are borrowed and never released.
+        let src = "oper main {} [ let m = \"a\" || \"b\"; write_line { message: m }; ];";
+        let module = lower_ok(src);
+        let concat = first_concat_dst(&module);
+        let releases = main_releases(&module);
+        assert_eq!(
+            releases.iter().filter(|v| **v == concat).count(),
+            1,
+            "owned concat local released exactly once; releases={releases:?}"
+        );
+        assert_eq!(releases.len(), 1, "only the concat local; releases={releases:?}");
+    }
+
+    #[test]
+    fn chained_concat_releases_intermediate() {
+        // `"a" || "b" || "c"` = `("a"||"b") || "c"`: the inner concat is an
+        // owned temporary consumed by the outer concat — it must be released,
+        // as must the final result bound to `m`. Two releases total.
+        let src = "oper main {} [ let m = \"a\" || \"b\" || \"c\"; write_line { message: m }; ];";
+        let module = lower_ok(src);
+        let inner = first_concat_dst(&module);
+        let releases = main_releases(&module);
+        assert!(
+            releases.contains(&inner),
+            "inner concat temporary released; releases={releases:?}"
+        );
+        assert_eq!(releases.len(), 2, "inner temp + outer local; releases={releases:?}");
+    }
+
+    #[test]
+    fn inline_concat_argument_released_after_call() {
+        // `write_line { message: "a" || name }` with `name` a borrowed param:
+        // the inline concat is an owned temporary, released right after the
+        // call consumes it. The borrowed `name` is never released.
+        let src = "oper greet { name: Text } [ write_line { message: \"a\" || name }; ];";
+        let module = lower_ok(src);
+        let greet = module.functions.iter().find(|f| f.name == "greet").unwrap();
+        let concat = greet
+            .blocks[0]
+            .insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::ScalarOp { dst, op: ScalarOp::Concat, .. } => Some(*dst),
+                _ => None,
+            })
+            .expect("a Concat present");
+        let releases: Vec<ValueId> = greet.blocks[0]
+            .insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::Release { src } => Some(*src),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(releases, vec![concat], "only the inline concat temp; got {releases:?}");
+    }
+
+    #[test]
+    fn borrowed_text_field_is_not_released() {
+        // `t.message` is a `TupleField` — a borrowed `(ptr,len)` into the
+        // tuple, NOT an owned heap Text. It must never be released (that would
+        // be a premature free). The literal is borrowed too. Zero releases.
+        let src = "oper main {} [ let t = { message: \"hi\" }; write_line { message: t.message }; ];";
+        let module = lower_ok(src);
+        assert!(
+            main_releases(&module).is_empty(),
+            "borrowed Text field must not be released"
+        );
+    }
+
     #[test]
     fn string_literal_decodes_escapes() {
         let src = "oper main {} [ write_line{message: \"a\\nb\"}; ];";
@@ -5151,9 +5448,13 @@ oper main {} [
     // ── extract (Phase 21) ───────────────────────────────────────────
 
     #[test]
-    fn extract_on_temporary_emits_inst_then_release() {
-        // The `r where a = 2` is a fresh allocation — extract should
-        // emit Inst::Extract followed by Inst::Release(src).
+    fn extract_on_temporary_defers_source_release_to_epilogue() {
+        // The `r where a = 2` is a fresh temporary. Extract copies its cells
+        // into the tuple as *borrowed* `(ptr,len)` values, so releasing the
+        // source immediately would free `Text` cells the borrowed fields still
+        // point at (the relation drop walker frees them). The release is
+        // therefore deferred to the function epilogue — present, but NOT the
+        // instruction right after Extract.
         let src = "oper main {} [ \
                    let r = Relation { {a: 1}, {a: 2} }; \
                    let t = extract (r where a = 2); \
@@ -5165,17 +5466,20 @@ oper main {} [
             .iter()
             .position(|i| matches!(i, Inst::Extract { .. }))
             .expect("Inst::Extract emitted");
-        // The next instruction must be a Release of the extract's
-        // source (the temporary from the `where`).
         let extract_src = match &insts[extract_idx] {
             Inst::Extract { src, .. } => *src,
             _ => unreachable!(),
         };
-        let next = &insts[extract_idx + 1];
-        match next {
-            Inst::Release { src } => assert_eq!(*src, extract_src),
-            other => panic!("expected Release after Extract, got {other:?}"),
-        }
+        // The release exists (the temporary is freed at function exit) ...
+        let release_idx = insts
+            .iter()
+            .position(|i| matches!(i, Inst::Release { src } if *src == extract_src))
+            .expect("extract source released at the function epilogue");
+        // ... but it is deferred, not emitted immediately after Extract.
+        assert!(
+            release_idx > extract_idx + 1,
+            "source release should be deferred to the epilogue; extract@{extract_idx} release@{release_idx}"
+        );
     }
 
     #[test]

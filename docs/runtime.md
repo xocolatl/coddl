@@ -170,20 +170,34 @@ that table.)
 ### Drop walker
 
 When `coddl_rc_release` brings the refcount to zero, the runtime
-dispatches on the header's `kind`. For `CoddlKind::Relation`, the
-drop walker iterates each record, reads the descriptor for the
-per-attribute kind, and recurses into any nested heap cells before
-freeing the block.
+dispatches on the header's `kind`. For `CoddlKind::Relation`,
+`drop_relation_payload` iterates each record and releases every `Text`
+cell — recursing through inline `Tuple` cells to their `Text` leaves via
+the shared `walk_text_cells` traversal (the same kind-dispatch shape as
+the printer's `print_cell`). Integer / Boolean cells carry no heap
+pointer and are skipped; an immortal-literal `Text` cell sees `rc ==
+IMMORTAL_RC` and no-ops.
 
-There are no nested *heap* cells in practice yet — relation records
-hold scalars (Integer / Boolean), pointers to immortal Text bytes
-(string literals are placed in read-only data segments by codegen), or
-inline `Tuple` cells whose leaves are those same no-op-drop scalars/Text.
-Tuple cells are inline (no heap pointer), so the drop walker stays a
-no-op: `Text` inside a tuple leaks exactly as top-level `Text` does
-today, and the recursion to release tuple-of-`Text`-owners lands when
-scalar-`Text` refcounting does. The hook is in place so future phases
-(relation-of-relations, owned-`Text` tuples) slot in without re-plumbing.
+This release is balanced by the **one-reference-per-cell invariant**:
+every `Text` cell a relation holds was given exactly one owned reference
+at production. The producers:
+
+- **retain-on-store** — codegen retains a scalar `Text` as it is stored
+  into a relation-literal cell (`emit_attr_store` / `store_attr`);
+- **retain-on-copy** — each relation operator that copies cells from its
+  input(s) calls `retain_text_cells` over its output *before* any
+  `coddl_relation_seal` (`where` / `project` / `rename` / `join` /
+  `union` / `minus` / `restructure` / `tclose`);
+- **move-in** — a cell produced fresh at rc=1 (an `extend`-computed
+  concat, a marshaled SQLite text) is stored without a retain.
+
+`coddl_relation_seal`'s dedup (`dedup_records` with `release_dropped_text
+= true`) releases the `Text` cells of each duplicate row it discards, so
+the retain-on-copy/store of a dropped row is balanced. `tclose` runs its
+*intermediate* dedups over un-retained working copies (`release_dropped_text
+= false`) and retains its final output once. The descriptor's `desc`
+pointer on the header supplies the layout; a null `desc` (or zero-width
+record) makes the walker a no-op.
 
 ## Heading descriptors
 
