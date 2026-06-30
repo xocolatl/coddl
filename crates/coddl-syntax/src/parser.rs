@@ -406,13 +406,21 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
-    /// A type expression. Today only a single identifier is recognized;
-    /// `Tuple H`, `Relation H`, `Sequence T`, and qualified names land
-    /// alongside the rest of expression parsing.
+    /// A type expression. Either a single named type (`Integer`,
+    /// `Customer`) or the generator application `Sequence <type-ref>`,
+    /// which nests an element `TYPE_REF` (e.g. `Sequence Integer`,
+    /// `Sequence Sequence Text`). `Tuple H` / `Relation H` and qualified
+    /// names land alongside the rest of expression parsing.
     pub(crate) fn parse_type_ref(&mut self) {
         self.bump_trivia();
         self.start_node(SyntaxKind::TYPE_REF);
-        if !self.eat(SyntaxKind::IDENT) {
+        if self.at_keyword("Sequence") {
+            // `Sequence <type-ref>`: the element type is a nested
+            // TYPE_REF. A missing element type surfaces as P0011 from
+            // the recursive call.
+            self.bump(); // `Sequence`
+            self.parse_type_ref();
+        } else if !self.eat(SyntaxKind::IDENT) {
             self.error("P0011", "expected type name");
         }
         self.finish_node();
@@ -882,6 +890,10 @@ impl<'a> Parser<'a> {
             self.parse_relation_lit();
             return true;
         }
+        if self.at_keyword("Sequence") {
+            self.parse_sequence_lit();
+            return true;
+        }
         // `extract <expr>` — prefix-position unary form. Recognized
         // before the generic IDENT branch so the AST gets a
         // distinct `UNARY_EXPR` node. The operand parses at full
@@ -1024,6 +1036,54 @@ impl<'a> Parser<'a> {
 
         if !self.eat(SyntaxKind::R_BRACE) {
             self.error("P0033", "expected `}` to close relation literal");
+        }
+        self.finish_node();
+    }
+
+    /// `Sequence [ <expr>, <expr>, … ]` in expression position — a
+    /// sequence literal, the ordered generator-prefixed counterpart to
+    /// `Relation { … }`. Elements are arbitrary expressions; an empty
+    /// `Sequence []` parses cleanly (the typechecker resolves its element
+    /// type from a `let` annotation, else T0061). Trailing comma is
+    /// accepted. This is *syntactically* a primary expression; the
+    /// typechecker restricts it to `let`-binding values (T0063).
+    fn parse_sequence_lit(&mut self) {
+        debug_assert!(self.at_keyword("Sequence"));
+        self.bump_trivia();
+        self.start_node(SyntaxKind::SEQUENCE_LIT);
+        self.bump(); // `Sequence`
+
+        if !self.at(SyntaxKind::L_BRACKET) {
+            self.error("P0055", "expected `[` after `Sequence`");
+            self.finish_node();
+            return;
+        }
+        self.bump(); // [
+
+        if self.eat(SyntaxKind::R_BRACKET) {
+            self.finish_node();
+            return;
+        }
+
+        loop {
+            let before = self.pos;
+            self.parse_expr();
+            // No progress (garbage element) — bail rather than spin;
+            // recovery happens at the enclosing statement anchor.
+            if self.pos == before {
+                break;
+            }
+            if !self.eat(SyntaxKind::COMMA) {
+                break;
+            }
+            // Trailing comma: `Sequence [ 1, ]` is the same as `Sequence [ 1 ]`.
+            if self.at(SyntaxKind::R_BRACKET) {
+                break;
+            }
+        }
+
+        if !self.eat(SyntaxKind::R_BRACKET) {
+            self.error("P0056", "expected `]` to close sequence literal");
         }
         self.finish_node();
     }
@@ -2907,6 +2967,93 @@ mod tests {
         assert!(
             out.diagnostics.iter().any(|d| d.code == "P0033"),
             "expected P0033, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    // ── Sequence literals + `Sequence T` type-refs ──────────────────
+
+    #[test]
+    fn empty_sequence_literal_parses() {
+        let out = parse_str("oper f {} [ let s = Sequence []; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let seq = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::SEQUENCE_LIT)
+            .expect("SEQUENCE_LIT in tree");
+        assert_eq!(seq.text(), "Sequence []");
+    }
+
+    #[test]
+    fn sequence_literal_with_elements_parses() {
+        let out = parse_str("oper f {} [ let s = Sequence [ \"a\", \"b\" ]; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let seq = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::SEQUENCE_LIT)
+            .expect("SEQUENCE_LIT in tree");
+        let elems: Vec<_> = seq.children().filter_map(crate::ast::Expr::cast).collect();
+        assert_eq!(elems.len(), 2);
+    }
+
+    #[test]
+    fn sequence_literal_trailing_comma_parses() {
+        let out = parse_str("oper f {} [ let s = Sequence [ 1, 2, ]; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let seq = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::SEQUENCE_LIT)
+            .expect("SEQUENCE_LIT in tree");
+        let elems: Vec<_> = seq.children().filter_map(crate::ast::Expr::cast).collect();
+        assert_eq!(elems.len(), 2);
+    }
+
+    #[test]
+    fn sequence_literal_missing_lbracket_diagnoses_p0055() {
+        let out = parse_str("oper f {} [ let s = Sequence ; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0055"),
+            "expected P0055, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn unterminated_sequence_literal_diagnoses_p0056() {
+        let out = parse_str("oper f {} [ let s = Sequence [ 1 ; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0056"),
+            "expected P0056, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn sequence_type_ref_nests_inner_type_ref() {
+        let out = parse_str("oper f {} [ let s: Sequence Integer = Sequence []; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        // The annotation is `TYPE_REF { Sequence, TYPE_REF { Integer } }`.
+        let outer = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::TYPE_REF)
+            .expect("outer TYPE_REF in tree");
+        let inner = outer
+            .children()
+            .find(|n| n.kind() == SyntaxKind::TYPE_REF)
+            .expect("nested element TYPE_REF");
+        assert_eq!(inner.text(), "Integer");
+    }
+
+    #[test]
+    fn sequence_type_ref_missing_element_diagnoses_p0011() {
+        let out = parse_str("oper f {} [ let s: Sequence = Sequence []; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0011"),
+            "expected P0011, got {:?}",
             out.diagnostics
         );
     }

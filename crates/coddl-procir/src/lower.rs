@@ -19,8 +19,8 @@ use coddl_syntax::ast::{
     InsertStmt,
     ExtendExpr, FieldAccess, Item,
     LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, RenameExpr,
-    ReplaceExpr, Root, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit, UnaryExpr, UnaryOp,
-    UnwrapExpr, UpdateStmt, WrapExpr,
+    ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
+    UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, WrapExpr,
 };
 use coddl_syntax::{parse_format_template, SyntaxKind, TemplateChunk};
 use coddl_types::{check, Heading, RelvarKind, RelvarTable, Type};
@@ -1528,6 +1528,7 @@ impl Lowerer {
             Expr::Transaction(t) => self.lower_transaction_expr(t),
             Expr::TupleLit(t) => self.lower_tuple_lit(t),
             Expr::RelationLit(r) => self.lower_relation_lit(r),
+            Expr::SequenceLit(s) => self.lower_sequence_lit(s),
             Expr::FieldAccess(f) => self.lower_field_access(f),
             Expr::BoolLit(b) => self.lower_bool_lit(b),
             Expr::Binary(b) => self.lower_binary_expr(b),
@@ -3403,6 +3404,27 @@ impl Lowerer {
     /// one static descriptor per unique heading. Empty literals are
     /// kept out by the typechecker (T0018); reaching here with zero
     /// tuples is an internal bug.
+    /// Sequences parse and typecheck but are not yet executable — their
+    /// runtime representation and iteration land with `load` (milestone
+    /// step 6). Emitting an error here marks the lowered IR unsafe, so the
+    /// driver reports T0064 and skips codegen rather than producing a
+    /// program that can't run. The returned placeholder value is never
+    /// used — the IR is discarded once a lowering error is present.
+    fn lower_sequence_lit(&mut self, seq: &SequenceLit) -> ValueId {
+        self.diagnostics.push(Diagnostic::error(
+            self.node_span(seq.syntax()),
+            "T0064",
+            "sequence values are not yet executable (lands with `load`)",
+        ));
+        // Inert placeholder: the IR is discarded once a lowering error is
+        // present, but the value still flows through `let` binding and the
+        // scope-exit walk, which require a recorded type. `Unit` is
+        // non-heap, so no spurious release is emitted.
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Unit);
+        dst
+    }
+
     fn lower_relation_lit(&mut self, rel: &RelationLit) -> ValueId {
         let tuples: Vec<TupleLit> = rel.tuples().collect();
         assert!(
@@ -3939,6 +3961,9 @@ fn proc_type_from_type(ty: &Type) -> ProcType {
         }
         Type::FormatText => {
             unreachable!("Type::FormatText is compile-time-only and never lowered")
+        }
+        Type::Sequence(_) => {
+            unreachable!("Type::Sequence is not yet lowered (rejected at T0064)")
         }
         Type::Unknown => unreachable!("Type::Unknown survived typecheck"),
     }
@@ -5608,6 +5633,25 @@ oper main {} [
         let out = lower(src, FileId(0));
         assert!(out.module.is_none());
         assert!(out.diagnostics.iter().any(|d| d.code == "T0001"));
+    }
+
+    #[test]
+    fn sequence_literal_is_not_yet_executable_emits_t0064() {
+        // A sequence literal parses and typechecks, but lowering rejects
+        // it gracefully (sequences aren't executable until `load` lands) —
+        // a diagnostic, not a panic. No module is produced, so codegen
+        // never runs.
+        let src = "oper main {} [ let _s = Sequence [ 1, 2 ]; ];";
+        let out = lower(src, FileId(0));
+        assert!(
+            out.module.is_none(),
+            "expected no module for an unexecutable sequence"
+        );
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "T0064"),
+            "expected T0064, got {:?}",
+            out.diagnostics
+        );
     }
 
     #[test]

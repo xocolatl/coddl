@@ -144,6 +144,12 @@ pub enum Type {
     Tuple(Heading),
     /// Structural relation: a set of tuples all sharing one heading.
     Relation(Heading),
+    /// Ordered, finite list of values of one element type — the
+    /// procedural-side companion to `Relation` (position significant,
+    /// duplicates allowed). The type generator `Sequence T`; its surface
+    /// literal is `Sequence [ … ]`. The element type may be any type,
+    /// including a nested `Sequence`.
+    Sequence(Box<Type>),
     /// Used wherever a type couldn't be resolved (unknown type name,
     /// unresolved callee, etc.). Compares equal to anything so the
     /// checker can keep walking without piling errors on top of
@@ -198,6 +204,7 @@ impl Type {
             | (Type::FormatText, Type::FormatText) => true,
             (Type::Tuple(a), Type::Tuple(b)) => a.assignable_to(b),
             (Type::Relation(a), Type::Relation(b)) => a.assignable_to(b),
+            (Type::Sequence(a), Type::Sequence(b)) => a.assignable_to(b),
             _ => false,
         }
     }
@@ -217,6 +224,7 @@ impl fmt::Display for Type {
             Type::FormatText => f.write_str("FormatText"),
             Type::Tuple(h) => write!(f, "Tuple {h}"),
             Type::Relation(h) => write!(f, "Relation {h}"),
+            Type::Sequence(t) => write!(f, "Sequence {t}"),
             Type::Unknown => f.write_str("<unknown>"),
         }
     }

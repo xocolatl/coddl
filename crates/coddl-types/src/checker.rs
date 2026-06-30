@@ -16,8 +16,8 @@ use coddl_syntax::ast::{
     InsertStmt,
     ExtendExpr, FieldAccess, Heading as AstHeading, Item, KeyClause, LetStmt, NamedArg, OperDecl,
     PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr,
-    ReplaceExpr, Root, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit, UnaryExpr, UnaryOp,
-    UnwrapExpr, UpdateStmt, WrapExpr,
+    ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
+    TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, WrapExpr,
 };
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
@@ -527,8 +527,8 @@ impl TypeChecker {
                 );
                 continue;
             }
-            let ty = match param.type_ref().and_then(|tr| tr.name()) {
-                Some(t) => self.resolve_type_name(&t),
+            let ty = match param.type_ref() {
+                Some(tr) => self.resolve_type_ref(&tr),
                 None => Type::Unknown,
             };
             fields.push((name, ty));
@@ -586,8 +586,7 @@ impl TypeChecker {
                 let Some(pname_tok) = param.name() else { continue };
                 let pty = param
                     .type_ref()
-                    .and_then(|tr| tr.name())
-                    .and_then(|t| Type::from_builtin_name(t.text()))
+                    .map(|tr| Self::type_ref_quiet(&tr))
                     .unwrap_or(Type::Unknown);
                 params.push((
                     Cow::Owned(pname_tok.text().to_string()),
@@ -596,8 +595,8 @@ impl TypeChecker {
             }
         }
 
-        let return_type = match decl.return_type().and_then(|tr| tr.name()) {
-            Some(t) => Type::from_builtin_name(t.text()).unwrap_or(Type::Unknown),
+        let return_type = match decl.return_type() {
+            Some(tr) => Self::type_ref_quiet(&tr),
             None => Type::unit(),
         };
 
@@ -654,8 +653,8 @@ impl TypeChecker {
                     continue;
                 }
 
-                let ty = match param.type_ref().and_then(|tr| tr.name()) {
-                    Some(name_tok) => self.resolve_type_name(&name_tok),
+                let ty = match param.type_ref() {
+                    Some(tr) => self.resolve_type_ref(&tr),
                     None => Type::Unknown,
                 };
                 scope.insert(name, ty, self.token_span(&name_tok), BindingOrigin::Param);
@@ -667,8 +666,8 @@ impl TypeChecker {
         // When absent, also surface the implicit return as an inlay
         // hint right after the heading — that's where the user would
         // have typed `-> Type`.
-        let return_type = match decl.return_type().and_then(|tr| tr.name()) {
-            Some(name_tok) => self.resolve_type_name(&name_tok),
+        let return_type = match decl.return_type() {
+            Some(tr) => self.resolve_type_ref(&tr),
             None => {
                 if let Some(heading) = decl.heading() {
                     let r = heading.syntax().text_range();
@@ -743,6 +742,45 @@ impl TypeChecker {
                 Type::Unknown
             }
         }
+    }
+
+    /// Resolve a (possibly generator-applied) `TypeRef` to a `Type`.
+    /// `Sequence T` recurses into the element type-ref; any other head is
+    /// a leaf name resolved through [`Self::resolve_type_name`] (which
+    /// emits T0005 on an unknown name). A `Sequence` with no element
+    /// type-ref (parser already emitted P0011) yields `Sequence Unknown`
+    /// rather than cascading.
+    fn resolve_type_ref(&mut self, tr: &TypeRef) -> Type {
+        let Some(name_tok) = tr.name() else {
+            return Type::Unknown;
+        };
+        if name_tok.text() == "Sequence" {
+            let elem = match tr.element() {
+                Some(e) => self.resolve_type_ref(&e),
+                None => Type::Unknown,
+            };
+            return Type::Sequence(Box::new(elem));
+        }
+        self.resolve_type_name(&name_tok)
+    }
+
+    /// Quiet (no-diagnostic) counterpart of [`Self::resolve_type_ref`],
+    /// used by the signature pre-pass ([`Self::register_user_oper`]) where
+    /// resolving loudly would double-report T0005. `Sequence T` recurses;
+    /// an unknown leaf becomes `Unknown` silently — the body-walking pass
+    /// re-resolves the same tokens loudly.
+    fn type_ref_quiet(tr: &TypeRef) -> Type {
+        let Some(name_tok) = tr.name() else {
+            return Type::Unknown;
+        };
+        if name_tok.text() == "Sequence" {
+            let elem = tr
+                .element()
+                .map(|e| Self::type_ref_quiet(&e))
+                .unwrap_or(Type::Unknown);
+            return Type::Sequence(Box::new(elem));
+        }
+        Type::from_builtin_name(name_tok.text()).unwrap_or(Type::Unknown)
     }
 
     fn check_block(&mut self, block: &Block, scope: &mut Scope) -> Type {
@@ -1107,10 +1145,26 @@ impl TypeChecker {
     }
 
     fn check_let_stmt(&mut self, stmt: &LetStmt, scope: &mut Scope) {
-        // Infer the RHS type. Missing name or value here means the
-        // parser already reported the recovery; we still walk what's
-        // parseable to keep diagnostics flowing.
+        // Resolve the optional annotation first: it's authoritative, and
+        // for a `Sequence [ … ]` RHS its element type is the inference
+        // context an empty literal falls back on.
+        let declared = stmt.type_ref().map(|tr| self.resolve_type_ref(&tr));
+
+        // Infer the RHS type. A sequence literal is checked specially so
+        // it can take its element type from `declared` when empty and so
+        // it is *permitted* here — `check_expr` rejects sequence literals
+        // in every other position (T0063, the let-value-only rule).
+        // Missing name or value means the parser already reported the
+        // recovery; we still walk what's parseable to keep diagnostics
+        // flowing.
         let rhs_ty = match stmt.value() {
+            Some(Expr::SequenceLit(s)) => {
+                let expected_elem = match &declared {
+                    Some(Type::Sequence(e)) => Some((**e).clone()),
+                    _ => None,
+                };
+                self.check_sequence_lit(&s, scope, expected_elem)
+            }
             Some(v) => self.check_expr(&v, scope),
             None => Type::Unknown,
         };
@@ -1120,9 +1174,8 @@ impl TypeChecker {
         // subsequent lookups see the declared type, not the inferred
         // one. Otherwise the inferred type is bound *and* surfaced as
         // an inlay hint — that's what the editor renders.
-        let bound_ty = match stmt.type_ref().and_then(|tr| tr.name()) {
-            Some(name_tok) => {
-                let declared = self.resolve_type_name(&name_tok);
+        let bound_ty = match declared {
+            Some(declared) => {
                 if !rhs_ty.assignable_to(&declared) {
                     let span = stmt
                         .value()
@@ -1235,6 +1288,18 @@ impl TypeChecker {
             Expr::Transaction(t) => self.check_transaction_expr(t, scope),
             Expr::TupleLit(t) => self.check_tuple_lit(t, scope),
             Expr::RelationLit(r) => self.check_relation_lit(r, scope),
+            Expr::SequenceLit(s) => {
+                // A sequence literal is valid only as a `let` binding's
+                // value, where `check_let_stmt` intercepts it before this
+                // generic walk. Reaching here means it appeared elsewhere
+                // (a call argument, nested in an expression, …) — reject.
+                self.error(
+                    self.node_span(s.syntax()),
+                    "T0063",
+                    "a sequence literal is only allowed as a `let` binding value",
+                );
+                Type::Unknown
+            }
             Expr::FieldAccess(f) => self.check_field_access(f, scope),
             Expr::BoolLit(_) => Type::Boolean,
             Expr::Binary(b) => self.check_binary_expr(b, scope),
@@ -1987,6 +2052,55 @@ impl TypeChecker {
             }
         }
         Type::Relation(first_heading)
+    }
+
+    /// Walk a `Sequence [ e, … ]` literal. The element type is inferred
+    /// from the first element; every later element must be assignable to
+    /// it (T0062 otherwise). An empty literal has no element to infer
+    /// from, so it takes `expected` — the `let` annotation's element type
+    /// — when present, else emits T0061. The result is `Sequence T`.
+    ///
+    /// Only [`Self::check_let_stmt`] calls this; a sequence literal in any
+    /// other position is rejected by `check_expr` (T0063, the
+    /// let-value-only rule), so `expected` is exactly the binding's
+    /// declared element type.
+    fn check_sequence_lit(
+        &mut self,
+        seq: &SequenceLit,
+        scope: &mut Scope,
+        expected: Option<Type>,
+    ) -> Type {
+        let elems: Vec<Expr> = seq.elements().collect();
+        let Some((first, rest)) = elems.split_first() else {
+            // Empty `Sequence []`: fall back to the annotation's element
+            // type, or demand one.
+            return match expected {
+                Some(e) => Type::Sequence(Box::new(e)),
+                None => {
+                    self.error(
+                        self.node_span(seq.syntax()),
+                        "T0061",
+                        "empty sequence literal needs a type annotation, \
+                         e.g. `let s: Sequence Integer = Sequence []`",
+                    );
+                    Type::Sequence(Box::new(Type::Unknown))
+                }
+            };
+        };
+        let elem_ty = self.check_expr(first, scope);
+        for e in rest {
+            let t = self.check_expr(e, scope);
+            if !t.assignable_to(&elem_ty) {
+                self.error(
+                    self.node_span(e.syntax()),
+                    "T0062",
+                    format!(
+                        "sequence element type {t} differs from the first element's {elem_ty}"
+                    ),
+                );
+            }
+        }
+        Type::Sequence(Box::new(elem_ty))
     }
 
     /// Walk `<expr>.<field>`. The base must be of type `Tuple H`; the
@@ -3810,6 +3924,59 @@ mod tests {
         // The hint span is right after the heading's closing `}`.
         let after_heading = src.find("{}").unwrap() + "{}".len();
         assert_eq!(hint.span.start as usize, after_heading);
+    }
+
+    // ── Sequence literals (let-value-only) ──────────────────────────
+
+    #[test]
+    fn sequence_let_infers_element_type() {
+        let src = "oper main {} [ let _s = Sequence [ 1, 2, 3 ]; ];";
+        let out = check(src, FileId(0), FileKind::Cd);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let hint = out
+            .hints
+            .iter()
+            .find(|h| h.kind == HintKind::LetBinding)
+            .expect("expected a LetBinding hint");
+        assert!(
+            matches!(&hint.ty, Type::Sequence(e) if **e == Type::Integer),
+            "expected `Sequence Integer`, got {}",
+            hint.ty
+        );
+    }
+
+    #[test]
+    fn sequence_let_element_mismatch_emits_t0062() {
+        let src = "oper main {} [ let _s = Sequence [ 1, \"x\" ]; ];";
+        assert!(codes(src).contains(&"T0062"), "got {:?}", codes(src));
+    }
+
+    #[test]
+    fn empty_sequence_without_annotation_emits_t0061() {
+        let src = "oper main {} [ let _s = Sequence []; ];";
+        assert!(codes(src).contains(&"T0061"), "got {:?}", codes(src));
+    }
+
+    #[test]
+    fn empty_sequence_with_annotation_checks_clean() {
+        let src = "oper main {} [ let _s: Sequence Integer = Sequence []; ];";
+        let out = check(src, FileId(0), FileKind::Cd);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    #[test]
+    fn sequence_annotation_vs_rhs_mismatch_emits_t0010() {
+        // RHS infers `Sequence Text`; annotation says `Sequence Integer`.
+        let src = "oper main {} [ let _s: Sequence Integer = Sequence [ \"x\" ]; ];";
+        assert!(codes(src).contains(&"T0010"), "got {:?}", codes(src));
+    }
+
+    #[test]
+    fn sequence_literal_outside_let_emits_t0063() {
+        // A sequence literal as a bare expression (not a `let` value) is
+        // rejected by the let-value-only rule.
+        let src = "oper main {} [ Sequence [ 1 ]; ];";
+        assert!(codes(src).contains(&"T0063"), "got {:?}", codes(src));
     }
 
     #[test]

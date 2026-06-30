@@ -286,10 +286,18 @@ impl KeyClause {
 ast_node!(pub TypeRef, TYPE_REF);
 
 impl TypeRef {
-    /// Today only a single named type is recognized; this returns its
-    /// IDENT token.
+    /// The head type-name token — the leftmost IDENT. For a leaf type-ref
+    /// (`Integer`, `Customer`) this is the type name; for the generator
+    /// application `Sequence T` it is `Sequence` (the element type is the
+    /// nested [`TypeRef`], reached via [`TypeRef::element`]).
     pub fn name(&self) -> Option<SyntaxToken> {
         first_token_of_kind(&self.syntax, SyntaxKind::IDENT)
+    }
+
+    /// The element type of a generator application `Sequence <type-ref>`:
+    /// the nested `TYPE_REF` child. `None` for a leaf type-ref.
+    pub fn element(&self) -> Option<TypeRef> {
+        child(&self.syntax)
     }
 }
 
@@ -490,6 +498,7 @@ pub enum Expr {
     Transaction(TransactionExpr),
     TupleLit(TupleLit),
     RelationLit(RelationLit),
+    SequenceLit(SequenceLit),
     FieldAccess(FieldAccess),
     BoolLit(BoolLit),
     Binary(BinaryExpr),
@@ -512,6 +521,7 @@ impl Expr {
             SyntaxKind::TRANSACTION_EXPR => Expr::Transaction(TransactionExpr { syntax }),
             SyntaxKind::TUPLE_LIT => Expr::TupleLit(TupleLit { syntax }),
             SyntaxKind::RELATION_LIT => Expr::RelationLit(RelationLit { syntax }),
+            SyntaxKind::SEQUENCE_LIT => Expr::SequenceLit(SequenceLit { syntax }),
             SyntaxKind::FIELD_ACCESS => Expr::FieldAccess(FieldAccess { syntax }),
             SyntaxKind::BOOL_LITERAL => Expr::BoolLit(BoolLit { syntax }),
             SyntaxKind::BINARY_EXPR => Expr::Binary(BinaryExpr { syntax }),
@@ -539,6 +549,7 @@ impl Expr {
             Expr::Transaction(t) => t.syntax(),
             Expr::TupleLit(t) => t.syntax(),
             Expr::RelationLit(r) => r.syntax(),
+            Expr::SequenceLit(s) => s.syntax(),
             Expr::FieldAccess(f) => f.syntax(),
             Expr::BoolLit(b) => b.syntax(),
             Expr::Binary(b) => b.syntax(),
@@ -669,6 +680,15 @@ impl RelationLit {
     /// An empty relation literal yields zero elements.
     pub fn tuples(&self) -> impl Iterator<Item = TupleLit> + '_ {
         children(&self.syntax)
+    }
+}
+
+ast_node!(pub SequenceLit, SEQUENCE_LIT);
+
+impl SequenceLit {
+    /// All elements in source order. An empty `Sequence []` yields zero.
+    pub fn elements(&self) -> impl Iterator<Item = Expr> + '_ {
+        self.syntax.children().filter_map(Expr::cast)
     }
 }
 

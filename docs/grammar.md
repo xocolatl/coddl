@@ -66,7 +66,7 @@ This eliminates the relational-algebra/scalar-op syntactic distinction the autho
 A consistent two-character distinction across the entire surface syntax:
 
 - **`{ ... }` (curly braces) — unordered.** A set-like collection where position is meaningless. Used for named-argument lists, `Tuple` and `Relation` literals, heading declarations, and parameter lists in `oper` declarations. Reordering the contents preserves meaning.
-- **`[ ... ]` (square brackets) — ordered.** A sequence where position is semantically significant. Used for `Sequence T` literals (`[1, 2, 3]`, `[tup1, tup2, tup3]`), operator bodies (statements run in order), `load` ordering specs, and any other context where the reader's expectation is "this is a sequence." Reordering changes meaning.
+- **`[ ... ]` (square brackets) — ordered.** A sequence where position is semantically significant. Used for `Sequence T` literals (`Sequence [1, 2, 3]`, `Sequence [tup1, tup2, tup3]` — the brackets always follow the `Sequence` generator keyword), operator bodies (statements run in order), `load` ordering specs, and any other context where the reader's expectation is "this is a sequence." Reordering changes meaning.
 - **`( ... )` (parentheses)** — expression grouping only. There is no positional call form; every operator invocation uses `name { … }` (see "Named-prefix with braces" above).
 
 This maps directly onto TTM: tuples, relations, and headings have no ordinal position semantics (RM Pro 1); they get `{ ... }`. Procedural code is sequential by nature; it gets `[ ... ]`. The punctuation tells the reader which kind of collection they're looking at without having to recall any context.
@@ -391,7 +391,13 @@ function that implements it.
 
 <heading>       ::= '{' [ <param> commalist ] '}' ;            -- parse_heading
 <param>         ::= <identifier> ':' <type-ref> ;              -- parse_param
-<type-ref>      ::= <identifier> ;                             -- parse_type_ref
+<type-ref>      ::= 'Sequence' <type-ref>                       -- parse_type_ref
+                  | <identifier> ;
+                    -- `Sequence T` is the one generator-applied type
+                    -- form: a nested element type-ref (e.g.
+                    -- `Sequence Integer`, `Sequence Sequence Text`).
+                    -- `Tuple H` / `Relation H` are not yet a <type-ref>
+                    -- (see "Deliberately not yet in the grammar").
 
 <key-clause>    ::= 'key' <ident-brace-list> ;                 -- parse_key_clause
 <ident-brace-list> ::= '{' [ <identifier> commalist ] '}' ;    -- parse_ident_brace_list
@@ -536,6 +542,7 @@ function that implements it.
                   | <transaction-expr>
                   | <tuple-lit>
                   | <relation-lit>
+                  | <sequence-lit>
                   | <extract-expr>
                   | <paren-expr> ;                             -- parse_primary_expr
 <bool-lit>      ::= 'true' | 'false' ;                         -- BOOL_LITERAL
@@ -668,6 +675,18 @@ function that implements it.
                     -- trailing comma allowed. Empty `Relation {}`
                     -- parses cleanly but typechecks as T0018 (no
                     -- inference context for the heading).
+<sequence-lit>  ::= 'Sequence' '[' [ <expr> commalist ] ']' ;     -- parse_sequence_lit
+                    -- 'Sequence' is a contextual keyword; recognized
+                    -- by name in primary-expr position. The body is a
+                    -- comma-separated list of element expressions,
+                    -- trailing comma allowed (P0055 on a missing `[`,
+                    -- P0056 if unterminated). Empty `Sequence []`
+                    -- parses cleanly. *Syntactically* a primary
+                    -- expression, but the typechecker permits it only
+                    -- as a `let` binding value (T0063 elsewhere); an
+                    -- empty literal takes its element type from the
+                    -- `let` annotation (`let s: Sequence Integer =
+                    -- Sequence []`), else T0061.
 
 <unknown-item>  ::= -- error recovery: any tokens until the next
                     -- top-level ';' at bracket-depth zero or EOF.
@@ -687,12 +706,12 @@ The following are decided design intent (see the rationale section
 above) but not yet wired into the parser. Listed here so the omission
 is explicit, not implied:
 
-- **Tuple/Relation/Sequence as a `<type-ref>`**. Today only built-in
-  scalar names resolve as type references; type-generator
-  applications (`Tuple H`, `Relation H`, `Sequence T`) land alongside
-  user-defined types.
-- **Type generators** in `<type-ref>` — `Tuple H`, `Relation H`,
-  `Sequence T`.
+- **Tuple/Relation as a `<type-ref>`**. Today built-in scalar names
+  and the `Sequence T` generator (see `<type-ref>` above) resolve as
+  type references; the `Tuple H` / `Relation H` generator applications
+  land alongside user-defined types.
+- **Type generators** in `<type-ref>` — `Tuple H`, `Relation H`
+  (`Sequence T` is now supported).
 - **Statement forms** other than `<let-stmt>`, `<assign-stmt>`,
   `<truncate-stmt>`, `<delete-stmt>`, `<insert-stmt>`, `<update-stmt>`,
   and `<expr> ';'` — `mut`, `return`.
@@ -772,12 +791,14 @@ enforces that.
 | P0052 | Expected attribute name in unwrap list                  |
 | P0053 | Expected `}` to close unwrap list                       |
 | P0054 | Expected `{ … }` clause after the `update` target        |
+| P0055 | Expected `[` after `Sequence`                           |
+| P0056 | Expected `]` to close sequence literal                  |
 
-Note: missing-type-after-`:` (let annotation) and missing-type-
-after-`->` (operator return clause) both surface as `P0011`
-("expected type name") via `parse_type_ref` — the diagnostic
-message is identical and adding distinct codes would dedupe to the
-same message.
+Note: missing-type-after-`:` (let annotation), missing-type-after-`->`
+(operator return clause), and missing-element-after-`Sequence` all
+surface as `P0011` ("expected type name") via `parse_type_ref` — the
+diagnostic message is identical and adding distinct codes would dedupe
+to the same message.
 
 
 ## Lexer diagnostics

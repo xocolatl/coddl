@@ -1010,6 +1010,9 @@ fn proc_type_from_attr(ty: &Type) -> ProcType {
         Type::FormatText => {
             unreachable!("Type::FormatText is compile-time-only; never reaches codegen")
         }
+        Type::Sequence(_) => {
+            unreachable!("Type::Sequence is not yet lowered; never reaches codegen")
+        }
         Type::Unknown => unreachable!("Type::Unknown reached codegen"),
     }
 }
