@@ -23,6 +23,9 @@ pub enum ParamKind {
     Concrete(Type),
     /// Polymorphic over any `Relation H`. Used by `write_relation`.
     AnyRelation,
+    /// Polymorphic over any `Tuple H`. Used by `format`'s `params`; the
+    /// heading is captured at the call site (mirrors `AnyRelation`).
+    AnyTuple,
 }
 
 /// Whether an operator is safe to call inside a `transaction [...]`.
@@ -50,15 +53,24 @@ pub struct OperSig {
 }
 
 /// Registry of every built-in operator known to the typechecker.
+///
+/// A name maps to a *list* of signatures: most names have exactly one,
+/// but overloaded names (`to_text`) carry several, resolved by argument
+/// type at the call site (static dispatch — each underlying signature is
+/// monomorphic, so RM Pre 8 is preserved). The intrinsic `format` is not
+/// in this table; the checker special-cases it (it needs a cross-argument
+/// placeholders-↔-heading check and has no runtime symbol).
 pub struct Builtins {
-    opers: HashMap<&'static str, OperSig>,
+    opers: HashMap<&'static str, Vec<OperSig>>,
 }
 
 impl Builtins {
     /// Populate with the current built-in set.
     pub fn new() -> Self {
-        let mut opers = HashMap::new();
-        opers.insert(
+        let mut b = Builtins {
+            opers: HashMap::new(),
+        };
+        b.register(
             "write_line",
             OperSig {
                 params: vec![("message", ParamKind::Concrete(Type::Text))],
@@ -68,7 +80,7 @@ impl Builtins {
         );
         // `write_relation { rel: Relation H }` — polymorphic; the
         // backend supplies a per-call-site heading descriptor.
-        opers.insert(
+        b.register(
             "write_relation",
             OperSig {
                 params: vec![("rel", ParamKind::AnyRelation)],
@@ -79,7 +91,7 @@ impl Builtins {
         // `read_line { prompt: Text } -> Text` — prints the prompt, reads
         // one line from stdin (newline stripped). Side-effecting: it
         // touches the outside world, so it's barred inside a transaction.
-        opers.insert(
+        b.register(
             "read_line",
             OperSig {
                 params: vec![("prompt", ParamKind::Concrete(Type::Text))],
@@ -87,13 +99,44 @@ impl Builtins {
                 purity: Purity::SideEffecting,
             },
         );
-        Self { opers }
+        // `to_text { self: <scalar> } -> Text` — the overloaded conversion
+        // string interpolation desugars to, and the first multi-signature
+        // builtin. One monomorphic signature per scalar type; the checker
+        // picks by the static type of `self`. `Text` is an identity and
+        // `Character` reuses `CharToText`; `Integer` / `Boolean` carry their
+        // own runtime conversions (`coddl_int_to_text` / `coddl_bool_to_text`).
+        for self_ty in [Type::Text, Type::Character, Type::Integer, Type::Boolean] {
+            b.register(
+                "to_text",
+                OperSig {
+                    params: vec![("self", ParamKind::Concrete(self_ty))],
+                    return_type: Type::Text,
+                    purity: Purity::Pure,
+                },
+            );
+        }
+        b
     }
 
-    /// Look up an operator by name. Returns `None` for unknown names;
-    /// the caller emits T0001 in that case.
+    fn register(&mut self, name: &'static str, sig: OperSig) {
+        self.opers.entry(name).or_default().push(sig);
+    }
+
+    /// Every signature registered under `name`, in registration order.
+    /// Empty slice for an unknown name (the caller emits T0001).
+    pub fn candidates(&self, name: &str) -> &[OperSig] {
+        self.opers.get(name).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Look up an operator that has exactly one signature. Returns `None`
+    /// for an unknown name *or* an overloaded one — overloaded callers
+    /// must use [`Builtins::candidates`]. Kept for the non-overloaded
+    /// call path and for introspection.
     pub fn oper(&self, name: &str) -> Option<&OperSig> {
-        self.opers.get(name)
+        match self.opers.get(name) {
+            Some(sigs) if sigs.len() == 1 => Some(&sigs[0]),
+            _ => None,
+        }
     }
 }
 
@@ -151,5 +194,37 @@ mod tests {
     fn unknown_oper_returns_none() {
         let b = Builtins::new();
         assert!(b.oper("write_lne").is_none());
+        assert!(b.candidates("write_lne").is_empty());
+    }
+
+    #[test]
+    fn to_text_is_overloaded() {
+        let b = Builtins::new();
+        let sigs = b.candidates("to_text");
+        assert_eq!(
+            sigs.len(),
+            4,
+            "expected Text + Character + Integer + Boolean overloads"
+        );
+        // Overloaded names are not reachable via the single-sig `oper()`.
+        assert!(b.oper("to_text").is_none());
+        // Every overload takes one `self` param and returns Text.
+        for sig in sigs {
+            assert_eq!(sig.params.len(), 1);
+            assert_eq!(sig.params[0].0, "self");
+            assert!(matches!(sig.return_type, Type::Text));
+            assert_eq!(sig.purity, Purity::Pure);
+        }
+        let self_types: Vec<_> = sigs
+            .iter()
+            .map(|s| match &s.params[0].1 {
+                ParamKind::Concrete(t) => t.clone(),
+                _ => panic!("to_text self should be Concrete"),
+            })
+            .collect();
+        assert!(self_types.contains(&Type::Text));
+        assert!(self_types.contains(&Type::Character));
+        assert!(self_types.contains(&Type::Integer));
+        assert!(self_types.contains(&Type::Boolean));
     }
 }

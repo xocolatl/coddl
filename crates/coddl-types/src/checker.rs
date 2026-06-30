@@ -20,7 +20,7 @@ use coddl_syntax::ast::{
 };
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
-use coddl_syntax::{parse, FileKind, SyntaxKind};
+use coddl_syntax::{parse, parse_format_template, FileKind, SyntaxKind, TemplateChunk};
 
 use crate::builtins::Builtins;
 use crate::relvars::{RelvarInfo, RelvarKind, RelvarTable};
@@ -1142,6 +1142,22 @@ impl TypeChecker {
                 Some(SyntaxKind::INTEGER_LIT) => Type::Integer,
                 Some(SyntaxKind::RATIONAL_LIT) => Type::Rational,
                 Some(SyntaxKind::APPROXIMATE_LIT) => Type::Approximate,
+                Some(SyntaxKind::FORMAT_STRING_LIT) => {
+                    // The legitimate template is intercepted in
+                    // `check_format_call` before it reaches the generic
+                    // walk, so any `f"…"` arriving here is misplaced. The
+                    // type is still `FormatText` (its only producer is this
+                    // literal) — the firewall is that it is unusable
+                    // anywhere but `format`'s `template`.
+                    if let Some(tok) = lit.token() {
+                        self.error(
+                            self.token_span(&tok),
+                            "T0055",
+                            "an f\"…\" format string is only allowed as the `template` argument of `format`",
+                        );
+                    }
+                    Type::FormatText
+                }
                 _ => Type::Unknown,
             },
             Expr::Call(call) => self.check_call(call, scope),
@@ -2445,31 +2461,49 @@ impl TypeChecker {
         };
 
         let callee_name = callee_name_tok.text().to_string();
-        let sig = self.builtins.oper(&callee_name).cloned();
-        let Some(sig) = sig else {
-            self.error(
-                self.token_span(&callee_name_tok),
-                "T0001",
-                format!("cannot resolve name `{callee_name}`"),
-            );
-            return Type::Unknown;
-        };
 
-        // Transactions must be pure so the runtime can replay them on
-        // serialization conflict. Side-effecting builtins (write_line,
-        // write_relation) are blocked here; the surface rule extends to
-        // user-defined opers once they carry a derived purity flag.
-        if self.transaction_depth > 0
-            && matches!(sig.purity, crate::builtins::Purity::SideEffecting)
-        {
-            self.error(
-                self.token_span(&callee_name_tok),
-                "T0026",
-                format!(
-                    "side-effecting operator `{callee_name}` called inside `transaction [...]` (transactions must be pure)"
-                ),
-            );
+        // `format` is a compile-time intrinsic, not an ordinary builtin: it
+        // needs a cross-argument check (placeholders ↔ params heading) and
+        // has no runtime symbol, so it is handled entirely here and is not
+        // in the registry.
+        if callee_name == "format" {
+            return self.check_format_call(call, scope);
         }
+
+        let candidates = self.builtins.candidates(&callee_name).to_vec();
+        match candidates.len() {
+            0 => {
+                self.error(
+                    self.token_span(&callee_name_tok),
+                    "T0001",
+                    format!("cannot resolve name `{callee_name}`"),
+                );
+                Type::Unknown
+            }
+            // Fast path for the common single-signature case — behavior is
+            // identical to before overloading landed.
+            1 => self.check_monomorphic_call(
+                call,
+                &callee_name,
+                &callee_name_tok,
+                candidates.into_iter().next().unwrap(),
+                scope,
+            ),
+            _ => self.check_overloaded_call(call, &callee_name, &callee_name_tok, &candidates, scope),
+        }
+    }
+
+    /// The single-signature call path: purity check, name-matched argument
+    /// validation, missing-argument check, result type.
+    fn check_monomorphic_call(
+        &mut self,
+        call: &CallExpr,
+        callee_name: &str,
+        callee_name_tok: &SyntaxToken,
+        sig: crate::builtins::OperSig,
+        scope: &mut Scope,
+    ) -> Type {
+        self.check_call_purity(callee_name, callee_name_tok, &sig);
 
         // Walk the actual argument list against the declared parameters.
         let mut seen: HashSet<String> = HashSet::new();
@@ -2496,6 +2530,288 @@ impl TypeChecker {
         }
 
         sig.return_type.clone()
+    }
+
+    /// Resolve an overloaded builtin (e.g. `to_text`) by the static types
+    /// of its arguments. Each candidate signature is monomorphic, so this
+    /// is pure static dispatch (RM Pre 8 preserved); the surface name is
+    /// just a shared spelling. Argument types are evaluated once here to
+    /// avoid double-checking expressions.
+    fn check_overloaded_call(
+        &mut self,
+        call: &CallExpr,
+        callee_name: &str,
+        callee_name_tok: &SyntaxToken,
+        sigs: &[crate::builtins::OperSig],
+        scope: &mut Scope,
+    ) -> Type {
+        let mut seen: HashSet<String> = HashSet::new();
+        // (arg name, evaluated type)
+        let mut args: Vec<(String, Type)> = Vec::new();
+        let mut any_unknown = false;
+        if let Some(arg_list) = call.args() {
+            for arg in arg_list.args() {
+                let Some(name_tok) = arg.name() else { continue };
+                let aname = name_tok.text().to_string();
+                if !seen.insert(aname.clone()) {
+                    self.error(
+                        self.token_span(&name_tok),
+                        "T0008",
+                        format!("duplicate argument `{aname}`"),
+                    );
+                    continue;
+                }
+                let aty = match arg.value() {
+                    Some(v) => self.check_expr(&v, scope),
+                    None => Type::Unknown,
+                };
+                if matches!(aty, Type::Unknown) {
+                    any_unknown = true;
+                }
+                args.push((aname, aty));
+            }
+        }
+
+        let provided: HashSet<&str> = args.iter().map(|(n, _)| n.as_str()).collect();
+        let applicable: Vec<&crate::builtins::OperSig> = sigs
+            .iter()
+            .filter(|sig| {
+                let pnames: HashSet<&str> = sig.params.iter().map(|(p, _)| *p).collect();
+                pnames == provided
+                    && sig.params.iter().all(|(p, kind)| {
+                        args.iter()
+                            .find(|(n, _)| n == p)
+                            .map(|(_, t)| param_kind_accepts(kind, t))
+                            .unwrap_or(false)
+                    })
+            })
+            .collect();
+
+        match applicable.as_slice() {
+            [sig] => {
+                self.check_call_purity(callee_name, callee_name_tok, sig);
+                sig.return_type.clone()
+            }
+            // Unknown argument types (error recovery) make multiple — or
+            // zero — candidates "match" spuriously; stay quiet so we don't
+            // pile on the upstream error.
+            _ if any_unknown => applicable
+                .first()
+                .map(|s| s.return_type.clone())
+                .unwrap_or(Type::Unknown),
+            [] => {
+                let got = args
+                    .iter()
+                    .map(|(n, t)| format!("{n}: {t}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let span = call
+                    .args()
+                    .map(|a| self.node_span(a.syntax()))
+                    .unwrap_or_else(|| self.node_span(call.syntax()));
+                self.error(
+                    span,
+                    "T0054",
+                    format!("no matching overload of `{callee_name}` for argument types {{ {got} }}"),
+                );
+                Type::Unknown
+            }
+            // Genuine ambiguity can't arise from the current builtins (each
+            // overload has a distinct concrete `self` type). Fall back to
+            // the first applicable signature's result without inventing a
+            // diagnostic code for an unreachable case.
+            _ => applicable[0].return_type.clone(),
+        }
+    }
+
+    /// Transactions must be pure so the runtime can replay them on
+    /// serialization conflict. Side-effecting builtins (write_line,
+    /// write_relation, read_line) are blocked inside one; the surface rule
+    /// extends to user-defined opers once they carry a derived purity flag.
+    fn check_call_purity(
+        &mut self,
+        callee_name: &str,
+        callee_name_tok: &SyntaxToken,
+        sig: &crate::builtins::OperSig,
+    ) {
+        if self.transaction_depth > 0
+            && matches!(sig.purity, crate::builtins::Purity::SideEffecting)
+        {
+            self.error(
+                self.token_span(callee_name_tok),
+                "T0026",
+                format!(
+                    "side-effecting operator `{callee_name}` called inside `transaction [...]` (transactions must be pure)"
+                ),
+            );
+        }
+    }
+
+    /// Type-check the `format { template: f"…", params: { … } }` intrinsic.
+    ///
+    /// `template` must be an `f"…"` literal (T0056) — it is *not* routed
+    /// through `check_expr`, both so the literal-only requirement is
+    /// enforced and so the stray-`f"…"` firewall (T0055) doesn't fire on
+    /// the one legitimate site. `params` is heading-polymorphic and
+    /// optional (absent ⇒ empty heading). Every placeholder must name a
+    /// `params` attribute (T0058); attributes no placeholder uses warn
+    /// (T0059); a malformed template is T0057. The result is always `Text`
+    /// (the lowerer desugars it to a `to_text`/`||` chain), returned even
+    /// on error so callers recover.
+    fn check_format_call(&mut self, call: &CallExpr, scope: &mut Scope) -> Type {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut template_tok: Option<SyntaxToken> = None;
+        let mut have_template = false;
+        // `Some(h)` once params types to a `Tuple`; left `None` if params is
+        // absent *or* ill-typed — disambiguated by `params_present`.
+        let mut params_heading: Option<Heading> = None;
+        let mut params_present = false;
+
+        if let Some(arg_list) = call.args() {
+            for arg in arg_list.args() {
+                let Some(name_tok) = arg.name() else { continue };
+                let name = name_tok.text().to_string();
+                if !seen.insert(name.clone()) {
+                    self.error(
+                        self.token_span(&name_tok),
+                        "T0008",
+                        format!("duplicate argument `{name}`"),
+                    );
+                    continue;
+                }
+                match name.as_str() {
+                    "template" => {
+                        have_template = true;
+                        match arg.value() {
+                            Some(Expr::Literal(lit))
+                                if lit.token().map(|t| t.kind())
+                                    == Some(SyntaxKind::FORMAT_STRING_LIT) =>
+                            {
+                                template_tok = lit.token();
+                            }
+                            other => {
+                                let span = other
+                                    .as_ref()
+                                    .map(|v| self.node_span(v.syntax()))
+                                    .unwrap_or_else(|| self.node_span(arg.syntax()));
+                                self.error(
+                                    span,
+                                    "T0056",
+                                    "`format` template must be an f\"…\" literal",
+                                );
+                            }
+                        }
+                    }
+                    "params" => {
+                        params_present = true;
+                        let ty = match arg.value() {
+                            Some(v) => self.check_expr(&v, scope),
+                            None => Type::Unknown,
+                        };
+                        match ty {
+                            Type::Tuple(h) => params_heading = Some(h),
+                            Type::Unknown => {} // recovery; heading stays None
+                            other => {
+                                let span = arg
+                                    .value()
+                                    .map(|v| self.node_span(v.syntax()))
+                                    .unwrap_or_else(|| self.node_span(arg.syntax()));
+                                self.error(
+                                    span,
+                                    "T0004",
+                                    format!("argument `params` expected a Tuple, got {other}"),
+                                );
+                            }
+                        }
+                    }
+                    _ => {
+                        self.error(
+                            self.token_span(&name_tok),
+                            "T0002",
+                            format!("argument `{name}` is not declared"),
+                        );
+                    }
+                }
+            }
+        }
+
+        if !have_template {
+            let span = call
+                .args()
+                .map(|a| self.node_span(a.syntax()))
+                .unwrap_or_else(|| self.node_span(call.syntax()));
+            self.error(
+                span,
+                "T0003",
+                "missing argument `template` in call to `format`",
+            );
+            return Type::Text;
+        }
+
+        // Resolve the heading to check placeholders against: absent params ⇒
+        // empty (placeholders all fail T0058); present-but-ill-typed ⇒ None
+        // (skip placeholder/heading checks, but still validate structure).
+        let heading: Option<Heading> = match (params_present, params_heading) {
+            (false, _) => Some(Heading::empty()),
+            (true, Some(h)) => Some(h),
+            (true, None) => None,
+        };
+
+        let Some(tok) = template_tok else {
+            // T0056 already reported; can't read placeholders.
+            return Type::Text;
+        };
+        let tok_span = self.token_span(&tok);
+        let sub_span = |range: std::ops::Range<usize>| {
+            Span::new(
+                tok_span.file,
+                tok_span.start + range.start as u32,
+                tok_span.start + range.end as u32,
+            )
+        };
+
+        match parse_format_template(tok.text()) {
+            Err(errors) => {
+                for e in errors {
+                    self.error(sub_span(e.range), "T0057", e.kind.message());
+                }
+            }
+            Ok(chunks) => {
+                let mut used: HashSet<String> = HashSet::new();
+                for chunk in &chunks {
+                    if let TemplateChunk::Placeholder { name, range } = chunk {
+                        used.insert(name.clone());
+                        if let Some(h) = &heading {
+                            if h.lookup(name).is_none() {
+                                self.error(
+                                    sub_span(range.clone()),
+                                    "T0058",
+                                    format!(
+                                        "format template references `{{{name}}}` but `params` has no attribute `{name}`"
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+                // Every params attribute should be referenced by the template.
+                if let Some(h) = &heading {
+                    for (attr, _) in h.attrs() {
+                        if !used.contains(attr) {
+                            self.warn(
+                                tok_span,
+                                "T0059",
+                                format!(
+                                    "`params` attribute `{attr}` is never used by the format template"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Type::Text
     }
 
     fn check_named_arg(
@@ -2564,6 +2880,22 @@ impl TypeChecker {
                     );
                 }
             }
+            Some(crate::builtins::ParamKind::AnyTuple) => {
+                provided.insert(name.clone());
+                // Accept any `Tuple H` regardless of heading (mirrors
+                // `AnyRelation`); `Unknown` slips through for recovery.
+                if !matches!(arg_ty, Type::Tuple(_) | Type::Unknown) {
+                    let span = arg
+                        .value()
+                        .map(|v| self.node_span(v.syntax()))
+                        .unwrap_or_else(|| self.node_span(arg.syntax()));
+                    self.error(
+                        span,
+                        "T0004",
+                        format!("argument `{name}` expected a Tuple, got {arg_ty}"),
+                    );
+                }
+            }
             None => {
                 self.error(
                     self.token_span(&name_tok),
@@ -2572,6 +2904,18 @@ impl TypeChecker {
                 );
             }
         }
+    }
+}
+
+/// Does an argument of static type `ty` satisfy a parameter of kind `kind`?
+/// `Unknown` (error recovery) is accepted everywhere so one upstream
+/// failure doesn't poison overload resolution. Shared by the overloaded
+/// call path.
+fn param_kind_accepts(kind: &crate::builtins::ParamKind, ty: &Type) -> bool {
+    match kind {
+        crate::builtins::ParamKind::Concrete(expected) => ty.assignable_to(expected),
+        crate::builtins::ParamKind::AnyRelation => matches!(ty, Type::Relation(_) | Type::Unknown),
+        crate::builtins::ParamKind::AnyTuple => matches!(ty, Type::Tuple(_) | Type::Unknown),
     }
 }
 
@@ -4557,5 +4901,83 @@ mod tests {
             "T0026 should not fire on pure ops: {:?}",
             codes(&src)
         );
+    }
+
+    // ── string interpolation: `format` + `f"…"` + `to_text` ──────────────
+
+    const FORMAT_HELLO: &str = "program p;\n\
+        oper main {} [\n\
+            let name_in = read_line { prompt: \"n: \" };\n\
+            let message = format { template: f\"Hello, {name}!\", params: { name: name_in } };\n\
+            write_line { message };\n\
+        ];\n";
+
+    #[test]
+    fn format_interpolation_checks_clean() {
+        let diags = diagnostics(FORMAT_HELLO);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn format_returns_text() {
+        // `message` flows into write_line's Text `message` param with no
+        // T0004 — proving format's result type is Text.
+        assert!(!codes(FORMAT_HELLO).contains(&"T0004"), "{:?}", codes(FORMAT_HELLO));
+    }
+
+    #[test]
+    fn fstring_outside_format_is_t0056() {
+        // The firewall: an f"…" anywhere but format's template.
+        let src = "program p; oper main {} [ let x = f\"hi {y}\"; ];";
+        assert!(codes(src).contains(&"T0055"), "{:?}", codes(src));
+        // And it cannot slip into a Text slot either.
+        let src2 = "program p; oper main {} [ write_line { message: f\"hi\" }; ];";
+        let c2 = codes(src2);
+        assert!(c2.contains(&"T0055"), "{:?}", c2);
+    }
+
+    #[test]
+    fn format_template_must_be_fstring_literal_t0057() {
+        // A plain string in template position is the classic mistake.
+        let src = "program p; oper main {} [ let m = format { template: \"hi {x}\", params: { x: 1 } }; write_line { m }; ];";
+        assert!(codes(src).contains(&"T0056"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn format_placeholder_without_attribute_is_t0059() {
+        let src = "program p; oper main {} [ let m = format { template: f\"hi {missing}\", params: { present: 1 } }; write_line { m }; ];";
+        let c = codes(src);
+        assert!(c.contains(&"T0058"), "{:?}", c);
+    }
+
+    #[test]
+    fn format_unused_params_attribute_warns_t0060() {
+        let src = "program p; oper main {} [ let m = format { template: f\"hi\", params: { unused: 1 } }; write_line { m }; ];";
+        let c = codes(src);
+        assert!(c.contains(&"T0059"), "{:?}", c);
+    }
+
+    #[test]
+    fn format_malformed_template_is_t0058() {
+        let src = "program p; oper main {} [ let m = format { template: f\"hi {}\", params: {} }; write_line { m }; ];";
+        assert!(codes(src).contains(&"T0057"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn to_text_overload_resolves_for_text_and_character() {
+        // Both overloads are reachable; neither is a no-match (T0054).
+        let src = "program p; oper main {} [ let a = to_text { self: \"x\" }; let b = to_text { self: 'y' }; write_line { a }; write_line { b }; ];";
+        let c = codes(src);
+        assert!(!c.contains(&"T0054"), "{:?}", c);
+        assert!(!c.contains(&"T0001"), "{:?}", c);
+    }
+
+    #[test]
+    fn to_text_no_matching_overload_is_t0054() {
+        // No `to_text { self: Relation }` overload exists.
+        let src = "program p; private relvar R { a: Integer } key { a }; \
+                   oper main {} [ let t = to_text { self: R }; write_line { t }; ];";
+        let c = codes(src);
+        assert!(c.contains(&"T0054"), "{:?}", c);
     }
 }

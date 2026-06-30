@@ -27,6 +27,7 @@ pub enum SyntaxKind {
     RATIONAL_LIT,
     APPROXIMATE_LIT,
     STRING_LIT,
+    FORMAT_STRING_LIT,
     CHAR_LIT,
 
     L_BRACE,
@@ -283,6 +284,7 @@ impl From<TokenKind> for SyntaxKind {
             TokenKind::RationalLit => SyntaxKind::RATIONAL_LIT,
             TokenKind::ApproximateLit => SyntaxKind::APPROXIMATE_LIT,
             TokenKind::StringLit => SyntaxKind::STRING_LIT,
+            TokenKind::FormatStringLit => SyntaxKind::FORMAT_STRING_LIT,
             TokenKind::CharLit => SyntaxKind::CHAR_LIT,
 
             TokenKind::LBrace => SyntaxKind::L_BRACE,
@@ -335,6 +337,7 @@ mod tests {
             TokenKind::RationalLit,
             TokenKind::ApproximateLit,
             TokenKind::StringLit,
+            TokenKind::FormatStringLit,
             TokenKind::CharLit,
             TokenKind::LBrace,
             TokenKind::RBrace,

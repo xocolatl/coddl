@@ -2329,6 +2329,7 @@ fn proc_type_from_attr(ty: &Type) -> ProcType {
         Type::Boolean => ProcType::Boolean,
         Type::Tuple(h) => ProcType::Tuple(h.clone()),
         Type::Relation(_) => ProcType::Pointer,
+        Type::FormatText => unreachable!("Type::FormatText is compile-time-only; never reaches codegen"),
         Type::Unknown => unreachable!("Type::Unknown reached codegen"),
     }
 }

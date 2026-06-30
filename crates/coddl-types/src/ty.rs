@@ -130,6 +130,15 @@ pub enum Type {
     Binary,
     Byte,
     Boolean,
+    /// The type of an `f"…"` format-string literal. Compile-time-only and
+    /// non-storable: its only producer is the literal, there is **no**
+    /// `Text -> FormatText` coercion (that absence is the firewall keeping
+    /// runtime `Text` — e.g. `read_line` input — out of template slots),
+    /// and it never survives lowering. Unspellable as a type name (absent
+    /// from `from_builtin_name`), so it can never be a relvar/tuple
+    /// attribute. Only `format`'s `template` parameter accepts it. See
+    /// `docs/typecheck.md`.
+    FormatText,
     /// Structural tuple: a value whose shape is its heading. The empty
     /// `Tuple` is the unit type (`Tuple {}`).
     Tuple(Heading),
@@ -183,7 +192,10 @@ impl Type {
             | (Type::Character, Type::Character)
             | (Type::Binary, Type::Binary)
             | (Type::Byte, Type::Byte)
-            | (Type::Boolean, Type::Boolean) => true,
+            | (Type::Boolean, Type::Boolean)
+            // FormatText is assignable only to itself — deliberately no
+            // `Text -> FormatText` arm (the format-string-injection firewall).
+            | (Type::FormatText, Type::FormatText) => true,
             (Type::Tuple(a), Type::Tuple(b)) => a.assignable_to(b),
             (Type::Relation(a), Type::Relation(b)) => a.assignable_to(b),
             _ => false,
@@ -202,6 +214,7 @@ impl fmt::Display for Type {
             Type::Binary => f.write_str("Binary"),
             Type::Byte => f.write_str("Byte"),
             Type::Boolean => f.write_str("Boolean"),
+            Type::FormatText => f.write_str("FormatText"),
             Type::Tuple(h) => write!(f, "Tuple {h}"),
             Type::Relation(h) => write!(f, "Relation {h}"),
             Type::Unknown => f.write_str("<unknown>"),
@@ -249,6 +262,20 @@ mod tests {
     fn assignable_scalar_mismatch_rejected() {
         assert!(!Type::Integer.assignable_to(&Type::Text));
         assert!(!Type::Boolean.assignable_to(&Type::Byte));
+    }
+
+    #[test]
+    fn format_text_is_the_injection_firewall() {
+        // FormatText is unspellable as a type name (can never be a
+        // relvar/tuple attribute) …
+        assert!(Type::from_builtin_name("FormatText").is_none());
+        // … assignable only to itself …
+        assert!(Type::FormatText.assignable_to(&Type::FormatText));
+        // … and crucially NOT interchangeable with Text in either
+        // direction (runtime Text can never become a template).
+        assert!(!Type::Text.assignable_to(&Type::FormatText));
+        assert!(!Type::FormatText.assignable_to(&Type::Text));
+        assert_eq!(format!("{}", Type::FormatText), "FormatText");
     }
 
     #[test]

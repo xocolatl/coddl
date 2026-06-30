@@ -130,6 +130,20 @@ mod tests {
     }
 
     #[test]
+    fn format_string_literal_stays_glued_to_its_prefix() {
+        // The `f"…"` token must not be split — `f` stays fused to the quote
+        // (the whole point of lexing it as one token), and the call formats
+        // canonically.
+        let src = "program p;\noper main {} [ let m=format{template:f\"Hi {x}!\",params:{x:x}}; ];\n";
+        let got = fmt(src);
+        assert!(
+            got.contains("template: f\"Hi {x}!\""),
+            "f\"…\" must stay glued, got:\n{got}"
+        );
+        assert_eq!(fmt(&got), got, "format-string formatting must be idempotent");
+    }
+
+    #[test]
     fn preserves_leading_and_trailing_comments() {
         let src = "// header\nprogram p; // trailing\noper main {} [\n    write_line { message: \"hi\" }; // note\n];\n";
         let got = fmt(src);

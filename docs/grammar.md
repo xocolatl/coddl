@@ -116,6 +116,7 @@ Deliberately **not** in the synonym set: Greek letters (`π σ ρ γ` — too ea
 ## Literals
 
 - **Text** literals: double-quoted, e.g. `"hello, world"`. Standard escape sequences `\n`, `\r`, `\t`, `\"`, `\\`, and `\u{HHHHHH}` for a Unicode codepoint (1–6 hex digits, value ≤ U+10FFFF, outside the UTF-16 surrogate range D800–DFFF). Multi-line is permitted — raw newlines are kept as-is.
+- **Format-string** literals: a Text literal prefixed by `f` with the `f` **fused to the opening quote** (no space), e.g. `f"Hello, {name}!"`. Same body and escapes as a Text literal, plus `{name}` placeholders (a single attribute name) and `{{` / `}}` for literal braces. Its type is `FormatText` (see [typecheck.md](typecheck.md)), which exists only as the `template` argument of `format` — there is no `Text → FormatText` conversion, so a runtime `Text` can never be used as a template. Only the exact adjacency `f"` triggers it: a bare `f`, `f { … }`, `f "x"` (with a space), and `xf"x"` all stay an ordinary identifier (optionally) followed by a plain string. Lexical form → type, like the numeric shapes below. The lexer does **not** validate placeholders; that is a typecheck-time concern (T0055–T0059).
 - **Character** literals: single-quoted, exactly one codepoint, e.g. `'a'`, `'\n'`, `'\u{1F600}'`. The lexer rejects empty `''` and multi-codepoint `'ab'` at the lexical level. Escape syntax matches Text.
 - **Boolean** literals: `true`, `false`.
 - **Numeric** literals — three lexical shapes, one per numeric type:
@@ -227,12 +228,14 @@ when it appears in user source.
 
 ```
 <literal>             ::= <string-literal>
+                        | <format-string-literal>
                         | <char-literal>
                         | <integer-literal>
                         | <rational-literal>
                         | <approximate-literal> ;
 
 <string-literal>      ::= '"' { <string-char> } '"' ;
+<format-string-literal> ::= 'f' '"' { <string-char> } '"' ;  -- 'f' fused to the quote, no space
 <string-char>         ::= -- any source character other than '"' or '\'
                         | '\' <escape> ;
 <escape>              ::= 'n' | 'r' | 't' | '"' | '\'

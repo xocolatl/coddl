@@ -5,6 +5,7 @@
     "fileTypes": ["cd"],
     "patterns": [
         { "include": "#comments" },
+        { "include": "#format_strings" },
         { "include": "#strings" },
         { "include": "#numbers" },
         { "include": "#constants" },
@@ -45,6 +46,42 @@
                         {
                             "name": "constant.character.escape.coddl",
                             "match": "\\\\."
+                        }
+                    ]
+                }
+            ]
+        },
+        "format_strings": {
+            "patterns": [
+                {
+                    "comment": "Format-string literal f\"…\" — the `f` is fused to the opening quote (lexed as one token), so it's coloured as part of the string, not as an identifier. The negative lookbehind keeps `xf\"` (identifier `xf` + plain string) and `f \"` (with a space) out.",
+                    "name": "string.quoted.double.format.coddl",
+                    "begin": "(?<![A-Za-z0-9_#])f\"",
+                    "beginCaptures": {
+                        "0": { "name": "punctuation.definition.string.begin.coddl" }
+                    },
+                    "end": "\"",
+                    "endCaptures": {
+                        "0": { "name": "punctuation.definition.string.end.coddl" }
+                    },
+                    "patterns": [
+                        {
+                            "name": "constant.character.escape.coddl",
+                            "match": "\\\\."
+                        },
+                        {
+                            "comment": "Escaped literal braces {{ and }}.",
+                            "name": "constant.character.escape.coddl",
+                            "match": "\\{\\{|\\}\\}"
+                        },
+                        {
+                            "comment": "{name} placeholder — an attribute of the params tuple.",
+                            "match": "(\\{)([A-Za-z_][A-Za-z0-9_]*)(\\})",
+                            "captures": {
+                                "1": { "name": "punctuation.section.interpolation.begin.coddl" },
+                                "2": { "name": "variable.other.interpolation.coddl" },
+                                "3": { "name": "punctuation.section.interpolation.end.coddl" }
+                            }
                         }
                     ]
                 }

@@ -577,8 +577,8 @@ ast_node!(pub Literal, LITERAL);
 
 impl Literal {
     /// The underlying literal token. Its `kind()` distinguishes
-    /// `STRING_LIT` / `CHAR_LIT` / `INTEGER_LIT` / `RATIONAL_LIT` /
-    /// `APPROXIMATE_LIT`.
+    /// `STRING_LIT` / `FORMAT_STRING_LIT` / `CHAR_LIT` / `INTEGER_LIT` /
+    /// `RATIONAL_LIT` / `APPROXIMATE_LIT`.
     pub fn token(&self) -> Option<SyntaxToken> {
         self.syntax
             .children_with_tokens()
@@ -587,6 +587,7 @@ impl Literal {
                 matches!(
                     t.kind(),
                     SyntaxKind::STRING_LIT
+                        | SyntaxKind::FORMAT_STRING_LIT
                         | SyntaxKind::CHAR_LIT
                         | SyntaxKind::INTEGER_LIT
                         | SyntaxKind::RATIONAL_LIT

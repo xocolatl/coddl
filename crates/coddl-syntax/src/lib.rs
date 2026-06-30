@@ -18,6 +18,7 @@ pub mod ast_cdmap;
 pub mod ast_cdstore;
 pub mod cst;
 pub mod file_kind;
+pub mod format_template;
 pub mod lexer;
 pub mod parser;
 pub mod parser_cddb;
@@ -28,6 +29,9 @@ pub mod token;
 
 pub use cst::{CoddlLanguage, CstBuilder, SyntaxElement, SyntaxNode, SyntaxToken};
 pub use file_kind::FileKind;
+pub use format_template::{
+    parse_format_template, TemplateChunk, TemplateError, TemplateErrorKind,
+};
 pub use lexer::{lex, LexOutput};
 pub use parser::parse;
 pub use syntax_kind::SyntaxKind;

@@ -51,6 +51,13 @@ pub enum TokenKind {
     ApproximateLit,
     /// `"hello"` — double-quoted text. Includes the quotes in the span.
     StringLit,
+    /// `f"hello, {name}!"` — format-string literal. The `f` is fused to
+    /// the opening quote (no space); only the adjacency `f"` triggers it,
+    /// so `f` stays an ordinary identifier everywhere else. Lexically the
+    /// same body as `StringLit` (the lexer doesn't validate placeholders);
+    /// the `{…}` placeholder structure is interpreted later. Its type is
+    /// `FormatText` — see `docs/typecheck.md`.
+    FormatStringLit,
     /// `'a'`, `'\n'`, `'\u{1F600}'` — single-codepoint character literal.
     CharLit,
 

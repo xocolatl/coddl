@@ -22,7 +22,7 @@ use coddl_syntax::ast::{
     ReplaceExpr, Root, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit, UnaryExpr, UnaryOp,
     UnwrapExpr, UpdateStmt, WrapExpr,
 };
-use coddl_syntax::SyntaxKind;
+use coddl_syntax::{parse_format_template, SyntaxKind, TemplateChunk};
 use coddl_types::{check, Heading, RelvarKind, RelvarTable, Type};
 
 use coddl_relir::{
@@ -66,6 +66,23 @@ struct BuiltinExtern {
     params: &'static [(&'static str, ProcType)],
     return_type: ProcType,
 }
+
+// Internal `to_text` conversions — not user-callable surfaces (so absent from
+// `BUILTIN_EXTERNS`), but declared like any Text-returning extern: the length
+// crosses back through the synthesized `len_out` (the `returns_fat_pointer`
+// path), same as `read_line`. `lower_to_text` references these directly.
+const INT_TO_TEXT_EXTERN: BuiltinExtern = BuiltinExtern {
+    surface: "int_to_text",
+    linkage: "coddl_int_to_text",
+    params: &[("n", ProcType::Integer)],
+    return_type: ProcType::Text,
+};
+const BOOL_TO_TEXT_EXTERN: BuiltinExtern = BuiltinExtern {
+    surface: "bool_to_text",
+    linkage: "coddl_bool_to_text",
+    params: &[("b", ProcType::Boolean)],
+    return_type: ProcType::Text,
+};
 
 /// The output of one `lower` pass. `module` is `None` iff any error
 /// diagnostic was emitted upstream — the lowering pass refuses to
@@ -3427,6 +3444,15 @@ impl Lowerer {
         if surface == "write_relation" {
             return self.lower_write_relation_call(call);
         }
+        // String interpolation: both are compile-time / overloaded
+        // constructs with no single `coddl_*` symbol, so they are lowered
+        // bespoke and kept out of `BUILTIN_EXTERNS`.
+        if surface == "format" {
+            return self.lower_format_call(call);
+        }
+        if surface == "to_text" {
+            return self.lower_to_text_call(call);
+        }
 
         let ext = self
             .lookup_extern(&surface)
@@ -3520,6 +3546,197 @@ impl Lowerer {
         self.record_type(v, ProcType::Unit);
         v
     }
+
+    /// Lower `to_text { self: <scalar> }` to an **owned** heap `Text`. The
+    /// overload was already resolved by the typechecker; here we dispatch on
+    /// the lowered value's machine type. Returning an owned value means the
+    /// result is always safe to bind or concatenate without aliasing the
+    /// source (an identity `Text` is retained, not handed back bare).
+    fn lower_to_text_call(&mut self, call: &CallExpr) -> ValueId {
+        let arg_list = call.args().expect("typechecked call has an arg list");
+        let self_arg = arg_list
+            .args()
+            .find(|a| a.name().map(|t| t.text().to_string()).as_deref() == Some("self"))
+            .expect("typechecked to_text has a `self` arg");
+        let value_expr = self_arg.value().expect("self arg has a value");
+        let v = self.lower_expr(&value_expr);
+        self.lower_to_text(v)
+    }
+
+    /// Convert an already-lowered scalar `v` to a fresh, independently-owned
+    /// heap `Text`. Slice B-core: `Text` (a deep copy — *not* an alias, so the
+    /// result never shares a refcount with a source local or a `params` cell,
+    /// both of which are released elsewhere) and `Character` (`CharToText`).
+    /// `Integer`/`Boolean` arrive with their runtime routines. Shared by
+    /// `to_text` and `format`.
+    fn lower_to_text(&mut self, v: ValueId) -> ValueId {
+        match self.value_type(v) {
+            ProcType::Text => {
+                // Copy via concat with "" — the cheapest way to get a
+                // standalone owned `Text`. Aliasing the source instead would
+                // either leak (a borrowing call skips releasing a local) or
+                // dangle (a `format` placeholder borrows a cell freed after
+                // the fold).
+                let empty = self.emit_text_const(Vec::new());
+                self.concat_text(empty, v)
+            }
+            ProcType::Character => self.coerce_to_text(v),
+            ProcType::Integer => self.call_text_conv(&INT_TO_TEXT_EXTERN, v),
+            ProcType::Boolean => self.call_text_conv(&BOOL_TO_TEXT_EXTERN, v),
+            other => unreachable!(
+                "to_text has no overload for `{other}` (Text, Character, Integer, Boolean)"
+            ),
+        }
+    }
+
+    /// Emit a call to a Text-returning conversion extern (`coddl_int_to_text`
+    /// / `coddl_bool_to_text`) over one scalar argument. The result is a fresh
+    /// owned heap `Text` (rc=1); the backend supplies the trailing `len_out`
+    /// for the fat-pointer return, exactly as for `read_line`.
+    fn call_text_conv(&mut self, ext: &'static BuiltinExtern, arg: ValueId) -> ValueId {
+        self.ensure_extern(ext);
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Text);
+        self.insts.push(Inst::Call {
+            dst: Some(dst),
+            callee: ext.linkage.to_string(),
+            args: vec![arg],
+            return_type: ProcType::Text,
+        });
+        self.mark_text_owned(dst);
+        dst
+    }
+
+    /// Lower the `format { template: f"…", params: { … } }` intrinsic to a
+    /// `to_text`/`||` concatenation, the desugar string interpolation is
+    /// built on. The template is scanned (the typechecker already validated
+    /// it) into literal chunks and placeholders; each placeholder reads its
+    /// value from the `params` tuple via a borrowed `TupleField`, is
+    /// converted with `to_text`, and the pieces are concatenated. `params`
+    /// is materialized once, so per-field effects run once and repeated
+    /// placeholders are handled correctly.
+    fn lower_format_call(&mut self, call: &CallExpr) -> ValueId {
+        let arg_list = call.args().expect("typechecked call has an arg list");
+        let mut template_tok = None;
+        let mut params_expr: Option<Expr> = None;
+        for arg in arg_list.args() {
+            match arg.name().map(|t| t.text().to_string()).as_deref() {
+                Some("template") => {
+                    if let Some(Expr::Literal(lit)) = arg.value() {
+                        template_tok = lit.token();
+                    }
+                }
+                Some("params") => params_expr = arg.value(),
+                _ => {}
+            }
+        }
+        let tok = template_tok.expect("typechecked format has an f\"…\" template literal");
+        let chunks = parse_format_template(tok.text()).unwrap_or_default();
+
+        // Materialize `params` once iff a placeholder needs it.
+        let needs_params = chunks
+            .iter()
+            .any(|c| matches!(c, TemplateChunk::Placeholder { .. }));
+        let params_tv = if needs_params {
+            params_expr.as_ref().map(|e| self.lower_expr(e))
+        } else {
+            None
+        };
+        let params_heading = params_tv.map(|tv| match self.value_type(tv) {
+            ProcType::Tuple(h) => h,
+            other => unreachable!("format params lowered to non-tuple `{other}`"),
+        });
+
+        // Each chunk becomes a `Text` piece: literal const, or a placeholder
+        // read (TupleField → to_text). Placeholder pieces are owned; literal
+        // pieces are borrowed consts.
+        let mut pieces: Vec<ValueId> = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            match chunk {
+                TemplateChunk::Literal(bytes) => {
+                    pieces.push(self.emit_text_const(bytes.clone()));
+                }
+                TemplateChunk::Placeholder { name, .. } => {
+                    let tv = params_tv.expect("placeholder requires materialized params");
+                    let heading = params_heading.as_ref().expect("params heading");
+                    let field_type = heading
+                        .lookup(name)
+                        .map(proc_type_from_type)
+                        .unwrap_or_else(|| {
+                            unreachable!("placeholder `{name}` missing from params heading past typecheck")
+                        });
+                    let field = self.fresh_value();
+                    self.record_type(field, field_type.clone());
+                    self.insts.push(Inst::TupleField {
+                        dst: field,
+                        src: tv,
+                        field_name: name.clone(),
+                        field_type,
+                    });
+                    pieces.push(self.lower_to_text(field));
+                }
+            }
+        }
+
+        // Fold into one `Text`. Single owned piece (lone placeholder) is
+        // returned as-is; a lone literal const is fine to bind borrowed; an
+        // empty template yields "".
+        let result = match pieces.len() {
+            0 => self.emit_text_const(Vec::new()),
+            1 => pieces[0],
+            _ => {
+                let mut acc = pieces[0];
+                for &p in &pieces[1..] {
+                    acc = self.concat_text(acc, p);
+                }
+                acc
+            }
+        };
+
+        // Release the owned `Text` cells the materialized `params` tuple
+        // holds (mirrors `lower_relation_lit`). A `NameRef`-aliased params
+        // tuple contributes none, so this is a no-op there.
+        if let Some(tv) = params_tv {
+            if let Some(temps) = self.tuple_cell_text_temps.remove(&tv) {
+                for t in temps {
+                    self.release_text_temp(t);
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Emit a borrowed `Text` constant (`Inst::Const`), like a string
+    /// literal — not marked owned.
+    fn emit_text_const(&mut self, bytes: Vec<u8>) -> ValueId {
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Text);
+        self.insts.push(Inst::Const {
+            dst,
+            value: Const::Text(bytes),
+            ty: ProcType::Text,
+        });
+        dst
+    }
+
+    /// Concatenate two `Text` values into a fresh owned `Text`, releasing any
+    /// owned-temp operands — the same shape as a `||` in `lower_binary_expr`.
+    fn concat_text(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Text);
+        self.insts.push(Inst::ScalarOp {
+            dst,
+            op: ScalarOp::Concat,
+            operand_type: ProcType::Text,
+            lhs,
+            rhs,
+        });
+        self.mark_text_owned(dst);
+        self.release_text_temp(lhs);
+        self.release_text_temp(rhs);
+        dst
+    }
 }
 
 /// The attribute name if `expr` is a bare `NameRef`, else `None`. Used by
@@ -3610,6 +3827,9 @@ fn proc_type_from_type(ty: &Type) -> ProcType {
             unreachable!(
                 "Type::Relation inside a non-relation context — use Lowerer::proc_type_from_type"
             )
+        }
+        Type::FormatText => {
+            unreachable!("Type::FormatText is compile-time-only and never lowered")
         }
         Type::Unknown => unreachable!("Type::Unknown survived typecheck"),
     }
@@ -5349,6 +5569,82 @@ oper main {} [
             .expect("write_line call present")
             .expect("write_line call has an arg");
         assert_eq!(arg, field_dst);
+    }
+
+    // ── string interpolation: format + to_text ──────────────────────
+
+    #[test]
+    fn format_lowers_to_concat_with_placeholder_field() {
+        let src = "oper main {} [ \
+                   let name_in = read_line { prompt: \"n: \" }; \
+                   let message = format { template: f\"Hello, {name}!\", params: { name: name_in } }; \
+                   write_line { message }; \
+                   ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let insts = &main.blocks[0].insts;
+
+        // `params` is materialized once …
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::TupleLit { .. })),
+            "expected params TupleLit"
+        );
+        // … and `{name}` is read out of it via TupleField.
+        assert!(
+            insts.iter().any(
+                |i| matches!(i, Inst::TupleField { field_name, .. } if field_name == "name")
+            ),
+            "expected a TupleField for `name`"
+        );
+        // The two literal chunks become Text consts.
+        let text_consts: Vec<String> = insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::Const {
+                    value: Const::Text(b),
+                    ..
+                } => Some(String::from_utf8_lossy(b).into_owned()),
+                _ => None,
+            })
+            .collect();
+        assert!(text_consts.iter().any(|s| s == "Hello, "), "{text_consts:?}");
+        assert!(text_consts.iter().any(|s| s == "!"), "{text_consts:?}");
+        // Three pieces fold via at least two Concats.
+        let concats = insts
+            .iter()
+            .filter(|i| matches!(i, Inst::ScalarOp { op: ScalarOp::Concat, .. }))
+            .count();
+        assert!(concats >= 2, "expected ≥2 concats, got {concats}");
+    }
+
+    #[test]
+    fn format_integer_placeholder_calls_int_to_text() {
+        let src = "oper main {} [ \
+                   let message = format { template: f\"count: {n}\", params: { n: 7 } }; \
+                   write_line { message }; \
+                   ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            main.blocks[0].insts.iter().any(
+                |i| matches!(i, Inst::Call { callee, .. } if callee == "coddl_int_to_text")
+            ),
+            "expected a coddl_int_to_text call for the Integer placeholder"
+        );
+    }
+
+    #[test]
+    fn to_text_character_lowers_to_char_to_text() {
+        let src = "oper main {} [ let s = to_text { self: 'a' }; write_line { message: s }; ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            main.blocks[0]
+                .insts
+                .iter()
+                .any(|i| matches!(i, Inst::CharToText { .. })),
+            "expected CharToText for to_text on a Character"
+        );
     }
 
     #[test]

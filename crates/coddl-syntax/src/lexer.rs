@@ -129,6 +129,12 @@ impl<'a> Lexer<'a> {
                 _ => self.lex_single(TokenKind::Slash, start),
             },
 
+            // format-string literal: `f` fused to the opening quote, no
+            // space. Only this exact adjacency triggers it; `f` stays an
+            // ordinary identifier everywhere else (`f`, `f { … }`, `f "x"`,
+            // `xf"x"`). Lexical form → type, like `42` vs `42.0`.
+            'f' if self.peek_n(1) == Some('"') => self.lex_format_string(start),
+
             // string and char literals
             '"' => self.lex_string(start),
             '\'' => self.lex_char(start),
@@ -299,17 +305,35 @@ impl<'a> Lexer<'a> {
 
     fn lex_string(&mut self, start: usize) {
         self.bump(); // opening '"'
+        self.scan_string_body(start, TokenKind::StringLit);
+    }
+
+    /// `f"…"` — same byte-level scan as a plain string (the lexer does not
+    /// interpret `{…}` placeholders; that happens later, against the params
+    /// heading). The leading `f` and opening `"` are already confirmed
+    /// adjacent by the dispatch; here we just consume them and the body.
+    fn lex_format_string(&mut self, start: usize) {
+        self.bump(); // 'f'
+        self.bump(); // opening '"'
+        self.scan_string_body(start, TokenKind::FormatStringLit);
+    }
+
+    /// Scan a double-quoted body up to and including the closing `"`,
+    /// emitting `kind`. The cursor must be positioned just past the
+    /// opening quote. Shared by plain and format strings so their escape
+    /// handling can never drift.
+    fn scan_string_body(&mut self, start: usize, kind: TokenKind) {
         loop {
             match self.peek() {
                 None => {
                     let span = self.span(start);
                     self.diag(span, "E0003", "unterminated string literal");
-                    self.emit(TokenKind::StringLit, start);
+                    self.emit(kind, start);
                     return;
                 }
                 Some('"') => {
                     self.bump(); // closing '"'
-                    self.emit(TokenKind::StringLit, start);
+                    self.emit(kind, start);
                     return;
                 }
                 Some('\\') => {
@@ -321,7 +345,7 @@ impl<'a> Lexer<'a> {
                     if self.bump().is_none() {
                         let span = self.span(start);
                         self.diag(span, "E0003", "unterminated string literal");
-                        self.emit(TokenKind::StringLit, start);
+                        self.emit(kind, start);
                         return;
                     }
                 }
@@ -588,6 +612,62 @@ mod tests {
     fn unterminated_string_diagnoses_and_emits_token() {
         let out = lex_all(r#""abc"#);
         assert_eq!(out.tokens[0].kind, TokenKind::StringLit);
+        assert!(out.diagnostics.iter().any(|d| d.code == "E0003"));
+    }
+
+    #[test]
+    fn format_string_is_one_token() {
+        let kinds = lex_kinds(r#"f"Hello, {name}!""#);
+        assert_eq!(kinds, vec![TokenKind::FormatStringLit, TokenKind::Eof]);
+    }
+
+    #[test]
+    fn format_string_honors_escapes() {
+        let kinds = lex_kinds(r#"f"a \"b\" {x}""#);
+        assert_eq!(kinds, vec![TokenKind::FormatStringLit, TokenKind::Eof]);
+    }
+
+    #[test]
+    fn f_with_space_before_quote_is_ident_then_string() {
+        // The `f"` adjacency is what triggers the format string; a space
+        // breaks it back into a plain identifier and a plain string.
+        let kinds = lex_kinds(r#"f "x""#);
+        assert_eq!(
+            kinds,
+            vec![TokenKind::Ident, TokenKind::StringLit, TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn longer_ident_ending_in_f_is_not_a_format_string() {
+        // Only a bare `f` glued to the quote triggers it; `xf"…"` is the
+        // identifier `xf` followed by a plain string.
+        let kinds = lex_kinds(r#"xf"x""#);
+        assert_eq!(
+            kinds,
+            vec![TokenKind::Ident, TokenKind::StringLit, TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn bare_f_stays_an_identifier() {
+        assert_eq!(lex_kinds("f"), vec![TokenKind::Ident, TokenKind::Eof]);
+        assert_eq!(
+            lex_kinds("f { x }"),
+            vec![
+                TokenKind::Ident,
+                TokenKind::LBrace,
+                TokenKind::Ident,
+                TokenKind::RBrace,
+                TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn unterminated_format_string_diagnoses_and_emits_token() {
+        let out = lex_all(r#"f"abc"#);
+        assert_eq!(out.tokens[0].kind, TokenKind::FormatStringLit);
         assert!(out.diagnostics.iter().any(|d| d.code == "E0003"));
     }
 

@@ -33,7 +33,7 @@ The split matches Rust's `String` / `char` distinction and TTM's Appendix-A "sca
 
 Distinct named scalar types are disjoint; `Integer` and `Rational` cannot be silently mixed. Equality `=` is type-monomorphic per RM Pre 8 ("indistinguishable for all operators on T").
 
-**Static operator overloading is permitted.** A few comparison operators resolve to distinct underlying operators depending on the operand type family — most notably, `<=` and `>=` are scalar comparison on scalars and **subset** / **superset** on relations (`<` and `>` give strict subset / superset). The same identifier names two operators; the type checker picks which based on operand types at compile time. RM Pre 8 monomorphism is preserved because each underlying operator is type-monomorphic; the surface `<=` is just a shared spelling, the same way `+` can be spelled by `Integer` addition and `Rational` addition without violating RM Pre 8.
+**Static operator overloading is permitted.** A few comparison operators resolve to distinct underlying operators depending on the operand type family — most notably, `<=` and `>=` are scalar comparison on scalars and **subset** / **superset** on relations (`<` and `>` give strict subset / superset). The same identifier names two operators; the type checker picks which based on operand types at compile time. RM Pre 8 monomorphism is preserved because each underlying operator is type-monomorphic; the surface `<=` is just a shared spelling, the same way `+` can be spelled by `Integer` addition and `Rational` addition without violating RM Pre 8. The registry expresses this directly: a built-in name maps to a *list* of signatures, and the checker resolves a call by the static argument types — `to_text` (see [Built-in operator registry](#built-in-operator-registry)) is the first such overloaded builtin.
 
 ### No nulls
 
@@ -159,19 +159,53 @@ rather than producing a generic parse error.
 
 ## Built-in operator registry
 
-The `Builtins` table maps operator names to their `OperSig`. A call
-whose callee is a `NameRef` looks up its lexeme in this table; an
-unknown name produces `T0001`.
+The `Builtins` table maps operator names to a *list* of `OperSig`s
+(most names have one; overloaded names have several). A call whose
+callee is a `NameRef` looks up its lexeme in this table; an unknown name
+produces `T0001`.
 
 | Name             | Heading                | Returns    |
 |------------------|------------------------|------------|
 | `write_line`     | `{ message: Text }`    | `Tuple {}` |
 | `write_relation` | `{ rel: Relation H }`  | `Tuple {}` |
 | `read_line`      | `{ prompt: Text }`     | `Text`     |
+| `to_text`        | `{ self: T }`          | `Text`     |
 
 `write_relation` is polymorphic over the heading `H` (see
 "`write_relation` polymorphism" below). `read_line` is the first
-`Text`-returning builtin. More operators arrive as the runtime grows.
+`Text`-returning builtin.
+
+`to_text` is the first **overloaded** builtin: one monomorphic signature
+per scalar type `T` — `Text` (an identity copy), `Character`, `Integer`
+(decimal), and `Boolean` (`"true"`/`"false"`); the other scalar types
+follow as the runtime grows. The checker resolves the call by the static
+type of `self`
+(no match → `T0054`); each underlying signature is type-monomorphic, so
+RM Pre 8 holds (the shared spelling is what's polymorphic, not any one
+operator). This is the same overload-by-argument-type machinery that
+later serves UFCS `self`-dispatch and user-defined scalar operators.
+
+### `format` and the `FormatText` firewall
+
+`format { template: FormatText, params: <Tuple> } -> Text` is the string-
+interpolation primitive. It is **not** in the registry: it is a compile-
+time intrinsic (it needs a cross-argument check — every `{name}`
+placeholder in `template` must name an attribute of `params` — and it has
+no runtime symbol). It desugars to a `to_text`/`||` chain in lowering.
+
+`FormatText` is the type of an `f"…"` literal (see
+[grammar.md](grammar.md)). It is **literal-only** (its sole producer is
+the literal), **compile-time-only** (never lowered — it desugars away),
+and **non-storable** (it is unspellable as a type name, so it can never be
+a relvar/tuple attribute). Crucially there is **no `Text → FormatText`
+coercion**: that absence is the firewall keeping a runtime `Text` (e.g.
+`read_line` input) out of a template slot — the trusted-format-string
+pattern. An `f"…"` literal anywhere but `format`'s `template` is `T0055`;
+a non-`f"…"` `template` argument is `T0056`. `params` is heading-
+polymorphic (`ParamKind::AnyTuple`) and optional (absent ⇒ empty
+heading). Placeholder checks: malformed template → `T0057`; a placeholder
+with no matching `params` attribute → `T0058`; a `params` attribute no
+placeholder uses → `T0059` (warning).
 
 
 ## Pass overview
@@ -542,3 +576,9 @@ check script enforces that.
 | T0051 | _(warning)_ `R := R` self-assignment has no effect (elided) |
 | T0052 | `delete` without a `where` clause (a bare `delete R;`) — use `truncate` to clear the whole relvar |
 | T0053 | `update` clause names an attribute not in the relvar's heading (the target must already exist) |
+| T0054 | no matching overload of an operator for the supplied argument types |
+| T0055 | an `f"…"` format string is used outside `format`'s `template` argument |
+| T0056 | `format`'s `template` argument is not an `f"…"` literal |
+| T0057 | malformed placeholder in a format template (unmatched/empty/non-identifier `{…}`) |
+| T0058 | format template references `{x}` but `params` has no attribute `x` |
+| T0059 | _(warning)_ a `params` attribute is never used by the format template |

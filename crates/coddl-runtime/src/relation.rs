@@ -911,6 +911,54 @@ pub extern "C" fn coddl_utf8_len(cp: u32) -> usize {
     char::from_u32(cp).map_or(0, |c| c.len_utf8())
 }
 
+/// Format an `Integer` (`i64` at the current machine representation) as a
+/// decimal `Text`. The byte length crosses back through the trailing
+/// `len_out` pointer — the fat-pointer-return convention of
+/// [`coddl_read_line`](crate::coddl_read_line). The `to_text { self: Integer }`
+/// overload (and `format` placeholders of Integer type) lower to a call here.
+/// Reference-counted like [`coddl_text_concat`]'s result (rc=1).
+///
+/// # Safety
+/// `len_out` must point to a writable `usize`.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_int_to_text(n: i64, len_out: *mut usize) -> *mut u8 {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let out = crate::rc::coddl_rc_alloc(
+        len,
+        len as u32,
+        crate::rc::CoddlKind::Text as u32,
+        std::ptr::null(),
+    );
+    if len > 0 {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, len);
+    }
+    *len_out = len;
+    out
+}
+
+/// Format a `Boolean` as the `Text` `"true"` / `"false"`. `b` is the `i8`
+/// the backends use for `Boolean` (0 = false, non-zero = true). Same len-out
+/// convention as [`coddl_int_to_text`]; rc=1 result.
+///
+/// # Safety
+/// `len_out` must point to a writable `usize`.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_bool_to_text(b: i8, len_out: *mut usize) -> *mut u8 {
+    let bytes: &[u8] = if b != 0 { b"true" } else { b"false" };
+    let len = bytes.len();
+    let out = crate::rc::coddl_rc_alloc(
+        len,
+        len as u32,
+        crate::rc::CoddlKind::Text as u32,
+        std::ptr::null(),
+    );
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, len);
+    *len_out = len;
+    out
+}
+
 /// Byte width of one cell of the given [`CoddlAttrKind`]. Mirrors the
 /// record-layout table in the module header: scalar cells are 8 bytes,
 /// `Text` is a 16-byte `(ptr, len)` pair.
@@ -1534,6 +1582,31 @@ mod tests {
                 );
                 coddl_rc_release(out);
             }
+        }
+    }
+
+    #[test]
+    fn int_to_text_formats_decimal() {
+        for (n, expect) in [(0i64, "0"), (42, "42"), (-7, "-7"), (i64::MIN, "-9223372036854775808")] {
+            unsafe {
+                let mut len = 0usize;
+                let out = coddl_int_to_text(n, &mut len);
+                assert_eq!(std::slice::from_raw_parts(out, len), expect.as_bytes(), "int {n}");
+                coddl_rc_release(out);
+            }
+        }
+    }
+
+    #[test]
+    fn bool_to_text_formats_true_false() {
+        unsafe {
+            let mut len = 0usize;
+            let t = coddl_bool_to_text(1, &mut len);
+            assert_eq!(std::slice::from_raw_parts(t, len), b"true");
+            coddl_rc_release(t);
+            let f = coddl_bool_to_text(0, &mut len);
+            assert_eq!(std::slice::from_raw_parts(f, len), b"false");
+            coddl_rc_release(f);
         }
     }
 

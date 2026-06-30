@@ -910,6 +910,7 @@ impl<'a> Parser<'a> {
                 true
             }
             SyntaxKind::STRING_LIT
+            | SyntaxKind::FORMAT_STRING_LIT
             | SyntaxKind::CHAR_LIT
             | SyntaxKind::INTEGER_LIT
             | SyntaxKind::RATIONAL_LIT
@@ -1811,6 +1812,28 @@ mod tests {
         let lit = stmt.first_child().unwrap();
         assert_eq!(lit.kind(), SyntaxKind::LITERAL);
         assert_eq!(lit.text(), "\"hi\"");
+    }
+
+    #[test]
+    fn format_string_literal_expr_stmt() {
+        let out = parse_str("oper f {} [ f\"hi {x}\"; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let stmt = out
+            .tree
+            .first_child()
+            .unwrap()
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BLOCK)
+            .unwrap()
+            .first_child()
+            .unwrap();
+        let lit = stmt.first_child().unwrap();
+        assert_eq!(lit.kind(), SyntaxKind::LITERAL);
+        assert_eq!(lit.text(), "f\"hi {x}\"");
+        assert_eq!(
+            lit.first_token().unwrap().kind(),
+            SyntaxKind::FORMAT_STRING_LIT
+        );
     }
 
     #[test]

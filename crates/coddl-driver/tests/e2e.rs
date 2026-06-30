@@ -771,6 +771,51 @@ oper main {} [
 }
 
 #[test]
+fn format_interpolates_read_line_into_greeting() {
+    // The `format` intrinsic twin of `read_line_echoes_into_greeting`:
+    // `f"Hello, {name}!"` + `params: { name }` desugars to the same
+    // `to_text`/`||` chain. Exercises FORMAT_STRING_LIT lexing, the
+    // `format` check + desugar, and `to_text` (Text identity) end to end.
+    let src = "\
+program greet_fmt;
+oper main {} [
+    let name = read_line { prompt: \"Name: \" };
+    let message = format { template: f\"Hello, {name}!\", params: { name: name } };
+    write_line { message };
+];
+";
+    run_both_backends_with_stdin(src, "format-greet.cd", b"Vik\n", b"Name: Hello, Vik!\n");
+}
+
+#[test]
+fn format_interpolates_a_character() {
+    // A `Character` placeholder exercises the second `to_text` overload
+    // (CharToText) inside `format`.
+    let src = "\
+program greet_char;
+oper main {} [
+    let message = format { template: f\"grade: {g}\", params: { g: 'A' } };
+    write_line { message };
+];
+";
+    run_both_backends_expect(src, "format-char.cd", b"grade: A\n");
+}
+
+#[test]
+fn format_interpolates_an_integer() {
+    // An `Integer` placeholder exercises the `to_text { self: Integer }`
+    // overload → `coddl_int_to_text` end to end (overloading across types).
+    let src = "\
+program greet_int;
+oper main {} [
+    let message = format { template: f\"count: {n}\", params: { n: 7 } };
+    write_line { message };
+];
+";
+    run_both_backends_expect(src, "format-int.cd", b"count: 7\n");
+}
+
+#[test]
 fn read_line_at_eof_yields_empty_text() {
     // Closed stdin (no bytes) → `read_line` returns the empty Text, so the
     // greeting collapses to just the bracketing literals. Confirms the

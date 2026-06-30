@@ -1,7 +1,7 @@
 program hello_world;
 
 oper main {} [
-    let name = read_line { prompt: "Enter your name: " };
-    let message = "Hello, " || name || "!";
+    let name_in = read_line { prompt: "Enter your name: " };
+    let message = format { template: f"Hello, {name}!", params: { name: name_in } };
     write_line { message };
 ];
