@@ -234,7 +234,12 @@ a non-`f"…"` `template` argument is `T0056`. `params` is heading-
 polymorphic (`ParamKind::AnyTuple`) and optional (absent ⇒ empty
 heading). Placeholder checks: malformed template → `T0057`; a placeholder
 with no matching `params` attribute → `T0058`; a `params` attribute no
-placeholder uses → `T0059` (warning).
+placeholder uses → `T0059` (warning); a placeholder whose attribute type
+has no `to_text` overload (a `Sequence`, `Tuple`, or `Relation`) → `T0054`
+— the same code a direct `to_text { self: … }` over that type raises,
+since each `{x}` desugars to `to_text { self: x }`. Validating it here
+keeps the non-scalar case from reaching the lowerer's `to_text` fold,
+which has no such overload.
 
 
 ## Pass overview

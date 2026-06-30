@@ -2839,6 +2839,22 @@ impl TypeChecker {
         }
     }
 
+    /// True iff some `to_text` overload accepts a `self` argument of type
+    /// `ty`. `format` desugars each `{x}` placeholder to `to_text { self: x }`,
+    /// so a placeholder whose `params` attribute isn't `to_text`-able (a
+    /// `Sequence`, `Tuple`, or `Relation`) must be rejected at check time —
+    /// otherwise it reaches the lowerer's `to_text` fold, which has no such
+    /// overload and would panic.
+    fn to_text_accepts(&self, ty: &Type) -> bool {
+        self.builtins.candidates("to_text").iter().any(|sig| {
+            sig.params
+                .iter()
+                .find(|(p, _)| p.as_ref() == "self")
+                .map(|(_, kind)| param_kind_accepts(kind, ty))
+                .unwrap_or(false)
+        })
+    }
+
     /// Type-check the `format { template: f"…", params: { … } }` intrinsic.
     ///
     /// `template` must be an `f"…"` literal (T0056) — it is *not* routed
@@ -2974,14 +2990,34 @@ impl TypeChecker {
                     if let TemplateChunk::Placeholder { name, range } = chunk {
                         used.insert(name.clone());
                         if let Some(h) = &heading {
-                            if h.lookup(name).is_none() {
-                                self.error(
-                                    sub_span(range.clone()),
-                                    "T0058",
-                                    format!(
-                                        "format template references `{{{name}}}` but `params` has no attribute `{name}`"
-                                    ),
-                                );
+                            match h.lookup(name) {
+                                None => {
+                                    self.error(
+                                        sub_span(range.clone()),
+                                        "T0058",
+                                        format!(
+                                            "format template references `{{{name}}}` but `params` has no attribute `{name}`"
+                                        ),
+                                    );
+                                }
+                                // `{name}` desugars to `to_text { self: <attr> }`;
+                                // a non-`to_text`-able attribute (Sequence / Tuple /
+                                // Relation) fails here exactly as a direct `to_text`
+                                // call would (T0054), instead of panicking in the
+                                // lowerer.
+                                Some(attr_ty) => {
+                                    if !matches!(attr_ty, Type::Unknown)
+                                        && !self.to_text_accepts(attr_ty)
+                                    {
+                                        self.error(
+                                            sub_span(range.clone()),
+                                            "T0054",
+                                            format!(
+                                                "format placeholder `{{{name}}}` has type {attr_ty}, which has no `to_text` overload"
+                                            ),
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -5278,5 +5314,36 @@ mod tests {
                    oper main {} [ let t = to_text { self: R }; write_line { t }; ];";
         let c = codes(src);
         assert!(c.contains(&"T0054"), "{:?}", c);
+    }
+
+    #[test]
+    fn format_placeholder_non_to_text_tuple_is_t0054() {
+        // `{t}` desugars to `to_text { self: t }`; a Tuple has no overload,
+        // so this is rejected at check time rather than panicking in lowering.
+        let src = "program p; oper main {} [ let t = { a: 1 }; \
+                   let m = format { template: f\"{t}\", params: { t } }; \
+                   write_line { m }; ];";
+        assert!(codes(src).contains(&"T0054"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn format_placeholder_sequence_is_t0054() {
+        // A `Sequence` param interpolated into a template has no `to_text`
+        // overload — caught at typecheck, so lowering (and T0064) never runs.
+        let src = "program p; oper main {} [ let s = Sequence [ 1, 2 ]; \
+                   let m = format { template: f\"{s}\", params: { s } }; \
+                   write_line { m }; ];";
+        assert!(codes(src).contains(&"T0054"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn format_placeholder_scalar_types_have_no_t0054() {
+        // Text / Integer / Boolean placeholders all have a `to_text` overload;
+        // the happy path must not regress.
+        let src = "program p; oper main {} [ \
+                   let m = format { template: f\"{a}{b}{c}\", \
+                   params: { a: \"x\", b: 1, c: true } }; \
+                   write_line { m }; ];";
+        assert!(!codes(src).contains(&"T0054"), "{:?}", codes(src));
     }
 }
