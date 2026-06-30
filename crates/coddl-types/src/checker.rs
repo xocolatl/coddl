@@ -571,15 +571,8 @@ impl TypeChecker {
         let Some(name_tok) = decl.name() else { return };
         let name = name_tok.text().to_string();
 
-        if self.builtins.is_known(&name) || self.user_opers.contains_key(&name) {
-            self.error(
-                self.token_span(&name_tok),
-                "T0060",
-                format!("operator `{name}` is already defined"),
-            );
-            return;
-        }
-
+        // Build the heading first: operators are identified by name *and*
+        // heading, so the collision check below needs the parameter shape.
         let mut params: Vec<(Cow<'static, str>, ParamKind)> = Vec::new();
         if let Some(heading) = decl.heading() {
             for param in heading.params() {
@@ -595,6 +588,47 @@ impl TypeChecker {
             }
         }
 
+        // `format` is a compile-time intrinsic, not an overloadable operator
+        // (no runtime symbol, cross-argument check) — it cannot be redefined.
+        if name == "format" {
+            self.error(
+                self.token_span(&name_tok),
+                "T0060",
+                format!("`{name}` is a built-in intrinsic and cannot be overloaded"),
+            );
+            return;
+        }
+
+        // A user `oper` may *extend* a built-in name with a distinct heading
+        // (e.g. `to_text { self: Sequence Text }` alongside the built-in
+        // `to_text { self: Text }`). Reject only a true duplicate: a heading
+        // that exactly matches an existing built-in overload of this name, or
+        // a second user overload of this name (only one user overload per name
+        // is supported until linkage-name mangling lands).
+        if self
+            .builtins
+            .candidates(&name)
+            .iter()
+            .any(|sig| Self::same_heading(&sig.params, &params))
+        {
+            self.error(
+                self.token_span(&name_tok),
+                "T0060",
+                format!("operator `{name}` with this heading is already defined by a built-in"),
+            );
+            return;
+        }
+        if self.user_opers.contains_key(&name) {
+            self.error(
+                self.token_span(&name_tok),
+                "T0060",
+                format!(
+                    "operator `{name}` already has a user-defined overload (only one user overload per operator name is supported for now)"
+                ),
+            );
+            return;
+        }
+
         let return_type = match decl.return_type() {
             Some(tr) => Self::type_ref_quiet(&tr),
             None => Type::unit(),
@@ -608,6 +642,20 @@ impl TypeChecker {
                 purity: Purity::SideEffecting,
             },
         );
+    }
+
+    /// Exact heading equality — same set of `(param name, ParamKind)` pairs,
+    /// order-independent (headings are unordered). Used to decide whether a
+    /// user `oper` is a true redefinition of an existing overload (vs. a
+    /// distinct-heading extension). Param names are unique within a heading,
+    /// so a same-length all-match comparison is exact.
+    fn same_heading(
+        a: &[(Cow<'static, str>, ParamKind)],
+        b: &[(Cow<'static, str>, ParamKind)],
+    ) -> bool {
+        a.len() == b.len()
+            && a.iter()
+                .all(|(an, ak)| b.iter().any(|(bn, bk)| an == bn && ak == bk))
     }
 
     fn check_oper_decl(&mut self, decl: &OperDecl) {
@@ -2655,14 +2703,15 @@ impl TypeChecker {
             return self.check_format_call(call, scope);
         }
 
-        // User-defined operators resolve through the same monomorphic path as
-        // a single-signature builtin. Names are unique across builtins ∪ user
-        // ops (T0060 at registration), so a hit here is unambiguous.
-        if let Some(sig) = self.user_opers.get(&callee_name).cloned() {
-            return self.check_monomorphic_call(call, &callee_name, &callee_name_tok, sig, scope);
+        // Operators are identified by name + heading: a user `oper` may extend
+        // a built-in name with a distinct heading, so resolve across the merged
+        // candidate set — every built-in overload of this name plus the (at most
+        // one) user overload. A single candidate takes the monomorphic path; two
+        // or more go through overload resolution.
+        let mut candidates = self.builtins.candidates(&callee_name).to_vec();
+        if let Some(user_sig) = self.user_opers.get(&callee_name).cloned() {
+            candidates.push(user_sig);
         }
-
-        let candidates = self.builtins.candidates(&callee_name).to_vec();
         match candidates.len() {
             0 => {
                 self.error(
@@ -2846,13 +2895,20 @@ impl TypeChecker {
     /// otherwise it reaches the lowerer's `to_text` fold, which has no such
     /// overload and would panic.
     fn to_text_accepts(&self, ty: &Type) -> bool {
-        self.builtins.candidates("to_text").iter().any(|sig| {
-            sig.params
-                .iter()
-                .find(|(p, _)| p.as_ref() == "self")
-                .map(|(_, kind)| param_kind_accepts(kind, ty))
-                .unwrap_or(false)
-        })
+        // Built-in `to_text` overloads plus the (at most one) user-defined one —
+        // interpolation dispatches across the merged set, so a user
+        // `to_text { self: T }` makes `{x : T}` renderable.
+        self.builtins
+            .candidates("to_text")
+            .iter()
+            .chain(self.user_opers.get("to_text"))
+            .any(|sig| {
+                sig.params
+                    .iter()
+                    .find(|(p, _)| p.as_ref() == "self")
+                    .map(|(_, kind)| param_kind_accepts(kind, ty))
+                    .unwrap_or(false)
+            })
     }
 
     /// Type-check the `format { template: f"…", params: { … } }` intrinsic.
@@ -3281,12 +3337,46 @@ mod tests {
     }
 
     #[test]
-    fn user_oper_shadowing_builtin_diagnoses_t0060() {
-        // A user `oper` may not redefine a built-in name — every callee must
-        // resolve to exactly one definition.
+    fn user_oper_redefining_builtin_heading_diagnoses_t0060() {
+        // Operators are identified by name + heading: a user `oper` whose
+        // heading exactly matches a built-in overload is a redefinition (T0060).
         let src = "program p; \
-                   oper read_line {} -> Text [ \"a\" ]; \
+                   oper write_line { message: Text } [ {} ]; \
                    oper main {} [ write_line { message: \"x\" }; ];";
+        assert!(codes(src).contains(&"T0060"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn user_oper_extending_builtin_with_distinct_heading_is_allowed() {
+        // A distinct heading is a *new* overload, not a redefinition — so a user
+        // `to_text { self: Sequence Text }` registers alongside the built-in
+        // `to_text` overloads and a call resolves to it (no T0060, no T0054).
+        let src = "program p; \
+                   oper to_text { self: Sequence Text } -> Text [ \"x\" ]; \
+                   oper main {} [ let names = Sequence [ \"a\" ]; \
+                   let _t = to_text { self: names }; ];";
+        let c = codes(src);
+        assert!(!c.contains(&"T0060"), "unexpected T0060: {c:?}");
+        assert!(!c.contains(&"T0054"), "unexpected T0054: {c:?}");
+        assert!(!c.contains(&"T0001"), "unexpected T0001: {c:?}");
+    }
+
+    #[test]
+    fn second_user_overload_of_a_name_diagnoses_t0060() {
+        // Only one user overload per name is supported for now (pending linkage
+        // mangling), even with distinct headings.
+        let src = "program p; \
+                   oper to_text { self: Sequence Text } -> Text [ \"x\" ]; \
+                   oper to_text { self: Sequence Integer } -> Text [ \"y\" ]; \
+                   oper main {} [];";
+        assert!(codes(src).contains(&"T0060"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn user_oper_cannot_redefine_format_intrinsic_t0060() {
+        let src = "program p; \
+                   oper format { x: Text } -> Text [ \"x\" ]; \
+                   oper main {} [];";
         assert!(codes(src).contains(&"T0060"), "{:?}", codes(src));
     }
 

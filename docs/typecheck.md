@@ -616,7 +616,7 @@ check script enforces that.
 | T0057 | malformed placeholder in a format template (unmatched/empty/non-identifier `{…}`) |
 | T0058 | format template references `{x}` but `params` has no attribute `x` |
 | T0059 | _(warning)_ a `params` attribute is never used by the format template |
-| T0060 | operator name is already defined (a second user `oper`, or a clash with a built-in) |
+| T0060 | operator with this name + heading is already defined (a heading that exactly matches a built-in overload, a second user overload of the same name — only one is supported for now, pending linkage mangling — or redefining the `format` intrinsic). A user `oper` *may* extend a built-in name with a distinct heading. |
 | T0061 | empty `Sequence []` has no element to infer from and no `let` type annotation to fall back on |
 | T0062 | a `Sequence [ … ]` element's type differs from the first element's (sequences are homogeneous) |
 | T0063 | a sequence literal appears outside a `let` binding value (the only position it is permitted) |

@@ -18,7 +18,7 @@ use crate::ty::{Heading, Type};
 /// any `Type::Relation(_)` matches regardless of heading. The
 /// typechecker reports T0004 ("argument type mismatch") whenever the
 /// supplied value doesn't fit the declared kind.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParamKind {
     /// Concrete type. Standard structural assignability check.
     Concrete(Type),
