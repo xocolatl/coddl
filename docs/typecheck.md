@@ -185,6 +185,32 @@ RM Pre 8 holds (the shared spelling is what's polymorphic, not any one
 operator). This is the same overload-by-argument-type machinery that
 later serves UFCS `self`-dispatch and user-defined scalar operators.
 
+### User-defined operators
+
+A top-level `oper` declaration is callable like any built-in. Before any
+operator body is walked, a pre-pass collects every user `oper`'s signature
+(`name`, parameter headings, return type) into a table that is the operator
+analogue of the relvar table — so a call resolves regardless of declaration
+order (forward references are fine). A call's callee name is resolved in
+this order: the `format` intrinsic, then user operators, then the built-in
+registry, then `T0001`. To keep every name resolving to exactly **one**
+definition, registration rejects a user `oper` whose name already names a
+built-in (or `format`) or an earlier user `oper` with `T0060`, keeping the
+first.
+
+A user operator is checked through the same monomorphic path as a
+single-signature built-in (`check_monomorphic_call`): the same signature
+type (`OperSig`) carries both, with parameter names widened to `Cow` so the
+built-in literals stay borrowed while user params own their strings. Every
+user parameter is a `ParamKind::Concrete` type; missing/extra/mistyped
+arguments still produce `T0003`/`T0004`. User operators default to
+`SideEffecting` purity — the sound default for the transaction gate
+(`T0026`) until body-derived purity lands (a pure helper is then
+conservatively barred from a `transaction [...]`, never the reverse).
+User-operator *overloading*, and binding parameters inside the body, are
+later work; v1 calls nullary user operators (e.g. an `ask {} -> Text`
+wrapper) and operators whose bodies ignore their parameters.
+
 ### `format` and the `FormatText` firewall
 
 `format { template: FormatText, params: <Tuple> } -> Text` is the string-
@@ -582,3 +608,4 @@ check script enforces that.
 | T0057 | malformed placeholder in a format template (unmatched/empty/non-identifier `{…}`) |
 | T0058 | format template references `{x}` but `params` has no attribute `x` |
 | T0059 | _(warning)_ a `params` attribute is never used by the format template |
+| T0060 | operator name is already defined (a second user `oper`, or a clash with a built-in) |

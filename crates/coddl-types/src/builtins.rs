@@ -5,6 +5,7 @@
 //! `NameRef`. The current set is the I/O builtins — `write_line`,
 //! `write_relation`, and `read_line`; more arrive as the runtime grows.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::ty::{Heading, Type};
@@ -41,13 +42,16 @@ pub enum Purity {
     SideEffecting,
 }
 
-/// One built-in operator's declared signature.
+/// One operator's declared signature.
 ///
 /// `params` is the operator's heading, in source order; the typechecker
-/// matches arguments by name, not position.
+/// matches arguments by name, not position. Param names are `Cow` so the
+/// same signature type serves both built-ins (borrowed `&'static str`
+/// literals, no allocation) and user-defined operators collected from the
+/// AST (owned `String`s). User ops only ever use `ParamKind::Concrete`.
 #[derive(Clone, Debug)]
 pub struct OperSig {
-    pub params: Vec<(&'static str, ParamKind)>,
+    pub params: Vec<(Cow<'static, str>, ParamKind)>,
     pub return_type: Type,
     pub purity: Purity,
 }
@@ -73,7 +77,7 @@ impl Builtins {
         b.register(
             "write_line",
             OperSig {
-                params: vec![("message", ParamKind::Concrete(Type::Text))],
+                params: vec![("message".into(), ParamKind::Concrete(Type::Text))],
                 return_type: Type::unit(),
                 purity: Purity::SideEffecting,
             },
@@ -83,7 +87,7 @@ impl Builtins {
         b.register(
             "write_relation",
             OperSig {
-                params: vec![("rel", ParamKind::AnyRelation)],
+                params: vec![("rel".into(), ParamKind::AnyRelation)],
                 return_type: Type::unit(),
                 purity: Purity::SideEffecting,
             },
@@ -94,7 +98,7 @@ impl Builtins {
         b.register(
             "read_line",
             OperSig {
-                params: vec![("prompt", ParamKind::Concrete(Type::Text))],
+                params: vec![("prompt".into(), ParamKind::Concrete(Type::Text))],
                 return_type: Type::Text,
                 purity: Purity::SideEffecting,
             },
@@ -109,7 +113,7 @@ impl Builtins {
             b.register(
                 "to_text",
                 OperSig {
-                    params: vec![("self", ParamKind::Concrete(self_ty))],
+                    params: vec![("self".into(), ParamKind::Concrete(self_ty))],
                     return_type: Type::Text,
                     purity: Purity::Pure,
                 },
@@ -138,6 +142,15 @@ impl Builtins {
             _ => None,
         }
     }
+
+    /// Whether `name` is a built-in operator. Used by the typechecker to
+    /// reject a user-defined `oper` that would shadow a built-in (every
+    /// callee name must resolve to exactly one definition). `format` is an
+    /// intrinsic handled outside the registry, so it is reported as known
+    /// too — a user op may not redefine it either.
+    pub fn is_known(&self, name: &str) -> bool {
+        name == "format" || self.opers.contains_key(name)
+    }
 }
 
 impl Default for Builtins {
@@ -162,7 +175,7 @@ mod tests {
         let b = Builtins::new();
         let sig = b.oper("write_line").expect("write_line should exist");
         assert_eq!(sig.params.len(), 1);
-        assert_eq!(sig.params[0].0, "message");
+        assert_eq!(sig.params[0].0.as_ref(), "message");
         assert!(matches!(sig.params[0].1, ParamKind::Concrete(Type::Text)));
         assert!(matches!(sig.return_type, Type::Tuple(ref h) if h.is_empty()));
         assert_eq!(sig.purity, Purity::SideEffecting);
@@ -173,7 +186,7 @@ mod tests {
         let b = Builtins::new();
         let sig = b.oper("write_relation").expect("write_relation should exist");
         assert_eq!(sig.params.len(), 1);
-        assert_eq!(sig.params[0].0, "rel");
+        assert_eq!(sig.params[0].0.as_ref(), "rel");
         assert!(matches!(sig.params[0].1, ParamKind::AnyRelation));
         assert!(matches!(sig.return_type, Type::Tuple(ref h) if h.is_empty()));
         assert_eq!(sig.purity, Purity::SideEffecting);
@@ -184,7 +197,7 @@ mod tests {
         let b = Builtins::new();
         let sig = b.oper("read_line").expect("read_line should exist");
         assert_eq!(sig.params.len(), 1);
-        assert_eq!(sig.params[0].0, "prompt");
+        assert_eq!(sig.params[0].0.as_ref(), "prompt");
         assert!(matches!(sig.params[0].1, ParamKind::Concrete(Type::Text)));
         assert!(matches!(sig.return_type, Type::Text));
         assert_eq!(sig.purity, Purity::SideEffecting);
@@ -211,7 +224,7 @@ mod tests {
         // Every overload takes one `self` param and returns Text.
         for sig in sigs {
             assert_eq!(sig.params.len(), 1);
-            assert_eq!(sig.params[0].0, "self");
+            assert_eq!(sig.params[0].0.as_ref(), "self");
             assert!(matches!(sig.return_type, Type::Text));
             assert_eq!(sig.purity, Purity::Pure);
         }

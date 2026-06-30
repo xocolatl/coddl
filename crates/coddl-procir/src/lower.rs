@@ -67,6 +67,17 @@ struct BuiltinExtern {
     return_type: ProcType,
 }
 
+/// A user-defined operator's lowered signature, collected in a pre-pass over
+/// the program's `oper` declarations so a call site (`lower_call`) can resolve
+/// a non-builtin callee regardless of declaration order. Unlike a
+/// `BuiltinExtern`, a user op lowers to an in-module `Function` whose linkage
+/// name is its surface name, so there's no separate `linkage` field and no
+/// `ensure_extern` — the backend finds it among `Module::functions`.
+struct UserOpSig {
+    params: Vec<(String, ProcType)>,
+    return_type: ProcType,
+}
+
 // Internal `to_text` conversions — not user-callable surfaces (so absent from
 // `BUILTIN_EXTERNS`), but declared like any Text-returning extern: the length
 // crosses back through the synthesized `len_out` (the `returns_fat_pointer`
@@ -311,6 +322,11 @@ struct Lowerer {
     /// a `transaction [...]` the extract sat inside), with no leak (it *is*
     /// released, just last). Drained in `lower_oper_decl`.
     deferred_relation_releases: Vec<ValueId>,
+    /// Signatures of every user-defined `oper`, collected in a pre-pass over
+    /// `lower_root` before any body is lowered, so a call to an operator
+    /// defined later in the file still resolves. `lower_call` consults this
+    /// after the builtin special-cases; a hit emits an in-module `Inst::Call`.
+    user_opers: HashMap<String, UserOpSig>,
 }
 
 impl Lowerer {
@@ -350,6 +366,7 @@ impl Lowerer {
             owned_texts: HashSet::new(),
             tuple_cell_text_temps: HashMap::new(),
             deferred_relation_releases: Vec::new(),
+            user_opers: HashMap::new(),
         }
     }
 
@@ -613,6 +630,22 @@ impl Lowerer {
     // ── Walks ────────────────────────────────────────────────────────
 
     fn lower_root(&mut self, root: &Root) -> Module {
+        // Pre-pass: record every user-defined operator's signature so a call
+        // to an operator declared later in the file resolves during body
+        // lowering. The typechecker already proved the names unique across
+        // builtins ∪ user ops, so a plain insert can't clobber a builtin.
+        for item in root.items() {
+            if let Item::OperDecl(o) = item {
+                let (name, params, return_type) = Self::oper_signature(&o);
+                self.user_opers.insert(
+                    name,
+                    UserOpSig {
+                        params,
+                        return_type,
+                    },
+                );
+            }
+        }
         for item in root.items() {
             match item {
                 Item::ProgramDecl(p) => self.lower_program_decl(&p),
@@ -746,18 +779,18 @@ impl Lowerer {
         }
     }
 
-    fn lower_oper_decl(&mut self, decl: &OperDecl) -> Function {
-        self.reset_function_state();
-
+    /// Extract a user `oper`'s lowered signature — `(name, params, return
+    /// type)` — from its declaration. Shared by the `lower_root` pre-pass
+    /// (which records it in `user_opers` for call resolution) and
+    /// `lower_oper_decl` (which builds the `Function`), so the call-site view
+    /// of an operator never drifts from the emitted function. An absent param
+    /// type or return clause maps to `Unit`, mirroring the typechecker's
+    /// defaults for a clean program (the only input lowering sees).
+    fn oper_signature(decl: &OperDecl) -> (String, Vec<(String, ProcType)>, ProcType) {
         let name = decl
             .name()
             .map(|t| t.text().to_string())
             .unwrap_or_default();
-        // Defined functions: surface name is the linkage name for now.
-        // Adding name mangling — for overloading or module-scoped
-        // symbols — slots in here once it arrives.
-        let linkage_name = name.clone();
-
         let mut params: Vec<(String, ProcType)> = Vec::new();
         if let Some(heading) = decl.heading() {
             for param in heading.params() {
@@ -773,18 +806,26 @@ impl Lowerer {
                 params.push((pname, pty));
             }
         }
-
-        let is_main = name == "main";
-
-        // Resolve the declared return type. Default = Unit. Main is
-        // treated as Unit at the IR level (the backends special-case
-        // `ret i32 0`); the typechecker rejects a declared non-Unit
-        // return on `main` with T0011, so this assignment is safe.
-        let declared_return = decl
+        let return_type = decl
             .return_type()
             .and_then(|tr| tr.name())
             .map(|t| proc_type_from_builtin_name(t.text()))
             .unwrap_or(ProcType::Unit);
+        (name, params, return_type)
+    }
+
+    fn lower_oper_decl(&mut self, decl: &OperDecl) -> Function {
+        self.reset_function_state();
+
+        // Surface name doubles as the linkage name for now. Adding name
+        // mangling — for overloading or module-scoped symbols — slots into
+        // `oper_signature` once it arrives. The declared return type defaults
+        // to Unit; main is treated as Unit at the IR level (the backends
+        // special-case `ret i32 0`), and the typechecker rejects a declared
+        // non-Unit return on `main` with T0011, so that is safe.
+        let (name, params, declared_return) = Self::oper_signature(decl);
+        let linkage_name = name.clone();
+        let is_main = name == "main";
 
         let block_id = self.fresh_block();
 
@@ -3453,6 +3494,12 @@ impl Lowerer {
         if surface == "to_text" {
             return self.lower_to_text_call(call);
         }
+        // A non-builtin callee is a user-defined operator — an in-module
+        // function. (Names are unique across builtins ∪ user ops, so this
+        // never shadows a builtin.)
+        if self.user_opers.contains_key(&surface) {
+            return self.lower_user_call(&surface, call);
+        }
 
         let ext = self
             .lookup_extern(&surface)
@@ -3514,6 +3561,68 @@ impl Lowerer {
         // fresh id so the surrounding expression machinery has a place
         // to plug in once it grows real consumers. Today nothing reads
         // it.
+        dst.unwrap_or_else(|| {
+            let v = self.fresh_value();
+            self.record_type(v, ProcType::Unit);
+            v
+        })
+    }
+
+    /// Lower a call to a user-defined operator to an in-module `Inst::Call`
+    /// whose callee is the operator's surface name (its linkage name).
+    /// Arguments are lowered by matching each declared parameter name, the
+    /// same name-driven order the builtin path uses; the typechecker has
+    /// guaranteed each declared parameter is supplied exactly once. A Text
+    /// result is marked owned so the caller's binding releases it at scope
+    /// exit — the callee returned it live (its tail-expression temporary is
+    /// not a scope-bound local, so `lower_oper_decl`'s epilogue doesn't free
+    /// it). User ops are in-module functions, so there is no `ensure_extern`.
+    ///
+    /// Note: a user operator's *parameters* are not yet bound as body locals,
+    /// and the caller/callee ownership convention for a `Text` *argument* is
+    /// unsettled, so owned-Text temps passed as arguments are not released
+    /// here. Only nullary user ops are exercised today; arg ownership lands
+    /// with parameter binding.
+    fn lower_user_call(&mut self, surface: &str, call: &CallExpr) -> ValueId {
+        let (params, return_type) = {
+            let sig = self
+                .user_opers
+                .get(surface)
+                .expect("lower_user_call invoked only for a known user op");
+            (sig.params.clone(), sig.return_type.clone())
+        };
+
+        let arg_list = call.args().expect("typechecked call has an arg list");
+        let supplied: Vec<NamedArg> = arg_list.args().collect();
+        let mut arg_values: Vec<ValueId> = Vec::with_capacity(params.len());
+        for (pname, _) in &params {
+            let arg = supplied
+                .iter()
+                .find(|a| a.name().map(|t| t.text().to_string()).as_deref() == Some(pname.as_str()))
+                .unwrap_or_else(|| unreachable!("missing arg `{pname}` survived typecheck"));
+            let value_expr = arg.value().expect("typechecked named arg has a value");
+            arg_values.push(self.lower_expr(&value_expr));
+        }
+
+        let returns_text = matches!(return_type, ProcType::Text);
+        let dst = if matches!(return_type, ProcType::Unit) {
+            None
+        } else {
+            let v = self.fresh_value();
+            self.record_type(v, return_type.clone());
+            Some(v)
+        };
+        self.insts.push(Inst::Call {
+            dst,
+            callee: surface.to_string(),
+            args: arg_values,
+            return_type,
+        });
+        if returns_text {
+            if let Some(v) = dst {
+                self.mark_text_owned(v);
+            }
+        }
         dst.unwrap_or_else(|| {
             let v = self.fresh_value();
             self.record_type(v, ProcType::Unit);
@@ -4116,6 +4225,51 @@ mod tests {
             assert!(names.contains(&needed), "expected {needed} in {names:?}");
         }
         assert_eq!(m.functions.len(), 4);
+    }
+
+    #[test]
+    fn user_oper_call_lowers_to_in_module_call_and_owns_text() {
+        let src = "program p;\n\
+                   oper greet {} -> Text [ \"hi\" ];\n\
+                   oper main {} [ let g = greet {}; write_line { message: g }; ];";
+        let m = lower_ok(src);
+
+        // `greet` is emitted as an in-module function that returns its body
+        // value (a Text), not an extern.
+        let greet = m
+            .functions
+            .iter()
+            .find(|f| f.name == "greet")
+            .expect("greet function emitted");
+        assert!(matches!(greet.return_type, ProcType::Text));
+        assert!(greet.blocks.iter().any(
+            |b| matches!(b.terminator, Terminator::Return(Some(_)))
+        ));
+
+        // `main` calls `greet` by its surface linkage name (no extern symbol),
+        // binds a Text dst, and releases the owned result at scope exit.
+        let main = m
+            .functions
+            .iter()
+            .find(|f| f.name == "main")
+            .expect("main emitted");
+        let insts = &main.blocks[0].insts;
+        let call = insts.iter().find_map(|i| match i {
+            Inst::Call {
+                callee,
+                dst,
+                return_type,
+                ..
+            } if callee == "greet" => Some((dst.is_some(), return_type.clone())),
+            _ => None,
+        });
+        let (binds_dst, ret_ty) = call.expect("main emits a call to greet");
+        assert!(binds_dst, "the greet call binds a dst value");
+        assert!(matches!(ret_ty, ProcType::Text));
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::Release { .. })),
+            "main releases the owned Text returned by greet"
+        );
     }
 
     // ── SQL pushdown ──────────────────────────────────────────────────

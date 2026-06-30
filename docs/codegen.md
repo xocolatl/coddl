@@ -176,6 +176,17 @@ convention**, applied uniformly in both backends keyed on
   `i64` len slot, appends its address as the last argument, takes the
   call's returned payload `ptr`, loads the length back from the slot,
   and binds the ProcIR `dst` to `ValueRepr::Text { ptr, len }`.
+- The **return site** of a *defined* `Text`/`Binary`-returning function
+  (a user `oper` like `ask {} -> Text`) is the mirror image: the entry
+  block carries the same trailing len-out param (the LLVM `define` adds a
+  named `ptr %.ret_len_out`; Cranelift reads it as the block param just
+  past the declared params), and the `Terminator::Return(Some(v))` arm,
+  for a `ValueRepr::Text { ptr, len }`, **stores `len` through that
+  len-out pointer and returns `ptr`**. So the callee allocates the
+  payload and hands ownership out live; the caller's call-site rebuild
+  above reconstitutes the `(ptr, len)` pair. (The lowerer already declined
+  to release a returned tail-expression temporary, so the value crosses
+  the boundary alive.)
 
 This is the same idiom the relvar materializer already uses for
 `coddl_resolve_op_field`. ProcIR stays oblivious — it records the clean

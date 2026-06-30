@@ -1087,6 +1087,12 @@ fn emit_function(
     // 1:1 to the declared params in source order. For Text params,
     // each contributes two consecutive ABI slots (ptr, len) which
     // combine into one `ValueRepr::Text`.
+    //
+    // A `Text`/`Binary`-returning function carries one extra trailing param —
+    // the caller-supplied len-out pointer (see `cranelift_signature`). It sits
+    // just past the declared params; capture it so the return terminator can
+    // write the length there and return the payload pointer.
+    let mut ret_len_out: Option<CrValue> = None;
     if let Some(entry_proc_block) = func.blocks.first() {
         let entry_cl = block_map[&entry_proc_block.id];
         builder.append_block_params_for_function_params(entry_cl);
@@ -1112,6 +1118,9 @@ fn emit_function(
                 }
             }
         }
+        if returns_fat_pointer(&func.return_type) {
+            ret_len_out = Some(bps[idx]);
+        }
     }
     for procir_block in &func.blocks {
         let cl_block = block_map[&procir_block.id];
@@ -1130,6 +1139,7 @@ fn emit_function(
             &mut values,
             next_data,
             is_main,
+            ret_len_out,
         )?;
         builder.seal_block(cl_block);
     }
@@ -1157,6 +1167,7 @@ fn emit_block(
     values: &mut HashMap<ValueId, ValueRepr>,
     next_data: &mut u32,
     is_main: bool,
+    ret_len_out: Option<CrValue>,
 ) -> Result<(), CraneliftEmitError> {
     for inst in &block.insts {
         emit_inst(
@@ -1174,7 +1185,7 @@ fn emit_block(
             next_data,
         )?;
     }
-    emit_terminator(builder, &block.terminator, values, is_main)?;
+    emit_terminator(builder, &block.terminator, values, is_main, ret_len_out)?;
     Ok(())
 }
 
@@ -2354,6 +2365,7 @@ fn emit_terminator(
     term: &Terminator,
     values: &HashMap<ValueId, ValueRepr>,
     is_main: bool,
+    ret_len_out: Option<CrValue>,
 ) -> Result<(), CraneliftEmitError> {
     match term {
         Terminator::Return(None) if is_main => {
@@ -2370,9 +2382,23 @@ fn emit_terminator(
             Some(ValueRepr::Tuple { fields }) if fields.is_empty() => {
                 builder.ins().return_(&[]);
             }
-            Some(ValueRepr::Text { .. })
-            | Some(ValueRepr::Tuple { .. })
-            | None => {
+            // A `Text`/`Binary` return crosses the C ABI as `(ptr, len_out)`:
+            // write the length into the caller-supplied out-pointer, return
+            // the payload pointer. Symmetric with the call-site rebuild in
+            // the `Inst::Call` arm. The owned/borrowed status travels with the
+            // value — the lowerer already declined to release a returned temp.
+            Some(ValueRepr::Text { ptr, len }) => {
+                let len_out = ret_len_out.ok_or_else(|| {
+                    CraneliftEmitError::UnsupportedInst(
+                        "Text return without a len-out parameter in the signature".into(),
+                    )
+                })?;
+                builder
+                    .ins()
+                    .store(MemFlags::trusted(), *len, len_out, 0);
+                builder.ins().return_(&[*ptr]);
+            }
+            Some(ValueRepr::Tuple { .. }) | None => {
                 return Err(CraneliftEmitError::UnsupportedInst(format!(
                     "returning {v:?} unsupported"
                 )));
@@ -2421,6 +2447,27 @@ mod tests {
         assert!(
             names.iter().any(|n| n == "main" || n == "_main"),
             "no main symbol in {names:?}"
+        );
+    }
+
+    #[test]
+    fn text_returning_user_oper_emits_and_defines_greet_symbol() {
+        use object::{Object, ObjectSymbol};
+        // A user `oper` returning Text exercises the fat-pointer return ABI
+        // (store length through the trailing len-out param, return the payload
+        // pointer). Before that landed this `emit` returned `UnsupportedInst`.
+        let src = "program p;\n\
+                   oper greet {} -> Text [ \"hi\" ];\n\
+                   oper main {} [ let g = greet {}; write_line { message: g }; ];";
+        let bytes = emit_ok(src);
+        let obj = object::File::parse(&*bytes).expect("parse object");
+        let names: Vec<String> = obj
+            .symbols()
+            .filter_map(|s| s.name().ok().map(|n| n.to_string()))
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "greet" || n == "_greet"),
+            "no greet symbol in {names:?}"
         );
     }
 

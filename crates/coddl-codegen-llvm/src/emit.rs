@@ -579,6 +579,14 @@ impl Emitter {
         for (pname, pty) in &func.params {
             push_param_decl(&mut params, pname, pty);
         }
+        // A `Text`/`Binary`-returning function takes one extra trailing param —
+        // the caller-supplied len-out pointer (see the call site and
+        // `emit_extern`). The `.`-prefixed name can't collide with a
+        // `push_param_decl` name (those always start with the user param's
+        // identifier); the return terminator stores the length there.
+        if returns_fat_pointer(&func.return_type) {
+            params.push("ptr %.ret_len_out".to_string());
+        }
         self.values.clear();
 
         // Seed `self.values` with the function's parameters. The
@@ -2180,10 +2188,15 @@ impl Emitter {
                             writeln!(self.body, "    ret {ty} {op}").unwrap();
                         }
                     }
-                    ValueRepr::Text { .. } => {
-                        return Err(LlvmEmitError::UnsupportedInst(
-                            "returning Text by value not yet supported".into(),
-                        ));
+                    ValueRepr::Text { ptr_op, len_op } => {
+                        // A `Text`/`Binary` return crosses the C ABI as
+                        // `(ptr, len_out)`: store the length through the
+                        // caller-supplied out-pointer, return the payload
+                        // pointer. Symmetric with the call-site rebuild and the
+                        // `read_line` extern ABI. The signature declared the
+                        // `%.ret_len_out` param (see `emit_function`).
+                        writeln!(self.body, "    store i64 {len_op}, ptr %.ret_len_out").unwrap();
+                        writeln!(self.body, "    ret ptr {ptr_op}").unwrap();
                     }
                     ValueRepr::Tuple { .. } => {
                         return Err(LlvmEmitError::UnsupportedInst(
@@ -2394,6 +2407,29 @@ mod tests {
         assert!(
             ir.contains("load i64, ptr %v"),
             "length load missing:\n{ir}"
+        );
+    }
+
+    #[test]
+    fn text_returning_user_oper_uses_len_out_param() {
+        // A user `oper` returning Text defines a function with the trailing
+        // len-out pointer; its return stores the length there and returns the
+        // payload pointer. `main` then calls it like any in-module function.
+        let src = "program p;\n\
+                   oper greet {} -> Text [ \"hi\" ];\n\
+                   oper main {} [ let g = greet {}; write_line { message: g }; ];";
+        let ir = emit_ok(src);
+        assert!(
+            ir.contains("define ptr @greet(ptr %.ret_len_out)"),
+            "greet signature missing the len-out param:\n{ir}"
+        );
+        assert!(
+            ir.contains("store i64") && ir.contains("ptr %.ret_len_out"),
+            "greet return does not store the length through the len-out param:\n{ir}"
+        );
+        assert!(
+            ir.contains("call ptr @greet("),
+            "main does not call greet as an in-module function:\n{ir}"
         );
     }
 

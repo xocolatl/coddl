@@ -7,6 +7,7 @@
 //! → `check_oper_decl`, etc.); `docs/typecheck.md` is the spec they
 //! enforce.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use coddl_diagnostics::{Diagnostic, FileId, Span};
@@ -22,7 +23,7 @@ use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDe
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
 use coddl_syntax::{parse, parse_format_template, FileKind, SyntaxKind, TemplateChunk};
 
-use crate::builtins::Builtins;
+use crate::builtins::{Builtins, OperSig, ParamKind, Purity};
 use crate::relvars::{RelvarInfo, RelvarKind, RelvarTable};
 use crate::ty::{Heading, Type};
 
@@ -174,6 +175,7 @@ pub fn check(source: &str, file: FileId, file_kind: FileKind) -> CheckOutput {
         relvars: RelvarTable::new(),
         transaction_depth: 0,
         public_relvars: HashSet::new(),
+        user_opers: HashMap::new(),
     };
     match file_kind {
         FileKind::Cd => {
@@ -216,6 +218,13 @@ struct TypeChecker {
     /// lexeme is in this set produces a `Type::Relation(H)` and — if
     /// `transaction_depth == 0` — fires T0025.
     public_relvars: HashSet<String>,
+    /// Signatures of every user-defined `oper` in this file, collected in a
+    /// pre-pass (sibling of `relvars`) before any body is walked, so a call
+    /// resolves regardless of declaration order (forward references). A call
+    /// whose callee is in this table is checked through the same monomorphic
+    /// path as a single-signature builtin. Names are unique across builtins ∪
+    /// user ops — a collision is rejected at registration with T0060.
+    user_opers: HashMap<String, crate::builtins::OperSig>,
 }
 
 impl TypeChecker {
@@ -284,6 +293,14 @@ impl TypeChecker {
                 Item::BaseRelvarDecl(d) => self.check_base_relvar_decl(&d),
                 Item::VirtualRelvarDecl(d) => self.check_virtual_relvar_decl(&d),
                 _ => {}
+            }
+        }
+        // Pre-pass: collect every user-defined operator's signature so a
+        // call site resolves regardless of declaration order (forward
+        // references). Bodies are still walked in the main pass below.
+        for item in root.items() {
+            if let Item::OperDecl(o) = item {
+                self.register_user_oper(&o);
             }
         }
         // Main pass: walk operator bodies + label-only items.
@@ -538,6 +555,60 @@ impl TypeChecker {
             attrs.push(name);
         }
         attrs
+    }
+
+    /// Collect one user `oper`'s signature into `user_opers`. Param and
+    /// return types resolve *quietly* here (via `Type::from_builtin_name`):
+    /// the body-walking `check_oper_decl` re-resolves the same tokens through
+    /// `resolve_type_name`, which is where any T0005 (unknown type) is
+    /// emitted — resolving loudly in both passes would double-report it.
+    /// Every user param is `ParamKind::Concrete`; user ops default to
+    /// `SideEffecting` purity — the sound default for the transaction-purity
+    /// gate (T0026) until body-derived purity lands. A name that already
+    /// names a builtin or an earlier user op is rejected with T0060 and the
+    /// first definition wins.
+    fn register_user_oper(&mut self, decl: &OperDecl) {
+        let Some(name_tok) = decl.name() else { return };
+        let name = name_tok.text().to_string();
+
+        if self.builtins.is_known(&name) || self.user_opers.contains_key(&name) {
+            self.error(
+                self.token_span(&name_tok),
+                "T0060",
+                format!("operator `{name}` is already defined"),
+            );
+            return;
+        }
+
+        let mut params: Vec<(Cow<'static, str>, ParamKind)> = Vec::new();
+        if let Some(heading) = decl.heading() {
+            for param in heading.params() {
+                let Some(pname_tok) = param.name() else { continue };
+                let pty = param
+                    .type_ref()
+                    .and_then(|tr| tr.name())
+                    .and_then(|t| Type::from_builtin_name(t.text()))
+                    .unwrap_or(Type::Unknown);
+                params.push((
+                    Cow::Owned(pname_tok.text().to_string()),
+                    ParamKind::Concrete(pty),
+                ));
+            }
+        }
+
+        let return_type = match decl.return_type().and_then(|tr| tr.name()) {
+            Some(t) => Type::from_builtin_name(t.text()).unwrap_or(Type::Unknown),
+            None => Type::unit(),
+        };
+
+        self.user_opers.insert(
+            name,
+            OperSig {
+                params,
+                return_type,
+                purity: Purity::SideEffecting,
+            },
+        );
     }
 
     fn check_oper_decl(&mut self, decl: &OperDecl) {
@@ -2470,6 +2541,13 @@ impl TypeChecker {
             return self.check_format_call(call, scope);
         }
 
+        // User-defined operators resolve through the same monomorphic path as
+        // a single-signature builtin. Names are unique across builtins ∪ user
+        // ops (T0060 at registration), so a hit here is unambiguous.
+        if let Some(sig) = self.user_opers.get(&callee_name).cloned() {
+            return self.check_monomorphic_call(call, &callee_name, &callee_name_tok, sig, scope);
+        }
+
         let candidates = self.builtins.candidates(&callee_name).to_vec();
         match candidates.len() {
             0 => {
@@ -2516,7 +2594,7 @@ impl TypeChecker {
 
         // Every declared parameter must be supplied exactly once.
         for (pname, _) in &sig.params {
-            if !provided.contains(*pname) {
+            if !provided.contains(pname.as_ref()) {
                 let span = call
                     .args()
                     .map(|a| self.node_span(a.syntax()))
@@ -2576,11 +2654,11 @@ impl TypeChecker {
         let applicable: Vec<&crate::builtins::OperSig> = sigs
             .iter()
             .filter(|sig| {
-                let pnames: HashSet<&str> = sig.params.iter().map(|(p, _)| *p).collect();
+                let pnames: HashSet<&str> = sig.params.iter().map(|(p, _)| p.as_ref()).collect();
                 pnames == provided
                     && sig.params.iter().all(|(p, kind)| {
                         args.iter()
-                            .find(|(n, _)| n == p)
+                            .find(|(n, _)| n.as_str() == p.as_ref())
                             .map(|(_, t)| param_kind_accepts(kind, t))
                             .unwrap_or(false)
                     })
@@ -2840,7 +2918,7 @@ impl TypeChecker {
         let declared = sig
             .params
             .iter()
-            .find(|(p, _)| *p == name)
+            .find(|(p, _)| p.as_ref() == name.as_str())
             .map(|(_, k)| k.clone());
 
         let arg_ty = match arg.value() {
@@ -3006,6 +3084,60 @@ mod tests {
     fn hello_world_checks_clean() {
         let diags = diagnostics(HELLO_WORLD);
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn user_oper_call_resolves_clean() {
+        let src = "program p; \
+                   oper greet {} -> Text [ \"hi\" ]; \
+                   oper main {} [ let g = greet {}; write_line { message: g }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn user_oper_forward_reference_resolves_no_t0001() {
+        // `main` calls `greet` declared *after* it — the pre-pass registers
+        // every signature before any body is walked.
+        let src = "program p; \
+                   oper main {} [ let g = greet {}; write_line { message: g }; ]; \
+                   oper greet {} -> Text [ \"hi\" ];";
+        assert!(!codes(src).contains(&"T0001"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn user_oper_missing_arg_diagnoses_t0003() {
+        let src = "program p; \
+                   oper echo { x: Text } -> Text [ x ]; \
+                   oper main {} [ let g = echo {}; write_line { message: g }; ];";
+        assert!(codes(src).contains(&"T0003"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn user_oper_wrong_arg_type_diagnoses_t0004() {
+        let src = "program p; \
+                   oper echo { x: Text } -> Text [ x ]; \
+                   oper main {} [ let g = echo { x: 42 }; write_line { message: g }; ];";
+        assert!(codes(src).contains(&"T0004"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn duplicate_user_oper_diagnoses_t0060() {
+        let src = "program p; \
+                   oper foo {} -> Text [ \"a\" ]; \
+                   oper foo {} -> Text [ \"b\" ]; \
+                   oper main {} [ write_line { message: foo {} }; ];";
+        assert!(codes(src).contains(&"T0060"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn user_oper_shadowing_builtin_diagnoses_t0060() {
+        // A user `oper` may not redefine a built-in name — every callee must
+        // resolve to exactly one definition.
+        let src = "program p; \
+                   oper read_line {} -> Text [ \"a\" ]; \
+                   oper main {} [ write_line { message: \"x\" }; ];";
+        assert!(codes(src).contains(&"T0060"), "{:?}", codes(src));
     }
 
     #[test]
