@@ -59,6 +59,12 @@ pub enum CoddlKind {
     /// recursion); string literals carry the same header with `rc =
     /// IMMORTAL_RC` so retain/release are uniform. See `docs/memory.md`.
     Text = 1,
+    /// An ordered, duplicate-preserving `Sequence` payload. Physically a
+    /// relation payload that was never sealed (sort + dedup): `desc` points
+    /// to the synthetic single-attribute heading, `length` is the element
+    /// count. The drop walker reuses `drop_relation_payload` — element cells
+    /// release exactly like relation cells.
+    Sequence = 2,
 }
 
 /// RC header preceding every heap payload at offset `-HEADER_SIZE`.
@@ -183,7 +189,10 @@ pub unsafe extern "C" fn coddl_rc_release(ptr: *mut u8) {
     // Tuple cells in records that themselves carry heap pointers
     // (Text, nested Relation) get released here.
     let kind = (*header).kind;
-    if kind == CoddlKind::Relation as u32 {
+    if kind == CoddlKind::Relation as u32 || kind == CoddlKind::Sequence as u32 {
+        // A sequence is an unsealed relation over the synthetic element
+        // heading — same per-record cell layout, so the same drop walker
+        // releases its (Text / nested) element cells.
         crate::relation::drop_relation_payload(ptr, &*header);
     }
     // Free the block with the SAME layout `coddl_rc_alloc` used — the

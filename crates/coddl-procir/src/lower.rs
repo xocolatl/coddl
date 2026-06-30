@@ -20,7 +20,7 @@ use coddl_syntax::ast::{
     ExtendExpr, FieldAccess, Item,
     LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, RenameExpr,
     ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
-    UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, WrapExpr,
+    TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, WrapExpr,
 };
 use coddl_syntax::{parse_format_template, SyntaxKind, TemplateChunk};
 use coddl_types::{check, Heading, RelvarKind, RelvarTable, Type};
@@ -524,7 +524,7 @@ impl Lowerer {
     /// `Text` is provenance-dependent (owned vs borrowed) and handled
     /// separately via `owned_texts` — see [`Self::needs_scope_release`].
     fn is_heap_managed(ty: &ProcType) -> bool {
-        matches!(ty, ProcType::Relation(_))
+        matches!(ty, ProcType::Relation(_) | ProcType::Sequence(_))
     }
 
     /// Whether a *scope-bound local* `v` of type `ty` must be released at
@@ -800,16 +800,14 @@ impl Lowerer {
                     .unwrap_or_default();
                 let pty = param
                     .type_ref()
-                    .and_then(|tr| tr.name())
-                    .map(|t| proc_type_from_builtin_name(t.text()))
+                    .map(|tr| proc_type_from_type_ref(&tr))
                     .unwrap_or(ProcType::Unit);
                 params.push((pname, pty));
             }
         }
         let return_type = decl
             .return_type()
-            .and_then(|tr| tr.name())
-            .map(|t| proc_type_from_builtin_name(t.text()))
+            .map(|tr| proc_type_from_type_ref(&tr))
             .unwrap_or(ProcType::Unit);
         (name, params, return_type)
     }
@@ -3411,17 +3409,50 @@ impl Lowerer {
     /// program that can't run. The returned placeholder value is never
     /// used — the IR is discarded once a lowering error is present.
     fn lower_sequence_lit(&mut self, seq: &SequenceLit) -> ValueId {
-        self.diagnostics.push(Diagnostic::error(
-            self.node_span(seq.syntax()),
-            "T0064",
-            "sequence values are not yet executable (lands with `load`)",
-        ));
-        // Inert placeholder: the IR is discarded once a lowering error is
-        // present, but the value still flows through `let` binding and the
-        // scope-exit walk, which require a recorded type. `Unit` is
-        // non-heap, so no spurious release is emitted.
+        let elements: Vec<Expr> = seq.elements().collect();
+        if elements.is_empty() {
+            // An empty `Sequence []` carries no element to derive the payload
+            // layout from here; its execution lands with `load`.
+            self.diagnostics.push(Diagnostic::error(
+                self.node_span(seq.syntax()),
+                "T0064",
+                "empty sequence values are not yet executable",
+            ));
+            let dst = self.fresh_value();
+            self.record_type(dst, ProcType::Unit);
+            return dst;
+        }
+
+        // Lower each element value, in order.
+        let elem_values: Vec<ValueId> = elements.iter().map(|e| self.lower_expr(e)).collect();
+
+        // Element type from the first element (typecheck guarantees the rest
+        // are assignable to it).
+        let elem_proc = self.value_type(elem_values[0]);
+
+        // A `Sequence` is physically a kind-tagged, *unsealed* relation over a
+        // synthetic single-attribute heading `{ value: elem }`, so element
+        // storage and the drop walker reuse the relation machinery.
+        let heading = Heading::new(vec![("value".to_string(), type_from_proc(&elem_proc))]);
+        let heading_id = self.intern_heading(&heading);
+
         let dst = self.fresh_value();
-        self.record_type(dst, ProcType::Unit);
+        self.record_type(dst, ProcType::Sequence(Box::new(elem_proc)));
+
+        self.insts.push(Inst::SequenceLit {
+            dst,
+            elements: elem_values.clone(),
+            heading_id,
+        });
+
+        // Retain-on-store (in codegen) gives the sequence its own reference to
+        // each heap element; balance the producer reference for owned temps
+        // (a no-op for string literals and locals), mirroring
+        // `lower_relation_lit`.
+        for v in elem_values {
+            self.release_text_temp(v);
+        }
+
         dst
     }
 
@@ -3962,9 +3993,7 @@ fn proc_type_from_type(ty: &Type) -> ProcType {
         Type::FormatText => {
             unreachable!("Type::FormatText is compile-time-only and never lowered")
         }
-        Type::Sequence(_) => {
-            unreachable!("Type::Sequence is not yet lowered (rejected at T0064)")
-        }
+        Type::Sequence(elem) => ProcType::Sequence(Box::new(proc_type_from_type(elem))),
         Type::Unknown => unreachable!("Type::Unknown survived typecheck"),
     }
 }
@@ -3996,6 +4025,24 @@ fn type_from_proc(pt: &ProcType) -> Type {
                 "ProcType::Relation in a tuple cell — needs heading interner; not reachable in Phase 19"
             )
         }
+        ProcType::Sequence(elem) => Type::Sequence(Box::new(type_from_proc(elem))),
+    }
+}
+
+/// Resolve a (possibly generator-applied) type-ref to a `ProcType`,
+/// mirroring the typechecker's `resolve_type_ref`. `Sequence T` recurses
+/// into the element type-ref; any other head is a built-in scalar name.
+fn proc_type_from_type_ref(tr: &TypeRef) -> ProcType {
+    match tr.name() {
+        Some(tok) if tok.text() == "Sequence" => {
+            let elem = tr
+                .element()
+                .map(|e| proc_type_from_type_ref(&e))
+                .unwrap_or(ProcType::Unit);
+            ProcType::Sequence(Box::new(elem))
+        }
+        Some(tok) => proc_type_from_builtin_name(tok.text()),
+        None => ProcType::Unit,
     }
 }
 
@@ -5636,16 +5683,30 @@ oper main {} [
     }
 
     #[test]
-    fn sequence_literal_is_not_yet_executable_emits_t0064() {
-        // A sequence literal parses and typechecks, but lowering rejects
-        // it gracefully (sequences aren't executable until `load` lands) —
-        // a diagnostic, not a panic. No module is produced, so codegen
-        // never runs.
-        let src = "oper main {} [ let _s = Sequence [ 1, 2 ]; ];";
+    fn nonempty_sequence_literal_lowers_to_sequence_lit() {
+        // A non-empty sequence literal now constructs at runtime — no T0064.
+        let src = "oper main {} [ let _s = Sequence [ \"a\", \"b\" ]; \
+                   write_line { message: \"ok\" }; ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let has_seq = main
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::SequenceLit { .. }));
+        assert!(has_seq, "expected a SequenceLit instruction");
+    }
+
+    #[test]
+    fn empty_sequence_literal_is_not_yet_executable_emits_t0064() {
+        // An empty sequence carries no element to derive the payload layout
+        // from at this stage; its execution lands with `load`. Graceful —
+        // a diagnostic, not a panic; no module, so codegen never runs.
+        let src = "oper main {} [ let _s: Sequence Integer = Sequence []; ];";
         let out = lower(src, FileId(0));
         assert!(
             out.module.is_none(),
-            "expected no module for an unexecutable sequence"
+            "expected no module for an empty sequence"
         );
         assert!(
             out.diagnostics.iter().any(|d| d.code == "T0064"),

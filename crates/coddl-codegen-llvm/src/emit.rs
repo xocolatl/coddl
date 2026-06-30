@@ -776,6 +776,11 @@ impl Emitter {
                 tuples,
                 heading_id,
             } => self.lower_relation_lit(*dst, tuples, *heading_id),
+            Inst::SequenceLit {
+                dst,
+                elements,
+                heading_id,
+            } => self.lower_sequence_lit(*dst, elements, *heading_id),
             Inst::Retain { src } => {
                 let op = self.rc_ptr(src)?;
                 writeln!(self.body, "    call void @coddl_rc_retain(ptr {op})").unwrap();
@@ -1969,6 +1974,61 @@ impl Emitter {
         Ok(())
     }
 
+    /// Lower `Inst::SequenceLit` — like `RelationLit` but each element is a
+    /// raw value stored as the single cell of one record in the synthetic
+    /// `{ value: elem }` heading, the kind tag is `Sequence` (2), and there
+    /// is **no** seal (sequences are ordered and keep duplicates).
+    fn lower_sequence_lit(
+        &mut self,
+        dst: ValueId,
+        elements: &[ValueId],
+        heading_id: HeadingId,
+    ) -> Result<(), LlvmEmitError> {
+        let layout = self
+            .heading_layouts
+            .get(heading_id.0 as usize)
+            .ok_or_else(|| {
+                LlvmEmitError::UnsupportedInst(format!(
+                    "unknown heading_id {} in SequenceLit",
+                    heading_id.0
+                ))
+            })?
+            .clone();
+        let attr = layout.attrs.first().ok_or_else(|| {
+            LlvmEmitError::UnsupportedInst("sequence heading has no element attribute".to_string())
+        })?;
+        let count = elements.len();
+        let record_size = layout.record_size as usize;
+        let payload_bytes = record_size * count;
+        let dst_name = format!("%v{}", dst.0);
+        // 1. Allocate (kind = Sequence).
+        writeln!(
+            self.body,
+            "    {dst_name} = call ptr @coddl_rc_alloc(i64 {payload_bytes}, i32 {count}, i32 2, ptr @.heading.{})",
+            heading_id.0,
+        )
+        .unwrap();
+        // 2. Store each element into its record's single cell. No seal.
+        for (record_idx, elem_vid) in elements.iter().enumerate() {
+            let field_repr = self.values.get(elem_vid).cloned().ok_or_else(|| {
+                LlvmEmitError::UnsupportedInst(format!(
+                    "undefined element value {elem_vid:?} in SequenceLit"
+                ))
+            })?;
+            let byte_offset = record_idx * record_size + attr.offset as usize;
+            self.emit_attr_store(&dst_name, byte_offset, &field_repr, attr.sub.as_ref())?;
+        }
+        // 3. Record the dst's ValueRepr (the sequence payload pointer).
+        self.values.insert(
+            dst,
+            ValueRepr::Scalar {
+                ty: "ptr".to_string(),
+                op: dst_name,
+            },
+        );
+        Ok(())
+    }
+
     /// Store one attribute's flattened operands into the relation's
     /// payload at `byte_offset`. Integer/Boolean: one i64 store.
     /// Text: two stores (ptr, i64) at byte_offset and byte_offset+8.
@@ -2277,6 +2337,8 @@ fn llvm_value_type(ty: &ProcType) -> &'static str {
         // Relations cross the ABI as a single payload pointer; the
         // heading lives in static data, reached via the descriptor.
         ProcType::Relation(_) => "ptr",
+        // Sequences are RC'd heap values — a single payload pointer too.
+        ProcType::Sequence(_) => "ptr",
         // Non-flattened tuple uses are limited to multi-attribute
         // returns, which need return-pair codegen and aren't on Phase
         // 18's path. Empty tuples lower to `void` via

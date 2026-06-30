@@ -32,6 +32,7 @@ fn fixtures_dir() -> &'static Path {
         let tmp = tempfile::tempdir().expect("fixtures tempdir");
         for (name, src) in [
             ("hello-world", HELLO_WORLD_SRC),
+            ("sequence-construct", SEQUENCE_CONSTRUCT_SRC),
             ("transaction", TRANSACTION_SRC),
             ("join-times-compose", JOIN_TIMES_COMPOSE_SRC),
             ("union-intersect-minus", UNION_INTERSECT_MINUS_SRC),
@@ -58,6 +59,14 @@ const HELLO_WORLD_SRC: &str = "\
 program hello_world;
 oper main {} [
     write_line { message: \"Hello, world!\" };
+];
+";
+
+const SEQUENCE_CONSTRUCT_SRC: &str = "\
+program sequence_construct;
+oper main {} [
+    let _names = Sequence [\"Alice\", \"Bob\"];
+    write_line { message: \"constructed\" };
 ];
 ";
 
@@ -240,6 +249,38 @@ fn coddl_run_cranelift_backend_prints_hello_world() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.stdout, b"Hello, world!\n");
+}
+
+#[test]
+fn coddl_run_llvm_constructs_sequence() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("sequence-construct"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=llvm failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"constructed\n");
+}
+
+#[test]
+fn coddl_run_cranelift_constructs_sequence() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("sequence-construct"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"constructed\n");
 }
 
 #[test]

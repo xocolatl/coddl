@@ -986,6 +986,7 @@ fn cranelift_value_type(
         ProcType::Boolean => types::I8,
         ProcType::Unit => types::I8, // unused; caller filters Unit out
         ProcType::Relation(_) => ptr_ty,
+        ProcType::Sequence(_) => ptr_ty,
         ProcType::Tuple(_) => unreachable!(
             "Tuple ProcType must be flattened at ABI boundaries; bare Tuple seen in scalar context"
         ),
@@ -1446,6 +1447,67 @@ fn emit_inst(
             let seal_id = funcs["coddl_relation_seal"];
             let seal_local = obj.declare_func_in_func(seal_id, builder.func);
             builder.ins().call(seal_local, &[payload, desc_val]);
+
+            values.insert(*dst, ValueRepr::Scalar(payload));
+            Ok(())
+        }
+        Inst::SequenceLit {
+            dst,
+            elements,
+            heading_id,
+        } => {
+            let _ = next_data;
+            // Like `RelationLit`, but each element is a raw value stored as the
+            // single cell of one record in the synthetic `{ value: elem }`
+            // heading; kind = Sequence (2); and there is no seal (ordered,
+            // duplicate-preserving).
+            let layout = heading_layouts.get(heading_id.0 as usize).ok_or_else(|| {
+                CraneliftEmitError::UnsupportedInst(format!(
+                    "unknown heading_id {} in SequenceLit",
+                    heading_id.0
+                ))
+            })?;
+            let attr = layout.attrs.first().ok_or_else(|| {
+                CraneliftEmitError::UnsupportedInst(
+                    "sequence heading has no element attribute".to_string(),
+                )
+            })?;
+            let desc_id = heading_desc_ids[heading_id.0 as usize];
+            let desc_gv = obj.declare_data_in_func(desc_id, builder.func);
+            let ptr_ty = obj.target_config().pointer_type();
+            let desc_val = builder.ins().symbol_value(ptr_ty, desc_gv);
+
+            let alloc_id = funcs["coddl_rc_alloc"];
+            let alloc_local = obj.declare_func_in_func(alloc_id, builder.func);
+            let count = elements.len() as i64;
+            let payload_size = (layout.record_size as i64) * count;
+            let size_val = builder.ins().iconst(types::I64, payload_size);
+            let count_val = builder.ins().iconst(types::I32, count);
+            let kind_val = builder.ins().iconst(types::I32, 2); // CoddlKind::Sequence
+            let call = builder
+                .ins()
+                .call(alloc_local, &[size_val, count_val, kind_val, desc_val]);
+            let payload = builder.inst_results(call)[0];
+
+            let record_size = layout.record_size as i32;
+            let attr_offset = attr.offset as i32;
+            for (record_idx, elem_vid) in elements.iter().enumerate() {
+                let field_repr = values.get(elem_vid).cloned().ok_or_else(|| {
+                    CraneliftEmitError::UnsupportedInst(format!(
+                        "undefined element value {elem_vid:?} in SequenceLit"
+                    ))
+                })?;
+                let byte_offset = record_idx as i32 * record_size + attr_offset;
+                let retain_ref = obj.declare_func_in_func(funcs["coddl_rc_retain"], builder.func);
+                store_attr(
+                    builder,
+                    payload,
+                    byte_offset,
+                    &field_repr,
+                    attr.sub.as_ref(),
+                    retain_ref,
+                )?;
+            }
 
             values.insert(*dst, ValueRepr::Scalar(payload));
             Ok(())

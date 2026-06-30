@@ -43,7 +43,7 @@ The type system has no nullable-attribute facility. Missing information is a dat
 
 - `Tuple { a: T, b: U, … }` and `Relation { a: T, b: U, … }` are type generators producing structurally-identified types: `Tuple H1 = Tuple H2` iff `H1 = H2` as sets of `{name: type}` pairs. Same for `Relation`. Attribute order is immaterial. Both generators may take zero attributes (`reltrue` and `relfalse` are the only inhabitants of `Relation {}` — see the naming note below).
 - **`Tuple {}` is the unit type** — the type of a tuple with no attributes. It has exactly one value, written `{}` (the empty tuple literal). This is Coddl's analogue of Rust's `()`, Swift's `Void`, or the unit type in ML. An `oper` declared without an explicit return clause implicitly returns `Tuple {}`. The two spellings `Tuple {}` and the value `{}` are unambiguous in context — one appears in type position, the other in expression position.
-- `Sequence T` is the ordered counterpart — a finite ordered list of values of element type `T`, duplicates allowed, position significant. It's the procedural-side companion to `Relation`: where `Relation H` is an unordered set of tuples (RM Pro 1, 3), `Sequence Tuple H` is an ordered list of tuples (the canonical iteration form — see [runtime.md](runtime.md) "load"). The element type `T` may be any type — primitives (`Sequence Integer`), tuples (`Sequence Tuple H` — the typical case), or even relations (`Sequence Relation H`). The type generator `Sequence T` and its literal `Sequence [ … ]` are wired through the frontend (parse + typecheck); the literal is permitted only as a `let` binding value (T0063), and its element type is inferred from the elements or, when empty, taken from the `let` annotation (`let s: Sequence Integer = Sequence []`, else T0061). **Execution** — building a sequence value at runtime and iterating it — is deferred to the `load` form (lowering rejects a sequence literal with T0064 until then).
+- `Sequence T` is the ordered counterpart — a finite ordered list of values of element type `T`, duplicates allowed, position significant. It's the procedural-side companion to `Relation`: where `Relation H` is an unordered set of tuples (RM Pro 1, 3), `Sequence Tuple H` is an ordered list of tuples (the canonical iteration form — see [runtime.md](runtime.md) "load"). The element type `T` may be any type — primitives (`Sequence Integer`), tuples (`Sequence Tuple H` — the typical case), or even relations (`Sequence Relation H`). The type generator `Sequence T` and its literal `Sequence [ … ]` are wired through the frontend (parse + typecheck); the literal is permitted only as a `let` binding value (T0063), and its element type is inferred from the elements or, when empty, taken from the `let` annotation (`let s: Sequence Integer = Sequence []`, else T0061). A non-empty literal **constructs** at runtime (an RC'd heap value, physically a kind-tagged unsealed relation over a synthetic single-attribute heading, so element storage and drop reuse the relation machinery). Still deferred to the `load` form: **iteration**, and constructing an **empty** literal (no element to derive the payload layout from — lowering emits T0064 for `Sequence []`).
 - Headings may include relation-valued and tuple-valued attributes (nesting permitted; RM Pre 6–7).
 - A **relvar** is a named variable of some `Relation H` type. Per RM Pre 14, every relvar has at least one declared candidate key (RM Pre 15), possibly the empty key (which forces cardinality ≤ 1). Coddl classifies relvars by lifetime and provenance, with one of the following kinds at declaration time:
   - **database relvars** (visible only in `.cddb` catalogs — see [plan.md](plan.md)): `real` / `base` (backed by storage), or `virtual` (a view).
@@ -123,12 +123,13 @@ the typechecker.
 
 The following are deferred until the relevant productions arrive:
 
-- **`Sequence T` execution** — the `Type::Sequence` variant, the
-  `Sequence [ … ]` literal, and `Sequence T` type annotations are wired
-  through the frontend (see "Type generators" above). What remains
-  deferred is *execution*: lowering, a runtime representation, and
-  iteration land with the `LOAD ARRAY ... ORDER (...)` form. Until then
-  lowering a sequence literal emits T0064.
+- **`Sequence T` iteration** — the `Type::Sequence` variant, the
+  `Sequence [ … ]` literal, `Sequence T` type annotations, and runtime
+  *construction* of a non-empty literal are wired (a `ProcType::Sequence`
+  + `Inst::SequenceLit` lowering to an RC'd `CoddlKind::Sequence` value).
+  What remains deferred is **iteration** (the `LOAD ARRAY ... ORDER (...)`
+  form) and constructing an **empty** literal — lowering a `Sequence []`
+  emits T0064.
 - **User-defined scalar types** via `possrep` — the typechecker has
   no notion of user types yet; every type-name lookup either resolves
   to a built-in or yields `T0005`.
@@ -620,4 +621,4 @@ check script enforces that.
 | T0061 | empty `Sequence []` has no element to infer from and no `let` type annotation to fall back on |
 | T0062 | a `Sequence [ … ]` element's type differs from the first element's (sequences are homogeneous) |
 | T0063 | a sequence literal appears outside a `let` binding value (the only position it is permitted) |
-| T0064 | a `Sequence [ … ]` value is not yet executable — sequence lowering/iteration lands with `load` (lowering) |
+| T0064 | an **empty** `Sequence []` can't be constructed yet (no element to derive the payload layout from); empty-construction and iteration land with `load` (lowering) |

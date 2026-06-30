@@ -212,6 +212,18 @@ pub enum Inst {
         tuples: Vec<ValueId>,
         heading_id: HeadingId,
     },
+    /// Construct a `Sequence` value from its elements, in order. Each
+    /// `element` is a `ValueId` of the sequence's element type, stored as
+    /// the single cell of one record in the synthetic single-attribute
+    /// heading at `heading_id`. Lowering allocates an RC payload (kind
+    /// `Sequence`), writes each element into its record, and — unlike
+    /// `RelationLit` — does **not** seal: sequences are ordered and
+    /// duplicate-preserving. The `dst` carries `ProcType::Sequence(elem)`.
+    SequenceLit {
+        dst: ValueId,
+        elements: Vec<ValueId>,
+        heading_id: HeadingId,
+    },
     /// Increment the refcount of `src`. Emitted by the lowerer when a
     /// heap-typed value is bound to a `let` whose RHS is a `NameRef`
     /// to an already-bound source (so both bindings hold a count).
@@ -575,6 +587,13 @@ pub enum ProcType {
     Pointer,
     Tuple(Heading),
     Relation(HeadingId),
+    /// Ordered, finite list of values of one element type — an RC'd heap
+    /// value (kind `Sequence`). Physically a kind-tagged, *unsealed*
+    /// relation over a synthetic single-attribute heading, so element
+    /// storage and drop reuse the relation machinery. Carries the element
+    /// `ProcType` (not a heading id) so it round-trips through the free
+    /// `proc_type_from_type` in tuple-field contexts.
+    Sequence(Box<ProcType>),
 }
 
 // ── Display ──────────────────────────────────────────────────────────
@@ -606,6 +625,7 @@ impl fmt::Display for ProcType {
             ProcType::Pointer => f.write_str("Pointer"),
             ProcType::Tuple(h) => write!(f, "Tuple {h}"),
             ProcType::Relation(id) => write!(f, "Relation heading_{}", id.0),
+            ProcType::Sequence(elem) => write!(f, "Sequence {elem}"),
         }
     }
 }
@@ -690,6 +710,20 @@ impl fmt::Display for Inst {
                     write!(f, "{v}")?;
                 }
                 f.write_str("}")
+            }
+            Inst::SequenceLit {
+                dst,
+                elements,
+                heading_id,
+            } => {
+                write!(f, "{dst} = sequence_lit heading_{} [", heading_id.0)?;
+                for (i, v) in elements.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{v}")?;
+                }
+                f.write_str("]")
             }
             Inst::Retain { src } => write!(f, "retain {src}"),
             Inst::Release { src } => write!(f, "release {src}"),
