@@ -34,6 +34,7 @@ fn fixtures_dir() -> &'static Path {
             ("hello-world", HELLO_WORLD_SRC),
             ("sequence-construct", SEQUENCE_CONSTRUCT_SRC),
             ("hello-everyone", HELLO_EVERYONE_SRC),
+            ("param-echo", PARAM_ECHO_SRC),
             ("transaction", TRANSACTION_SRC),
             ("join-times-compose", JOIN_TIMES_COMPOSE_SRC),
             ("union-intersect-minus", UNION_INTERSECT_MINUS_SRC),
@@ -81,6 +82,16 @@ oper main {} [
     let names = Sequence [\"Alice\", \"Bob\"];
     let message = format { template: f\"Hello, {names}!\", params: { names } };
     write_line { message };
+];
+";
+
+// A user oper whose body references its parameter (`self`) — param-binding-in-body.
+const PARAM_ECHO_SRC: &str = "\
+program param_echo;
+oper echo { self: Text } -> Text [ self ];
+oper main {} [
+    let g = echo { self: \"hi there\" };
+    write_line { message: g };
 ];
 ";
 
@@ -263,6 +274,38 @@ fn coddl_run_cranelift_backend_prints_hello_world() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.stdout, b"Hello, world!\n");
+}
+
+#[test]
+fn coddl_run_llvm_oper_param_in_body() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("param-echo"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=llvm failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"hi there\n");
+}
+
+#[test]
+fn coddl_run_cranelift_oper_param_in_body() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("param-echo"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"hi there\n");
 }
 
 #[test]

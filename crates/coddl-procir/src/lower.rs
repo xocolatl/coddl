@@ -305,6 +305,11 @@ struct Lowerer {
     /// them). Function-global like `value_types` — must survive `pop_local_scope`
     /// so a transaction-escaping owned `Text` stays owned.
     owned_texts: HashSet<ValueId>,
+    /// ValueIds of the current function's parameters (`ValueId(0..N)`, matching
+    /// the backends' parameter seeding). Parameters are *borrowed* — the caller
+    /// owns the argument — so they are bound as body locals (resolving a body
+    /// reference like `self`) but excluded from the scope-exit release.
+    param_value_ids: Vec<ValueId>,
     /// For each `TupleLit` (by dst `ValueId`): the `Text` cell values consumed
     /// directly into it — direct `Text` field values plus, recursively, the
     /// temps of *fresh nested `TupleLit`* fields (not `NameRef`-aliased tuples).
@@ -364,6 +369,7 @@ impl Lowerer {
             private_relvar_order: Vec::new(),
             used_private_relvars: HashSet::new(),
             owned_texts: HashSet::new(),
+            param_value_ids: Vec::new(),
             tuple_cell_text_temps: HashMap::new(),
             deferred_relation_releases: Vec::new(),
             user_opers: HashMap::new(),
@@ -498,6 +504,7 @@ impl Lowerer {
         self.relexpr_aliases.push(HashMap::new());
         self.value_types.clear();
         self.owned_texts.clear();
+        self.param_value_ids.clear();
         self.tuple_cell_text_temps.clear();
         self.deferred_relation_releases.clear();
     }
@@ -582,6 +589,10 @@ impl Lowerer {
             .cloned()
             .collect();
         for (v, ty) in candidates {
+            // Parameters are borrowed (the caller owns them) — never release.
+            if self.param_value_ids.contains(&v) {
+                continue;
+            }
             if self.needs_scope_release(v, &ty) {
                 self.insts.push(Inst::Release { src: v });
             }
@@ -826,6 +837,21 @@ impl Lowerer {
         let (name, params, declared_return) = Self::oper_signature(decl);
         let linkage_name = name.clone();
         let is_main = name == "main";
+
+        // Bind parameters as body locals so a body reference (e.g. `self`)
+        // resolves to the parameter value rather than the `Unit` placeholder.
+        // Parameters occupy `ValueId(0..N)` in declared order — matching the
+        // backends' parameter seeding — so mint them directly and advance
+        // `next_value` past them before any `fresh_value()`. They are
+        // *borrowed* (the caller owns the argument); `param_value_ids` excludes
+        // them from the scope-exit release.
+        self.param_value_ids = (0..params.len() as u32).map(ValueId).collect();
+        for (i, (pname, pty)) in params.iter().enumerate() {
+            let vid = ValueId(i as u32);
+            self.bind_local(pname.clone(), vid, pty.clone());
+            self.record_type(vid, pty.clone());
+        }
+        self.next_value = params.len() as u32;
 
         let block_id = self.fresh_block();
 
@@ -5708,6 +5734,24 @@ oper main {} [
         let out = lower(src, FileId(0));
         assert!(out.module.is_none());
         assert!(out.diagnostics.iter().any(|d| d.code == "T0001"));
+    }
+
+    #[test]
+    fn oper_param_reference_lowers_to_param_value() {
+        // A body reference to a parameter resolves to the parameter's ValueId
+        // (params occupy ValueId(0..N)), not the old `Unit` placeholder. Here
+        // `echo`'s body is just `self`, so it returns parameter 0.
+        let src = "program p; \
+                   oper echo { self: Text } -> Text [ self ]; \
+                   oper main {} [ let g = echo { self: \"x\" }; \
+                   write_line { message: g }; ];";
+        let m = lower_ok(src);
+        let echo = m.functions.iter().find(|f| f.name == "echo").expect("echo fn");
+        let term = &echo.blocks.last().expect("a block").terminator;
+        assert!(
+            matches!(term, Terminator::Return(Some(v)) if *v == ValueId(0)),
+            "expected echo to return its `self` param ValueId(0), got {term:?}"
+        );
     }
 
     #[test]
