@@ -236,11 +236,13 @@ polymorphic (`ParamKind::AnyTuple`) and optional (absent ⇒ empty
 heading). Placeholder checks: malformed template → `T0057`; a placeholder
 with no matching `params` attribute → `T0058`; a `params` attribute no
 placeholder uses → `T0059` (warning); a placeholder whose attribute type
-has no `to_text` overload (a `Sequence`, `Tuple`, or `Relation`) → `T0054`
+has no `to_text` overload — built-in **or** user-defined — → `T0054`
 — the same code a direct `to_text { self: … }` over that type raises,
-since each `{x}` desugars to `to_text { self: x }`. Validating it here
-keeps the non-scalar case from reaching the lowerer's `to_text` fold,
-which has no such overload.
+since each `{x}` desugars to `to_text { self: x }`. The check (and the
+lowerer's dispatch) resolve across built-in and user overloads, so a user
+`to_text { self: T }` makes `{x : T}` renderable (e.g. a `Sequence Text`
+once such an overload is in scope); only a type with *no* matching
+overload (a bare `Tuple`/`Relation`, an un-extended `Sequence`) is T0054.
 
 
 ## Pass overview

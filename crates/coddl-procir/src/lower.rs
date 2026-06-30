@@ -632,8 +632,10 @@ impl Lowerer {
     fn lower_root(&mut self, root: &Root) -> Module {
         // Pre-pass: record every user-defined operator's signature so a call
         // to an operator declared later in the file resolves during body
-        // lowering. The typechecker already proved the names unique across
-        // builtins ∪ user ops, so a plain insert can't clobber a builtin.
+        // lowering. A user op may share a name with a built-in (open
+        // overloading), but built-ins live in a separate table, so this insert
+        // never clobbers one; the typechecker caps it at one user overload per
+        // name (T0060), so the by-name `user_opers` map stays unambiguous.
         for item in root.items() {
             if let Item::OperDecl(o) = item {
                 let (name, params, return_type) = Self::oper_signature(&o);
@@ -3732,7 +3734,33 @@ impl Lowerer {
     /// `Integer`/`Boolean` arrive with their runtime routines. Shared by
     /// `to_text` and `format`.
     fn lower_to_text(&mut self, v: ValueId) -> ValueId {
-        match self.value_type(v) {
+        let vty = self.value_type(v);
+        // A user `to_text { self: T }` overload takes precedence for value
+        // types the built-in conversions don't cover (e.g. a `Sequence`).
+        // Resolve it by the value's ProcType against the overload's `self`
+        // parameter — the same name + heading rule the typechecker used.
+        let user_return = self.user_opers.get("to_text").and_then(|sig| {
+            sig.params
+                .iter()
+                .any(|(n, self_ty)| n.as_str() == "self" && *self_ty == vty)
+                .then(|| sig.return_type.clone())
+        });
+        if let Some(return_type) = user_return {
+            let returns_text = matches!(return_type, ProcType::Text);
+            let dst = self.fresh_value();
+            self.record_type(dst, return_type.clone());
+            self.insts.push(Inst::Call {
+                dst: Some(dst),
+                callee: "to_text".to_string(),
+                args: vec![v],
+                return_type,
+            });
+            if returns_text {
+                self.mark_text_owned(dst);
+            }
+            return dst;
+        }
+        match vty {
             ProcType::Text => {
                 // Copy via concat with "" — the cheapest way to get a
                 // standalone owned `Text`. Aliasing the source instead would
@@ -5695,6 +5723,26 @@ oper main {} [
             .flat_map(|b| &b.insts)
             .any(|i| matches!(i, Inst::SequenceLit { .. }));
         assert!(has_seq, "expected a SequenceLit instruction");
+    }
+
+    #[test]
+    fn format_dispatches_sequence_placeholder_to_user_to_text() {
+        // `{names}` over a Sequence has no built-in `to_text`; it must lower to
+        // a call to the user `to_text { self: Sequence Text }` overload rather
+        // than hitting the built-in conversion's `unreachable!`.
+        let src = "program p; \
+                   oper to_text { self: Sequence Text } -> Text [ \"x\" ]; \
+                   oper main {} [ let names = Sequence [ \"a\" ]; \
+                   let m = format { template: f\"{names}\", params: { names } }; \
+                   write_line { message: m }; ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let calls_to_text = main
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::Call { callee, .. } if callee == "to_text"));
+        assert!(calls_to_text, "expected a call to the user `to_text`");
     }
 
     #[test]

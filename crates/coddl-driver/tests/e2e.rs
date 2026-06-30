@@ -33,6 +33,7 @@ fn fixtures_dir() -> &'static Path {
         for (name, src) in [
             ("hello-world", HELLO_WORLD_SRC),
             ("sequence-construct", SEQUENCE_CONSTRUCT_SRC),
+            ("hello-everyone", HELLO_EVERYONE_SRC),
             ("transaction", TRANSACTION_SRC),
             ("join-times-compose", JOIN_TIMES_COMPOSE_SRC),
             ("union-intersect-minus", UNION_INTERSECT_MINUS_SRC),
@@ -67,6 +68,19 @@ program sequence_construct;
 oper main {} [
     let _names = Sequence [\"Alice\", \"Bob\"];
     write_line { message: \"constructed\" };
+];
+";
+
+// A user-defined `to_text { self: Sequence Text }` overload (open overloading)
+// that string interpolation dispatches to: `{names}` desugars to
+// `to_text { self: names }`, picking the user overload for the sequence value.
+const HELLO_EVERYONE_SRC: &str = "\
+program hello_world;
+oper to_text { self: Sequence Text } -> Text [ \"everyone\" ];
+oper main {} [
+    let names = Sequence [\"Alice\", \"Bob\"];
+    let message = format { template: f\"Hello, {names}!\", params: { names } };
+    write_line { message };
 ];
 ";
 
@@ -281,6 +295,38 @@ fn coddl_run_cranelift_constructs_sequence() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.stdout, b"constructed\n");
+}
+
+#[test]
+fn coddl_run_llvm_interpolates_via_user_to_text() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("hello-everyone"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=llvm failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"Hello, everyone!\n");
+}
+
+#[test]
+fn coddl_run_cranelift_interpolates_via_user_to_text() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("hello-everyone"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"Hello, everyone!\n");
 }
 
 #[test]

@@ -1,11 +1,22 @@
 program hello_world;
 
-oper ask {} -> Text [
-    read_line { prompt: "Enter your name: " }
+// A user-defined `to_text` overload. String interpolation desugars every
+// `{x}` to a call `to_text { self: x }`, so this is the hook that teaches
+// `format` how to render a value whose type has no built-in `to_text` —
+// here a `Sequence Text`. Operators are identified by name *and* heading,
+// so this is a *distinct* operator from the built-in `to_text { self: Text }`,
+// not a redefinition — and the heading must name the parameter `self`: a
+// `to_text { thing: ... }` is a different operator and would never match
+// the desugared call.
+//
+// The body is a placeholder: rendering the actual elements needs sequence
+// iteration (the deferred `load` work), so it returns a fixed string for now.
+oper to_text { self: Sequence Text } -> Text [
+    "everyone"
 ];
 
 oper main {} [
-    let name_in = ask {};
-    let message = format { template: f"Hello, {name}!", params: { name: name_in } };
+    let names = Sequence ["Alice", "Bob"];
+    let message = format { template: f"Hello, {names}!", params: { names } };
     write_line { message };
 ];
