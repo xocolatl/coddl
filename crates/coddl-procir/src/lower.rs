@@ -58,6 +58,19 @@ const BUILTIN_EXTERNS: &[BuiltinExtern] = &[
         params: &[("prompt", ProcType::Text)],
         return_type: ProcType::Text,
     },
+    // `cardinality { self } -> Integer`. Polymorphic over `Relation H` and
+    // `Sequence T`; both store their element/tuple count in the RC header's
+    // `length` slot, so one runtime read (`coddl_rc_length`) serves either.
+    // The `self` param type is an ABI sentinel only — the generic `lower_call`
+    // path ignores it and lowers whatever argument is supplied; both
+    // `Relation(_)` and `Sequence(_)` are a single pointer, so this declares
+    // the extern as `i64 coddl_rc_length(ptr)`.
+    BuiltinExtern {
+        surface: "cardinality",
+        linkage: "coddl_rc_length",
+        params: &[("self", ProcType::Relation(HeadingId(0)))],
+        return_type: ProcType::Integer,
+    },
 ];
 
 struct BuiltinExtern {
@@ -5996,6 +6009,45 @@ oper main {} [
                 .any(|i| matches!(i, Inst::CharToText { .. })),
             "expected CharToText for to_text on a Character"
         );
+    }
+
+    #[test]
+    fn cardinality_lowers_to_coddl_rc_length_call() {
+        // Both the `Sequence` and the `Relation` overload lower a
+        // `cardinality {}` to a borrow-only call to the runtime's
+        // `coddl_rc_length`, returning Integer — the count lives in the
+        // shared RC-header `length` slot, so one symbol serves either.
+        let src = "oper main {} [ \
+                   let xs = Sequence [ \"a\", \"b\", \"c\" ]; \
+                   let _ns = cardinality { self: xs }; \
+                   let r = Relation { {a: 1}, {a: 2} }; \
+                   let _nr = cardinality { self: r }; \
+                   ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let calls = main.blocks[0]
+            .insts
+            .iter()
+            .filter(|i| {
+                matches!(i, Inst::Call { callee, return_type, .. }
+                    if callee == "coddl_rc_length"
+                        && matches!(return_type, ProcType::Integer))
+            })
+            .count();
+        assert_eq!(
+            calls, 2,
+            "both cardinality calls lower to coddl_rc_length -> Integer"
+        );
+
+        // The extern is declared once as a block-less in-module function so
+        // each backend emits an import for it.
+        let ext = m
+            .functions
+            .iter()
+            .find(|f| f.linkage_name == "coddl_rc_length")
+            .expect("coddl_rc_length extern declared");
+        assert!(ext.blocks.is_empty(), "extern is a declaration only");
+        assert!(matches!(ext.return_type, ProcType::Integer));
     }
 
     #[test]

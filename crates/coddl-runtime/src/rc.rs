@@ -207,6 +207,25 @@ pub unsafe extern "C" fn coddl_rc_release(ptr: *mut u8) {
     LIVE_ALLOCATIONS.fetch_sub(1, Ordering::SeqCst);
 }
 
+/// Read the `length` field from a heap payload's header — the element
+/// count for a `Sequence`, the tuple count for a `Relation`. The
+/// `cardinality` built-in lowers to a call here. Borrows: it only
+/// inspects the header and never touches the refcount. Returns `i64`
+/// (the surface `Integer`); the stored count is a `u32` widened here so
+/// the caller needs no conversion.
+///
+/// # Safety
+/// `ptr` must be null or point to a payload returned by
+/// [`coddl_rc_alloc`] (or an immortal payload with a valid header).
+#[no_mangle]
+pub unsafe extern "C" fn coddl_rc_length(ptr: *const u8) -> i64 {
+    if ptr.is_null() {
+        return 0;
+    }
+    let header = ptr.sub(HEADER_SIZE) as *const CoddlRcHeader;
+    i64::from((*header).length)
+}
+
 /// Debug-build accessor for the live-allocation counter. Returns 0
 /// in release builds. Used by runtime unit tests to confirm
 /// retain/release balance.

@@ -24,6 +24,10 @@ pub enum ParamKind {
     Concrete(Type),
     /// Polymorphic over any `Relation H`. Used by `write_relation`.
     AnyRelation,
+    /// Polymorphic over any `Sequence T`. Used by `cardinality`, which
+    /// reads the element count regardless of element type (mirrors
+    /// `AnyRelation`).
+    AnySequence,
     /// Polymorphic over any `Tuple H`. Used by `format`'s `params`; the
     /// heading is captured at the call site (mirrors `AnyRelation`).
     AnyTuple,
@@ -115,6 +119,21 @@ impl Builtins {
                 OperSig {
                     params: vec![("self".into(), ParamKind::Concrete(self_ty))],
                     return_type: Type::Text,
+                    purity: Purity::Pure,
+                },
+            );
+        }
+        // `cardinality { self } -> Integer` — the element/tuple count, read
+        // from the RC header's `length` field. Polymorphic over both
+        // `Relation H` (the natural TTM `COUNT`) and `Sequence T`; the count
+        // lives in the same header slot for both, so one runtime read serves
+        // either. Pure — it only inspects the header.
+        for self_kind in [ParamKind::AnyRelation, ParamKind::AnySequence] {
+            b.register(
+                "cardinality",
+                OperSig {
+                    params: vec![("self".into(), self_kind)],
+                    return_type: Type::Integer,
                     purity: Purity::Pure,
                 },
             );
@@ -239,5 +258,23 @@ mod tests {
         assert!(self_types.contains(&Type::Character));
         assert!(self_types.contains(&Type::Integer));
         assert!(self_types.contains(&Type::Boolean));
+    }
+
+    #[test]
+    fn cardinality_is_overloaded() {
+        let b = Builtins::new();
+        let sigs = b.candidates("cardinality");
+        assert_eq!(sigs.len(), 2, "expected Relation + Sequence overloads");
+        // Overloaded names are not reachable via the single-sig `oper()`.
+        assert!(b.oper("cardinality").is_none());
+        for sig in sigs {
+            assert_eq!(sig.params.len(), 1);
+            assert_eq!(sig.params[0].0.as_ref(), "self");
+            assert!(matches!(sig.return_type, Type::Integer));
+            assert_eq!(sig.purity, Purity::Pure);
+        }
+        let kinds: Vec<_> = sigs.iter().map(|s| s.params[0].1.clone()).collect();
+        assert!(kinds.contains(&ParamKind::AnyRelation));
+        assert!(kinds.contains(&ParamKind::AnySequence));
     }
 }

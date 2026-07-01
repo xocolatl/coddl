@@ -20,6 +20,17 @@ const HELLO_WORLD: &str = "program hello_world;\n\
                                write_line{message: \"Hello, world!\"};\n\
                            ];\n";
 
+// `cardinality { self: Sequence T }` reads the element count out of the RC
+// header and prints it (via `to_text { self: Integer }`). Three elements →
+// `3`. Uses the explicit prefix form; the dot receiver form is not wired yet.
+const CARDINALITY: &str = "program p;\n\
+                           oper main {}\n\
+                           [\n\
+                               let xs = Sequence [\"a\", \"b\", \"c\"];\n\
+                               let n = cardinality { self: xs };\n\
+                               write_line { message: to_text { self: n } };\n\
+                           ];\n";
+
 fn workspace_root() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop();
@@ -45,9 +56,11 @@ fn runtime_staticlib() -> PathBuf {
     path
 }
 
-#[test]
-fn hello_world_cranelift_e2e() {
-    let lower_out = lower(HELLO_WORLD, FileId(0));
+/// Lower `src`, emit a native object via Cranelift, link it with the runtime
+/// staticlib via `cc`, run the binary, and return its stdout. Asserts each
+/// step succeeds.
+fn compile_and_run(src: &str) -> Vec<u8> {
+    let lower_out = lower(src, FileId(0));
     assert!(
         lower_out.diagnostics.is_empty(),
         "lowering reported diagnostics: {:?}",
@@ -59,8 +72,8 @@ fn hello_world_cranelift_e2e() {
     let obj_bytes = backend.emit(&module).expect("emit ok");
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let obj_path = tmp.path().join("hello.o");
-    let bin_path = tmp.path().join("hello");
+    let obj_path = tmp.path().join("prog.o");
+    let bin_path = tmp.path().join("prog");
     std::fs::write(&obj_path, &obj_bytes).expect("write object");
 
     let runtime = runtime_staticlib();
@@ -86,10 +99,27 @@ fn hello_world_cranelift_e2e() {
         run.status,
         String::from_utf8_lossy(&run.stderr)
     );
+    run.stdout
+}
+
+#[test]
+fn hello_world_cranelift_e2e() {
+    let stdout = compile_and_run(HELLO_WORLD);
     assert_eq!(
-        run.stdout,
+        stdout,
         b"Hello, world!\n",
         "unexpected stdout: {:?}",
-        String::from_utf8_lossy(&run.stdout)
+        String::from_utf8_lossy(&stdout)
+    );
+}
+
+#[test]
+fn cardinality_cranelift_e2e() {
+    let stdout = compile_and_run(CARDINALITY);
+    assert_eq!(
+        stdout,
+        b"3\n",
+        "unexpected stdout: {:?}",
+        String::from_utf8_lossy(&stdout)
     );
 }

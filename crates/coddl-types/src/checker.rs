@@ -3164,6 +3164,23 @@ impl TypeChecker {
                     );
                 }
             }
+            Some(crate::builtins::ParamKind::AnySequence) => {
+                provided.insert(name.clone());
+                // Accept any `Sequence T` regardless of element type
+                // (mirrors `AnyRelation`); `Unknown` slips through for
+                // recovery.
+                if !matches!(arg_ty, Type::Sequence(_) | Type::Unknown) {
+                    let span = arg
+                        .value()
+                        .map(|v| self.node_span(v.syntax()))
+                        .unwrap_or_else(|| self.node_span(arg.syntax()));
+                    self.error(
+                        span,
+                        "T0004",
+                        format!("argument `{name}` expected a Sequence, got {arg_ty}"),
+                    );
+                }
+            }
             Some(crate::builtins::ParamKind::AnyTuple) => {
                 provided.insert(name.clone());
                 // Accept any `Tuple H` regardless of heading (mirrors
@@ -3199,6 +3216,7 @@ fn param_kind_accepts(kind: &crate::builtins::ParamKind, ty: &Type) -> bool {
     match kind {
         crate::builtins::ParamKind::Concrete(expected) => ty.assignable_to(expected),
         crate::builtins::ParamKind::AnyRelation => matches!(ty, Type::Relation(_) | Type::Unknown),
+        crate::builtins::ParamKind::AnySequence => matches!(ty, Type::Sequence(_) | Type::Unknown),
         crate::builtins::ParamKind::AnyTuple => matches!(ty, Type::Tuple(_) | Type::Unknown),
     }
 }

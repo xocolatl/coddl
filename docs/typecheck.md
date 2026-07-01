@@ -168,16 +168,26 @@ The `Builtins` table maps operator names to a *list* of `OperSig`s
 callee is a `NameRef` looks up its lexeme in this table; an unknown name
 produces `T0001`.
 
-| Name             | Heading                | Returns    |
-|------------------|------------------------|------------|
-| `write_line`     | `{ message: Text }`    | `Tuple {}` |
-| `write_relation` | `{ rel: Relation H }`  | `Tuple {}` |
-| `read_line`      | `{ prompt: Text }`     | `Text`     |
-| `to_text`        | `{ self: T }`          | `Text`     |
+| Name             | Heading                            | Returns    |
+|------------------|------------------------------------|------------|
+| `write_line`     | `{ message: Text }`                | `Tuple {}` |
+| `write_relation` | `{ rel: Relation H }`              | `Tuple {}` |
+| `read_line`      | `{ prompt: Text }`                 | `Text`     |
+| `to_text`        | `{ self: T }`                      | `Text`     |
+| `cardinality`    | `{ self: Relation H / Sequence T }`| `Integer`  |
 
 `write_relation` is polymorphic over the heading `H` (see
 "`write_relation` polymorphism" below). `read_line` is the first
 `Text`-returning builtin.
+
+`cardinality` is overloaded over `Relation H` and `Sequence T` — the TTM
+`COUNT` over a relation, and the element count of a sequence. Both store
+their count in the same RC-header `length` slot, so it lowers to one
+runtime read (`coddl_rc_length`), borrowing the receiver (it never alters
+the refcount). Like `write_relation`, each overload is heading-/element-type
+polymorphic — a dedicated `ParamKind` (`AnyRelation` / `AnySequence`)
+accepts any heading or element type. `Text` is intentionally excluded: its
+`length` is a byte count, not a character count.
 
 `to_text` is the first **overloaded** builtin: one monomorphic signature
 per scalar type `T` — `Text` (an identity copy), `Character`, `Integer`
