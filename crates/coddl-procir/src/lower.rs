@@ -660,6 +660,27 @@ impl Lowerer {
         }
     }
 
+    /// If `value` is a heap-managed binding in the current top scope, retain it
+    /// so it survives the scope-exit [`Self::release_top_scope_heap_locals`]
+    /// that follows — it escapes as the scope's result (return-of-local, e.g.
+    /// `[ let s = a || b; s ]`). The retain balances that release, leaving the
+    /// consumer a live `rc=1` reference; the consumer's own release frees it. A
+    /// fresh tail temporary (not bound to a local) isn't in the release set, so
+    /// it needs no retain; a value-type or borrowed (`param_value_ids`) result
+    /// no-ops via [`Self::needs_scope_release`]. Shared by the function
+    /// epilogue, `if`-arm exit, and transaction exit.
+    fn retain_if_escaping_local(&mut self, value: ValueId) {
+        let ty = self.value_type(value);
+        let in_scope = self
+            .locals
+            .last()
+            .map(|s| s.values().any(|(v, _)| *v == value))
+            .unwrap_or(false);
+        if in_scope && self.needs_scope_release(value, &ty) {
+            self.insts.push(Inst::Retain { src: value });
+        }
+    }
+
     fn lookup_extern(&self, surface: &str) -> Option<&'static BuiltinExtern> {
         BUILTIN_EXTERNS.iter().find(|e| e.surface == surface)
     }
@@ -966,10 +987,23 @@ impl Lowerer {
 
         let body_value = decl.body().map(|body| self.lower_block(&body));
 
-        // Release every heap-typed function-scope local before either
-        // the runtime-shutdown call (main) or the terminator (others).
-        // Phase 19 doesn't yet return heap values from functions, so
-        // we can release everything in the function scope here.
+        // When the body's tail value is actually returned (a non-`main`,
+        // non-Unit oper — the same condition that builds `Return(Some(v))`
+        // below), and that value is a heap-managed local, it escapes the
+        // function: retain it so the scope release below leaves the caller a
+        // live reference (return-of-local, `[ let s = a || b; s ]`). `main` and
+        // Unit-returning opers discard the tail value, so retaining it would
+        // leak — hence the guard.
+        let returns_value = !is_main && !matches!(declared_return, ProcType::Unit);
+        if returns_value {
+            if let Some(v) = body_value {
+                self.retain_if_escaping_local(v);
+            }
+        }
+
+        // Release every heap-typed function-scope local before either the
+        // runtime-shutdown call (main) or the terminator (others). The escaping
+        // return value, if any, was retained just above so it survives.
         self.release_top_scope_heap_locals();
         // Then the deferred `extract`-source relations — released last, after
         // every borrowed field they fed has been consumed.
@@ -1750,6 +1784,10 @@ impl Lowerer {
             Some(b) => {
                 self.push_local_scope();
                 let val = self.lower_block(&b);
+                // The arm's tail value always flows out to the merge block, so
+                // retain it if it's a heap-managed local before releasing the
+                // arm scope (return-of-local from an arm).
+                self.retain_if_escaping_local(val);
                 self.release_top_scope_heap_locals();
                 self.pop_local_scope();
                 val
@@ -3639,28 +3677,14 @@ impl Lowerer {
             None => self.fresh_value(),
         };
         self.emit_tx_call("coddl_commit_tx");
-        // If the body's tail value is a heap-typed local in this scope, it
-        // *escapes* as the transaction's result — retain it so the scope
-        // release below leaves the caller a live `rc=1` reference. (A relation
-        // returned from a transaction, e.g. `let x = R; x`, is a real case;
-        // without this the local is freed before the caller can use it.) A
-        // fresh tail value not bound to a local isn't in the release set, so it
-        // survives without a retain.
-        let val_ty = self.value_type(value);
-        let in_scope = self
-            .locals
-            .last()
-            .map(|scope| scope.values().any(|(v, _)| *v == value))
-            .unwrap_or(false);
-        // Owned `Text` escapes a transaction the same way a relation does
-        // (`let m = transaction [ let t = "a"||b; t ]`): retain before the
-        // scope release so the caller keeps a live reference. The escaped
-        // ValueId stays in `owned_texts` (function-global), so the outer
-        // binding's scope-exit release balances this retain.
-        let escapes = in_scope && self.needs_scope_release(value, &val_ty);
-        if escapes {
-            self.insts.push(Inst::Retain { src: value });
-        }
+        // The body's tail value is the transaction's result — if it's a
+        // heap-managed local in this scope it escapes, so retain it before the
+        // scope release leaves the caller a live reference (a relation or owned
+        // `Text` returned from a transaction, `let x = R; x` /
+        // `let m = transaction [ let t = "a"||b; t ]`). The escaped ValueId
+        // stays in `owned_texts` (function-global), so the outer binding's
+        // scope-exit release balances this retain.
+        self.retain_if_escaping_local(value);
         self.release_top_scope_heap_locals();
         self.pop_local_scope();
         value
@@ -6426,6 +6450,47 @@ oper main {} [
                 Inst::Call { callee, args, .. } if callee == "echo" && args.len() == 1
             )),
             "expected an in-module `echo` call with the receiver as its sole arg"
+        );
+    }
+
+    #[test]
+    fn return_of_owned_local_retains_before_release() {
+        // `[ let s = "a" || "b"; s ]` returns a bound owned-`Text` local. The
+        // epilogue retains it (escaping) so the scope release doesn't free the
+        // value the caller receives — return-of-local.
+        let src = "oper f {} -> Text [ let s = \"a\" || \"b\"; s ]; oper main {} [];";
+        let m = lower_ok(src);
+        let f = m.functions.iter().find(|f| f.name == "f").unwrap();
+        let block = &f.blocks[0];
+        let ret = match &block.terminator {
+            Terminator::Return(Some(v)) => *v,
+            other => panic!("expected Return(Some(_)), got {other:?}"),
+        };
+        assert!(
+            block
+                .insts
+                .iter()
+                .any(|i| matches!(i, Inst::Retain { src } if *src == ret)),
+            "the returned owned local must be retained (escaping) before the epilogue release"
+        );
+    }
+
+    #[test]
+    fn owned_local_not_returned_is_released_without_escaping_retain() {
+        // A Unit-returning oper binds an owned `Text` it does *not* return: it
+        // is released at scope exit, with no spurious escaping retain (which
+        // would leak).
+        let src = "oper g {} [ let _s = \"a\" || \"b\"; ];";
+        let m = lower_ok(src);
+        let g = m.functions.iter().find(|f| f.name == "g").unwrap();
+        let insts = &g.blocks[0].insts;
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::Release { .. })),
+            "the non-returned owned local should be released"
+        );
+        assert!(
+            !insts.iter().any(|i| matches!(i, Inst::Retain { .. })),
+            "no escaping retain for a value that isn't returned"
         );
     }
 

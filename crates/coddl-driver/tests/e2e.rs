@@ -39,6 +39,7 @@ fn fixtures_dir() -> &'static Path {
             ("relvar-if", RELVAR_IF_SRC),
             ("hello-everyone-2", HELLO_EVERYONE_2_SRC),
             ("ufcs-method", UFCS_METHOD_SRC),
+            ("return-local", RETURN_LOCAL_SRC),
             ("transaction", TRANSACTION_SRC),
             ("join-times-compose", JOIN_TIMES_COMPOSE_SRC),
             ("union-intersect-minus", UNION_INTERSECT_MINUS_SRC),
@@ -127,14 +128,24 @@ oper main {} [
 const HELLO_EVERYONE_2_SRC: &str = "\
 program hello_world;
 oper to_text { self: Sequence Text } -> Text [
-    if self.cardinality {} = 0 then [ \"no one\" ]
-    else [ self[0] || \" and possibly others\" ]
+    let result = if self.cardinality {} = 0 then [ \"no one\" ]
+                 else [ self[0] || \" and possibly others\" ];
+    result
 ];
 oper main {} [
     let names = Sequence [\"Alice\", \"Bob\"];
     let message = format { template: f\"Hello, {names}!\", params: { names } };
     write_line { message };
 ];
+";
+
+// Return-of-local: an oper returns a `let`-bound owned `Text`. The epilogue
+// retains it so the scope release doesn't free the value the caller receives
+// (a double-free would abort at runtime).
+const RETURN_LOCAL_SRC: &str = "\
+program return_local;
+oper make {} -> Text [ let s = \"x\" || \"y\"; s ];
+oper main {} [ write_line { message: make {} }; ];
 ";
 
 // UFCS on a *user* operator: `\"hi\".shout {}` ≡ `shout { self: \"hi\" }` — the
@@ -437,6 +448,38 @@ fn coddl_run_cranelift_ufcs_and_full_to_text() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.stdout, b"Hello, Alice and possibly others!\n");
+}
+
+#[test]
+fn coddl_run_llvm_return_of_owned_local() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("return-local"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=llvm failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"xy\n");
+}
+
+#[test]
+fn coddl_run_cranelift_return_of_owned_local() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("return-local"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"xy\n");
 }
 
 #[test]
