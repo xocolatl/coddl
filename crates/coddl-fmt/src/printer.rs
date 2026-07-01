@@ -135,6 +135,19 @@ fn separator(
         return Sep::Newline;
     }
 
+    // Glue a bracket-list to the name it belongs to — no space before the
+    // opener — for the three name-attached forms: a call's argument list
+    // (`f{ … }`), an `oper` declaration's parameter heading (`oper m{ … }`),
+    // and a sequence index (`s[0]`). This is a structural test on the CST, not
+    // a token-adjacency one: a `{ … }` tuple/relation literal or a
+    // `Sequence [ … ]` literal is *not* name-attached and keeps its space.
+    if ck == L_BRACE && opens_glued_braces(&toks[i]) {
+        return Sep::None;
+    }
+    if ck == L_BRACKET && is_child_of(&toks[i], INDEX_EXPR) {
+        return Sep::None;
+    }
+
     // Statement / declaration / member boundary: one per line at top level and
     // inside a multi-line group (block); an inline group stays on one line.
     if pk == SEMICOLON {
@@ -258,6 +271,28 @@ fn push_token(out: &mut String, tok: &SyntaxToken) {
     } else {
         out.push_str(tok.text());
     }
+}
+
+/// Whether this opening `{` heads a name-attached brace-list that glues to the
+/// preceding token: a call's argument list (`ARG_LIST` under a `CALL_EXPR`) or
+/// an `oper` declaration's parameter heading (`HEADING` under an `OPER_DECL`).
+/// Deliberately narrow — a shared `HEADING` under a `TYPE_REF`/relvar decl, or
+/// an `ARG_LIST` under a postfix operator, keeps its space.
+fn opens_glued_braces(tok: &SyntaxToken) -> bool {
+    let Some(parent) = tok.parent() else {
+        return false;
+    };
+    let grandparent = parent.parent().map(|n| n.kind());
+    match parent.kind() {
+        ARG_LIST => grandparent == Some(CALL_EXPR),
+        HEADING => grandparent == Some(OPER_DECL),
+        _ => false,
+    }
+}
+
+/// Whether `tok`'s immediate parent node is of kind `k`.
+fn is_child_of(tok: &SyntaxToken, k: SyntaxKind) -> bool {
+    tok.parent().map(|n| n.kind()) == Some(k)
 }
 
 fn is_open(k: SyntaxKind) -> bool {

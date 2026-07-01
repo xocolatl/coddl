@@ -94,14 +94,14 @@ mod tests {
     #[test]
     fn reformats_messy_into_canonical() {
         let src = "program p;\noper   main {}[ write_line{message:\"hi\"} ; ];\n";
-        let want = "program p;\noper main {} [\n    write_line { message: \"hi\" };\n];\n";
+        let want = "program p;\noper main{} [\n    write_line{ message: \"hi\" };\n];\n";
         let got = fmt(src);
         assert_eq!(got, want, "\n=== got ===\n{got}=== want ===\n{want}");
     }
 
     #[test]
     fn already_canonical_is_a_fixpoint() {
-        let src = "program p;\noper main {} [\n    write_line { message: \"hi\" };\n];\n";
+        let src = "program p;\noper main{} [\n    write_line{ message: \"hi\" };\n];\n";
         assert_eq!(fmt(src), src);
     }
 
@@ -148,13 +148,13 @@ mod tests {
         let src = "// header\nprogram p; // trailing\noper main {} [\n    write_line { message: \"hi\" }; // note\n];\n";
         let got = fmt(src);
         assert!(got.starts_with("// header\nprogram p; // trailing\n"), "got:\n{got}");
-        assert!(got.contains("write_line { message: \"hi\" }; // note"), "got:\n{got}");
+        assert!(got.contains("write_line{ message: \"hi\" }; // note"), "got:\n{got}");
         assert_eq!(fmt(&got), got, "comments must survive idempotently");
     }
 
     #[test]
     fn multiline_heading_and_block_are_preserved_and_idempotent() {
-        let src = "program p;\npublic relvar G {\n    id: Integer,\n    name: Text,\n} key { id };\noper main {} [\n    let t = transaction [\n        G where id = 1\n    ];\n];\n";
+        let src = "program p;\npublic relvar G {\n    id: Integer,\n    name: Text,\n} key { id };\noper main{} [\n    let t = transaction [\n        G where id = 1\n    ];\n];\n";
         let got = fmt(src);
         assert_eq!(got, src, "already-canonical multi-line input is a fixpoint:\n{got}");
     }
@@ -163,7 +163,33 @@ mod tests {
     fn collapses_blank_line_runs_to_one() {
         let src = "program p;\n\n\n\noper main {} [];\n";
         let got = fmt(src);
-        assert_eq!(got, "program p;\n\noper main {} [];\n", "got:\n{got}");
+        assert_eq!(got, "program p;\n\noper main{} [];\n", "got:\n{got}");
+    }
+
+    #[test]
+    fn glues_name_attached_bracket_lists() {
+        // A call's arg-list, an `oper` decl's heading, and a sequence index all
+        // glue their opener to the preceding name; the change is idempotent.
+        let src = "program p;\noper to_text { self: Sequence Text } [\n    let x = self [0];\n    write_line { message: x };\n];\n";
+        let got = fmt(src);
+        assert!(got.contains("oper to_text{ self: Sequence Text }"), "heading glue, got:\n{got}");
+        assert!(got.contains("self[0]"), "index glue, got:\n{got}");
+        assert!(got.contains("write_line{ message: x }"), "call glue, got:\n{got}");
+        assert_eq!(fmt(&got), got, "gluing must be idempotent");
+    }
+
+    #[test]
+    fn literals_and_shared_headings_keep_their_space() {
+        // The glue rule is structural and narrow: a `{ … }` tuple/relation
+        // literal value, a `Sequence [ … ]` literal, and a relvar declaration's
+        // (shared `HEADING`) heading all keep their leading space.
+        let src = "program p;\npublic relvar G { id: Integer } key { id };\noper main {} [\n    let xs = Sequence [\"a\", \"b\"];\n    let m = f { params: { xs } };\n];\n";
+        let got = fmt(src);
+        assert!(got.contains("public relvar G { id: Integer }"), "relvar heading spaced, got:\n{got}");
+        assert!(got.contains("Sequence [\"a\", \"b\"]"), "sequence literal spaced, got:\n{got}");
+        assert!(got.contains("params: { xs }"), "tuple literal spaced, got:\n{got}");
+        assert!(got.contains("f{ params:"), "call still glues, got:\n{got}");
+        assert_eq!(fmt(&got), got);
     }
 
     #[test]

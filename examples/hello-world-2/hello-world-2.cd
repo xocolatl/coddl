@@ -1,17 +1,17 @@
 program hello_world;
 
-oper to_text { self: Sequence Text } -> Text [
-    let result = if self.cardinality {} = 0 then [
+oper to_text{ self: Sequence Text } -> Text [
+    let result = if self.cardinality{} = 0 then [
         "no one"
     ] else [
-        self [0] || " and possibly others"
+        self[0] || " and possibly others"
     ];
 
     result
 ];
 
-oper main {} [
+oper main{} [
     let names = Sequence ["Alice", "Bob"];
-    let message = format { template: f"Hello, {names}!", params: { names } };
-    write_line { message };
+    let message = format{ template: f"Hello, {names}!", params: { names } };
+    write_line{ message };
 ];

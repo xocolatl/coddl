@@ -20,7 +20,8 @@ The formatter is opinionated and has few knobs. A `fmt` whose output drifts betw
 
 - **Indent**: 4 spaces (`indent_width` config; revisit if real demand surfaces).
 - **Line width**: 100 columns soft; hard if a single token can't be split.
-- **Braces**: `{` on the same line as the keyword/operator that opens them; `}` on its own line aligned with the opener — except trivial single-line bodies (`OP { x: 1, y: 2 }`) which stay inline up to the line-width limit.
+- **Braces**: `{` on the same line as the keyword/operator that opens them; `}` on its own line aligned with the opener — except trivial single-line bodies (`OP{ x: 1, y: 2 }`) which stay inline up to the line-width limit.
+- **Name-attached bracket lists glue to their name** — no space before the opener — for the three forms where the brackets *belong to* the preceding name: a call's argument list (`f{ … }`, including the dot-method form `x.m{ … }`), an `oper` declaration's parameter heading (`oper name{ … }`), and a sequence index (`s[0]`). This is a structural rule keyed on the CST node that owns the bracket, not on token adjacency: a `{ … }` tuple/relation literal value, a `Sequence [ … ]` literal, and a relvar/`Tuple`/`Relation` heading (the shared `HEADING` node in a non-`oper` position) are *not* name-attached and keep their leading space. Empty argument braces stay tight (`m{}`).
 - **Named arguments inside braces**: one space after the colon (`name: value`), one space after the inter-arg comma. One per line if any single arg makes the whole call exceed the line width; otherwise stay on the line. No alignment of names or colons across lines (it churns under add/remove).
 - **Operator spacing**: one space around `=`, `<`, `>`, `+`, `-`, `*`, `/`, `,`; no space around `.`.
 - **Trailing commas**: required in multi-line bracketed lists, forbidden in single-line ones (so adding then removing a wrap is idempotent).

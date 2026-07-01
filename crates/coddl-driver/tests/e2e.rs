@@ -3329,7 +3329,7 @@ fn fmt_reformats_to_canonical_and_is_idempotent() {
     let formatted = String::from_utf8(out.stdout).expect("utf8");
     assert_eq!(
         formatted,
-        "program p;\noper main {} [\n    write_line { message: \"hi\" };\n];\n"
+        "program p;\noper main{} [\n    write_line{ message: \"hi\" };\n];\n"
     );
 
     // Formatting the formatted output is byte-identical (idempotent).
