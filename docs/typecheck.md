@@ -634,3 +634,5 @@ check script enforces that.
 | T0062 | a `Sequence [ … ]` element's type differs from the first element's (sequences are homogeneous) |
 | T0063 | a sequence literal appears outside a `let` binding value (the only position it is permitted) |
 | T0064 | an **empty** `Sequence []` can't be constructed yet (no element to derive the payload layout from); empty-construction and iteration land with `load` (lowering) |
+| T0065 | postfix index `s[i]` requires a `Sequence` operand (the operand has some other type) |
+| T0066 | postfix index `s[i]` requires an `Integer` index (the index has some other type) |

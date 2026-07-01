@@ -534,8 +534,17 @@ function that implements it.
                     -- keywords. (Symbolic `-` is `Sub`; the keyword
                     -- `minus` is the relational set-difference op.)
 <postfix>       ::= <arg-list>                                 -- call: CALL_EXPR
-                  | <field-access-tail> ;                      -- field access: FIELD_ACCESS
+                  | <field-access-tail>                        -- field access: FIELD_ACCESS
+                  | <index-tail> ;                             -- index: INDEX_EXPR
 <field-access-tail> ::= '.' <identifier> ;
+<index-tail>    ::= '[' <expr> ']' ;                          -- INDEX_EXPR
+                    -- 0-based postfix sequence index `s[i]`,
+                    -- parsed inline in the postfix loop (like
+                    -- <field-access-tail>) so it binds tighter than
+                    -- the pipeline suffixes and `x[0][1]` nests left.
+                    -- P0058 on a missing index expr, P0057 on a
+                    -- missing `]`. Typecheck: operand `Sequence T`,
+                    -- index `Integer`, result `T` (T0065 / T0066).
 <primary-expr>  ::= <name-ref>
                   | <literal>
                   | <bool-lit>
@@ -721,7 +730,6 @@ is explicit, not implied:
   Relation literals `Relation { … }` landed in Phase 19. Boolean
   literals `true` / `false` and infix `=`, `<>`, `<`, `>`, `<=`,
   `>=`, `and`, `or`, `where` landed in Phase 20.)
-- **Indexing** (`s[i]`) in expression postfix position.
 - **`mod`** (`Integer × Integer → Integer`, multiplicative precedence) and
   **unary minus** / negative literals. Still deferred. (Binary arithmetic
   `+`, `-`, `*`, `/` on `Integer` and concatenation `||` on `Text`/`Character`
@@ -793,6 +801,8 @@ enforces that.
 | P0054 | Expected `{ … }` clause after the `update` target        |
 | P0055 | Expected `[` after `Sequence`                           |
 | P0056 | Expected `]` to close sequence literal                  |
+| P0057 | Expected `]` to close index expression                  |
+| P0058 | Expected index expression                               |
 
 Note: missing-type-after-`:` (let annotation), missing-type-after-`->`
 (operator return clause), and missing-element-after-`Sequence` all

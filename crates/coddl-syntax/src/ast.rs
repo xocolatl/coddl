@@ -510,6 +510,7 @@ pub enum Expr {
     Rename(RenameExpr),
     Wrap(WrapExpr),
     Unwrap(UnwrapExpr),
+    Index(IndexExpr),
 }
 
 impl Expr {
@@ -533,6 +534,7 @@ impl Expr {
             SyntaxKind::RENAME_EXPR => Expr::Rename(RenameExpr { syntax }),
             SyntaxKind::WRAP_EXPR => Expr::Wrap(WrapExpr { syntax }),
             SyntaxKind::UNWRAP_EXPR => Expr::Unwrap(UnwrapExpr { syntax }),
+            SyntaxKind::INDEX_EXPR => Expr::Index(IndexExpr { syntax }),
             // Parenthesized expressions are transparent — recurse to
             // the inner `Expr` so the typechecker / lowerer never see
             // the wrapper. Used purely for precedence grouping.
@@ -561,6 +563,7 @@ impl Expr {
             Expr::Rename(r) => r.syntax(),
             Expr::Wrap(w) => w.syntax(),
             Expr::Unwrap(u) => u.syntax(),
+            Expr::Index(i) => i.syntax(),
         }
     }
 }
@@ -1133,6 +1136,22 @@ impl TcloseExpr {
                     None
                 }
             })
+    }
+}
+
+ast_node!(pub IndexExpr, INDEX_EXPR);
+
+impl IndexExpr {
+    /// The sequence operand being indexed — the first `Expr` child
+    /// (`s` in `s[i]`).
+    pub fn sequence(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// The index expression between the brackets — the second `Expr` child
+    /// (`i` in `s[i]`). `None` on parse-recovery (an empty `s[]`, P0058).
+    pub fn index(&self) -> Option<Expr> {
+        self.syntax.children().filter_map(Expr::cast).nth(1)
     }
 }
 

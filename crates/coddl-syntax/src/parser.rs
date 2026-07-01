@@ -770,6 +770,22 @@ impl<'a> Parser<'a> {
                     }
                     self.finish_node();
                 }
+                // Postfix sequence index `s[i]` — 0-based, binds tighter than
+                // the pipeline operators (like the call/field-access arms), so
+                // `x[0][1]` nests left-associatively via the shared checkpoint.
+                SyntaxKind::L_BRACKET => {
+                    self.start_node_at(cp, SyntaxKind::INDEX_EXPR);
+                    self.bump(); // `[`
+                    let before = self.pos;
+                    self.parse_expr();
+                    if self.pos == before {
+                        self.error("P0058", "expected index expression");
+                    }
+                    if !self.eat(SyntaxKind::R_BRACKET) {
+                        self.error("P0057", "expected `]` to close index expression");
+                    }
+                    self.finish_node();
+                }
                 _ => break,
             }
         }
@@ -2886,6 +2902,60 @@ mod tests {
         assert!(
             out.diagnostics.iter().any(|d| d.code == "P0030"),
             "expected P0030, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    // ── Postfix sequence index `s[i]` ────────────────────────────────
+
+    #[test]
+    fn index_expr_parses() {
+        let out = parse_str("oper f {} [ s[1]; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let ie = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::INDEX_EXPR)
+            .expect("INDEX_EXPR in tree");
+        // Operand is a NAME_REF; the index `1` is a nested LITERAL.
+        let operand = ie.first_child().unwrap();
+        assert_eq!(operand.kind(), SyntaxKind::NAME_REF);
+        assert_eq!(operand.text(), "s");
+        assert_eq!(ie.text(), "s[1]");
+    }
+
+    #[test]
+    fn chained_index_nests() {
+        // `s[0][1]` — the outer INDEX_EXPR wraps the inner one.
+        let out = parse_str("oper f {} [ s[0][1]; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let outer = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::INDEX_EXPR)
+            .expect("INDEX_EXPR in tree");
+        let inner = outer.first_child().unwrap();
+        assert_eq!(inner.kind(), SyntaxKind::INDEX_EXPR);
+        assert_eq!(inner.text(), "s[0]");
+        assert_eq!(outer.text(), "s[0][1]");
+    }
+
+    #[test]
+    fn index_missing_close_bracket_diagnoses_p0057() {
+        let out = parse_str("oper f {} [ s[1; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0057"),
+            "expected P0057, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn index_missing_expr_diagnoses_p0058() {
+        let out = parse_str("oper f {} [ s[]; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0058"),
+            "expected P0058, got {:?}",
             out.diagnostics
         );
     }

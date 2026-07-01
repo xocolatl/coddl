@@ -31,6 +31,25 @@ const CARDINALITY: &str = "program p;\n\
                                write_line { message: to_text { self: n } };\n\
                            ];\n";
 
+// Postfix sequence indexing `s[i]` — 0-based. `xs[1]` on `["Alice", "Bob"]`
+// is the second element, printed directly. The element is retained into an
+// owned copy so it outlives the sequence's scope-exit release.
+const INDEX: &str = "program p;\n\
+                     oper main {}\n\
+                     [\n\
+                         let xs = Sequence [\"Alice\", \"Bob\"];\n\
+                         write_line { message: xs[1] };\n\
+                     ];\n";
+
+// An out-of-bounds index is a runtime error: `coddl_seq_index` aborts with a
+// diagnostic and a non-zero exit.
+const INDEX_OOB: &str = "program p;\n\
+                         oper main {}\n\
+                         [\n\
+                             let xs = Sequence [\"Alice\", \"Bob\"];\n\
+                             write_line { message: xs[5] };\n\
+                         ];\n";
+
 fn workspace_root() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop();
@@ -57,9 +76,10 @@ fn runtime_staticlib() -> PathBuf {
 }
 
 /// Lower `src`, emit a native object via Cranelift, link it with the runtime
-/// staticlib via `cc`, run the binary, and return its stdout. Asserts each
-/// step succeeds.
-fn compile_and_run(src: &str) -> Vec<u8> {
+/// staticlib via `cc`, and run the binary. Asserts the lower/emit/link steps
+/// succeed; returns the run's full `Output` **without** asserting on its exit
+/// status (so callers can assert either success or a runtime abort).
+fn run_program(src: &str) -> std::process::Output {
     let lower_out = lower(src, FileId(0));
     assert!(
         lower_out.diagnostics.is_empty(),
@@ -90,9 +110,14 @@ fn compile_and_run(src: &str) -> Vec<u8> {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let run = Command::new(&bin_path)
+    Command::new(&bin_path)
         .output()
-        .expect("run compiled binary");
+        .expect("run compiled binary")
+}
+
+/// Compile + run `src`, asserting a clean exit, and return its stdout.
+fn compile_and_run(src: &str) -> Vec<u8> {
+    let run = run_program(src);
     assert!(
         run.status.success(),
         "binary exited with {}:\nstderr:\n{}",
@@ -121,5 +146,31 @@ fn cardinality_cranelift_e2e() {
         b"3\n",
         "unexpected stdout: {:?}",
         String::from_utf8_lossy(&stdout)
+    );
+}
+
+#[test]
+fn index_cranelift_e2e() {
+    let stdout = compile_and_run(INDEX);
+    assert_eq!(
+        stdout,
+        b"Bob\n",
+        "unexpected stdout: {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+}
+
+#[test]
+fn index_out_of_bounds_aborts_cranelift_e2e() {
+    let run = run_program(INDEX_OOB);
+    assert!(
+        !run.status.success(),
+        "out-of-bounds index should exit non-zero, got {}",
+        run.status
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("out of bounds"),
+        "expected an out-of-bounds diagnostic on stderr, got: {stderr:?}"
     );
 }

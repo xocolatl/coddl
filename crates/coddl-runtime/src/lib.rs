@@ -27,8 +27,8 @@ pub mod relation;
 pub mod sqlite;
 
 pub use rc::{
-    coddl_rc_alloc, coddl_rc_length, coddl_rc_release, coddl_rc_retain, live_allocations,
-    CoddlKind, CoddlRcHeader, HEADER_SIZE, IMMORTAL_RC,
+    coddl_rc_alloc, coddl_rc_length, coddl_rc_release, coddl_rc_retain, coddl_seq_index,
+    live_allocations, CoddlKind, CoddlRcHeader, HEADER_SIZE, IMMORTAL_RC,
 };
 pub use relation::{
     coddl_extract_check_cardinality, coddl_relation_project, coddl_relation_rename,

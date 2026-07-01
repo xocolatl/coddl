@@ -226,6 +226,35 @@ pub unsafe extern "C" fn coddl_rc_length(ptr: *const u8) -> i64 {
     i64::from((*header).length)
 }
 
+/// Return the element *record* pointer for a 0-based `Sequence` index —
+/// `payload + index * record_size`, from which the caller `AttrLoad`s the
+/// synthetic single `value` cell (at offset 0). The postfix index expression
+/// `s[i]` lowers to a call here followed by that load.
+///
+/// Bounds are checked here (the codegen has no branching yet): a null
+/// sequence, or an `index` outside `0 ..< length`, prints a diagnostic and
+/// aborts (non-zero exit), mirroring `coddl_extract_check_cardinality`.
+/// Borrows: it inspects only the header and never touches any refcount.
+///
+/// # Safety
+/// `seq` must point to a payload returned by [`coddl_rc_alloc`] with a valid
+/// `Sequence` header (its `desc` carrying the element `record_size`).
+#[no_mangle]
+pub unsafe extern "C" fn coddl_seq_index(seq: *const u8, index: i64) -> *const u8 {
+    if seq.is_null() {
+        eprintln!("coddl: index: null sequence");
+        std::process::abort();
+    }
+    let header = seq.sub(HEADER_SIZE) as *const CoddlRcHeader;
+    let length = i64::from((*header).length);
+    if index < 0 || index >= length {
+        eprintln!("coddl: index {index} out of bounds (sequence length {length})");
+        std::process::abort();
+    }
+    let record_size = (*(*header).desc).record_size as usize;
+    seq.add(index as usize * record_size)
+}
+
 /// Debug-build accessor for the live-allocation counter. Returns 0
 /// in release builds. Used by runtime unit tests to confirm
 /// retain/release balance.

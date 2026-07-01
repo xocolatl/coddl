@@ -17,7 +17,7 @@ use coddl_plan::{Plan, WritePolicy};
 use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, DeleteStmt, Expr, ExprStmt,
     InsertStmt,
-    ExtendExpr, FieldAccess, Item,
+    ExtendExpr, FieldAccess, IndexExpr, Item,
     LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, RenameExpr,
     ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
     TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, WrapExpr,
@@ -638,15 +638,24 @@ impl Lowerer {
     /// Used by `main`'s init/shutdown wrapping; the synthetic extern
     /// participates in the same `seen_externs` deduplication as the
     /// builtin-mapped externs.
-    fn ensure_runtime_extern(&mut self, linkage: &'static str) {
+    /// Register a runtime extern (a block-less `Function` the backends emit as a
+    /// `declare`) under its linkage name, deduped by name. `params`/`return_type`
+    /// give the ABI signature used for the declaration; the call site supplies
+    /// the actual operands.
+    fn ensure_runtime_extern(
+        &mut self,
+        linkage: &'static str,
+        params: Vec<(String, ProcType)>,
+        return_type: ProcType,
+    ) {
         if !self.seen_externs.insert(linkage) {
             return;
         }
         self.functions.push(Function {
             name: linkage.to_string(),
             linkage_name: linkage.to_string(),
-            params: Vec::new(),
-            return_type: ProcType::Integer,
+            params,
+            return_type,
             blocks: Vec::new(),
         });
     }
@@ -874,7 +883,7 @@ impl Lowerer {
         // work — DB connection pool, prepared-statement cache,
         // arena setup — slots in without a codegen change.
         if is_main {
-            self.ensure_runtime_extern("coddl_runtime_init");
+            self.ensure_runtime_extern("coddl_runtime_init", Vec::new(), ProcType::Integer);
             let dst = self.fresh_value();
             self.record_type(dst, ProcType::Integer);
             self.insts.push(Inst::Call {
@@ -906,7 +915,7 @@ impl Lowerer {
             // call by `finalize_main_prologue`, mirroring the slot inits it
             // emits. The runtime's own `coddl_runtime_shutdown` also frees
             // any slot still alive (defense in depth).
-            self.ensure_runtime_extern("coddl_runtime_shutdown");
+            self.ensure_runtime_extern("coddl_runtime_shutdown", Vec::new(), ProcType::Integer);
             let dst = self.fresh_value();
             self.record_type(dst, ProcType::Integer);
             self.insts.push(Inst::Call {
@@ -1579,8 +1588,68 @@ impl Lowerer {
             Expr::Unwrap(u) => self.lower_unwrap_expr(u),
             Expr::Extend(e) => self.lower_extend_expr(e),
             Expr::Tclose(t) => self.lower_tclose_expr(t),
+            Expr::Index(i) => self.lower_index_expr(i),
             Expr::NameRef(n) => self.lower_name_ref(n),
         }
+    }
+
+    /// Lower `s[i]` — postfix sequence indexing (0-based). The runtime
+    /// `coddl_seq_index` bounds-checks `i` against the sequence's length
+    /// (aborting on out-of-bounds) and returns the element *record* pointer
+    /// `payload + i * record_size`; an `AttrLoad` at offset 0 then reads the
+    /// synthetic `value` cell. A heap `Text` element is retained into an owned
+    /// copy so it outlives the sequence's release (it may be returned or
+    /// consumed past the container's lifetime); a value-type element passes
+    /// through as-is.
+    fn lower_index_expr(&mut self, ie: &IndexExpr) -> ValueId {
+        let seq_expr = ie
+            .sequence()
+            .expect("typechecked index has a sequence operand");
+        let seq = self.lower_expr(&seq_expr);
+        let elem_proc = match self.value_type(seq) {
+            ProcType::Sequence(elem) => *elem,
+            other => unreachable!("index on non-sequence `{other}` survived typecheck"),
+        };
+        let idx_expr = ie.index().expect("typechecked index has an index operand");
+        let idx = self.lower_expr(&idx_expr);
+
+        // Bounds-checked element record pointer from the runtime.
+        self.ensure_runtime_extern(
+            "coddl_seq_index",
+            vec![
+                ("seq".to_string(), ProcType::Pointer),
+                ("index".to_string(), ProcType::Integer),
+            ],
+            ProcType::Pointer,
+        );
+        let rec = self.fresh_value();
+        self.record_type(rec, ProcType::Pointer);
+        self.insts.push(Inst::Call {
+            dst: Some(rec),
+            callee: "coddl_seq_index".to_string(),
+            args: vec![seq, idx],
+            return_type: ProcType::Pointer,
+        });
+
+        // Read the synthetic single `value` cell (offset 0 of the element
+        // record) — `AttrLoad` handles both scalar and `(ptr, len)` Text cells.
+        let elem = self.fresh_value();
+        self.record_type(elem, elem_proc.clone());
+        self.insts.push(Inst::AttrLoad {
+            dst: elem,
+            src: rec,
+            offset: 0,
+            attr_type: elem_proc.clone(),
+        });
+
+        // Owned copy: retain a heap `Text` element (the load is a borrow into
+        // the sequence's cell). Value-type elements need no retain.
+        if matches!(elem_proc, ProcType::Text) {
+            self.insts.push(Inst::Retain { src: elem });
+            self.mark_text_owned(elem);
+        }
+
+        elem
     }
 
     /// Development tripwire for the scalability gap S1 in `.local/optimizations.md`.
@@ -3424,7 +3493,7 @@ impl Lowerer {
     /// The dst is allocated and typed `Integer` (`CoddlStatus`) but
     /// never consumed — the no-op runtime always returns Ok in v1.
     fn emit_tx_call(&mut self, linkage: &'static str) {
-        self.ensure_runtime_extern(linkage);
+        self.ensure_runtime_extern(linkage, Vec::new(), ProcType::Integer);
         let dst = self.fresh_value();
         self.record_type(dst, ProcType::Integer);
         self.insts.push(Inst::Call {
@@ -6048,6 +6117,63 @@ oper main {} [
             .expect("coddl_rc_length extern declared");
         assert!(ext.blocks.is_empty(), "extern is a declaration only");
         assert!(matches!(ext.return_type, ProcType::Integer));
+    }
+
+    #[test]
+    fn sequence_index_lowers_to_seq_index_attrload_retain() {
+        // `s[i]` lowers to a bounds-checked `coddl_seq_index` call (-> Pointer,
+        // the element record), an `AttrLoad` of the synthetic `value` cell at
+        // offset 0, and — because the element is `Text` — a `Retain` into an
+        // owned copy.
+        let src = "oper main {} [ \
+                   let xs = Sequence [ \"a\", \"b\" ]; \
+                   let _e = xs[1]; \
+                   ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let insts = &main.blocks[0].insts;
+
+        // The runtime call returns a Pointer (the element record) from two args.
+        let (call_dst, args, ret) = insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::Call {
+                    dst,
+                    callee,
+                    args,
+                    return_type,
+                } if callee == "coddl_seq_index" => {
+                    Some((dst.unwrap(), args.clone(), return_type.clone()))
+                }
+                _ => None,
+            })
+            .expect("coddl_seq_index call emitted");
+        assert!(matches!(ret, ProcType::Pointer));
+        assert_eq!(args.len(), 2, "seq + index args");
+
+        // An AttrLoad at offset 0 reads the Text element cell from that Pointer.
+        assert!(
+            insts.iter().any(|i| matches!(i,
+                Inst::AttrLoad { src, offset: 0, attr_type, .. }
+                    if *src == call_dst && matches!(attr_type, ProcType::Text))),
+            "AttrLoad of the Text element at offset 0 of the record pointer"
+        );
+
+        // The Text element is retained into an owned copy.
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::Retain { .. })),
+            "Text element retained into an owned copy"
+        );
+
+        // The extern is declared once as a block-less `(Pointer, Integer) -> Pointer`.
+        let ext = m
+            .functions
+            .iter()
+            .find(|f| f.linkage_name == "coddl_seq_index")
+            .expect("coddl_seq_index extern declared");
+        assert!(ext.blocks.is_empty(), "extern is a declaration only");
+        assert!(matches!(ext.return_type, ProcType::Pointer));
+        assert_eq!(ext.params.len(), 2);
     }
 
     #[test]

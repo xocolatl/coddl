@@ -14,7 +14,8 @@ use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, DeleteStmt, Expr, ExprStmt,
     InsertStmt,
-    ExtendExpr, FieldAccess, Heading as AstHeading, Item, KeyClause, LetStmt, NamedArg, OperDecl,
+    ExtendExpr, FieldAccess, Heading as AstHeading, IndexExpr, Item, KeyClause, LetStmt, NamedArg,
+    OperDecl,
     PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr,
     ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
     TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, WrapExpr,
@@ -1359,6 +1360,51 @@ impl TypeChecker {
             Expr::Rename(r) => self.check_rename_expr(r, scope),
             Expr::Wrap(w) => self.check_wrap_expr(w, scope),
             Expr::Unwrap(u) => self.check_unwrap_expr(u, scope),
+            Expr::Index(i) => self.check_index_expr(i, scope),
+        }
+    }
+
+    /// Walk `s[i]` — postfix sequence indexing (0-based). The operand must be a
+    /// `Sequence T` (T0065 otherwise) and the index must be `Integer` (T0066
+    /// otherwise); the result is the element type `T`. Out-of-bounds is a
+    /// runtime error, not a type error.
+    fn check_index_expr(&mut self, ie: &IndexExpr, scope: &mut Scope) -> Type {
+        let seq_ty = match ie.sequence() {
+            Some(s) => self.check_expr(&s, scope),
+            None => return Type::Unknown,
+        };
+        // Check the index in all cases so its own errors (unresolved names,
+        // etc.) surface even when the operand is already bad.
+        let idx_ty = match ie.index() {
+            Some(i) => self.check_expr(&i, scope),
+            None => return Type::Unknown,
+        };
+        if !matches!(idx_ty, Type::Integer | Type::Unknown) {
+            let span = ie
+                .index()
+                .map(|i| self.node_span(i.syntax()))
+                .unwrap_or_else(|| self.node_span(ie.syntax()));
+            self.error(
+                span,
+                "T0066",
+                format!("sequence index must be Integer, but has type {idx_ty}"),
+            );
+        }
+        match seq_ty {
+            Type::Unknown => Type::Unknown,
+            Type::Sequence(elem) => *elem,
+            other => {
+                let span = ie
+                    .sequence()
+                    .map(|s| self.node_span(s.syntax()))
+                    .unwrap_or_else(|| self.node_span(ie.syntax()));
+                self.error(
+                    span,
+                    "T0065",
+                    format!("indexing requires a Sequence value, but operand has type {other}"),
+                );
+                Type::Unknown
+            }
         }
     }
 
@@ -4121,6 +4167,36 @@ mod tests {
         // rejected by the let-value-only rule.
         let src = "oper main {} [ Sequence [ 1 ]; ];";
         assert!(codes(src).contains(&"T0063"), "got {:?}", codes(src));
+    }
+
+    #[test]
+    fn sequence_index_yields_element_type() {
+        // `s[i]` on a `Sequence Text` has type `Text` (the element type).
+        let src = "oper main {} [ let _s = Sequence [ \"a\", \"b\" ]; let _e = _s[1]; ];";
+        let out = check(src, FileId(0), FileKind::Cd);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        // Two LetBinding hints: `_s : Sequence Text` and `_e : Text`.
+        assert!(
+            out.hints
+                .iter()
+                .any(|h| h.kind == HintKind::LetBinding && h.ty == Type::Text),
+            "expected a `Text` hint for the index result, got {:?}",
+            out.hints.iter().map(|h| &h.ty).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn indexing_non_sequence_emits_t0065() {
+        // The operand is an `Integer`, not a `Sequence`.
+        let src = "oper main {} [ let _s = 5; let _e = _s[0]; ];";
+        assert!(codes(src).contains(&"T0065"), "got {:?}", codes(src));
+    }
+
+    #[test]
+    fn non_integer_index_emits_t0066() {
+        // The index is a `Text`, not an `Integer`.
+        let src = "oper main {} [ let _s = Sequence [ \"a\" ]; let _e = _s[\"k\"]; ];";
+        assert!(codes(src).contains(&"T0066"), "got {:?}", codes(src));
     }
 
     #[test]
