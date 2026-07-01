@@ -1069,6 +1069,7 @@ fn emit_function(
 ) -> Result<(), CraneliftEmitError> {
     let mut ctx = obj.make_context();
     ctx.func.signature = cranelift_signature(obj, func);
+    let ptr_ty = obj.target_config().pointer_type();
     let mut fb_ctx = FunctionBuilderContext::new();
     let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
 
@@ -1126,6 +1127,35 @@ fn emit_function(
             ret_len_out = Some(bps[idx]);
         }
     }
+
+    // Append parameters for non-entry (merge) blocks — an `if` join value.
+    // Cranelift block parameters are the phi equivalent; each predecessor's
+    // jump supplies matching arguments. Seeded up front so the arms' jumps
+    // and uses after the merge resolve. Entry-block params (function params)
+    // were already seeded above; a `BasicBlock::params` is only ever non-empty
+    // for a merge block.
+    for procir_block in &func.blocks {
+        let cl_block = block_map[&procir_block.id];
+        for (pvid, pty) in &procir_block.params {
+            match pty {
+                ProcType::Text | ProcType::Binary => {
+                    let ptr = builder.append_block_param(cl_block, ptr_ty);
+                    let len = builder.append_block_param(cl_block, types::I64);
+                    values.insert(*pvid, ValueRepr::Text { ptr, len });
+                }
+                ProcType::Tuple(_) => {
+                    return Err(CraneliftEmitError::UnsupportedInst(
+                        "merging a Tuple value through `if` not yet supported".into(),
+                    ));
+                }
+                other => {
+                    let v = builder.append_block_param(cl_block, cranelift_value_type(other, ptr_ty));
+                    values.insert(*pvid, ValueRepr::Scalar(v));
+                }
+            }
+        }
+    }
+
     for procir_block in &func.blocks {
         let cl_block = block_map[&procir_block.id];
         builder.switch_to_block(cl_block);
@@ -1144,6 +1174,7 @@ fn emit_function(
             next_data,
             is_main,
             ret_len_out,
+            &block_map,
         )?;
         builder.seal_block(cl_block);
     }
@@ -1172,6 +1203,7 @@ fn emit_block(
     next_data: &mut u32,
     is_main: bool,
     ret_len_out: Option<CrValue>,
+    block_map: &HashMap<coddl_procir::BlockId, cranelift_codegen::ir::Block>,
 ) -> Result<(), CraneliftEmitError> {
     for inst in &block.insts {
         emit_inst(
@@ -1189,7 +1221,7 @@ fn emit_block(
             next_data,
         )?;
     }
-    emit_terminator(builder, &block.terminator, values, is_main, ret_len_out)?;
+    emit_terminator(builder, &block.terminator, values, is_main, ret_len_out, block_map)?;
     Ok(())
 }
 
@@ -2431,6 +2463,7 @@ fn emit_terminator(
     values: &HashMap<ValueId, ValueRepr>,
     is_main: bool,
     ret_len_out: Option<CrValue>,
+    block_map: &HashMap<coddl_procir::BlockId, cranelift_codegen::ir::Block>,
 ) -> Result<(), CraneliftEmitError> {
     match term {
         Terminator::Return(None) if is_main => {
@@ -2469,6 +2502,40 @@ fn emit_terminator(
                 )));
             }
         },
+        Terminator::CondBr {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            let c = match values.get(cond) {
+                Some(ValueRepr::Scalar(v)) => *v,
+                _ => {
+                    return Err(CraneliftEmitError::UnsupportedInst(
+                        "`if` condition must be a scalar Boolean".into(),
+                    ))
+                }
+            };
+            // `brif` branches on `c` being non-zero. Neither target takes
+            // arguments — join values flow through the merge block via each
+            // arm's `jump`.
+            builder
+                .ins()
+                .brif(c, block_map[then_block], &[], block_map[else_block], &[]);
+        }
+        Terminator::Br { target, args } => {
+            let mut cl_args: Vec<CrValue> = Vec::new();
+            for a in args {
+                match values.get(a) {
+                    Some(repr) => repr.push_call_operands(&mut cl_args),
+                    None => {
+                        return Err(CraneliftEmitError::UnsupportedInst(format!(
+                            "undefined branch argument {a:?}"
+                        )))
+                    }
+                }
+            }
+            builder.ins().jump(block_map[target], &cl_args);
+        }
         Terminator::Unreachable => {
             builder
                 .ins()

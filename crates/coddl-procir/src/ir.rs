@@ -151,6 +151,12 @@ impl Function {
 #[derive(Clone, Debug)]
 pub struct BasicBlock {
     pub id: BlockId,
+    /// Block parameters — SSA values bound on entry to this block, in order.
+    /// Empty for the entry block (function parameters are seeded from the
+    /// signature) and for the arms of an `if`; a merge block created by
+    /// `lower_if_expr` carries one parameter (the if-expression's value).
+    /// A predecessor's [`Terminator::Br`] supplies one argument per param.
+    pub params: Vec<(ValueId, ProcType)>,
     pub insts: Vec<Inst>,
     pub terminator: Terminator,
 }
@@ -539,6 +545,23 @@ pub enum ScalarOp {
 #[derive(Clone, Debug)]
 pub enum Terminator {
     Return(Option<ValueId>),
+    /// Two-way conditional branch on a `Boolean` value. Neither target
+    /// takes branch arguments — values that must survive the join flow
+    /// through the merge block's parameters via the arms' [`Terminator::Br`]
+    /// (see `lower_if_expr`). LLVM lowers this to `br i1`; Cranelift to
+    /// `brif`.
+    CondBr {
+        cond: ValueId,
+        then_block: BlockId,
+        else_block: BlockId,
+    },
+    /// Unconditional branch to `target`, passing `args` as that block's
+    /// parameters (SSA join). LLVM realizes the params as `phi` nodes at the
+    /// top of `target`; Cranelift as `target`'s block parameters.
+    Br {
+        target: BlockId,
+        args: Vec<ValueId>,
+    },
     /// Reserved for control-flow paths the typechecker has ruled out
     /// (e.g. a divergent branch). Not produced by hello-world.
     Unreachable,
@@ -916,6 +939,25 @@ impl fmt::Display for Terminator {
         match self {
             Terminator::Return(None) => f.write_str("return"),
             Terminator::Return(Some(v)) => write!(f, "return {v}"),
+            Terminator::CondBr {
+                cond,
+                then_block,
+                else_block,
+            } => write!(f, "condbr {cond} -> {then_block}, {else_block}"),
+            Terminator::Br { target, args } => {
+                write!(f, "br {target}")?;
+                if !args.is_empty() {
+                    f.write_str("(")?;
+                    for (i, a) in args.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{a}")?;
+                    }
+                    f.write_str(")")?;
+                }
+                Ok(())
+            }
             Terminator::Unreachable => f.write_str("unreachable"),
         }
     }
@@ -923,7 +965,18 @@ impl fmt::Display for Terminator {
 
 impl fmt::Display for BasicBlock {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "    {}:", self.id)?;
+        if self.params.is_empty() {
+            writeln!(f, "    {}:", self.id)?;
+        } else {
+            write!(f, "    {}(", self.id)?;
+            for (i, (v, ty)) in self.params.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{v}: {ty}")?;
+            }
+            writeln!(f, "):")?;
+        }
         for inst in &self.insts {
             writeln!(f, "        {inst}")?;
         }
@@ -1023,6 +1076,7 @@ mod tests {
             return_type: ProcType::Unit,
             blocks: vec![BasicBlock {
                 id: BlockId(0),
+                params: Vec::new(),
                 insts: vec![
                     Inst::Const {
                         dst: ValueId(0),

@@ -14,8 +14,8 @@ use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, DeleteStmt, Expr, ExprStmt,
     InsertStmt,
-    ExtendExpr, FieldAccess, Heading as AstHeading, IndexExpr, Item, KeyClause, LetStmt, NamedArg,
-    OperDecl,
+    ExtendExpr, FieldAccess, Heading as AstHeading, IfExpr, IndexExpr, Item, KeyClause, LetStmt,
+    NamedArg, OperDecl,
     PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr,
     ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
     TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, WrapExpr,
@@ -1361,6 +1361,85 @@ impl TypeChecker {
             Expr::Wrap(w) => self.check_wrap_expr(w, scope),
             Expr::Unwrap(u) => self.check_unwrap_expr(u, scope),
             Expr::Index(i) => self.check_index_expr(i, scope),
+            Expr::If(i) => self.check_if_expr(i, scope),
+        }
+    }
+
+    /// Check one `if` arm — an ordered block, scoped like a `transaction`
+    /// body so its locals don't leak (but without the transaction-depth bump;
+    /// an `if` is not a transaction boundary). An absent block (parse
+    /// recovery) is Unit.
+    fn check_if_arm(&mut self, block: Option<Block>, scope: &mut Scope) -> Type {
+        scope.push();
+        let ty = match block {
+            Some(b) => self.check_block(&b, scope),
+            None => Type::unit(),
+        };
+        let unused = scope.pop();
+        self.warn_unused(unused);
+        ty
+    }
+
+    /// Walk `if <cond> then [ … ] else [ … ]`. The condition must be `Boolean`
+    /// (T0067). With `else`, both arms must share a type (T0068) and that is
+    /// the result. Without `else`, the then-arm must be Unit (T0069) and the
+    /// result is Unit — the statement form.
+    fn check_if_expr(&mut self, ife: &IfExpr, scope: &mut Scope) -> Type {
+        let cond_ty = match ife.condition() {
+            Some(c) => self.check_expr(&c, scope),
+            None => Type::Unknown,
+        };
+        if !matches!(cond_ty, Type::Boolean | Type::Unknown) {
+            let span = ife
+                .condition()
+                .map(|c| self.node_span(c.syntax()))
+                .unwrap_or_else(|| self.node_span(ife.syntax()));
+            self.error(
+                span,
+                "T0067",
+                format!("`if` condition must be Boolean, but has type {cond_ty}"),
+            );
+        }
+
+        let then_ty = self.check_if_arm(ife.then_body(), scope);
+
+        match ife.else_body() {
+            Some(else_block) => {
+                let else_ty = self.check_if_arm(Some(else_block), scope);
+                // Only flag a genuine mismatch — if an arm already errored
+                // (Unknown), stay quiet and propagate the concrete side.
+                match (&then_ty, &else_ty) {
+                    (Type::Unknown, _) => else_ty,
+                    (_, Type::Unknown) => then_ty,
+                    _ if then_ty == else_ty => then_ty,
+                    _ => {
+                        self.error(
+                            self.node_span(ife.syntax()),
+                            "T0068",
+                            format!(
+                                "`if` arms have mismatched types — then {then_ty}, else {else_ty}"
+                            ),
+                        );
+                        Type::Unknown
+                    }
+                }
+            }
+            None => {
+                if then_ty != Type::unit() && then_ty != Type::Unknown {
+                    let span = ife
+                        .then_body()
+                        .map(|b| self.node_span(b.syntax()))
+                        .unwrap_or_else(|| self.node_span(ife.syntax()));
+                    self.error(
+                        span,
+                        "T0069",
+                        format!(
+                            "an `if` without `else` must have a Unit then-arm, but it has type {then_ty}"
+                        ),
+                    );
+                }
+                Type::unit()
+            }
         }
     }
 
@@ -2726,17 +2805,33 @@ impl TypeChecker {
     }
 
     fn check_call(&mut self, call: &CallExpr, scope: &mut Scope) -> Type {
-        // The callee must be a `NameRef` whose lexeme is in builtins.
+        // Resolve the callee to a method name plus, for the UFCS method-call
+        // form `receiver.method { … }`, the receiver's type — injected below
+        // as a synthetic `self` argument (`x.m { … }` ≡ `m { self: x, … }`).
+        // A bare `NameRef` callee is the ordinary prefix call (no receiver).
         let callee = call.callee();
-        let callee_name_tok = match &callee {
-            Some(Expr::NameRef(n)) => n.ident(),
-            _ => None,
-        };
-
-        let Some(callee_name_tok) = callee_name_tok else {
-            // Parser already complained about a missing callee, or the
-            // callee is structurally something else we don't handle yet.
-            return Type::Unknown;
+        let (callee_name_tok, self_ty): (SyntaxToken, Option<Type>) = match &callee {
+            Some(Expr::NameRef(n)) => match n.ident() {
+                Some(t) => (t, None),
+                None => return Type::Unknown,
+            },
+            Some(Expr::FieldAccess(fa)) => {
+                // The receiver is type-checked exactly once, here. (A braced
+                // call over a field access is a method call; a bare field
+                // access with no braces is a possrep/tuple field, handled by
+                // `check_field_access`.)
+                let recv_ty = match fa.base() {
+                    Some(b) => self.check_expr(&b, scope),
+                    None => return Type::Unknown,
+                };
+                match fa.field() {
+                    Some(t) => (t, Some(recv_ty)),
+                    None => return Type::Unknown,
+                }
+            }
+            // Parser already complained about a missing callee, or the callee
+            // is structurally something we don't handle as a call.
+            _ => return Type::Unknown,
         };
 
         let callee_name = callee_name_tok.text().to_string();
@@ -2744,8 +2839,9 @@ impl TypeChecker {
         // `format` is a compile-time intrinsic, not an ordinary builtin: it
         // needs a cross-argument check (placeholders ↔ params heading) and
         // has no runtime symbol, so it is handled entirely here and is not
-        // in the registry.
-        if callee_name == "format" {
+        // in the registry. It is not method-callable (`x.format {}` falls
+        // through to normal resolution and fails to resolve).
+        if callee_name == "format" && self_ty.is_none() {
             return self.check_format_call(call, scope);
         }
 
@@ -2758,6 +2854,24 @@ impl TypeChecker {
         if let Some(user_sig) = self.user_opers.get(&callee_name).cloned() {
             candidates.push(user_sig);
         }
+
+        // A method call `x.m { … }` requires `m` to declare a `self` parameter
+        // (UFCS binds the receiver to it). Reject up front with a clear
+        // diagnostic rather than cascading through arg resolution.
+        if self_ty.is_some()
+            && !candidates.is_empty()
+            && !candidates
+                .iter()
+                .any(|s| s.params.iter().any(|(p, _)| p.as_ref() == "self"))
+        {
+            self.error(
+                self.token_span(&callee_name_tok),
+                "T0070",
+                format!("`{callee_name}` is not callable as a method — it has no `self` parameter"),
+            );
+            return Type::Unknown;
+        }
+
         match candidates.len() {
             0 => {
                 self.error(
@@ -2774,9 +2888,17 @@ impl TypeChecker {
                 &callee_name,
                 &callee_name_tok,
                 candidates.into_iter().next().unwrap(),
+                self_ty,
                 scope,
             ),
-            _ => self.check_overloaded_call(call, &callee_name, &callee_name_tok, &candidates, scope),
+            _ => self.check_overloaded_call(
+                call,
+                &callee_name,
+                &callee_name_tok,
+                &candidates,
+                self_ty,
+                scope,
+            ),
         }
     }
 
@@ -2788,6 +2910,7 @@ impl TypeChecker {
         callee_name: &str,
         callee_name_tok: &SyntaxToken,
         sig: crate::builtins::OperSig,
+        self_ty: Option<Type>,
         scope: &mut Scope,
     ) -> Type {
         self.check_call_purity(callee_name, callee_name_tok, &sig);
@@ -2795,6 +2918,27 @@ impl TypeChecker {
         // Walk the actual argument list against the declared parameters.
         let mut seen: HashSet<String> = HashSet::new();
         let mut provided: HashSet<String> = HashSet::new();
+
+        // UFCS: the receiver supplies `self`. Mark it seen (so an explicit
+        // `self:` in the braces trips T0008) and provided, and validate the
+        // receiver against the `self` parameter's kind. (A candidate lacking
+        // `self` was already rejected in `check_call` with T0070.)
+        if let Some(recv_ty) = &self_ty {
+            seen.insert("self".to_string());
+            if let Some((_, kind)) = sig.params.iter().find(|(p, _)| p.as_ref() == "self") {
+                provided.insert("self".to_string());
+                if !matches!(recv_ty, Type::Unknown) && !param_kind_accepts(kind, recv_ty) {
+                    self.error(
+                        self.token_span(callee_name_tok),
+                        "T0004",
+                        format!(
+                            "receiver of `{callee_name}` has type {recv_ty}, which its `self` parameter does not accept"
+                        ),
+                    );
+                }
+            }
+        }
+
         if let Some(arg_list) = call.args() {
             for arg in arg_list.args() {
                 self.check_named_arg(&arg, &sig, scope, &mut seen, &mut provided);
@@ -2830,12 +2974,25 @@ impl TypeChecker {
         callee_name: &str,
         callee_name_tok: &SyntaxToken,
         sigs: &[crate::builtins::OperSig],
+        self_ty: Option<Type>,
         scope: &mut Scope,
     ) -> Type {
         let mut seen: HashSet<String> = HashSet::new();
         // (arg name, evaluated type)
         let mut args: Vec<(String, Type)> = Vec::new();
         let mut any_unknown = false;
+        // UFCS: the receiver is a synthetic `self` argument (already checked in
+        // `check_call`). It joins overload resolution like any other arg — its
+        // type picks the overload (e.g. a `Sequence` receiver selects
+        // `cardinality`'s `AnySequence` over `AnyRelation`). Seeding `seen`
+        // makes an explicit `self:` in the braces a duplicate (T0008).
+        if let Some(recv_ty) = self_ty {
+            seen.insert("self".to_string());
+            if matches!(recv_ty, Type::Unknown) {
+                any_unknown = true;
+            }
+            args.push(("self".to_string(), recv_ty));
+        }
         if let Some(arg_list) = call.args() {
             for arg in arg_list.args() {
                 let Some(name_tok) = arg.name() else { continue };
@@ -4197,6 +4354,87 @@ mod tests {
         // The index is a `Text`, not an `Integer`.
         let src = "oper main {} [ let _s = Sequence [ \"a\" ]; let _e = _s[\"k\"]; ];";
         assert!(codes(src).contains(&"T0066"), "got {:?}", codes(src));
+    }
+
+    // ── `if <cond> then [ … ] else [ … ]` ────────────────────────────
+
+    #[test]
+    fn if_with_else_typechecks_clean() {
+        // The `if` is the tail expression; both arms are Integer, matching
+        // the declared return.
+        let src = "oper f {} -> Integer [ if true then [ 1 ] else [ 2 ] ]; oper main {} [];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected clean, got {diags:?}");
+    }
+
+    #[test]
+    fn if_non_boolean_condition_emits_t0067() {
+        let src = "oper main {} [ let _b = if 5 then [ 1 ] else [ 2 ]; ];";
+        assert!(codes(src).contains(&"T0067"), "got {:?}", codes(src));
+    }
+
+    #[test]
+    fn if_arm_type_mismatch_emits_t0068() {
+        // then is Integer, else is Text.
+        let src = "oper main {} [ let _b = if true then [ 1 ] else [ \"x\" ]; ];";
+        assert!(codes(src).contains(&"T0068"), "got {:?}", codes(src));
+    }
+
+    #[test]
+    fn if_without_else_non_unit_then_emits_t0069() {
+        // No else, but the then-arm is Integer (not Unit).
+        let src = "oper main {} [ if true then [ 1 ]; ];";
+        assert!(codes(src).contains(&"T0069"), "got {:?}", codes(src));
+    }
+
+    #[test]
+    fn if_without_else_unit_then_clean() {
+        // No else, then-arm value is Unit (`{}`) — the statement form.
+        let src = "oper main {} [ if true then [ {} ]; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected clean, got {diags:?}");
+    }
+
+    // ── UFCS method calls (`x.m {}` ≡ `m { self: x }`) ───────────────
+
+    #[test]
+    fn ufcs_cardinality_on_sequence_resolves() {
+        // `xs.cardinality {}` picks the `AnySequence` overload → Integer.
+        let src = "oper main {} [ let xs = Sequence [ \"a\", \"b\" ]; let _n = xs.cardinality {}; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected clean, got {diags:?}");
+    }
+
+    #[test]
+    fn ufcs_user_oper_method_resolves() {
+        // `"hi".greet {}` ≡ `greet { self: "hi" }`.
+        let src = "oper greet { self: Text } -> Text [ self ]; \
+                   oper main {} [ let _g = \"hi\".greet {}; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected clean, got {diags:?}");
+    }
+
+    #[test]
+    fn ufcs_multi_arg_binds_self_from_receiver() {
+        // `self` comes from the receiver, `other` from the braces.
+        let src = "oper same { self: Integer, other: Integer } -> Boolean [ self = other ]; \
+                   oper main {} [ let _b = 5.same { other: 3 }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected clean, got {diags:?}");
+    }
+
+    #[test]
+    fn ufcs_method_without_self_param_emits_t0070() {
+        let src = "oper noself {} -> Integer [ 1 ]; \
+                   oper main {} [ let _n = 5.noself {}; ];";
+        assert!(codes(src).contains(&"T0070"), "got {:?}", codes(src));
+    }
+
+    #[test]
+    fn ufcs_receiver_type_mismatch_emits_t0054() {
+        // `cardinality`'s overloads accept Relation/Sequence, not Integer.
+        let src = "oper main {} [ let _n = 5.cardinality {}; ];";
+        assert!(codes(src).contains(&"T0054"), "got {:?}", codes(src));
     }
 
     #[test]

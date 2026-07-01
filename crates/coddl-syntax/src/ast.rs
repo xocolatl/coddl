@@ -511,6 +511,7 @@ pub enum Expr {
     Wrap(WrapExpr),
     Unwrap(UnwrapExpr),
     Index(IndexExpr),
+    If(IfExpr),
 }
 
 impl Expr {
@@ -535,6 +536,7 @@ impl Expr {
             SyntaxKind::WRAP_EXPR => Expr::Wrap(WrapExpr { syntax }),
             SyntaxKind::UNWRAP_EXPR => Expr::Unwrap(UnwrapExpr { syntax }),
             SyntaxKind::INDEX_EXPR => Expr::Index(IndexExpr { syntax }),
+            SyntaxKind::IF_EXPR => Expr::If(IfExpr { syntax }),
             // Parenthesized expressions are transparent — recurse to
             // the inner `Expr` so the typechecker / lowerer never see
             // the wrapper. Used purely for precedence grouping.
@@ -564,6 +566,7 @@ impl Expr {
             Expr::Wrap(w) => w.syntax(),
             Expr::Unwrap(u) => u.syntax(),
             Expr::Index(i) => i.syntax(),
+            Expr::If(i) => i.syntax(),
         }
     }
 }
@@ -1152,6 +1155,29 @@ impl IndexExpr {
     /// (`i` in `s[i]`). `None` on parse-recovery (an empty `s[]`, P0058).
     pub fn index(&self) -> Option<Expr> {
         self.syntax.children().filter_map(Expr::cast).nth(1)
+    }
+}
+
+ast_node!(pub IfExpr, IF_EXPR);
+
+impl IfExpr {
+    /// The condition expression — the sole `Expr` child, sitting between
+    /// `if` and `then`. `None` on parse-recovery. (`Block` arms are not
+    /// `Expr`s, so they never shadow this.)
+    pub fn condition(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// The then-block — the first `Block` child (after `then`). `None` on
+    /// parse-recovery.
+    pub fn then_body(&self) -> Option<Block> {
+        children::<Block>(&self.syntax).next()
+    }
+
+    /// The else-block — the second `Block` child. `None` when the `if` has no
+    /// `else` clause (the Unit-typed statement form).
+    pub fn else_body(&self) -> Option<Block> {
+        children::<Block>(&self.syntax).nth(1)
     }
 }
 

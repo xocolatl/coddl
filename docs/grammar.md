@@ -537,6 +537,13 @@ function that implements it.
                   | <field-access-tail>                        -- field access: FIELD_ACCESS
                   | <index-tail> ;                             -- index: INDEX_EXPR
 <field-access-tail> ::= '.' <identifier> ;
+                    -- A brace call over a field access — a CALL_EXPR whose
+                    -- callee is a FIELD_ACCESS (`x.m { … }`) — is the UFCS
+                    -- method-call form: sugar for `m { self: x, … }`,
+                    -- resolved by the typechecker (dispatch on the receiver's
+                    -- type; T0070 if `m` has no `self` param). No dedicated
+                    -- production — it falls out of postfix chaining. A bare
+                    -- `x.m` with no braces stays a possrep/tuple field access.
 <index-tail>    ::= '[' <expr> ']' ;                          -- INDEX_EXPR
                     -- 0-based postfix sequence index `s[i]`,
                     -- parsed inline in the postfix loop (like
@@ -549,6 +556,7 @@ function that implements it.
                   | <literal>
                   | <bool-lit>
                   | <transaction-expr>
+                  | <if-expr>
                   | <tuple-lit>
                   | <relation-lit>
                   | <sequence-lit>
@@ -656,6 +664,21 @@ function that implements it.
                     -- on a missing `{`, P0052 on a missing name, P0053 on a
                     -- missing `}`. v1 declines the SQL push. Contextual keyword.
 <transaction-expr> ::= 'transaction' <block> ;                 -- parse_transaction_expr
+<if-expr>       ::= 'if' <expr> 'then' <block>
+                    [ 'else' <block> ] ;                       -- parse_if_expr (IF_EXPR)
+                    -- `if`/`then`/`else` are contextual keywords. `then`
+                    -- delimits the condition so it parses at full precedence:
+                    -- `[` is otherwise ambiguous between a postfix index and
+                    -- the ordered block, and a condition ending in an index
+                    -- run (`if grid[r][c] then …`) can't be split from the
+                    -- block positionally. Both arms are ordered <block>s
+                    -- (bracket = ordered). `else` is optional — a bare
+                    -- `if … then [ … ]` is the Unit-typed statement form.
+                    -- P0059 if `then` is missing, P0060 on a missing then-block
+                    -- `[`, P0061 on a missing else-block `[`. Typecheck:
+                    -- condition Boolean (T0067); with `else` the arms unify
+                    -- (T0068); without `else` the then-arm must be Unit
+                    -- (T0069). Chain via nesting `else [ if … ]`.
 <name-ref>      ::= <identifier> ;
 <arg-list>      ::= '{' [ <named-arg> commalist ] '}' ;        -- parse_arg_list
 <named-arg>     ::= <identifier> [ ':' <expr> ] ;              -- parse_named_arg
@@ -803,6 +826,9 @@ enforces that.
 | P0056 | Expected `]` to close sequence literal                  |
 | P0057 | Expected `]` to close index expression                  |
 | P0058 | Expected index expression                               |
+| P0059 | Expected `then` after the `if` condition                |
+| P0060 | Expected `[` to start the `if` block                    |
+| P0061 | Expected `[` after `else`                               |
 
 Note: missing-type-after-`:` (let annotation), missing-type-after-`->`
 (operator return clause), and missing-element-after-`Sequence` all

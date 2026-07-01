@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use coddl_procir::{
-    record_layout, BasicBlock, Codegen, Const, Function, HeadingId, Inst, Module, ProcType,
+    record_layout, BasicBlock, BlockId, Codegen, Const, Function, HeadingId, Inst, Module, ProcType,
     RecordLayout, ScalarOp, Terminator, Type, ValueId,
 };
 
@@ -634,8 +634,13 @@ impl Emitter {
         )
         .unwrap();
 
+        // Predecessor `Br` edges per block, so a merge block's parameters can
+        // be realized as `phi` nodes (each incoming value paired with the
+        // predecessor block it flows from). Only `Br` carries join values;
+        // `CondBr` targets never have parameters.
+        let preds = br_predecessors(&func.blocks);
         for block in &func.blocks {
-            self.emit_block(block, is_main, &func.return_type)?;
+            self.emit_block(block, &preds, is_main, &func.return_type)?;
         }
 
         writeln!(self.body, "}}").unwrap();
@@ -645,14 +650,107 @@ impl Emitter {
     fn emit_block(
         &mut self,
         block: &BasicBlock,
+        preds: &HashMap<BlockId, Vec<(BlockId, Vec<ValueId>)>>,
         is_main: bool,
         return_type: &ProcType,
     ) -> Result<(), LlvmEmitError> {
         writeln!(self.body, "{}:", block.id).unwrap();
+        // Block parameters (an `if` merge block's join value) become `phi`
+        // nodes — which must precede all non-phi instructions.
+        if !block.params.is_empty() {
+            let empty = Vec::new();
+            let incoming = preds.get(&block.id).unwrap_or(&empty);
+            for (i, (pvid, pty)) in block.params.clone().iter().enumerate() {
+                self.emit_phi(*pvid, pty, i, incoming)?;
+            }
+        }
         for inst in &block.insts {
             self.emit_inst(inst)?;
         }
         self.emit_terminator(&block.terminator, is_main, return_type)?;
+        Ok(())
+    }
+
+    /// Emit the `phi` node(s) defining block parameter `pvid` of type `pty`,
+    /// selecting the `idx`-th argument from each predecessor's `Br`. A scalar
+    /// param is one `phi`; a `Text` param is two (ptr + len).
+    fn emit_phi(
+        &mut self,
+        pvid: ValueId,
+        pty: &ProcType,
+        idx: usize,
+        incoming: &[(BlockId, Vec<ValueId>)],
+    ) -> Result<(), LlvmEmitError> {
+        // Resolve the incoming value from each predecessor into its repr.
+        let mut reprs: Vec<(BlockId, ValueRepr)> = Vec::with_capacity(incoming.len());
+        for (src, args) in incoming {
+            let arg = args.get(idx).ok_or_else(|| {
+                LlvmEmitError::UnsupportedInst(format!(
+                    "block param {idx} has no branch argument from {src:?}"
+                ))
+            })?;
+            let repr = self
+                .values
+                .get(arg)
+                .ok_or_else(|| {
+                    LlvmEmitError::UnsupportedInst(format!("undefined phi operand {arg:?}"))
+                })?
+                .clone();
+            reprs.push((*src, repr));
+        }
+
+        match pty {
+            ProcType::Text | ProcType::Binary => {
+                let ptr_name = format!("%v{}.ptr", pvid.0);
+                let len_name = format!("%v{}.len", pvid.0);
+                let mut ptr_entries = Vec::new();
+                let mut len_entries = Vec::new();
+                for (src, repr) in &reprs {
+                    let ValueRepr::Text { ptr_op, len_op } = repr else {
+                        return Err(LlvmEmitError::UnsupportedInst(
+                            "phi expected a Text operand".into(),
+                        ));
+                    };
+                    ptr_entries.push(format!("[ {ptr_op}, %{src} ]"));
+                    len_entries.push(format!("[ {len_op}, %{src} ]"));
+                }
+                writeln!(self.body, "    {ptr_name} = phi ptr {}", ptr_entries.join(", ")).unwrap();
+                writeln!(self.body, "    {len_name} = phi i64 {}", len_entries.join(", ")).unwrap();
+                self.values.insert(
+                    pvid,
+                    ValueRepr::Text {
+                        ptr_op: ptr_name,
+                        len_op: len_name,
+                    },
+                );
+            }
+            ProcType::Tuple(_) => {
+                return Err(LlvmEmitError::UnsupportedInst(
+                    "merging a Tuple value through `if` not yet supported".into(),
+                ));
+            }
+            other => {
+                let name = format!("%v{}", pvid.0);
+                let lty = llvm_value_type(other);
+                let mut entries = Vec::new();
+                for (src, repr) in &reprs {
+                    let ValueRepr::Scalar { op, .. } = repr else {
+                        return Err(LlvmEmitError::UnsupportedInst(
+                            "phi expected a scalar operand".into(),
+                        ));
+                    };
+                    entries.push(format!("[ {op}, %{src} ]"));
+                }
+                writeln!(self.body, "    {name} = phi {lty} {}", entries.join(", ")).unwrap();
+                self.values.insert(
+                    pvid,
+                    ValueRepr::Scalar {
+                        ty: lty.to_string(),
+                        op: name,
+                    },
+                );
+            }
+        }
         Ok(())
     }
 
@@ -2265,12 +2363,64 @@ impl Emitter {
                     }
                 }
             }
+            Terminator::CondBr {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                let repr = self
+                    .values
+                    .get(cond)
+                    .ok_or_else(|| {
+                        LlvmEmitError::UnsupportedInst(format!("undefined condition {cond:?}"))
+                    })?
+                    .clone();
+                let cond_i1 = match repr {
+                    ValueRepr::Scalar { ty, op } if ty == "i1" => op,
+                    // A Boolean that arrived as `i8` (a C-ABI-widened value)
+                    // truncates back to `i1` for the branch.
+                    ValueRepr::Scalar { ty, op } if ty == "i8" => {
+                        let t = format!("%v_cond.{}", self.next_str);
+                        self.next_str += 1;
+                        writeln!(self.body, "    {t} = trunc i8 {op} to i1").unwrap();
+                        t
+                    }
+                    other => {
+                        return Err(LlvmEmitError::UnsupportedInst(format!(
+                            "`if` condition must be a Boolean scalar, got {other:?}"
+                        )))
+                    }
+                };
+                writeln!(
+                    self.body,
+                    "    br i1 {cond_i1}, label %{then_block}, label %{else_block}"
+                )
+                .unwrap();
+            }
+            Terminator::Br { target, .. } => {
+                // Arguments feed the target's `phi` nodes (emitted there), not
+                // the branch itself.
+                writeln!(self.body, "    br label %{target}").unwrap();
+            }
             Terminator::Unreachable => {
                 writeln!(self.body, "    unreachable").unwrap();
             }
         }
         Ok(())
     }
+}
+
+/// Map each block to the predecessors that reach it via an unconditional
+/// `Br`, along with the branch arguments they pass. Only `Br` supplies
+/// `phi` operands; a `CondBr`'s targets never carry parameters.
+fn br_predecessors(blocks: &[BasicBlock]) -> HashMap<BlockId, Vec<(BlockId, Vec<ValueId>)>> {
+    let mut preds: HashMap<BlockId, Vec<(BlockId, Vec<ValueId>)>> = HashMap::new();
+    for b in blocks {
+        if let Terminator::Br { target, args } = &b.terminator {
+            preds.entry(*target).or_default().push((b.id, args.clone()));
+        }
+    }
+    preds
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

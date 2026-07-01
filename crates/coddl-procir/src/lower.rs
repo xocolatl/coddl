@@ -17,7 +17,7 @@ use coddl_plan::{Plan, WritePolicy};
 use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, DeleteStmt, Expr, ExprStmt,
     InsertStmt,
-    ExtendExpr, FieldAccess, IndexExpr, Item,
+    ExtendExpr, FieldAccess, IfExpr, IndexExpr, Item,
     LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, RenameExpr,
     ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
     TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, WrapExpr,
@@ -233,7 +233,20 @@ struct Lowerer {
     // Per-function state, reset on each `lower_oper_decl`.
     next_value: u32,
     next_block: u32,
+    /// Instructions accumulated into the block currently being built
+    /// (`current_block`). Moved into a `BasicBlock` by `finish_block`.
     insts: Vec<Inst>,
+    /// Finished basic blocks of the current function, in *finish order*.
+    /// A block is finished (pushed here) only once its terminator is known,
+    /// which guarantees the entry block lands first and every predecessor
+    /// precedes the block it branches to — the ordering both backends rely
+    /// on. A straight-line body produces a single entry block, as before.
+    blocks: Vec<BasicBlock>,
+    /// Id of the block currently being built.
+    current_block: BlockId,
+    /// Parameters of `current_block` (SSA values bound on block entry).
+    /// Non-empty only for an `if` merge block that carries the join value.
+    current_block_params: Vec<(ValueId, ProcType)>,
     /// Stack of binding scopes. The outermost layer is the function's
     /// parameter scope; each `transaction [...]` block pushes a new
     /// layer; `let` statements insert into the topmost layer. Each
@@ -364,6 +377,9 @@ impl Lowerer {
             next_value: 0,
             next_block: 0,
             insts: Vec::new(),
+            blocks: Vec::new(),
+            current_block: BlockId(0),
+            current_block_params: Vec::new(),
             locals: vec![HashMap::new()],
             relexpr_aliases: vec![HashMap::new()],
             value_types: HashMap::new(),
@@ -507,10 +523,42 @@ impl Lowerer {
         b
     }
 
+    /// Open a function/helper body: mint the entry block and make it current.
+    /// Returns the entry `BlockId` (always `BlockId(0)` after a reset — the
+    /// backends seed function parameters into `blocks.first()`).
+    fn begin_function_body(&mut self) -> BlockId {
+        let entry = self.fresh_block();
+        self.current_block = entry;
+        self.current_block_params.clear();
+        entry
+    }
+
+    /// Seal `current_block` with `terminator`, moving its accumulated
+    /// instructions and parameters into a finished `BasicBlock`.
+    fn finish_block(&mut self, terminator: Terminator) {
+        let block = BasicBlock {
+            id: self.current_block,
+            params: std::mem::take(&mut self.current_block_params),
+            insts: std::mem::take(&mut self.insts),
+            terminator,
+        };
+        self.blocks.push(block);
+    }
+
+    /// Make `id` the current block, with the given block parameters. `insts`
+    /// is already empty (the previous block was sealed by `finish_block`).
+    fn start_block(&mut self, id: BlockId, params: Vec<(ValueId, ProcType)>) {
+        self.current_block = id;
+        self.current_block_params = params;
+    }
+
     fn reset_function_state(&mut self) {
         self.next_value = 0;
         self.next_block = 0;
         self.insts.clear();
+        self.blocks.clear();
+        self.current_block = BlockId(0);
+        self.current_block_params.clear();
         self.locals.clear();
         self.locals.push(HashMap::new());
         self.relexpr_aliases.clear();
@@ -788,22 +836,39 @@ impl Lowerer {
             Some(f) => f,
             None => return,
         };
-        let block = match main.blocks.first_mut() {
-            Some(b) => b,
-            None => return,
-        };
-        let at = block
-            .insts
-            .iter()
-            .position(|i| matches!(i, Inst::Call { callee, .. } if callee == "coddl_runtime_init"))
-            .map(|p| p + 1)
-            .unwrap_or(0);
-        block.insts.splice(at..at, prologue);
+        // The prologue goes right after `coddl_runtime_init` and the releases
+        // right before `coddl_runtime_shutdown`. Both calls sit in a *single*
+        // block each, but not necessarily the same one: `init` is always in the
+        // entry block (emitted before the body), while `shutdown` rides the
+        // block current at body end — the entry for a straight-line `main`, or
+        // a merge block if `main`'s body ends in control flow (an `if`). Locate
+        // each by the block that holds its call so both cases splice correctly.
+        if !prologue.is_empty() {
+            if let Some(block) = main.blocks.iter_mut().find(|b| {
+                b.insts.iter().any(
+                    |i| matches!(i, Inst::Call { callee, .. } if callee == "coddl_runtime_init"),
+                )
+            }) {
+                let at = block
+                    .insts
+                    .iter()
+                    .position(|i| matches!(i, Inst::Call { callee, .. } if callee == "coddl_runtime_init"))
+                    .map(|p| p + 1)
+                    .unwrap_or(0);
+                block.insts.splice(at..at, prologue);
+            }
+        }
         if !releases.is_empty() {
-            if let Some(sp) = block.insts.iter().position(
-                |i| matches!(i, Inst::Call { callee, .. } if callee == "coddl_runtime_shutdown"),
-            ) {
-                block.insts.splice(sp..sp, releases);
+            if let Some(block) = main.blocks.iter_mut().find(|b| {
+                b.insts.iter().any(
+                    |i| matches!(i, Inst::Call { callee, .. } if callee == "coddl_runtime_shutdown"),
+                )
+            }) {
+                if let Some(sp) = block.insts.iter().position(
+                    |i| matches!(i, Inst::Call { callee, .. } if callee == "coddl_runtime_shutdown"),
+                ) {
+                    block.insts.splice(sp..sp, releases);
+                }
             }
         }
     }
@@ -875,7 +940,7 @@ impl Lowerer {
         }
         self.next_value = params.len() as u32;
 
-        let block_id = self.fresh_block();
+        self.begin_function_body();
 
         // The compiled program's startup must call the runtime before
         // touching any other extern (docs/runtime.md). Today the
@@ -939,18 +1004,14 @@ impl Lowerer {
             Terminator::Return(None)
         };
 
-        let block = BasicBlock {
-            id: block_id,
-            insts: std::mem::take(&mut self.insts),
-            terminator,
-        };
+        self.finish_block(terminator);
 
         Function {
             name,
             linkage_name,
             params,
             return_type: declared_return,
-            blocks: vec![block],
+            blocks: std::mem::take(&mut self.blocks),
         }
     }
 
@@ -1589,7 +1650,115 @@ impl Lowerer {
             Expr::Extend(e) => self.lower_extend_expr(e),
             Expr::Tclose(t) => self.lower_tclose_expr(t),
             Expr::Index(i) => self.lower_index_expr(i),
+            Expr::If(i) => self.lower_if_expr(i),
             Expr::NameRef(n) => self.lower_name_ref(n),
+        }
+    }
+
+    /// Lower `if <cond> then [ … ] else [ … ]`. The condition computes in the
+    /// current block, which is sealed with a `CondBr`; each arm is its own
+    /// block that branches to a shared merge block, passing its value as the
+    /// merge block's parameter (the SSA join). Without `else`, the false edge
+    /// jumps straight to the merge and the value is Unit (the statement form);
+    /// a Unit result carries no merge parameter in either form.
+    ///
+    /// Blocks are sealed in the order entry → then → else → merge, so the
+    /// entry stays first and every predecessor precedes the block it branches
+    /// to — the ordering the backends rely on. Nesting composes: an `if` in an
+    /// arm seals its own blocks between that arm's `start` and `Br`.
+    fn lower_if_expr(&mut self, ife: &IfExpr) -> ValueId {
+        let cond_expr = ife.condition().expect("typechecked if has a condition");
+        let cond = self.lower_expr(&cond_expr);
+
+        let then_id = self.fresh_block();
+
+        if let Some(else_block) = ife.else_body() {
+            let else_id = self.fresh_block();
+            let merge_id = self.fresh_block();
+            self.finish_block(Terminator::CondBr {
+                cond,
+                then_block: then_id,
+                else_block: else_id,
+            });
+
+            self.start_block(then_id, Vec::new());
+            let then_val = self.lower_if_arm(ife.then_body());
+            let ty = self.value_type(then_val);
+            let is_unit = matches!(ty, ProcType::Unit);
+            let then_args = if is_unit { Vec::new() } else { vec![then_val] };
+            self.finish_block(Terminator::Br {
+                target: merge_id,
+                args: then_args,
+            });
+
+            self.start_block(else_id, Vec::new());
+            let else_val = self.lower_if_arm(Some(else_block));
+            let else_args = if is_unit { Vec::new() } else { vec![else_val] };
+            self.finish_block(Terminator::Br {
+                target: merge_id,
+                args: else_args,
+            });
+
+            // The join value is the merge block's sole parameter — unless it
+            // is Unit (no runtime representation), in which case the merge
+            // takes no parameter and the value is a fresh Unit placeholder.
+            let result = self.fresh_value();
+            self.record_type(result, ty.clone());
+            let params = if is_unit {
+                Vec::new()
+            } else {
+                // A `Text` join value is owned downstream (safe: releasing an
+                // immortal literal arm is a no-op; an owned-temp arm is freed).
+                if matches!(ty, ProcType::Text) {
+                    self.mark_text_owned(result);
+                }
+                vec![(result, ty)]
+            };
+            self.start_block(merge_id, params);
+            result
+        } else {
+            // No `else`: the false edge goes straight to the merge; the value
+            // is Unit (typecheck guarantees a Unit then-arm).
+            let merge_id = self.fresh_block();
+            self.finish_block(Terminator::CondBr {
+                cond,
+                then_block: then_id,
+                else_block: merge_id,
+            });
+
+            self.start_block(then_id, Vec::new());
+            self.lower_if_arm(ife.then_body());
+            self.finish_block(Terminator::Br {
+                target: merge_id,
+                args: Vec::new(),
+            });
+
+            let result = self.fresh_value();
+            self.record_type(result, ProcType::Unit);
+            self.start_block(merge_id, Vec::new());
+            result
+        }
+    }
+
+    /// Lower one `if` arm block in its own local scope, releasing arm-local
+    /// heap bindings at the arm's exit (before it branches to the merge). The
+    /// arm's tail value flows out as the join value and is a temporary, so it
+    /// is not among the released bindings. An absent block (parse recovery)
+    /// yields a fresh Unit value.
+    fn lower_if_arm(&mut self, block: Option<Block>) -> ValueId {
+        match block {
+            Some(b) => {
+                self.push_local_scope();
+                let val = self.lower_block(&b);
+                self.release_top_scope_heap_locals();
+                self.pop_local_scope();
+                val
+            }
+            None => {
+                let v = self.fresh_value();
+                self.record_type(v, ProcType::Unit);
+                v
+            }
         }
     }
 
@@ -2014,10 +2183,15 @@ impl Lowerer {
         // deferred extract-source list (an `extract` in a computed value).
         let saved_owned_texts = std::mem::take(&mut self.owned_texts);
         let saved_deferred = std::mem::take(&mut self.deferred_relation_releases);
+        // The helper builds its own blocks; isolate the enclosing function's
+        // block-building state (a computed value may contain an `if`).
+        let saved_blocks = std::mem::take(&mut self.blocks);
+        let saved_current_block = self.current_block;
+        let saved_current_block_params = std::mem::take(&mut self.current_block_params);
         self.outer_locals_for_capture = Some(saved_locals.clone());
 
         // 4. Helper params: `src_record` (ValueId 0), `dst_record` (ValueId 1).
-        let block_id = self.fresh_block();
+        self.begin_function_body();
         let src_ptr = self.fresh_value();
         self.record_type(src_ptr, ProcType::Pointer);
         let dst_ptr = self.fresh_value();
@@ -2080,11 +2254,7 @@ impl Lowerer {
         self.drain_deferred_relation_releases();
 
         // 9. Close the helper (void return, two pointer params).
-        let block = BasicBlock {
-            id: block_id,
-            insts: std::mem::take(&mut self.insts),
-            terminator: Terminator::Return(None),
-        };
+        self.finish_block(Terminator::Return(None));
         self.functions.push(Function {
             name: helper_name.clone(),
             linkage_name: helper_name.clone(),
@@ -2093,13 +2263,16 @@ impl Lowerer {
                 ("dst_record".to_string(), ProcType::Pointer),
             ],
             return_type: ProcType::Unit,
-            blocks: vec![block],
+            blocks: std::mem::take(&mut self.blocks),
         });
 
         // 10. Restore the enclosing function's state.
         self.next_value = saved_next_value;
         self.next_block = saved_next_block;
         self.insts = saved_insts;
+        self.blocks = saved_blocks;
+        self.current_block = saved_current_block;
+        self.current_block_params = saved_current_block_params;
         self.locals = saved_locals;
         self.relexpr_aliases = saved_aliases;
         self.value_types = saved_value_types;
@@ -3265,13 +3438,18 @@ impl Lowerer {
         // deferred extract-source list (an `extract` inside the predicate).
         let saved_owned_texts = std::mem::take(&mut self.owned_texts);
         let saved_deferred = std::mem::take(&mut self.deferred_relation_releases);
+        // Isolate the enclosing function's block-building state (a predicate
+        // may contain an `if`).
+        let saved_blocks = std::mem::take(&mut self.blocks);
+        let saved_current_block = self.current_block;
+        let saved_current_block_params = std::mem::take(&mut self.current_block_params);
         self.outer_locals_for_capture = Some(saved_locals.clone());
 
         // 4. Build the predicate body. The function has a single
         //    parameter `record_ptr: Pointer`. Pre-emit `AttrLoad` for
         //    each heading attribute at function entry; bind each in
         //    the predicate scope under its source-level name.
-        let block_id = self.fresh_block();
+        self.begin_function_body();
         let record_ptr = self.fresh_value();
         self.record_type(record_ptr, ProcType::Pointer);
         for attr in &layout.attrs {
@@ -3298,23 +3476,22 @@ impl Lowerer {
         self.drain_deferred_relation_releases();
 
         // 6. Close the predicate function.
-        let block = BasicBlock {
-            id: block_id,
-            insts: std::mem::take(&mut self.insts),
-            terminator: Terminator::Return(Some(pred_value)),
-        };
+        self.finish_block(Terminator::Return(Some(pred_value)));
         self.functions.push(Function {
             name: pred_name.clone(),
             linkage_name: pred_name.clone(),
             params: vec![("record_ptr".to_string(), ProcType::Pointer)],
             return_type: ProcType::Boolean,
-            blocks: vec![block],
+            blocks: std::mem::take(&mut self.blocks),
         });
 
         // 7. Restore the enclosing function's state.
         self.next_value = saved_next_value;
         self.next_block = saved_next_block;
         self.insts = saved_insts;
+        self.blocks = saved_blocks;
+        self.current_block = saved_current_block;
+        self.current_block_params = saved_current_block_params;
         self.locals = saved_locals;
         self.relexpr_aliases = saved_aliases;
         self.value_types = saved_value_types;
@@ -3635,11 +3812,29 @@ impl Lowerer {
     }
 
     fn lower_call(&mut self, call: &CallExpr) -> ValueId {
-        let callee_name = match call.callee() {
-            Some(Expr::NameRef(n)) => n.ident().map(|t| t.text().to_string()),
-            _ => None,
+        // Resolve the callee to a method name plus, for the UFCS method-call
+        // form `receiver.method { … }`, the lowered receiver value — injected
+        // below as the `self` argument (`x.m { … }` ≡ `m { self: x, … }`).
+        // A bare `NameRef` callee is the ordinary prefix call.
+        let (surface, self_val): (String, Option<ValueId>) = match call.callee() {
+            Some(Expr::NameRef(n)) => (
+                n.ident()
+                    .map(|t| t.text().to_string())
+                    .expect("typechecked NameRef call has an ident"),
+                None,
+            ),
+            Some(Expr::FieldAccess(fa)) => {
+                let recv = fa.base().expect("typechecked UFCS call has a receiver");
+                let v = self.lower_expr(&recv);
+                let method = fa
+                    .field()
+                    .expect("typechecked UFCS call has a method name")
+                    .text()
+                    .to_string();
+                (method, Some(v))
+            }
+            _ => unreachable!("typechecked call has a NameRef or FieldAccess callee"),
         };
-        let surface = callee_name.expect("typechecked call has a NameRef callee");
 
         // Polymorphic-Relation builtins are lowered to specialized
         // ProcIR ops carrying their argument's `HeadingId`. The
@@ -3655,13 +3850,13 @@ impl Lowerer {
             return self.lower_format_call(call);
         }
         if surface == "to_text" {
-            return self.lower_to_text_call(call);
+            return self.lower_to_text_call(call, self_val);
         }
         // A non-builtin callee is a user-defined operator — an in-module
         // function. (Names are unique across builtins ∪ user ops, so this
         // never shadows a builtin.)
         if self.user_opers.contains_key(&surface) {
-            return self.lower_user_call(&surface, call);
+            return self.lower_user_call(&surface, call, self_val);
         }
 
         let ext = self
@@ -3672,11 +3867,18 @@ impl Lowerer {
 
         // Lower each argument in the order the operator declared its
         // parameters; the typechecker has guaranteed every declared
-        // parameter is supplied exactly once.
+        // parameter is supplied exactly once. For a UFCS call the `self`
+        // parameter is bound to the receiver rather than a brace argument.
         let arg_list = call.args().expect("typechecked call has an arg list");
         let supplied: Vec<NamedArg> = arg_list.args().collect();
         let mut arg_values: Vec<ValueId> = Vec::with_capacity(ext.params.len());
         for (pname, _) in ext.params {
+            if *pname == "self" {
+                if let Some(v) = self_val {
+                    arg_values.push(v);
+                    continue;
+                }
+            }
             let arg = supplied
                 .iter()
                 .find(|a| a.name().map(|t| t.text().to_string()).as_deref() == Some(*pname))
@@ -3746,7 +3948,12 @@ impl Lowerer {
     /// unsettled, so owned-Text temps passed as arguments are not released
     /// here. Only nullary user ops are exercised today; arg ownership lands
     /// with parameter binding.
-    fn lower_user_call(&mut self, surface: &str, call: &CallExpr) -> ValueId {
+    fn lower_user_call(
+        &mut self,
+        surface: &str,
+        call: &CallExpr,
+        self_val: Option<ValueId>,
+    ) -> ValueId {
         let (params, return_type) = {
             let sig = self
                 .user_opers
@@ -3759,12 +3966,21 @@ impl Lowerer {
         let supplied: Vec<NamedArg> = arg_list.args().collect();
         let mut arg_values: Vec<ValueId> = Vec::with_capacity(params.len());
         for (pname, _) in &params {
-            let arg = supplied
-                .iter()
-                .find(|a| a.name().map(|t| t.text().to_string()).as_deref() == Some(pname.as_str()))
-                .unwrap_or_else(|| unreachable!("missing arg `{pname}` survived typecheck"));
-            let value_expr = arg.value().expect("typechecked named arg has a value");
-            arg_values.push(self.lower_expr(&value_expr));
+            // For a UFCS call the `self` parameter is bound to the receiver
+            // (`self_val`) rather than a brace argument.
+            let value = if pname.as_str() == "self" && self_val.is_some() {
+                self_val.expect("guarded by is_some")
+            } else {
+                let arg = supplied
+                    .iter()
+                    .find(|a| {
+                        a.name().map(|t| t.text().to_string()).as_deref() == Some(pname.as_str())
+                    })
+                    .unwrap_or_else(|| unreachable!("missing arg `{pname}` survived typecheck"));
+                let value_expr = arg.value().expect("typechecked named arg has a value");
+                self.lower_expr(&value_expr)
+            };
+            arg_values.push(value);
         }
 
         let returns_text = matches!(return_type, ProcType::Text);
@@ -3824,14 +4040,20 @@ impl Lowerer {
     /// the lowered value's machine type. Returning an owned value means the
     /// result is always safe to bind or concatenate without aliasing the
     /// source (an identity `Text` is retained, not handed back bare).
-    fn lower_to_text_call(&mut self, call: &CallExpr) -> ValueId {
-        let arg_list = call.args().expect("typechecked call has an arg list");
-        let self_arg = arg_list
-            .args()
-            .find(|a| a.name().map(|t| t.text().to_string()).as_deref() == Some("self"))
-            .expect("typechecked to_text has a `self` arg");
-        let value_expr = self_arg.value().expect("self arg has a value");
-        let v = self.lower_expr(&value_expr);
+    fn lower_to_text_call(&mut self, call: &CallExpr, self_val: Option<ValueId>) -> ValueId {
+        // UFCS `x.to_text {}` supplies `self` via the receiver; the prefix
+        // form `to_text { self: x }` supplies it in the braces.
+        let v = if let Some(sv) = self_val {
+            sv
+        } else {
+            let arg_list = call.args().expect("typechecked call has an arg list");
+            let self_arg = arg_list
+                .args()
+                .find(|a| a.name().map(|t| t.text().to_string()).as_deref() == Some("self"))
+                .expect("typechecked to_text has a `self` arg");
+            let value_expr = self_arg.value().expect("self arg has a value");
+            self.lower_expr(&value_expr)
+        };
         self.lower_to_text(v)
     }
 
@@ -5936,6 +6158,59 @@ oper main {} [
         ));
     }
 
+    // ── `if … then [ … ] else [ … ]` multi-block lowering ────────────
+
+    #[test]
+    fn if_with_else_lowers_to_four_blocks_with_merge_param() {
+        // entry (CondBr) → then (Br) + else (Br) → merge (Return of its param).
+        let src = "oper pick { self: Boolean } -> Integer \
+                   [ if self then [ 1 ] else [ 2 ] ];";
+        let m = lower_ok(src);
+        let pick = m.functions.iter().find(|f| f.name == "pick").unwrap();
+        assert_eq!(pick.blocks.len(), 4, "entry + then + else + merge");
+        assert!(
+            matches!(pick.blocks[0].terminator, Terminator::CondBr { .. }),
+            "entry ends in CondBr, got {:?}",
+            pick.blocks[0].terminator
+        );
+        let brs = pick
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.terminator, Terminator::Br { .. }))
+            .count();
+        assert_eq!(brs, 2, "both arms branch to the merge");
+        // Exactly one block carries a parameter (the Integer join value), and
+        // it is the merge block that returns that parameter.
+        let merge = pick
+            .blocks
+            .iter()
+            .find(|b| !b.params.is_empty())
+            .expect("a merge block with a parameter");
+        assert_eq!(merge.params.len(), 1);
+        assert_eq!(merge.params[0].1, ProcType::Integer);
+        assert!(matches!(merge.terminator, Terminator::Return(Some(_))));
+    }
+
+    #[test]
+    fn if_without_else_lowers_to_three_blocks_no_param() {
+        // entry (CondBr false→merge) → then (Br merge) → merge (Return None).
+        let src = "oper act { self: Boolean } [ if self then [ {} ]; ];";
+        let m = lower_ok(src);
+        let act = m.functions.iter().find(|f| f.name == "act").unwrap();
+        assert_eq!(act.blocks.len(), 3, "entry + then + merge");
+        assert!(matches!(act.blocks[0].terminator, Terminator::CondBr { .. }));
+        let brs = act
+            .blocks
+            .iter()
+            .filter(|b| matches!(b.terminator, Terminator::Br { .. }))
+            .count();
+        assert_eq!(brs, 1, "only the then-arm branches to the merge");
+        assert!(
+            act.blocks.iter().all(|b| b.params.is_empty()),
+            "a Unit `if` carries no merge parameter"
+        );
+    }
+
     #[test]
     fn integer_literal_decodes_decimal_and_hex() {
         assert_eq!(parse_integer_literal("42"), 42);
@@ -6117,6 +6392,41 @@ oper main {} [
             .expect("coddl_rc_length extern declared");
         assert!(ext.blocks.is_empty(), "extern is a declaration only");
         assert!(matches!(ext.return_type, ProcType::Integer));
+    }
+
+    #[test]
+    fn ufcs_method_call_lowers_like_prefix_call() {
+        // `xs.cardinality {}` ≡ `cardinality { self: xs }` — a borrow-only
+        // `coddl_rc_length` call with the receiver as the sole argument.
+        let src = "oper main {} [ \
+                   let xs = Sequence [ \"a\", \"b\" ]; \
+                   let _n = xs.cardinality {}; \
+                   ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let calls = main.blocks[0]
+            .insts
+            .iter()
+            .filter(|i| matches!(i, Inst::Call { callee, .. } if callee == "coddl_rc_length"))
+            .count();
+        assert_eq!(calls, 1, "the method call lowers to one coddl_rc_length call");
+    }
+
+    #[test]
+    fn ufcs_user_oper_method_lowers_to_in_module_call() {
+        // `"hi".echo {}` ≡ `echo { self: "hi" }` — an in-module call passing
+        // the receiver as the sole argument.
+        let src = "oper echo { self: Text } -> Text [ self ]; \
+                   oper main {} [ let g = \"hi\".echo {}; write_line { message: g }; ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            main.blocks[0].insts.iter().any(|i| matches!(
+                i,
+                Inst::Call { callee, args, .. } if callee == "echo" && args.len() == 1
+            )),
+            "expected an in-module `echo` call with the receiver as its sole arg"
+        );
     }
 
     #[test]

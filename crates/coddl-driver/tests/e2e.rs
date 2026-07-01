@@ -35,6 +35,10 @@ fn fixtures_dir() -> &'static Path {
             ("sequence-construct", SEQUENCE_CONSTRUCT_SRC),
             ("hello-everyone", HELLO_EVERYONE_SRC),
             ("param-echo", PARAM_ECHO_SRC),
+            ("if-demo", IF_DEMO_SRC),
+            ("relvar-if", RELVAR_IF_SRC),
+            ("hello-everyone-2", HELLO_EVERYONE_2_SRC),
+            ("ufcs-method", UFCS_METHOD_SRC),
             ("transaction", TRANSACTION_SRC),
             ("join-times-compose", JOIN_TIMES_COMPOSE_SRC),
             ("union-intersect-minus", UNION_INTERSECT_MINUS_SRC),
@@ -92,6 +96,69 @@ oper echo { self: Text } -> Text [ self ];
 oper main {} [
     let g = echo { self: \"hi there\" };
     write_line { message: g };
+];
+";
+
+// `if <cond> then [ … ] else [ … ]` end to end. `sign` exercises the
+// with-else form with a nested `if` in the else arm and a Text join value
+// (the merge block carries a Text parameter — two phi slots / block params).
+// The trailing no-else `if` in `main` (a false condition) exercises the
+// statement form: the then-arm is skipped and control falls straight to the
+// merge, so \"skipped!\" must NOT print.
+const IF_DEMO_SRC: &str = "\
+program if_demo;
+oper sign { self: Integer } -> Text [
+    if self = 0 then [ \"zero\" ]
+    else [ if self = 1 then [ \"one\" ] else [ \"many\" ] ]
+];
+oper main {} [
+    write_line { message: sign { self: 0 } };
+    write_line { message: sign { self: 1 } };
+    write_line { message: sign { self: 9 } };
+    if 5 = 0 then [ write_line { message: \"skipped!\" } ];
+    write_line { message: \"done\" };
+];
+";
+
+// The full hello-world-2 shape: a user `to_text { self: Sequence Text }` whose
+// body uses UFCS `self.cardinality {}`, `if/then/else`, and indexing; the
+// `{names}` placeholder interpolates through it. A two-element sequence takes
+// the else arm → "Alice and possibly others".
+const HELLO_EVERYONE_2_SRC: &str = "\
+program hello_world;
+oper to_text { self: Sequence Text } -> Text [
+    if self.cardinality {} = 0 then [ \"no one\" ]
+    else [ self[0] || \" and possibly others\" ]
+];
+oper main {} [
+    let names = Sequence [\"Alice\", \"Bob\"];
+    let message = format { template: f\"Hello, {names}!\", params: { names } };
+    write_line { message };
+];
+";
+
+// UFCS on a *user* operator: `\"hi\".shout {}` ≡ `shout { self: \"hi\" }` — the
+// receiver binds the `self` parameter of an in-module call.
+const UFCS_METHOD_SRC: &str = "\
+program ufcs_method;
+oper shout { self: Text } -> Text [ self ];
+oper main {} [
+    write_line { message: \"hi\".shout {} };
+];
+";
+
+// A private relvar (so `main` gets slot init/release) *and* a top-level `if`
+// (so `main` is multi-block). Exercises `finalize_main_prologue` splicing the
+// slot-init after `runtime_init` in the entry block and the slot-release
+// before `runtime_shutdown` in the merge block — the two calls live in
+// different blocks once `main`'s body ends in control flow.
+const RELVAR_IF_SRC: &str = "\
+program relvar_if;
+private relvar Flag { on: Integer } key { on };
+oper main {} [
+    Flag := Relation { { on: 1 } };
+    if 1 = 1 then [ write_line { message: \"in-if\" } ];
+    write_line { message: \"done\" };
 ];
 ";
 
@@ -306,6 +373,134 @@ fn coddl_run_cranelift_oper_param_in_body() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.stdout, b"hi there\n");
+}
+
+#[test]
+fn coddl_run_llvm_if_expr() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("if-demo"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=llvm failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"zero\none\nmany\ndone\n");
+}
+
+#[test]
+fn coddl_run_cranelift_if_expr() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("if-demo"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"zero\none\nmany\ndone\n");
+}
+
+#[test]
+fn coddl_run_llvm_ufcs_and_full_to_text() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("hello-everyone-2"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=llvm failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"Hello, Alice and possibly others!\n");
+}
+
+#[test]
+fn coddl_run_cranelift_ufcs_and_full_to_text() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("hello-everyone-2"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"Hello, Alice and possibly others!\n");
+}
+
+#[test]
+fn coddl_run_llvm_ufcs_user_oper_method() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("ufcs-method"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=llvm failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"hi\n");
+}
+
+#[test]
+fn coddl_run_cranelift_ufcs_user_oper_method() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("ufcs-method"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"hi\n");
+}
+
+#[test]
+fn coddl_run_llvm_relvar_with_multiblock_main() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("relvar-if"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=llvm failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"in-if\ndone\n");
+}
+
+#[test]
+fn coddl_run_cranelift_relvar_with_multiblock_main() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("relvar-if"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"in-if\ndone\n");
 }
 
 #[test]

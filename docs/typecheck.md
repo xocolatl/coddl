@@ -221,9 +221,24 @@ arguments still produce `T0003`/`T0004`. User operators default to
 `SideEffecting` purity — the sound default for the transaction gate
 (`T0026`) until body-derived purity lands (a pure helper is then
 conservatively barred from a `transaction [...]`, never the reverse).
-User-operator *overloading*, and binding parameters inside the body, are
-later work; v1 calls nullary user operators (e.g. an `ask {} -> Text`
-wrapper) and operators whose bodies ignore their parameters.
+User-operator *overloading* (a second user overload of one name) is later
+work.
+
+### UFCS method calls
+
+Any operator with a parameter literally named `self` — built-in or
+user-defined — is callable in method position: `x.method { … }` is pure
+sugar for `method { self: x, … }`. The braces distinguish it from a bare
+possrep/field access (`x.field`). `check_call` handles it directly: when the
+callee is a field access, it type-checks the receiver once, takes the field
+as the method name, and injects the receiver as a synthetic `self` argument
+into the existing monomorphic / overloaded resolution — so the receiver's
+type participates in dispatch exactly like an explicit `self:` argument
+(e.g. a `Sequence` receiver selects `cardinality`'s `Sequence` overload).
+A method call on an operator with no `self` parameter is `T0070`; a receiver
+whose type no overload accepts falls out as `T0004` (monomorphic) or `T0054`
+(overloaded), the same codes a prefix call raises. Position of `self` in the
+heading is irrelevant, and `self` never warns as unused.
 
 ### `format` and the `FormatText` firewall
 
@@ -300,6 +315,15 @@ each `parse_<x>` has a corresponding `check_<x>`.
   `transaction [...]` block pushes a layer on entry and pops on
   exit. Lookups walk innermost-first so inner bindings shadow
   outer ones.
+- **`check_if_expr`** — `if <cond> then [ … ] else [ … ]`. The
+  condition must be `Boolean` (`T0067`). Each arm is a `check_block`
+  in its own pushed scope (like a `transaction` body, but without the
+  transaction-depth bump — an `if` is not a transaction boundary). With
+  `else`, the two arm types must unify (`T0068`) and that is the
+  expression's type. Without `else`, the then-arm must be Unit
+  (`Tuple {}`, `T0069`) and the expression's type is Unit — the
+  statement form. `else if` is spelled by nesting an `if` in the
+  `else` block.
 - **`check_let_stmt`** — infers the RHS expression's type. If the
   binding carries an explicit `: <type-ref>` annotation, the
   declared type is authoritative: the RHS must conform (or `T0010`
@@ -636,3 +660,7 @@ check script enforces that.
 | T0064 | an **empty** `Sequence []` can't be constructed yet (no element to derive the payload layout from); empty-construction and iteration land with `load` (lowering) |
 | T0065 | postfix index `s[i]` requires a `Sequence` operand (the operand has some other type) |
 | T0066 | postfix index `s[i]` requires an `Integer` index (the index has some other type) |
+| T0067 | `if` condition is not `Boolean` |
+| T0068 | `if` arms have mismatched types — the `then` and `else` blocks must unify |
+| T0069 | an `if` without `else` must have a Unit (`Tuple {}`) then-arm (the statement form) |
+| T0070 | a UFCS method call `x.m {}` names an operator with no `self` parameter (not method-callable) |

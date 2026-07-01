@@ -902,6 +902,10 @@ impl<'a> Parser<'a> {
             self.parse_transaction_expr();
             return true;
         }
+        if self.at_keyword("if") {
+            self.parse_if_expr();
+            return true;
+        }
         if self.at_keyword("Relation") {
             self.parse_relation_lit();
             return true;
@@ -1137,6 +1141,51 @@ impl<'a> Parser<'a> {
             return;
         }
         self.parse_block();
+        self.finish_node();
+    }
+
+    /// `if <cond> then [ <block> ]` with an optional `else [ <block> ]`.
+    /// `then` delimits the condition, so it parses at full precedence — a
+    /// trailing index run like `grid[r][c]` belongs to the condition, not
+    /// the block (`[` is otherwise ambiguous between postfix index and the
+    /// ordered block). Both arms are ordered statement blocks
+    /// (`parse_block`); `else` is optional — a bare `if … then [ … ]` is the
+    /// Unit-typed statement form.
+    fn parse_if_expr(&mut self) {
+        debug_assert!(self.at_keyword("if"));
+        self.bump_trivia();
+        self.start_node(SyntaxKind::IF_EXPR);
+        self.bump(); // `if`
+
+        // Condition — a full expression. `then` is neither an infix operator
+        // (`peek_infix_prec`) nor a postfix trigger, so the condition stops
+        // there naturally. A missing condition surfaces as P0014.
+        self.parse_expr();
+
+        if !self.at_keyword("then") {
+            self.error("P0059", "expected `then` after the `if` condition");
+            self.finish_node();
+            return;
+        }
+        self.bump(); // `then`
+
+        if !self.at(SyntaxKind::L_BRACKET) {
+            self.error("P0060", "expected `[` to start the `if` block");
+            self.finish_node();
+            return;
+        }
+        self.parse_block();
+
+        if self.at_keyword("else") {
+            self.bump(); // `else`
+            if !self.at(SyntaxKind::L_BRACKET) {
+                self.error("P0061", "expected `[` after `else`");
+                self.finish_node();
+                return;
+            }
+            self.parse_block();
+        }
+
         self.finish_node();
     }
 
@@ -2956,6 +3005,107 @@ mod tests {
         assert!(
             out.diagnostics.iter().any(|d| d.code == "P0058"),
             "expected P0058, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    // ── `if <cond> then [ … ] else [ … ]` ────────────────────────────
+
+    #[test]
+    fn if_expr_with_else_parses() {
+        let out = parse_str("oper f {} [ if b then [ 1 ] else [ 2 ]; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let ife = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::IF_EXPR)
+            .expect("IF_EXPR in tree");
+        // Condition is the first child node (a NAME_REF `b`); the two arms
+        // are BLOCK children.
+        assert_eq!(ife.first_child().unwrap().kind(), SyntaxKind::NAME_REF);
+        let blocks = ife
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::BLOCK)
+            .count();
+        assert_eq!(blocks, 2, "then + else blocks");
+    }
+
+    #[test]
+    fn if_expr_no_else_parses() {
+        let out = parse_str("oper f {} [ if b then [ 1 ]; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let ife = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::IF_EXPR)
+            .expect("IF_EXPR in tree");
+        let blocks = ife
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::BLOCK)
+            .count();
+        assert_eq!(blocks, 1, "then block only");
+    }
+
+    #[test]
+    fn if_expr_nested_in_else_arm() {
+        // `else [ if … then [ … ] else [ … ] ]` — the deferred `else if`.
+        let out = parse_str("oper f {} [ if a then [ 1 ] else [ if b then [ 2 ] else [ 3 ] ]; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let count = out
+            .tree
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::IF_EXPR)
+            .count();
+        assert_eq!(count, 2, "outer + nested IF_EXPR");
+    }
+
+    #[test]
+    fn if_expr_index_run_condition_needs_no_parens() {
+        // `then` delimits, so an index-run condition parses cleanly and the
+        // `[ 1 ]` block is NOT swallowed as another index of `grid`.
+        let out = parse_str("oper f {} [ if grid[a][b] then [ 1 ] else [ 2 ]; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let ife = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::IF_EXPR)
+            .expect("IF_EXPR in tree");
+        let cond = ife.first_child().unwrap();
+        assert_eq!(cond.kind(), SyntaxKind::INDEX_EXPR);
+        assert_eq!(cond.text(), "grid[a][b]");
+        let blocks = ife
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::BLOCK)
+            .count();
+        assert_eq!(blocks, 2);
+    }
+
+    #[test]
+    fn if_missing_then_diagnoses_p0059() {
+        let out = parse_str("oper f {} [ if b [ 1 ] else [ 2 ]; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0059"),
+            "expected P0059, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn if_missing_then_block_diagnoses_p0060() {
+        let out = parse_str("oper f {} [ if b then 1; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0060"),
+            "expected P0060, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn if_missing_else_block_diagnoses_p0061() {
+        let out = parse_str("oper f {} [ if b then [ 1 ] else 2; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0061"),
+            "expected P0061, got {:?}",
             out.diagnostics
         );
     }
