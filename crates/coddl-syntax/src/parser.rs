@@ -488,13 +488,18 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
-    /// `for <ident> := <expr> to <expr> do <block> ;` — a counted loop with an
-    /// **inclusive** upper bound (`i <= hi`). `to` and `do` are contextual
+    /// Two forms, dispatched on the header separator after the loop variable:
+    ///   counted — `for <ident> := <expr> to <expr> do <block> ;`
+    ///   element — `for <ident> in <expr> do <block> ;`
+    /// Counted has an **inclusive** upper bound (`i <= hi`); element iterates a
+    /// `Sequence` (RM Pro 7 forbids tuple-at-a-time over a relation, so a
+    /// relation operand is a type error). `in`/`to`/`do` are contextual
     /// keywords recognized only in this statement position (Coddl has no
-    /// reserved words); each bound is a full `<expr>` that stops at the next
-    /// keyword because neither `to` nor `do` is an infix operator or a postfix
-    /// trigger. The counter is loop-scoped and immutable (assigning it is
-    /// T0049). A trailing `;` is required (P0013).
+    /// reserved words); each `<expr>` stops at the next keyword because none of
+    /// them is an infix operator or a postfix trigger. The loop variable is
+    /// loop-scoped and immutable (assigning it is T0072). A trailing `;` is
+    /// required (P0013). Both forms build one `FOR_STMT`; the AST distinguishes
+    /// them by the presence of the `:=` token.
     fn parse_for_stmt(&mut self) {
         debug_assert!(self.at_keyword("for"));
         self.start_node(SyntaxKind::FOR_STMT);
@@ -505,23 +510,31 @@ impl<'a> Parser<'a> {
             self.finish_node();
             return;
         }
-        if !self.eat(SyntaxKind::ASSIGN) {
-            self.error("P0063", "expected `:=` after the `for` loop variable");
+        if self.at_keyword("in") {
+            // Element loop: `in <expr>` — the sequence to iterate.
+            self.bump(); // `in`
+            self.parse_expr();
+        } else if self.eat(SyntaxKind::ASSIGN) {
+            // Counted loop: `:= <expr> to <expr>` (inclusive).
+            self.parse_expr(); // lower bound — stops at `to`
+            if !self.at_keyword("to") {
+                self.error("P0064", "expected `to` after the `for` lower bound");
+                self.finish_node();
+                return;
+            }
+            self.bump(); // `to`
+            self.parse_expr(); // upper bound — stops at `do`
+        } else {
+            self.error(
+                "P0063",
+                "expected `:=` or `in` after the `for` loop variable",
+            );
             self.finish_node();
             return;
         }
-        // Lower bound — stops at `to` (not an infix operator).
-        self.parse_expr();
-        if !self.at_keyword("to") {
-            self.error("P0064", "expected `to` after the `for` lower bound");
-            self.finish_node();
-            return;
-        }
-        self.bump(); // `to`
-        // Upper bound — stops at `do`, for the same reason.
-        self.parse_expr();
+        // Shared tail: `do <block> ;`.
         if !self.at_keyword("do") {
-            self.error("P0065", "expected `do` after the `for` upper bound");
+            self.error("P0065", "expected `do` before the `for` loop body");
             self.finish_node();
             return;
         }
@@ -3270,6 +3283,60 @@ mod tests {
         assert!(
             out.diagnostics.iter().any(|d| d.code == "P0013"),
             "expected P0013, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn for_in_stmt_parses() {
+        let src = "oper f {} [ for name in xs do [ name; ]; ];";
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.tree.text(), src);
+        let fs = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::FOR_STMT)
+            .expect("FOR_STMT in tree");
+        // The element form has no `:=` — direct IDENT tokens are `for`,
+        // `name`, `in`, `do`; the iterable is the sole (NameRef) Expr child.
+        let idents: Vec<_> = fs
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| t.kind() == SyntaxKind::IDENT)
+            .map(|t| t.text().to_string())
+            .collect();
+        assert_eq!(idents, vec!["for", "name", "in", "do"]);
+        assert!(
+            fs.children_with_tokens()
+                .filter_map(|e| e.into_token())
+                .all(|t| t.kind() != SyntaxKind::ASSIGN),
+            "the element form carries no `:=` token"
+        );
+        let iterable = fs
+            .children()
+            .find(|n| n.kind() == SyntaxKind::NAME_REF)
+            .expect("iterable NAME_REF");
+        assert_eq!(iterable.text(), "xs");
+    }
+
+    #[test]
+    fn for_in_missing_do_diagnoses_p0065() {
+        let out = parse_str("oper f {} [ for name in xs [ name; ]; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0065"),
+            "expected P0065, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn for_missing_separator_diagnoses_p0063() {
+        // Neither `:=` nor `in` after the loop variable.
+        let out = parse_str("oper f {} [ for name xs do [ name; ]; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0063"),
+            "expected P0063, got {:?}",
             out.diagnostics
         );
     }

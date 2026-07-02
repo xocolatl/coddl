@@ -1690,37 +1690,22 @@ impl Lowerer {
         }
     }
 
-    /// Lower `if <cond> then [ … ] else [ … ]`. The condition computes in the
-    /// current block, which is sealed with a `CondBr`; each arm is its own
-    /// block that branches to a shared merge block, passing its value as the
-    /// merge block's parameter (the SSA join). Without `else`, the false edge
-    /// jumps straight to the merge and the value is Unit (the statement form);
-    /// a Unit result carries no merge parameter in either form.
-    ///
-    /// Blocks are sealed in the order entry → then → else → merge, so the
-    /// entry stays first and every predecessor precedes the block it branches
-    /// to — the ordering the backends rely on. Nesting composes: an `if` in an
-    /// arm seals its own blocks between that arm's `start` and `Br`.
-    /// Lower a counted `for i := lo to hi do [ … ]` loop — the project's first
-    /// *cyclic* CFG (a block that branches back to an earlier one). Shape, with
-    /// `entry` being whatever block is current on entry:
-    ///
-    /// ```text
-    /// entry:  %lo = <lo>; %hi = <hi>; Br header [%lo]
-    /// header (param %i): %c = %i <= %hi; CondBr %c -> body, exit
-    /// body:   <body>; %inc = %i + 1; Br header [%inc]      ← back-edge
-    /// exit:   …                                            ← left as current
-    /// ```
-    ///
-    /// `%hi` is evaluated **once**, in the entry block (it dominates the
-    /// header). The counter rides the header block's parameter — the same
-    /// block-param join `if` uses for its merge, now fed from two predecessors
-    /// (`%lo` on the entry edge, `%inc` on the back-edge). `to` is inclusive
-    /// (`<=`), so `lo > hi` fails the first test and the loop runs zero times.
-    /// The counter is bound as a body-scope local so `NameRef`s in the body
-    /// resolve to `%i`; it is `Integer`, so it needs no scope-exit release.
+    /// Lower a `for` loop — dispatch on the header form. The counted form runs
+    /// a compiler-managed induction variable; the element form (`for name in
+    /// seq`) desugars onto the same counted loop. Both build one CFG via
+    /// [`Self::lower_counted_loop`].
     fn lower_for_stmt(&mut self, stmt: &ForStmt) {
-        // Evaluate both bounds once, in the entry block, before the loop.
+        if stmt.is_for_in() {
+            self.lower_for_in_stmt(stmt);
+        } else {
+            self.lower_for_counted_stmt(stmt);
+        }
+    }
+
+    /// Lower a counted `for i := lo to hi do [ … ]` loop. Both bounds are
+    /// evaluated **once**, in the entry block (they dominate the header); the
+    /// counter is bound as the loop-scoped body local `i`.
+    fn lower_for_counted_stmt(&mut self, stmt: &ForStmt) {
         let lo = stmt
             .lower_bound()
             .map(|e| self.lower_expr(&e))
@@ -1729,7 +1714,126 @@ impl Lowerer {
             .upper_bound()
             .map(|e| self.lower_expr(&e))
             .unwrap_or_else(|| self.fresh_value());
+        let name = stmt.var_name().map(|t| t.text().to_string());
+        self.lower_counted_loop(lo, hi, stmt.body(), |this, counter| {
+            if let Some(n) = &name {
+                this.bind_local(n.clone(), counter, ProcType::Integer);
+            }
+        });
+    }
 
+    /// Lower an element `for name in seq do [ … ]` loop by desugaring onto the
+    /// counted loop: `for __i := 0 to cardinality(seq) - 1 do [ let name =
+    /// seq[__i]; <body> ]`. The sequence is lowered **once** and held in an
+    /// outer scope — owned like a `let __seq = <seq>`, with an alias-retain when
+    /// it borrows an existing binding — so it is released exactly once after the
+    /// loop; the element is read per iteration via the same bounds-checked index
+    /// path as `s[i]` (owned-copy retain for a heap `Text`). Empty-safe: an
+    /// empty sequence gives `0 to -1`, i.e. zero iterations.
+    fn lower_for_in_stmt(&mut self, stmt: &ForStmt) {
+        // Outer scope holds the sequence for the loop's whole duration.
+        self.push_local_scope();
+
+        // Lower the iterable once and own it like `let __seq = <iterable>`:
+        // retain when it aliases an existing binding so the scope-exit release
+        // balances (mirrors `lower_let_stmt`). `Sequence` is heap-managed, so
+        // the outer scope's release frees it after the loop.
+        let iterable = stmt.iterable();
+        let iterable_is_name = matches!(iterable, Some(Expr::NameRef(_)));
+        let seq = iterable
+            .as_ref()
+            .map(|e| self.lower_expr(e))
+            .unwrap_or_else(|| self.fresh_value());
+        let seq_ty = self.value_type(seq);
+        if iterable_is_name && Self::is_heap_managed(&seq_ty) {
+            self.insts.push(Inst::Retain { src: seq });
+        }
+        self.bind_local("__seq".to_string(), seq, seq_ty.clone());
+        let elem_ty = match &seq_ty {
+            ProcType::Sequence(elem) => (**elem).clone(),
+            // A non-Sequence operand is T0073 at typecheck; this is recovery.
+            _ => ProcType::Unit,
+        };
+
+        // hi = cardinality(seq) - 1, lo = 0. Reuse the `cardinality` builtin's
+        // extern registration (deduped by surface name) so its `coddl_rc_length`
+        // symbol is declared once even if the program also calls `cardinality`.
+        let card_ext = self
+            .lookup_extern("cardinality")
+            .expect("the `cardinality` builtin extern exists");
+        let card_linkage = card_ext.linkage.to_string();
+        let card_ret = card_ext.return_type.clone();
+        self.ensure_extern(card_ext);
+        let card = self.fresh_value();
+        self.record_type(card, card_ret.clone());
+        self.insts.push(Inst::Call {
+            dst: Some(card),
+            callee: card_linkage,
+            args: vec![seq],
+            return_type: card_ret,
+        });
+        let one = self.fresh_value();
+        self.record_type(one, ProcType::Integer);
+        self.insts.push(Inst::Const {
+            dst: one,
+            value: Const::Integer(1),
+            ty: ProcType::Integer,
+        });
+        let hi = self.fresh_value();
+        self.record_type(hi, ProcType::Integer);
+        self.insts.push(Inst::ScalarOp {
+            dst: hi,
+            op: ScalarOp::Sub,
+            operand_type: ProcType::Integer,
+            lhs: card,
+            rhs: one,
+        });
+        let lo = self.fresh_value();
+        self.record_type(lo, ProcType::Integer);
+        self.insts.push(Inst::Const {
+            dst: lo,
+            value: Const::Integer(0),
+            ty: ProcType::Integer,
+        });
+
+        // Counted loop over [0, card-1], binding `name = seq[__i]` per iteration.
+        let name = stmt.var_name().map(|t| t.text().to_string());
+        self.lower_counted_loop(lo, hi, stmt.body(), |this, i| {
+            let elem = this.lower_seq_index_value(seq, i, elem_ty.clone());
+            if let Some(n) = &name {
+                this.bind_local(n.clone(), elem, elem_ty.clone());
+            }
+        });
+
+        // Release the sequence once, after the loop (current == exit block).
+        self.release_top_scope_heap_locals();
+        self.pop_local_scope();
+    }
+
+    /// Build the counted-loop CFG (the project's first **cyclic** CFG), leaving
+    /// the exit block current. Shape, with `entry` the block current on entry:
+    ///
+    /// ```text
+    /// entry:  Br header [lo]
+    /// header (param %i): %c = %i <= hi; CondBr %c -> body, exit
+    /// body:   <prologue>; <body>; %inc = %i + 1; Br header [%inc]   ← back-edge
+    /// exit:   …                                                     ← current
+    /// ```
+    ///
+    /// `hi` (already lowered) dominates the header. The counter rides the header
+    /// block's parameter — the block-param join `if` uses for its merge, now fed
+    /// from two predecessors (`lo` on the entry edge, `%inc` on the back-edge).
+    /// `to` is inclusive (`<=`), so `lo > hi` runs zero times. `body_prologue`
+    /// runs inside the body's local scope, after the counter is available and
+    /// before the user block — the counted form binds the counter there, the
+    /// element form binds `name = seq[counter]`.
+    fn lower_counted_loop(
+        &mut self,
+        lo: ValueId,
+        hi: ValueId,
+        user_body: Option<Block>,
+        mut body_prologue: impl FnMut(&mut Self, ValueId),
+    ) {
         let header = self.fresh_block();
         let body = self.fresh_block();
         let exit = self.fresh_block();
@@ -1760,15 +1864,13 @@ impl Lowerer {
             else_block: exit,
         });
 
-        // Body: bind the counter as a loop-scoped local, lower the body,
+        // Body: run the prologue (binds the loop variable), lower the body,
         // release any heap locals it allocated (once per iteration), then
         // compute `i + 1` and branch back to the header (the back-edge).
         self.start_block(body, Vec::new());
         self.push_local_scope();
-        if let Some(name_tok) = stmt.var_name() {
-            self.bind_local(name_tok.text().to_string(), counter, ProcType::Integer);
-        }
-        if let Some(b) = stmt.body() {
+        body_prologue(self, counter);
+        if let Some(b) = user_body {
             self.lower_block(&b);
         }
         self.release_top_scope_heap_locals();
@@ -1801,6 +1903,17 @@ impl Lowerer {
         self.start_block(exit, Vec::new());
     }
 
+    /// Lower `if <cond> then [ … ] else [ … ]`. The condition computes in the
+    /// current block, which is sealed with a `CondBr`; each arm is its own
+    /// block that branches to a shared merge block, passing its value as the
+    /// merge block's parameter (the SSA join). Without `else`, the false edge
+    /// jumps straight to the merge and the value is Unit (the statement form);
+    /// a Unit result carries no merge parameter in either form.
+    ///
+    /// Blocks are sealed in the order entry → then → else → merge, so the
+    /// entry stays first and every predecessor precedes the block it branches
+    /// to — the ordering the backends rely on. Nesting composes: an `if` in an
+    /// arm seals its own blocks between that arm's `start` and `Br`.
     fn lower_if_expr(&mut self, ife: &IfExpr) -> ValueId {
         let cond_expr = ife.condition().expect("typechecked if has a condition");
         let cond = self.lower_expr(&cond_expr);
@@ -1901,14 +2014,9 @@ impl Lowerer {
         }
     }
 
-    /// Lower `s[i]` — postfix sequence indexing (0-based). The runtime
-    /// `coddl_seq_index` bounds-checks `i` against the sequence's length
-    /// (aborting on out-of-bounds) and returns the element *record* pointer
-    /// `payload + i * record_size`; an `AttrLoad` at offset 0 then reads the
-    /// synthetic `value` cell. A heap `Text` element is retained into an owned
-    /// copy so it outlives the sequence's release (it may be returned or
-    /// consumed past the container's lifetime); a value-type element passes
-    /// through as-is.
+    /// Lower `s[i]` — postfix sequence indexing (0-based). Delegates the
+    /// bounds-checked read to [`Self::lower_seq_index_value`], which the
+    /// `for … in` desugar shares.
     fn lower_index_expr(&mut self, ie: &IndexExpr) -> ValueId {
         let seq_expr = ie
             .sequence()
@@ -1920,8 +2028,24 @@ impl Lowerer {
         };
         let idx_expr = ie.index().expect("typechecked index has an index operand");
         let idx = self.lower_expr(&idx_expr);
+        self.lower_seq_index_value(seq, idx, elem_proc)
+    }
 
-        // Bounds-checked element record pointer from the runtime.
+    /// Read `seq[idx]` — the bounds-checked, 0-based element. The runtime
+    /// `coddl_seq_index` bounds-checks `idx` against the sequence's length
+    /// (aborting on out-of-bounds) and returns the element *record* pointer
+    /// `payload + idx * record_size`; an `AttrLoad` at offset 0 then reads the
+    /// synthetic `value` cell. A heap `Text` element is retained into an owned
+    /// copy so it outlives the sequence's release (it may be returned or
+    /// consumed past the container's lifetime); a value-type element passes
+    /// through as-is. Shared by the postfix `s[i]` operator and the `for … in`
+    /// desugar.
+    fn lower_seq_index_value(
+        &mut self,
+        seq: ValueId,
+        idx: ValueId,
+        elem_type: ProcType,
+    ) -> ValueId {
         self.ensure_runtime_extern(
             "coddl_seq_index",
             vec![
@@ -1942,17 +2066,17 @@ impl Lowerer {
         // Read the synthetic single `value` cell (offset 0 of the element
         // record) — `AttrLoad` handles both scalar and `(ptr, len)` Text cells.
         let elem = self.fresh_value();
-        self.record_type(elem, elem_proc.clone());
+        self.record_type(elem, elem_type.clone());
         self.insts.push(Inst::AttrLoad {
             dst: elem,
             src: rec,
             offset: 0,
-            attr_type: elem_proc.clone(),
+            attr_type: elem_type.clone(),
         });
 
         // Owned copy: retain a heap `Text` element (the load is a borrow into
         // the sequence's cell). Value-type elements need no retain.
-        if matches!(elem_proc, ProcType::Text) {
+        if matches!(elem_type, ProcType::Text) {
             self.insts.push(Inst::Retain { src: elem });
             self.mark_text_owned(elem);
         }
@@ -6377,6 +6501,51 @@ oper main {} [
             }
             other => panic!("entry should end in Br, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn for_in_desugars_onto_counted_loop() {
+        // `for name in names` lowers to the same counted-loop CFG plus the
+        // desugar's `cardinality` (bound) and per-element index calls.
+        let src = "oper main {} [ let names = Sequence [\"a\", \"b\"]; \
+                   for name in names do [ write_line { message: name }; ]; ];";
+        let m = lower_ok(src);
+        let f = m.functions.iter().find(|f| f.name == "main").unwrap();
+
+        // The same 4-block counted CFG with an Integer counter and a back-edge.
+        assert_eq!(f.blocks.len(), 4, "entry + header + body + exit");
+        let header = f
+            .blocks
+            .iter()
+            .find(|b| !b.params.is_empty())
+            .expect("header block with the counter param");
+        assert_eq!(header.params[0].1, ProcType::Integer, "counter is Integer");
+        let header_idx = f.blocks.iter().position(|b| b.id == header.id).unwrap();
+        assert!(
+            f.blocks.iter().enumerate().any(|(idx, b)| idx > header_idx
+                && matches!(&b.terminator, Terminator::Br { target, .. } if *target == header.id)),
+            "a later block branches back to the header (the back-edge)"
+        );
+
+        // The desugar's runtime calls: `cardinality` (→ `coddl_rc_length`) for
+        // the bound, and `coddl_seq_index` for the per-iteration element read.
+        let calls: Vec<&str> = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|i| match i {
+                Inst::Call { callee, .. } => Some(callee.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            calls.contains(&"coddl_rc_length"),
+            "expected a cardinality call, got {calls:?}"
+        );
+        assert!(
+            calls.contains(&"coddl_seq_index"),
+            "expected a per-element index call, got {calls:?}"
+        );
     }
 
     #[test]

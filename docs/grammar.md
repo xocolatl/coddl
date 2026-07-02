@@ -491,21 +491,34 @@ function that implements it.
                     -- contextual keyword (the `let` precedent).
 <let-stmt>      ::= 'let' <identifier> [ ':' <type-ref> ]
                     '=' <expr> ';' ;                           -- parse_let_stmt
-<for-stmt>      ::= 'for' <identifier> ':=' <expr> 'to' <expr>
-                    'do' <block> ';' ;                         -- parse_for_stmt (FOR_STMT)
-                    -- A counted loop with an INCLUSIVE upper bound (`i <= hi`).
-                    -- `to` and `do` are contextual keywords recognized only in
-                    -- this statement position (the `let` precedent); each bound
-                    -- is a full <expr> that stops at the next keyword because
-                    -- neither `to` nor `do` is an infix operator or a postfix
-                    -- trigger. The counter is loop-scoped, `Integer`, and
-                    -- immutable — assigning it is T0072; both bounds must be
-                    -- Integer (T0071). `lo > hi` runs zero times (empty-safe at
-                    -- the header test). A trailing `;` is required — a `for` is
-                    -- a statement, never a value.
-                    -- P0062 on a missing counter name, P0063 on a missing `:=`,
-                    -- P0064 on a missing `to`, P0065 on a missing `do`, P0066 on
-                    -- a missing body `[`; P0013 on a missing trailing `;`.
+<for-stmt>      ::= 'for' <identifier>
+                      ( ':=' <expr> 'to' <expr> | 'in' <expr> )
+                      'do' <block> ';' ;                       -- parse_for_stmt (FOR_STMT)
+                    -- Two forms, dispatched on the header separator after the
+                    -- loop variable: `:=` → a **counted** loop with an INCLUSIVE
+                    -- upper bound (`i <= hi`); `in` → an **element** loop over a
+                    -- Sequence. `in`/`to`/`do` are contextual keywords recognized
+                    -- only in this statement position (the `let` precedent); each
+                    -- <expr> stops at the next keyword because none of them is an
+                    -- infix operator or a postfix trigger. The loop variable is
+                    -- loop-scoped and immutable — assigning it is T0072. Counted:
+                    -- both bounds must be Integer (T0071); `lo > hi` runs zero
+                    -- times (empty-safe at the header test). Element: the operand
+                    -- must be a `Sequence T` (a relation is T0073, pointing at
+                    -- `load … order`), the variable takes the element type `T`.
+                    -- A trailing `;` is required — a `for` is a statement, never
+                    -- a value. Both forms build one FOR_STMT; the AST tells them
+                    -- apart by the `:=` token.
+                    --
+                    -- The element form is pure sugar, desugared in the lowerer
+                    -- onto the counted loop: `for name in seq do [ … ]` becomes
+                    -- `for __i := 0 to cardinality(seq) - 1 do [ let name =
+                    -- seq[__i]; … ]` (`__i` in the compiler-internal namespace).
+                    --
+                    -- P0062 on a missing loop variable, P0063 on a missing
+                    -- `:=`/`in`, P0064 on a missing `to` (counted), P0065 on a
+                    -- missing `do`, P0066 on a missing body `[`; P0013 on a
+                    -- missing trailing `;`.
 
 <expr>          ::= <expr-prec> ;                            -- parse_expr
 <expr-prec>     ::= <primary-expr> { <postfix> }
@@ -846,9 +859,9 @@ enforces that.
 | P0060 | Expected `[` to start the `if` block                    |
 | P0061 | Expected `[` after `else`                               |
 | P0062 | Expected a loop variable name after `for`               |
-| P0063 | Expected `:=` after the `for` loop variable             |
+| P0063 | Expected `:=` or `in` after the `for` loop variable     |
 | P0064 | Expected `to` after the `for` lower bound               |
-| P0065 | Expected `do` after the `for` upper bound               |
+| P0065 | Expected `do` before the `for` loop body                |
 | P0066 | Expected `[` to start the `for` loop body               |
 
 Note: missing-type-after-`:` (let annotation), missing-type-after-`->`

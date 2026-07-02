@@ -394,20 +394,35 @@ impl LetStmt {
 ast_node!(pub ForStmt, FOR_STMT);
 
 impl ForStmt {
-    /// The loop counter's name (the IDENT immediately after `for`). Since
-    /// `for`/`to`/`do` are all contextual-keyword IDENT tokens, the counter
-    /// is the second IDENT child token.
+    /// The loop variable's name (the IDENT immediately after `for`). Since
+    /// `for`/`in`/`to`/`do` are all contextual-keyword IDENT tokens, the
+    /// variable is the second IDENT child token.
     pub fn var_name(&self) -> Option<SyntaxToken> {
         nth_token(&self.syntax, SyntaxKind::IDENT, 1)
     }
 
-    /// The lower bound — the first `Expr` child (before `to`).
+    /// Whether this is the element form `for name in seq` (vs. the counted
+    /// form `for i := lo to hi`). The counted form always carries a `:=`
+    /// (`ASSIGN`) token; the element form never does — robust even when the
+    /// loop variable is literally named `in`.
+    pub fn is_for_in(&self) -> bool {
+        first_token_of_kind(&self.syntax, SyntaxKind::ASSIGN).is_none()
+    }
+
+    /// The sequence operand of the element form `for name in <seq>` — its sole
+    /// `Expr` child. `None` (and meaningless) for the counted form.
+    pub fn iterable(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// The lower bound of the counted form — the first `Expr` child (before
+    /// `to`).
     pub fn lower_bound(&self) -> Option<Expr> {
         self.syntax.children().find_map(Expr::cast)
     }
 
-    /// The (inclusive) upper bound — the second `Expr` child (between `to`
-    /// and `do`).
+    /// The (inclusive) upper bound of the counted form — the second `Expr`
+    /// child (between `to` and `do`).
     pub fn upper_bound(&self) -> Option<Expr> {
         self.syntax.children().filter_map(Expr::cast).nth(1)
     }

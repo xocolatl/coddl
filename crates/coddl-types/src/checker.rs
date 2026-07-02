@@ -868,36 +868,68 @@ impl TypeChecker {
         }
     }
 
-    /// Check a counted `for i := lo to hi do [ … ]` loop. Both bounds must be
-    /// `Integer`; the counter `i` is bound `Integer`, loop-scoped, and
-    /// immutable (assigning it is T0072, in `check_assignment_stmt`). `to` is
-    /// inclusive — `lo > hi` simply runs zero times, no diagnostic.
+    /// Check a `for` loop — counted (`for i := lo to hi`) or element
+    /// (`for name in seq`). The loop variable is bound loop-scoped and
+    /// immutable (assigning it is T0072, in `check_assignment_stmt`), and is
+    /// exempt from the unused-binding warning. The counted `to` is inclusive
+    /// (`lo > hi` runs zero times, no diagnostic); `for … in` iterates a
+    /// `Sequence` element-wise.
     fn check_for_stmt(&mut self, stmt: &ForStmt, scope: &mut Scope) {
-        // Both bounds are full expressions in the *enclosing* scope (they can't
-        // reference the counter). Check them before binding the counter so the
-        // counter never leaks into a bound, and so bound diagnostics surface
-        // even if the body is empty.
-        for (bound, which) in [(stmt.lower_bound(), "lower"), (stmt.upper_bound(), "upper")] {
-            if let Some(expr) = bound {
-                let ty = self.check_expr(&expr, scope);
-                if !matches!(ty, Type::Integer | Type::Unknown) {
-                    self.error(
-                        self.node_span(expr.syntax()),
-                        "T0071",
-                        format!("`for` loop {which} bound must be Integer, but has type {ty}"),
-                    );
+        // The header operands are full expressions in the *enclosing* scope
+        // (they can't reference the loop variable). Check them before binding
+        // it, so the variable never leaks into a header and header diagnostics
+        // surface even if the body is empty. The loop variable's type follows
+        // the form.
+        let var_ty = if stmt.is_for_in() {
+            // Element form: the operand must be a `Sequence T`; the variable
+            // takes the element type `T`. A `Relation` (or scalar) operand is
+            // the RM Pro 7 boundary — point at `load … order`.
+            match stmt.iterable() {
+                Some(expr) => match self.check_expr(&expr, scope) {
+                    Type::Sequence(elem) => *elem,
+                    // A bare sequence literal already produced T0063, and parse
+                    // recovery yields Unknown — no second diagnostic either way.
+                    Type::Unknown => Type::Unknown,
+                    other => {
+                        self.error(
+                            self.node_span(expr.syntax()),
+                            "T0073",
+                            format!(
+                                "`for … in` requires a Sequence, but the operand has type \
+                                 {other}; materialize a relation into an ordered Sequence with \
+                                 `load … order`"
+                            ),
+                        );
+                        Type::Unknown
+                    }
+                },
+                None => Type::Unknown,
+            }
+        } else {
+            // Counted form: both bounds must be Integer; the counter is Integer.
+            for (bound, which) in [(stmt.lower_bound(), "lower"), (stmt.upper_bound(), "upper")] {
+                if let Some(expr) = bound {
+                    let ty = self.check_expr(&expr, scope);
+                    if !matches!(ty, Type::Integer | Type::Unknown) {
+                        self.error(
+                            self.node_span(expr.syntax()),
+                            "T0071",
+                            format!("`for` loop {which} bound must be Integer, but has type {ty}"),
+                        );
+                    }
                 }
             }
-        }
+            Type::Integer
+        };
 
-        // The counter is loop-scoped: push a layer, bind it `Integer` with the
+        // The loop variable is loop-scoped: push a layer, bind it with the
         // `ForCounter` origin (immutable, exempt from the unused warning), check
         // the body, then pop and report any unused *body* bindings.
         scope.push();
         if let Some(name_tok) = stmt.var_name() {
             scope.insert(
                 name_tok.text().to_string(),
-                Type::Integer,
+                var_ty,
                 self.token_span(&name_tok),
                 BindingOrigin::ForCounter,
             );
@@ -5648,6 +5680,37 @@ mod tests {
         // an unresolved name (T0001).
         let src = "oper main {} [ for i := 0 to 2 do [ let _x = i; ]; let _y = i; ];";
         assert!(codes(src).contains(&"T0001"), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn for_in_over_sequence_typechecks_clean() {
+        // The element binds to the sequence's element type (`Text` here) and is
+        // in scope in the body.
+        let src = "oper main {} [ let names = Sequence [\"a\", \"b\"]; \
+                   for name in names do [ write_line { message: name }; ]; ];";
+        let d = diagnostics(src);
+        assert!(
+            d.iter().all(|x| x.severity != coddl_diagnostics::Severity::Error),
+            "expected no errors, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn for_in_over_relation_diagnoses_t0073() {
+        // A relation can't be iterated tuple-at-a-time (RM Pro 7); T0073 points
+        // at `load … order`.
+        let src = "oper main {} [ let r = Relation { {a: 1} }; \
+                   for t in r do [ let _x = t; ]; ];";
+        assert!(codes(src).contains(&"T0073"), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn for_in_element_is_immutable_t0072() {
+        // The element variable is loop-scoped and immutable, like the counted
+        // counter.
+        let src = "oper main {} [ let names = Sequence [\"a\", \"b\"]; \
+                   for name in names do [ name := \"x\"; ]; ];";
+        assert!(codes(src).contains(&"T0072"), "{:?}", diagnostics(src));
     }
 
     #[test]

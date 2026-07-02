@@ -37,6 +37,7 @@ fn fixtures_dir() -> &'static Path {
             ("param-echo", PARAM_ECHO_SRC),
             ("if-demo", IF_DEMO_SRC),
             ("for-demo", FOR_DEMO_SRC),
+            ("for-in-demo", FOR_IN_DEMO_SRC),
             ("relvar-if", RELVAR_IF_SRC),
             ("hello-everyone-2", HELLO_EVERYONE_2_SRC),
             ("ufcs-method", UFCS_METHOD_SRC),
@@ -134,6 +135,20 @@ oper main {} [
     ];
     for _j := 0 to 0 - 1 do [
         write_line { message: \"unreachable\" };
+    ];
+    write_line { message: \"done\" };
+];
+";
+
+// Element loop `for name in seq`: iterates a `let`-bound sequence (a borrowed
+// iterable — the desugar retains it, releasing once after the loop) and prints
+// each element, then `done` proves control resumes after the loop.
+const FOR_IN_DEMO_SRC: &str = "\
+program for_in_demo;
+oper main {} [
+    let names = Sequence [\"Alice\", \"Bob\"];
+    for name in names do [
+        write_line { message: name };
     ];
     write_line { message: \"done\" };
 ];
@@ -467,6 +482,39 @@ fn coddl_run_cranelift_for_counted() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.stdout, b"0\n1\n2\ndone\n");
+}
+
+#[test]
+fn coddl_run_llvm_for_in() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("for-in-demo"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=llvm failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Each element in order, then `done`.
+    assert_eq!(out.stdout, b"Alice\nBob\ndone\n");
+}
+
+#[test]
+fn coddl_run_cranelift_for_in() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("for-in-demo"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"Alice\nBob\ndone\n");
 }
 
 #[test]

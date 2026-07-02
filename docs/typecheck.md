@@ -665,4 +665,5 @@ check script enforces that.
 | T0069 | an `if` without `else` must have a Unit (`Tuple {}`) then-arm (the statement form) |
 | T0070 | a UFCS method call `x.m {}` names an operator with no `self` parameter (not method-callable) |
 | T0071 | a counted `for i := lo to hi` bound is not `Integer` (both bounds must be Integer) |
-| T0072 | assignment to a `for` loop counter — the counter is loop-scoped and immutable |
+| T0072 | assignment to a `for` loop variable — it is loop-scoped and immutable |
+| T0073 | `for … in` requires a `Sequence` operand; a `Relation` (or scalar) is rejected, pointing at `load … order` (the RM Pro 7 tuple-at-a-time boundary) |
