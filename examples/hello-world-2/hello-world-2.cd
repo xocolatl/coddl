@@ -1,26 +1,29 @@
 program hello_world;
 
 oper main{} [
-    let names = Sequence ["Alice", "Bob", "Carole"];
+    let rnames = Relation { { name: "Carole" }, { name: "Alice" }, { name: "Bob" } };
 
-    for name in names do [
-        let message = format{ template: f"Hello, {name}!", params: { name } };
-        write_line{ message };
+    var names;
+    load names from rnames order[asc name];
+
+    for n in names do [
+        let message = format { template: f"Hello, {name}!", params: { name: n.name } };
+        write_line { message };
     ];
 
-    for i := 0 to names.cardinality{} - 1 do [
-        write_line{ message: format{ template: f"Hi, {name}.", params: { name: names[i] } } };
+    for i := 0 to names.cardinality {} - 1 do [
+        write_line { message: format { template: f"Hi, {name}.", params: { name: names [i].name } } };
     ];
 
     var j := 0;
-    while j < names.cardinality{} do [
-        write_line{ message: format{ template: f"Hi, {name}.", params: { name: names[j] } } };
+    while j < names.cardinality {} do [
+        write_line { message: format { template: f"Hi, {name}.", params: { name: names [j].name } } };
         j := j + 1;
     ];
 
     var k := 0;
     do [
-        write_line{ message: format{ template: f"Hi, {name}.", params: { name: names[k] } } };
+        write_line { message: format { template: f"Hi, {name}.", params: { name: names [k].name } } };
         k := k + 1;
-    ] while k < names.cardinality{};
+    ] while k < names.cardinality {};
 ];

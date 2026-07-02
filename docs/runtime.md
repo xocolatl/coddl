@@ -48,7 +48,7 @@ A first-class relation is one of three things, behind a single `Relation` handle
 
 1. **Plan-backed** — a `plan_id` plus its already-bound parameters. The default. Each use re-evaluates against current relvar state. The runtime may memoize the result when source-relvar invalidation is provably absent, but that's an optimization, not a semantic guarantee.
 2. **Materialized** — a runtime-owned buffer of tuples (arena-allocated, or a backend temp table for large ones — see [risks.md](risks.md) risk #1). Used when tuples are already in memory: relation literals (`Relation { tup1, tup2 }`), results of in-process evaluation, in-memory inputs being shipped back into SQL via temp table.
-3. **Cursor** — a live result set being drained. Compiler-only optimization for `load ... order (...)` flows where the sequence is consumed once and never escapes — lets the runtime stream rows from the backend into the sequence slot-by-slot instead of buffering them all.
+3. **Cursor** — a live result set being drained. Compiler-only optimization for `load … order [ … ]` flows where the sequence is consumed once and never escapes — lets the runtime stream rows from the backend into the sequence slot-by-slot instead of buffering them all.
 
 ## Plan registration
 
@@ -64,18 +64,20 @@ A first-class relation is one of three things, behind a single `Relation` handle
 There is no tuple-at-a-time access to relvars or relations (RM Pro 7). The only iteration primitive is `load`, which forces the relation, imposes an order, and writes the tuples into a local sequence:
 
 ```
-var A: Sequence Tuple { S#: S#, QTY: QTY };
-load A from ( SP where P# = P#('P1') ) { S#, QTY } order ( asc S# );
-do i := 1 to count(A) [
-    -- process A[i]
+var names;
+load names from rnames order [ asc name ];
+for i := 0 to names.cardinality {} - 1 do [
+    -- process names[i]
 ];
 ```
 
-`A` here has type `Sequence Tuple { S#: S#, QTY: QTY }` — an ordered list of tuples. `load` populates the sequence from a relation with a given order; the counted `do` loop walks it by position.
+`names` here has type `Sequence Tuple { name: Text }` — an ordered list of tuples whose element type is read off the source relation's heading. The unannotated `var names;` is the idiom: `load` is that binding's definite-assignment site, so the element type is inferred (the explicit `var names: Sequence Tuple { name: Text };` stays legal as the checked variant). The counted `for` loop walks the sequence by position (0-based).
+
+The order spec is an **ordered** bracket-list of sort items — `[ asc name, desc other ]`, each an optional `asc`/`desc` direction (bare defaults to `asc`) before an attribute name — the same `<sort-item>` grammar shared with window ranking (`rank [ asc score ]`). `load` has no projection slot of its own: to keep only some attributes, project in the source expression (`load names from ( rnames project { name } ) order [ asc name ]`).
 
 `load` is the syntactic and semantic gate between the set-oriented and procedural worlds: it forces the relation, imposes an order (the order is part of the operation, not a property of the relation), and writes the tuples into a local sequence. This is the *only* sanctioned path; the compiler rejects any other attempt to step through tuples one at a time.
 
-The reverse direction — `load <relvar target> from <sequence var ref>` — assigns the (set-valued) projection of the sequence's tuples back into a relvar. Useful for round-tripping procedurally-built sequences into relational form.
+The reverse direction — `load <relvar target> from <sequence var ref>` (no `order` clause) — assigns the (set-valued) projection of the sequence's tuples back into a relvar. Useful for round-tripping procedurally-built sequences into relational form.
 
 ## Multiple assignment
 

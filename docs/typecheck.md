@@ -127,9 +127,11 @@ The following are deferred until the relevant productions arrive:
   `Sequence [ … ]` literal, `Sequence T` type annotations, and runtime
   *construction* of a non-empty literal are wired (a `ProcType::Sequence`
   + `Inst::SequenceLit` lowering to an RC'd `CoddlKind::Sequence` value).
-  What remains deferred is **iteration** (the `LOAD ARRAY ... ORDER (...)`
-  form) and constructing an **empty** literal — lowering a `Sequence []`
-  emits T0064.
+  What remains deferred is **iteration** (the `load … order [ … ]` form,
+  which binds an unannotated `var` as its definite-assignment site and
+  infers the `Sequence Tuple { … }` element type from the source heading)
+  and constructing an **empty** literal — lowering a `Sequence []` emits
+  T0064.
 - **User-defined scalar types** via `possrep` — the typechecker has
   no notion of user types yet; every type-name lookup either resolves
   to a built-in or yields `T0005`.
