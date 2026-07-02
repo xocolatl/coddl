@@ -488,6 +488,56 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
+    /// `for <ident> := <expr> to <expr> do <block> ;` — a counted loop with an
+    /// **inclusive** upper bound (`i <= hi`). `to` and `do` are contextual
+    /// keywords recognized only in this statement position (Coddl has no
+    /// reserved words); each bound is a full `<expr>` that stops at the next
+    /// keyword because neither `to` nor `do` is an infix operator or a postfix
+    /// trigger. The counter is loop-scoped and immutable (assigning it is
+    /// T0049). A trailing `;` is required (P0013).
+    fn parse_for_stmt(&mut self) {
+        debug_assert!(self.at_keyword("for"));
+        self.start_node(SyntaxKind::FOR_STMT);
+        self.bump(); // `for`
+
+        if !self.eat(SyntaxKind::IDENT) {
+            self.error("P0062", "expected a loop variable name after `for`");
+            self.finish_node();
+            return;
+        }
+        if !self.eat(SyntaxKind::ASSIGN) {
+            self.error("P0063", "expected `:=` after the `for` loop variable");
+            self.finish_node();
+            return;
+        }
+        // Lower bound — stops at `to` (not an infix operator).
+        self.parse_expr();
+        if !self.at_keyword("to") {
+            self.error("P0064", "expected `to` after the `for` lower bound");
+            self.finish_node();
+            return;
+        }
+        self.bump(); // `to`
+        // Upper bound — stops at `do`, for the same reason.
+        self.parse_expr();
+        if !self.at_keyword("do") {
+            self.error("P0065", "expected `do` after the `for` upper bound");
+            self.finish_node();
+            return;
+        }
+        self.bump(); // `do`
+        if !self.at(SyntaxKind::L_BRACKET) {
+            self.error("P0066", "expected `[` to start the `for` loop body");
+            self.finish_node();
+            return;
+        }
+        self.parse_block();
+        if !self.eat(SyntaxKind::SEMICOLON) {
+            self.error("P0013", "expected `;` after the `for` loop");
+        }
+        self.finish_node();
+    }
+
     /// `truncate <relvar> ;` — clear every tuple from a relvar. The operand
     /// is parsed permissively (`parse_expr`); the typechecker restricts it to
     /// a bare assignable relvar name (T0033) and the lowerer desugars it to
@@ -672,6 +722,10 @@ impl<'a> Parser<'a> {
         }
         if self.at_keyword("update") {
             self.parse_update_stmt();
+            return;
+        }
+        if self.at_keyword("for") {
+            self.parse_for_stmt();
             return;
         }
 
@@ -3106,6 +3160,116 @@ mod tests {
         assert!(
             out.diagnostics.iter().any(|d| d.code == "P0061"),
             "expected P0061, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    // ── Counted `for` loop ───────────────────────────────────────────
+
+    #[test]
+    fn for_stmt_counted_parses() {
+        let src = "oper f {} [ for i := 0 to 2 do [ i; ]; ];";
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.tree.text(), src);
+        let fs = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::FOR_STMT)
+            .expect("FOR_STMT in tree");
+        // The direct IDENT token children are exactly the contextual keywords
+        // and the counter: `to`/`do` survive as tokens (not swallowed into a
+        // bound expression), and the counter is the second IDENT.
+        let idents: Vec<_> = fs
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| t.kind() == SyntaxKind::IDENT)
+            .map(|t| t.text().to_string())
+            .collect();
+        assert_eq!(idents, vec!["for", "i", "to", "do"]);
+        let blocks = fs
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::BLOCK)
+            .count();
+        assert_eq!(blocks, 1, "one body block");
+    }
+
+    #[test]
+    fn for_stmt_upper_bound_is_full_expr() {
+        // `n - 1` binds as the whole upper bound (a BINARY_EXPR), not stopping
+        // at `n`; `do` still delimits the body.
+        let src = "oper f {} [ for i := 0 to n - 1 do [ i; ]; ];";
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.tree.text(), src);
+        let fs = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::FOR_STMT)
+            .unwrap();
+        let bin = fs
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("upper bound is a BINARY_EXPR");
+        assert_eq!(bin.text(), "n - 1");
+    }
+
+    #[test]
+    fn for_stmt_missing_name_diagnoses_p0062() {
+        let out = parse_str("oper f {} [ for := 0 to 2 do [ i; ]; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0062"),
+            "expected P0062, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn for_stmt_missing_assign_diagnoses_p0063() {
+        let out = parse_str("oper f {} [ for i 0 to 2 do [ i; ]; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0063"),
+            "expected P0063, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn for_stmt_missing_to_diagnoses_p0064() {
+        let out = parse_str("oper f {} [ for i := 0 2 do [ i; ]; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0064"),
+            "expected P0064, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn for_stmt_missing_do_diagnoses_p0065() {
+        let out = parse_str("oper f {} [ for i := 0 to 2 [ i; ]; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0065"),
+            "expected P0065, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn for_stmt_missing_body_bracket_diagnoses_p0066() {
+        let out = parse_str("oper f {} [ for i := 0 to 2 do i; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0066"),
+            "expected P0066, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn for_stmt_missing_semicolon_diagnoses_p0013() {
+        let out = parse_str("oper f {} [ for i := 0 to 2 do [ i ] ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0013"),
+            "expected P0013, got {:?}",
             out.diagnostics
         );
     }

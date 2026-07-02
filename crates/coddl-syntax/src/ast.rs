@@ -337,6 +337,7 @@ pub enum Stmt {
     Insert(InsertStmt),
     Update(UpdateStmt),
     ExprStmt(ExprStmt),
+    For(ForStmt),
 }
 
 impl Stmt {
@@ -349,6 +350,7 @@ impl Stmt {
             SyntaxKind::INSERT_STMT => Stmt::Insert(InsertStmt { syntax }),
             SyntaxKind::UPDATE_STMT => Stmt::Update(UpdateStmt { syntax }),
             SyntaxKind::EXPR_STMT => Stmt::ExprStmt(ExprStmt { syntax }),
+            SyntaxKind::FOR_STMT => Stmt::For(ForStmt { syntax }),
             _ => return None,
         })
     }
@@ -362,6 +364,7 @@ impl Stmt {
             Stmt::Insert(s) => s.syntax(),
             Stmt::Update(s) => s.syntax(),
             Stmt::ExprStmt(s) => s.syntax(),
+            Stmt::For(s) => s.syntax(),
         }
     }
 }
@@ -385,6 +388,33 @@ impl LetStmt {
     /// The right-hand-side expression.
     pub fn value(&self) -> Option<Expr> {
         self.syntax.children().find_map(Expr::cast)
+    }
+}
+
+ast_node!(pub ForStmt, FOR_STMT);
+
+impl ForStmt {
+    /// The loop counter's name (the IDENT immediately after `for`). Since
+    /// `for`/`to`/`do` are all contextual-keyword IDENT tokens, the counter
+    /// is the second IDENT child token.
+    pub fn var_name(&self) -> Option<SyntaxToken> {
+        nth_token(&self.syntax, SyntaxKind::IDENT, 1)
+    }
+
+    /// The lower bound — the first `Expr` child (before `to`).
+    pub fn lower_bound(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// The (inclusive) upper bound — the second `Expr` child (between `to`
+    /// and `do`).
+    pub fn upper_bound(&self) -> Option<Expr> {
+        self.syntax.children().filter_map(Expr::cast).nth(1)
+    }
+
+    /// The loop body block (the `[ … ]` after `do`).
+    pub fn body(&self) -> Option<Block> {
+        child(&self.syntax)
     }
 }
 

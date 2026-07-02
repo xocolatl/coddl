@@ -1176,8 +1176,13 @@ fn emit_function(
             ret_len_out,
             &block_map,
         )?;
-        builder.seal_block(cl_block);
     }
+    // Seal all blocks together, once every branch has been emitted. Sealing a
+    // block eagerly (right after emitting it) is fine for a forward-only CFG
+    // but wrong for a loop header, whose back-edge predecessor is emitted only
+    // *after* the header — the first cyclic CFG (counted `for`). All blocks are
+    // pre-created, so their predecessors are all known by here.
+    builder.seal_all_blocks();
 
     builder.finalize();
 

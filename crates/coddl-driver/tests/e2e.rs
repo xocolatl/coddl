@@ -36,6 +36,7 @@ fn fixtures_dir() -> &'static Path {
             ("hello-everyone", HELLO_EVERYONE_SRC),
             ("param-echo", PARAM_ECHO_SRC),
             ("if-demo", IF_DEMO_SRC),
+            ("for-demo", FOR_DEMO_SRC),
             ("relvar-if", RELVAR_IF_SRC),
             ("hello-everyone-2", HELLO_EVERYONE_2_SRC),
             ("ufcs-method", UFCS_METHOD_SRC),
@@ -117,6 +118,23 @@ oper main {} [
     write_line { message: sign { self: 1 } };
     write_line { message: sign { self: 9 } };
     if 5 = 0 then [ write_line { message: \"skipped!\" } ];
+    write_line { message: \"done\" };
+];
+";
+
+// Counted `for` loop: three iterations print the counter (0, 1, 2 — proving
+// the counter increments across the back-edge), then an empty loop
+// (`0 to 0 - 1` = `0 to -1`) runs zero times and prints nothing, then `done`
+// proves control resumes after the loop's exit block.
+const FOR_DEMO_SRC: &str = "\
+program for_demo;
+oper main {} [
+    for i := 0 to 2 do [
+        write_line { message: to_text { self: i } };
+    ];
+    for _j := 0 to 0 - 1 do [
+        write_line { message: \"unreachable\" };
+    ];
     write_line { message: \"done\" };
 ];
 ";
@@ -416,6 +434,39 @@ fn coddl_run_cranelift_if_expr() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.stdout, b"zero\none\nmany\ndone\n");
+}
+
+#[test]
+fn coddl_run_llvm_for_counted() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("for-demo"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=llvm failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Three iterations (0, 1, 2), the empty loop prints nothing, then `done`.
+    assert_eq!(out.stdout, b"0\n1\n2\ndone\n");
+}
+
+#[test]
+fn coddl_run_cranelift_for_counted() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("for-demo"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"0\n1\n2\ndone\n");
 }
 
 #[test]

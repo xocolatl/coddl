@@ -664,3 +664,5 @@ check script enforces that.
 | T0068 | `if` arms have mismatched types — the `then` and `else` blocks must unify |
 | T0069 | an `if` without `else` must have a Unit (`Tuple {}`) then-arm (the statement form) |
 | T0070 | a UFCS method call `x.m {}` names an operator with no `self` parameter (not method-callable) |
+| T0071 | a counted `for i := lo to hi` bound is not `Integer` (both bounds must be Integer) |
+| T0072 | assignment to a `for` loop counter — the counter is loop-scoped and immutable |

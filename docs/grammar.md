@@ -418,6 +418,7 @@ function that implements it.
                     -- the block's value. Statements terminated by ';'
                     -- have their results discarded.
 <stmt>          ::= <let-stmt>
+                  | <for-stmt>
                   | <truncate-stmt>
                   | <delete-stmt>
                   | <insert-stmt>
@@ -490,6 +491,21 @@ function that implements it.
                     -- contextual keyword (the `let` precedent).
 <let-stmt>      ::= 'let' <identifier> [ ':' <type-ref> ]
                     '=' <expr> ';' ;                           -- parse_let_stmt
+<for-stmt>      ::= 'for' <identifier> ':=' <expr> 'to' <expr>
+                    'do' <block> ';' ;                         -- parse_for_stmt (FOR_STMT)
+                    -- A counted loop with an INCLUSIVE upper bound (`i <= hi`).
+                    -- `to` and `do` are contextual keywords recognized only in
+                    -- this statement position (the `let` precedent); each bound
+                    -- is a full <expr> that stops at the next keyword because
+                    -- neither `to` nor `do` is an infix operator or a postfix
+                    -- trigger. The counter is loop-scoped, `Integer`, and
+                    -- immutable — assigning it is T0072; both bounds must be
+                    -- Integer (T0071). `lo > hi` runs zero times (empty-safe at
+                    -- the header test). A trailing `;` is required — a `for` is
+                    -- a statement, never a value.
+                    -- P0062 on a missing counter name, P0063 on a missing `:=`,
+                    -- P0064 on a missing `to`, P0065 on a missing `do`, P0066 on
+                    -- a missing body `[`; P0013 on a missing trailing `;`.
 
 <expr>          ::= <expr-prec> ;                            -- parse_expr
 <expr-prec>     ::= <primary-expr> { <postfix> }
@@ -829,6 +845,11 @@ enforces that.
 | P0059 | Expected `then` after the `if` condition                |
 | P0060 | Expected `[` to start the `if` block                    |
 | P0061 | Expected `[` after `else`                               |
+| P0062 | Expected a loop variable name after `for`               |
+| P0063 | Expected `:=` after the `for` loop variable             |
+| P0064 | Expected `to` after the `for` lower bound               |
+| P0065 | Expected `do` after the `for` upper bound               |
+| P0066 | Expected `[` to start the `for` loop body               |
 
 Note: missing-type-after-`:` (let annotation), missing-type-after-`->`
 (operator return clause), and missing-element-after-`Sequence` all

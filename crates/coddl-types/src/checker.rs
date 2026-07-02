@@ -14,7 +14,8 @@ use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, DeleteStmt, Expr, ExprStmt,
     InsertStmt,
-    ExtendExpr, FieldAccess, Heading as AstHeading, IfExpr, IndexExpr, Item, KeyClause, LetStmt,
+    ExtendExpr, FieldAccess, ForStmt, Heading as AstHeading, IfExpr, IndexExpr, Item, KeyClause,
+    LetStmt,
     NamedArg, OperDecl,
     PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr,
     ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
@@ -41,6 +42,10 @@ enum BindingOrigin {
     Param,
     Relvar,
     WhereAttr,
+    /// The counter of a counted `for i := lo to hi` loop. Loop-scoped and
+    /// immutable (assigning it is T0072); excluded from the unused-binding
+    /// warning (a counted loop may legitimately ignore its counter).
+    ForCounter,
 }
 
 /// One binding in a scope layer: its `Type` for lookup, plus the metadata the
@@ -98,6 +103,18 @@ impl Scope {
         for layer in (0..self.layers.len()).rev() {
             if let Some(&idx) = self.layers[layer].get(name) {
                 return Some(&self.records[layer][idx].ty);
+            }
+        }
+        None
+    }
+
+    /// The origin of the active binding for `name` (innermost layer first),
+    /// or `None` if unbound. Used to give an assignment to a loop counter a
+    /// dedicated diagnostic (T0072).
+    fn origin(&self, name: &str) -> Option<BindingOrigin> {
+        for layer in (0..self.layers.len()).rev() {
+            if let Some(&idx) = self.layers[layer].get(name) {
+                return Some(self.records[layer][idx].origin);
             }
         }
         None
@@ -842,12 +859,54 @@ impl TypeChecker {
                 Stmt::Insert(i) => self.check_insert_stmt(&i, scope),
                 Stmt::Update(u) => self.check_update_stmt(&u, scope),
                 Stmt::ExprStmt(e) => self.check_expr_stmt(&e, scope),
+                Stmt::For(f) => self.check_for_stmt(&f, scope),
             }
         }
         match block.tail_expr() {
             Some(expr) => self.check_expr(&expr, scope),
             None => Type::unit(),
         }
+    }
+
+    /// Check a counted `for i := lo to hi do [ … ]` loop. Both bounds must be
+    /// `Integer`; the counter `i` is bound `Integer`, loop-scoped, and
+    /// immutable (assigning it is T0072, in `check_assignment_stmt`). `to` is
+    /// inclusive — `lo > hi` simply runs zero times, no diagnostic.
+    fn check_for_stmt(&mut self, stmt: &ForStmt, scope: &mut Scope) {
+        // Both bounds are full expressions in the *enclosing* scope (they can't
+        // reference the counter). Check them before binding the counter so the
+        // counter never leaks into a bound, and so bound diagnostics surface
+        // even if the body is empty.
+        for (bound, which) in [(stmt.lower_bound(), "lower"), (stmt.upper_bound(), "upper")] {
+            if let Some(expr) = bound {
+                let ty = self.check_expr(&expr, scope);
+                if !matches!(ty, Type::Integer | Type::Unknown) {
+                    self.error(
+                        self.node_span(expr.syntax()),
+                        "T0071",
+                        format!("`for` loop {which} bound must be Integer, but has type {ty}"),
+                    );
+                }
+            }
+        }
+
+        // The counter is loop-scoped: push a layer, bind it `Integer` with the
+        // `ForCounter` origin (immutable, exempt from the unused warning), check
+        // the body, then pop and report any unused *body* bindings.
+        scope.push();
+        if let Some(name_tok) = stmt.var_name() {
+            scope.insert(
+                name_tok.text().to_string(),
+                Type::Integer,
+                self.token_span(&name_tok),
+                BindingOrigin::ForCounter,
+            );
+        }
+        if let Some(body) = stmt.body() {
+            self.check_block(&body, scope);
+        }
+        let unused = scope.pop();
+        self.warn_unused(unused);
     }
 
     /// Check a relational assignment `R := <expr>;`. The target must be a bare
@@ -877,6 +936,17 @@ impl TypeChecker {
         };
         let Some(ident) = target.ident() else { return };
         let name = ident.text();
+
+        // A loop counter is immutable — assigning it is its own error, before
+        // the relvar lookup (the counter is a scope local, never a relvar).
+        if matches!(scope.origin(name), Some(BindingOrigin::ForCounter)) {
+            self.error(
+                self.token_span(&ident),
+                "T0072",
+                format!("`{name}` is a loop counter and cannot be reassigned"),
+            );
+            return;
+        }
 
         // … bound to an assignable relvar (public or private).
         let lookup = self.relvars.get(name).and_then(|i| {
@@ -5525,6 +5595,59 @@ mod tests {
         let src =
             "oper main {} [ let r = Relation { {a: 1}, {a: 2} }; let _s = r where a = 2; ];";
         assert!(!codes(src).contains(&"T0032"));
+    }
+
+    // ── Counted `for` loop ───────────────────────────────────────────
+
+    #[test]
+    fn for_counted_typechecks_clean() {
+        // The counter is Integer and in scope in the body; the bounds are
+        // Integer. No errors.
+        let src = "oper main {} [ for i := 0 to 2 do [ let _x = i + 1; ]; ];";
+        let d = diagnostics(src);
+        assert!(
+            d.iter().all(|x| x.severity != coddl_diagnostics::Severity::Error),
+            "expected no errors, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn for_counter_unused_does_not_warn_t0032() {
+        // A counted loop may legitimately ignore its counter — the ForCounter
+        // origin is exempt from the unused-binding warning.
+        let src = "oper main {} [ for i := 0 to 2 do [ write_line { message: \"hi\" }; ]; ];";
+        assert!(!codes(src).contains(&"T0032"), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn for_non_integer_bound_diagnoses_t0071() {
+        let src = "oper main {} [ for i := \"x\" to 2 do [ let _x = i; ]; ];";
+        assert!(codes(src).contains(&"T0071"), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn for_counter_is_immutable_t0072() {
+        let src = "oper main {} [ for i := 0 to 2 do [ i := 5; ]; ];";
+        let c = codes(src);
+        assert!(
+            c.contains(&"T0072"),
+            "expected T0072, got {:?}",
+            diagnostics(src)
+        );
+        // The dedicated code fires — not the generic non-relvar assignment T0033.
+        assert!(
+            !c.contains(&"T0033"),
+            "should not fall through to T0033: {:?}",
+            diagnostics(src)
+        );
+    }
+
+    #[test]
+    fn for_counter_is_scoped_to_body() {
+        // `i` is visible only inside the loop body; referencing it afterward is
+        // an unresolved name (T0001).
+        let src = "oper main {} [ for i := 0 to 2 do [ let _x = i; ]; let _y = i; ];";
+        assert!(codes(src).contains(&"T0001"), "{:?}", diagnostics(src));
     }
 
     #[test]

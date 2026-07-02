@@ -689,13 +689,30 @@ impl Emitter {
                     "block param {idx} has no branch argument from {src:?}"
                 ))
             })?;
-            let repr = self
-                .values
-                .get(arg)
-                .ok_or_else(|| {
-                    LlvmEmitError::UnsupportedInst(format!("undefined phi operand {arg:?}"))
-                })?
-                .clone();
+            let repr = match self.values.get(arg) {
+                Some(r) => r.clone(),
+                // A back-edge (the counted `for` loop's latch) branches to a
+                // header that *precedes* it, so the incoming value is defined in
+                // a not-yet-emitted block. A `phi` operand may reference such a
+                // value: its LLVM name is the canonical `%v<N>` for any
+                // instruction- or param-defined scalar, so synthesize the
+                // operand from the block param's type rather than requiring the
+                // defining block to be emitted first. (Loop-carried Text / Tuple
+                // values would need their multi-register names and are not yet
+                // threaded through a loop.)
+                None => match pty {
+                    ProcType::Text | ProcType::Binary | ProcType::Tuple(_) => {
+                        return Err(LlvmEmitError::UnsupportedInst(format!(
+                            "phi operand {arg:?} of type {pty:?} is defined in a later \
+                             block; loop-carried non-scalar values are not yet supported"
+                        )));
+                    }
+                    other => ValueRepr::Scalar {
+                        ty: llvm_value_type(other).to_string(),
+                        op: format!("%v{}", arg.0),
+                    },
+                },
+            };
             reprs.push((*src, repr));
         }
 

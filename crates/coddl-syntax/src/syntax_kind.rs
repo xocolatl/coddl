@@ -108,6 +108,7 @@ pub enum SyntaxKind {
     TRUNCATE_STMT,
     RETURN_STMT,
     EXPR_STMT,
+    FOR_STMT,
 
     // Expressions.
     LITERAL,

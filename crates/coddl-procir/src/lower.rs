@@ -17,7 +17,7 @@ use coddl_plan::{Plan, WritePolicy};
 use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, DeleteStmt, Expr, ExprStmt,
     InsertStmt,
-    ExtendExpr, FieldAccess, IfExpr, IndexExpr, Item,
+    ExtendExpr, FieldAccess, ForStmt, IfExpr, IndexExpr, Item,
     LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, RenameExpr,
     ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
     TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, WrapExpr,
@@ -1062,6 +1062,7 @@ impl Lowerer {
                 Stmt::Insert(i) => self.lower_insert_stmt(&i),
                 Stmt::Update(u) => self.lower_update_stmt(&u),
                 Stmt::ExprStmt(e) => self.lower_expr_stmt(&e),
+                Stmt::For(f) => self.lower_for_stmt(&f),
             }
         }
         match block.tail_expr() {
@@ -1700,6 +1701,106 @@ impl Lowerer {
     /// entry stays first and every predecessor precedes the block it branches
     /// to — the ordering the backends rely on. Nesting composes: an `if` in an
     /// arm seals its own blocks between that arm's `start` and `Br`.
+    /// Lower a counted `for i := lo to hi do [ … ]` loop — the project's first
+    /// *cyclic* CFG (a block that branches back to an earlier one). Shape, with
+    /// `entry` being whatever block is current on entry:
+    ///
+    /// ```text
+    /// entry:  %lo = <lo>; %hi = <hi>; Br header [%lo]
+    /// header (param %i): %c = %i <= %hi; CondBr %c -> body, exit
+    /// body:   <body>; %inc = %i + 1; Br header [%inc]      ← back-edge
+    /// exit:   …                                            ← left as current
+    /// ```
+    ///
+    /// `%hi` is evaluated **once**, in the entry block (it dominates the
+    /// header). The counter rides the header block's parameter — the same
+    /// block-param join `if` uses for its merge, now fed from two predecessors
+    /// (`%lo` on the entry edge, `%inc` on the back-edge). `to` is inclusive
+    /// (`<=`), so `lo > hi` fails the first test and the loop runs zero times.
+    /// The counter is bound as a body-scope local so `NameRef`s in the body
+    /// resolve to `%i`; it is `Integer`, so it needs no scope-exit release.
+    fn lower_for_stmt(&mut self, stmt: &ForStmt) {
+        // Evaluate both bounds once, in the entry block, before the loop.
+        let lo = stmt
+            .lower_bound()
+            .map(|e| self.lower_expr(&e))
+            .unwrap_or_else(|| self.fresh_value());
+        let hi = stmt
+            .upper_bound()
+            .map(|e| self.lower_expr(&e))
+            .unwrap_or_else(|| self.fresh_value());
+
+        let header = self.fresh_block();
+        let body = self.fresh_block();
+        let exit = self.fresh_block();
+
+        // Entry edge: seed the counter with the lower bound.
+        self.finish_block(Terminator::Br {
+            target: header,
+            args: vec![lo],
+        });
+
+        // Header: the counter is the sole block parameter (the SSA join). Test
+        // `i <= hi` and branch to the body or the exit.
+        let counter = self.fresh_value();
+        self.record_type(counter, ProcType::Integer);
+        self.start_block(header, vec![(counter, ProcType::Integer)]);
+        let cmp = self.fresh_value();
+        self.record_type(cmp, ProcType::Boolean);
+        self.insts.push(Inst::ScalarOp {
+            dst: cmp,
+            op: ScalarOp::LtEq,
+            operand_type: ProcType::Integer,
+            lhs: counter,
+            rhs: hi,
+        });
+        self.finish_block(Terminator::CondBr {
+            cond: cmp,
+            then_block: body,
+            else_block: exit,
+        });
+
+        // Body: bind the counter as a loop-scoped local, lower the body,
+        // release any heap locals it allocated (once per iteration), then
+        // compute `i + 1` and branch back to the header (the back-edge).
+        self.start_block(body, Vec::new());
+        self.push_local_scope();
+        if let Some(name_tok) = stmt.var_name() {
+            self.bind_local(name_tok.text().to_string(), counter, ProcType::Integer);
+        }
+        if let Some(b) = stmt.body() {
+            self.lower_block(&b);
+        }
+        self.release_top_scope_heap_locals();
+        self.pop_local_scope();
+        // The increment and back-edge are emitted into whatever block the body
+        // ended in — an inner `if` may have introduced blocks — which
+        // `current_block` / `self.insts` already track.
+        let one = self.fresh_value();
+        self.record_type(one, ProcType::Integer);
+        self.insts.push(Inst::Const {
+            dst: one,
+            value: Const::Integer(1),
+            ty: ProcType::Integer,
+        });
+        let inc = self.fresh_value();
+        self.record_type(inc, ProcType::Integer);
+        self.insts.push(Inst::ScalarOp {
+            dst: inc,
+            op: ScalarOp::Add,
+            operand_type: ProcType::Integer,
+            lhs: counter,
+            rhs: one,
+        });
+        self.finish_block(Terminator::Br {
+            target: header,
+            args: vec![inc],
+        });
+
+        // Exit: subsequent statements (and the block's tail) emit here.
+        self.start_block(exit, Vec::new());
+    }
+
     fn lower_if_expr(&mut self, ife: &IfExpr) -> ValueId {
         let cond_expr = ife.condition().expect("typechecked if has a condition");
         let cond = self.lower_expr(&cond_expr);
@@ -6233,6 +6334,49 @@ oper main {} [
             act.blocks.iter().all(|b| b.params.is_empty()),
             "a Unit `if` carries no merge parameter"
         );
+    }
+
+    // ── counted `for` loop — the first cyclic CFG ────────────────────
+
+    #[test]
+    fn for_counted_lowers_to_back_edge_cfg() {
+        // entry (Br→header, seeding the counter) → header (Integer counter
+        // param, CondBr) → body (Br→header — the back-edge) → exit (Return).
+        let src = "oper counted {} [ for i := 0 to 2 do [ let _x = i; ]; ];";
+        let m = lower_ok(src);
+        let f = m.functions.iter().find(|f| f.name == "counted").unwrap();
+        assert_eq!(f.blocks.len(), 4, "entry + header + body + exit");
+
+        // Exactly one block — the header — carries a parameter: the counter.
+        let headers: Vec<_> = f.blocks.iter().filter(|b| !b.params.is_empty()).collect();
+        assert_eq!(headers.len(), 1, "only the header carries a block param");
+        let header = headers[0];
+        assert_eq!(header.params.len(), 1);
+        assert_eq!(header.params[0].1, ProcType::Integer, "counter is Integer");
+        assert!(
+            matches!(header.terminator, Terminator::CondBr { .. }),
+            "header ends in CondBr, got {:?}",
+            header.terminator
+        );
+
+        // The back-edge: a `Br` to the header from a block that appears *after*
+        // the header in program order (the defining property of a loop).
+        let header_id = header.id;
+        let header_idx = f.blocks.iter().position(|b| b.id == header_id).unwrap();
+        let has_back_edge = f.blocks.iter().enumerate().any(|(idx, b)| {
+            idx > header_idx
+                && matches!(&b.terminator, Terminator::Br { target, .. } if *target == header_id)
+        });
+        assert!(has_back_edge, "a later block branches back to the header");
+
+        // The entry seeds the counter: `Br → header` with one argument.
+        match &f.blocks[0].terminator {
+            Terminator::Br { target, args } => {
+                assert_eq!(*target, header_id, "entry branches to the header");
+                assert_eq!(args.len(), 1, "entry seeds the counter with the lower bound");
+            }
+            other => panic!("entry should end in Br, got {other:?}"),
+        }
     }
 
     #[test]
