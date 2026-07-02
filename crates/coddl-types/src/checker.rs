@@ -2679,20 +2679,20 @@ impl TypeChecker {
 
     /// Walk a `Relation { <tuple-lit>, <tuple-lit>, … }` literal. The
     /// first tuple establishes the heading; subsequent tuples must
-    /// have the same `(name, type)` set. An empty `Relation {}` emits
-    /// T0018 (no inference context for the heading). A heading
-    /// mismatch emits T0019 on the offending tuple; the typechecker
-    /// keeps the first tuple's heading so downstream checks see a
-    /// stable type.
+    /// have the same `(name, type)` set. An empty `Relation {}` is the
+    /// nullary empty relation `relfalse` (empty heading, zero tuples —
+    /// the zero of the join semiring); its sibling `reltrue` is
+    /// `Relation { {} }` (one empty tuple). A heading mismatch emits
+    /// T0019 on the offending tuple; the typechecker keeps the first
+    /// tuple's heading so downstream checks see a stable type.
     fn check_relation_lit(&mut self, rel: &RelationLit, scope: &mut Scope) -> Type {
         let tuples: Vec<TupleLit> = rel.tuples().collect();
         if tuples.is_empty() {
-            self.error(
-                self.node_span(rel.syntax()),
-                "T0018",
-                "empty relation literal requires at least one tuple",
-            );
-            return Type::Unknown;
+            // `Relation {}` = `relfalse`. The empty heading is fully determined
+            // (no attributes named, no tuples), so there is nothing to infer and
+            // nothing to reject — unlike a *headed* empty relation, which has no
+            // literal form (the heading can only come from tuples).
+            return Type::Relation(Heading::empty());
         }
         let first_heading = match self.check_tuple_lit(&tuples[0], scope) {
             Type::Tuple(h) => h,
@@ -4311,12 +4311,13 @@ mod tests {
     }
 
     #[test]
-    fn insert_empty_tuple_set_diagnoses_t0018() {
-        // An empty `{}` is a zero-tuple relation literal — rejected like any
-        // empty relation literal (no heading to infer).
+    fn insert_empty_tuple_set_diagnoses_t0034() {
+        // An empty `{}` is `relfalse` (the nullary empty relation). Inserting it
+        // into a headed relvar is a heading mismatch (∅ vs `{a}`) — T0034, the
+        // same as any source whose heading differs from the relvar's.
         let src = "program p; private relvar R { a: Integer } key { a }; \
                    oper main {} [ insert R {}; ];";
-        assert!(codes(src).contains(&"T0018"), "{:?}", codes(src));
+        assert!(codes(src).contains(&"T0034"), "{:?}", codes(src));
     }
 
     #[test]
@@ -5274,9 +5275,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_relation_lit_diagnoses_t0018() {
-        let src = "oper main {} [ let r = Relation {}; ];";
-        assert!(codes(src).contains(&"T0018"));
+    fn empty_relation_lit_is_relfalse() {
+        // `Relation {}` is the nullary empty relation `relfalse` — a valid value,
+        // no longer rejected. Its sibling `reltrue` is `Relation { {} }`.
+        let src = "oper main {} [ let _r = Relation {}; ];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
     }
 
     #[test]

@@ -39,6 +39,7 @@ fn fixtures_dir() -> &'static Path {
             ("for-demo", FOR_DEMO_SRC),
             ("while-demo", WHILE_DEMO_SRC),
             ("do-while-demo", DO_WHILE_DEMO_SRC),
+            ("nullary-relations", NULLARY_RELATIONS_SRC),
             ("var-accum", VAR_ACCUM_SRC),
             ("uninit-var", UNINIT_VAR_SRC),
             ("for-in-demo", FOR_IN_DEMO_SRC),
@@ -179,6 +180,23 @@ oper main {} [
         write_line { message: \"once\" };
     ] while false;
     write_line { message: \"done\" };
+];
+";
+
+// The two nullary relations. `relfalse` (`Relation {}`, zero tuples) prints
+// nothing; `reltrue` (`Relation { {} }`, one empty tuple) prints `{}`. Sentinel
+// lines bracket each so the empty output of relfalse is observable (before/mid
+// are adjacent).
+const NULLARY_RELATIONS_SRC: &str = "\
+program nullary_relations;
+oper main {} [
+    let f = Relation {};
+    let t = Relation { {} };
+    write_line { message: \"before\" };
+    write_relation { rel: f };
+    write_line { message: \"mid\" };
+    write_relation { rel: t };
+    write_line { message: \"after\" };
 ];
 ";
 
@@ -626,6 +644,39 @@ fn coddl_run_cranelift_do_while() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.stdout, b"0\n1\n2\nonce\ndone\n");
+}
+
+#[test]
+fn coddl_run_llvm_nullary_relations() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("nullary-relations"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=llvm failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // relfalse prints nothing (before/mid adjacent); reltrue prints `{}`.
+    assert_eq!(out.stdout, b"before\nmid\n{}\nafter\n");
+}
+
+#[test]
+fn coddl_run_cranelift_nullary_relations() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("nullary-relations"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"before\nmid\n{}\nafter\n");
 }
 
 #[test]

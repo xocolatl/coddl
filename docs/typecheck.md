@@ -372,8 +372,9 @@ each `parse_<x>` has a corresponding `check_<x>`.
   field name; on miss emits `T0017` and returns `Type::Unknown`; on
   hit returns the attribute's type.
 - **`check_relation_lit`** — walks each nested tuple via
-  `check_tuple_lit`. Empty `Relation {}` emits `T0018` (no
-  inference context for the heading) and returns `Type::Unknown`.
+  `check_tuple_lit`. Empty `Relation {}` is `relfalse` — the nullary
+  empty relation (empty heading, zero tuples) — and returns
+  `Type::Relation(∅)`; its sibling `reltrue` is `Relation { {} }`.
   The first tuple's heading establishes the relation's heading;
   every subsequent tuple must match (per `Heading::assignable_to`);
   mismatches emit `T0019` on the offending tuple without cascading
@@ -574,7 +575,8 @@ and transaction rule (**T0025**):
   the relvar's (**T0034**). The two surface forms — a brace `<tuple-set>` (a
   keyword-less relation literal) or a relation `<expr>` — are a single `source`
   expression to the checker, so one `check_expr` validates either (an empty
-  tuple-set is the empty-relation-literal error, **T0018**).
+  tuple-set is `relfalse`, the nullary empty relation, whose ∅ heading a headed
+  relvar rejects as a heading mismatch, **T0034**).
 - **`update R where p { c: e };`** → `R := (R where ¬p) union ((R where p)
   «sub»)`. The operand must be relvar-rooted (a bare relvar, or `R where p`) over
   a bare assignable relvar (**T0033**); the predicate is validated like any
@@ -611,7 +613,7 @@ check script enforces that.
 | T0015 | Duplicate field name in tuple literal                    |
 | T0016 | Field access on a value whose type isn't a tuple         |
 | T0017 | Unknown field name in tuple field access                 |
-| T0018 | Empty relation literal — no inference context for heading |
+| T0018 | _(retired — code available for reuse)_ — was "empty relation literal"; `Relation {}` is now the nullary empty relation `relfalse` |
 | T0019 | Tuple heading mismatch in relation literal                |
 | T0020 | `where` predicate must be Boolean                         |
 | T0021 | Scalar operator operand type mismatch                     |

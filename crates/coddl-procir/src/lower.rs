@@ -4512,10 +4512,21 @@ impl Lowerer {
 
     fn lower_relation_lit(&mut self, rel: &RelationLit) -> ValueId {
         let tuples: Vec<TupleLit> = rel.tuples().collect();
-        assert!(
-            !tuples.is_empty(),
-            "empty relation literal survived typecheck (T0018)"
-        );
+        // `Relation {}` = `relfalse`: the nullary empty relation. Build it
+        // directly — the empty heading is the descriptor, and the seal of zero
+        // records is a no-op. The sibling `reltrue` (`Relation { {} }`) takes the
+        // general path below with a single empty tuple.
+        if tuples.is_empty() {
+            let heading_id = self.intern_heading(&Heading::empty());
+            let dst = self.fresh_value();
+            self.record_type(dst, ProcType::Relation(heading_id));
+            self.insts.push(Inst::RelationLit {
+                dst,
+                tuples: Vec::new(),
+                heading_id,
+            });
+            return dst;
+        }
         let mut tuple_values: Vec<ValueId> = Vec::with_capacity(tuples.len());
         let mut heading: Option<Heading> = None;
         for tup in &tuples {
@@ -6468,6 +6479,30 @@ oper main {} [
         assert!(h.lookup("b").is_some(), "`b` kept");
         assert!(h.lookup("a").is_none(), "`a` renamed away");
         assert_eq!(perm, vec![1, 0], "dst [b, z] ← src [a, b] indices");
+    }
+
+    #[test]
+    fn empty_relation_literal_lowers_to_relfalse() {
+        // `Relation {}` = relfalse: an `Inst::RelationLit` with zero tuples and
+        // the empty (nullary) heading — no T0018, no lowering assert.
+        let src = "oper main {} [ let _f = Relation {}; ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let (tuples_len, heading_id) = main.blocks[0]
+            .insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::RelationLit {
+                    tuples, heading_id, ..
+                } => Some((tuples.len(), *heading_id)),
+                _ => None,
+            })
+            .expect("expected an Inst::RelationLit");
+        assert_eq!(tuples_len, 0, "relfalse has zero tuples");
+        assert!(
+            m.headings[heading_id.0 as usize].attrs().is_empty(),
+            "relfalse carries the empty (nullary) heading"
+        );
     }
 
     #[test]

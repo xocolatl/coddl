@@ -474,7 +474,8 @@ function that implements it.
                     -- (the body is identical to <relation-lit>'s and reuses its
                     -- tuple-body codes P0032 / P0033), so the checker and
                     -- lowerer treat it as a relation source uniformly. An empty
-                    -- `{}` is a zero-tuple relation literal (rejected, T0018).
+                    -- `{}` is `relfalse` (the nullary empty relation); inserting
+                    -- it into a headed relvar is a heading mismatch (T0034).
 <update-stmt>   ::= 'update' <expr> <arg-list> ';' ;           -- parse_update_stmt
                     -- Overwrite named attributes of the matching tuples — sugar
                     -- for `R := (R where ¬p) union ((R where p) «substitute»)`
@@ -790,9 +791,11 @@ function that implements it.
                     -- 'Relation' is a contextual keyword; recognized
                     -- by name in primary-expr position. The body is
                     -- a comma-separated list of tuple literals,
-                    -- trailing comma allowed. Empty `Relation {}`
-                    -- parses cleanly but typechecks as T0018 (no
-                    -- inference context for the heading).
+                    -- trailing comma allowed. Empty `Relation {}` is
+                    -- `relfalse` — the nullary empty relation (empty
+                    -- heading, zero tuples; the zero of the join
+                    -- semiring). Its sibling `reltrue` is the one-empty-
+                    -- tuple literal `Relation { {} }`.
 <sequence-lit>  ::= 'Sequence' '[' [ <expr> commalist ] ']' ;     -- parse_sequence_lit
                     -- 'Sequence' is a contextual keyword; recognized
                     -- by name in primary-expr position. The body is a
