@@ -418,13 +418,14 @@ function that implements it.
                     -- the block's value. Statements terminated by ';'
                     -- have their results discarded.
 <stmt>          ::= <let-stmt>
+                  | <var-stmt>
                   | <for-stmt>
                   | <truncate-stmt>
                   | <delete-stmt>
                   | <insert-stmt>
                   | <update-stmt>
                   | <assign-stmt>
-                  | <expr> ';' ;                               -- parse_stmt (LET_STMT, TRUNCATE_STMT, DELETE_STMT, INSERT_STMT, UPDATE_STMT, ASSIGN_STMT, or EXPR_STMT)
+                  | <expr> ';' ;                               -- parse_stmt (LET_STMT, VAR_STMT, TRUNCATE_STMT, DELETE_STMT, INSERT_STMT, UPDATE_STMT, ASSIGN_STMT, or EXPR_STMT)
 <assign-stmt>   ::= <expr> ':=' <expr> ';' ;                   -- parse_stmt (ASSIGN_STMT)
                     -- Relational assignment. The parser accepts any
                     -- expression as the target (LHS); the typechecker
@@ -491,6 +492,25 @@ function that implements it.
                     -- contextual keyword (the `let` precedent).
 <let-stmt>      ::= 'let' <identifier> [ ':' <type-ref> ]
                     '=' <expr> ';' ;                           -- parse_let_stmt
+                    -- An **immutable** value binding: the operator is `=`. A
+                    -- `:=` here is the `var` operator by mistake — P0067, then
+                    -- the `:=` is consumed for recovery so the RHS still parses.
+                    -- `let` is a contextual keyword (usable as an identifier
+                    -- elsewhere; no reserved words).
+<var-stmt>      ::= 'var' <identifier> [ ':' <type-ref> ]
+                    ':=' <expr> ';' ;                          -- parse_var_stmt (VAR_STMT)
+                    -- A **mutable** value binding — the reassignable sibling of
+                    -- `let`. The operator is `:=`, matching the operator that
+                    -- reassigns it (`<name> := <expr>;`, an <assign-stmt>) and
+                    -- the counted-`for` counter init; `=` here is the `let`
+                    -- operator by mistake — P0068, then `=` is consumed for
+                    -- recovery. The `:` annotation never eats the `:` of `:=`
+                    -- (which lexes as one `ASSIGN` token). `var` is a contextual
+                    -- keyword recognized only as the leading token of a statement
+                    -- (the `let` precedent), usable as an identifier elsewhere —
+                    -- with the usual cost that a bare `var := …;` reassigning a
+                    -- relvar/local literally named `var` is instead read as a
+                    -- (malformed) `var` declaration.
 <for-stmt>      ::= 'for' <identifier>
                       ( ':=' <expr> 'to' <expr> | 'in' <expr> )
                       'do' <block> ';' ;                       -- parse_for_stmt (FOR_STMT)
@@ -814,7 +834,7 @@ enforces that.
 | P0015 | Expected `}` to close argument list                     |
 | P0016 | Expected argument name                                  |
 | P0017 | Expected `:` after argument name                        |
-| P0018 | `let` statement is malformed (missing name, `=`, or RHS)|
+| P0018 | `let`/`var` binding is malformed (missing name, operator, or RHS) |
 | P0019 | `transaction` not followed by `[`                       |
 | P0020 | Expected database name (in `database <Name>;`)          |
 | P0021 | Expected `;` after `database <Name>`                    |
@@ -863,6 +883,8 @@ enforces that.
 | P0064 | Expected `to` after the `for` lower bound               |
 | P0065 | Expected `do` before the `for` loop body                |
 | P0066 | Expected `[` to start the `for` loop body               |
+| P0067 | `let` binding bound with `:=` (use `=`)                 |
+| P0068 | `var` binding bound with `=` (use `:=`)                 |
 
 Note: missing-type-after-`:` (let annotation), missing-type-after-`->`
 (operator return clause), and missing-element-after-`Sequence` all

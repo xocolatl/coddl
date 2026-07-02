@@ -331,6 +331,7 @@ impl Block {
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Let(LetStmt),
+    Var(VarStmt),
     Assign(AssignStmt),
     Truncate(TruncateStmt),
     Delete(DeleteStmt),
@@ -338,12 +339,14 @@ pub enum Stmt {
     Update(UpdateStmt),
     ExprStmt(ExprStmt),
     For(ForStmt),
+    // `return` arrives when its semantics are settled.
 }
 
 impl Stmt {
     pub fn cast(syntax: SyntaxNode) -> Option<Self> {
         Some(match syntax.kind() {
             SyntaxKind::LET_STMT => Stmt::Let(LetStmt { syntax }),
+            SyntaxKind::VAR_STMT => Stmt::Var(VarStmt { syntax }),
             SyntaxKind::ASSIGN_STMT => Stmt::Assign(AssignStmt { syntax }),
             SyntaxKind::TRUNCATE_STMT => Stmt::Truncate(TruncateStmt { syntax }),
             SyntaxKind::DELETE_STMT => Stmt::Delete(DeleteStmt { syntax }),
@@ -358,6 +361,7 @@ impl Stmt {
     pub fn syntax(&self) -> &SyntaxNode {
         match self {
             Stmt::Let(s) => s.syntax(),
+            Stmt::Var(s) => s.syntax(),
             Stmt::Assign(s) => s.syntax(),
             Stmt::Truncate(s) => s.syntax(),
             Stmt::Delete(s) => s.syntax(),
@@ -381,6 +385,28 @@ impl LetStmt {
 
     /// The optional type annotation: the `TypeRef` child between the
     /// binding name and the `=`. Absent → type inferred from RHS.
+    pub fn type_ref(&self) -> Option<TypeRef> {
+        child(&self.syntax)
+    }
+
+    /// The right-hand-side expression.
+    pub fn value(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+}
+
+ast_node!(pub VarStmt, VAR_STMT);
+
+impl VarStmt {
+    /// The binding's name (the IDENT immediately after `var`).
+    pub fn name(&self) -> Option<SyntaxToken> {
+        // Skip the `var` IDENT (contextual keyword); the binding name
+        // is the second IDENT child token.
+        nth_token(&self.syntax, SyntaxKind::IDENT, 1)
+    }
+
+    /// The optional type annotation: the `TypeRef` child between the
+    /// binding name and the `:=`. Absent → type inferred from RHS.
     pub fn type_ref(&self) -> Option<TypeRef> {
         child(&self.syntax)
     }

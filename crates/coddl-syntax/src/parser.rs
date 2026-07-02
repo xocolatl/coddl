@@ -457,10 +457,11 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
-    /// `let <name> [: <type-ref>] = <expr>;` — a value binding visible
-    /// to subsequent statements in the same block. Type annotation is
-    /// optional; when absent, the binding's type is inferred from the
-    /// RHS. No `mut`, no destructuring for now.
+    /// `let <name> [: <type-ref>] = <expr>;` — an immutable value binding
+    /// visible to subsequent statements in the same block. Type annotation
+    /// is optional; when absent, the binding's type is inferred from the
+    /// RHS. The mutable sibling is `var … := …` (`parse_var_stmt`). No
+    /// destructuring for now.
     fn parse_let_stmt(&mut self) {
         debug_assert!(self.at_keyword("let"));
         self.start_node(SyntaxKind::LET_STMT);
@@ -474,7 +475,13 @@ impl<'a> Parser<'a> {
         if self.eat(SyntaxKind::COLON) {
             self.parse_type_ref();
         }
-        if !self.eat(SyntaxKind::EQ) {
+        // The binding operator is `=`. A `:=` here is the `var` operator
+        // used by mistake — flag it specifically, then consume it so the
+        // RHS still parses (recovery).
+        if self.at(SyntaxKind::ASSIGN) {
+            self.error("P0067", "`let` bindings bind with `=`, not `:=`");
+            self.bump(); // consume `:=` for recovery
+        } else if !self.eat(SyntaxKind::EQ) {
             self.error("P0018", "expected `=` in `let`");
         }
         let before = self.pos;
@@ -484,6 +491,46 @@ impl<'a> Parser<'a> {
         }
         if !self.eat(SyntaxKind::SEMICOLON) {
             self.error("P0013", "expected `;` after `let`");
+        }
+        self.finish_node();
+    }
+
+    /// `var <name> [: <type-ref>] := <expr>;` — a mutable value binding.
+    /// Like `let`, but reassignable via a bare `<name> := <expr>;`
+    /// (`ASSIGN_STMT`); the binding operator is `:=`, matching the operator
+    /// that reassigns it and the counted-`for` counter init. Type annotation
+    /// is optional; when absent, the type is inferred from the RHS. No
+    /// destructuring for now.
+    fn parse_var_stmt(&mut self) {
+        debug_assert!(self.at_keyword("var"));
+        self.start_node(SyntaxKind::VAR_STMT);
+        self.bump(); // `var`
+
+        self.bump_trivia();
+        if !self.eat(SyntaxKind::IDENT) {
+            self.error("P0018", "expected binding name in `var`");
+        }
+        // Optional `: <type-ref>` annotation between the name and `:=`.
+        // (`:=` lexes as one `ASSIGN` token, so this never eats its `:`.)
+        if self.eat(SyntaxKind::COLON) {
+            self.parse_type_ref();
+        }
+        // The binding operator is `:=`. A plain `=` here is the `let`
+        // operator used by mistake — flag it specifically, then consume it
+        // so the RHS still parses (recovery).
+        if self.at(SyntaxKind::EQ) {
+            self.error("P0068", "`var` bindings assign with `:=`, not `=`");
+            self.bump(); // consume `=` for recovery
+        } else if !self.eat(SyntaxKind::ASSIGN) {
+            self.error("P0018", "expected `:=` in `var`");
+        }
+        let before = self.pos;
+        self.parse_expr();
+        if self.pos == before {
+            self.error("P0018", "expected expression in `var`");
+        }
+        if !self.eat(SyntaxKind::SEMICOLON) {
+            self.error("P0013", "expected `;` after `var`");
         }
         self.finish_node();
     }
@@ -719,6 +766,10 @@ impl<'a> Parser<'a> {
         }
         if self.at_keyword("let") {
             self.parse_let_stmt();
+            return;
+        }
+        if self.at_keyword("var") {
+            self.parse_var_stmt();
             return;
         }
         if self.at_keyword("truncate") {
@@ -3074,6 +3125,61 @@ mod tests {
             "expected P0058, got {:?}",
             out.diagnostics
         );
+    }
+
+    // ── `var <name> := <expr>` and the let/var operator mismatch ─────
+
+    #[test]
+    fn var_stmt_parses_to_var_stmt() {
+        let out = parse_str("oper f {} [ var x := 1; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert!(
+            out.tree
+                .descendants()
+                .any(|n| n.kind() == SyntaxKind::VAR_STMT),
+            "expected a VAR_STMT node"
+        );
+    }
+
+    #[test]
+    fn var_stmt_with_annotation_parses() {
+        // The `:` annotation never eats the `:` of the `:=` operator (which
+        // lexes as one ASSIGN token).
+        let out = parse_str("oper f {} [ var x: Integer := 1; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert!(out
+            .tree
+            .descendants()
+            .any(|n| n.kind() == SyntaxKind::VAR_STMT));
+    }
+
+    #[test]
+    fn let_with_walrus_diagnoses_p0067_and_recovers() {
+        let out = parse_str("oper f {} [ let x := 1; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0067"),
+            "expected P0067, got {:?}",
+            out.diagnostics
+        );
+        // Recovery consumes the `:=` and still parses the binding as a LET_STMT.
+        assert!(out
+            .tree
+            .descendants()
+            .any(|n| n.kind() == SyntaxKind::LET_STMT));
+    }
+
+    #[test]
+    fn var_with_eq_diagnoses_p0068_and_recovers() {
+        let out = parse_str("oper f {} [ var x = 1; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0068"),
+            "expected P0068, got {:?}",
+            out.diagnostics
+        );
+        assert!(out
+            .tree
+            .descendants()
+            .any(|n| n.kind() == SyntaxKind::VAR_STMT));
     }
 
     // ── `if <cond> then [ … ] else [ … ]` ────────────────────────────

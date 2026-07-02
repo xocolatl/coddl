@@ -1,6 +1,12 @@
 # LSP — `coddl-lsp` language server + VSCode extension
 
-A VSCode extension shipping a TextMate grammar for instant lexical highlighting, paired with `coddl-lsp` — a Rust language server built on the same frontend crates as the compiler. v1 scope is the two capabilities currently committed: **syntax highlighting and diagnostics (warnings/errors)**. Hover, go-to-definition, find-references, completion, and semantic-token enhancements are designed-for but not v1 work.
+A VSCode extension shipping a TextMate grammar for instant lexical highlighting, paired with `coddl-lsp` — a Rust language server built on the same frontend crates as the compiler. v1 capabilities currently committed: **syntax highlighting, diagnostics (warnings/errors), inferred-type inlay hints, formatting, and semantic tokens** for mutable-`var` highlighting (see below). Hover, go-to-definition, find-references, completion, and fuller semantic-token coverage (every identifier classified) are designed-for but not v1 work.
+
+## Semantic tokens (mutable-`var` highlighting)
+
+The server advertises `textDocument/semanticTokens` with a minimal legend — token types `[variable]`, token modifiers `[mutable]` — and answers `semantic_tokens_full` by emitting one `variable`+`mutable` token per occurrence (declaration, read, and write) of a mutable `var` binding. This mirrors rust-analyzer's `mutable` modifier so editors underline mutable variables.
+
+The occurrence spans are **precomputed by the typechecker**, not walked in the LSP: `coddl_types::check` resolves every `NameRef` to its binding already, so it records each `var` occurrence's span into `CheckOutput::mutable_spans` as a side product. The analyzer carries that `Vec<Span>` into the `Snapshot` (like `hints`), and `semantic_tokens_full` just sorts, dedups, and delta-encodes it against the `LineIndex`. Because the spans are plain byte offsets (Send/Sync), this needs **no** stored `GreenNode` — sidestepping the `!Sync` rowan-cursor constraint that a general tree-walking semantic-token pass would hit. A fuller highlighter (typing every identifier) is the natural next step and would keep this same span-list plumbing.
 
 ## Crate shape
 

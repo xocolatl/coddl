@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use coddl_diagnostics::{Diagnostic, FileId};
+use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{AstNode, Root};
 use coddl_syntax::FileKind;
 use coddl_types::TypeHint;
@@ -169,14 +169,14 @@ impl Analyzer {
         // reconstitute the `SyntaxNode` per request.
         let source_for_blocking = source.clone();
         let snap_arc = tokio::task::spawn_blocking(move || {
-            let (diagnostics, hints) = match kind {
+            let (diagnostics, hints, mutable_spans) = match kind {
                 FileKind::Cd | FileKind::Cddb => {
                     let check = coddl_types::check(&source_for_blocking, FileId(0), kind);
-                    (check.diagnostics, check.hints)
+                    (check.diagnostics, check.hints, check.mutable_spans)
                 }
                 other => {
                     let parse_out = coddl_syntax::parse(&source_for_blocking, FileId(0), other);
-                    (parse_out.diagnostics, Vec::new())
+                    (parse_out.diagnostics, Vec::new(), Vec::new())
                 }
             };
             let line_index = LineIndex::new(source_for_blocking.clone());
@@ -184,6 +184,7 @@ impl Analyzer {
                 source: source_for_blocking,
                 diagnostics,
                 hints,
+                mutable_spans,
                 line_index,
                 version,
             })
@@ -616,6 +617,9 @@ pub struct Snapshot {
     pub source: Arc<str>,
     pub diagnostics: Vec<Diagnostic>,
     pub hints: Vec<TypeHint>,
+    /// Occurrence spans of mutable `var` bindings — one `variable`+`mutable`
+    /// semantic token each (see `semantic_tokens_full`).
+    pub mutable_spans: Vec<Span>,
     pub line_index: LineIndex,
     pub version: i32,
 }

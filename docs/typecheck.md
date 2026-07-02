@@ -667,3 +667,7 @@ check script enforces that.
 | T0071 | a counted `for i := lo to hi` bound is not `Integer` (both bounds must be Integer) |
 | T0072 | assignment to a `for` loop variable — it is loop-scoped and immutable |
 | T0073 | `for … in` requires a `Sequence` operand; a `Relation` (or scalar) is rejected, pointing at `load … order` (the RM Pro 7 tuple-at-a-time boundary) |
+| T0074 | reassignment (`x := …`) of an immutable `let` binding or a parameter — declare it with `var` to allow reassignment (a loop counter is the distinct T0072) |
+| T0075 | reassignment (`x := …`) of a `var` whose RHS type differs from the binding's declared/inferred type |
+| T0076 | reassigning a **heap-typed** `var` (`Text`/`Sequence`/`Relation`) *across a control-flow join* (a loop back-edge or `if` merge) is not yet lowered — value-typed vars thread fine, and straight-line heap reassignment is fine (lowering) |
+| T0077 | _(warning)_ a `var` is read but never reassigned — use `let` (a leading `_` opts out; the analog of Rust's `unused_mut`) |

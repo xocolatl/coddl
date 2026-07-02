@@ -100,7 +100,7 @@ pub enum SyntaxKind {
 
     // Statements.
     LET_STMT,
-    MUT_STMT,
+    VAR_STMT,
     ASSIGN_STMT,
     INSERT_STMT,
     DELETE_STMT,

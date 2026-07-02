@@ -19,7 +19,7 @@ use coddl_syntax::ast::{
     NamedArg, OperDecl,
     PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr,
     ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
-    TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, WrapExpr,
+    TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WrapExpr,
 };
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
@@ -39,6 +39,11 @@ use crate::ty::{Heading, Type};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BindingOrigin {
     Let,
+    /// A mutable `var x := …` binding. Reassignable via `x := …` (T0074
+    /// otherwise, for `Let`/`Param`); every occurrence is reported to editors
+    /// as mutable (the LSP's `mutable` semantic-token modifier). Warns unused
+    /// like `Let`.
+    Var,
     Param,
     Relvar,
     WhereAttr,
@@ -49,14 +54,17 @@ enum BindingOrigin {
 }
 
 /// One binding in a scope layer: its `Type` for lookup, plus the metadata the
-/// unused-binding check needs — the name-token span (for the squiggle), the
-/// origin, and whether any `NameRef` ever resolved to it.
+/// binding lints need — the name-token span (for the squiggle), the origin,
+/// whether any `NameRef` ever resolved to it (`used`), and whether it was ever
+/// the target of a reassignment (`reassigned`; a `var` that never is should be
+/// a `let`, T0077).
 struct Binding {
     ty: Type,
     name: String,
     span: Span,
     origin: BindingOrigin,
     used: bool,
+    reassigned: bool,
 }
 
 #[derive(Default)]
@@ -92,6 +100,7 @@ impl Scope {
             span,
             origin,
             used: false,
+            reassigned: false,
         });
         self.layers
             .last_mut()
@@ -126,6 +135,17 @@ impl Scope {
         for layer in (0..self.layers.len()).rev() {
             if let Some(&idx) = self.layers[layer].get(name) {
                 self.records[layer][idx].used = true;
+                return;
+            }
+        }
+    }
+
+    /// Mark the active binding for `name` as reassigned (innermost layer
+    /// first) — a `var` that is never reassigned should be a `let` (T0077).
+    fn mark_reassigned(&mut self, name: &str) {
+        for layer in (0..self.layers.len()).rev() {
+            if let Some(&idx) = self.layers[layer].get(name) {
+                self.records[layer][idx].reassigned = true;
                 return;
             }
         }
@@ -168,6 +188,12 @@ pub struct CheckOutput {
     pub tree: SyntaxNode,
     pub diagnostics: Vec<Diagnostic>,
     pub hints: Vec<TypeHint>,
+    /// Byte ranges of every occurrence — declaration, read, and write — of a
+    /// mutable `var` binding, collected as a side product of name resolution.
+    /// The LSP emits one `variable`+`mutable` semantic token per span (the
+    /// rust-analyzer-style mutability marking); no symbol table or tree walk
+    /// is needed downstream.
+    pub mutable_spans: Vec<Span>,
     /// All relvars declared in this file. For `.cd`: public + private
     /// (and any base/virtual the user mistakenly placed in `.cd`,
     /// which T0014 flags). For `.cddb`: base + virtual (similarly).
@@ -190,6 +216,7 @@ pub fn check(source: &str, file: FileId, file_kind: FileKind) -> CheckOutput {
         builtins: Builtins::new(),
         diagnostics: parse_out.diagnostics,
         hints: Vec::new(),
+        mutable_spans: Vec::new(),
         relvars: RelvarTable::new(),
         transaction_depth: 0,
         public_relvars: HashSet::new(),
@@ -215,6 +242,7 @@ pub fn check(source: &str, file: FileId, file_kind: FileKind) -> CheckOutput {
         tree,
         diagnostics: tc.diagnostics,
         hints: tc.hints,
+        mutable_spans: tc.mutable_spans,
         relvars: tc.relvars,
     }
 }
@@ -225,6 +253,8 @@ struct TypeChecker {
     builtins: Builtins,
     diagnostics: Vec<Diagnostic>,
     hints: Vec<TypeHint>,
+    /// Occurrence spans of mutable `var` bindings; see [`CheckOutput`].
+    mutable_spans: Vec<Span>,
     relvars: RelvarTable,
     /// How many `transaction [...]` blocks the current walk is nested
     /// inside. Bumped by `check_transaction_expr` around its body. Used
@@ -258,32 +288,48 @@ impl TypeChecker {
             .push(Diagnostic::warning(span, code, message));
     }
 
-    /// Emit T0032 for every user `let` binding in a popped scope layer that no
-    /// `NameRef` ever resolved to. A leading `_` (including bare `_`) opts out
-    /// — the "unused-OK" convention. Injected names (relvars, `where`
-    /// attributes) and parameters are excluded by origin.
+    /// Binding lints for a popped scope layer: T0032 for a `let`/`var`/param
+    /// no `NameRef` ever resolved to, and T0077 for a `var` that is read but
+    /// never reassigned (it should be a `let`). A leading `_` (including bare
+    /// `_`) opts out of both — the "unused-OK" convention. Injected names
+    /// (relvars, `where` attributes) are excluded by origin.
     fn warn_unused(&mut self, layer: Vec<Binding>) {
         for b in layer {
-            if b.used || !matches!(b.origin, BindingOrigin::Let | BindingOrigin::Param) {
-                continue;
-            }
-            // A leading `_` opts out. `self` is the UFCS receiver — a parameter
-            // literally named `self` is what makes an `oper` callable as
-            // `x.method { ... }`, so renaming it to `_self` would break that
-            // call syntax; it never warns even when the body ignores it.
+            // A leading `_` opts out of every binding lint. `self` is the UFCS
+            // receiver — a parameter literally named `self` is what makes an
+            // `oper` callable as `x.method { ... }`, so renaming it to `_self`
+            // would break that call syntax; it never warns even when ignored.
             if b.name.starts_with('_') || b.name == "self" {
                 continue;
             }
-            let what = if matches!(b.origin, BindingOrigin::Param) {
-                "parameter"
-            } else {
-                "binding"
-            };
-            self.warn(
-                b.span,
-                "T0032",
-                format!("unused {what} `{}`; prefix with `_` if intentional", b.name),
-            );
+            // Never read → unused binding (T0032), for `let`/`var`/parameters.
+            if !b.used
+                && matches!(
+                    b.origin,
+                    BindingOrigin::Let | BindingOrigin::Var | BindingOrigin::Param
+                )
+            {
+                let what = if matches!(b.origin, BindingOrigin::Param) {
+                    "parameter"
+                } else {
+                    "binding"
+                };
+                self.warn(
+                    b.span,
+                    "T0032",
+                    format!("unused {what} `{}`; prefix with `_` if intentional", b.name),
+                );
+                continue;
+            }
+            // Read but never reassigned → a `var` that could be a `let`
+            // (the analog of Rust's `unused_mut`).
+            if b.origin == BindingOrigin::Var && b.used && !b.reassigned {
+                self.warn(
+                    b.span,
+                    "T0077",
+                    format!("`{}` is declared `var` but never reassigned; use `let`", b.name),
+                );
+            }
         }
     }
 
@@ -853,6 +899,7 @@ impl TypeChecker {
         for stmt in block.statements() {
             match stmt {
                 Stmt::Let(l) => self.check_let_stmt(&l, scope),
+                Stmt::Var(v) => self.check_var_stmt(&v, scope),
                 Stmt::Assign(a) => self.check_assignment_stmt(&a, scope),
                 Stmt::Truncate(t) => self.check_truncate_stmt(&t, scope),
                 Stmt::Delete(d) => self.check_delete_stmt(&d, scope),
@@ -978,6 +1025,55 @@ impl TypeChecker {
                 format!("`{name}` is a loop counter and cannot be reassigned"),
             );
             return;
+        }
+
+        // A local-binding target: a mutable `var` is reassignable; an
+        // immutable `let` or a parameter is not. This precedes the relvar
+        // lookup — a local binding shadows any same-named relvar for
+        // assignment, and its diagnostics are clearer than "not a relvar".
+        // (`Relvar`/`WhereAttr` origins fall through to the relvar path.)
+        match scope.origin(name) {
+            Some(BindingOrigin::Var) => {
+                // A write is a mutable occurrence (LSP marking) but not a
+                // read — an only-written `var` still warns unused (T0032).
+                self.mutable_spans.push(self.token_span(&ident));
+                // Record the reassignment so a never-reassigned `var` can be
+                // flagged as a `let` at scope exit (T0077).
+                scope.mark_reassigned(name);
+                if let Some(decl_ty) = scope.lookup(name).cloned() {
+                    if !rhs_ty.assignable_to(&decl_ty) {
+                        let span = stmt
+                            .value()
+                            .map(|v| self.node_span(v.syntax()))
+                            .unwrap_or_else(|| self.token_span(&ident));
+                        self.error(
+                            span,
+                            "T0075",
+                            format!("cannot assign {rhs_ty} to `{name}`, declared {decl_ty}"),
+                        );
+                    }
+                }
+                return;
+            }
+            Some(origin @ (BindingOrigin::Let | BindingOrigin::Param)) => {
+                let what = if origin == BindingOrigin::Param {
+                    "a parameter"
+                } else {
+                    "an immutable `let` binding"
+                };
+                let hint = if origin == BindingOrigin::Param {
+                    ""
+                } else {
+                    "; declare it with `var` to allow reassignment"
+                };
+                self.error(
+                    self.token_span(&ident),
+                    "T0074",
+                    format!("`{name}` is {what} and cannot be reassigned{hint}"),
+                );
+                return;
+            }
+            _ => {}
         }
 
         // … bound to an assignable relvar (public or private).
@@ -1296,27 +1392,65 @@ impl TypeChecker {
     }
 
     fn check_let_stmt(&mut self, stmt: &LetStmt, scope: &mut Scope) {
+        self.check_binding(
+            stmt.name(),
+            stmt.type_ref(),
+            stmt.value(),
+            stmt.syntax(),
+            BindingOrigin::Let,
+            "let",
+            scope,
+        );
+    }
+
+    fn check_var_stmt(&mut self, stmt: &VarStmt, scope: &mut Scope) {
+        self.check_binding(
+            stmt.name(),
+            stmt.type_ref(),
+            stmt.value(),
+            stmt.syntax(),
+            BindingOrigin::Var,
+            "var",
+            scope,
+        );
+    }
+
+    /// Shared body of `let`/`var` binding checks. `origin` distinguishes the
+    /// immutable `let` from the mutable `var`; `kw` labels the two in
+    /// diagnostics. For a `var`, the declaration's name span is recorded as a
+    /// mutable occurrence (LSP mutability marking).
+    #[allow(clippy::too_many_arguments)]
+    fn check_binding(
+        &mut self,
+        name: Option<SyntaxToken>,
+        type_ref: Option<TypeRef>,
+        value: Option<Expr>,
+        stmt_syntax: &SyntaxNode,
+        origin: BindingOrigin,
+        kw: &str,
+        scope: &mut Scope,
+    ) {
         // Resolve the optional annotation first: it's authoritative, and
         // for a `Sequence [ … ]` RHS its element type is the inference
         // context an empty literal falls back on.
-        let declared = stmt.type_ref().map(|tr| self.resolve_type_ref(&tr));
+        let declared = type_ref.map(|tr| self.resolve_type_ref(&tr));
 
         // Infer the RHS type. A sequence literal is checked specially so
         // it can take its element type from `declared` when empty and so
         // it is *permitted* here — `check_expr` rejects sequence literals
-        // in every other position (T0063, the let-value-only rule).
+        // in every other position (T0063, the binding-value-only rule).
         // Missing name or value means the parser already reported the
         // recovery; we still walk what's parseable to keep diagnostics
         // flowing.
-        let rhs_ty = match stmt.value() {
+        let rhs_ty = match &value {
             Some(Expr::SequenceLit(s)) => {
                 let expected_elem = match &declared {
                     Some(Type::Sequence(e)) => Some((**e).clone()),
                     _ => None,
                 };
-                self.check_sequence_lit(&s, scope, expected_elem)
+                self.check_sequence_lit(s, scope, expected_elem)
             }
-            Some(v) => self.check_expr(&v, scope),
+            Some(v) => self.check_expr(v, scope),
             None => Type::Unknown,
         };
 
@@ -1328,22 +1462,22 @@ impl TypeChecker {
         let bound_ty = match declared {
             Some(declared) => {
                 if !rhs_ty.assignable_to(&declared) {
-                    let span = stmt
-                        .value()
+                    let span = value
+                        .as_ref()
                         .map(|v| self.node_span(v.syntax()))
-                        .unwrap_or_else(|| self.node_span(stmt.syntax()));
+                        .unwrap_or_else(|| self.node_span(stmt_syntax));
                     self.error(
                         span,
                         "T0010",
                         format!(
-                            "let binding declared {declared}, but expression produces {rhs_ty}"
+                            "{kw} binding declared {declared}, but expression produces {rhs_ty}"
                         ),
                     );
                 }
                 declared
             }
             None => {
-                if let Some(name_tok) = stmt.name() {
+                if let Some(name_tok) = &name {
                     // Render the hint immediately after the binding
                     // name token — that's where the user would have
                     // typed `: Type`.
@@ -1358,12 +1492,17 @@ impl TypeChecker {
             }
         };
 
-        if let Some(name_tok) = stmt.name() {
+        if let Some(name_tok) = &name {
+            // A `var` declaration is itself a mutable occurrence — mark it so
+            // the editor underlines the binding site, not just its uses.
+            if origin == BindingOrigin::Var {
+                self.mutable_spans.push(self.token_span(name_tok));
+            }
             scope.insert(
                 name_tok.text().to_string(),
                 bound_ty,
-                self.token_span(&name_tok),
-                BindingOrigin::Let,
+                self.token_span(name_tok),
+                origin,
             );
         }
     }
@@ -1387,6 +1526,11 @@ impl TypeChecker {
                     // resolution site, so it captures every source use —
                     // including ones the lowerer later folds/pushes away.
                     scope.mark_used(name);
+                    // A read of a mutable `var` is a mutable occurrence — the
+                    // editor marks every use, not just the declaration.
+                    if scope.origin(name) == Some(BindingOrigin::Var) {
+                        self.mutable_spans.push(self.token_span(&ident));
+                    }
                     // A public-relvar reference is allowed only inside
                     // a `transaction [...]` block — that's where the
                     // runtime can safely begin/commit (or replay on
@@ -5672,6 +5816,80 @@ mod tests {
             "should not fall through to T0033: {:?}",
             diagnostics(src)
         );
+    }
+
+    // ── mutable `var` bindings + reassignment ────────────────────────
+
+    #[test]
+    fn var_reassignment_is_allowed() {
+        let src = "oper main {} [ var x := 1; x := 2; let _y = x; ];";
+        let c = codes(src);
+        assert!(!c.contains(&"T0074"), "reassigning a `var` is legal: {:?}", diagnostics(src));
+        assert!(!c.contains(&"T0075"), "same-type value is fine: {:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn reassigning_let_binding_is_t0074() {
+        let src = "oper main {} [ let x = 1; x := 2; ];";
+        let c = codes(src);
+        assert!(c.contains(&"T0074"), "expected T0074, got {:?}", diagnostics(src));
+        // The dedicated code fires — not the generic non-relvar assignment T0033.
+        assert!(!c.contains(&"T0033"), "should not fall through to T0033: {:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn var_reassignment_type_mismatch_is_t0075() {
+        let src = "oper main {} [ var x := 1; x := \"s\"; ];";
+        assert!(codes(src).contains(&"T0075"), "expected T0075, got {:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn unused_var_binding_warns_t0032() {
+        // A `var` warns unused like a `let`; a write does not count as a use.
+        let src = "oper main {} [ var x := 1; x := 2; ];";
+        assert!(codes(src).contains(&"T0032"), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn underscore_prefixed_var_is_exempt() {
+        let src = "oper main {} [ var _x := 1; _x := 2; ];";
+        assert!(!codes(src).contains(&"T0032"), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn var_occurrences_recorded_as_mutable_spans() {
+        // decl (`var x`) + one read (RHS `x`) + one write (target `x`) = 3.
+        let src = "oper main {} [ var x := 1; x := x; ];";
+        let out = check(src, FileId(0), FileKind::Cd);
+        assert_eq!(out.mutable_spans.len(), 3, "decl + read + write; got {:?}", out.mutable_spans);
+    }
+
+    #[test]
+    fn let_binding_has_no_mutable_spans() {
+        let src = "oper main {} [ let x = 1; let _y = x; ];";
+        let out = check(src, FileId(0), FileKind::Cd);
+        assert!(out.mutable_spans.is_empty(), "an immutable `let` is not mutable: {:?}", out.mutable_spans);
+    }
+
+    #[test]
+    fn var_read_but_never_reassigned_suggests_let_t0077() {
+        // The analog of Rust's `unused_mut`: read, never written → use `let`.
+        let src = "oper main {} [ var x := 1; let _y = x; ];";
+        let d = diagnostics(src);
+        let t = d.iter().find(|d| d.code == "T0077").expect("expected T0077");
+        assert_eq!(t.severity, coddl_diagnostics::Severity::Warning);
+    }
+
+    #[test]
+    fn reassigned_var_does_not_suggest_let() {
+        let src = "oper main {} [ var x := 1; x := 2; let _y = x; ];";
+        assert!(!codes(src).contains(&"T0077"), "a genuinely mutable var: {:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn underscore_var_never_reassigned_is_exempt_from_t0077() {
+        let src = "oper main {} [ var _x := 1; let _y = _x; ];";
+        assert!(!codes(src).contains(&"T0077"), "{:?}", diagnostics(src));
     }
 
     #[test]

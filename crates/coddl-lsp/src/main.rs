@@ -99,6 +99,22 @@ impl LanguageServer for CoddlLsp {
                 )),
                 document_formatting_provider: Some(OneOf::Left(true)),
                 inlay_hint_provider: Some(OneOf::Left(true)),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            work_done_progress_options: WorkDoneProgressOptions::default(),
+                            // One type + one modifier: every mutable `var`
+                            // occurrence is a `variable` marked `mutable` (the
+                            // rust-analyzer-style mutability highlight).
+                            legend: SemanticTokensLegend {
+                                token_types: vec![SemanticTokenType::VARIABLE],
+                                token_modifiers: vec![SemanticTokenModifier::new("mutable")],
+                            },
+                            range: None,
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                        },
+                    ),
+                ),
                 ..ServerCapabilities::default()
             },
         })
@@ -207,6 +223,52 @@ impl LanguageServer for CoddlLsp {
             })
             .collect();
         Ok(Some(hints))
+    }
+
+    // ── Semantic tokens (mutable-`var` highlighting) ────────────────
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> LspResult<Option<SemanticTokensResult>> {
+        let Some(snap) = self.analyzer.snapshot(&params.text_document.uri).await else {
+            return Ok(None);
+        };
+        // Each mutable `var` occurrence → a `variable` token with the `mutable`
+        // modifier (token type 0, modifier bit 0 of the legend above). Tokens
+        // must be delta-encoded in ascending document order.
+        let mut spans = snap.mutable_spans.clone();
+        spans.sort_by_key(|s| s.start);
+        spans.dedup_by_key(|s| s.start);
+        let mut data = Vec::with_capacity(spans.len());
+        let mut prev_line = 0u32;
+        let mut prev_char = 0u32;
+        for span in spans {
+            let start = snap.line_index.position(span.start);
+            let end = snap.line_index.position(span.end);
+            // An identifier never spans lines, so its length is a single-line
+            // UTF-16 delta (the units `LineIndex::position` already reports).
+            let length = end.character.saturating_sub(start.character);
+            let delta_line = start.line - prev_line;
+            let delta_start = if delta_line == 0 {
+                start.character - prev_char
+            } else {
+                start.character
+            };
+            data.push(SemanticToken {
+                delta_line,
+                delta_start,
+                length,
+                token_type: 0,
+                token_modifiers_bitset: 1,
+            });
+            prev_line = start.line;
+            prev_char = start.character;
+        }
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        })))
     }
 }
 

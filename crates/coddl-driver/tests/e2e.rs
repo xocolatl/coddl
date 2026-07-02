@@ -37,6 +37,7 @@ fn fixtures_dir() -> &'static Path {
             ("param-echo", PARAM_ECHO_SRC),
             ("if-demo", IF_DEMO_SRC),
             ("for-demo", FOR_DEMO_SRC),
+            ("var-accum", VAR_ACCUM_SRC),
             ("for-in-demo", FOR_IN_DEMO_SRC),
             ("relvar-if", RELVAR_IF_SRC),
             ("hello-everyone-2", HELLO_EVERYONE_2_SRC),
@@ -137,6 +138,26 @@ oper main {} [
         write_line { message: \"unreachable\" };
     ];
     write_line { message: \"done\" };
+];
+";
+
+// A mutable `var` accumulator carried across a loop back-edge and an `if`
+// merge (SSA block-parameter threading): `total` sums 1..3 = 6, then the `if`
+// arm reassigns it to 106. Proves reassignment executes across control flow.
+const VAR_ACCUM_SRC: &str = "\
+program var_accum;
+oper main {} [
+    var total := 0;
+    for i := 1 to 3 do [
+        total := total + i;
+    ];
+    write_line { message: to_text { self: total } };
+    if total > 5 then [
+        total := total + 100;
+    ] else [
+        total := 0;
+    ];
+    write_line { message: to_text { self: total } };
 ];
 ";
 
@@ -482,6 +503,39 @@ fn coddl_run_cranelift_for_counted() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.stdout, b"0\n1\n2\ndone\n");
+}
+
+#[test]
+fn coddl_run_llvm_var_accumulator() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("var-accum"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=llvm failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Loop sums 1+2+3 = 6; the `if` arm then adds 100 → 106.
+    assert_eq!(out.stdout, b"6\n106\n");
+}
+
+#[test]
+fn coddl_run_cranelift_var_accumulator() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("var-accum"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"6\n106\n");
 }
 
 #[test]

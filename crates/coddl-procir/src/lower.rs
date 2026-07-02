@@ -20,7 +20,7 @@ use coddl_syntax::ast::{
     ExtendExpr, FieldAccess, ForStmt, IfExpr, IndexExpr, Item,
     LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, RenameExpr,
     ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
-    TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, WrapExpr,
+    TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WrapExpr,
 };
 use coddl_syntax::{parse_format_template, SyntaxKind, TemplateChunk};
 use coddl_types::{check, Heading, RelvarKind, RelvarTable, Type};
@@ -487,6 +487,82 @@ impl Lowerer {
             .last_mut()
             .expect("scope stack empty")
             .insert(name, (v, ty));
+    }
+
+    /// Point an existing local binding at a new SSA value — the effect of a
+    /// `var` reassignment (`x := …`). Updates the innermost scope layer that
+    /// holds `name` in place, so the binding keeps its declaration layer while
+    /// its current value changes. No-op if unbound (the typechecker guarantees
+    /// a `var` binding reached here).
+    fn rebind_local(&mut self, name: &str, v: ValueId, ty: ProcType) {
+        for layer in self.locals.iter_mut().rev() {
+            if layer.contains_key(name) {
+                layer.insert(name.to_string(), (v, ty));
+                return;
+            }
+        }
+    }
+
+    /// Names that appear as the target of an `x := …` reassignment anywhere in
+    /// `block`, including nested loops / `if` arms / transactions. Over-collects
+    /// relvar targets and inner-scope names; callers intersect with the outer
+    /// `locals` to keep only carried outer `var`s.
+    fn collect_reassigned_names(&self, block: &Block, out: &mut Vec<String>) {
+        for node in block.syntax().descendants() {
+            if node.kind() == SyntaxKind::ASSIGN_STMT {
+                if let Some(assign) = AssignStmt::cast(node) {
+                    if let Some(Expr::NameRef(t)) = assign.target() {
+                        if let Some(id) = t.ident() {
+                            out.push(id.text().to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The outer `var`s reassigned within `body`, captured as
+    /// `(name, pre-join value, type)` for block-parameter threading across a
+    /// control-flow join (a loop back-edge or an `if` merge). Value-typed vars
+    /// thread with no refcount work and are unconditionally correct. A carried
+    /// var of a heap-managed / `Text` type is **not yet lowered** — refcount-
+    /// correct heap mutation across a join is future work — so each emits T0076
+    /// at `span` and is excluded (the error makes the IR unsafe to run, so the
+    /// body's own straight-line rebind never executes).
+    fn carried_value_vars(
+        &mut self,
+        bodies: &[Option<&Block>],
+        span: Span,
+    ) -> Vec<(String, ValueId, ProcType)> {
+        let mut names = Vec::new();
+        for body in bodies {
+            if let Some(b) = body {
+                self.collect_reassigned_names(b, &mut names);
+            }
+        }
+        let mut seen = HashSet::new();
+        let mut carried = Vec::new();
+        for name in names {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let Some((v, ty)) = self.lookup_local(&name) else {
+                continue; // a relvar or inner-scope name — not an outer var
+            };
+            if Self::is_heap_managed(&ty) || matches!(ty, ProcType::Text) {
+                self.diagnostics.push(Diagnostic::error(
+                    span,
+                    "T0076",
+                    format!(
+                        "reassigning the heap-typed variable `{name}` across a loop or \
+                         `if` is not yet lowered"
+                    ),
+                ));
+                continue;
+            }
+            carried.push((name, v, ty));
+        }
+        carried
     }
 
     fn lookup_local(&self, name: &str) -> Option<(ValueId, ProcType)> {
@@ -1056,6 +1132,7 @@ impl Lowerer {
         for stmt in block.statements() {
             match stmt {
                 Stmt::Let(l) => self.lower_let_stmt(&l),
+                Stmt::Var(v) => self.lower_var_stmt(&v),
                 Stmt::Assign(a) => self.lower_assign_stmt(&a),
                 Stmt::Truncate(t) => self.lower_truncate_stmt(&t),
                 Stmt::Delete(d) => self.lower_delete_stmt(&d),
@@ -1092,6 +1169,35 @@ impl Lowerer {
         // `R := R` does nothing — elide it entirely (the typechecker already
         // warned, T0051). This holds for both a public and a private target.
         if matches!(&value_expr, Expr::NameRef(v) if v.ident().is_some_and(|t| t.text() == name)) {
+            return;
+        }
+
+        // A local `var` reassignment: rebind the name to the new value. The
+        // typechecker guarantees only a mutable `var` reaches here as a local —
+        // never a relvar (not in `locals`), a `let`/parameter (T0074), or a loop
+        // counter (T0072). Its value flows across control-flow joins via the
+        // block-parameter threading in `lower_counted_loop` / `lower_if_expr`.
+        if let Some((old_v, old_ty)) = self.lookup_local(&name) {
+            let rhs_is_existing_name = matches!(value_expr, Expr::NameRef(_));
+            let new_v = self.lower_expr(&value_expr);
+            let new_ty = self.value_type(new_v);
+            // Drop the previous value if this binding owned it (owned Text /
+            // relation / sequence); a borrowed or value-typed old value no-ops.
+            if self.needs_scope_release(old_v, &old_ty) {
+                self.insts.push(Inst::Release { src: old_v });
+            }
+            // Take ownership of the new value the way a `let`/`var` decl does:
+            // an aliasing RHS is retained (an aliased `Text` marked owned) so
+            // the binding's scope-exit release stays balanced.
+            if rhs_is_existing_name
+                && (Self::is_heap_managed(&new_ty) || matches!(new_ty, ProcType::Text))
+            {
+                self.insts.push(Inst::Retain { src: new_v });
+                if matches!(new_ty, ProcType::Text) {
+                    self.mark_text_owned(new_v);
+                }
+            }
+            self.rebind_local(&name, new_v, new_ty);
             return;
         }
 
@@ -1651,6 +1757,31 @@ impl Lowerer {
         }
     }
 
+    /// Lower `var <name> := <expr>;` — a mutable binding. Unlike `let`, a `var`
+    /// always **materializes** its RHS to a concrete value bound via
+    /// `bind_local` (never a deferred `RelExpr` alias — a value that can be
+    /// reassigned can't be a deferred query). Otherwise identical to `let`:
+    /// an aliasing RHS is retained so the refcount reflects the new owner.
+    fn lower_var_stmt(&mut self, stmt: &VarStmt) {
+        let value_expr = match stmt.value() {
+            Some(v) => v,
+            None => return,
+        };
+        let rhs_is_existing_name = matches!(value_expr, Expr::NameRef(_));
+        let id = self.lower_expr(&value_expr);
+        let ty = self.value_type(id);
+        let alias_of_heap_text = rhs_is_existing_name && matches!(ty, ProcType::Text);
+        if rhs_is_existing_name && (Self::is_heap_managed(&ty) || matches!(ty, ProcType::Text)) {
+            self.insts.push(Inst::Retain { src: id });
+        }
+        if alias_of_heap_text {
+            self.mark_text_owned(id);
+        }
+        if let Some(name_tok) = stmt.name() {
+            self.bind_local(name_tok.text().to_string(), id, ty);
+        }
+    }
+
     fn lower_expr_stmt(&mut self, stmt: &ExprStmt) {
         if let Some(expr) = stmt.expr() {
             let _ = self.lower_expr(&expr);
@@ -1715,7 +1846,8 @@ impl Lowerer {
             .map(|e| self.lower_expr(&e))
             .unwrap_or_else(|| self.fresh_value());
         let name = stmt.var_name().map(|t| t.text().to_string());
-        self.lower_counted_loop(lo, hi, stmt.body(), |this, counter| {
+        let span = self.node_span(stmt.syntax());
+        self.lower_counted_loop(lo, hi, stmt.body(), span, |this, counter| {
             if let Some(n) = &name {
                 this.bind_local(n.clone(), counter, ProcType::Integer);
             }
@@ -1798,7 +1930,8 @@ impl Lowerer {
 
         // Counted loop over [0, card-1], binding `name = seq[__i]` per iteration.
         let name = stmt.var_name().map(|t| t.text().to_string());
-        self.lower_counted_loop(lo, hi, stmt.body(), |this, i| {
+        let span = self.node_span(stmt.syntax());
+        self.lower_counted_loop(lo, hi, stmt.body(), span, |this, i| {
             let elem = this.lower_seq_index_value(seq, i, elem_ty.clone());
             if let Some(n) = &name {
                 this.bind_local(n.clone(), elem, elem_ty.clone());
@@ -1832,23 +1965,46 @@ impl Lowerer {
         lo: ValueId,
         hi: ValueId,
         user_body: Option<Block>,
+        loop_span: Span,
         mut body_prologue: impl FnMut(&mut Self, ValueId),
     ) {
+        // Outer value-typed `var`s reassigned in the body ride extra header
+        // block parameters — the SSA join of the entry edge (pre-loop values)
+        // and the back-edge (end-of-iteration values). Captured before any
+        // block is sealed, while `locals` still holds their pre-loop values.
+        let carried = self.carried_value_vars(&[user_body.as_ref()], loop_span);
+
         let header = self.fresh_block();
         let body = self.fresh_block();
         let exit = self.fresh_block();
 
-        // Entry edge: seed the counter with the lower bound.
+        // Entry edge: seed the counter with the lower bound, then each carried
+        // var with its pre-loop value.
+        let mut entry_args = vec![lo];
+        entry_args.extend(carried.iter().map(|(_, v, _)| *v));
         self.finish_block(Terminator::Br {
             target: header,
-            args: vec![lo],
+            args: entry_args,
         });
 
-        // Header: the counter is the sole block parameter (the SSA join). Test
-        // `i <= hi` and branch to the body or the exit.
+        // Header: the counter plus one parameter per carried var (the SSA
+        // joins). Rebind each carried var to its parameter so the condition and
+        // body read the joined value. Test `i <= hi` and branch to body/exit.
         let counter = self.fresh_value();
         self.record_type(counter, ProcType::Integer);
-        self.start_block(header, vec![(counter, ProcType::Integer)]);
+        let mut header_params = vec![(counter, ProcType::Integer)];
+        let mut carried_params: Vec<(String, ValueId, ProcType)> =
+            Vec::with_capacity(carried.len());
+        for (name, _, ty) in &carried {
+            let p = self.fresh_value();
+            self.record_type(p, ty.clone());
+            header_params.push((p, ty.clone()));
+            carried_params.push((name.clone(), p, ty.clone()));
+        }
+        self.start_block(header, header_params);
+        for (name, p, ty) in &carried_params {
+            self.rebind_local(name, *p, ty.clone());
+        }
         let cmp = self.fresh_value();
         self.record_type(cmp, ProcType::Boolean);
         self.insts.push(Inst::ScalarOp {
@@ -1864,9 +2020,10 @@ impl Lowerer {
             else_block: exit,
         });
 
-        // Body: run the prologue (binds the loop variable), lower the body,
-        // release any heap locals it allocated (once per iteration), then
-        // compute `i + 1` and branch back to the header (the back-edge).
+        // Body: run the prologue (binds the loop variable), lower the body
+        // (reassignments rebind carried vars in `locals`), release any heap
+        // locals it allocated (once per iteration), then compute `i + 1` and
+        // branch back to the header carrying each var's current value.
         self.start_block(body, Vec::new());
         self.push_local_scope();
         body_prologue(self, counter);
@@ -1894,13 +2051,19 @@ impl Lowerer {
             lhs: counter,
             rhs: one,
         });
+        let mut back_args = vec![inc];
+        back_args.extend(self.carried_current_values(&carried));
         self.finish_block(Terminator::Br {
             target: header,
-            args: vec![inc],
+            args: back_args,
         });
 
-        // Exit: subsequent statements (and the block's tail) emit here.
+        // Exit: the header parameters dominate the sole exit edge, so each
+        // carried var's final value is its header parameter.
         self.start_block(exit, Vec::new());
+        for (name, p, ty) in &carried_params {
+            self.rebind_local(name, *p, ty.clone());
+        }
     }
 
     /// Lower `if <cond> then [ … ] else [ … ]`. The condition computes in the
@@ -1916,76 +2079,123 @@ impl Lowerer {
     /// arm seals its own blocks between that arm's `start` and `Br`.
     fn lower_if_expr(&mut self, ife: &IfExpr) -> ValueId {
         let cond_expr = ife.condition().expect("typechecked if has a condition");
+        let span = self.node_span(ife.syntax());
+        let then_body = ife.then_body();
+        let else_body = ife.else_body();
+
+        // Value-typed outer vars reassigned in either arm are carried through
+        // the merge as block parameters — the SSA join of the two edges. The
+        // not-taken edge forwards the pre-`if` value (a missing `else` gets an
+        // explicit skip block for that, since `CondBr` carries no args).
+        // Captured before the arms rebind `locals`.
+        let carried = self.carried_value_vars(&[then_body.as_ref(), else_body.as_ref()], span);
+
         let cond = self.lower_expr(&cond_expr);
 
-        let then_id = self.fresh_block();
-
-        if let Some(else_block) = ife.else_body() {
-            let else_id = self.fresh_block();
-            let merge_id = self.fresh_block();
-            self.finish_block(Terminator::CondBr {
-                cond,
-                then_block: then_id,
-                else_block: else_id,
-            });
-
-            self.start_block(then_id, Vec::new());
-            let then_val = self.lower_if_arm(ife.then_body());
-            let ty = self.value_type(then_val);
-            let is_unit = matches!(ty, ProcType::Unit);
-            let then_args = if is_unit { Vec::new() } else { vec![then_val] };
-            self.finish_block(Terminator::Br {
-                target: merge_id,
-                args: then_args,
-            });
-
-            self.start_block(else_id, Vec::new());
-            let else_val = self.lower_if_arm(Some(else_block));
-            let else_args = if is_unit { Vec::new() } else { vec![else_val] };
-            self.finish_block(Terminator::Br {
-                target: merge_id,
-                args: else_args,
-            });
-
-            // The join value is the merge block's sole parameter — unless it
-            // is Unit (no runtime representation), in which case the merge
-            // takes no parameter and the value is a fresh Unit placeholder.
-            let result = self.fresh_value();
-            self.record_type(result, ty.clone());
-            let params = if is_unit {
-                Vec::new()
-            } else {
-                // A `Text` join value is owned downstream (safe: releasing an
-                // immortal literal arm is a no-op; an owned-temp arm is freed).
-                if matches!(ty, ProcType::Text) {
-                    self.mark_text_owned(result);
-                }
-                vec![(result, ty)]
-            };
-            self.start_block(merge_id, params);
-            result
-        } else {
-            // No `else`: the false edge goes straight to the merge; the value
-            // is Unit (typecheck guarantees a Unit then-arm).
+        // No `else` and nothing mutated: the false edge goes straight to the
+        // merge (statement form, Unit value) — no skip block, three blocks.
+        if else_body.is_none() && carried.is_empty() {
+            let then_id = self.fresh_block();
             let merge_id = self.fresh_block();
             self.finish_block(Terminator::CondBr {
                 cond,
                 then_block: then_id,
                 else_block: merge_id,
             });
-
             self.start_block(then_id, Vec::new());
-            self.lower_if_arm(ife.then_body());
+            self.lower_if_arm(then_body);
             self.finish_block(Terminator::Br {
                 target: merge_id,
                 args: Vec::new(),
             });
-
             let result = self.fresh_value();
             self.record_type(result, ProcType::Unit);
             self.start_block(merge_id, Vec::new());
-            result
+            return result;
         }
+
+        let then_id = self.fresh_block();
+        let else_id = self.fresh_block();
+        let merge_id = self.fresh_block();
+        self.finish_block(Terminator::CondBr {
+            cond,
+            then_block: then_id,
+            else_block: else_id,
+        });
+
+        // Then arm.
+        self.start_block(then_id, Vec::new());
+        let then_val = self.lower_if_arm(then_body);
+        let ty = self.value_type(then_val);
+        let is_unit = matches!(ty, ProcType::Unit);
+        let mut then_args = if is_unit { Vec::new() } else { vec![then_val] };
+        then_args.extend(self.carried_current_values(&carried));
+        self.finish_block(Terminator::Br {
+            target: merge_id,
+            args: then_args,
+        });
+
+        // Arms are alternatives, not sequential: restore each carried var to
+        // its pre-`if` value before lowering the else/skip edge.
+        for (name, prev, cty) in &carried {
+            self.rebind_local(name, *prev, cty.clone());
+        }
+
+        // Else arm — the real `else` block, or an empty skip block forwarding
+        // the pre-`if` values when there is no `else`.
+        self.start_block(else_id, Vec::new());
+        let else_val = if else_body.is_some() {
+            self.lower_if_arm(else_body)
+        } else {
+            // No `else`: the value is Unit (typecheck guarantees a Unit then).
+            let v = self.fresh_value();
+            self.record_type(v, ProcType::Unit);
+            v
+        };
+        let mut else_args = if is_unit { Vec::new() } else { vec![else_val] };
+        else_args.extend(self.carried_current_values(&carried));
+        self.finish_block(Terminator::Br {
+            target: merge_id,
+            args: else_args,
+        });
+
+        // Merge: the join value (unless Unit) plus one parameter per carried
+        // var. A `Text` join value is owned downstream (safe: releasing an
+        // immortal literal arm is a no-op; an owned-temp arm is freed).
+        let result = self.fresh_value();
+        self.record_type(result, ty.clone());
+        let mut params = Vec::new();
+        if !is_unit {
+            if matches!(ty, ProcType::Text) {
+                self.mark_text_owned(result);
+            }
+            params.push((result, ty));
+        }
+        let mut carried_params: Vec<(String, ValueId, ProcType)> = Vec::with_capacity(carried.len());
+        for (name, _, cty) in &carried {
+            let p = self.fresh_value();
+            self.record_type(p, cty.clone());
+            params.push((p, cty.clone()));
+            carried_params.push((name.clone(), p, cty.clone()));
+        }
+        self.start_block(merge_id, params);
+        for (name, p, cty) in &carried_params {
+            self.rebind_local(name, *p, cty.clone());
+        }
+        result
+    }
+
+    /// The current SSA value of each carried var (read from `locals`) — the
+    /// arguments an arm passes on its edge to a merge/back-edge block.
+    fn carried_current_values(&self, carried: &[(String, ValueId, ProcType)]) -> Vec<ValueId> {
+        carried
+            .iter()
+            .map(|(name, _, _)| {
+                self.lookup_local(name)
+                    .map(|(v, _)| v)
+                    .expect("carried var stays bound through the arm")
+            })
+            .collect()
     }
 
     /// Lower one `if` arm block in its own local scope, releasing arm-local
@@ -4948,6 +5158,39 @@ mod tests {
         assert!(
             insts.iter().any(|i| matches!(i, Inst::Release { .. })),
             "main releases the owned Text returned by greet"
+        );
+    }
+
+    #[test]
+    fn loop_carries_reassigned_var_as_block_param() {
+        // A `var` accumulator reassigned in a counted loop rides an extra
+        // header block parameter alongside the counter (the SSA join).
+        let src = "program p;\n\
+                   oper main {} [ var total := 0; for i := 1 to 3 do [ total := total + i; ]; ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").expect("main");
+        // The loop header is the block sealed with a `CondBr`; it carries the
+        // counter plus the one carried var → two parameters.
+        let header = main
+            .blocks
+            .iter()
+            .find(|b| matches!(b.terminator, Terminator::CondBr { .. }))
+            .expect("loop header block");
+        assert_eq!(header.params.len(), 2, "counter + carried `total`");
+    }
+
+    #[test]
+    fn heap_var_carried_across_loop_diagnoses_t0076() {
+        // Refcount-correct heap mutation across a join is future work — a
+        // `Text` var reassigned inside a loop is a lowering error, not a
+        // miscompile.
+        let src = "program p;\n\
+                   oper main {} [ var s := \"a\"; for i := 1 to 2 do [ s := s; ]; ];";
+        let out = lower(src, FileId(0));
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "T0076"),
+            "expected T0076, got {:?}",
+            out.diagnostics
         );
     }
 

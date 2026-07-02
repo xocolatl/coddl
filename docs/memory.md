@@ -21,8 +21,8 @@ Borrow checking prevents two co-existing references where one mutates — use-af
 
 - Values are passed by value; the runtime decides whether that's an `Rc` bump or an actual copy.
 - No `&` / `&mut` / `Box` / `Rc` in the surface language.
-- Mutable locals (`let mut x = …; mut x = …;`) are stack slots that don't escape; no shared references to them exist.
-- "Mutation" of a heap value (`mut xs = xs ++ [item];`) produces a new value. If the original had a single owner, copy-on-write turns it into in-place mutation; otherwise structural sharing makes the new value cheap.
+- Mutable locals (`var x := …; x := …;`) are stack slots that don't escape; no shared references to them exist.
+- "Mutation" of a heap value (`var xs := …; xs := xs ++ [item];`) produces a new value. If the original had a single owner, copy-on-write turns it into in-place mutation; otherwise structural sharing makes the new value cheap.
 
 The borrow checker's job — preventing aliased mutation — is done by the *type system* (no way to obtain a mutable alias), not by lifetime tracking.
 
@@ -91,7 +91,7 @@ These are the working assumptions that keep the model honest. They are *not* com
 2. **No back-pointers in tuples or relations.** Already enforced by OO Pro 2.
 3. **Closures capture by value.** Anonymous opers capture refcounted values; closing over a mutable local copies the *current* value, not the binding.
 4. **No reference / box / pointer type at all.** Including indirectly via recursive type definitions that would let "a tuple containing a relation containing this tuple" exist. The typechecker rejects recursive type definitions; if we ever want them, we add cycle detection at the value-construction site rather than weakening the model.
-5. **Mutating methods are surface sugar.** `customer.rename { new_name: "Bob" }` desugars to `mut customer = customer.rename { new_name: "Bob" };` in the caller's scope. The pure function returns a new value; the rebind happens at the call site. COW makes this cheap in the common case.
+5. **Mutating methods are surface sugar.** `customer.rename { new_name: "Bob" }` desugars to `customer := customer.rename { new_name: "Bob" };` in the caller's scope (with `customer` a `var`). The pure function returns a new value; the rebind happens at the call site. COW makes this cheap in the common case.
 
 ## When the model bends
 
