@@ -407,10 +407,12 @@ impl<'a> Parser<'a> {
     }
 
     /// A type expression. Either a single named type (`Integer`,
-    /// `Customer`) or the generator application `Sequence <type-ref>`,
-    /// which nests an element `TYPE_REF` (e.g. `Sequence Integer`,
-    /// `Sequence Sequence Text`). `Tuple H` / `Relation H` and qualified
-    /// names land alongside the rest of expression parsing.
+    /// `Customer`), the generator application `Sequence <type-ref>` — which
+    /// nests an element `TYPE_REF` (e.g. `Sequence Integer`, `Sequence
+    /// Sequence Text`) — or the heading generators `Tuple <heading>` /
+    /// `Relation <heading>`, which nest a `HEADING` (e.g. `Relation { name:
+    /// Text }`, `Tuple {}`). A bare `Tuple`/`Relation` with no `{` stays a leaf
+    /// name (resolving to the unknown-type T0005, as before).
     pub(crate) fn parse_type_ref(&mut self) {
         self.bump_trivia();
         self.start_node(SyntaxKind::TYPE_REF);
@@ -420,6 +422,15 @@ impl<'a> Parser<'a> {
             // the recursive call.
             self.bump(); // `Sequence`
             self.parse_type_ref();
+        } else if self.at_keyword("Tuple") || self.at_keyword("Relation") {
+            // `Tuple <heading>` / `Relation <heading>`: the heading is a nested
+            // HEADING (reusing `parse_heading`, so attribute types nest). Only
+            // when a `{` follows — a bare `Relation`/`Tuple` falls through as a
+            // leaf name (the TYPE_REF holds just the keyword token → T0005).
+            self.bump(); // `Tuple` / `Relation`
+            if self.at(SyntaxKind::L_BRACE) {
+                self.parse_heading();
+            }
         } else if !self.eat(SyntaxKind::IDENT) {
             self.error("P0011", "expected type name");
         }
@@ -3847,6 +3858,49 @@ mod tests {
             "expected P0011, got {:?}",
             out.diagnostics
         );
+    }
+
+    #[test]
+    fn relation_type_ref_nests_a_heading() {
+        let src = "oper f {} [ let r: Relation { name: Text } = Relation {}; ];";
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.tree.text(), src);
+        // The annotation is `TYPE_REF { Relation, HEADING { PARAM … } }`.
+        let tr = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::TYPE_REF)
+            .expect("TYPE_REF in tree");
+        let heading = tr
+            .children()
+            .find(|n| n.kind() == SyntaxKind::HEADING)
+            .expect("nested HEADING child");
+        assert!(heading.children().any(|n| n.kind() == SyntaxKind::PARAM));
+    }
+
+    #[test]
+    fn tuple_type_ref_nests_a_heading() {
+        let src = "oper f {} [ let t: Tuple { a: Integer } = {a: 1}; ];";
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.tree.text(), src);
+        let tr = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::TYPE_REF)
+            .expect("TYPE_REF in tree");
+        assert!(tr.children().any(|n| n.kind() == SyntaxKind::HEADING));
+    }
+
+    #[test]
+    fn relation_type_ref_heading_types_nest() {
+        // A relation-valued attribute type nests a further TYPE_REF (here a
+        // `Sequence Text`) inside the heading's PARAM.
+        let src = "oper f {} [ let r: Relation { xs: Sequence Text } = Relation {}; ];";
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.tree.text(), src);
     }
 
     // ── Infix operators + bool literals + `where` (Phase 20) ────────

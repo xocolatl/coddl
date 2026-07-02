@@ -392,12 +392,21 @@ function that implements it.
 <heading>       ::= '{' [ <param> commalist ] '}' ;            -- parse_heading
 <param>         ::= <identifier> ':' <type-ref> ;              -- parse_param
 <type-ref>      ::= 'Sequence' <type-ref>                       -- parse_type_ref
+                  | ( 'Tuple' | 'Relation' ) <heading>
                   | <identifier> ;
-                    -- `Sequence T` is the one generator-applied type
-                    -- form: a nested element type-ref (e.g.
+                    -- Three generator-applied forms plus a leaf name.
+                    -- `Sequence T` nests an element type-ref (e.g.
                     -- `Sequence Integer`, `Sequence Sequence Text`).
-                    -- `Tuple H` / `Relation H` are not yet a <type-ref>
-                    -- (see "Deliberately not yet in the grammar").
+                    -- `Tuple <heading>` / `Relation <heading>` nest a
+                    -- HEADING (e.g. `Relation { name: Text }`, `Tuple
+                    -- {}`) whose attribute types are themselves type-refs
+                    -- (so headings nest). Only when a `{` follows — a bare
+                    -- `Tuple`/`Relation` stays a leaf name (resolving to
+                    -- the unknown-type T0005). A generator heading type in
+                    -- an operator parameter/return position is not yet
+                    -- lowerable (T0018); local `let`/`var` annotations are
+                    -- fully supported. `parse_heading` emits P0008 on a
+                    -- missing `}`.
 
 <key-clause>    ::= 'key' <ident-brace-list> ;                 -- parse_key_clause
 <ident-brace-list> ::= '{' [ <identifier> commalist ] '}' ;    -- parse_ident_brace_list
@@ -827,12 +836,6 @@ The following are decided design intent (see the rationale section
 above) but not yet wired into the parser. Listed here so the omission
 is explicit, not implied:
 
-- **Tuple/Relation as a `<type-ref>`**. Today built-in scalar names
-  and the `Sequence T` generator (see `<type-ref>` above) resolve as
-  type references; the `Tuple H` / `Relation H` generator applications
-  land alongside user-defined types.
-- **Type generators** in `<type-ref>` — `Tuple H`, `Relation H`
-  (`Sequence T` is now supported).
 - **Statement forms** other than `<let-stmt>`, `<assign-stmt>`,
   `<truncate-stmt>`, `<delete-stmt>`, `<insert-stmt>`, `<update-stmt>`,
   and `<expr> ';'` — `mut`, `return`.

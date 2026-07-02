@@ -299,6 +299,13 @@ impl TypeRef {
     pub fn element(&self) -> Option<TypeRef> {
         child(&self.syntax)
     }
+
+    /// The heading of a heading generator `Tuple <heading>` / `Relation
+    /// <heading>`: the nested `HEADING` child (e.g. `Relation { name: Text }`).
+    /// `None` for a leaf or `Sequence` type-ref.
+    pub fn heading(&self) -> Option<Heading> {
+        child(&self.syntax)
+    }
 }
 
 // ── Block + statements ───────────────────────────────────────────────────

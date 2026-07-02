@@ -1795,7 +1795,7 @@ impl Lowerer {
         // the shared rc) and the new local is marked owned so its scope-exit
         // release balances the retain.
         let rhs_is_existing_name = matches!(value_expr, Expr::NameRef(_));
-        let id = self.lower_expr(&value_expr);
+        let id = self.lower_binding_rhs(&value_expr, stmt.type_ref());
         let ty = self.value_type(id);
         let alias_of_heap_text = rhs_is_existing_name && matches!(ty, ProcType::Text);
         if rhs_is_existing_name && (Self::is_heap_managed(&ty) || matches!(ty, ProcType::Text)) {
@@ -1831,7 +1831,7 @@ impl Lowerer {
             Some(v) => v,
         };
         let rhs_is_existing_name = matches!(value_expr, Expr::NameRef(_));
-        let id = self.lower_expr(&value_expr);
+        let id = self.lower_binding_rhs(&value_expr, stmt.type_ref());
         let ty = self.value_type(id);
         let alias_of_heap_text = rhs_is_existing_name && matches!(ty, ProcType::Text);
         if rhs_is_existing_name && (Self::is_heap_managed(&ty) || matches!(ty, ProcType::Text)) {
@@ -4510,22 +4510,51 @@ impl Lowerer {
         dst
     }
 
+    /// Lower a binding's RHS. Special-cases an **empty** `Relation {}` so it can
+    /// take its heading from a `Relation { H }` annotation (a *headed* empty
+    /// relation); with no annotation (or a non-relation one) it stays `relfalse`.
+    /// Every other RHS lowers via `lower_expr`. Called by `lower_let_stmt` /
+    /// `lower_var_stmt` in place of the bare `lower_expr`.
+    fn lower_binding_rhs(&mut self, value_expr: &Expr, type_ref: Option<TypeRef>) -> ValueId {
+        if let Expr::RelationLit(r) = value_expr {
+            if r.tuples().next().is_none() {
+                let heading = type_ref
+                    .and_then(|tr| match coddl_types::resolve_type_ref_quiet(&tr) {
+                        Type::Relation(h) => Some(h),
+                        _ => None,
+                    })
+                    .unwrap_or_else(Heading::empty);
+                return self.lower_empty_relation_lit(heading);
+            }
+        }
+        self.lower_expr(value_expr)
+    }
+
+    /// Lower an empty relation literal to a fresh sealed zero-tuple relation of
+    /// `heading`: `relfalse` when `heading` is empty, a headed empty relation
+    /// otherwise. `alloc(0, 0)` is a valid zero-length relation and the seal of
+    /// zero records is a no-op.
+    fn lower_empty_relation_lit(&mut self, heading: Heading) -> ValueId {
+        let heading_id = self.intern_heading(&heading);
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Relation(heading_id));
+        self.insts.push(Inst::RelationLit {
+            dst,
+            tuples: Vec::new(),
+            heading_id,
+        });
+        dst
+    }
+
     fn lower_relation_lit(&mut self, rel: &RelationLit) -> ValueId {
         let tuples: Vec<TupleLit> = rel.tuples().collect();
-        // `Relation {}` = `relfalse`: the nullary empty relation. Build it
-        // directly — the empty heading is the descriptor, and the seal of zero
-        // records is a no-op. The sibling `reltrue` (`Relation { {} }`) takes the
-        // general path below with a single empty tuple.
+        // `Relation {}` = `relfalse`: the nullary empty relation. Build it with
+        // the empty heading. (A *headed* empty relation — the same literal under
+        // a `Relation { H }` annotation — is built by `lower_binding_rhs`, which
+        // supplies the heading.) The sibling `reltrue` (`Relation { {} }`) takes
+        // the general path below with a single empty tuple.
         if tuples.is_empty() {
-            let heading_id = self.intern_heading(&Heading::empty());
-            let dst = self.fresh_value();
-            self.record_type(dst, ProcType::Relation(heading_id));
-            self.insts.push(Inst::RelationLit {
-                dst,
-                tuples: Vec::new(),
-                heading_id,
-            });
-            return dst;
+            return self.lower_empty_relation_lit(Heading::empty());
         }
         let mut tuple_values: Vec<ValueId> = Vec::with_capacity(tuples.len());
         let mut heading: Option<Heading> = None;
@@ -6503,6 +6532,30 @@ oper main {} [
             m.headings[heading_id.0 as usize].attrs().is_empty(),
             "relfalse carries the empty (nullary) heading"
         );
+    }
+
+    #[test]
+    fn headed_empty_relation_interns_the_annotation_heading() {
+        // `let r: Relation { name: Text } = Relation {}` lowers to a zero-tuple
+        // RelationLit whose interned heading is `{name}` — not the empty (∅)
+        // heading of relfalse.
+        let src = "oper main {} [ let _r: Relation { name: Text } = Relation {}; ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let (tuples_len, heading_id) = main.blocks[0]
+            .insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::RelationLit {
+                    tuples, heading_id, ..
+                } => Some((tuples.len(), *heading_id)),
+                _ => None,
+            })
+            .expect("expected an Inst::RelationLit");
+        assert_eq!(tuples_len, 0, "still an empty relation (zero tuples)");
+        let h = &m.headings[heading_id.0 as usize];
+        assert!(h.lookup("name").is_some(), "carries the annotation's `name`");
+        assert_eq!(h.attrs().len(), 1, "exactly the annotation heading");
     }
 
     #[test]

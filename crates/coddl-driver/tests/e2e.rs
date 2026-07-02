@@ -40,6 +40,7 @@ fn fixtures_dir() -> &'static Path {
             ("while-demo", WHILE_DEMO_SRC),
             ("do-while-demo", DO_WHILE_DEMO_SRC),
             ("nullary-relations", NULLARY_RELATIONS_SRC),
+            ("headed-empty-relation", HEADED_EMPTY_RELATION_SRC),
             ("var-accum", VAR_ACCUM_SRC),
             ("uninit-var", UNINIT_VAR_SRC),
             ("for-in-demo", FOR_IN_DEMO_SRC),
@@ -197,6 +198,21 @@ oper main {} [
     write_line { message: \"mid\" };
     write_relation { rel: t };
     write_line { message: \"after\" };
+];
+";
+
+// A *headed* empty relation: `Relation {}` under a `Relation { H }` annotation
+// takes that heading (not relfalse's ∅). It prints nothing on its own; unioning
+// it with a matching one-tuple literal observes the heading — a ∅ relfalse would
+// be a union heading-mismatch compile error, so a clean run proves the heading.
+const HEADED_EMPTY_RELATION_SRC: &str = "\
+program headed_empty_relation;
+oper main {} [
+    let e: Relation { name: Text } = Relation {};
+    write_line { message: \"empty:\" };
+    write_relation { rel: e };
+    write_line { message: \"unioned:\" };
+    write_relation { rel: e union Relation { {name: \"Alice\"} } };
 ];
 ";
 
@@ -677,6 +693,40 @@ fn coddl_run_cranelift_nullary_relations() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.stdout, b"before\nmid\n{}\nafter\n");
+}
+
+#[test]
+fn coddl_run_llvm_headed_empty_relation() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("headed-empty-relation"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=llvm failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The headed empty relation prints nothing; the union with a matching tuple
+    // proves the heading is `{name: Text}`.
+    assert_eq!(out.stdout, b"empty:\nunioned:\n{name: \"Alice\"}\n");
+}
+
+#[test]
+fn coddl_run_cranelift_headed_empty_relation() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("headed-empty-relation"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"empty:\nunioned:\n{name: \"Alice\"}\n");
 }
 
 #[test]

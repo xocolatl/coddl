@@ -347,6 +347,54 @@ pub fn check(source: &str, file: FileId, file_kind: FileKind) -> CheckOutput {
     }
 }
 
+/// Quiet (no-diagnostic) resolution of a `TypeRef` to a `Type`. The static
+/// counterpart of [`TypeChecker::resolve_type_ref`]: `Sequence T` recurses,
+/// `Relation { H }` / `Tuple { H }` build the heading via [`heading_quiet`], and
+/// an unknown leaf becomes `Unknown` silently. Used by the operator-signature
+/// pre-pass (where a loud resolve would double-report T0005) and by the ProcIR
+/// lowerer (to resolve a `let`/`var` annotation's heading without a checker).
+pub fn resolve_type_ref_quiet(tr: &TypeRef) -> Type {
+    let Some(name_tok) = tr.name() else {
+        return Type::Unknown;
+    };
+    if name_tok.text() == "Sequence" {
+        let elem = tr
+            .element()
+            .map(|e| resolve_type_ref_quiet(&e))
+            .unwrap_or(Type::Unknown);
+        return Type::Sequence(Box::new(elem));
+    }
+    if name_tok.text() == "Relation" {
+        if let Some(h) = tr.heading() {
+            return Type::Relation(heading_quiet(&h));
+        }
+    }
+    if name_tok.text() == "Tuple" {
+        if let Some(h) = tr.heading() {
+            return Type::Tuple(heading_quiet(&h));
+        }
+    }
+    Type::from_builtin_name(name_tok.text()).unwrap_or(Type::Unknown)
+}
+
+/// Quiet (no-diagnostic) heading builder — the static sibling of
+/// [`TypeChecker::resolve_heading`]. Skips duplicate detection (the loud
+/// body-walking pass re-reports T0007); a missing attribute type is `Unknown`.
+fn heading_quiet(heading: &AstHeading) -> Heading {
+    let mut fields: Vec<(String, Type)> = Vec::new();
+    for param in heading.params() {
+        let Some(name_tok) = param.name() else {
+            continue;
+        };
+        let ty = param
+            .type_ref()
+            .map(|tr| resolve_type_ref_quiet(&tr))
+            .unwrap_or(Type::Unknown);
+        fields.push((name_tok.text().to_string(), ty));
+    }
+    Heading::new(fields)
+}
+
 struct TypeChecker {
     file: FileId,
     file_kind: FileKind,
@@ -700,6 +748,28 @@ impl TypeChecker {
         Heading::new(fields)
     }
 
+    /// Reject a `Relation { H }` / `Tuple { H }` heading-generator type in
+    /// operator parameter or return position. The parser and resolver accept it,
+    /// but the ProcIR signature path (`proc_type_from_type_ref`) can't yet build
+    /// a heading-generator `ProcType`, so lowering it would be unsound — T0018
+    /// (revived from the retired empty-relation-literal code). Local `let`/`var`
+    /// annotations are fully supported and never reach here.
+    fn reject_generator_signature_type(&mut self, tr: &TypeRef, role: &str) {
+        let Some(name_tok) = tr.name() else {
+            return;
+        };
+        if (name_tok.text() == "Relation" || name_tok.text() == "Tuple") && tr.heading().is_some() {
+            self.error(
+                self.node_span(tr.syntax()),
+                "T0018",
+                format!(
+                    "a `Relation`/`Tuple` heading type in {role} position is not yet \
+                     supported (only local `let`/`var` bindings for now)"
+                ),
+            );
+        }
+    }
+
     /// Verify every attribute named in `key { ... }` actually appears
     /// in `heading`. Emits T0013 against each offender. Returns the
     /// list of attribute names in source order — even ones that
@@ -743,7 +813,7 @@ impl TypeChecker {
                 let Some(pname_tok) = param.name() else { continue };
                 let pty = param
                     .type_ref()
-                    .map(|tr| Self::type_ref_quiet(&tr))
+                    .map(|tr| resolve_type_ref_quiet(&tr))
                     .unwrap_or(Type::Unknown);
                 params.push((
                     Cow::Owned(pname_tok.text().to_string()),
@@ -794,7 +864,7 @@ impl TypeChecker {
         }
 
         let return_type = match decl.return_type() {
-            Some(tr) => Self::type_ref_quiet(&tr),
+            Some(tr) => resolve_type_ref_quiet(&tr),
             None => Type::unit(),
         };
 
@@ -866,7 +936,10 @@ impl TypeChecker {
                 }
 
                 let ty = match param.type_ref() {
-                    Some(tr) => self.resolve_type_ref(&tr),
+                    Some(tr) => {
+                        self.reject_generator_signature_type(&tr, "an operator parameter");
+                        self.resolve_type_ref(&tr)
+                    }
                     None => Type::Unknown,
                 };
                 scope.insert(name, ty, self.token_span(&name_tok), BindingOrigin::Param);
@@ -879,7 +952,10 @@ impl TypeChecker {
         // hint right after the heading — that's where the user would
         // have typed `-> Type`.
         let return_type = match decl.return_type() {
-            Some(tr) => self.resolve_type_ref(&tr),
+            Some(tr) => {
+                self.reject_generator_signature_type(&tr, "an operator return");
+                self.resolve_type_ref(&tr)
+            }
             None => {
                 if let Some(heading) = decl.heading() {
                     let r = heading.syntax().text_range();
@@ -973,27 +1049,22 @@ impl TypeChecker {
             };
             return Type::Sequence(Box::new(elem));
         }
+        // The heading generators `Relation { H }` / `Tuple { H }` take a nested
+        // HEADING; a bare `Relation`/`Tuple` (no heading) falls through to the
+        // leaf path → T0005, as before.
+        if name_tok.text() == "Relation" {
+            if let Some(h) = tr.heading() {
+                return Type::Relation(self.resolve_heading(&h));
+            }
+        }
+        if name_tok.text() == "Tuple" {
+            if let Some(h) = tr.heading() {
+                return Type::Tuple(self.resolve_heading(&h));
+            }
+        }
         self.resolve_type_name(&name_tok)
     }
 
-    /// Quiet (no-diagnostic) counterpart of [`Self::resolve_type_ref`],
-    /// used by the signature pre-pass ([`Self::register_user_oper`]) where
-    /// resolving loudly would double-report T0005. `Sequence T` recurses;
-    /// an unknown leaf becomes `Unknown` silently — the body-walking pass
-    /// re-resolves the same tokens loudly.
-    fn type_ref_quiet(tr: &TypeRef) -> Type {
-        let Some(name_tok) = tr.name() else {
-            return Type::Unknown;
-        };
-        if name_tok.text() == "Sequence" {
-            let elem = tr
-                .element()
-                .map(|e| Self::type_ref_quiet(&e))
-                .unwrap_or(Type::Unknown);
-            return Type::Sequence(Box::new(elem));
-        }
-        Type::from_builtin_name(name_tok.text()).unwrap_or(Type::Unknown)
-    }
 
     fn check_block(&mut self, block: &Block, scope: &mut Scope) -> Type {
         for stmt in block.statements() {
@@ -1670,6 +1741,18 @@ impl TypeChecker {
                 };
                 self.check_sequence_lit(s, scope, expected_elem)
             }
+            Some(Expr::RelationLit(r)) => {
+                // An empty `Relation {}` takes its heading from a `Relation { H }`
+                // annotation (a headed empty relation); with no annotation it is
+                // relfalse. A non-empty literal ignores the expected heading and
+                // infers from its tuples (the annotation conformance is checked
+                // below, T0010).
+                let expected_heading = match &declared {
+                    Some(Type::Relation(h)) => Some(h.clone()),
+                    _ => None,
+                };
+                self.check_relation_lit(r, scope, expected_heading)
+            }
             Some(v) => self.check_expr(v, scope),
             None => Type::Unknown,
         };
@@ -1811,7 +1894,7 @@ impl TypeChecker {
             Expr::Call(call) => self.check_call(call, scope),
             Expr::Transaction(t) => self.check_transaction_expr(t, scope),
             Expr::TupleLit(t) => self.check_tuple_lit(t, scope),
-            Expr::RelationLit(r) => self.check_relation_lit(r, scope),
+            Expr::RelationLit(r) => self.check_relation_lit(r, scope, None),
             Expr::SequenceLit(s) => {
                 // A sequence literal is valid only as a `let` binding's
                 // value, where `check_let_stmt` intercepts it before this
@@ -2685,14 +2768,20 @@ impl TypeChecker {
     /// `Relation { {} }` (one empty tuple). A heading mismatch emits
     /// T0019 on the offending tuple; the typechecker keeps the first
     /// tuple's heading so downstream checks see a stable type.
-    fn check_relation_lit(&mut self, rel: &RelationLit, scope: &mut Scope) -> Type {
+    fn check_relation_lit(
+        &mut self,
+        rel: &RelationLit,
+        scope: &mut Scope,
+        expected: Option<Heading>,
+    ) -> Type {
         let tuples: Vec<TupleLit> = rel.tuples().collect();
         if tuples.is_empty() {
-            // `Relation {}` = `relfalse`. The empty heading is fully determined
-            // (no attributes named, no tuples), so there is nothing to infer and
-            // nothing to reject — unlike a *headed* empty relation, which has no
-            // literal form (the heading can only come from tuples).
-            return Type::Relation(Heading::empty());
+            // Empty `Relation {}`: take the heading from the expected type when
+            // there is one (a `let`/`var` annotation → a *headed* empty
+            // relation), else default to `relfalse` — the nullary empty relation
+            // (∅ heading). Unlike an empty `Sequence []` (T0061), no annotation
+            // is *required*: relfalse is a sensible unconstrained default.
+            return Type::Relation(expected.unwrap_or_else(Heading::empty));
         }
         let first_heading = match self.check_tuple_lit(&tuples[0], scope) {
             Type::Tuple(h) => h,
@@ -5280,6 +5369,43 @@ mod tests {
         // no longer rejected. Its sibling `reltrue` is `Relation { {} }`.
         let src = "oper main {} [ let _r = Relation {}; ];";
         assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn headed_empty_relation_takes_annotation_heading() {
+        // With a `Relation { H }` annotation, an empty `Relation {}` is the empty
+        // relation *of that heading* — it conforms (no T0010), not relfalse.
+        let src = "oper main {} [ let _r: Relation { name: Text } = Relation {}; ];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn tuple_annotation_typechecks() {
+        let src = "oper main {} [ let _t: Tuple { a: Integer } = {a: 1}; ];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn headed_empty_relation_annotation_mismatch_diagnoses_t0010() {
+        // A *non-empty* literal ignores the expected heading and infers from its
+        // tuples; a heading that differs from the annotation is a conformance
+        // error (T0010).
+        let src = "oper main {} [ let _r: Relation { a: Integer } = Relation { {a: 1, b: 2} }; ];";
+        assert!(codes(src).contains(&"T0010"), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn generator_typed_oper_param_diagnoses_t0018() {
+        // A `Relation { H }` operator parameter parses and typechecks as a type
+        // but is not yet lowerable — revived T0018.
+        let src = "oper f { r: Relation { a: Integer } } [ let _x = 1; ];";
+        assert!(codes(src).contains(&"T0018"), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn generator_typed_oper_return_diagnoses_t0018() {
+        let src = "oper f {} -> Relation { a: Integer } [ Relation { {a: 1} } ];";
+        assert!(codes(src).contains(&"T0018"), "{:?}", diagnostics(src));
     }
 
     #[test]

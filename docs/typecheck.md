@@ -372,13 +372,26 @@ each `parse_<x>` has a corresponding `check_<x>`.
   field name; on miss emits `T0017` and returns `Type::Unknown`; on
   hit returns the attribute's type.
 - **`check_relation_lit`** — walks each nested tuple via
-  `check_tuple_lit`. Empty `Relation {}` is `relfalse` — the nullary
-  empty relation (empty heading, zero tuples) — and returns
-  `Type::Relation(∅)`; its sibling `reltrue` is `Relation { {} }`.
-  The first tuple's heading establishes the relation's heading;
-  every subsequent tuple must match (per `Heading::assignable_to`);
-  mismatches emit `T0019` on the offending tuple without cascading
-  the failure. Returns `Type::Relation(h0)`.
+  `check_tuple_lit`. An empty `Relation {}` takes its heading from an
+  `expected: Option<Heading>` (a `Relation { H }` `let`/`var`
+  annotation, threaded by `check_binding` — a **headed** empty
+  relation), else defaults to `relfalse` — the nullary empty relation
+  (∅ heading, zero tuples). Unlike an empty `Sequence []` (T0061), no
+  annotation is *required*: `relfalse` is a sensible unconstrained
+  default, and its sibling `reltrue` is `Relation { {} }`. A non-empty
+  literal ignores `expected` and infers from its tuples: the first
+  tuple's heading establishes the relation's heading; every subsequent
+  tuple must match (per `Heading::assignable_to`), mismatches emit
+  `T0019` on the offending tuple without cascading. Returns
+  `Type::Relation(h)`.
+- **`resolve_type_ref`** now resolves the three generator forms:
+  `Sequence T`, `Tuple { H }`, and `Relation { H }` (headings via
+  `resolve_heading`, recursively). The static `resolve_type_ref_quiet`
+  is its no-diagnostic twin, exposed for the ProcIR lowerer (which
+  resolves a `let`/`var` annotation's heading to build a headed empty
+  relation). A generator heading type in operator parameter/return
+  position is rejected (`T0018`) — the ProcIR signature path can't yet
+  build a heading-generator `ProcType`; local bindings are unaffected.
 - **`write_relation` polymorphism** — the built-in's `rel`
   parameter has `ParamKind::AnyRelation` rather than a concrete
   type. `check_named_arg` special-cases this kind: any
@@ -613,7 +626,7 @@ check script enforces that.
 | T0015 | Duplicate field name in tuple literal                    |
 | T0016 | Field access on a value whose type isn't a tuple         |
 | T0017 | Unknown field name in tuple field access                 |
-| T0018 | _(retired — code available for reuse)_ — was "empty relation literal"; `Relation {}` is now the nullary empty relation `relfalse` |
+| T0018 | a `Relation { H }` / `Tuple { H }` heading type in operator parameter/return position is not yet lowerable (local `let`/`var` annotations are supported) |
 | T0019 | Tuple heading mismatch in relation literal                |
 | T0020 | `where` predicate must be Boolean                         |
 | T0021 | Scalar operator operand type mismatch                     |
