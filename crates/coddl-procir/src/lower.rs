@@ -262,6 +262,12 @@ struct Lowerer {
     /// (same push/pop discipline); an alias carries no `ValueId`, so it never
     /// appears in `locals` and is invisible to scope-release.
     relexpr_aliases: Vec<HashMap<String, RelExpr>>,
+    /// Names declared by an uninitialized `var x;` that are not yet bound —
+    /// the *pending* set. The first assignment binds the name into `locals`
+    /// (at this same layer) and removes it here. Parallel to `locals` (same
+    /// push/pop discipline). Definite assignment (T0079) guarantees a pending
+    /// var is never read, so it never needs a value until its first write.
+    pending_uninit: Vec<HashSet<String>>,
     /// Type of every SSA value defined in the current function. Built
     /// up as each `Inst` is emitted; consulted by lowerings that need
     /// the static type of a base expression (notably field access on
@@ -382,6 +388,7 @@ impl Lowerer {
             current_block_params: Vec::new(),
             locals: vec![HashMap::new()],
             relexpr_aliases: vec![HashMap::new()],
+            pending_uninit: vec![HashSet::new()],
             value_types: HashMap::new(),
             outer_locals_for_capture: None,
             public_relvars: HashMap::new(),
@@ -475,11 +482,13 @@ impl Lowerer {
     fn push_local_scope(&mut self) {
         self.locals.push(HashMap::new());
         self.relexpr_aliases.push(HashMap::new());
+        self.pending_uninit.push(HashSet::new());
     }
 
     fn pop_local_scope(&mut self) {
         self.locals.pop();
         self.relexpr_aliases.pop();
+        self.pending_uninit.pop();
     }
 
     fn bind_local(&mut self, name: String, v: ValueId, ty: ProcType) {
@@ -498,6 +507,25 @@ impl Lowerer {
         for layer in self.locals.iter_mut().rev() {
             if layer.contains_key(name) {
                 layer.insert(name.to_string(), (v, ty));
+                return;
+            }
+        }
+    }
+
+    /// Whether `name` is a declared-but-unbound `var x;` awaiting its first
+    /// assignment (see `pending_uninit`).
+    fn is_pending(&self, name: &str) -> bool {
+        self.pending_uninit.iter().any(|l| l.contains(name))
+    }
+
+    /// Bind a pending uninitialized `var` on its **first** assignment: install
+    /// it in `locals` at its *declaration* layer (so it survives an `if` arm
+    /// that first-assigns it) and clear it from `pending_uninit`. No-op if the
+    /// name wasn't pending.
+    fn bind_pending_first_assign(&mut self, name: &str, v: ValueId, ty: ProcType) {
+        for layer in (0..self.pending_uninit.len()).rev() {
+            if self.pending_uninit[layer].remove(name) {
+                self.locals[layer].insert(name.to_string(), (v, ty));
                 return;
             }
         }
@@ -639,6 +667,8 @@ impl Lowerer {
         self.locals.push(HashMap::new());
         self.relexpr_aliases.clear();
         self.relexpr_aliases.push(HashMap::new());
+        self.pending_uninit.clear();
+        self.pending_uninit.push(HashSet::new());
         self.value_types.clear();
         self.owned_texts.clear();
         self.param_value_ids.clear();
@@ -1198,6 +1228,25 @@ impl Lowerer {
                 }
             }
             self.rebind_local(&name, new_v, new_ty);
+            return;
+        }
+
+        // First assignment to a declared-but-unbound `var x;`. Definite
+        // assignment (T0079) guarantees this precedes any read, so binding it
+        // here (at its declaration layer) is enough — no placeholder needed.
+        if self.is_pending(&name) {
+            let rhs_is_existing_name = matches!(value_expr, Expr::NameRef(_));
+            let new_v = self.lower_expr(&value_expr);
+            let new_ty = self.value_type(new_v);
+            if rhs_is_existing_name
+                && (Self::is_heap_managed(&new_ty) || matches!(new_ty, ProcType::Text))
+            {
+                self.insts.push(Inst::Retain { src: new_v });
+                if matches!(new_ty, ProcType::Text) {
+                    self.mark_text_owned(new_v);
+                }
+            }
+            self.bind_pending_first_assign(&name, new_v, new_ty);
             return;
         }
 
@@ -1764,8 +1813,19 @@ impl Lowerer {
     /// an aliasing RHS is retained so the refcount reflects the new owner.
     fn lower_var_stmt(&mut self, stmt: &VarStmt) {
         let value_expr = match stmt.value() {
+            // Uninitialized `var x;` — record it as pending in this scope layer;
+            // the first assignment binds it (nothing is emitted until then).
+            // Definite assignment (T0079) guarantees it isn't read before that.
+            None => {
+                if let Some(name_tok) = stmt.name() {
+                    self.pending_uninit
+                        .last_mut()
+                        .expect("scope stack empty")
+                        .insert(name_tok.text().to_string());
+                }
+                return;
+            }
             Some(v) => v,
-            None => return,
         };
         let rhs_is_existing_name = matches!(value_expr, Expr::NameRef(_));
         let id = self.lower_expr(&value_expr);
@@ -2114,6 +2174,13 @@ impl Lowerer {
             return result;
         }
 
+        // Introduced vars: a `var x;` (pending, unbound) assigned in *both*
+        // arms — definitely assigned after the `if`, so it also rides the merge
+        // as a block parameter, but with no pre-`if` value (each arm
+        // first-assigns/rebinds it). Detected by name here; its type is known
+        // only after the then-arm infers it (heap ⇒ T0076, like heap-carried).
+        let introduced_names = self.introduced_var_names(then_body.as_ref(), else_body.as_ref());
+
         let then_id = self.fresh_block();
         let else_id = self.fresh_block();
         let merge_id = self.fresh_block();
@@ -2128,15 +2195,37 @@ impl Lowerer {
         let then_val = self.lower_if_arm(then_body);
         let ty = self.value_type(then_val);
         let is_unit = matches!(ty, ProcType::Unit);
+        // Introduced vars are now bound (first-assigned in the then-arm); keep
+        // the value-typed ones (name, type, then-value). A heap type crossing
+        // the merge is deferred (T0076).
+        let mut introduced: Vec<(String, ProcType, ValueId)> = Vec::new();
+        for name in &introduced_names {
+            if let Some((v, vty)) = self.lookup_local(name) {
+                if Self::is_heap_managed(&vty) || matches!(vty, ProcType::Text) {
+                    self.diagnostics.push(Diagnostic::error(
+                        span,
+                        "T0076",
+                        format!(
+                            "initializing the heap-typed variable `{name}` on both branches \
+                             of an `if` is not yet lowered"
+                        ),
+                    ));
+                } else {
+                    introduced.push((name.clone(), vty, v));
+                }
+            }
+        }
         let mut then_args = if is_unit { Vec::new() } else { vec![then_val] };
         then_args.extend(self.carried_current_values(&carried));
+        then_args.extend(introduced.iter().map(|(_, _, v)| *v));
         self.finish_block(Terminator::Br {
             target: merge_id,
             args: then_args,
         });
 
         // Arms are alternatives, not sequential: restore each carried var to
-        // its pre-`if` value before lowering the else/skip edge.
+        // its pre-`if` value before the else/skip edge. Introduced vars are
+        // left bound (to the then-value); the else-arm rebinds them.
         for (name, prev, cty) in &carried {
             self.rebind_local(name, *prev, cty.clone());
         }
@@ -2154,14 +2243,16 @@ impl Lowerer {
         };
         let mut else_args = if is_unit { Vec::new() } else { vec![else_val] };
         else_args.extend(self.carried_current_values(&carried));
+        else_args.extend(self.introduced_current_values(&introduced));
         self.finish_block(Terminator::Br {
             target: merge_id,
             args: else_args,
         });
 
         // Merge: the join value (unless Unit) plus one parameter per carried
-        // var. A `Text` join value is owned downstream (safe: releasing an
-        // immortal literal arm is a no-op; an owned-temp arm is freed).
+        // then introduced var. A `Text` join value is owned downstream (safe:
+        // releasing an immortal literal arm is a no-op; an owned-temp arm is
+        // freed).
         let result = self.fresh_value();
         self.record_type(result, ty.clone());
         let mut params = Vec::new();
@@ -2178,11 +2269,57 @@ impl Lowerer {
             params.push((p, cty.clone()));
             carried_params.push((name.clone(), p, cty.clone()));
         }
+        let mut introduced_params: Vec<(String, ValueId, ProcType)> =
+            Vec::with_capacity(introduced.len());
+        for (name, ity, _) in &introduced {
+            let p = self.fresh_value();
+            self.record_type(p, ity.clone());
+            params.push((p, ity.clone()));
+            introduced_params.push((name.clone(), p, ity.clone()));
+        }
         self.start_block(merge_id, params);
-        for (name, p, cty) in &carried_params {
+        for (name, p, cty) in carried_params.iter().chain(introduced_params.iter()) {
             self.rebind_local(name, *p, cty.clone());
         }
         result
+    }
+
+    /// Names assigned in *both* arms of an `if` that are currently pending
+    /// (`var x;` unbound) — the vars an `if` *introduces* (definitely assigned
+    /// on both paths). Only when both arms exist; a missing `else` can't make a
+    /// var definitely assigned.
+    fn introduced_var_names(
+        &self,
+        then_b: Option<&Block>,
+        else_b: Option<&Block>,
+    ) -> Vec<String> {
+        let (Some(t), Some(e)) = (then_b, else_b) else {
+            return Vec::new();
+        };
+        let mut then_names = Vec::new();
+        self.collect_reassigned_names(t, &mut then_names);
+        let mut else_names = Vec::new();
+        self.collect_reassigned_names(e, &mut else_names);
+        let else_set: HashSet<&String> = else_names.iter().collect();
+        let mut seen = HashSet::new();
+        then_names
+            .iter()
+            .filter(|n| else_set.contains(*n) && self.is_pending(n) && seen.insert((*n).clone()))
+            .cloned()
+            .collect()
+    }
+
+    /// The current SSA value of each introduced var (read from `locals` after
+    /// an arm rebinds it) — the arguments that arm passes to the merge.
+    fn introduced_current_values(&self, introduced: &[(String, ProcType, ValueId)]) -> Vec<ValueId> {
+        introduced
+            .iter()
+            .map(|(name, _, _)| {
+                self.lookup_local(name)
+                    .map(|(v, _)| v)
+                    .expect("introduced var is assigned on both arms")
+            })
+            .collect()
     }
 
     /// The current SSA value of each carried var (read from `locals`) — the
@@ -2650,6 +2787,7 @@ impl Lowerer {
         let saved_insts = std::mem::take(&mut self.insts);
         let saved_locals = std::mem::replace(&mut self.locals, vec![HashMap::new()]);
         let saved_aliases = std::mem::replace(&mut self.relexpr_aliases, vec![HashMap::new()]);
+        let saved_pending = std::mem::replace(&mut self.pending_uninit, vec![HashSet::new()]);
         let saved_value_types = std::mem::take(&mut self.value_types);
         // Isolate `owned_texts` like `value_types`: the helper resets `next_value`,
         // so its ValueIds collide with the enclosing function's. Same for the
@@ -2748,6 +2886,7 @@ impl Lowerer {
         self.current_block_params = saved_current_block_params;
         self.locals = saved_locals;
         self.relexpr_aliases = saved_aliases;
+        self.pending_uninit = saved_pending;
         self.value_types = saved_value_types;
         self.owned_texts = saved_owned_texts;
         self.deferred_relation_releases = saved_deferred;
@@ -3904,6 +4043,7 @@ impl Lowerer {
         let saved_insts = std::mem::take(&mut self.insts);
         let saved_locals = std::mem::replace(&mut self.locals, vec![HashMap::new()]);
         let saved_aliases = std::mem::replace(&mut self.relexpr_aliases, vec![HashMap::new()]);
+        let saved_pending = std::mem::replace(&mut self.pending_uninit, vec![HashSet::new()]);
         let saved_value_types = std::mem::take(&mut self.value_types);
         // The helper resets `next_value` to 0, so its ValueIds collide with the
         // enclosing function's; `owned_texts` is keyed by ValueId, so isolate it
@@ -3967,6 +4107,7 @@ impl Lowerer {
         self.current_block_params = saved_current_block_params;
         self.locals = saved_locals;
         self.relexpr_aliases = saved_aliases;
+        self.pending_uninit = saved_pending;
         self.value_types = saved_value_types;
         self.owned_texts = saved_owned_texts;
         self.deferred_relation_releases = saved_deferred;
@@ -5177,6 +5318,22 @@ mod tests {
             .find(|b| matches!(b.terminator, Terminator::CondBr { .. }))
             .expect("loop header block");
         assert_eq!(header.params.len(), 2, "counter + carried `total`");
+    }
+
+    #[test]
+    fn if_both_arms_introduce_var_as_merge_block_param() {
+        // A `var x;` assigned on both arms is definitely assigned after the
+        // `if` — it rides the merge block as an (Integer) block parameter.
+        let src = "program p;\n\
+                   oper main {} [ var x; if true then [ x := 1; ] else [ x := 2; ]; let _y = x; ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").expect("main");
+        assert!(
+            main.blocks
+                .iter()
+                .any(|b| b.params.iter().any(|(_, t)| matches!(t, ProcType::Integer))),
+            "expected a merge block parameter carrying the introduced `x`"
+        );
     }
 
     #[test]

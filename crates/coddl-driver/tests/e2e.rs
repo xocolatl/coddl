@@ -38,6 +38,7 @@ fn fixtures_dir() -> &'static Path {
             ("if-demo", IF_DEMO_SRC),
             ("for-demo", FOR_DEMO_SRC),
             ("var-accum", VAR_ACCUM_SRC),
+            ("uninit-var", UNINIT_VAR_SRC),
             ("for-in-demo", FOR_IN_DEMO_SRC),
             ("relvar-if", RELVAR_IF_SRC),
             ("hello-everyone-2", HELLO_EVERYONE_2_SRC),
@@ -138,6 +139,22 @@ oper main {} [
         write_line { message: \"unreachable\" };
     ];
     write_line { message: \"done\" };
+];
+";
+
+// Uninitialized `var` declarations (no annotation — type inferred from the
+// first assignment) with definite assignment: `x` is declared then assigned
+// straight-line; `y` is declared then assigned on *both* `if` arms (a
+// merge-introduced var). Prints `42` then `1`.
+const UNINIT_VAR_SRC: &str = "\
+program uninit_var;
+oper main {} [
+    var x;
+    x := 42;
+    write_line { message: to_text { self: x } };
+    var y;
+    if x > 10 then [ y := 1; ] else [ y := 2; ];
+    write_line { message: to_text { self: y } };
 ];
 ";
 
@@ -503,6 +520,39 @@ fn coddl_run_cranelift_for_counted() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.stdout, b"0\n1\n2\ndone\n");
+}
+
+#[test]
+fn coddl_run_llvm_uninitialized_var() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("uninit-var"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=llvm failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // `x := 42` straight-line; `y` assigned on both `if` arms (42 > 10 → 1).
+    assert_eq!(out.stdout, b"42\n1\n");
+}
+
+#[test]
+fn coddl_run_cranelift_uninitialized_var() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("uninit-var"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"42\n1\n");
 }
 
 #[test]

@@ -54,10 +54,13 @@ enum BindingOrigin {
 }
 
 /// One binding in a scope layer: its `Type` for lookup, plus the metadata the
-/// binding lints need — the name-token span (for the squiggle), the origin,
-/// whether any `NameRef` ever resolved to it (`used`), and whether it was ever
-/// the target of a reassignment (`reassigned`; a `var` that never is should be
-/// a `let`, T0077).
+/// binding lints + definite-assignment need — the name-token span (for the
+/// squiggle), the origin, whether any `NameRef` ever resolved to it (`used`),
+/// whether it was ever the target of a reassignment (`reassigned`; a `var` that
+/// never is should be a `let`, T0077), and whether it is definitely assigned at
+/// the current program point (`initialized`; reading an uninitialized `var` is
+/// T0079). For an unannotated `var x;`, `ty` starts `Unknown` and is inferred
+/// from the first assignment.
 struct Binding {
     ty: Type,
     name: String,
@@ -65,6 +68,7 @@ struct Binding {
     origin: BindingOrigin,
     used: bool,
     reassigned: bool,
+    initialized: bool,
 }
 
 #[derive(Default)]
@@ -101,6 +105,9 @@ impl Scope {
             origin,
             used: false,
             reassigned: false,
+            // Assigned by default; an uninitialized `var x;` clears this via
+            // `mark_uninitialized` right after insertion.
+            initialized: true,
         });
         self.layers
             .last_mut()
@@ -149,6 +156,98 @@ impl Scope {
                 return;
             }
         }
+    }
+
+    /// Find the active binding for `name` as a stable `(layer, idx)` handle
+    /// (innermost layer first). `(layer, idx)` survives arm scopes being
+    /// pushed/popped, so it identifies a binding across the definite-assignment
+    /// snapshot dance below (where `name` alone would be ambiguous under
+    /// shadowing).
+    fn locate(&self, name: &str) -> Option<(usize, usize)> {
+        for layer in (0..self.layers.len()).rev() {
+            if let Some(&idx) = self.layers[layer].get(name) {
+                return Some((layer, idx));
+            }
+        }
+        None
+    }
+
+    /// Clear the active binding's `initialized` flag — for a freshly declared
+    /// uninitialized `var x;` (definite-assignment starts it un-assigned).
+    fn mark_uninitialized(&mut self, name: &str) {
+        if let Some((l, i)) = self.locate(name) {
+            self.records[l][i].initialized = false;
+        }
+    }
+
+    /// Mark the active binding for `name` definitely assigned (its first/any
+    /// assignment reached this program point unconditionally).
+    fn mark_initialized(&mut self, name: &str) {
+        if let Some((l, i)) = self.locate(name) {
+            self.records[l][i].initialized = true;
+        }
+    }
+
+    /// Whether the active binding for `name` is definitely assigned. An unbound
+    /// or unknown name reports `true` so unrelated resolution failures (T0001)
+    /// don't also trip the read-before-assignment check (T0079).
+    fn is_initialized(&self, name: &str) -> bool {
+        match self.locate(name) {
+            Some((l, i)) => self.records[l][i].initialized,
+            None => true,
+        }
+    }
+
+    /// Set the active binding's type — used to infer an unannotated `var x;`
+    /// from its first assignment.
+    fn set_type(&mut self, name: &str, ty: Type) {
+        if let Some((l, i)) = self.locate(name) {
+            self.records[l][i].ty = ty;
+        }
+    }
+
+    /// The name-token span of the active binding for `name` — the anchor for a
+    /// deferred inlay hint on an unannotated `var x;` once its type is inferred.
+    fn binding_span(&self, name: &str) -> Option<Span> {
+        self.locate(name).map(|(l, i)| self.records[l][i].span)
+    }
+
+    /// Every currently-uninitialized binding, as `(layer, idx)` handles — the
+    /// definite-assignment state to intersect across `if` arms / restore after
+    /// a conditional or loop body.
+    fn uninit_snapshot(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (l, layer) in self.records.iter().enumerate() {
+            for (i, b) in layer.iter().enumerate() {
+                if !b.initialized {
+                    out.push((l, i));
+                }
+            }
+        }
+        out
+    }
+
+    /// Reset the given bindings to uninitialized — undoing any assignments a
+    /// conditional/loop body made (its effects don't persist to the join).
+    fn restore_uninit(&mut self, snap: &[(usize, usize)]) {
+        for &(l, i) in snap {
+            self.records[l][i].initialized = false;
+        }
+    }
+
+    /// The snapshot entries that are now initialized — the vars a walked arm
+    /// definitely assigned. Intersecting `then`/`else` results gives the vars
+    /// assigned on *both* paths (definitely assigned after the `if`).
+    fn newly_initialized(&self, snap: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        snap.iter()
+            .copied()
+            .filter(|&(l, i)| self.records[l][i].initialized)
+            .collect()
+    }
+
+    /// Mark a `(layer, idx)` binding definitely assigned (the post-`if` commit).
+    fn set_initialized_at(&mut self, l: usize, i: usize) {
+        self.records[l][i].initialized = true;
     }
 }
 
@@ -981,9 +1080,14 @@ impl TypeChecker {
                 BindingOrigin::ForCounter,
             );
         }
+        // Definite assignment: the body may run zero times, so an outer `var`
+        // it assigns is not definitely assigned after the loop — snapshot the
+        // uninitialized bindings and roll them back once the body is checked.
+        let da_snap = scope.uninit_snapshot();
         if let Some(body) = stmt.body() {
             self.check_block(&body, scope);
         }
+        scope.restore_uninit(&da_snap);
         let unused = scope.pop();
         self.warn_unused(unused);
     }
@@ -1040,19 +1144,40 @@ impl TypeChecker {
                 // Record the reassignment so a never-reassigned `var` can be
                 // flagged as a `let` at scope exit (T0077).
                 scope.mark_reassigned(name);
-                if let Some(decl_ty) = scope.lookup(name).cloned() {
-                    if !rhs_ty.assignable_to(&decl_ty) {
-                        let span = stmt
-                            .value()
-                            .map(|v| self.node_span(v.syntax()))
-                            .unwrap_or_else(|| self.token_span(&ident));
-                        self.error(
-                            span,
-                            "T0075",
-                            format!("cannot assign {rhs_ty} to `{name}`, declared {decl_ty}"),
-                        );
+                // An unannotated `var x;` has an `Unknown` type until its first
+                // assignment infers it; later assignments must match (T0075).
+                match scope.lookup(name).cloned() {
+                    Some(Type::Unknown) => {
+                        scope.set_type(name, rhs_ty.clone());
+                        // Surface the inferred type as an inlay hint at the
+                        // declaration, so an unannotated `var x;` shows `: T`
+                        // once the first assignment fixes it (like `let x = …`).
+                        if let Some(decl_span) = scope.binding_span(name) {
+                            self.hints.push(TypeHint {
+                                span: Span::new(self.file, decl_span.end, decl_span.end),
+                                ty: rhs_ty.clone(),
+                                kind: HintKind::LetBinding,
+                            });
+                        }
                     }
+                    Some(decl_ty) => {
+                        if !rhs_ty.assignable_to(&decl_ty) {
+                            let span = stmt
+                                .value()
+                                .map(|v| self.node_span(v.syntax()))
+                                .unwrap_or_else(|| self.token_span(&ident));
+                            self.error(
+                                span,
+                                "T0075",
+                                format!("cannot assign {rhs_ty} to `{name}`, declared {decl_ty}"),
+                            );
+                        }
+                    }
+                    None => {}
                 }
+                // The var is now definitely assigned at this program point
+                // (the initialization of a deferred `var x;`, or a reassignment).
+                scope.mark_initialized(name);
                 return;
             }
             Some(origin @ (BindingOrigin::Let | BindingOrigin::Param)) => {
@@ -1435,6 +1560,36 @@ impl TypeChecker {
         // context an empty literal falls back on.
         let declared = type_ref.map(|tr| self.resolve_type_ref(&tr));
 
+        // Uninitialized declaration: `let/var x [: T];` with no `:= …`.
+        if value.is_none() {
+            if origin == BindingOrigin::Let {
+                // An immutable binding that is never assigned is meaningless —
+                // a `let` can't be reassigned later either (that's T0074).
+                self.error(
+                    self.node_span(stmt_syntax),
+                    "T0078",
+                    "an immutable `let` binding must be initialized; use `var` for a later-assigned local",
+                );
+            }
+            // An unannotated `var x;` starts with an unknown type — inferred
+            // from its first assignment; an annotation fixes it up front.
+            let bound_ty = declared.unwrap_or(Type::Unknown);
+            if let Some(name_tok) = &name {
+                if origin == BindingOrigin::Var {
+                    self.mutable_spans.push(self.token_span(name_tok));
+                }
+                let n = name_tok.text().to_string();
+                scope.insert(n.clone(), bound_ty, self.token_span(name_tok), origin);
+                // A valid uninitialized `var` is not yet assigned (definite-
+                // assignment, T0079, tracks it). The `let` errored above; leave
+                // it "initialized" so it doesn't also trip read-before-assign.
+                if origin == BindingOrigin::Var {
+                    scope.mark_uninitialized(&n);
+                }
+            }
+            return;
+        }
+
         // Infer the RHS type. A sequence literal is checked specially so
         // it can take its element type from `declared` when empty and so
         // it is *permitted* here — `check_expr` rejects sequence literals
@@ -1530,6 +1685,15 @@ impl TypeChecker {
                     // editor marks every use, not just the declaration.
                     if scope.origin(name) == Some(BindingOrigin::Var) {
                         self.mutable_spans.push(self.token_span(&ident));
+                    }
+                    // Definite assignment: reading a `var` declared without a
+                    // value before it has been assigned is an error.
+                    if !scope.is_initialized(name) {
+                        self.error(
+                            self.token_span(&ident),
+                            "T0079",
+                            format!("`{name}` may be read before it is assigned"),
+                        );
                     }
                     // A public-relvar reference is allowed only inside
                     // a `transaction [...]` block — that's where the
@@ -1647,11 +1811,26 @@ impl TypeChecker {
             );
         }
 
+        // Definite assignment: an arm's assignments to an outer `var` are only
+        // conditional. Snapshot the uninitialized bindings, walk each arm from
+        // the same pre-`if` state, and (with an `else`) commit as assigned only
+        // the vars assigned on *both* paths.
+        let da_snap = scope.uninit_snapshot();
         let then_ty = self.check_if_arm(ife.then_body(), scope);
+        let then_init = scope.newly_initialized(&da_snap);
+        scope.restore_uninit(&da_snap);
 
         match ife.else_body() {
             Some(else_block) => {
                 let else_ty = self.check_if_arm(Some(else_block), scope);
+                let else_init = scope.newly_initialized(&da_snap);
+                scope.restore_uninit(&da_snap);
+                // Assigned on both arms ⇒ definitely assigned after the `if`.
+                for handle in &then_init {
+                    if else_init.contains(handle) {
+                        scope.set_initialized_at(handle.0, handle.1);
+                    }
+                }
                 // Only flag a genuine mismatch — if an arm already errored
                 // (Unknown), stay quiet and propagate the concrete side.
                 match (&then_ty, &else_ty) {
@@ -1671,6 +1850,8 @@ impl TypeChecker {
                 }
             }
             None => {
+                // No `else`: the then-arm may not run, so nothing it assigned is
+                // definite afterward (already rolled back by `restore_uninit`).
                 if then_ty != Type::unit() && then_ty != Type::Unknown {
                     let span = ife
                         .then_body()
@@ -5890,6 +6071,80 @@ mod tests {
     fn underscore_var_never_reassigned_is_exempt_from_t0077() {
         let src = "oper main {} [ var _x := 1; let _y = _x; ];";
         assert!(!codes(src).contains(&"T0077"), "{:?}", diagnostics(src));
+    }
+
+    // ── uninitialized `var` + definite assignment ────────────────────
+
+    #[test]
+    fn uninitialized_let_is_t0078() {
+        let src = "oper main {} [ let x: Integer; ];";
+        assert!(codes(src).contains(&"T0078"), "expected T0078, got {:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn uninitialized_var_assigned_then_read_is_clean() {
+        // `var x;` with no annotation: the type is inferred from `x := 1`, and
+        // the read follows the assignment — no T0078/T0079.
+        let src = "oper main {} [ var x; x := 1; let _y = x; ];";
+        let d = diagnostics(src);
+        assert!(
+            d.iter().all(|x| x.severity != coddl_diagnostics::Severity::Error),
+            "expected no errors, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn read_before_assignment_is_t0079() {
+        let src = "oper main {} [ var x; let _y = x; ];";
+        assert!(codes(src).contains(&"T0079"), "expected T0079, got {:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn both_arms_assign_then_read_is_clean() {
+        // Full definite-assignment: assigned on every branch ⇒ assigned after.
+        let src = "oper main {} [ var x; if true then [ x := 1; ] else [ x := 2; ]; let _y = x; ];";
+        let d = diagnostics(src);
+        assert!(
+            d.iter().all(|x| x.severity != coddl_diagnostics::Severity::Error),
+            "expected no errors, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn assign_in_only_one_arm_then_read_is_t0079() {
+        // No `else` ⇒ the then-arm may not run ⇒ not definitely assigned after.
+        let src = "oper main {} [ var x; if true then [ x := 1; ]; let _y = x; ];";
+        assert!(codes(src).contains(&"T0079"), "expected T0079, got {:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn assign_in_loop_body_then_read_after_is_t0079() {
+        // A loop may run zero times ⇒ its body's assignments aren't definite.
+        let src = "oper main {} [ var x; for i := 1 to 3 do [ x := i; ]; let _y = x; ];";
+        assert!(codes(src).contains(&"T0079"), "expected T0079, got {:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn inferred_type_fixed_by_first_assignment_is_t0075() {
+        // `x`'s type is inferred `Integer` from `x := 1`; the `Text` write fails.
+        let src = "oper main {} [ var x; x := 1; x := \"s\"; ];";
+        assert!(codes(src).contains(&"T0075"), "expected T0075, got {:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn uninitialized_var_shows_inferred_type_hint_at_declaration() {
+        // `var x;` gets its `: Integer` inlay hint at the declaration once the
+        // first assignment infers the type — anchored right after the decl `x`,
+        // not the assignment.
+        let src = "oper main {} [ var x; x := 42; let _y = x; ];";
+        let out = check(src, FileId(0), FileKind::Cd);
+        let decl_x_end = (src.find("var x").unwrap() + "var x".len()) as u32;
+        let hint = out
+            .hints
+            .iter()
+            .find(|h| h.kind == HintKind::LetBinding && h.span.start == decl_x_end)
+            .expect("expected an inferred-type hint anchored at `var x`");
+        assert!(matches!(hint.ty, Type::Integer), "hint type was {:?}", hint.ty);
     }
 
     #[test]

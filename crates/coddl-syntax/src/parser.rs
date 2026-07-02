@@ -460,8 +460,10 @@ impl<'a> Parser<'a> {
     /// `let <name> [: <type-ref>] = <expr>;` — an immutable value binding
     /// visible to subsequent statements in the same block. Type annotation
     /// is optional; when absent, the binding's type is inferred from the
-    /// RHS. The mutable sibling is `var … := …` (`parse_var_stmt`). No
-    /// destructuring for now.
+    /// RHS. The mutable sibling is `var … := …` (`parse_var_stmt`). The
+    /// initializer is optional at the parse level (`let x;` parses), but an
+    /// uninitialized `let` is a type error (T0078) — an immutable binding must
+    /// be initialized. No destructuring for now.
     fn parse_let_stmt(&mut self) {
         debug_assert!(self.at_keyword("let"));
         self.start_node(SyntaxKind::LET_STMT);
@@ -475,19 +477,21 @@ impl<'a> Parser<'a> {
         if self.eat(SyntaxKind::COLON) {
             self.parse_type_ref();
         }
-        // The binding operator is `=`. A `:=` here is the `var` operator
-        // used by mistake — flag it specifically, then consume it so the
-        // RHS still parses (recovery).
-        if self.at(SyntaxKind::ASSIGN) {
-            self.error("P0067", "`let` bindings bind with `=`, not `:=`");
-            self.bump(); // consume `:=` for recovery
-        } else if !self.eat(SyntaxKind::EQ) {
-            self.error("P0018", "expected `=` in `let`");
-        }
-        let before = self.pos;
-        self.parse_expr();
-        if self.pos == before {
-            self.error("P0018", "expected expression in `let`");
+        // The initializer is optional: a bare `let x;` parses (the typechecker
+        // rejects it, T0078). When present, the operator is `=`; a `:=` is the
+        // `var` operator by mistake — flag it, then consume it for recovery.
+        if !self.at(SyntaxKind::SEMICOLON) {
+            if self.at(SyntaxKind::ASSIGN) {
+                self.error("P0067", "`let` bindings bind with `=`, not `:=`");
+                self.bump(); // consume `:=` for recovery
+            } else if !self.eat(SyntaxKind::EQ) {
+                self.error("P0018", "expected `=` in `let`");
+            }
+            let before = self.pos;
+            self.parse_expr();
+            if self.pos == before {
+                self.error("P0018", "expected expression in `let`");
+            }
         }
         if !self.eat(SyntaxKind::SEMICOLON) {
             self.error("P0013", "expected `;` after `let`");
@@ -495,12 +499,14 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
-    /// `var <name> [: <type-ref>] := <expr>;` — a mutable value binding.
+    /// `var <name> [: <type-ref>] [:= <expr>];` — a mutable value binding.
     /// Like `let`, but reassignable via a bare `<name> := <expr>;`
     /// (`ASSIGN_STMT`); the binding operator is `:=`, matching the operator
-    /// that reassigns it and the counted-`for` counter init. Type annotation
-    /// is optional; when absent, the type is inferred from the RHS. No
-    /// destructuring for now.
+    /// that reassigns it and the counted-`for` counter init. Both the type
+    /// annotation and the initializer are optional: `var x;` declares an
+    /// uninitialized mutable local whose type is inferred from its first
+    /// assignment (definite-assignment then ensures it is assigned before it
+    /// is read). No destructuring for now.
     fn parse_var_stmt(&mut self) {
         debug_assert!(self.at_keyword("var"));
         self.start_node(SyntaxKind::VAR_STMT);
@@ -515,19 +521,22 @@ impl<'a> Parser<'a> {
         if self.eat(SyntaxKind::COLON) {
             self.parse_type_ref();
         }
-        // The binding operator is `:=`. A plain `=` here is the `let`
-        // operator used by mistake — flag it specifically, then consume it
-        // so the RHS still parses (recovery).
-        if self.at(SyntaxKind::EQ) {
-            self.error("P0068", "`var` bindings assign with `:=`, not `=`");
-            self.bump(); // consume `=` for recovery
-        } else if !self.eat(SyntaxKind::ASSIGN) {
-            self.error("P0018", "expected `:=` in `var`");
-        }
-        let before = self.pos;
-        self.parse_expr();
-        if self.pos == before {
-            self.error("P0018", "expected expression in `var`");
+        // The initializer is optional: a bare `var x;` declares without a value
+        // (the future `load`/a later `x := …` fills it). When present, the
+        // operator is `:=`; a plain `=` is the `let` operator by mistake — flag
+        // it, then consume it for recovery.
+        if !self.at(SyntaxKind::SEMICOLON) {
+            if self.at(SyntaxKind::EQ) {
+                self.error("P0068", "`var` bindings assign with `:=`, not `=`");
+                self.bump(); // consume `=` for recovery
+            } else if !self.eat(SyntaxKind::ASSIGN) {
+                self.error("P0018", "expected `:=` in `var`");
+            }
+            let before = self.pos;
+            self.parse_expr();
+            if self.pos == before {
+                self.error("P0018", "expected expression in `var`");
+            }
         }
         if !self.eat(SyntaxKind::SEMICOLON) {
             self.error("P0013", "expected `;` after `var`");
@@ -3180,6 +3189,39 @@ mod tests {
             .tree
             .descendants()
             .any(|n| n.kind() == SyntaxKind::VAR_STMT));
+    }
+
+    #[test]
+    fn uninitialized_var_no_annotation_parses() {
+        // `var x;` — no annotation, no initializer (type inferred later).
+        let out = parse_str("oper f {} [ var x; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert!(out
+            .tree
+            .descendants()
+            .any(|n| n.kind() == SyntaxKind::VAR_STMT));
+    }
+
+    #[test]
+    fn uninitialized_var_with_annotation_parses() {
+        let out = parse_str("oper f {} [ var x: Integer; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert!(out
+            .tree
+            .descendants()
+            .any(|n| n.kind() == SyntaxKind::VAR_STMT));
+    }
+
+    #[test]
+    fn uninitialized_let_parses_for_the_typechecker_to_reject() {
+        // `let x;` parses (the typechecker rejects it, T0078) — a clean semantic
+        // error beats a parse error.
+        let out = parse_str("oper f {} [ let x: Integer; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert!(out
+            .tree
+            .descendants()
+            .any(|n| n.kind() == SyntaxKind::LET_STMT));
     }
 
     // ── `if <cond> then [ … ] else [ … ]` ────────────────────────────

@@ -491,26 +491,33 @@ function that implements it.
                     -- and bare-reference values are allowed. `update` is a
                     -- contextual keyword (the `let` precedent).
 <let-stmt>      ::= 'let' <identifier> [ ':' <type-ref> ]
-                    '=' <expr> ';' ;                           -- parse_let_stmt
+                    [ '=' <expr> ] ';' ;                       -- parse_let_stmt
                     -- An **immutable** value binding: the operator is `=`. A
                     -- `:=` here is the `var` operator by mistake — P0067, then
                     -- the `:=` is consumed for recovery so the RHS still parses.
-                    -- `let` is a contextual keyword (usable as an identifier
-                    -- elsewhere; no reserved words).
+                    -- The initializer is optional at the parse level (`let x;`
+                    -- parses), but an uninitialized `let` is a type error (T0078)
+                    -- — an immutable binding must be initialized. `let` is a
+                    -- contextual keyword (usable as an identifier elsewhere; no
+                    -- reserved words).
 <var-stmt>      ::= 'var' <identifier> [ ':' <type-ref> ]
-                    ':=' <expr> ';' ;                          -- parse_var_stmt (VAR_STMT)
+                    [ ':=' <expr> ] ';' ;                      -- parse_var_stmt (VAR_STMT)
                     -- A **mutable** value binding — the reassignable sibling of
                     -- `let`. The operator is `:=`, matching the operator that
                     -- reassigns it (`<name> := <expr>;`, an <assign-stmt>) and
                     -- the counted-`for` counter init; `=` here is the `let`
                     -- operator by mistake — P0068, then `=` is consumed for
-                    -- recovery. The `:` annotation never eats the `:` of `:=`
-                    -- (which lexes as one `ASSIGN` token). `var` is a contextual
-                    -- keyword recognized only as the leading token of a statement
-                    -- (the `let` precedent), usable as an identifier elsewhere —
-                    -- with the usual cost that a bare `var := …;` reassigning a
-                    -- relvar/local literally named `var` is instead read as a
-                    -- (malformed) `var` declaration.
+                    -- recovery. Both the type annotation and the initializer are
+                    -- optional: a bare `var x;` declares an uninitialized mutable
+                    -- local whose type is **inferred from its first assignment**
+                    -- (definite-assignment, T0079, then ensures it is assigned
+                    -- before it is read). The `:` annotation never eats the `:`
+                    -- of `:=` (which lexes as one `ASSIGN` token). `var` is a
+                    -- contextual keyword recognized only as the leading token of a
+                    -- statement (the `let` precedent), usable as an identifier
+                    -- elsewhere — with the usual cost that a bare `var := …;`
+                    -- reassigning a relvar/local literally named `var` is instead
+                    -- read as a (malformed) `var` declaration.
 <for-stmt>      ::= 'for' <identifier>
                       ( ':=' <expr> 'to' <expr> | 'in' <expr> )
                       'do' <block> ';' ;                       -- parse_for_stmt (FOR_STMT)
