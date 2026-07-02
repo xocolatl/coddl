@@ -12,14 +12,15 @@ use std::collections::{HashMap, HashSet};
 
 use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{
-    AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, DeleteStmt, Expr, ExprStmt,
+    AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, DeleteStmt, DoWhileStmt, Expr,
+    ExprStmt,
     InsertStmt,
     ExtendExpr, FieldAccess, ForStmt, Heading as AstHeading, IfExpr, IndexExpr, Item, KeyClause,
     LetStmt,
     NamedArg, OperDecl,
     PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr,
     ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
-    TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WrapExpr,
+    TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WhileStmt, WrapExpr,
 };
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
@@ -1006,6 +1007,8 @@ impl TypeChecker {
                 Stmt::Update(u) => self.check_update_stmt(&u, scope),
                 Stmt::ExprStmt(e) => self.check_expr_stmt(&e, scope),
                 Stmt::For(f) => self.check_for_stmt(&f, scope),
+                Stmt::While(w) => self.check_while_stmt(&w, scope),
+                Stmt::DoWhile(d) => self.check_do_while_stmt(&d, scope),
             }
         }
         match block.tail_expr() {
@@ -1090,6 +1093,68 @@ impl TypeChecker {
         scope.restore_uninit(&da_snap);
         let unused = scope.pop();
         self.warn_unused(unused);
+    }
+
+    /// Check a `while <cond> do [ … ]` pre-test loop. The condition is `Boolean`
+    /// (T0080) and checked in the enclosing scope. The body may run zero times,
+    /// so — like `for` — a `var` it assigns is not definitely assigned after the
+    /// loop: snapshot the uninitialized bindings and roll them back once the body
+    /// is checked. There is no loop variable (the driver is the user's own outer
+    /// `var`).
+    fn check_while_stmt(&mut self, stmt: &WhileStmt, scope: &mut Scope) {
+        self.check_loop_condition(stmt.condition(), stmt.syntax(), "while", scope);
+        let da_snap = scope.uninit_snapshot();
+        scope.push();
+        if let Some(body) = stmt.body() {
+            self.check_block(&body, scope);
+        }
+        scope.restore_uninit(&da_snap);
+        let unused = scope.pop();
+        self.warn_unused(unused);
+    }
+
+    /// Check a `do [ … ] while <cond>` post-test loop. The body runs at least
+    /// once, so its *unconditional* assignments to an outer `var` are definitely
+    /// assigned afterward (and when the trailing condition reads them) — no
+    /// snapshot/rollback (contrast `while`/`for`). The body is checked first, in
+    /// its own scope; the condition (`Boolean`, T0080) is checked afterward in
+    /// the enclosing scope — body-locals are scoped to the `[ … ]` and never
+    /// visible to the condition.
+    fn check_do_while_stmt(&mut self, stmt: &DoWhileStmt, scope: &mut Scope) {
+        scope.push();
+        if let Some(body) = stmt.body() {
+            self.check_block(&body, scope);
+        }
+        let unused = scope.pop();
+        self.warn_unused(unused);
+        self.check_loop_condition(stmt.condition(), stmt.syntax(), "do … while", scope);
+    }
+
+    /// Shared loop-condition check: the condition must be `Boolean` (T0080). A
+    /// missing condition is parse recovery (no second diagnostic). `keyword`
+    /// names the loop form in the message.
+    fn check_loop_condition(
+        &mut self,
+        cond: Option<Expr>,
+        stmt_node: &SyntaxNode,
+        keyword: &str,
+        scope: &mut Scope,
+    ) {
+        let cond_ty = match &cond {
+            Some(c) => self.check_expr(c, scope),
+            None => return,
+        };
+        if !matches!(cond_ty, Type::Boolean | Type::Unknown) {
+            let span = cond
+                .as_ref()
+                .map(|c| self.node_span(c.syntax()))
+                .unwrap_or_else(|| self.node_span(stmt_node));
+            self.error(
+                span,
+                "T0080",
+                format!("`{keyword}` condition must be Boolean, but has type {cond_ty}"),
+            );
+        }
     }
 
     /// Check a relational assignment `R := <expr>;`. The target must be a bare
@@ -5997,6 +6062,52 @@ mod tests {
             "should not fall through to T0033: {:?}",
             diagnostics(src)
         );
+    }
+
+    // ── `while` / `do … while` loops ─────────────────────────────────
+
+    #[test]
+    fn while_loop_typechecks() {
+        let src = "oper main {} [ var j := 0; while j < 3 do [ j := j + 1; ]; let _y = j; ];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn while_non_boolean_condition_diagnoses_t0080() {
+        let src = "oper main {} [ var j := 0; while j + 1 do [ j := j + 1; ]; ];";
+        assert!(codes(src).contains(&"T0080"), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn do_while_loop_typechecks() {
+        let src = "oper main {} [ var k := 0; do [ k := k + 1; ] while k < 3; let _y = k; ];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn do_while_non_boolean_condition_diagnoses_t0080() {
+        let src = "oper main {} [ var k := 0; do [ k := k + 1; ] while k; ];";
+        assert!(codes(src).contains(&"T0080"), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn do_while_body_runs_so_var_is_definitely_assigned() {
+        // The post-test body runs at least once, so an outer `var x;`
+        // unconditionally assigned in the body is definitely assigned when the
+        // trailing condition reads it and afterward — no read-before-assign
+        // (T0079).
+        let src = "oper main {} [ var x; do [ x := 5; ] while x < 10; let _y = x; ];";
+        assert!(!codes(src).contains(&"T0079"), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn while_body_may_skip_so_var_stays_unassigned() {
+        // The pre-test body may run zero times, so a `var x;` it assigns is NOT
+        // definitely assigned after the loop — reading it afterward is T0079.
+        // The condition reads only `g` (initialized), isolating the after-loop read.
+        let src =
+            "oper main {} [ var x; var g := 0; while g < 0 do [ x := 5; g := g + 1; ]; let _y = x; ];";
+        assert!(codes(src).contains(&"T0079"), "{:?}", diagnostics(src));
     }
 
     // ── mutable `var` bindings + reassignment ────────────────────────

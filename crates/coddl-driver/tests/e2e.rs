@@ -37,6 +37,8 @@ fn fixtures_dir() -> &'static Path {
             ("param-echo", PARAM_ECHO_SRC),
             ("if-demo", IF_DEMO_SRC),
             ("for-demo", FOR_DEMO_SRC),
+            ("while-demo", WHILE_DEMO_SRC),
+            ("do-while-demo", DO_WHILE_DEMO_SRC),
             ("var-accum", VAR_ACCUM_SRC),
             ("uninit-var", UNINIT_VAR_SRC),
             ("for-in-demo", FOR_IN_DEMO_SRC),
@@ -138,6 +140,44 @@ oper main {} [
     for _j := 0 to 0 - 1 do [
         write_line { message: \"unreachable\" };
     ];
+    write_line { message: \"done\" };
+];
+";
+
+// Pre-test `while`: a `var j` drives the loop (reassigned in the body, carried
+// across the back-edge). The first loop prints 0/1/2; the second's condition is
+// false on entry, so it prints nothing (empty-safe); then `done`.
+const WHILE_DEMO_SRC: &str = "\
+program while_demo;
+oper main {} [
+    var j := 0;
+    while j < 3 do [
+        write_line { message: to_text { self: j } };
+        j := j + 1;
+    ];
+    var g := 0;
+    while g < 0 do [
+        write_line { message: \"unreachable\" };
+        g := g + 1;
+    ];
+    write_line { message: \"done\" };
+];
+";
+
+// Post-test `do … while`: the first loop prints 0/1/2 (body then test); the
+// second proves the body runs once even when the condition is false on the first
+// test (`while false` → `once`); then `done`.
+const DO_WHILE_DEMO_SRC: &str = "\
+program do_while_demo;
+oper main {} [
+    var k := 0;
+    do [
+        write_line { message: to_text { self: k } };
+        k := k + 1;
+    ] while k < 3;
+    do [
+        write_line { message: \"once\" };
+    ] while false;
     write_line { message: \"done\" };
 ];
 ";
@@ -520,6 +560,72 @@ fn coddl_run_cranelift_for_counted() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.stdout, b"0\n1\n2\ndone\n");
+}
+
+#[test]
+fn coddl_run_llvm_while() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("while-demo"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=llvm failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Three iterations (0, 1, 2), the false-on-entry loop prints nothing, `done`.
+    assert_eq!(out.stdout, b"0\n1\n2\ndone\n");
+}
+
+#[test]
+fn coddl_run_cranelift_while() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("while-demo"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"0\n1\n2\ndone\n");
+}
+
+#[test]
+fn coddl_run_llvm_do_while() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("do-while-demo"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=llvm failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // 0/1/2 (body-then-test), then `once` proving run-once, then `done`.
+    assert_eq!(out.stdout, b"0\n1\n2\nonce\ndone\n");
+}
+
+#[test]
+fn coddl_run_cranelift_do_while() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("do-while-demo"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"0\n1\n2\nonce\ndone\n");
 }
 
 #[test]

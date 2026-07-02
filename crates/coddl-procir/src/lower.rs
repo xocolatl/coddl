@@ -15,12 +15,13 @@ use std::collections::{HashMap, HashSet};
 use coddl_diagnostics::{Diagnostic, FileId, Severity, Span};
 use coddl_plan::{Plan, WritePolicy};
 use coddl_syntax::ast::{
-    AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, DeleteStmt, Expr, ExprStmt,
+    AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, DeleteStmt, DoWhileStmt,
+    Expr, ExprStmt,
     InsertStmt,
     ExtendExpr, FieldAccess, ForStmt, IfExpr, IndexExpr, Item,
     LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, RenameExpr,
     ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
-    TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WrapExpr,
+    TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WhileStmt, WrapExpr,
 };
 use coddl_syntax::{parse_format_template, SyntaxKind, TemplateChunk};
 use coddl_types::{check, Heading, RelvarKind, RelvarTable, Type};
@@ -1170,6 +1171,8 @@ impl Lowerer {
                 Stmt::Update(u) => self.lower_update_stmt(&u),
                 Stmt::ExprStmt(e) => self.lower_expr_stmt(&e),
                 Stmt::For(f) => self.lower_for_stmt(&f),
+                Stmt::While(w) => self.lower_while_stmt(&w),
+                Stmt::DoWhile(d) => self.lower_do_while_stmt(&d),
             }
         }
         match block.tail_expr() {
@@ -2123,6 +2126,170 @@ impl Lowerer {
         self.start_block(exit, Vec::new());
         for (name, p, ty) in &carried_params {
             self.rebind_local(name, *p, ty.clone());
+        }
+    }
+
+    /// Lower a `while <cond> do [ … ]` pre-test loop — the counted-loop CFG
+    /// minus the counter/increment, with the user condition re-evaluated in the
+    /// header each iteration:
+    ///
+    /// ```text
+    /// entry:            Br header [carried…]
+    /// header(params P): rebind carried→P; <eval cond>; CondBr cond -> body, exit
+    /// body:             <user body>; Br header [carried_now…]   ← back-edge
+    /// exit:             rebind carried→P
+    /// ```
+    ///
+    /// Outer value-typed `var`s reassigned in the body ride the header block
+    /// params — the SSA join of the entry edge (pre-loop values) and the
+    /// back-edge (end-of-iteration values); a heap-typed carry is deferred
+    /// (T0076, in `carried_value_vars`). The condition reads the joined values
+    /// via the rebound header params. Empty-safe: the condition is tested first.
+    fn lower_while_stmt(&mut self, stmt: &WhileStmt) {
+        let span = self.node_span(stmt.syntax());
+        let body = stmt.body();
+        let carried = self.carried_value_vars(&[body.as_ref()], span);
+
+        let header = self.fresh_block();
+        let body_block = self.fresh_block();
+        let exit = self.fresh_block();
+
+        // Entry edge: seed each carried var with its pre-loop value.
+        let entry_args: Vec<ValueId> = carried.iter().map(|(_, v, _)| *v).collect();
+        self.finish_block(Terminator::Br {
+            target: header,
+            args: entry_args,
+        });
+
+        // Header: one param per carried var; rebind, evaluate the condition,
+        // branch to body or exit.
+        let mut header_params: Vec<(ValueId, ProcType)> = Vec::with_capacity(carried.len());
+        let mut carried_params: Vec<(String, ValueId, ProcType)> =
+            Vec::with_capacity(carried.len());
+        for (name, _, ty) in &carried {
+            let p = self.fresh_value();
+            self.record_type(p, ty.clone());
+            header_params.push((p, ty.clone()));
+            carried_params.push((name.clone(), p, ty.clone()));
+        }
+        self.start_block(header, header_params);
+        for (name, p, ty) in &carried_params {
+            self.rebind_local(name, *p, ty.clone());
+        }
+        let cond = stmt
+            .condition()
+            .map(|c| self.lower_expr(&c))
+            .unwrap_or_else(|| self.fresh_value());
+        self.finish_block(Terminator::CondBr {
+            cond,
+            then_block: body_block,
+            else_block: exit,
+        });
+
+        // Body: lower it in its own scope; the back-edge carries current values.
+        // Emitted into whatever block the body ended in (an inner `if` may have
+        // introduced blocks).
+        self.start_block(body_block, Vec::new());
+        self.push_local_scope();
+        if let Some(b) = body {
+            self.lower_block(&b);
+        }
+        self.release_top_scope_heap_locals();
+        self.pop_local_scope();
+        let back_args = self.carried_current_values(&carried);
+        self.finish_block(Terminator::Br {
+            target: header,
+            args: back_args,
+        });
+
+        // Exit: the header params dominate the sole exit edge, so each carried
+        // var's final value (condition false on entry to this iteration) is its
+        // header parameter.
+        self.start_block(exit, Vec::new());
+        for (name, p, ty) in &carried_params {
+            self.rebind_local(name, *p, ty.clone());
+        }
+    }
+
+    /// Lower a `do [ … ] while <cond>` post-test loop. The body is the loop
+    /// header — entered from the pre-loop entry *and* the back-edge — so it
+    /// carries the block params; the condition is evaluated after the body and a
+    /// tiny `latch` supplies the back-edge args (a `CondBr` carries none):
+    ///
+    /// ```text
+    /// entry:          Br body [carried…]
+    /// body(params P): rebind carried→P; <user body>; <eval cond>;
+    ///                 CondBr cond -> latch, exit
+    /// latch:          Br body [carried_now…]        ← back-edge
+    /// exit:           rebind carried→carried_now
+    /// ```
+    ///
+    /// The body runs once before the first test (the post-test caveat). The
+    /// condition reads each carried var's end-of-iteration value (post-body).
+    /// The block holding the `CondBr` dominates both `latch` and `exit`, so
+    /// `exit` binds each carried var to its final `carried_now` value.
+    fn lower_do_while_stmt(&mut self, stmt: &DoWhileStmt) {
+        let span = self.node_span(stmt.syntax());
+        let body = stmt.body();
+        let carried = self.carried_value_vars(&[body.as_ref()], span);
+
+        let body_block = self.fresh_block();
+        let latch = self.fresh_block();
+        let exit = self.fresh_block();
+
+        // Entry edge: seed the body params with each carried var's pre-loop value.
+        let entry_args: Vec<ValueId> = carried.iter().map(|(_, v, _)| *v).collect();
+        self.finish_block(Terminator::Br {
+            target: body_block,
+            args: entry_args,
+        });
+
+        // Body header: one param per carried var; rebind, then run the body.
+        let mut body_params: Vec<(ValueId, ProcType)> = Vec::with_capacity(carried.len());
+        let mut carried_params: Vec<(String, ValueId, ProcType)> =
+            Vec::with_capacity(carried.len());
+        for (name, _, ty) in &carried {
+            let p = self.fresh_value();
+            self.record_type(p, ty.clone());
+            body_params.push((p, ty.clone()));
+            carried_params.push((name.clone(), p, ty.clone()));
+        }
+        self.start_block(body_block, body_params);
+        for (name, p, ty) in &carried_params {
+            self.rebind_local(name, *p, ty.clone());
+        }
+        self.push_local_scope();
+        if let Some(b) = body {
+            self.lower_block(&b);
+        }
+        self.release_top_scope_heap_locals();
+        self.pop_local_scope();
+        // Post-test: capture the end-of-iteration values, evaluate the condition
+        // on them (emitted into whatever block the body ended in), then loop back
+        // (latch) or leave (exit).
+        let carried_now = self.carried_current_values(&carried);
+        let cond = stmt
+            .condition()
+            .map(|c| self.lower_expr(&c))
+            .unwrap_or_else(|| self.fresh_value());
+        self.finish_block(Terminator::CondBr {
+            cond,
+            then_block: latch,
+            else_block: exit,
+        });
+
+        // Latch: the back-edge, feeding the current values into the body params.
+        self.start_block(latch, Vec::new());
+        self.finish_block(Terminator::Br {
+            target: body_block,
+            args: carried_now.clone(),
+        });
+
+        // Exit: the CondBr block dominates this edge, so each carried var's final
+        // value is its end-of-iteration value.
+        self.start_block(exit, Vec::new());
+        for ((name, _, ty), v) in carried.iter().zip(carried_now.iter()) {
+            self.rebind_local(name, *v, ty.clone());
         }
     }
 
@@ -6946,6 +7113,92 @@ oper main {} [
             calls.contains(&"coddl_seq_index"),
             "expected a per-element index call, got {calls:?}"
         );
+    }
+
+    #[test]
+    fn while_lowers_to_header_cond_back_edge_cfg() {
+        // entry (Br→header) → header (carried `j` param, condition, CondBr) →
+        // body (Br→header — the back-edge) → exit.
+        let src = "program p;\n\
+                   oper w {} [ var j := 0; while j < 3 do [ j := j + 1; ]; ];";
+        let m = lower_ok(src);
+        let f = m.functions.iter().find(|f| f.name == "w").unwrap();
+        assert_eq!(f.blocks.len(), 4, "entry + header + body + exit");
+
+        // The header is the block sealed with a CondBr; it carries the one
+        // carried var `j` — no counter (unlike the counted loop).
+        let header = f
+            .blocks
+            .iter()
+            .find(|b| matches!(b.terminator, Terminator::CondBr { .. }))
+            .expect("loop header block");
+        assert_eq!(header.params.len(), 1, "carried `j` only");
+        assert_eq!(header.params[0].1, ProcType::Integer);
+
+        // The back-edge: a later block branches back to the header.
+        let header_idx = f.blocks.iter().position(|b| b.id == header.id).unwrap();
+        assert!(
+            f.blocks.iter().enumerate().any(|(idx, b)| idx > header_idx
+                && matches!(&b.terminator, Terminator::Br { target, .. } if *target == header.id)),
+            "a later block branches back to the header"
+        );
+
+        // Entry seeds the carried var: Br → header with one arg.
+        match &f.blocks[0].terminator {
+            Terminator::Br { target, args } => {
+                assert_eq!(*target, header.id);
+                assert_eq!(args.len(), 1, "entry seeds the carried `j`");
+            }
+            other => panic!("entry should end in Br, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn do_while_lowers_to_body_header_latch_cfg() {
+        // entry (Br→body) → body (carried `k` param, body work + condition,
+        // CondBr) → latch (Br→body — the empty back-edge) → exit.
+        let src = "program p;\n\
+                   oper d {} [ var k := 0; do [ k := k + 1; ] while k < 3; ];";
+        let m = lower_ok(src);
+        let f = m.functions.iter().find(|f| f.name == "d").unwrap();
+        assert_eq!(f.blocks.len(), 4, "entry + body + latch + exit");
+
+        // The body is both the loop header (carries the param) and the test
+        // block (ends in CondBr) — the post-test shape.
+        let body = f
+            .blocks
+            .iter()
+            .find(|b| matches!(b.terminator, Terminator::CondBr { .. }))
+            .expect("body/test block");
+        assert_eq!(body.params.len(), 1, "carried `k`");
+        assert_eq!(body.params[0].1, ProcType::Integer);
+
+        // The latch: a later block whose sole role is the back-edge Br→body; it
+        // carries no instructions (contrast `while`, whose back-edge block holds
+        // the body work).
+        let body_idx = f.blocks.iter().position(|b| b.id == body.id).unwrap();
+        let latch = f
+            .blocks
+            .iter()
+            .enumerate()
+            .find(|(idx, b)| *idx > body_idx
+                && matches!(&b.terminator, Terminator::Br { target, .. } if *target == body.id))
+            .map(|(_, b)| b)
+            .expect("a later block branches back to the body (the latch)");
+        assert!(
+            latch.insts.is_empty(),
+            "the latch is an empty back-edge, got {:?}",
+            latch.insts
+        );
+
+        // Entry seeds the body param and enters the body unconditionally.
+        match &f.blocks[0].terminator {
+            Terminator::Br { target, args } => {
+                assert_eq!(*target, body.id, "entry enters the body unconditionally");
+                assert_eq!(args.len(), 1, "entry seeds the carried `k`");
+            }
+            other => panic!("entry should end in Br, got {other:?}"),
+        }
     }
 
     #[test]

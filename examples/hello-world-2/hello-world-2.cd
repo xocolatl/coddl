@@ -1,17 +1,26 @@
 program hello_world;
 
-oper to_text{ self: Sequence Text } -> Text [
-    let result = if self.cardinality{} = 0 then [
-        "no one"
-    ] else [
-        self[0] || " and possibly others"
+oper main{} [
+    let names = Sequence ["Alice", "Bob", "Carole"];
+
+    for name in names do [
+        let message = format{ template: f"Hello, {name}!", params: { name } };
+        write_line{ message };
     ];
 
-    result
-];
+    for i := 0 to names.cardinality{} - 1 do [
+        write_line{ message: format{ template: f"Hi, {name}.", params: { name: names[i] } } };
+    ];
 
-oper main{} [
-    let names = Sequence ["Alice", "Bob"];
-    let message = format{ template: f"Hello, {names}!", params: { names } };
-    write_line{ message };
+    var j := 0;
+    while j < names.cardinality{} do [
+        write_line{ message: format{ template: f"Hi, {name}.", params: { name: names[j] } } };
+        j := j + 1;
+    ];
+
+    var k := 0;
+    do [
+        write_line{ message: format{ template: f"Hi, {name}.", params: { name: names[k] } } };
+        k := k + 1;
+    ] while k < names.cardinality{};
 ];

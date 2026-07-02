@@ -673,3 +673,4 @@ check script enforces that.
 | T0077 | _(warning)_ a `var` is read but never reassigned — use `let` (a leading `_` opts out; the analog of Rust's `unused_mut`) |
 | T0078 | an uninitialized `let x;` — an immutable binding must be initialized (use `var` for a later-assigned local) |
 | T0079 | definite assignment: a `var` declared without a value (`var x;`) is read before it is assigned on all paths |
+| T0080 | a `while` / `do … while` loop condition is not `Boolean` |

@@ -109,6 +109,8 @@ pub enum SyntaxKind {
     RETURN_STMT,
     EXPR_STMT,
     FOR_STMT,
+    WHILE_STMT,
+    DO_WHILE_STMT,
 
     // Expressions.
     LITERAL,
@@ -122,8 +124,6 @@ pub enum SyntaxKind {
     IF_EXPR,
     MATCH_EXPR,
     MATCH_ARM,
-    WHILE_EXPR,
-    DO_EXPR,
     TRANSACTION_EXPR,
 
     TUPLE_LIT,

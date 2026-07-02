@@ -607,6 +607,65 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
+    /// `while <expr> do <block> ;` — the pre-test loop. The condition is a full
+    /// `<expr>` (it stops at `do`, which is neither an infix operator nor a
+    /// postfix trigger); `while`/`do` are contextual keywords recognized only in
+    /// this statement position. The condition is tested before each iteration —
+    /// the loop is empty-safe. A trailing `;` is required (P0013). Builds
+    /// `WHILE_STMT`.
+    fn parse_while_stmt(&mut self) {
+        debug_assert!(self.at_keyword("while"));
+        self.start_node(SyntaxKind::WHILE_STMT);
+        self.bump(); // `while`
+        self.parse_expr(); // condition — stops at `do`
+        if !self.at_keyword("do") {
+            self.error("P0069", "expected `do` before the `while` loop body");
+            self.finish_node();
+            return;
+        }
+        self.bump(); // `do`
+        if !self.at(SyntaxKind::L_BRACKET) {
+            self.error("P0070", "expected `[` to start the `while` loop body");
+            self.finish_node();
+            return;
+        }
+        self.parse_block();
+        if !self.eat(SyntaxKind::SEMICOLON) {
+            self.error("P0013", "expected `;` after the `while` loop");
+        }
+        self.finish_node();
+    }
+
+    /// `do <block> while <expr> ;` — the post-test loop (C-style do…while). The
+    /// body runs once before the condition is first tested. A statement-leading
+    /// `do` is reserved exclusively for this form and *requires* a trailing
+    /// `while <cond>` — a bare `do [ … ]` block statement is a parse error
+    /// (P0072), otherwise `do [B] while c do [B2]` would be ambiguous against
+    /// "run block, then a pre-test loop". A trailing `;` is required (P0013).
+    /// Builds `DO_WHILE_STMT`.
+    fn parse_do_while_stmt(&mut self) {
+        debug_assert!(self.at_keyword("do"));
+        self.start_node(SyntaxKind::DO_WHILE_STMT);
+        self.bump(); // `do`
+        if !self.at(SyntaxKind::L_BRACKET) {
+            self.error("P0071", "expected `[` to start the `do` loop body");
+            self.finish_node();
+            return;
+        }
+        self.parse_block();
+        if !self.at_keyword("while") {
+            self.error("P0072", "expected `while` after the `do` loop body");
+            self.finish_node();
+            return;
+        }
+        self.bump(); // `while`
+        self.parse_expr(); // condition
+        if !self.eat(SyntaxKind::SEMICOLON) {
+            self.error("P0013", "expected `;` after the `do` loop");
+        }
+        self.finish_node();
+    }
+
     /// `truncate <relvar> ;` — clear every tuple from a relvar. The operand
     /// is parsed permissively (`parse_expr`); the typechecker restricts it to
     /// a bare assignable relvar name (T0033) and the lowerer desugars it to
@@ -799,6 +858,14 @@ impl<'a> Parser<'a> {
         }
         if self.at_keyword("for") {
             self.parse_for_stmt();
+            return;
+        }
+        if self.at_keyword("while") {
+            self.parse_while_stmt();
+            return;
+        }
+        if self.at_keyword("do") {
+            self.parse_do_while_stmt();
             return;
         }
 
@@ -3485,6 +3552,131 @@ mod tests {
         assert!(
             out.diagnostics.iter().any(|d| d.code == "P0063"),
             "expected P0063, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    // ── `while` / `do … while` loops ──────────────────────────────────
+
+    #[test]
+    fn while_stmt_parses() {
+        let src = "oper f {} [ while j < 3 do [ j; ]; ];";
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.tree.text(), src);
+        let ws = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::WHILE_STMT)
+            .expect("WHILE_STMT in tree");
+        // Direct IDENT token children are the contextual keywords `while`/`do`.
+        let idents: Vec<_> = ws
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| t.kind() == SyntaxKind::IDENT)
+            .map(|t| t.text().to_string())
+            .collect();
+        assert_eq!(idents, vec!["while", "do"]);
+        // The condition is a BINARY_EXPR; the body is one BLOCK.
+        assert!(ws.children().any(|n| n.kind() == SyntaxKind::BINARY_EXPR));
+        assert_eq!(
+            ws.children().filter(|n| n.kind() == SyntaxKind::BLOCK).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn while_stmt_condition_is_full_expr() {
+        // `j < n and j > 0` binds as the whole condition; `do` delimits the body.
+        let src = "oper f {} [ while j < n and j > 0 do [ j; ]; ];";
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.tree.text(), src);
+    }
+
+    #[test]
+    fn while_stmt_missing_do_diagnoses_p0069() {
+        let out = parse_str("oper f {} [ while j < 3 [ j; ]; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0069"),
+            "expected P0069, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn while_stmt_missing_body_bracket_diagnoses_p0070() {
+        let out = parse_str("oper f {} [ while j < 3 do j; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0070"),
+            "expected P0070, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn while_stmt_missing_semicolon_diagnoses_p0013() {
+        let out = parse_str("oper f {} [ while j < 3 do [ j ] ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0013"),
+            "expected P0013, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn do_while_stmt_parses() {
+        let src = "oper f {} [ do [ k; ] while k < 3; ];";
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.tree.text(), src);
+        let dw = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::DO_WHILE_STMT)
+            .expect("DO_WHILE_STMT in tree");
+        let idents: Vec<_> = dw
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| t.kind() == SyntaxKind::IDENT)
+            .map(|t| t.text().to_string())
+            .collect();
+        assert_eq!(idents, vec!["do", "while"]);
+        assert_eq!(
+            dw.children().filter(|n| n.kind() == SyntaxKind::BLOCK).count(),
+            1
+        );
+        assert!(dw.children().any(|n| n.kind() == SyntaxKind::BINARY_EXPR));
+    }
+
+    #[test]
+    fn do_while_stmt_missing_body_bracket_diagnoses_p0071() {
+        let out = parse_str("oper f {} [ do k; while k < 3; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0071"),
+            "expected P0071, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn do_stmt_without_while_diagnoses_p0072() {
+        // A bare `do [ … ];` with no trailing `while` is rejected — the settled
+        // "statement-leading `do` is the post-test loop" rule.
+        let out = parse_str("oper f {} [ do [ k; ]; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0072"),
+            "expected P0072, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn do_while_stmt_missing_semicolon_diagnoses_p0013() {
+        let out = parse_str("oper f {} [ do [ k; ] while k < 3 ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0013"),
+            "expected P0013, got {:?}",
             out.diagnostics
         );
     }

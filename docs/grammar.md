@@ -420,6 +420,8 @@ function that implements it.
 <stmt>          ::= <let-stmt>
                   | <var-stmt>
                   | <for-stmt>
+                  | <while-stmt>
+                  | <do-while-stmt>
                   | <truncate-stmt>
                   | <delete-stmt>
                   | <insert-stmt>
@@ -546,6 +548,34 @@ function that implements it.
                     -- `:=`/`in`, P0064 on a missing `to` (counted), P0065 on a
                     -- missing `do`, P0066 on a missing body `[`; P0013 on a
                     -- missing trailing `;`.
+<while-stmt>    ::= 'while' <expr> 'do' <block> ';' ;         -- parse_while_stmt (WHILE_STMT)
+                    -- The **pre-test** loop: the condition (a full <expr> that
+                    -- stops at `do`, which is neither an infix operator nor a
+                    -- postfix trigger) is tested before each iteration, and the
+                    -- loop runs while it is `true` (Boolean, T0080). Empty-safe.
+                    -- `while` is the loop primitive — the counted/element `for`
+                    -- forms desugar onto a counted loop, and `do … while` is this
+                    -- loop with the test relocated after the body. There is no
+                    -- loop variable; progress is the user's own `<name> := …` on a
+                    -- `var` declared outside the loop (an always-`true` condition
+                    -- is a legal infinite loop, not the compiler's concern).
+                    -- `while`/`do` are contextual keywords recognized only in this
+                    -- statement position (the `let` precedent). P0069 on a missing
+                    -- `do`, P0070 on a missing body `[`; P0013 on a missing `;`.
+<do-while-stmt> ::= 'do' <block> 'while' <expr> ';' ;         -- parse_do_while_stmt (DO_WHILE_STMT)
+                    -- The **post-test** loop (C-style do…while): the body runs
+                    -- **once before** the condition is first tested, then repeats
+                    -- while the condition is `true` (Boolean, T0080). Because the
+                    -- body always runs at least once, a `do [ … names[0] … ] while
+                    -- …` over an empty sequence indexes out of bounds — a
+                    -- documented caveat the user owns (`for … in` and `while` are
+                    -- empty-safe; this form is not). A statement-leading `do` is
+                    -- reserved exclusively for this form and *requires* a trailing
+                    -- `while <cond>`: a bare `do [ … ];` block statement is a parse
+                    -- error (P0072), otherwise `do [B] while c do [B2]` would be
+                    -- ambiguous against "run block, then a pre-test loop". P0071 on
+                    -- a missing body `[`, P0072 on a missing `while`; P0013 on a
+                    -- missing `;`.
 
 <expr>          ::= <expr-prec> ;                            -- parse_expr
 <expr-prec>     ::= <primary-expr> { <postfix> }
@@ -892,6 +922,10 @@ enforces that.
 | P0066 | Expected `[` to start the `for` loop body               |
 | P0067 | `let` binding bound with `:=` (use `=`)                 |
 | P0068 | `var` binding bound with `=` (use `:=`)                 |
+| P0069 | Expected `do` before the `while` loop body              |
+| P0070 | Expected `[` to start the `while` loop body             |
+| P0071 | Expected `[` to start the `do` loop body                |
+| P0072 | Expected `while` after the `do` loop body               |
 
 Note: missing-type-after-`:` (let annotation), missing-type-after-`->`
 (operator return clause), and missing-element-after-`Sequence` all

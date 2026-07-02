@@ -339,6 +339,8 @@ pub enum Stmt {
     Update(UpdateStmt),
     ExprStmt(ExprStmt),
     For(ForStmt),
+    While(WhileStmt),
+    DoWhile(DoWhileStmt),
     // `return` arrives when its semantics are settled.
 }
 
@@ -354,6 +356,8 @@ impl Stmt {
             SyntaxKind::UPDATE_STMT => Stmt::Update(UpdateStmt { syntax }),
             SyntaxKind::EXPR_STMT => Stmt::ExprStmt(ExprStmt { syntax }),
             SyntaxKind::FOR_STMT => Stmt::For(ForStmt { syntax }),
+            SyntaxKind::WHILE_STMT => Stmt::While(WhileStmt { syntax }),
+            SyntaxKind::DO_WHILE_STMT => Stmt::DoWhile(DoWhileStmt { syntax }),
             _ => return None,
         })
     }
@@ -369,6 +373,8 @@ impl Stmt {
             Stmt::Update(s) => s.syntax(),
             Stmt::ExprStmt(s) => s.syntax(),
             Stmt::For(s) => s.syntax(),
+            Stmt::While(s) => s.syntax(),
+            Stmt::DoWhile(s) => s.syntax(),
         }
     }
 }
@@ -456,6 +462,37 @@ impl ForStmt {
     /// The loop body block (the `[ … ]` after `do`).
     pub fn body(&self) -> Option<Block> {
         child(&self.syntax)
+    }
+}
+
+ast_node!(pub WhileStmt, WHILE_STMT);
+
+impl WhileStmt {
+    /// The loop condition — the `Expr` between `while` and `do`. Tested before
+    /// each iteration (pre-test); the loop runs while it is `true`.
+    pub fn condition(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// The loop body block (the `[ … ]` after `do`).
+    pub fn body(&self) -> Option<Block> {
+        child(&self.syntax)
+    }
+}
+
+ast_node!(pub DoWhileStmt, DO_WHILE_STMT);
+
+impl DoWhileStmt {
+    /// The loop body block (the `[ … ]` after `do`). Runs once **before** the
+    /// first test — an empty-sequence hazard the user owns.
+    pub fn body(&self) -> Option<Block> {
+        child(&self.syntax)
+    }
+
+    /// The loop condition — the `Expr` after the trailing `while`. Tested after
+    /// each iteration (post-test); the loop repeats while it is `true`.
+    pub fn condition(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
     }
 }
 
