@@ -1,11 +1,11 @@
 //! Scanner for the body of an `f"…"` format-string literal.
 //!
 //! A format string is a `Text` template: literal runs interleaved with
-//! `{name}` placeholders that name attributes of the `params` tuple at the
+//! `{name}` placeholders that name attributes of the `args` tuple at the
 //! `format` call site. This module turns the raw token text into an
 //! alternating sequence of [`TemplateChunk`]s — escape-decoded literal
 //! bytes and placeholder identifiers — so that both the typechecker
-//! (`coddl-types`, which checks each placeholder against the params
+//! (`coddl-types`, which checks each placeholder against the args
 //! heading) and the lowerer (`coddl-procir`, which emits the
 //! `|| to_text { … } ||` chain) agree on the structure byte-for-byte.
 //!

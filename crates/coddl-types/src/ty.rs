@@ -131,10 +131,12 @@ pub enum Type {
     Byte,
     Boolean,
     /// The type of an `f"…"` format-string literal. Compile-time-only and
-    /// non-storable: its only producer is the literal, there is **no**
+    /// non-storable: it never survives lowering, and there is **no**
     /// `Text -> FormatText` coercion (that absence is the firewall keeping
-    /// runtime `Text` — e.g. `read_line` input — out of template slots),
-    /// and it never survives lowering. Unspellable as a type name (absent
+    /// runtime `Text` — e.g. `read_line` input — out of template slots). It
+    /// may flow through a `let` binding — `let t = f"…"` — so a template can
+    /// be written once and reused across `format` calls; provenance still
+    /// traces to a compile-time literal. Unspellable as a type name (absent
     /// from `from_builtin_name`), so it can never be a relvar/tuple
     /// attribute. Only `format`'s `template` parameter accepts it. See
     /// `docs/typecheck.md`.

@@ -263,6 +263,12 @@ struct Lowerer {
     /// (same push/pop discipline); an alias carries no `ValueId`, so it never
     /// appears in `locals` and is invisible to scope-release.
     relexpr_aliases: Vec<HashMap<String, RelExpr>>,
+    /// `let x = f"…"` bindings: the format template's token text, keyed by name.
+    /// A `FormatText` is compile-time-only and never a runtime value, so — like
+    /// `relexpr_aliases` — the binding emits nothing and carries no `ValueId`;
+    /// `lower_format_call` folds the stored template in at each use site.
+    /// Parallel to `locals` (same push/pop discipline).
+    format_templates: Vec<HashMap<String, String>>,
     /// Names declared by an uninitialized `var x;` that are not yet bound —
     /// the *pending* set. The first assignment binds the name into `locals`
     /// (at this same layer) and removes it here. Parallel to `locals` (same
@@ -389,6 +395,7 @@ impl Lowerer {
             current_block_params: Vec::new(),
             locals: vec![HashMap::new()],
             relexpr_aliases: vec![HashMap::new()],
+            format_templates: vec![HashMap::new()],
             pending_uninit: vec![HashSet::new()],
             value_types: HashMap::new(),
             outer_locals_for_capture: None,
@@ -483,12 +490,14 @@ impl Lowerer {
     fn push_local_scope(&mut self) {
         self.locals.push(HashMap::new());
         self.relexpr_aliases.push(HashMap::new());
+        self.format_templates.push(HashMap::new());
         self.pending_uninit.push(HashSet::new());
     }
 
     fn pop_local_scope(&mut self) {
         self.locals.pop();
         self.relexpr_aliases.pop();
+        self.format_templates.pop();
         self.pending_uninit.pop();
     }
 
@@ -616,6 +625,23 @@ impl Lowerer {
         self.relexpr_aliases.iter().rev().find_map(|l| l.get(name))
     }
 
+    /// Record a `let x = f"…"` binding — its template token text, folded in by
+    /// `lower_format_call`. Emits no instruction and binds no `ValueId`.
+    fn bind_format_template(&mut self, name: String, text: String) {
+        self.format_templates
+            .last_mut()
+            .expect("scope stack empty")
+            .insert(name, text);
+    }
+
+    /// Resolve a name to its `let`-bound format-template text, innermost first.
+    fn lookup_format_template(&self, name: &str) -> Option<&str> {
+        self.format_templates
+            .iter()
+            .rev()
+            .find_map(|l| l.get(name).map(String::as_str))
+    }
+
     fn fresh_value(&mut self) -> ValueId {
         let v = ValueId(self.next_value);
         self.next_value += 1;
@@ -668,6 +694,8 @@ impl Lowerer {
         self.locals.push(HashMap::new());
         self.relexpr_aliases.clear();
         self.relexpr_aliases.push(HashMap::new());
+        self.format_templates.clear();
+        self.format_templates.push(HashMap::new());
         self.pending_uninit.clear();
         self.pending_uninit.push(HashSet::new());
         self.value_types.clear();
@@ -1173,6 +1201,9 @@ impl Lowerer {
                 Stmt::For(f) => self.lower_for_stmt(&f),
                 Stmt::While(w) => self.lower_while_stmt(&w),
                 Stmt::DoWhile(d) => self.lower_do_while_stmt(&d),
+                // `load` — force + order + materialize lowering lands with the
+                // statement's own lowerer.
+                Stmt::Load(_) => {}
             }
         }
         match block.tail_expr() {
@@ -1767,6 +1798,23 @@ impl Lowerer {
             Some(v) => v,
             None => return,
         };
+        // `let x = f"…"` binds a reusable format template. A `FormatText` is
+        // compile-time-only and never a runtime value, so — like a deferred
+        // `RelExpr` alias — record the template text and emit nothing;
+        // `lower_format_call` folds it in at each `format { template: x, … }`
+        // use. The typechecker guarantees only a direct `f"…"` literal reaches
+        // here (never a runtime `Text`).
+        if let Expr::Literal(lit) = &value_expr {
+            if lit.token().map(|t| t.kind()) == Some(SyntaxKind::FORMAT_STRING_LIT) {
+                if let (Some(tok), Some(name_tok)) = (lit.token(), stmt.name()) {
+                    self.bind_format_template(
+                        name_tok.text().to_string(),
+                        tok.text().to_string(),
+                    );
+                }
+                return;
+            }
+        }
         // Binding transparency: when a SQL dialect is active and the RHS is a
         // pushable relvar-rooted relational expression, record it as a
         // deferred `RelExpr` alias and emit nothing. Uses of the name fold the
@@ -2954,6 +3002,8 @@ impl Lowerer {
         let saved_insts = std::mem::take(&mut self.insts);
         let saved_locals = std::mem::replace(&mut self.locals, vec![HashMap::new()]);
         let saved_aliases = std::mem::replace(&mut self.relexpr_aliases, vec![HashMap::new()]);
+        let saved_format_templates =
+            std::mem::replace(&mut self.format_templates, vec![HashMap::new()]);
         let saved_pending = std::mem::replace(&mut self.pending_uninit, vec![HashSet::new()]);
         let saved_value_types = std::mem::take(&mut self.value_types);
         // Isolate `owned_texts` like `value_types`: the helper resets `next_value`,
@@ -3053,6 +3103,7 @@ impl Lowerer {
         self.current_block_params = saved_current_block_params;
         self.locals = saved_locals;
         self.relexpr_aliases = saved_aliases;
+        self.format_templates = saved_format_templates;
         self.pending_uninit = saved_pending;
         self.value_types = saved_value_types;
         self.owned_texts = saved_owned_texts;
@@ -4210,6 +4261,8 @@ impl Lowerer {
         let saved_insts = std::mem::take(&mut self.insts);
         let saved_locals = std::mem::replace(&mut self.locals, vec![HashMap::new()]);
         let saved_aliases = std::mem::replace(&mut self.relexpr_aliases, vec![HashMap::new()]);
+        let saved_format_templates =
+            std::mem::replace(&mut self.format_templates, vec![HashMap::new()]);
         let saved_pending = std::mem::replace(&mut self.pending_uninit, vec![HashSet::new()]);
         let saved_value_types = std::mem::take(&mut self.value_types);
         // The helper resets `next_value` to 0, so its ValueIds collide with the
@@ -4274,6 +4327,7 @@ impl Lowerer {
         self.current_block_params = saved_current_block_params;
         self.locals = saved_locals;
         self.relexpr_aliases = saved_aliases;
+        self.format_templates = saved_format_templates;
         self.pending_uninit = saved_pending;
         self.value_types = saved_value_types;
         self.owned_texts = saved_owned_texts;
@@ -4659,6 +4713,13 @@ impl Lowerer {
         if surface == "to_text" {
             return self.lower_to_text_call(call, self_val);
         }
+        // The `write_line { template, args }` overload: fold the template like
+        // `format`, then write the resulting `Text`. Only reached for the
+        // template form — the `message: Text` form flows through the generic
+        // extern path below.
+        if surface == "write_line" && call_has_named_arg(call, "template") {
+            return self.lower_write_line_format_call(call);
+        }
         // A non-builtin callee is a user-defined operator — an in-module
         // function. (Names are unique across builtins ∪ user ops, so this
         // never shadows a builtin.)
@@ -4934,44 +4995,78 @@ impl Lowerer {
         dst
     }
 
-    /// Lower the `format { template: f"…", params: { … } }` intrinsic to a
+    /// Lower the `write_line { template: f"…", args: { … } }` overload: fold
+    /// the template and args into a `Text` exactly as `format` does, then hand
+    /// that value to the `coddl_write_line` extern (the same symbol the
+    /// `message: Text` overload uses). The folded `Text` is an owned temp, so
+    /// release it after the call — mirroring the generic extern path's
+    /// `text_args` cleanup. Returns a fresh Unit value.
+    fn lower_write_line_format_call(&mut self, call: &CallExpr) -> ValueId {
+        let msg = self.lower_format_call(call);
+        let ext = self
+            .lookup_extern("write_line")
+            .expect("write_line extern is registered");
+        self.ensure_extern(ext);
+        self.insts.push(Inst::Call {
+            dst: None,
+            callee: ext.linkage.to_string(),
+            args: vec![msg],
+            return_type: ProcType::Unit,
+        });
+        self.release_text_temp(msg);
+        let v = self.fresh_value();
+        self.record_type(v, ProcType::Unit);
+        v
+    }
+
+    /// Lower the `format { template: f"…", args: { … } }` intrinsic to a
     /// `to_text`/`||` concatenation, the desugar string interpolation is
     /// built on. The template is scanned (the typechecker already validated
     /// it) into literal chunks and placeholders; each placeholder reads its
-    /// value from the `params` tuple via a borrowed `TupleField`, is
-    /// converted with `to_text`, and the pieces are concatenated. `params`
+    /// value from the `args` tuple via a borrowed `TupleField`, is
+    /// converted with `to_text`, and the pieces are concatenated. `args`
     /// is materialized once, so per-field effects run once and repeated
     /// placeholders are handled correctly.
     fn lower_format_call(&mut self, call: &CallExpr) -> ValueId {
         let arg_list = call.args().expect("typechecked call has an arg list");
-        let mut template_tok = None;
-        let mut params_expr: Option<Expr> = None;
+        let mut template_text: Option<String> = None;
+        let mut args_expr: Option<Expr> = None;
         for arg in arg_list.args() {
             match arg.name().map(|t| t.text().to_string()).as_deref() {
-                Some("template") => {
-                    if let Some(Expr::Literal(lit)) = arg.value() {
-                        template_tok = lit.token();
+                Some("template") => match arg.value() {
+                    // Inline `f"…"` literal.
+                    Some(Expr::Literal(lit)) => {
+                        template_text = lit.token().map(|t| t.text().to_string());
                     }
-                }
-                Some("params") => params_expr = arg.value(),
+                    // A `let x = f"…"` template, reused here — fold in the text
+                    // recorded at the binding site.
+                    Some(Expr::NameRef(n)) => {
+                        if let Some(ident) = n.ident() {
+                            template_text =
+                                self.lookup_format_template(ident.text()).map(str::to_string);
+                        }
+                    }
+                    _ => {}
+                },
+                Some("args") => args_expr = arg.value(),
                 _ => {}
             }
         }
-        let tok = template_tok.expect("typechecked format has an f\"…\" template literal");
-        let chunks = parse_format_template(tok.text()).unwrap_or_default();
+        let text = template_text.expect("typechecked format has an f\"…\" template");
+        let chunks = parse_format_template(&text).unwrap_or_default();
 
-        // Materialize `params` once iff a placeholder needs it.
-        let needs_params = chunks
+        // Materialize `args` once iff a placeholder needs it.
+        let needs_args = chunks
             .iter()
             .any(|c| matches!(c, TemplateChunk::Placeholder { .. }));
-        let params_tv = if needs_params {
-            params_expr.as_ref().map(|e| self.lower_expr(e))
+        let args_tv = if needs_args {
+            args_expr.as_ref().map(|e| self.lower_expr(e))
         } else {
             None
         };
-        let params_heading = params_tv.map(|tv| match self.value_type(tv) {
+        let args_heading = args_tv.map(|tv| match self.value_type(tv) {
             ProcType::Tuple(h) => h,
-            other => unreachable!("format params lowered to non-tuple `{other}`"),
+            other => unreachable!("format args lowered to non-tuple `{other}`"),
         });
 
         // Each chunk becomes a `Text` piece: literal const, or a placeholder
@@ -4984,13 +5079,13 @@ impl Lowerer {
                     pieces.push(self.emit_text_const(bytes.clone()));
                 }
                 TemplateChunk::Placeholder { name, .. } => {
-                    let tv = params_tv.expect("placeholder requires materialized params");
-                    let heading = params_heading.as_ref().expect("params heading");
+                    let tv = args_tv.expect("placeholder requires materialized args");
+                    let heading = args_heading.as_ref().expect("args heading");
                     let field_type = heading
                         .lookup(name)
                         .map(proc_type_from_type)
                         .unwrap_or_else(|| {
-                            unreachable!("placeholder `{name}` missing from params heading past typecheck")
+                            unreachable!("placeholder `{name}` missing from args heading past typecheck")
                         });
                     let field = self.fresh_value();
                     self.record_type(field, field_type.clone());
@@ -5020,10 +5115,10 @@ impl Lowerer {
             }
         };
 
-        // Release the owned `Text` cells the materialized `params` tuple
-        // holds (mirrors `lower_relation_lit`). A `NameRef`-aliased params
+        // Release the owned `Text` cells the materialized `args` tuple
+        // holds (mirrors `lower_relation_lit`). A `NameRef`-aliased args
         // tuple contributes none, so this is a no-op there.
-        if let Some(tv) = params_tv {
+        if let Some(tv) = args_tv {
             if let Some(temps) = self.tuple_cell_text_temps.remove(&tv) {
                 for t in temps {
                     self.release_text_temp(t);
@@ -5064,6 +5159,18 @@ impl Lowerer {
         self.release_text_temp(rhs);
         dst
     }
+}
+
+/// True iff `call` supplies an argument literally named `name`. Mirrors the
+/// checker's discriminator that routes `write_line { template, args }` to the
+/// format-writing overload.
+fn call_has_named_arg(call: &CallExpr, name: &str) -> bool {
+    call.args()
+        .map(|list| {
+            list.args()
+                .any(|a| a.name().map(|t| t.text().to_string()).as_deref() == Some(name))
+        })
+        .unwrap_or(false)
 }
 
 /// The attribute name if `expr` is a bare `NameRef`, else `None`. Used by
@@ -6985,7 +7092,7 @@ oper main {} [
         let src = "program p; \
                    oper to_text { self: Sequence Text } -> Text [ \"x\" ]; \
                    oper main {} [ let names = Sequence [ \"a\" ]; \
-                   let m = format { template: f\"{names}\", params: { names } }; \
+                   let m = format { template: f\"{names}\", args: { names } }; \
                    write_line { message: m }; ];";
         let m = lower_ok(src);
         let main = m.functions.iter().find(|f| f.name == "main").unwrap();
@@ -7363,17 +7470,17 @@ oper main {} [
     fn format_lowers_to_concat_with_placeholder_field() {
         let src = "oper main {} [ \
                    let name_in = read_line { prompt: \"n: \" }; \
-                   let message = format { template: f\"Hello, {name}!\", params: { name: name_in } }; \
+                   let message = format { template: f\"Hello, {name}!\", args: { name: name_in } }; \
                    write_line { message }; \
                    ];";
         let m = lower_ok(src);
         let main = m.functions.iter().find(|f| f.name == "main").unwrap();
         let insts = &main.blocks[0].insts;
 
-        // `params` is materialized once …
+        // `args` is materialized once …
         assert!(
             insts.iter().any(|i| matches!(i, Inst::TupleLit { .. })),
-            "expected params TupleLit"
+            "expected args TupleLit"
         );
         // … and `{name}` is read out of it via TupleField.
         assert!(
@@ -7406,7 +7513,7 @@ oper main {} [
     #[test]
     fn format_integer_placeholder_calls_int_to_text() {
         let src = "oper main {} [ \
-                   let message = format { template: f\"count: {n}\", params: { n: 7 } }; \
+                   let message = format { template: f\"count: {n}\", args: { n: 7 } }; \
                    write_line { message }; \
                    ];";
         let m = lower_ok(src);
@@ -7416,6 +7523,38 @@ oper main {} [
                 |i| matches!(i, Inst::Call { callee, .. } if callee == "coddl_int_to_text")
             ),
             "expected a coddl_int_to_text call for the Integer placeholder"
+        );
+    }
+
+    #[test]
+    fn write_line_format_overload_folds_then_writes() {
+        // `write_line { template, args }` folds the template exactly like
+        // `format` (TupleLit + TupleField), then writes the result through the
+        // same `coddl_write_line` extern — with no intermediate `message` let.
+        let src = "oper main {} [ \
+                   write_line { template: f\"Hello, {name}!\", args: { name: \"X\" } }; \
+                   ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let insts = &main.blocks[0].insts;
+
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::TupleLit { .. })),
+            "expected args TupleLit"
+        );
+        assert!(
+            insts.iter().any(
+                |i| matches!(i, Inst::TupleField { field_name, .. } if field_name == "name")
+            ),
+            "expected a TupleField for `name`"
+        );
+        let write = insts
+            .iter()
+            .find(|i| matches!(i, Inst::Call { callee, .. } if callee == "coddl_write_line"))
+            .expect("expected a coddl_write_line call");
+        assert!(
+            matches!(write, Inst::Call { dst: None, return_type: ProcType::Unit, args, .. } if args.len() == 1),
+            "write_line call should take the folded Text and return Unit, got {write:?}"
         );
     }
 

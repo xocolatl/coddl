@@ -93,7 +93,7 @@ program hello_world;
 oper to_text { self: Sequence Text } -> Text [ \"everyone\" ];
 oper main {} [
     let names = Sequence [\"Alice\", \"Bob\"];
-    let message = format { template: f\"Hello, {names}!\", params: { names } };
+    let message = format { template: f\"Hello, {names}!\", args: { names } };
     write_line { message };
 ];
 ";
@@ -279,7 +279,7 @@ oper to_text { self: Sequence Text } -> Text [
 ];
 oper main {} [
     let names = Sequence [\"Alice\", \"Bob\"];
-    let message = format { template: f\"Hello, {names}!\", params: { names } };
+    let message = format { template: f\"Hello, {names}!\", args: { names } };
     write_line { message };
 ];
 ";
@@ -1551,14 +1551,14 @@ oper main {} [
 #[test]
 fn format_interpolates_read_line_into_greeting() {
     // The `format` intrinsic twin of `read_line_echoes_into_greeting`:
-    // `f"Hello, {name}!"` + `params: { name }` desugars to the same
+    // `f"Hello, {name}!"` + `args: { name }` desugars to the same
     // `to_text`/`||` chain. Exercises FORMAT_STRING_LIT lexing, the
     // `format` check + desugar, and `to_text` (Text identity) end to end.
     let src = "\
 program greet_fmt;
 oper main {} [
     let name = read_line { prompt: \"Name: \" };
-    let message = format { template: f\"Hello, {name}!\", params: { name: name } };
+    let message = format { template: f\"Hello, {name}!\", args: { name: name } };
     write_line { message };
 ];
 ";
@@ -1572,7 +1572,7 @@ fn format_interpolates_a_character() {
     let src = "\
 program greet_char;
 oper main {} [
-    let message = format { template: f\"grade: {g}\", params: { g: 'A' } };
+    let message = format { template: f\"grade: {g}\", args: { g: 'A' } };
     write_line { message };
 ];
 ";
@@ -1586,11 +1586,53 @@ fn format_interpolates_an_integer() {
     let src = "\
 program greet_int;
 oper main {} [
-    let message = format { template: f\"count: {n}\", params: { n: 7 } };
+    let message = format { template: f\"count: {n}\", args: { n: 7 } };
     write_line { message };
 ];
 ";
     run_both_backends_expect(src, "format-int.cd", b"count: 7\n");
+}
+
+#[test]
+fn format_template_bound_to_let_is_reused() {
+    // A template written once and reused across two `format` calls with
+    // different `args`. The `f"…"` rides on the `let` binding at compile
+    // time (a `FormatText` is never a runtime value), so the lowerer folds it
+    // in at each call site — exercising the template-reuse path end to end.
+    let src = "\
+program greet_reuse;
+oper main {} [
+    let greeting = f\"Hello, {name}!\";
+    let a = format { template: greeting, args: { name: \"Alice\" } };
+    let b = format { template: greeting, args: { name: \"Bob\" } };
+    write_line { message: a };
+    write_line { message: b };
+];
+";
+    run_both_backends_expect(src, "format-reuse.cd", b"Hello, Alice!\nHello, Bob!\n");
+}
+
+#[test]
+fn write_line_format_overload_writes_interpolated_line() {
+    // The `write_line { template, args }` overload folds the template like
+    // `format` and writes it in one step. It must produce byte-identical output
+    // to the explicit `write_line { message: format { template, args } }`
+    // nesting. Covers all three forms: explicit nesting, the let-bound-template
+    // sugar (the equivalence), and an inline `f"…"` literal template.
+    let src = "\
+program greet_wl;
+oper main {} [
+    let template = f\"Hello, {name}!\";
+    write_line { message: format { template, args: { name: \"World\" } } };
+    write_line { template, args: { name: \"World\" } };
+    write_line { template: f\"Hi, {who}.\", args: { who: \"there\" } };
+];
+";
+    run_both_backends_expect(
+        src,
+        "write-line-format.cd",
+        b"Hello, World!\nHello, World!\nHi, there.\n",
+    );
 }
 
 #[test]

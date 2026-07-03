@@ -116,7 +116,7 @@ Deliberately **not** in the synonym set: Greek letters (`π σ ρ γ` — too ea
 ## Literals
 
 - **Text** literals: double-quoted, e.g. `"hello, world"`. Standard escape sequences `\n`, `\r`, `\t`, `\"`, `\\`, and `\u{HHHHHH}` for a Unicode codepoint (1–6 hex digits, value ≤ U+10FFFF, outside the UTF-16 surrogate range D800–DFFF). Multi-line is permitted — raw newlines are kept as-is.
-- **Format-string** literals: a Text literal prefixed by `f` with the `f` **fused to the opening quote** (no space), e.g. `f"Hello, {name}!"`. Same body and escapes as a Text literal, plus `{name}` placeholders (a single attribute name) and `{{` / `}}` for literal braces. Its type is `FormatText` (see [typecheck.md](typecheck.md)), which exists only as the `template` argument of `format` — there is no `Text → FormatText` conversion, so a runtime `Text` can never be used as a template. Only the exact adjacency `f"` triggers it: a bare `f`, `f { … }`, `f "x"` (with a space), and `xf"x"` all stay an ordinary identifier (optionally) followed by a plain string. Lexical form → type, like the numeric shapes below. The lexer does **not** validate placeholders; that is a typecheck-time concern (T0055–T0059).
+- **Format-string** literals: a Text literal prefixed by `f` with the `f` **fused to the opening quote** (no space), e.g. `f"Hello, {name}!"`. Same body and escapes as a Text literal, plus `{name}` placeholders (a single attribute name) and `{{` / `}}` for literal braces. Its type is `FormatText` (see [typecheck.md](typecheck.md)), which appears only as the `template` argument of `format` — either inline or bound once to a `let` and reused (`let t = f"…"; format { template: t, … }`) — there is no `Text → FormatText` conversion, so a runtime `Text` can never be used as a template. Only the exact adjacency `f"` triggers it: a bare `f`, `f { … }`, `f "x"` (with a space), and `xf"x"` all stay an ordinary identifier (optionally) followed by a plain string. Lexical form → type, like the numeric shapes below. The lexer does **not** validate placeholders; that is a typecheck-time concern (T0055–T0059).
 - **Character** literals: single-quoted, exactly one codepoint, e.g. `'a'`, `'\n'`, `'\u{1F600}'`. The lexer rejects empty `''` and multi-codepoint `'ab'` at the lexical level. Escape syntax matches Text.
 - **Boolean** literals: `true`, `false`.
 - **Numeric** literals — three lexical shapes, one per numeric type:
@@ -431,6 +431,7 @@ function that implements it.
                   | <for-stmt>
                   | <while-stmt>
                   | <do-while-stmt>
+                  | <load-stmt>
                   | <truncate-stmt>
                   | <delete-stmt>
                   | <insert-stmt>
@@ -586,6 +587,33 @@ function that implements it.
                     -- ambiguous against "run block, then a pre-test loop". P0071 on
                     -- a missing body `[`, P0072 on a missing `while`; P0013 on a
                     -- missing `;`.
+<load-stmt>     ::= 'load' <identifier> 'from' <expr>
+                    [ 'order' '[' <sort-item> { ',' <sort-item> } ']' ] ';' ;  -- parse_load_stmt (LOAD_STMT)
+                    -- The sole relation→sequence iteration gate (RM Pro 7):
+                    -- force the source relation, impose an order, and materialize
+                    -- its tuples into the `Sequence` target. The source is any
+                    -- relation <expr>; it stops at `order`, which is neither an
+                    -- infix operator nor a postfix trigger. The `order` clause is
+                    -- an ORDERED bracket-list of <sort-item>s (sort precedence is
+                    -- ordinal) and is optional — the reverse `load <relvar> from
+                    -- <sequence>` form carries none; the target's type
+                    -- disambiguates direction at typecheck. `load` has no
+                    -- projection slot: to keep only some attributes, project in
+                    -- the source <expr> (`load n from (R project { a }) order
+                    -- [asc a]`). `load`/`from`/`order` are contextual keywords
+                    -- recognized only in this statement position (Coddl reserves
+                    -- no words). P0073 on a missing target name, P0074 on a
+                    -- missing `from` (a missing source expression is the uniform
+                    -- P0014), P0075 on a missing order-list `[`, P0076 on an
+                    -- unterminated order list, P0077 on an empty/missing order
+                    -- key; P0013 on a missing `;`.
+<sort-item>     ::= [ 'asc' | 'desc' ] <identifier> ;          -- parse_sort_item (SORT_ITEM)
+                    -- One order key: an optional direction keyword (`asc`/`desc`,
+                    -- contextual — recognized only when an attribute <identifier>
+                    -- follows, so a bare attribute named `asc`/`desc` still
+                    -- parses) and the order-key attribute name. A bare attribute
+                    -- defaults to `asc`. Shared with the (planned) window `rank`
+                    -- sort list. P0077 on a missing attribute.
 
 <expr>          ::= <expr-prec> ;                            -- parse_expr
 <expr-prec>     ::= <primary-expr> { <postfix> }
@@ -932,6 +960,11 @@ enforces that.
 | P0070 | Expected `[` to start the `while` loop body             |
 | P0071 | Expected `[` to start the `do` loop body                |
 | P0072 | Expected `while` after the `do` loop body               |
+| P0073 | Expected a target name after `load`                     |
+| P0074 | Expected `from` after the `load` target                 |
+| P0075 | Expected `[` to open the `load` order list              |
+| P0076 | Expected `]` to close the `load` order list             |
+| P0077 | Expected an attribute name in the order key             |
 
 Note: missing-type-after-`:` (let annotation), missing-type-after-`->`
 (operator return clause), and missing-element-after-`Sequence` all

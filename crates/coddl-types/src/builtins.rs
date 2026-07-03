@@ -28,7 +28,7 @@ pub enum ParamKind {
     /// reads the element count regardless of element type (mirrors
     /// `AnyRelation`).
     AnySequence,
-    /// Polymorphic over any `Tuple H`. Used by `format`'s `params`; the
+    /// Polymorphic over any `Tuple H`. Used by `format`'s `args`; the
     /// heading is captured at the call site (mirrors `AnyRelation`).
     AnyTuple,
 }

@@ -131,6 +131,26 @@ impl<'a> Parser<'a> {
         &self.source[span.start as usize..span.end as usize] == lexeme
     }
 
+    /// Peek the kind of the `n`-th non-trivia token from the cursor
+    /// (`n == 0` is the current token, the same one [`current`] returns).
+    /// Returns [`SyntaxKind::EOF`] past the end. Used for the small lookahead
+    /// a sort-item needs to tell a direction keyword (`asc a`) from a bare
+    /// attribute that happens to be spelled `asc` (`[asc]`).
+    pub(crate) fn nth_kind(&self, n: usize) -> SyntaxKind {
+        let mut i = self.pos;
+        let mut seen = 0;
+        while i < self.tokens.len() {
+            if !self.tokens[i].kind.is_trivia() {
+                if seen == n {
+                    return SyntaxKind::from(self.tokens[i].kind);
+                }
+                seen += 1;
+            }
+            i += 1;
+        }
+        SyntaxKind::EOF
+    }
+
     /// Emit every trivia token at the cursor into the current node.
     pub(crate) fn bump_trivia(&mut self) {
         while self.pos < self.tokens.len() && self.tokens[self.pos].kind.is_trivia() {
@@ -677,6 +697,82 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
+    /// `load <target> from <source-expr> [ order [ <sort-item> { ',' <sort-item> } ] ] ;`
+    /// — the sole relation→sequence iteration gate (RM Pro 7): force the source
+    /// relation, impose an order, and materialize its tuples into the `Sequence`
+    /// target. `load` / `from` / `order` are contextual keywords recognized only
+    /// in this statement position (Coddl reserves no words); the source `Expr`
+    /// stops at `order` because that word is neither an infix nor a postfix
+    /// trigger. The `order` clause is an ordered bracket-list of `<sort-item>`s
+    /// (the same production the window `rank` reuses) and is optional — the
+    /// reverse `load <relvar> from <sequence>` form carries none. A trailing `;`
+    /// is required (P0013). Builds `LOAD_STMT`.
+    fn parse_load_stmt(&mut self) {
+        debug_assert!(self.at_keyword("load"));
+        self.start_node(SyntaxKind::LOAD_STMT);
+        self.bump(); // `load`
+
+        self.bump_trivia();
+        if !self.eat(SyntaxKind::IDENT) {
+            self.error("P0073", "expected a target name after `load`");
+        }
+        if self.at_keyword("from") {
+            self.bump(); // `from`
+        } else {
+            self.error("P0074", "expected `from` after the `load` target");
+        }
+        // The source relation expression — stops at `order` (a missing source
+        // is P0014 "expected expression" from the expression parser).
+        self.parse_expr();
+        // Optional `order [ <sort-item> { ',' <sort-item> } ]`.
+        if self.at_keyword("order") {
+            self.bump(); // `order`
+            if !self.eat(SyntaxKind::L_BRACKET) {
+                self.error("P0075", "expected `[` to open the `load` order list");
+            } else if self.at(SyntaxKind::R_BRACKET) {
+                // An empty `order []` has no order keys.
+                self.error("P0077", "expected an attribute name in the order key");
+                self.bump(); // `]`
+            } else {
+                loop {
+                    self.parse_sort_item();
+                    if !self.eat(SyntaxKind::COMMA) {
+                        break;
+                    }
+                    if self.at(SyntaxKind::R_BRACKET) {
+                        break; // trailing comma ok
+                    }
+                }
+                if !self.eat(SyntaxKind::R_BRACKET) {
+                    self.error("P0076", "expected `]` to close the `load` order list");
+                }
+            }
+        }
+        if !self.eat(SyntaxKind::SEMICOLON) {
+            self.error("P0013", "expected `;` after `load`");
+        }
+        self.finish_node();
+    }
+
+    /// `[asc|desc]? <attr>` — one entry in a `load` (or window `rank`) order
+    /// list. The direction is an optional contextual keyword, recognized only
+    /// when an attribute `IDENT` follows it; a bare attribute defaults to `asc`,
+    /// so an attribute literally named `asc` / `desc` still parses as the order
+    /// key (no reserved words). Builds `SORT_ITEM`.
+    fn parse_sort_item(&mut self) {
+        self.bump_trivia();
+        self.start_node(SyntaxKind::SORT_ITEM);
+        if (self.at_keyword("asc") || self.at_keyword("desc"))
+            && self.nth_kind(1) == SyntaxKind::IDENT
+        {
+            self.bump(); // direction keyword
+        }
+        if !self.eat(SyntaxKind::IDENT) {
+            self.error("P0077", "expected an attribute name in the order key");
+        }
+        self.finish_node();
+    }
+
     /// `truncate <relvar> ;` — clear every tuple from a relvar. The operand
     /// is parsed permissively (`parse_expr`); the typechecker restricts it to
     /// a bare assignable relvar name (T0033) and the lowerer desugars it to
@@ -877,6 +973,10 @@ impl<'a> Parser<'a> {
         }
         if self.at_keyword("do") {
             self.parse_do_while_stmt();
+            return;
+        }
+        if self.at_keyword("load") {
+            self.parse_load_stmt();
             return;
         }
 
@@ -3685,6 +3785,211 @@ mod tests {
     #[test]
     fn do_while_stmt_missing_semicolon_diagnoses_p0013() {
         let out = parse_str("oper f {} [ do [ k; ] while k < 3 ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0013"),
+            "expected P0013, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    // ── `load` statement ─────────────────────────────────────────────
+
+    #[test]
+    fn load_stmt_parses() {
+        let src = "oper f {} [ load names from rnames order [asc name]; ];";
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.tree.text(), src);
+        let ls = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::LOAD_STMT)
+            .expect("LOAD_STMT in tree");
+        // Direct IDENT token children are the contextual keywords + the target;
+        // the source relvar's IDENT is nested inside its NAME_REF child.
+        let idents: Vec<_> = ls
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| t.kind() == SyntaxKind::IDENT)
+            .map(|t| t.text().to_string())
+            .collect();
+        assert_eq!(idents, vec!["load", "names", "from", "order"]);
+        // The source is the sole (NameRef) Expr child.
+        let source = ls
+            .children()
+            .find(|n| n.kind() == SyntaxKind::NAME_REF)
+            .expect("source NAME_REF");
+        assert_eq!(source.text(), "rnames");
+        // One order key.
+        assert_eq!(
+            ls.children().filter(|n| n.kind() == SyntaxKind::SORT_ITEM).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn load_stmt_without_order_parses() {
+        // The reverse (sequence→relvar) / unordered form carries no `order`.
+        let src = "oper f {} [ load r from xs; ];";
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.tree.text(), src);
+        let ls = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::LOAD_STMT)
+            .expect("LOAD_STMT in tree");
+        assert_eq!(
+            ls.children().filter(|n| n.kind() == SyntaxKind::SORT_ITEM).count(),
+            0
+        );
+    }
+
+    #[test]
+    fn load_stmt_multi_key_order_parses() {
+        let src = "oper f {} [ load s from r order [asc a, desc b]; ];";
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.tree.text(), src);
+        let items: Vec<_> = out
+            .tree
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::SORT_ITEM)
+            .collect();
+        assert_eq!(items.len(), 2);
+        // Each item's IDENT tokens: `[direction?, attr]`. `desc a` → desc key;
+        // a bare attr → ascending.
+        let ids: Vec<Vec<String>> = items
+            .iter()
+            .map(|n| {
+                n.children_with_tokens()
+                    .filter_map(|e| e.into_token())
+                    .filter(|t| t.kind() == SyntaxKind::IDENT)
+                    .map(|t| t.text().to_string())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(ids[0], vec!["asc", "a"]);
+        assert_eq!(ids[1], vec!["desc", "b"]);
+    }
+
+    #[test]
+    fn load_stmt_bare_attr_defaults_to_asc() {
+        // `order [name]` — no direction keyword; one SORT_ITEM, attr `name`.
+        let src = "oper f {} [ load s from r order [name]; ];";
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let item = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::SORT_ITEM)
+            .expect("SORT_ITEM in tree");
+        let ids: Vec<_> = item
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| t.kind() == SyntaxKind::IDENT)
+            .map(|t| t.text().to_string())
+            .collect();
+        assert_eq!(ids, vec!["name"]);
+    }
+
+    #[test]
+    fn load_stmt_attr_named_asc_still_parses() {
+        // No reserved words: an attribute literally named `asc` is the order key
+        // (a direction is recognized only when another attribute IDENT follows).
+        let src = "oper f {} [ load s from r order [asc]; ];";
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let item = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::SORT_ITEM)
+            .expect("SORT_ITEM in tree");
+        let ids: Vec<_> = item
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| t.kind() == SyntaxKind::IDENT)
+            .map(|t| t.text().to_string())
+            .collect();
+        // A single IDENT `asc` — the attribute, not a direction.
+        assert_eq!(ids, vec!["asc"]);
+    }
+
+    #[test]
+    fn load_stmt_trailing_comma_in_order_parses() {
+        let src = "oper f {} [ load s from r order [asc a, desc b,]; ];";
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(
+            out.tree.descendants().filter(|n| n.kind() == SyntaxKind::SORT_ITEM).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn load_stmt_missing_target_diagnoses_p0073() {
+        let out = parse_str("oper f {} [ load 1 from r; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0073"),
+            "expected P0073, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn load_stmt_missing_from_diagnoses_p0074() {
+        let out = parse_str("oper f {} [ load names rnames order [asc name]; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0074"),
+            "expected P0074, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn load_stmt_missing_source_diagnoses_p0014() {
+        // A missing source relation is the uniform "expected expression" (P0014).
+        let out = parse_str("oper f {} [ load names from ; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0014"),
+            "expected P0014, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn load_stmt_missing_order_bracket_diagnoses_p0075() {
+        let out = parse_str("oper f {} [ load names from r order asc name; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0075"),
+            "expected P0075, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn load_stmt_unterminated_order_diagnoses_p0076() {
+        let out = parse_str("oper f {} [ load names from r order [asc name ; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0076"),
+            "expected P0076, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn load_stmt_empty_order_diagnoses_p0077() {
+        let out = parse_str("oper f {} [ load names from r order []; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0077"),
+            "expected P0077, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn load_stmt_missing_semicolon_diagnoses_p0013() {
+        let out = parse_str("oper f {} [ load names from r order [asc name] ];");
         assert!(
             out.diagnostics.iter().any(|d| d.code == "P0013"),
             "expected P0013, got {:?}",

@@ -309,7 +309,7 @@ impl<'a> Lexer<'a> {
     }
 
     /// `f"…"` — same byte-level scan as a plain string (the lexer does not
-    /// interpret `{…}` placeholders; that happens later, against the params
+    /// interpret `{…}` placeholders; that happens later, against the args
     /// heading). The leading `f` and opening `"` are already confirmed
     /// adjacent by the dispatch; here we just consume them and the body.
     fn lex_format_string(&mut self, start: usize) {

@@ -253,6 +253,21 @@ pub enum SyntaxKind {
     /// existing discriminants stable.
     UNWRAP_EXPR,
 
+    /// `load <target> from <relExpr> [ order [ <sort-item> , … ] ] ;` — the
+    /// sole relation→sequence iteration gate (RM Pro 7). Holds the `load` /
+    /// `from` / `order` contextual keywords (IDENTs), the target name (an
+    /// IDENT), the source relation `Expr`, and an ordered bracket-list of
+    /// `SORT_ITEM`s. Placed at the end of the enum to keep existing
+    /// discriminants stable.
+    LOAD_STMT,
+
+    /// One `[asc|desc]? attr` entry inside a `LOAD_STMT`'s order list (the same
+    /// production the window `rank` reuses): an optional direction keyword
+    /// (`asc`/`desc`, contextual IDENTs; bare defaults to `asc`) and the
+    /// order-key attribute name (an IDENT). Placed at the end of the enum to
+    /// keep existing discriminants stable.
+    SORT_ITEM,
+
     /// A range of source whose intended structure couldn't be
     /// recovered. The parser still wraps the tokens so the tree stays
     /// well-formed and downstream passes can keep going.
@@ -409,6 +424,8 @@ mod tests {
             SyntaxKind::WRAP_EXPR,
             SyntaxKind::WRAP_PAIR,
             SyntaxKind::UNWRAP_EXPR,
+            SyntaxKind::LOAD_STMT,
+            SyntaxKind::SORT_ITEM,
             SyntaxKind::PARSE_ERROR,
         ] {
             assert!(!sk.is_token(), "{sk:?} should be a node kind");

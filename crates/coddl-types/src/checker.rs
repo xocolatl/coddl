@@ -9,6 +9,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{
@@ -70,6 +71,10 @@ struct Binding {
     used: bool,
     reassigned: bool,
     initialized: bool,
+    /// The parsed template for a `let x = f"…"` binding, so each later
+    /// `format { template: x, … }` reuses the same chunks. `None` for every
+    /// other binding. See the type-level note above.
+    format_template: Option<Rc<Vec<TemplateChunk>>>,
 }
 
 #[derive(Default)]
@@ -109,6 +114,7 @@ impl Scope {
             // Assigned by default; an uninitialized `var x;` clears this via
             // `mark_uninitialized` right after insertion.
             initialized: true,
+            format_template: None,
         });
         self.layers
             .last_mut()
@@ -146,6 +152,21 @@ impl Scope {
                 return;
             }
         }
+    }
+
+    /// Attach a parsed `f"…"` template to the active binding for `name` — the
+    /// `let x = f"…"` case, so a later `format { template: x, … }` reuses it.
+    fn attach_format_template(&mut self, name: &str, chunks: Option<Rc<Vec<TemplateChunk>>>) {
+        if let Some((l, i)) = self.locate(name) {
+            self.records[l][i].format_template = chunks;
+        }
+    }
+
+    /// The parsed template of the active binding for `name`, if it is a
+    /// `let`-bound `f"…"` template (else `None`). The `Rc` clone is cheap.
+    fn format_template(&self, name: &str) -> Option<Rc<Vec<TemplateChunk>>> {
+        self.locate(name)
+            .and_then(|(l, i)| self.records[l][i].format_template.clone())
     }
 
     /// Mark the active binding for `name` as reassigned (innermost layer
@@ -1080,6 +1101,9 @@ impl TypeChecker {
                 Stmt::For(f) => self.check_for_stmt(&f, scope),
                 Stmt::While(w) => self.check_while_stmt(&w, scope),
                 Stmt::DoWhile(d) => self.check_do_while_stmt(&d, scope),
+                // `load` — element-type inference + definite assignment land
+                // with the statement's own checker.
+                Stmt::Load(_) => {}
             }
         }
         match block.tail_expr() {
@@ -1726,6 +1750,32 @@ impl TypeChecker {
             return;
         }
 
+        // `let x = f"…"` binds a reusable format template. Intercept it before
+        // the RHS reaches `check_expr` (which rejects any `f"…"` outside
+        // `format`'s template with T0055). The template is parsed once here and
+        // rides on the binding, so each later `format { template: x, … }` use
+        // validates its own `args` against the same chunks. Only a direct
+        // literal on an unannotated `let` qualifies — the provenance stays a
+        // compile-time literal, never a runtime `Text` (the FormatText firewall).
+        if origin == BindingOrigin::Let && declared.is_none() {
+            if let Some(Expr::Literal(lit)) = &value {
+                if lit.token().map(|t| t.kind()) == Some(SyntaxKind::FORMAT_STRING_LIT) {
+                    if let (Some(tok), Some(name_tok)) = (lit.token(), &name) {
+                        let chunks = self.parse_template_tok(&tok).map(Rc::new);
+                        let n = name_tok.text().to_string();
+                        scope.insert(
+                            n.clone(),
+                            Type::FormatText,
+                            self.token_span(name_tok),
+                            origin,
+                        );
+                        scope.attach_format_template(&n, chunks);
+                    }
+                    return;
+                }
+            }
+        }
+
         // Infer the RHS type. A sequence literal is checked specially so
         // it can take its element type from `declared` when empty and so
         // it is *permitted* here — `check_expr` rejects sequence literals
@@ -1857,6 +1907,19 @@ impl TypeChecker {
                                 "public relvar `{name}` referenced outside any `transaction [...]` block"
                             ),
                         );
+                    }
+                    // A `let`-bound `f"…"` template used anywhere but `format`'s
+                    // `template` argument — that legitimate use is intercepted in
+                    // `check_format_call` before reaching the generic walk. Same
+                    // firewall as a stray `f"…"` literal: recover as `Unknown` so
+                    // a redundant type-mismatch doesn't pile on.
+                    if matches!(ty, Type::FormatText) {
+                        self.error(
+                            self.token_span(&ident),
+                            "T0055",
+                            "an f\"…\" format string is only allowed as the `template` argument of `format`",
+                        );
+                        return Type::Unknown;
                     }
                     return ty;
                 }
@@ -3418,12 +3481,32 @@ impl TypeChecker {
         let callee_name = callee_name_tok.text().to_string();
 
         // `format` is a compile-time intrinsic, not an ordinary builtin: it
-        // needs a cross-argument check (placeholders ↔ params heading) and
+        // needs a cross-argument check (placeholders ↔ args heading) and
         // has no runtime symbol, so it is handled entirely here and is not
         // in the registry. It is not method-callable (`x.format {}` falls
         // through to normal resolution and fails to resolve).
         if callee_name == "format" && self_ty.is_none() {
             return self.check_format_call(call, scope);
+        }
+
+        // The `write_line { template: FormatText, args: Tuple H }` overload —
+        // the same heading shape as `format`, but it writes the interpolated
+        // Text instead of returning it. Like `format` it is frontend-hardcoded
+        // (no generics, absent from the registry, not user-declarable), and it
+        // routes to `check_format_call` so the template is validated inline —
+        // never through `check_expr`, so the `FormatText` firewall is untouched.
+        // Discriminated by a `template` argument; the `message: Text` overload
+        // never carries one, so the two forms are disjoint.
+        if callee_name == "write_line" && self_ty.is_none() && call_has_named_arg(call, "template") {
+            // Preserve the side-effecting/transaction rule (T0026) the plain
+            // overload gets from the registry.
+            if let Some(sig) = self.builtins.candidates("write_line").first().cloned() {
+                self.check_call_purity(&callee_name, &callee_name_tok, &sig);
+            }
+            // Validate template + args exactly as `format`; the Text result is
+            // discarded — this overload yields unit.
+            self.check_format_call(call, scope);
+            return Type::unit();
         }
 
         // Operators are identified by name + heading: a user `oper` may extend
@@ -3674,7 +3757,7 @@ impl TypeChecker {
 
     /// True iff some `to_text` overload accepts a `self` argument of type
     /// `ty`. `format` desugars each `{x}` placeholder to `to_text { self: x }`,
-    /// so a placeholder whose `params` attribute isn't `to_text`-able (a
+    /// so a placeholder whose `args` attribute isn't `to_text`-able (a
     /// `Sequence`, `Tuple`, or `Relation`) must be rejected at check time —
     /// otherwise it reaches the lowerer's `to_text` fold, which has no such
     /// overload and would panic.
@@ -3695,25 +3778,58 @@ impl TypeChecker {
             })
     }
 
-    /// Type-check the `format { template: f"…", params: { … } }` intrinsic.
+    /// Parse an `f"…"` token into template chunks, reporting T0057 at the
+    /// malformed-placeholder sub-span. Returns `None` when the template is
+    /// malformed (no usable chunks). Shared by the `let x = f"…"` binding site
+    /// and the inline-literal `format` template argument.
+    fn parse_template_tok(&mut self, tok: &SyntaxToken) -> Option<Vec<TemplateChunk>> {
+        let tok_span = self.token_span(tok);
+        match parse_format_template(tok.text()) {
+            Ok(chunks) => Some(chunks),
+            Err(errors) => {
+                for e in errors {
+                    let span = Span::new(
+                        tok_span.file,
+                        tok_span.start + e.range.start as u32,
+                        tok_span.start + e.range.end as u32,
+                    );
+                    self.error(span, "T0057", e.kind.message());
+                }
+                None
+            }
+        }
+    }
+
+    /// Type-check the `format { template: …, args: { … } }` intrinsic.
     ///
-    /// `template` must be an `f"…"` literal (T0056) — it is *not* routed
-    /// through `check_expr`, both so the literal-only requirement is
-    /// enforced and so the stray-`f"…"` firewall (T0055) doesn't fire on
-    /// the one legitimate site. `params` is heading-polymorphic and
-    /// optional (absent ⇒ empty heading). Every placeholder must name a
-    /// `params` attribute (T0058); attributes no placeholder uses warn
-    /// (T0059); a malformed template is T0057. The result is always `Text`
+    /// `template` must be an `f"…"` literal *or* a `let`-bound `f"…"` template
+    /// (T0056 otherwise) — neither is routed through `check_expr`, both so the
+    /// literal-only requirement is enforced and so the stray-`f"…"` firewall
+    /// (T0055) doesn't fire on a legitimate site. `args` is heading-
+    /// polymorphic and optional (absent ⇒ empty heading). Every placeholder
+    /// must name an `args` attribute (T0058); attributes no placeholder uses
+    /// warn (T0059); a malformed template is T0057. The result is always `Text`
     /// (the lowerer desugars it to a `to_text`/`||` chain), returned even
     /// on error so callers recover.
     fn check_format_call(&mut self, call: &CallExpr, scope: &mut Scope) -> Type {
+        // Where the template came from: an inline `f"…"` literal (parsed here,
+        // with T0057 at its sub-spans), or a `let`-bound template (chunks parsed
+        // once at the binding site; placeholder errors anchor at the argument).
+        enum TemplateSrc {
+            Missing,
+            Literal(SyntaxToken),
+            Bound {
+                chunks: Rc<Vec<TemplateChunk>>,
+                span: Span,
+            },
+        }
         let mut seen: HashSet<String> = HashSet::new();
-        let mut template_tok: Option<SyntaxToken> = None;
+        let mut template_src = TemplateSrc::Missing;
         let mut have_template = false;
-        // `Some(h)` once params types to a `Tuple`; left `None` if params is
-        // absent *or* ill-typed — disambiguated by `params_present`.
-        let mut params_heading: Option<Heading> = None;
-        let mut params_present = false;
+        // `Some(h)` once args types to a `Tuple`; left `None` if args is
+        // absent *or* ill-typed — disambiguated by `args_present`.
+        let mut args_heading: Option<Heading> = None;
+        let mut args_present = false;
 
         if let Some(arg_list) = call.args() {
             for arg in arg_list.args() {
@@ -3735,7 +3851,42 @@ impl TypeChecker {
                                 if lit.token().map(|t| t.kind())
                                     == Some(SyntaxKind::FORMAT_STRING_LIT) =>
                             {
-                                template_tok = lit.token();
+                                if let Some(tok) = lit.token() {
+                                    template_src = TemplateSrc::Literal(tok);
+                                }
+                            }
+                            // A `let`-bound `f"…"` template, reused here: the
+                            // chunks were parsed at the binding site and ride on
+                            // the binding. A name that resolves but isn't a
+                            // template binding is T0056; an unresolved one is the
+                            // usual T0001.
+                            Some(Expr::NameRef(n)) => {
+                                if let Some(ident) = n.ident() {
+                                    let nm = ident.text();
+                                    if let Some(chunks) = scope.format_template(nm) {
+                                        scope.mark_used(nm);
+                                        template_src = TemplateSrc::Bound {
+                                            chunks,
+                                            span: self.node_span(arg.syntax()),
+                                        };
+                                    } else if scope.lookup(nm).is_some() {
+                                        // Resolves, but isn't a template binding —
+                                        // still counts as a use (so it isn't also
+                                        // flagged unused, T0032).
+                                        scope.mark_used(nm);
+                                        self.error(
+                                            self.node_span(arg.syntax()),
+                                            "T0056",
+                                            "`format` template must be an f\"…\" literal or a `let` bound to one",
+                                        );
+                                    } else {
+                                        self.error(
+                                            self.token_span(&ident),
+                                            "T0001",
+                                            format!("cannot resolve name `{nm}`"),
+                                        );
+                                    }
+                                }
                             }
                             other => {
                                 let span = other
@@ -3745,19 +3896,19 @@ impl TypeChecker {
                                 self.error(
                                     span,
                                     "T0056",
-                                    "`format` template must be an f\"…\" literal",
+                                    "`format` template must be an f\"…\" literal or a `let` bound to one",
                                 );
                             }
                         }
                     }
-                    "params" => {
-                        params_present = true;
+                    "args" => {
+                        args_present = true;
                         let ty = match arg.value() {
                             Some(v) => self.check_expr(&v, scope),
                             None => Type::Unknown,
                         };
                         match ty {
-                            Type::Tuple(h) => params_heading = Some(h),
+                            Type::Tuple(h) => args_heading = Some(h),
                             Type::Unknown => {} // recovery; heading stays None
                             other => {
                                 let span = arg
@@ -3767,7 +3918,7 @@ impl TypeChecker {
                                 self.error(
                                     span,
                                     "T0004",
-                                    format!("argument `params` expected a Tuple, got {other}"),
+                                    format!("argument `args` expected a Tuple, got {other}"),
                                 );
                             }
                         }
@@ -3796,85 +3947,90 @@ impl TypeChecker {
             return Type::Text;
         }
 
-        // Resolve the heading to check placeholders against: absent params ⇒
+        // Resolve the heading to check placeholders against: absent args ⇒
         // empty (placeholders all fail T0058); present-but-ill-typed ⇒ None
         // (skip placeholder/heading checks, but still validate structure).
-        let heading: Option<Heading> = match (params_present, params_heading) {
+        let heading: Option<Heading> = match (args_present, args_heading) {
             (false, _) => Some(Heading::empty()),
             (true, Some(h)) => Some(h),
             (true, None) => None,
         };
 
-        let Some(tok) = template_tok else {
-            // T0056 already reported; can't read placeholders.
-            return Type::Text;
-        };
-        let tok_span = self.token_span(&tok);
-        let sub_span = |range: std::ops::Range<usize>| {
-            Span::new(
-                tok_span.file,
-                tok_span.start + range.start as u32,
-                tok_span.start + range.end as u32,
-            )
+        // Resolve the template to chunks plus a span for placeholder diagnostics.
+        // An inline literal parses here (T0057 at its sub-spans); a `let`-bound
+        // template reuses chunks parsed at the binding site and anchors any
+        // placeholder error at the argument. Either may yield no chunks (T0056/
+        // T0057 already reported), in which case the loop below is a no-op.
+        let (chunks, place_span, warn_span): (
+            Vec<TemplateChunk>,
+            Box<dyn Fn(std::ops::Range<usize>) -> Span>,
+            Span,
+        ) = match template_src {
+            TemplateSrc::Missing => return Type::Text,
+            TemplateSrc::Literal(tok) => {
+                let tok_span = self.token_span(&tok);
+                let chunks = self.parse_template_tok(&tok).unwrap_or_default();
+                (
+                    chunks,
+                    Box::new(move |r: std::ops::Range<usize>| {
+                        Span::new(
+                            tok_span.file,
+                            tok_span.start + r.start as u32,
+                            tok_span.start + r.end as u32,
+                        )
+                    }),
+                    tok_span,
+                )
+            }
+            TemplateSrc::Bound { chunks, span } => {
+                ((*chunks).clone(), Box::new(move |_r| span), span)
+            }
         };
 
-        match parse_format_template(tok.text()) {
-            Err(errors) => {
-                for e in errors {
-                    self.error(sub_span(e.range), "T0057", e.kind.message());
-                }
-            }
-            Ok(chunks) => {
-                let mut used: HashSet<String> = HashSet::new();
-                for chunk in &chunks {
-                    if let TemplateChunk::Placeholder { name, range } = chunk {
-                        used.insert(name.clone());
-                        if let Some(h) = &heading {
-                            match h.lookup(name) {
-                                None => {
-                                    self.error(
-                                        sub_span(range.clone()),
-                                        "T0058",
-                                        format!(
-                                            "format template references `{{{name}}}` but `params` has no attribute `{name}`"
-                                        ),
-                                    );
-                                }
-                                // `{name}` desugars to `to_text { self: <attr> }`;
-                                // a non-`to_text`-able attribute (Sequence / Tuple /
-                                // Relation) fails here exactly as a direct `to_text`
-                                // call would (T0054), instead of panicking in the
-                                // lowerer.
-                                Some(attr_ty) => {
-                                    if !matches!(attr_ty, Type::Unknown)
-                                        && !self.to_text_accepts(attr_ty)
-                                    {
-                                        self.error(
-                                            sub_span(range.clone()),
-                                            "T0054",
-                                            format!(
-                                                "format placeholder `{{{name}}}` has type {attr_ty}, which has no `to_text` overload"
-                                            ),
-                                        );
-                                    }
-                                }
+        let mut used: HashSet<String> = HashSet::new();
+        for chunk in &chunks {
+            if let TemplateChunk::Placeholder { name, range } = chunk {
+                used.insert(name.clone());
+                if let Some(h) = &heading {
+                    match h.lookup(name) {
+                        None => {
+                            self.error(
+                                place_span(range.clone()),
+                                "T0058",
+                                format!(
+                                    "format template references `{{{name}}}` but `args` has no attribute `{name}`"
+                                ),
+                            );
+                        }
+                        // `{name}` desugars to `to_text { self: <attr> }`;
+                        // a non-`to_text`-able attribute (Sequence / Tuple /
+                        // Relation) fails here exactly as a direct `to_text`
+                        // call would (T0054), instead of panicking in the
+                        // lowerer.
+                        Some(attr_ty) => {
+                            if !matches!(attr_ty, Type::Unknown) && !self.to_text_accepts(attr_ty) {
+                                self.error(
+                                    place_span(range.clone()),
+                                    "T0054",
+                                    format!(
+                                        "format placeholder `{{{name}}}` has type {attr_ty}, which has no `to_text` overload"
+                                    ),
+                                );
                             }
                         }
                     }
                 }
-                // Every params attribute should be referenced by the template.
-                if let Some(h) = &heading {
-                    for (attr, _) in h.attrs() {
-                        if !used.contains(attr) {
-                            self.warn(
-                                tok_span,
-                                "T0059",
-                                format!(
-                                    "`params` attribute `{attr}` is never used by the format template"
-                                ),
-                            );
-                        }
-                    }
+            }
+        }
+        // Every args attribute should be referenced by the template.
+        if let Some(h) = &heading {
+            for (attr, _) in h.attrs() {
+                if !used.contains(attr) {
+                    self.warn(
+                        warn_span,
+                        "T0059",
+                        format!("`args` attribute `{attr}` is never used by the format template"),
+                    );
                 }
             }
         }
@@ -3996,6 +4152,17 @@ impl TypeChecker {
 /// `Unknown` (error recovery) is accepted everywhere so one upstream
 /// failure doesn't poison overload resolution. Shared by the overloaded
 /// call path.
+/// True iff `call` supplies an argument literally named `name`. Used to route
+/// `write_line { template, args }` to the format-writing overload.
+fn call_has_named_arg(call: &CallExpr, name: &str) -> bool {
+    call.args()
+        .map(|list| {
+            list.args()
+                .any(|a| a.name().map(|t| t.text().to_string()).as_deref() == Some(name))
+        })
+        .unwrap_or(false)
+}
+
 fn param_kind_accepts(kind: &crate::builtins::ParamKind, ty: &Type) -> bool {
     match kind {
         crate::builtins::ParamKind::Concrete(expected) => ty.assignable_to(expected),
@@ -6564,7 +6731,7 @@ mod tests {
     const FORMAT_HELLO: &str = "program p;\n\
         oper main {} [\n\
             let name_in = read_line { prompt: \"n: \" };\n\
-            let message = format { template: f\"Hello, {name}!\", params: { name: name_in } };\n\
+            let message = format { template: f\"Hello, {name}!\", args: { name: name_in } };\n\
             write_line { message };\n\
         ];\n";
 
@@ -6582,40 +6749,76 @@ mod tests {
     }
 
     #[test]
-    fn fstring_outside_format_is_t0056() {
-        // The firewall: an f"…" anywhere but format's template.
-        let src = "program p; oper main {} [ let x = f\"hi {y}\"; ];";
+    fn fstring_outside_format_template_is_t0055() {
+        // The firewall: an f"…" literal anywhere but format's template.
+        let src = "program p; oper main {} [ write_line { message: f\"hi\" }; ];";
         assert!(codes(src).contains(&"T0055"), "{:?}", codes(src));
-        // And it cannot slip into a Text slot either.
-        let src2 = "program p; oper main {} [ write_line { message: f\"hi\" }; ];";
-        let c2 = codes(src2);
-        assert!(c2.contains(&"T0055"), "{:?}", c2);
+        // A `let`-bound template can't slip into a Text slot either — same
+        // firewall, now via the name reference rather than the literal.
+        let src2 = "program p; oper main {} [ let t = f\"hi\"; write_line { message: t }; ];";
+        assert!(codes(src2).contains(&"T0055"), "{:?}", codes(src2));
+    }
+
+    #[test]
+    fn fstring_bound_to_let_and_reused_checks_clean() {
+        // A template written once and reused in two `format` calls, each with
+        // its own `args`. The `{name}` hole need not resolve at the binding
+        // site — it is validated per call, not at the `let`.
+        let src = "program p; oper main {} [ \
+            let t = f\"Hi, {name}!\"; \
+            let a = format { template: t, args: { name: \"A\" } }; \
+            let b = format { template: t, args: { name: \"B\" } }; \
+            write_line { message: a }; write_line { message: b }; \
+        ];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn let_bound_template_placeholder_mismatch_is_t0058() {
+        // Placeholder vs `args` is checked at the call, not the binding.
+        let src = "program p; oper main {} [ \
+            let t = f\"Hi, {name}!\"; \
+            let m = format { template: t, args: { wrong: \"A\" } }; \
+            write_line { m }; \
+        ];";
+        assert!(codes(src).contains(&"T0058"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn non_fstring_let_in_template_position_is_t0056() {
+        // A `let` bound to a plain Text is not a template — provenance holds.
+        let src = "program p; oper main {} [ \
+            let t = \"hi {x}\"; \
+            let m = format { template: t, args: { x: 1 } }; \
+            write_line { m }; \
+        ];";
+        assert!(codes(src).contains(&"T0056"), "{:?}", codes(src));
     }
 
     #[test]
     fn format_template_must_be_fstring_literal_t0057() {
         // A plain string in template position is the classic mistake.
-        let src = "program p; oper main {} [ let m = format { template: \"hi {x}\", params: { x: 1 } }; write_line { m }; ];";
+        let src = "program p; oper main {} [ let m = format { template: \"hi {x}\", args: { x: 1 } }; write_line { m }; ];";
         assert!(codes(src).contains(&"T0056"), "{:?}", codes(src));
     }
 
     #[test]
     fn format_placeholder_without_attribute_is_t0059() {
-        let src = "program p; oper main {} [ let m = format { template: f\"hi {missing}\", params: { present: 1 } }; write_line { m }; ];";
+        let src = "program p; oper main {} [ let m = format { template: f\"hi {missing}\", args: { present: 1 } }; write_line { m }; ];";
         let c = codes(src);
         assert!(c.contains(&"T0058"), "{:?}", c);
     }
 
     #[test]
-    fn format_unused_params_attribute_warns_t0060() {
-        let src = "program p; oper main {} [ let m = format { template: f\"hi\", params: { unused: 1 } }; write_line { m }; ];";
+    fn format_unused_args_attribute_warns_t0060() {
+        let src = "program p; oper main {} [ let m = format { template: f\"hi\", args: { unused: 1 } }; write_line { m }; ];";
         let c = codes(src);
         assert!(c.contains(&"T0059"), "{:?}", c);
     }
 
     #[test]
     fn format_malformed_template_is_t0058() {
-        let src = "program p; oper main {} [ let m = format { template: f\"hi {}\", params: {} }; write_line { m }; ];";
+        let src = "program p; oper main {} [ let m = format { template: f\"hi {}\", args: {} }; write_line { m }; ];";
         assert!(codes(src).contains(&"T0057"), "{:?}", codes(src));
     }
 
@@ -6642,7 +6845,7 @@ mod tests {
         // `{t}` desugars to `to_text { self: t }`; a Tuple has no overload,
         // so this is rejected at check time rather than panicking in lowering.
         let src = "program p; oper main {} [ let t = { a: 1 }; \
-                   let m = format { template: f\"{t}\", params: { t } }; \
+                   let m = format { template: f\"{t}\", args: { t } }; \
                    write_line { m }; ];";
         assert!(codes(src).contains(&"T0054"), "{:?}", codes(src));
     }
@@ -6652,7 +6855,7 @@ mod tests {
         // A `Sequence` param interpolated into a template has no `to_text`
         // overload — caught at typecheck, so lowering (and T0064) never runs.
         let src = "program p; oper main {} [ let s = Sequence [ 1, 2 ]; \
-                   let m = format { template: f\"{s}\", params: { s } }; \
+                   let m = format { template: f\"{s}\", args: { s } }; \
                    write_line { m }; ];";
         assert!(codes(src).contains(&"T0054"), "{:?}", codes(src));
     }
@@ -6663,8 +6866,76 @@ mod tests {
         // the happy path must not regress.
         let src = "program p; oper main {} [ \
                    let m = format { template: f\"{a}{b}{c}\", \
-                   params: { a: \"x\", b: 1, c: true } }; \
+                   args: { a: \"x\", b: 1, c: true } }; \
                    write_line { m }; ];";
         assert!(!codes(src).contains(&"T0054"), "{:?}", codes(src));
+    }
+
+    // The `write_line { template: FormatText, args: Tuple H }` overload — the
+    // format-writing form. It shares `format`'s validation, so the diagnostics
+    // below are exactly the ones `format` raises for the same mistake.
+
+    #[test]
+    fn write_line_format_overload_checks_clean() {
+        // Inline template and a let-bound template both type-check to unit.
+        let src = "program p; oper main {} [ \
+                   write_line { template: f\"Hello, {name}!\", args: { name: \"X\" } }; ];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+        let bound = "program p; oper main {} [ \
+                     let t = f\"Hello, {name}!\"; \
+                     write_line { template: t, args: { name: \"X\" } }; ];";
+        assert!(diagnostics(bound).is_empty(), "{:?}", diagnostics(bound));
+    }
+
+    #[test]
+    fn write_line_format_overload_runtime_text_template_is_t0056() {
+        // A plain (runtime) Text in template position is rejected exactly as in
+        // a `format` call — the firewall holds through the write_line overload.
+        let src = "program p; oper main {} [ \
+                   write_line { template: \"hi {x}\", args: { x: 1 } }; ];";
+        assert!(codes(src).contains(&"T0056"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn write_line_format_overload_non_tuple_args_is_t0004() {
+        let src = "program p; oper main {} [ \
+                   write_line { template: f\"hi\", args: 5 }; ];";
+        assert!(codes(src).contains(&"T0004"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn write_line_format_overload_unknown_placeholder_is_t0058() {
+        let src = "program p; oper main {} [ \
+                   write_line { template: f\"hi {missing}\", args: { present: 1 } }; ];";
+        assert!(codes(src).contains(&"T0058"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn write_line_format_overload_stray_message_arg_is_t0002() {
+        // `message` alongside `template` routes to the format path, where any
+        // arg other than template/args is undeclared.
+        let src = "program p; oper main {} [ \
+                   write_line { template: f\"hi\", message: \"x\" }; ];";
+        assert!(codes(src).contains(&"T0002"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn write_line_format_overload_in_transaction_is_t0026() {
+        // The overload keeps write_line's side-effecting purity: illegal inside
+        // a `transaction [...]`, same as the `message` form.
+        let src = "program p; oper main {} [ \
+                   transaction [ write_line { template: f\"hi\", args: {} }; ]; ];";
+        assert!(codes(src).contains(&"T0026"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn write_line_message_overload_still_resolves() {
+        // The plain form is untouched — no `template` arg means the normal
+        // registry path, no T0001/T0002/T0003.
+        let src = "program p; oper main {} [ write_line { message: \"hi\" }; ];";
+        let c = codes(src);
+        assert!(!c.contains(&"T0001"), "{:?}", c);
+        assert!(!c.contains(&"T0002"), "{:?}", c);
+        assert!(!c.contains(&"T0003"), "{:?}", c);
     }
 }

@@ -180,7 +180,9 @@ produces `T0001`.
 
 `write_relation` is polymorphic over the heading `H` (see
 "`write_relation` polymorphism" below). `read_line` is the first
-`Text`-returning builtin.
+`Text`-returning builtin. `write_line` also has a second, frontend-hardcoded
+form `{ template: FormatText, args: Tuple H }` (not a registry row — resolved
+like `format`); see "`format` and the `FormatText` firewall" below.
 
 `cardinality` is overloaded over `Relation H` and `Sequence T` — the TTM
 `COUNT` over a relation, and the element count of a sequence. Both store
@@ -244,24 +246,34 @@ heading is irrelevant, and `self` never warns as unused.
 
 ### `format` and the `FormatText` firewall
 
-`format { template: FormatText, params: <Tuple> } -> Text` is the string-
+`format { template: FormatText, args: <Tuple> } -> Text` is the string-
 interpolation primitive. It is **not** in the registry: it is a compile-
 time intrinsic (it needs a cross-argument check — every `{name}`
-placeholder in `template` must name an attribute of `params` — and it has
+placeholder in `template` must name an attribute of `args` — and it has
 no runtime symbol). It desugars to a `to_text`/`||` chain in lowering.
 
 `FormatText` is the type of an `f"…"` literal (see
-[grammar.md](grammar.md)). It is **literal-only** (its sole producer is
-the literal), **compile-time-only** (never lowered — it desugars away),
-and **non-storable** (it is unspellable as a type name, so it can never be
-a relvar/tuple attribute). Crucially there is **no `Text → FormatText`
-coercion**: that absence is the firewall keeping a runtime `Text` (e.g.
-`read_line` input) out of a template slot — the trusted-format-string
-pattern. An `f"…"` literal anywhere but `format`'s `template` is `T0055`;
-a non-`f"…"` `template` argument is `T0056`. `params` is heading-
+[grammar.md](grammar.md)). It is **compile-time-only** (never lowered — it
+desugars away) and **non-storable** (it is unspellable as a type name, so
+it can never be a relvar/tuple attribute). A template may appear inline as
+`format`'s `template` argument **or** be bound once to a `let` and reused —
+`let t = f"Hi, {name}!";` then `format { template: t, args: … }` at
+several call sites. Only the two provenances qualify: a direct `f"…"`
+literal, or a bare name reference to a `let` bound *directly* to one (`var`
+templates, alias chains, and `if/then/else`-produced templates are
+rejected — they'd make the provenance statically ambiguous). The template
+is parsed once at its binding site; each `format` call validates its own
+`args` against the shared chunks. Crucially there is still **no
+`Text → FormatText` coercion**: that absence is the firewall keeping a
+runtime `Text` (e.g. `read_line` input) out of a template slot — the
+trusted-format-string pattern. A `FormatText` (literal or `let`-bound)
+used anywhere but a `template` argument (`format`'s or `write_line`'s — see
+below) is `T0055`; a `template` argument that is neither an `f"…"` literal
+nor a `let` bound to one is `T0056`.
+`args` is heading-
 polymorphic (`ParamKind::AnyTuple`) and optional (absent ⇒ empty
 heading). Placeholder checks: malformed template → `T0057`; a placeholder
-with no matching `params` attribute → `T0058`; a `params` attribute no
+with no matching `args` attribute → `T0058`; an `args` attribute no
 placeholder uses → `T0059` (warning); a placeholder whose attribute type
 has no `to_text` overload — built-in **or** user-defined — → `T0054`
 — the same code a direct `to_text { self: … }` over that type raises,
@@ -270,6 +282,23 @@ lowerer's dispatch) resolve across built-in and user overloads, so a user
 `to_text { self: T }` makes `{x : T}` renderable (e.g. a `Sequence Text`
 once such an overload is in scope); only a type with *no* matching
 overload (a bare `Tuple`/`Relation`, an un-extended `Sequence`) is T0054.
+
+**`write_line`'s format overload.** Besides `write_line { message: Text }`,
+`write_line` accepts `{ template: FormatText, args: Tuple H } -> Tuple {}` —
+the same heading shape as `format`, but it *writes* the interpolated text
+instead of returning it: `write_line { template: t, args: { … } }` is
+equivalent to `write_line { message: format { template: t, args: { … } } }`.
+It is frontend-hardcoded exactly like `format` — intercepted before registry
+resolution, reusing `format`'s validation (the same `T0004` / `T0056` /
+`T0058` / `T0059` / `T0054` diagnostics, and `T0055` never fires because the
+`template` is validated inline) and keeping `write_line`'s side-effecting
+purity (`T0026` inside a `transaction [...]`). The overload is selected by
+the presence of a `template` argument; the `message` form never carries one,
+so the two are disjoint. `FormatText` and the heading-polymorphic `Tuple H`
+stay **internal** — a user `oper` cannot declare a parameter of either type
+(that needs the heading polymorphism / specialization deferred in
+[risks.md](risks.md) §6–7), so this convenience is limited to the built-in
+`format` family for now.
 
 
 ## Pass overview
@@ -665,11 +694,11 @@ check script enforces that.
 | T0052 | `delete` without a `where` clause (a bare `delete R;`) — use `truncate` to clear the whole relvar |
 | T0053 | `update` clause names an attribute not in the relvar's heading (the target must already exist) |
 | T0054 | no matching overload of an operator for the supplied argument types |
-| T0055 | an `f"…"` format string is used outside `format`'s `template` argument |
-| T0056 | `format`'s `template` argument is not an `f"…"` literal |
+| T0055 | a `FormatText` (an `f"…"` literal or a `let` bound to one) is used outside a `template` argument (`format`'s or `write_line`'s) |
+| T0056 | `format`'s `template` argument is neither an `f"…"` literal nor a `let` bound to one |
 | T0057 | malformed placeholder in a format template (unmatched/empty/non-identifier `{…}`) |
-| T0058 | format template references `{x}` but `params` has no attribute `x` |
-| T0059 | _(warning)_ a `params` attribute is never used by the format template |
+| T0058 | format template references `{x}` but `args` has no attribute `x` |
+| T0059 | _(warning)_ an `args` attribute is never used by the format template |
 | T0060 | operator with this name + heading is already defined (a heading that exactly matches a built-in overload, a second user overload of the same name — only one is supported for now, pending linkage mangling — or redefining the `format` intrinsic). A user `oper` *may* extend a built-in name with a distinct heading. |
 | T0061 | empty `Sequence []` has no element to infer from and no `let` type annotation to fall back on |
 | T0062 | a `Sequence [ … ]` element's type differs from the first element's (sequences are homogeneous) |

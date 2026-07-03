@@ -134,7 +134,7 @@ mod tests {
         // The `f"…"` token must not be split — `f` stays fused to the quote
         // (the whole point of lexing it as one token), and the call formats
         // canonically.
-        let src = "program p;\noper main {} [ let m=format{template:f\"Hi {x}!\",params:{x:x}}; ];\n";
+        let src = "program p;\noper main {} [ let m=format{template:f\"Hi {x}!\",args:{x:x}}; ];\n";
         let got = fmt(src);
         assert!(
             got.contains("template: f\"Hi {x}!\""),

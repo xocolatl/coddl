@@ -1,29 +1,29 @@
 program hello_world;
 
 oper main{} [
+    let template = f"Hello, {name}!";
     let rnames = Relation { { name: "Carole" }, { name: "Alice" }, { name: "Bob" } };
 
     var names;
-    load names from rnames order[asc name];
+    load names from rnames order [asc name];
 
     for n in names do [
-        let message = format { template: f"Hello, {name}!", params: { name: n.name } };
-        write_line { message };
+        write_line{ template, args: { name: n.name } };
     ];
 
-    for i := 0 to names.cardinality {} - 1 do [
-        write_line { message: format { template: f"Hi, {name}.", params: { name: names [i].name } } };
+    for i := 0 to names.cardinality{} - 1 do [
+        write_line{ template, args: { name: names[i].name } };
     ];
 
     var j := 0;
-    while j < names.cardinality {} do [
-        write_line { message: format { template: f"Hi, {name}.", params: { name: names [j].name } } };
+    while j < names.cardinality{} do [
+        write_line{ template, args: { name: names[j].name } };
         j := j + 1;
     ];
 
     var k := 0;
     do [
-        write_line { message: format { template: f"Hi, {name}.", params: { name: names [k].name } } };
+        write_line{ template, args: { name: names[k].name } };
         k := k + 1;
-    ] while k < names.cardinality {};
+    ] while k < names.cardinality{};
 ];

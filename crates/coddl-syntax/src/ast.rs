@@ -348,6 +348,7 @@ pub enum Stmt {
     For(ForStmt),
     While(WhileStmt),
     DoWhile(DoWhileStmt),
+    Load(LoadStmt),
     // `return` arrives when its semantics are settled.
 }
 
@@ -365,6 +366,7 @@ impl Stmt {
             SyntaxKind::FOR_STMT => Stmt::For(ForStmt { syntax }),
             SyntaxKind::WHILE_STMT => Stmt::While(WhileStmt { syntax }),
             SyntaxKind::DO_WHILE_STMT => Stmt::DoWhile(DoWhileStmt { syntax }),
+            SyntaxKind::LOAD_STMT => Stmt::Load(LoadStmt { syntax }),
             _ => return None,
         })
     }
@@ -382,6 +384,7 @@ impl Stmt {
             Stmt::For(s) => s.syntax(),
             Stmt::While(s) => s.syntax(),
             Stmt::DoWhile(s) => s.syntax(),
+            Stmt::Load(s) => s.syntax(),
         }
     }
 }
@@ -500,6 +503,56 @@ impl DoWhileStmt {
     /// each iteration (post-test); the loop repeats while it is `true`.
     pub fn condition(&self) -> Option<Expr> {
         self.syntax.children().find_map(Expr::cast)
+    }
+}
+
+ast_node!(pub LoadStmt, LOAD_STMT);
+
+impl LoadStmt {
+    /// The target binding's name — the IDENT immediately after `load`. The
+    /// contextual keywords `load` / `from` / `order` are direct IDENT tokens of
+    /// the node, but the source relvar's IDENT is nested inside its `NAME_REF`
+    /// child (not a direct token), so the target is the *second* direct IDENT.
+    pub fn target(&self) -> Option<SyntaxToken> {
+        nth_token(&self.syntax, SyntaxKind::IDENT, 1)
+    }
+
+    /// The source relation expression — the sole `Expr` direct child (the order
+    /// keys live in `SORT_ITEM` children, not as `Expr`s).
+    pub fn source(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// The order keys, in precedence order. Empty for the reverse
+    /// sequence→relvar form (which has no `order` clause).
+    pub fn sort_items(&self) -> impl Iterator<Item = SortItem> + '_ {
+        children(&self.syntax)
+    }
+}
+
+ast_node!(pub SortItem, SORT_ITEM);
+
+impl SortItem {
+    /// The order-key attribute — the last IDENT token in the item (an optional
+    /// `asc` / `desc` direction keyword precedes it as a separate IDENT).
+    pub fn attr(&self) -> Option<SyntaxToken> {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .filter(|t| t.kind() == SyntaxKind::IDENT)
+            .last()
+    }
+
+    /// True iff a leading `desc` direction keyword is present (a separate IDENT
+    /// before the attribute). `asc` or no direction → ascending (`false`).
+    pub fn is_desc(&self) -> bool {
+        let idents: Vec<SyntaxToken> = self
+            .syntax
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .filter(|t| t.kind() == SyntaxKind::IDENT)
+            .collect();
+        idents.len() >= 2 && idents[0].text() == "desc"
     }
 }
 
