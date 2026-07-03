@@ -2,7 +2,11 @@ program hello_world;
 
 oper main{} [
     let template = f"Hello, {name}!";
-    let rnames = Relation { { name: "Carole" }, { name: "Alice" }, { name: "Bob" } };
+    let rnames = Relation {
+        { name: "Carole" },
+        { name: "Alice" },
+        { name: "Bob" },
+    };
 
     var names;
     load names from rnames order [asc name];

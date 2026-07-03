@@ -1244,6 +1244,99 @@ pub unsafe extern "C" fn coddl_relation_project(
     out
 }
 
+/// Force a relation into an ordered `Sequence` (RM Pro 7 iteration gate).
+/// Returns a fresh RC-managed `Sequence` payload (rc=1) holding the source's
+/// records **sorted by the order keys** — one tuple element per source tuple,
+/// physically an unsealed relation payload (`CoddlKind::Sequence`) reusing the
+/// source `rel_desc` (each element record *is* a source tuple). `rel` is left
+/// unchanged; its cells are copied by value and the surviving `Text` cells are
+/// retained so the sequence co-owns them.
+///
+/// `keys` is `key_count` bit-packed `u32`s, most-significant order key first:
+/// the low 31 bits index `rel_desc.attrs[]` (canonical name-sorted order) and
+/// bit 31, when set, marks that key **descending**. An empty `keys` (no `order`
+/// clause) leaves the records in the source's sealed, unspecified order — the
+/// sort becomes a stable no-op. Order keys are always scalar (T0082 rejects
+/// relation- and tuple-valued keys), so each key's `&CoddlAttrDesc` drives
+/// `cmp_cell` directly.
+///
+/// Unlike `coddl_relation_seal`, this does **not** dedup: a `Sequence` keeps
+/// duplicates and position. Records equal on every order key keep their input
+/// order (stable sort).
+///
+/// # Safety
+/// `rel` must point to a payload from `coddl_rc_alloc` whose kind is `Relation`
+/// and whose header carries `rel_desc`. `rel_desc` and `keys` (length
+/// `key_count`) must outlive this call.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_load_ordered(
+    rel: *const u8,
+    rel_desc: *const CoddlHeadingDesc,
+    keys: *const u32,
+    key_count: usize,
+) -> *mut u8 {
+    if rel.is_null() || rel_desc.is_null() {
+        return std::ptr::null_mut();
+    }
+    let header = rel.sub(HEADER_SIZE) as *const CoddlRcHeader;
+    let count = (*header).length as usize;
+    let record_size = (*rel_desc).record_size as usize;
+    let attrs = std::slice::from_raw_parts((*rel_desc).attrs, (*rel_desc).attr_count as usize);
+
+    // The result Sequence reuses the source descriptor — its element record is a
+    // source tuple. Allocate up front; an empty relation yields an empty Sequence.
+    let out = crate::rc::coddl_rc_alloc(
+        record_size * count,
+        count as u32,
+        crate::rc::CoddlKind::Sequence as u32,
+        rel_desc,
+    );
+    if out.is_null() || count == 0 {
+        return out;
+    }
+
+    // `from_raw_parts` requires a non-null pointer even at length 0, so an empty
+    // key list (no `order` clause) uses a borrowed empty slice.
+    let key_specs: &[u32] = if key_count == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(keys, key_count)
+    };
+    let src = std::slice::from_raw_parts(rel, count * record_size);
+
+    // Sort record indices by the order keys. `sort_by` is stable, so records
+    // equal on every key keep their input order (and an empty `key_specs` makes
+    // the comparator all-`Equal` → the whole sort is a no-op).
+    let mut indices: Vec<usize> = (0..count).collect();
+    indices.sort_by(|&a, &b| {
+        let ra = &src[a * record_size..(a + 1) * record_size];
+        let rb = &src[b * record_size..(b + 1) * record_size];
+        for &packed in key_specs {
+            let attr = &attrs[(packed & 0x7fff_ffff) as usize];
+            let off = attr.offset as usize;
+            let ord = cmp_cell(ra, off, rb, off, attr);
+            let ord = if packed >> 31 == 1 { ord.reverse() } else { ord };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+
+    // Permute records into the sequence in sorted order, then retain each
+    // surviving `Text` cell (the sequence co-owns the shared payloads; immortal
+    // literals no-op on retain).
+    for (pos, &i) in indices.iter().enumerate() {
+        std::ptr::copy_nonoverlapping(
+            rel.add(i * record_size),
+            out.add(pos * record_size),
+            record_size,
+        );
+    }
+    retain_text_cells(out, count, rel_desc);
+    out
+}
+
 /// Rename a relation's attributes in-process. Returns a fresh RC-managed
 /// relation (rc=1) whose heading is `dst_desc` — the renamed, re-sorted
 /// attributes — with each record's cells permuted from the source per `perm`.
@@ -2614,6 +2707,149 @@ mod tests {
             coddl_rc_release(flat);
             coddl_rc_release(wrapped);
             coddl_rc_release(back);
+        }
+    }
+
+    // Store `{a, b}` Integer rows into a fresh (unsealed) relation — the caller
+    // owns `desc` (and its backing attrs array), so the descriptor pointer stays
+    // valid for the whole test. No seal: the test controls input row order, so a
+    // stable sort's tie-breaking is observable.
+    unsafe fn ab_src(rows: &[(i64, i64)], desc: &CoddlHeadingDesc) -> *mut u8 {
+        let src = coddl_rc_alloc(16 * rows.len(), rows.len() as u32, CoddlKind::Relation as u32, desc);
+        for (i, &(a, b)) in rows.iter().enumerate() {
+            std::ptr::write(src.add(i * 16) as *mut i64, a);
+            std::ptr::write(src.add(i * 16 + 8) as *mut i64, b);
+        }
+        src
+    }
+
+    unsafe fn ab_row(seq: *const u8, i: usize) -> (i64, i64) {
+        (
+            std::ptr::read(seq.add(i * 16) as *const i64),
+            std::ptr::read(seq.add(i * 16 + 8) as *const i64),
+        )
+    }
+
+    #[test]
+    fn load_ordered_sorts_by_single_key_and_is_stable() {
+        unsafe {
+            // Rows chosen so the `a`-key has ties whose `b` order differs from
+            // any sort — a stable sort must keep the two `a==1` (and two `a==2`)
+            // rows in their input order.
+            let (attrs, mut desc) = ab_desc();
+            desc.attrs = attrs.as_ptr();
+            let src = ab_src(&[(2, 1), (1, 2), (2, 0), (1, 5)], &desc);
+
+            let asc = coddl_load_ordered(src, &desc, [0u32].as_ptr(), 1);
+            let header = asc.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*header).kind, CoddlKind::Sequence as u32, "result is a Sequence");
+            assert_eq!((*header).length, 4, "no dedup — every row kept");
+            assert_eq!(
+                [ab_row(asc, 0), ab_row(asc, 1), ab_row(asc, 2), ab_row(asc, 3)],
+                [(1, 2), (1, 5), (2, 1), (2, 0)],
+                "asc by a; ties keep input order",
+            );
+
+            // Descending flips the key groups but keeps each group's input order.
+            let desc_seq = coddl_load_ordered(src, &desc, [0x8000_0000u32].as_ptr(), 1);
+            assert_eq!(
+                [ab_row(desc_seq, 0), ab_row(desc_seq, 1), ab_row(desc_seq, 2), ab_row(desc_seq, 3)],
+                [(2, 1), (2, 0), (1, 2), (1, 5)],
+            );
+
+            coddl_rc_release(asc);
+            coddl_rc_release(desc_seq);
+            coddl_rc_release(src);
+        }
+    }
+
+    #[test]
+    fn load_ordered_multi_key() {
+        unsafe {
+            // Order by `a` asc, then `b` desc — key indices [a=0, b=1|desc].
+            let (attrs, mut desc) = ab_desc();
+            desc.attrs = attrs.as_ptr();
+            let src = ab_src(&[(1, 2), (1, 5), (2, 1), (2, 0)], &desc);
+            let keys = [0u32, 1u32 | 0x8000_0000];
+            let out = coddl_load_ordered(src, &desc, keys.as_ptr(), keys.len());
+            assert_eq!(
+                [ab_row(out, 0), ab_row(out, 1), ab_row(out, 2), ab_row(out, 3)],
+                [(1, 5), (1, 2), (2, 1), (2, 0)],
+            );
+            coddl_rc_release(out);
+            coddl_rc_release(src);
+        }
+    }
+
+    #[test]
+    fn load_ordered_no_keys_preserves_input_order() {
+        unsafe {
+            let (attrs, mut desc) = ab_desc();
+            desc.attrs = attrs.as_ptr();
+            let src = ab_src(&[(2, 0), (1, 0), (3, 0)], &desc);
+            let out = coddl_load_ordered(src, &desc, std::ptr::null(), 0);
+            let header = out.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*header).length, 3);
+            assert_eq!(
+                [ab_row(out, 0).0, ab_row(out, 1).0, ab_row(out, 2).0],
+                [2, 1, 3],
+                "no `order` clause leaves input order untouched",
+            );
+            coddl_rc_release(out);
+            coddl_rc_release(src);
+        }
+    }
+
+    #[test]
+    fn load_ordered_sorts_text_by_content() {
+        unsafe {
+            let attrs = [CoddlAttrDesc {
+                name: b"name".as_ptr(),
+                name_len: 4,
+                kind: CoddlAttrKind::Text as u32,
+                offset: 0,
+                sub: std::ptr::null(),
+            }];
+            let desc = CoddlHeadingDesc {
+                attr_count: 1,
+                record_size: 16,
+                attrs: attrs.as_ptr(),
+            };
+            let names: [&[u8]; 3] = [b"beta", b"alpha", b"gamma"];
+            let src = coddl_rc_alloc(16 * 3, 3, CoddlKind::Relation as u32, &desc);
+            for (i, n) in names.iter().enumerate() {
+                std::ptr::write(src.add(i * 16) as *mut *const u8, immortal_text(n));
+                std::ptr::write(src.add(i * 16 + 8) as *mut usize, n.len());
+            }
+
+            let out = coddl_load_ordered(src, &desc, [0u32].as_ptr(), 1);
+            let read = |i: usize| -> Vec<u8> {
+                let p = std::ptr::read(out.add(i * 16) as *const *const u8);
+                let l = std::ptr::read(out.add(i * 16 + 8) as *const usize);
+                std::slice::from_raw_parts(p, l).to_vec()
+            };
+            assert_eq!(read(0), b"alpha");
+            assert_eq!(read(1), b"beta");
+            assert_eq!(read(2), b"gamma");
+
+            coddl_rc_release(out);
+            coddl_rc_release(src);
+        }
+    }
+
+    #[test]
+    fn load_ordered_empty_relation_yields_empty_sequence() {
+        unsafe {
+            let (attrs, mut desc) = ab_desc();
+            desc.attrs = attrs.as_ptr();
+            let src = ab_src(&[], &desc);
+            let out = coddl_load_ordered(src, &desc, [0u32].as_ptr(), 1);
+            assert!(!out.is_null());
+            let header = out.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*header).kind, CoddlKind::Sequence as u32);
+            assert_eq!((*header).length, 0);
+            coddl_rc_release(out);
+            coddl_rc_release(src);
         }
     }
 }

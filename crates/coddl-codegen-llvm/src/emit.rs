@@ -295,6 +295,12 @@ impl Emitter {
             "declare ptr @coddl_relation_rename(ptr, ptr, ptr, ptr, i64)"
         )
         .unwrap();
+        // `load`: (src, src_desc, keys, key_count) -> rc=1 Sequence ptr.
+        writeln!(
+            self.body,
+            "declare ptr @coddl_load_ordered(ptr, ptr, ptr, i64)"
+        )
+        .unwrap();
         // Text byte-equality: (a_ptr, a_len, b_ptr, b_len) -> i8 (1 = equal).
         writeln!(
             self.body,
@@ -985,6 +991,12 @@ impl Emitter {
                 result_heading_id,
                 perm,
             } => self.lower_rename_inst(*dst, src, *src_heading_id, *result_heading_id, perm),
+            Inst::Load {
+                dst,
+                src,
+                heading_id,
+                keys,
+            } => self.lower_load_inst(*dst, src, *heading_id, keys),
             Inst::Join {
                 dst,
                 lhs,
@@ -1855,6 +1867,58 @@ impl Emitter {
             self.body,
             "    {name} = call ptr @coddl_relation_rename(ptr {src_op}, ptr @.heading.{}, ptr @.heading.{}, ptr @.perm.{}, i64 {})",
             src_heading_id.0, result_heading_id.0, perm_id, perm.len(),
+        )
+        .unwrap();
+        self.values.insert(
+            dst,
+            ValueRepr::Scalar {
+                ty: "ptr".to_string(),
+                op: name,
+            },
+        );
+        Ok(())
+    }
+
+    /// Emit `Inst::Load` — force a relation into an ordered `Sequence`. Bakes the
+    /// order keys as a read-only `u32` array (like `lower_rename_inst`'s `perm`)
+    /// and calls `coddl_load_ordered(src, src_desc, keys, key_count)`.
+    fn lower_load_inst(
+        &mut self,
+        dst: ValueId,
+        src: &ValueId,
+        heading_id: HeadingId,
+        keys: &[u32],
+    ) -> Result<(), LlvmEmitError> {
+        let src_op = self.scalar_op(src)?;
+        let keys_id = self.next_str;
+        self.next_str += 1;
+        if keys.is_empty() {
+            // No `order` clause — the runtime ignores the pointer (key_count 0).
+            writeln!(
+                self.globals,
+                "@.keys.{keys_id} = private unnamed_addr constant [0 x i32] zeroinitializer"
+            )
+            .unwrap();
+        } else {
+            write!(
+                self.globals,
+                "@.keys.{keys_id} = private unnamed_addr constant [{} x i32] [",
+                keys.len()
+            )
+            .unwrap();
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    self.globals.push_str(", ");
+                }
+                write!(self.globals, "i32 {k}").unwrap();
+            }
+            writeln!(self.globals, "]").unwrap();
+        }
+        let name = format!("%v{}", dst.0);
+        writeln!(
+            self.body,
+            "    {name} = call ptr @coddl_load_ordered(ptr {src_op}, ptr @.heading.{}, ptr @.keys.{keys_id}, i64 {})",
+            heading_id.0, keys.len(),
         )
         .unwrap();
         self.values.insert(

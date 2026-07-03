@@ -4453,3 +4453,52 @@ fn wrap_pushdown_llvm() {
 fn wrap_pushdown_cranelift() {
     assert_wrap_pushdown("cranelift");
 }
+
+// ── load … order → Sequence iteration (Chunk 4) ───────────────────────
+
+#[test]
+fn load_orders_a_relation_and_iterates_it() {
+    // `load` forces the relation, sorts by the order key, and materializes a
+    // `Sequence Tuple { n }`. `for … in` (tuple element) and the counted
+    // `xs[i].n` index both read the tuple attribute; a second `load` with `desc`
+    // reverses the order. Exercises the whole force → order → materialize → walk
+    // path plus the tuple-element `.attr` explode.
+    let src = "\
+program load_iter;
+oper main {} [
+    let r = Relation { {n: \"beta\"}, {n: \"alpha\"}, {n: \"gamma\"} };
+    var xs;
+    load xs from r order [asc n];
+    for x in xs do [ write_line { message: x.n }; ];
+    for i := 0 to xs.cardinality{} - 1 do [ write_line { message: xs[i].n }; ];
+    var ys;
+    load ys from r order [desc n];
+    for y in ys do [ write_line { message: y.n }; ];
+];
+";
+    // asc via for-in, asc via counted index, then desc via for-in.
+    run_both_backends_expect(
+        src,
+        "load-iter.cd",
+        b"alpha\nbeta\ngamma\nalpha\nbeta\ngamma\ngamma\nbeta\nalpha\n",
+    );
+}
+
+#[test]
+fn load_multi_key_orders_a_multi_attribute_tuple() {
+    // A two-attribute relation `{ id: Integer, tag: Text }` ordered by `id` asc
+    // then `tag` desc. Reading `x.tag` exercises reading a `Text` cell at a
+    // non-zero offset out of the exploded tuple element (canonical order puts
+    // `id`@0, `tag`@8); the ordering itself verifies the Integer key sort.
+    let src = "\
+program load_multi;
+oper main {} [
+    let r = Relation { {id: 2, tag: \"b\"}, {id: 1, tag: \"a\"}, {id: 2, tag: \"a\"} };
+    var xs;
+    load xs from r order [asc id, desc tag];
+    for x in xs do [ write_line { message: x.tag }; ];
+];
+";
+    // id asc, tag desc → (1,a), (2,b), (2,a).
+    run_both_backends_expect(src, "load-multi.cd", b"a\nb\na\n");
+}

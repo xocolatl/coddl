@@ -19,7 +19,8 @@ use coddl_syntax::ast::{
     Expr, ExprStmt,
     InsertStmt,
     ExtendExpr, FieldAccess, ForStmt, IfExpr, IndexExpr, Item,
-    LetStmt, Literal, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit, RenameExpr,
+    LetStmt, Literal, LoadStmt, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit,
+    RenameExpr,
     ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
     TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WhileStmt, WrapExpr,
 };
@@ -1201,9 +1202,7 @@ impl Lowerer {
                 Stmt::For(f) => self.lower_for_stmt(&f),
                 Stmt::While(w) => self.lower_while_stmt(&w),
                 Stmt::DoWhile(d) => self.lower_do_while_stmt(&d),
-                // `load` — force + order + materialize lowering lands with the
-                // statement's own lowerer.
-                Stmt::Load(_) => {}
+                Stmt::Load(l) => self.lower_load_stmt(&l),
             }
         }
         match block.tail_expr() {
@@ -2625,6 +2624,41 @@ impl Lowerer {
             return_type: ProcType::Pointer,
         });
 
+        // A tuple element (a `Sequence Tuple H` from `load`): explode the record
+        // into per-attribute cells and bundle them into a compile-time
+        // `ValueRepr::Tuple`, exactly like `Inst::Extract`. The cells are
+        // *borrows* into the sequence — which outlives every use (`for…in`
+        // retains the sequence for the loop; a `names[i]` var lives for its
+        // scope) — so unlike the scalar path below we do NOT retain them, which
+        // also avoids leaking a multi-attribute tuple's unread `Text` fields.
+        if let ProcType::Tuple(heading) = &elem_type {
+            let layout = crate::layout::record_layout(heading);
+            let mut fields: Vec<(String, ValueId)> = Vec::with_capacity(layout.attrs.len());
+            for attr in &layout.attrs {
+                let attr_ty = heading
+                    .lookup(&attr.name)
+                    .map(proc_type_from_type)
+                    .expect("record_layout attribute is in the heading");
+                let cell = self.fresh_value();
+                self.record_type(cell, attr_ty.clone());
+                self.insts.push(Inst::AttrLoad {
+                    dst: cell,
+                    src: rec,
+                    offset: attr.offset,
+                    attr_type: attr_ty,
+                });
+                fields.push((attr.name.clone(), cell));
+            }
+            let dst = self.fresh_value();
+            self.record_type(dst, elem_type.clone());
+            self.insts.push(Inst::TupleLit {
+                dst,
+                fields,
+                heading: heading.clone(),
+            });
+            return dst;
+        }
+
         // Read the synthetic single `value` cell (offset 0 of the element
         // record) — `AttrLoad` handles both scalar and `(ptr, len)` Text cells.
         let elem = self.fresh_value();
@@ -2644,6 +2678,59 @@ impl Lowerer {
         }
 
         elem
+    }
+
+    /// Lower `load <target> from <relExpr> [ order [ <sort-item>… ] ];` — the
+    /// RM Pro 7 iteration gate. Force the source relation to a runtime pointer,
+    /// emit `Inst::Load` (sort into an ordered `Sequence` of tuple records), and
+    /// bind the result to the pre-declared `var` target (its first assignment).
+    /// The source is copied+retained by `coddl_load_ordered`, so a *temporary*
+    /// source is released right after (unlike `extract`, which borrows into it).
+    fn lower_load_stmt(&mut self, stmt: &LoadStmt) {
+        let source_expr = stmt.source().expect("typechecked load has a source");
+        let rel = self.lower_expr(&source_expr);
+        let heading_id = match self.value_type(rel) {
+            ProcType::Relation(id) => id,
+            other => unreachable!("load source non-relation `{other}` survived typecheck"),
+        };
+        let heading = self.headings[heading_id.0 as usize].clone();
+
+        // Each order key → an index into the canonical (name-sorted) source
+        // heading, bit 31 set for a descending key. Empty for no `order` clause.
+        let keys: Vec<u32> = stmt
+            .sort_items()
+            .filter_map(|item| {
+                let name = item.attr()?.text().to_string();
+                let idx = heading.attrs().iter().position(|(n, _)| *n == name)? as u32;
+                Some(idx | (u32::from(item.is_desc()) << 31))
+            })
+            .collect();
+
+        let seq_ty = ProcType::Sequence(Box::new(ProcType::Tuple(heading)));
+        let seq = self.fresh_value();
+        self.record_type(seq, seq_ty.clone());
+        self.insts.push(Inst::Load {
+            dst: seq,
+            src: rel,
+            heading_id,
+            keys,
+        });
+
+        // `coddl_load_ordered` fully copies + retains the source's cells, so a
+        // temporary source (not bound to a local) can be released now.
+        let is_owned = self
+            .locals
+            .iter()
+            .any(|layer| layer.values().any(|(vid, _)| *vid == rel));
+        if !is_owned {
+            self.insts.push(Inst::Release { src: rel });
+        }
+
+        // Bind the deferred-init `var` target (registered pending by
+        // `lower_var_stmt`); scope exit releases the heap `Sequence`.
+        if let Some(target) = stmt.target() {
+            self.bind_pending_first_assign(&target.text().to_string(), seq, seq_ty);
+        }
     }
 
     /// Development tripwire for the scalability gap S1 in `.local/optimizations.md`.

@@ -310,6 +310,19 @@ fn declare_runtime_rc_externs(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert("coddl_relation_rename".into(), id);
     }
+    // coddl_load_ordered(src, src_desc, keys: ptr, key_count: usize) -> ptr
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty)); // usize key_count
+        sig.returns.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_load_ordered", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_load_ordered".into(), id);
+    }
     // coddl_extract_check_cardinality(src: ptr, desc: ptr) -> ptr
     {
         let mut sig = obj.make_signature();
@@ -1949,6 +1962,30 @@ fn emit_inst(
                 rename_local,
                 &[src_v, src_desc_val, res_desc_val, perm_val, count_val],
             );
+            let result = builder.inst_results(call)[0];
+            values.insert(*dst, ValueRepr::Scalar(result));
+            Ok(())
+        }
+        Inst::Load {
+            dst,
+            src,
+            heading_id,
+            keys,
+        } => {
+            let src_v = scalar_value(values, src)?;
+            let ptr_ty = obj.target_config().pointer_type();
+            let desc_id = heading_desc_ids[heading_id.0 as usize];
+            let desc_gv = obj.declare_data_in_func(desc_id, builder.func);
+            let desc_val = builder.ins().symbol_value(ptr_ty, desc_gv);
+            let keys_id = declare_perm_data(obj, keys)?;
+            let keys_gv = obj.declare_data_in_func(keys_id, builder.func);
+            let keys_val = builder.ins().symbol_value(ptr_ty, keys_gv);
+            let count_val = builder.ins().iconst(ptr_ty, keys.len() as i64);
+            let load_id = funcs["coddl_load_ordered"];
+            let load_local = obj.declare_func_in_func(load_id, builder.func);
+            let call = builder
+                .ins()
+                .call(load_local, &[src_v, desc_val, keys_val, count_val]);
             let result = builder.inst_results(call)[0];
             values.insert(*dst, ValueRepr::Scalar(result));
             Ok(())

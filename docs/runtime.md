@@ -77,6 +77,8 @@ The order spec is an **ordered** bracket-list of sort items — `[ asc name, des
 
 `load` is the syntactic and semantic gate between the set-oriented and procedural worlds: it forces the relation, imposes an order (the order is part of the operation, not a property of the relation), and writes the tuples into a local sequence. This is the *only* sanctioned path; the compiler rejects any other attempt to step through tuples one at a time.
 
+For a materialized (in-process) source, the forward `load` lowers to the runtime entry point `coddl_load_ordered(rel, rel_desc, keys, key_count)`. It is the relation seal's sort core **minus dedup, plus retain**: a stable sort of the record indices by the order keys (each `keys` entry an index into `rel_desc.attrs[]` with bit 31 for a descending key; comparison via the shared `cmp_cell`), then a fresh `CoddlKind::Sequence` payload allocated with the *same descriptor* — a `Sequence` is physically an unsealed relation, so each element record is a source tuple — into which the records are permuted in sorted order and every surviving `Text` cell is retained (the sequence co-owns the shared payloads; the source is left unchanged). Records equal on every order key keep their input order; no dedup runs, so a `Sequence` preserves duplicates and position. (A db-relvar-rooted source instead rides a trailing SQL `ORDER BY` — a later chunk; force-then-sort is the in-process fallback.)
+
 The reverse direction — `load <relvar target> from <sequence var ref>` (no `order` clause) — assigns the (set-valued) projection of the sequence's tuples back into a relvar. Useful for round-tripping procedurally-built sequences into relational form.
 
 ## Multiple assignment

@@ -346,6 +346,21 @@ pub enum Inst {
         result_heading_id: HeadingId,
         perm: Vec<u32>,
     },
+    /// Force a relation into an ordered `Sequence` (surface `load … from … order
+    /// [ … ]`, the RM Pro 7 iteration gate). Backends emit a call to
+    /// `coddl_load_ordered(src, &@.heading.<heading_id>, keys, key_count)`, which
+    /// sorts `src`'s records by the order keys and returns a `Sequence` payload
+    /// reusing the source layout (each element record *is* a source tuple). `keys`
+    /// is a static `u32` array emitted like `Rename`'s `perm`: each entry is an
+    /// index into the source heading's canonical attrs, with bit 31 set for a
+    /// descending key (empty for no `order` clause). `dst` carries
+    /// `ProcType::Sequence(Tuple(H))`.
+    Load {
+        dst: ValueId,
+        src: ValueId,
+        heading_id: HeadingId,
+        keys: Vec<u32>,
+    },
     /// Restructure a relation between two layouts that hold the same leaf cells
     /// (surface `wrap` / `unwrap`). Backends emit a call to
     /// `coddl_relation_restructure(src, &src_descriptor, &result_descriptor)`,
@@ -814,6 +829,16 @@ impl fmt::Display for Inst {
                 f,
                 "{dst} = rename {src} heading_{} -> heading_{} perm{perm:?}",
                 src_heading_id.0, result_heading_id.0
+            ),
+            Inst::Load {
+                dst,
+                src,
+                heading_id,
+                keys,
+            } => write!(
+                f,
+                "{dst} = load {src} heading_{} keys{keys:?}",
+                heading_id.0
             ),
             Inst::Restructure {
                 dst,
