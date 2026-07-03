@@ -17,7 +17,7 @@ use coddl_syntax::ast::{
     ExprStmt,
     InsertStmt,
     ExtendExpr, FieldAccess, ForStmt, Heading as AstHeading, IfExpr, IndexExpr, Item, KeyClause,
-    LetStmt,
+    LetStmt, LoadStmt,
     NamedArg, OperDecl,
     PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr,
     ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
@@ -1101,9 +1101,7 @@ impl TypeChecker {
                 Stmt::For(f) => self.check_for_stmt(&f, scope),
                 Stmt::While(w) => self.check_while_stmt(&w, scope),
                 Stmt::DoWhile(d) => self.check_do_while_stmt(&d, scope),
-                // `load` — element-type inference + definite assignment land
-                // with the statement's own checker.
-                Stmt::Load(_) => {}
+                Stmt::Load(l) => self.check_load_stmt(&l, scope),
             }
         }
         match block.tail_expr() {
@@ -1249,6 +1247,130 @@ impl TypeChecker {
                 "T0080",
                 format!("`{keyword}` condition must be Boolean, but has type {cond_ty}"),
             );
+        }
+    }
+
+    /// Check `load <target> from <relExpr> [ order [ <sort-item>… ] ];` — the
+    /// relation→`Sequence` iteration gate (RM Pro 7). The source must be a
+    /// `Relation H` (T0081); the materialized target is `Sequence Tuple H`, one
+    /// ordered tuple element per source tuple. Each `order` key must name an
+    /// attribute of `H` (T0027) and be scalar — a relation- or tuple-valued key
+    /// carries `=`/`<>` only (RM Pro 1), so it has no sort order (T0082). The
+    /// target is a pre-declared `var` (there is no expression form of `load`, so
+    /// the deferred-init `var names;` is the only legal target): an unannotated
+    /// one is inferred here and an annotated one is checked (T0075), then marked
+    /// definitely assigned — the same path a first `x := …` assignment takes.
+    fn check_load_stmt(&mut self, stmt: &LoadStmt, scope: &mut Scope) {
+        // Check the source first so its own diagnostics surface regardless of
+        // the target's validity (mirrors `check_assignment_stmt`).
+        let source_ty = match stmt.source() {
+            Some(e) => self.check_expr(&e, scope),
+            None => return, // parser recovery already emitted a diagnostic
+        };
+
+        // The `Sequence` holds one tuple element per source tuple, so its element
+        // type is `Tuple H`. A non-relation source is T0081; `Unknown` stays
+        // `Unknown` so a single failure doesn't poison the target's binding.
+        let inferred = match &source_ty {
+            Type::Relation(heading) => {
+                for item in stmt.sort_items() {
+                    let Some(tok) = item.attr() else { continue };
+                    let key = tok.text();
+                    match heading.lookup(key) {
+                        None => self.error(
+                            self.token_span(&tok),
+                            "T0027",
+                            format!("unknown attribute `{key}` in `order` of {heading}"),
+                        ),
+                        // Only scalars have an order; a relation- or tuple-valued
+                        // attribute carries `=`/`<>` only (RM Pro 1).
+                        Some(Type::Relation(_) | Type::Tuple(_)) => self.error(
+                            self.token_span(&tok),
+                            "T0082",
+                            format!("cannot order by `{key}`: only scalar attributes have an order"),
+                        ),
+                        Some(_) => {}
+                    }
+                }
+                Type::Sequence(Box::new(Type::Tuple(heading.clone())))
+            }
+            Type::Unknown => Type::Unknown,
+            other => {
+                let span = stmt
+                    .source()
+                    .map(|e| self.node_span(e.syntax()))
+                    .unwrap_or_else(|| self.node_span(stmt.syntax()));
+                self.error(
+                    span,
+                    "T0081",
+                    format!("`load` source must be a Relation, but has type {other}"),
+                );
+                Type::Unknown
+            }
+        };
+
+        // Bind the target — the deferred-init `var` (annotated or not).
+        let Some(ident) = stmt.target() else { return };
+        let name = ident.text();
+        match scope.origin(name) {
+            Some(BindingOrigin::ForCounter) => self.error(
+                self.token_span(&ident),
+                "T0072",
+                format!("`{name}` is a loop counter and cannot be a `load` target"),
+            ),
+            Some(BindingOrigin::Var) => {
+                // A write is a mutable occurrence (LSP marking) and counts as the
+                // `var`'s reassignment, so a deferred-init `var` filled only by
+                // `load` isn't flagged as a `let` (T0077) — the same bookkeeping
+                // a first `x := …` does.
+                self.mutable_spans.push(self.token_span(&ident));
+                scope.mark_reassigned(name);
+                match scope.lookup(name).cloned() {
+                    // An unannotated `var names;` has an `Unknown` type until the
+                    // `load` infers it; surface the result as an inlay hint at the
+                    // declaration (like `let x = …`).
+                    Some(Type::Unknown) => {
+                        scope.set_type(name, inferred.clone());
+                        if !matches!(inferred, Type::Unknown) {
+                            if let Some(decl_span) = scope.binding_span(name) {
+                                self.hints.push(TypeHint {
+                                    span: Span::new(self.file, decl_span.end, decl_span.end),
+                                    ty: inferred.clone(),
+                                    kind: HintKind::LetBinding,
+                                });
+                            }
+                        }
+                    }
+                    // An annotated target must accept the loaded sequence type.
+                    Some(decl_ty) => {
+                        if !inferred.assignable_to(&decl_ty) {
+                            self.error(
+                                self.token_span(&ident),
+                                "T0075",
+                                format!("cannot load {inferred} into `{name}`, declared {decl_ty}"),
+                            );
+                        }
+                    }
+                    None => {}
+                }
+                // Definitely assigned from here (the deferred `var`'s init).
+                scope.mark_initialized(name);
+            }
+            Some(BindingOrigin::Let) => self.error(
+                self.token_span(&ident),
+                "T0074",
+                format!("`{name}` is an immutable `let` binding and cannot be a `load` target; declare it with `var`"),
+            ),
+            Some(BindingOrigin::Param) => self.error(
+                self.token_span(&ident),
+                "T0074",
+                format!("`{name}` is a parameter and cannot be a `load` target"),
+            ),
+            _ => self.error(
+                self.token_span(&ident),
+                "T0001",
+                format!("`{name}` is not a declared `var`; `load` needs a `var` target"),
+            ),
         }
     }
 
@@ -6552,6 +6674,97 @@ mod tests {
             .find(|h| h.kind == HintKind::LetBinding && h.span.start == decl_x_end)
             .expect("expected an inferred-type hint anchored at `var x`");
         assert!(matches!(hint.ty, Type::Integer), "hint type was {:?}", hint.ty);
+    }
+
+    #[test]
+    fn load_infers_sequence_of_tuples() {
+        // `load names from rnames order [asc name]` fixes the unannotated
+        // `var names;` to `Sequence Tuple { name: Text }`, surfaced as a hint,
+        // and reports no diagnostics.
+        let src = "oper main {} [ \
+                   let rnames = Relation { { name: \"Alice\" } }; \
+                   var names; \
+                   load names from rnames order [asc name]; \
+                   let _c = names; ];";
+        let out = check(src, FileId(0), FileKind::Cd);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let want = Type::Sequence(Box::new(Type::Tuple(Heading::new(vec![(
+            "name".to_string(),
+            Type::Text,
+        )]))));
+        assert!(
+            out.hints
+                .iter()
+                .any(|h| h.kind == HintKind::LetBinding && h.ty == want),
+            "expected a `Sequence Tuple {{ name: Text }}` hint, got {:?}",
+            out.hints.iter().map(|h| &h.ty).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn load_unknown_order_key_is_t0027() {
+        // `nope` is not an attribute of the source heading.
+        let src = "oper main {} [ \
+                   let rnames = Relation { { name: \"Alice\" } }; \
+                   var names; \
+                   load names from rnames order [asc nope]; ];";
+        assert!(codes(src).contains(&"T0027"), "got {:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn load_non_relation_source_is_t0081() {
+        // The source is an `Integer`, not a `Relation`.
+        let src = "oper main {} [ var names; load names from 5; ];";
+        assert!(codes(src).contains(&"T0081"), "got {:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn load_tuple_valued_order_key_is_t0082() {
+        // `t` is a tuple-valued attribute — tuples carry `=`/`<>` only (RM Pro 1),
+        // so they have no sort order.
+        let src = "oper main {} [ \
+                   let r = Relation { { t: { a: 1 } } }; \
+                   var xs; \
+                   load xs from r order [asc t]; ];";
+        assert!(codes(src).contains(&"T0082"), "got {:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn load_agrees_with_matching_annotation() {
+        // An annotated target whose type matches the inferred sequence is
+        // error-free (an unused-`var` warning is fine — not an error).
+        let src = "oper main {} [ \
+                   let rnames = Relation { { name: \"Alice\" } }; \
+                   var names: Sequence Tuple { name: Text }; \
+                   load names from rnames order [asc name]; ];";
+        let d = diagnostics(src);
+        assert!(
+            d.iter().all(|x| x.severity != coddl_diagnostics::Severity::Error),
+            "expected no errors, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn load_conflicting_annotation_is_t0075() {
+        // The target is annotated `Sequence Integer`; the load produces a
+        // `Sequence Tuple {…}`, which doesn't match.
+        let src = "oper main {} [ \
+                   let rnames = Relation { { name: \"Alice\" } }; \
+                   var names: Sequence Integer; \
+                   load names from rnames order [asc name]; ];";
+        assert!(codes(src).contains(&"T0075"), "got {:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn reading_load_target_before_load_is_t0079() {
+        // `names` is a deferred-init `var names;`; reading it before the `load`
+        // that assigns it trips definite assignment.
+        let src = "oper main {} [ \
+                   let rnames = Relation { { name: \"Alice\" } }; \
+                   var names; \
+                   let _peek = names; \
+                   load names from rnames order [asc name]; ];";
+        assert!(codes(src).contains(&"T0079"), "got {:?}", diagnostics(src));
     }
 
     #[test]

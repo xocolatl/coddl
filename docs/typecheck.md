@@ -720,3 +720,5 @@ check script enforces that.
 | T0078 | an uninitialized `let x;` — an immutable binding must be initialized (use `var` for a later-assigned local) |
 | T0079 | definite assignment: a `var` declared without a value (`var x;`) is read before it is assigned on all paths |
 | T0080 | a `while` / `do … while` loop condition is not `Boolean` |
+| T0081 | a `load … from <expr>` source is not a `Relation` (the iteration gate forces a relation, so a scalar/`Sequence`/`Tuple` source is rejected) |
+| T0082 | a `load … order [ … ]` sort key names a **relation- or tuple-valued** attribute — only scalars have an order (tuples/relations carry `=`/`<>` only, RM Pro 1) |
