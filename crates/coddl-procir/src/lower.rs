@@ -2688,23 +2688,51 @@ impl Lowerer {
     /// source is released right after (unlike `extract`, which borrows into it).
     fn lower_load_stmt(&mut self, stmt: &LoadStmt) {
         let source_expr = stmt.source().expect("typechecked load has a source");
-        let rel = self.lower_expr(&source_expr);
+
+        // Order keys as (attribute-name, is_descending) pairs, in precedence
+        // order — the form the SQL `ORDER BY` needs (bit-packed indices for the
+        // in-process fallback are derived from the heading below).
+        let order: Vec<(String, bool)> = stmt
+            .sort_items()
+            .filter_map(|item| Some((item.attr()?.text().to_string(), item.is_desc())))
+            .collect();
+
+        // Prefer pushing the order into the source `SELECT` as a trailing
+        // `ORDER BY` (db-relvar-rooted sources): the rows arrive already ordered,
+        // so `Inst::Load` just wraps them (empty keys → `coddl_load_ordered` is a
+        // stable no-op). A materialized (non-pushable) source — or a shape the
+        // order can't ride (root set-op / `tclose`) — falls back to the
+        // in-process sort with bit-packed keys.
+        let pushed = if order.is_empty() {
+            None
+        } else {
+            self.try_lower_pushed_ordered(&source_expr, &order)
+        };
+        let (rel, pushed_order) = match pushed {
+            Some(rel) => (rel, true),
+            None => (self.lower_expr(&source_expr), false),
+        };
+
         let heading_id = match self.value_type(rel) {
             ProcType::Relation(id) => id,
             other => unreachable!("load source non-relation `{other}` survived typecheck"),
         };
         let heading = self.headings[heading_id.0 as usize].clone();
 
-        // Each order key → an index into the canonical (name-sorted) source
-        // heading, bit 31 set for a descending key. Empty for no `order` clause.
-        let keys: Vec<u32> = stmt
-            .sort_items()
-            .filter_map(|item| {
-                let name = item.attr()?.text().to_string();
-                let idx = heading.attrs().iter().position(|(n, _)| *n == name)? as u32;
-                Some(idx | (u32::from(item.is_desc()) << 31))
-            })
-            .collect();
+        // In-process sort keys: each an index into the canonical (name-sorted)
+        // source heading, bit 31 set for a descending key. Empty when the order
+        // already rode the SQL `ORDER BY`, or there was no `order` clause.
+        let keys: Vec<u32> = if pushed_order {
+            Vec::new()
+        } else {
+            order
+                .iter()
+                .filter_map(|(name, is_desc)| {
+                    let idx = heading.attrs().iter().position(|(n, _)| n == name)? as u32;
+                    Some(idx | (u32::from(*is_desc) << 31))
+                })
+                .collect()
+        };
 
         let seq_ty = ProcType::Sequence(Box::new(ProcType::Tuple(heading)));
         let seq = self.fresh_value();
@@ -3324,9 +3352,23 @@ impl Lowerer {
     /// via the legacy in-process path. No-op when pushdown is disabled
     /// (`dialect` is `None`).
     fn try_lower_pushed(&mut self, expr: &Expr) -> Option<ValueId> {
+        self.try_lower_pushed_ordered(expr, &[])
+    }
+
+    /// Like [`Self::try_lower_pushed`], but for the `load … order [ … ]` boundary:
+    /// thread the sort keys (`(attribute-name, is_descending)` pairs) into the
+    /// push so a relvar-rooted source rides a trailing SQL `ORDER BY` and the
+    /// rows come back already ordered. `None` when the source isn't pushable, or
+    /// when the order can't attach (root set-op / `tclose`) — the caller then
+    /// sorts in-process. An empty `order` is exactly the unordered push.
+    fn try_lower_pushed_ordered(
+        &mut self,
+        expr: &Expr,
+        order: &[(String, bool)],
+    ) -> Option<ValueId> {
         let dialect = self.dialect?;
         let rel = self.build_rel_expr(expr)?;
-        let query = crate::cut::try_push(&rel, dialect)?;
+        let query = crate::cut::try_push_ordered(&rel, dialect, order)?;
         // For `coddl explain`: a successful push is a clean RelExpr root (the
         // caller returns here, so no nested sub-expression is captured twice).
         if self.collect_relir {
@@ -6115,6 +6157,73 @@ public relvar Greetings { id: Integer, message: Text } key { id };\n\
             m.plans[0].sql,
             r#"SELECT "id", "message" FROM "greetings""#,
             "the relvar materializes (SELECT *) inside the transaction:\n{m}"
+        );
+    }
+
+    #[test]
+    fn load_from_relvar_pushes_order_by() {
+        // `load … from Greetings order [asc message]` inside a transaction pushes
+        // the order as a trailing SQL `ORDER BY`; the rows arrive ordered so the
+        // `Inst::Load` carries no in-process sort keys.
+        let src = format!(
+            "{BT_HEAD}oper main {{}} [\n\
+             var g;\n\
+             transaction [ load g from Greetings order [asc message]; ];\n\
+             ];\n"
+        );
+        let (m, insts) = bt_main_insts(&src);
+        assert_eq!(m.plans.len(), 1);
+        assert_eq!(
+            m.plans[0].sql,
+            r#"SELECT "id", "message" FROM "greetings" ORDER BY "message""#,
+            "the order rides the source SELECT:\n{m}"
+        );
+        let keys = insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::Load { keys, .. } => Some(keys.clone()),
+                _ => None,
+            })
+            .expect("a Load inst");
+        assert!(
+            keys.is_empty(),
+            "pushed order → no in-process sort keys:\n{m}"
+        );
+        assert!(
+            !insts.iter().any(|i| matches!(i, Inst::RelvarRead { .. })),
+            "the source pushed to a query, not an in-process relvar read:\n{m}"
+        );
+    }
+
+    #[test]
+    fn load_from_materialized_result_sorts_in_process() {
+        // Loading from a `let`-bound transaction snapshot (materialized, read
+        // outside the transaction) can't push — the source SELECT has no
+        // `ORDER BY` and the `Inst::Load` carries bit-packed in-process keys.
+        let src = format!(
+            "{BT_HEAD}oper main {{}} [\n\
+             var g;\n\
+             let snap = transaction [ Greetings ];\n\
+             load g from snap order [asc message];\n\
+             ];\n"
+        );
+        let (m, insts) = bt_main_insts(&src);
+        assert_eq!(m.plans.len(), 1);
+        assert_eq!(
+            m.plans[0].sql,
+            r#"SELECT "id", "message" FROM "greetings""#,
+            "the snapshot materialized with no ORDER BY:\n{m}"
+        );
+        let keys = insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::Load { keys, .. } => Some(keys.clone()),
+                _ => None,
+            })
+            .expect("a Load inst");
+        assert!(
+            !keys.is_empty(),
+            "materialized source → in-process sort keys:\n{m}"
         );
     }
 

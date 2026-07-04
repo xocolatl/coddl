@@ -4502,3 +4502,83 @@ oper main {} [
     // id asc, tag desc → (1,a), (2,b), (2,a).
     run_both_backends_expect(src, "load-multi.cd", b"a\nb\na\n");
 }
+
+/// Write the `greetings` companions and seed the table with three rows whose
+/// `message` order differs from both `id` and insertion order, so a pushed
+/// `ORDER BY "message"` is observably doing the sort. Returns the db path.
+fn seed_greetings_multirow(dir: &Path) -> PathBuf {
+    std::fs::write(
+        dir.join("greetings.cddb"),
+        "database greetings;\n\
+         base relvar Greetings { id: Integer, message: Text } key { id };\n",
+    )
+    .expect("write greetings.cddb");
+    std::fs::write(
+        dir.join("greetings.cdstore"),
+        "store for greetings;\n\
+         backend sqlite { file: \"greetings.sqlite\" };\n\
+         relvar Greetings: table \"greetings\" { columns: { id: \"id\", message: \"message\" } };\n",
+    )
+    .expect("write greetings.cdstore");
+    let db = dir.join("greetings.sqlite");
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "sqlite3 '{}' \"CREATE TABLE greetings (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); INSERT INTO greetings (id, message) VALUES (1, 'charlie'), (2, 'alice'), (3, 'bob');\"",
+            db.display()
+        ))
+        .status()
+        .expect("invoke sqlite3");
+    assert!(status.success(), "greetings multirow fixture seed failed");
+    db
+}
+
+#[test]
+fn load_from_db_relvar_pushes_order_by_both_directions() {
+    // `load … from Greetings order [asc|desc message]` inside a transaction: the
+    // order rides a trailing SQL `ORDER BY`, so the iterated sequence comes out
+    // sorted by `message` (not by `id`/insertion order). Runs on both backends
+    // against a real SQLite fixture; the two directions exercise two distinct
+    // pushed plans (`ORDER BY "message"` and `… DESC`).
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cd = tmp.path().join("load_db_order.cd");
+    std::fs::write(
+        &cd,
+        "program hello_world_db;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             var asc_seq;\n\
+             transaction [ load asc_seq from Greetings order [asc message]; ];\n\
+             for row in asc_seq do [ write_line { message: row.message }; ];\n\
+             var desc_seq;\n\
+             transaction [ load desc_seq from Greetings order [desc message]; ];\n\
+             for row in desc_seq do [ write_line { message: row.message }; ];\n\
+         ];\n",
+    )
+    .expect("write load_db_order.cd");
+    let db = seed_greetings_multirow(tmp.path());
+
+    for backend in ["llvm", "cranelift"] {
+        let out = coddl()
+            .env("CODDL_GREETINGS_FILE", &db)
+            .args(["run", &format!("--backend={backend}")])
+            .arg(&cd)
+            .output()
+            .expect("spawn coddl");
+        assert!(
+            out.status.success(),
+            "coddl run --backend={backend} {:?} failed: stderr=\n{}",
+            cd,
+            String::from_utf8_lossy(&out.stderr),
+        );
+        // message asc: alice(2), bob(3), charlie(1); then desc: charlie, bob, alice.
+        assert_eq!(
+            out.stdout,
+            b"alice\nbob\ncharlie\ncharlie\nbob\nalice\n".to_vec(),
+            "unexpected order on {backend}: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}

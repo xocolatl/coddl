@@ -156,7 +156,43 @@ pub fn emit_select(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
     if let RelExpr::TClose { input } = expr {
         return emit_tclose(input, dialect);
     }
-    emit_select_offset(expr, dialect, 0)
+    emit_select_offset(expr, dialect, 0, &[])
+}
+
+/// Emit a relvar-rooted relational expression as a `SELECT` with a trailing
+/// `ORDER BY` for the `load … order [ … ]` boundary. `order` is the sort keys as
+/// `(attribute-name, is_descending)` pairs, most-significant first; they render
+/// as `ORDER BY "attr"[ DESC], …` over the **output** columns (the SELECT list
+/// always names outputs by the Coddl attribute, so this resolves physical,
+/// renamed, and computed keys uniformly, and every key is in the select list —
+/// satisfying Postgres's `SELECT DISTINCT … ORDER BY`). The order rides a
+/// parameter, never a `RelExpr` node — relations stay unordered in RelIR
+/// (RM Pro 1).
+///
+/// A trailing `ORDER BY` attaches only to a single standard `SELECT`. A root
+/// set-op (`Or`/`Minus`) or `TClose` can't carry one in v1, so this **declines**
+/// (returns `Err`) for those roots when `order` is non-empty; the caller then
+/// sorts in-process (`coddl_load_ordered`). With an empty `order` it is exactly
+/// `emit_select`.
+pub fn emit_select_ordered(
+    expr: &RelExpr,
+    dialect: Dialect,
+    order: &[(String, bool)],
+) -> Result<SqlQuery> {
+    if order.is_empty() {
+        return emit_select(expr, dialect);
+    }
+    if matches!(
+        expr,
+        RelExpr::Or { .. } | RelExpr::Minus { .. } | RelExpr::TClose { .. }
+    ) {
+        return Err(BackendError::Other(
+            "order pushdown: a trailing ORDER BY cannot attach to a set-op or \
+             transitive-closure source"
+                .to_string(),
+        ));
+    }
+    emit_select_offset(expr, dialect, 0, order)
 }
 
 /// Emit a root `TClose` (surface `tclose`) as a backend `WITH RECURSIVE` query.
@@ -187,7 +223,7 @@ fn emit_tclose(input: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
     // itself a root `TClose` (a nested `(R tclose) tclose` declines through
     // `resolve` and decomposes in-process), and its placeholders start at the
     // statement's `$1`.
-    let op = emit_select_offset(input, dialect, 0)?;
+    let op = emit_select_offset(input, dialect, 0, &[])?;
     let src = &op.sql.text;
     let result = TCLOSE_RESULT_CTE;
     let edges = TCLOSE_OPERAND_CTE;
@@ -745,7 +781,12 @@ fn delete_base_table(expr: &RelExpr) -> Option<&str> {
 /// `emit_select` with a bind-parameter start offset, threaded so a set-op's
 /// right operand numbers its Postgres `$N` placeholders after the left's. The
 /// public entry passes `0`.
-fn emit_select_offset(expr: &RelExpr, dialect: Dialect, param_offset: u32) -> Result<SqlQuery> {
+fn emit_select_offset(
+    expr: &RelExpr,
+    dialect: Dialect,
+    param_offset: u32,
+    order: &[(String, bool)],
+) -> Result<SqlQuery> {
     // Root set-op: each operand emits as a full sub-SELECT, combined with a bare
     // compound operator (`UNION` for `Or`, `EXCEPT` for `Minus`; set semantics,
     // never `… ALL`). Params concatenate (lhs then rhs); the rhs's placeholders
@@ -760,8 +801,11 @@ fn emit_select_offset(expr: &RelExpr, dialect: Dialect, param_offset: u32) -> Re
         _ => None,
     };
     if let Some((op, lhs, rhs)) = set_op {
-        let l = emit_select_offset(lhs, dialect, param_offset)?;
-        let r = emit_select_offset(rhs, dialect, param_offset + l.sql.param_count)?;
+        // Operands never carry the load boundary's `ORDER BY` (it applies to the
+        // whole compound, appended by the caller — and v1 declines ordered
+        // set-op roots anyway), so they emit with no order.
+        let l = emit_select_offset(lhs, dialect, param_offset, &[])?;
+        let r = emit_select_offset(rhs, dialect, param_offset + l.sql.param_count, &[])?;
         // Unparenthesized compound SELECT: `… UNION/EXCEPT …`. SQLite rejects
         // parenthesized operands in a compound query (`(SELECT …) UNION …` is a
         // syntax error); the bare form is valid in both SQLite and Postgres and
@@ -892,6 +936,26 @@ fn emit_select_offset(expr: &RelExpr, dialect: Dialect, param_offset: u32) -> Re
     // tree (so a `where` above a `rename` resolves through the rename).
     let mut params: Vec<Value> = Vec::new();
     text.push_str(&render_where_clause(&wheres, dialect, param_offset, &mut params));
+
+    // Trailing `ORDER BY` for the `load … order [ … ]` boundary: order by the
+    // output columns (named by attribute), `DESC` where requested, `ASC` (SQL's
+    // default) omitted. Appended before the `plan_id` hash so an ordered query
+    // caches distinctly from its unordered twin.
+    if !order.is_empty() {
+        let terms: Vec<String> = order
+            .iter()
+            .map(|(attr, is_desc)| {
+                let col = quote_ident(attr);
+                if *is_desc {
+                    format!("{col} DESC")
+                } else {
+                    col
+                }
+            })
+            .collect();
+        text.push_str(" ORDER BY ");
+        text.push_str(&terms.join(", "));
+    }
 
     let plan_id = PlanId(fnv1a(dialect, &text));
     Ok(SqlQuery {
@@ -1324,6 +1388,98 @@ mod tests {
         assert_eq!(q.sql.param_count, 1);
         assert_eq!(q.params, vec![Value::Integer(1)]);
         assert_eq!(q.result_heading, greetings_heading());
+    }
+
+    #[test]
+    fn load_order_appends_order_by_asc() {
+        // `load … from Greetings order [asc message]` pushes the order as a
+        // trailing ORDER BY on the output column; ASC is SQL's default, so no
+        // direction token is emitted.
+        let q = emit_select_ordered(
+            &greetings(),
+            Dialect::SQLite,
+            &[("message".to_string(), false)],
+        )
+        .unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id", "message" FROM "greetings" ORDER BY "message""#
+        );
+    }
+
+    #[test]
+    fn load_order_desc_and_multi_key_in_precedence_order() {
+        // `order [desc id, asc message]` → `ORDER BY "id" DESC, "message"`: keys
+        // in precedence order, DESC emitted only for descending keys.
+        let q = emit_select_ordered(
+            &greetings(),
+            Dialect::SQLite,
+            &[("id".to_string(), true), ("message".to_string(), false)],
+        )
+        .unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id", "message" FROM "greetings" ORDER BY "id" DESC, "message""#
+        );
+    }
+
+    #[test]
+    fn load_order_rides_after_where() {
+        // The ORDER BY appends after the WHERE clause of a restricted source.
+        let q = emit_select_ordered(
+            &where_id_1(greetings()),
+            Dialect::SQLite,
+            &[("message".to_string(), false)],
+        )
+        .unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ? ORDER BY "message""#
+        );
+        assert_eq!(q.params, vec![Value::Integer(1)]);
+    }
+
+    #[test]
+    fn load_order_postgres_same_shape() {
+        let q = emit_select_ordered(
+            &greetings(),
+            Dialect::Postgres,
+            &[("message".to_string(), true)],
+        )
+        .unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id", "message" FROM "greetings" ORDER BY "message" DESC"#
+        );
+    }
+
+    #[test]
+    fn load_order_caches_distinctly_from_unordered() {
+        // The order is part of the plan identity — an ordered query hashes to a
+        // different plan_id than its unordered twin.
+        let unordered = emit_select(&greetings(), Dialect::SQLite).unwrap();
+        let ordered = emit_select_ordered(
+            &greetings(),
+            Dialect::SQLite,
+            &[("message".to_string(), false)],
+        )
+        .unwrap();
+        assert_ne!(unordered.plan_id, ordered.plan_id);
+    }
+
+    #[test]
+    fn load_order_declines_setop_root() {
+        // A trailing ORDER BY can't attach to a root UNION in v1 → Err, so the
+        // load falls back to the in-process sort. With no order it still emits
+        // the plain union.
+        let union = RelExpr::Or {
+            lhs: Box::new(greetings()),
+            rhs: Box::new(greetings()),
+        };
+        assert!(
+            emit_select_ordered(&union, Dialect::SQLite, &[("id".to_string(), false)]).is_err()
+        );
+        assert!(emit_select_ordered(&union, Dialect::SQLite, &[]).is_ok());
     }
 
     #[test]

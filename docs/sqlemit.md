@@ -74,6 +74,33 @@ In every drift case the two handle differently, `USING` either stays correct or 
 
 `wrap`/`unwrap` are pure **heading** restructures — they group attributes into a tuple-valued attribute (an inline nested cell — see [runtime.md](runtime.md)) or expand one — but the underlying SQL columns are always the flat **leaf** columns. SQLite has no composite column, so a pushed wrap emits no `$`-mangled aliases and no `JSON`: it selects the plain leaf columns, and the nesting lives entirely in the **result descriptor** (which the runtime reconstructs at materialization). `resolve` passes a `Wrap`/`Unwrap` straight through to its input (the `attr → column` map is keyed by the stable leaf names; the restructure changes only `expr.heading()`). `emit_select`'s column-list builder then **flattens** each `Tuple` attribute of the result heading to its component leaf columns, recursing depth-first in the sub-heading's canonical order — which is exactly `record_layout`'s leaf order, so the runtime's positional column→cell mapping reconstructs the inline nested cell. Net SQL for `Greetings wrap { t: {id, message} }`: `SELECT DISTINCT "id", "message" FROM "greetings"` — the wrap is invisible in the SQL; the result heading `{t: Tuple{id, message}}` and its (nested) descriptor carry it. A `wrap … unwrap` round-trip pushes as the plain flat select of the surviving columns.
 
+### Ordered `load` pushdown: trailing `ORDER BY`
+
+`load … from <src> order [ … ]` is the one place ordering enters SQL. Relations
+are unordered (RM Pro 1), so RelIR carries **no** sort node; the order rides a
+**parameter**, not a `RelExpr` node. `emit_select_ordered(expr, dialect, order)`
+takes the sort keys as `(attribute-name, is_descending)` pairs (precedence order,
+most-significant first) and appends `ORDER BY "attr"[ DESC], …` after the `WHERE`
+and **before** the plan-id hash — so an ordered query caches distinctly from its
+unordered twin. `ASC` is SQL's default, so only `DESC` is emitted.
+
+The terms name the **output columns** — always the Coddl attribute (physical
+columns get `AS "attr"` on mismatch, computed `extend` columns get `AS "attr"`),
+so a single rule orders physical, renamed, and computed keys uniformly, and every
+key is in the select list (satisfying Postgres's `SELECT DISTINCT … ORDER BY`).
+Order keys are always scalar (the typechecker rejects relation-/tuple-valued keys),
+so each is exactly one output column.
+
+A trailing `ORDER BY` attaches only to a single standard `SELECT`. A **root**
+set-op (`union`/`minus` → `UNION`/`EXCEPT`) or `tclose` (`WITH RECURSIVE`) can't
+carry one in v1, so `emit_select_ordered` **declines** (returns `Err`) for those
+roots when the order is non-empty; the cut turns that into a `None` and the load
+sorts in-process (`coddl_load_ordered`) instead. A set-op *under* a relational op
+already declined (`resolve` errs on `Or`/`Minus`). On the pushed path the rows
+arrive already ordered and the SQL path never re-seals, so the lowerer emits
+`coddl_load_ordered` with an **empty** key array — see [runtime.md](runtime.md)
+"Iteration: the `load` primitive."
+
 ### Surgical writes: assignment-RHS recognition
 
 `emit_assignment(target, rhs, dialect)` turns a relational assignment to a

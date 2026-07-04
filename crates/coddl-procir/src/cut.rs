@@ -7,7 +7,7 @@
 //! the seam where a real cost model lands later.
 
 use coddl_relir::{RelExpr, StorageOrigin};
-use coddl_sqlemit::{emit_select, Dialect, SqlQuery};
+use coddl_sqlemit::{emit_select_ordered, Dialect, SqlQuery};
 
 /// Try to push `expr` to the backend.
 ///
@@ -15,10 +15,24 @@ use coddl_sqlemit::{emit_select, Dialect, SqlQuery};
 /// cleanly, else `None` — the caller then lowers `expr` via the legacy
 /// in-process path.
 pub fn try_push(expr: &RelExpr, dialect: Dialect) -> Option<SqlQuery> {
+    try_push_ordered(expr, dialect, &[])
+}
+
+/// Try to push `expr` with a trailing `ORDER BY` for the `load … order [ … ]`
+/// boundary. `order` is the sort keys as `(attribute-name, is_descending)`
+/// pairs. Returns the ordered [`SqlQuery`] when the subtree is relvar-rooted and
+/// the order attaches cleanly; `None` otherwise (not relvar-rooted, or a root
+/// set-op / `tclose` that can't carry a trailing `ORDER BY` in v1) — the caller
+/// then sorts in-process. An empty `order` is exactly [`try_push`].
+pub fn try_push_ordered(
+    expr: &RelExpr,
+    dialect: Dialect,
+    order: &[(String, bool)],
+) -> Option<SqlQuery> {
     if expr.origin() != StorageOrigin::RelvarRooted {
         return None;
     }
-    emit_select(expr, dialect).ok()
+    emit_select_ordered(expr, dialect, order).ok()
 }
 
 #[cfg(test)]
@@ -91,5 +105,39 @@ mod tests {
             q.sql.text
         );
         assert!(q.sql.text.contains(r#"JOIN coddl_tc_op ON coddl_tc."b" = coddl_tc_op."a""#));
+    }
+
+    #[test]
+    fn ordered_push_appends_order_by() {
+        // `load … from (Greetings where id = 1) order [asc message]` pushes the
+        // order as a trailing ORDER BY on the relvar-rooted restrict.
+        let expr = RelExpr::Restrict {
+            input: Box::new(greetings()),
+            pred: Predicate::AttrCmp {
+                attr: "id".to_string(),
+                op: CmpOp::Eq,
+                value: Literal::Integer(1),
+            },
+        };
+        let q = try_push_ordered(&expr, Dialect::SQLite, &[("message".to_string(), false)])
+            .expect("relvar-rooted ordered load pushes");
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ? ORDER BY "message""#
+        );
+    }
+
+    #[test]
+    fn ordered_push_declines_setop_root() {
+        // A root `union` can't carry a trailing ORDER BY in v1 → decline, so the
+        // caller sorts in-process. Unordered, the same union still pushes.
+        let union = RelExpr::Or {
+            lhs: Box::new(greetings()),
+            rhs: Box::new(greetings()),
+        };
+        assert!(
+            try_push_ordered(&union, Dialect::SQLite, &[("id".to_string(), false)]).is_none()
+        );
+        assert!(try_push(&union, Dialect::SQLite).is_some());
     }
 }
