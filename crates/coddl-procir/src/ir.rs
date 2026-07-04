@@ -361,6 +361,17 @@ pub enum Inst {
         heading_id: HeadingId,
         keys: Vec<u32>,
     },
+    /// Collect a `Sequence` back into a relation **set** (the reverse `load
+    /// <relvar> from <sequence>` form — the inverse of [`Inst::Load`]). Backends
+    /// emit a call to `coddl_relation_from_sequence(src, &@.heading.<heading_id>)`,
+    /// which copies the sequence's element tuples, retains their `Text` cells, and
+    /// seals (sort + dedup, RM Pro 1, 3). `heading_id` is the element-tuple
+    /// heading; `dst` carries `ProcType::Relation(H)`.
+    Collect {
+        dst: ValueId,
+        src: ValueId,
+        heading_id: HeadingId,
+    },
     /// Restructure a relation between two layouts that hold the same leaf cells
     /// (surface `wrap` / `unwrap`). Backends emit a call to
     /// `coddl_relation_restructure(src, &src_descriptor, &result_descriptor)`,
@@ -840,6 +851,11 @@ impl fmt::Display for Inst {
                 "{dst} = load {src} heading_{} keys{keys:?}",
                 heading_id.0
             ),
+            Inst::Collect {
+                dst,
+                src,
+                heading_id,
+            } => write!(f, "{dst} = collect {src} heading_{}", heading_id.0),
             Inst::Restructure {
                 dst,
                 src,

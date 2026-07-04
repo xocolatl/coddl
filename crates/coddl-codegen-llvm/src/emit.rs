@@ -301,6 +301,13 @@ impl Emitter {
             "declare ptr @coddl_load_ordered(ptr, ptr, ptr, i64)"
         )
         .unwrap();
+        // Reverse `load`: (seq, desc) -> rc=1 Relation ptr (collect a Sequence
+        // into a set). Result heading == element-tuple heading ⇒ one desc.
+        writeln!(
+            self.body,
+            "declare ptr @coddl_relation_from_sequence(ptr, ptr)"
+        )
+        .unwrap();
         // Text byte-equality: (a_ptr, a_len, b_ptr, b_len) -> i8 (1 = equal).
         writeln!(
             self.body,
@@ -997,6 +1004,11 @@ impl Emitter {
                 heading_id,
                 keys,
             } => self.lower_load_inst(*dst, src, *heading_id, keys),
+            Inst::Collect {
+                dst,
+                src,
+                heading_id,
+            } => self.lower_collect_inst(*dst, src, *heading_id),
             Inst::Join {
                 dst,
                 lhs,
@@ -1919,6 +1931,33 @@ impl Emitter {
             self.body,
             "    {name} = call ptr @coddl_load_ordered(ptr {src_op}, ptr @.heading.{}, ptr @.keys.{keys_id}, i64 {})",
             heading_id.0, keys.len(),
+        )
+        .unwrap();
+        self.values.insert(
+            dst,
+            ValueRepr::Scalar {
+                ty: "ptr".to_string(),
+                op: name,
+            },
+        );
+        Ok(())
+    }
+
+    /// Emit `Inst::Collect` — collect a `Sequence` back into a relation set
+    /// (reverse `load`). Calls `coddl_relation_from_sequence(src, desc)`, which
+    /// copies + retains + seals; `dst` is the resulting relation pointer.
+    fn lower_collect_inst(
+        &mut self,
+        dst: ValueId,
+        src: &ValueId,
+        heading_id: HeadingId,
+    ) -> Result<(), LlvmEmitError> {
+        let src_op = self.scalar_op(src)?;
+        let name = format!("%v{}", dst.0);
+        writeln!(
+            self.body,
+            "    {name} = call ptr @coddl_relation_from_sequence(ptr {src_op}, ptr @.heading.{})",
+            heading_id.0,
         )
         .unwrap();
         self.values.insert(

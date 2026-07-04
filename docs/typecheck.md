@@ -123,15 +123,19 @@ the typechecker.
 
 The following are deferred until the relevant productions arrive:
 
-- **`Sequence T` iteration** — the `Type::Sequence` variant, the
-  `Sequence [ … ]` literal, `Sequence T` type annotations, and runtime
-  *construction* of a non-empty literal are wired (a `ProcType::Sequence`
-  + `Inst::SequenceLit` lowering to an RC'd `CoddlKind::Sequence` value).
-  What remains deferred is **iteration** (the `load … order [ … ]` form,
-  which binds an unannotated `var` as its definite-assignment site and
-  infers the `Sequence Tuple { … }` element type from the source heading)
-  and constructing an **empty** literal — lowering a `Sequence []` emits
-  T0064.
+- **`Sequence T`** is fully wired: the `Type::Sequence` variant, the
+  `Sequence [ … ]` literal (empty and non-empty), `Sequence T` annotations,
+  runtime construction (a `ProcType::Sequence` + `Inst::SequenceLit`
+  lowering to an RC'd `CoddlKind::Sequence` value), **iteration** via
+  `load … from … order [ … ]` (binds an unannotated `var` as its
+  definite-assignment site and infers `Sequence Tuple { … }` from the source
+  heading, then a `for … in` / counted loop walks it), and the **reverse**
+  `load <private-relvar> from <sequence>` (seals the sequence's element
+  tuples back into a relvar as a set — `Inst::Collect` →
+  `coddl_relation_from_sequence`). An empty `Sequence []` takes its element
+  type from the binding annotation (like an empty `Relation {}`); the former
+  empty-construction gap (T0064) survives only as a defensive lowering
+  fallback.
 - **User-defined scalar types** via `possrep` — the typechecker has
   no notion of user types yet; every type-name lookup either resolves
   to a built-in or yields `T0005`.
@@ -703,7 +707,7 @@ check script enforces that.
 | T0061 | empty `Sequence []` has no element to infer from and no `let` type annotation to fall back on |
 | T0062 | a `Sequence [ … ]` element's type differs from the first element's (sequences are homogeneous) |
 | T0063 | a sequence literal appears outside a `let` binding value (the only position it is permitted) |
-| T0064 | an **empty** `Sequence []` can't be constructed yet (no element to derive the payload layout from); empty-construction and iteration land with `load` (lowering) |
+| T0064 | an **empty** `Sequence []` reached lowering with no element type to derive the payload layout from — a defensive fallback: an *annotated* empty binding (`let s: Sequence T = Sequence []`) now constructs from its annotation (like an empty `Relation {}`), and the unannotated / non-binding shapes are already rejected earlier (T0061 / T0063) (lowering) |
 | T0065 | postfix index `s[i]` requires a `Sequence` operand (the operand has some other type) |
 | T0066 | postfix index `s[i]` requires an `Integer` index (the index has some other type) |
 | T0067 | `if` condition is not `Boolean` |
@@ -720,5 +724,7 @@ check script enforces that.
 | T0078 | an uninitialized `let x;` — an immutable binding must be initialized (use `var` for a later-assigned local) |
 | T0079 | definite assignment: a `var` declared without a value (`var x;`) is read before it is assigned on all paths |
 | T0080 | a `while` / `do … while` loop condition is not `Boolean` |
-| T0081 | a `load … from <expr>` source is not a `Relation` (the iteration gate forces a relation, so a scalar/`Sequence`/`Tuple` source is rejected) |
+| T0081 | a `load … from <expr>` source is neither a `Relation` (forward form — order into a `Sequence`) nor a `Sequence` (reverse form — seal into a relvar); a scalar/`Tuple` source is rejected |
 | T0082 | a `load … order [ … ]` sort key names a **relation- or tuple-valued** attribute — only scalars have an order (tuples/relations carry `=`/`<>` only, RM Pro 1) |
+| T0083 | an `order` clause on the reverse `load <relvar> from <sequence>` form — a relation is unordered (RM Pro 1), so ordering a seal-into-relvar is meaningless |
+| T0084 | the reverse `load` target is a **public** (SQL-backed) relvar — sealing a sequence into a public relvar (a DML replace) is not yet wired; use a private relvar |

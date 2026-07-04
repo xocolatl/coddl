@@ -2713,6 +2713,14 @@ impl Lowerer {
             None => (self.lower_expr(&source_expr), false),
         };
 
+        // A `Sequence` source is the reverse form: seal it back into a relvar (the
+        // typechecker guarantees the target is a matching private relvar and that
+        // there is no `order` clause). The lowered source type is authoritative.
+        if matches!(self.value_type(rel), ProcType::Sequence(_)) {
+            self.lower_load_reverse(stmt, rel);
+            return;
+        }
+
         let heading_id = match self.value_type(rel) {
             ProcType::Relation(id) => id,
             other => unreachable!("load source non-relation `{other}` survived typecheck"),
@@ -2758,6 +2766,50 @@ impl Lowerer {
         // `lower_var_stmt`); scope exit releases the heap `Sequence`.
         if let Some(target) = stmt.target() {
             self.bind_pending_first_assign(&target.text().to_string(), seq, seq_ty);
+        }
+    }
+
+    /// Lower the reverse `load <private-relvar> from <sequence>` form: collect the
+    /// already-lowered sequence `seq` into a relation set (`Inst::Collect` →
+    /// `coddl_relation_from_sequence`, which copies + retains + seals) and store it
+    /// into the target private relvar's in-memory slot. The source's element-tuple
+    /// heading (from its `ProcType`) is the result relation's heading.
+    fn lower_load_reverse(&mut self, stmt: &LoadStmt, seq: ValueId) {
+        let heading = match self.value_type(seq) {
+            ProcType::Sequence(inner) => match *inner {
+                ProcType::Tuple(h) => h,
+                other => {
+                    unreachable!("reverse load of `Sequence {other}` (non-tuple) survived typecheck")
+                }
+            },
+            other => unreachable!("reverse load source `{other}` is not a Sequence"),
+        };
+        let heading_id = self.intern_heading(&heading);
+
+        let rel = self.fresh_value();
+        self.record_type(rel, ProcType::Relation(heading_id));
+        self.insts.push(Inst::Collect {
+            dst: rel,
+            src: seq,
+            heading_id,
+        });
+
+        // `coddl_relation_from_sequence` fully copies + retains the sequence's
+        // cells, so a temporary source (not bound to a local) can be released now.
+        let is_owned = self
+            .locals
+            .iter()
+            .any(|layer| layer.values().any(|(vid, _)| *vid == seq));
+        if !is_owned {
+            self.insts.push(Inst::Release { src: seq });
+        }
+
+        // Store the sealed relation into the private relvar's slot (it takes
+        // ownership of the fresh rc=1 value — mirrors a private `R := …`).
+        if let Some(target) = stmt.target() {
+            let name = target.text().to_string();
+            self.used_private_relvars.insert(name.clone());
+            self.insts.push(Inst::RelvarSlotStore { name, value: rel });
         }
     }
 
@@ -4639,17 +4691,18 @@ impl Lowerer {
     /// one static descriptor per unique heading. Empty literals are
     /// kept out by the typechecker (T0018); reaching here with zero
     /// tuples is an internal bug.
-    /// Sequences parse and typecheck but are not yet executable — their
-    /// runtime representation and iteration land with `load` (milestone
-    /// step 6). Emitting an error here marks the lowered IR unsafe, so the
-    /// driver reports T0064 and skips codegen rather than producing a
-    /// program that can't run. The returned placeholder value is never
-    /// used — the IR is discarded once a lowering error is present.
+    ///
+    /// An **annotated** empty `Sequence []` is constructed upstream by
+    /// `lower_binding_rhs` (which has the declared element type for the payload
+    /// layout), so it never reaches this path. The empty branch below is a
+    /// defensive fallback for an empty literal with no usable element type — a
+    /// shape typecheck already rejects (T0061 for an unannotated empty literal,
+    /// T0063 for one outside a binding) — kept total via T0064 rather than a panic.
     fn lower_sequence_lit(&mut self, seq: &SequenceLit) -> ValueId {
         let elements: Vec<Expr> = seq.elements().collect();
         if elements.is_empty() {
-            // An empty `Sequence []` carries no element to derive the payload
-            // layout from here; its execution lands with `load`.
+            // An empty `Sequence []` with no element type reaching here has no
+            // payload layout to build from; keep lowering total with a diagnostic.
             self.diagnostics.push(Diagnostic::error(
                 self.node_span(seq.syntax()),
                 "T0064",
@@ -4702,7 +4755,8 @@ impl Lowerer {
         if let Expr::RelationLit(r) = value_expr {
             if r.tuples().next().is_none() {
                 let heading = type_ref
-                    .and_then(|tr| match coddl_types::resolve_type_ref_quiet(&tr) {
+                    .as_ref()
+                    .and_then(|tr| match coddl_types::resolve_type_ref_quiet(tr) {
                         Type::Relation(h) => Some(h),
                         _ => None,
                     })
@@ -4710,7 +4764,43 @@ impl Lowerer {
                 return self.lower_empty_relation_lit(heading);
             }
         }
+        // An empty `Sequence []` takes its element type from the annotation
+        // (typecheck requires one — T0061), mirroring the empty `Relation {}` case:
+        // `load` supplies a source heading for iteration, but a bare empty literal
+        // has none, so the declared element type provides the payload layout. A
+        // relation element isn't lowered here (same limit as a non-empty literal) —
+        // it falls through to the T0064 path.
+        if let Expr::SequenceLit(s) = value_expr {
+            if s.elements().next().is_none() {
+                if let Some(Type::Sequence(elem)) = type_ref
+                    .as_ref()
+                    .map(|tr| coddl_types::resolve_type_ref_quiet(tr))
+                {
+                    if !matches!(elem.as_ref(), Type::Relation(_) | Type::Unknown) {
+                        return self.lower_empty_sequence_lit(proc_type_from_type(&elem));
+                    }
+                }
+            }
+        }
         self.lower_expr(value_expr)
+    }
+
+    /// Lower an empty `Sequence []` to a fresh zero-length `Sequence` of element
+    /// type `elem_proc`. A `Sequence` is physically a kind-tagged unsealed relation
+    /// over the synthetic single-attribute heading `{ value: elem }` (the same
+    /// layout a non-empty `Sequence [ … ]` uses); `alloc(0, 0)` is a valid empty
+    /// one. Retires the empty-construction gap (T0064) for annotated bindings.
+    fn lower_empty_sequence_lit(&mut self, elem_proc: ProcType) -> ValueId {
+        let heading = Heading::new(vec![("value".to_string(), type_from_proc(&elem_proc))]);
+        let heading_id = self.intern_heading(&heading);
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Sequence(Box::new(elem_proc)));
+        self.insts.push(Inst::SequenceLit {
+            dst,
+            elements: Vec::new(),
+            heading_id,
+        });
+        dst
     }
 
     /// Lower an empty relation literal to a fresh sealed zero-tuple relation of
@@ -6228,6 +6318,32 @@ public relvar Greetings { id: Integer, message: Text } key { id };\n\
     }
 
     #[test]
+    fn load_reverse_emits_collect_and_slot_store() {
+        // The reverse `load <private-relvar> from <sequence>` seals the sequence
+        // (`Inst::Collect`) and stores the result into the relvar's slot.
+        let src = "program p; \
+                   private relvar Names { name: Text } key { name }; \
+                   oper main {} [ \
+                   let rnames = Relation { { name: \"Alice\" } }; \
+                   var names; \
+                   load names from rnames order [asc name]; \
+                   load Names from names; ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let insts: Vec<&Inst> = main.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::Collect { .. })),
+            "expected an Inst::Collect for the reverse load:\n{m}"
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|i| matches!(i, Inst::RelvarSlotStore { name, .. } if name == "Names")),
+            "expected a RelvarSlotStore into Names:\n{m}"
+        );
+    }
+
+    #[test]
     fn binding_transparency_pushes_project_through_let() {
         // `project` folds through the binding into a narrowed pushed SELECT.
         let src = format!(
@@ -7301,21 +7417,26 @@ oper main {} [
     }
 
     #[test]
-    fn empty_sequence_literal_is_not_yet_executable_emits_t0064() {
-        // An empty sequence carries no element to derive the payload layout
-        // from at this stage; its execution lands with `load`. Graceful —
-        // a diagnostic, not a panic; no module, so codegen never runs.
-        let src = "oper main {} [ let _s: Sequence Integer = Sequence []; ];";
+    fn empty_annotated_sequence_literal_lowers_to_empty_sequence_lit() {
+        // An empty `Sequence []` now constructs from its annotation — the element
+        // type supplies the payload layout (mirroring an empty `Relation {}`), so
+        // the former T0064 gap is retired for annotated bindings.
+        let src = "oper main {} [ let _s: Sequence Integer = Sequence []; \
+                   write_line { message: \"ok\" }; ];";
         let out = lower(src, FileId(0));
         assert!(
-            out.module.is_none(),
-            "expected no module for an empty sequence"
-        );
-        assert!(
-            out.diagnostics.iter().any(|d| d.code == "T0064"),
-            "expected T0064, got {:?}",
+            !out.diagnostics.iter().any(|d| d.code == "T0064"),
+            "empty annotated sequence should no longer emit T0064: {:?}",
             out.diagnostics
         );
+        let m = out.module.expect("module should be produced");
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let empty_seq = main
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::SequenceLit { elements, .. } if elements.is_empty()));
+        assert!(empty_seq, "expected an empty SequenceLit instruction");
     }
 
     #[test]

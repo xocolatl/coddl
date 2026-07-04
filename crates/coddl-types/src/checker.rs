@@ -1268,6 +1268,16 @@ impl TypeChecker {
             None => return, // parser recovery already emitted a diagnostic
         };
 
+        // A `Sequence` source is the reverse form: seal the sequence's element
+        // tuples back into a relvar as a set (RM Pro 1, 3). The source type — not
+        // the target — carries the direction, so dispatch on it; the forward form
+        // (`Relation` source → ordered `Sequence`) continues below.
+        if let Type::Sequence(elem) = &source_ty {
+            let elem = elem.as_ref().clone();
+            self.check_load_reverse(stmt, elem, scope);
+            return;
+        }
+
         // The `Sequence` holds one tuple element per source tuple, so its element
         // type is `Tuple H`. A non-relation source is T0081; `Unknown` stays
         // `Unknown` so a single failure doesn't poison the target's binding.
@@ -1371,6 +1381,92 @@ impl TypeChecker {
                 "T0001",
                 format!("`{name}` is not a declared `var`; `load` needs a `var` target"),
             ),
+        }
+    }
+
+    /// Check the reverse `load <relvar> from <sequence>` form: seal the source
+    /// sequence's element tuples back into a relvar as a set. The target must be a
+    /// **private** (in-memory) relvar whose heading matches the sequence's element
+    /// tuple; an `order` clause is rejected (a relation is unordered, T0083), and a
+    /// public relvar reverse — a SQL DML replace — is not yet wired (T0084). `elem`
+    /// is the sequence's element type.
+    fn check_load_reverse(&mut self, stmt: &LoadStmt, elem: Type, scope: &mut Scope) {
+        // A relation has no tuple order — an `order` clause on the reverse form is
+        // meaningless. Flag the first sort item.
+        if let Some(item) = stmt.sort_items().next() {
+            self.error(
+                self.node_span(item.syntax()),
+                "T0083",
+                "`order` is not allowed when loading a sequence into a relvar (a relation is unordered)",
+            );
+        }
+
+        let Some(ident) = stmt.target() else { return };
+        let name = ident.text();
+
+        // A local binding (`var`/`let`/parameter/loop counter) named `name` shadows
+        // any relvar and is not a valid reverse target — the target is a relvar.
+        if let Some(origin) = scope.origin(name) {
+            if !matches!(origin, BindingOrigin::Relvar) {
+                self.error(
+                    self.token_span(&ident),
+                    "T0033",
+                    format!("cannot load a sequence into `{name}`: not an assignable relvar"),
+                );
+                return;
+            }
+        }
+
+        // Resolve the target relvar. A private (in-memory) relvar is the legal
+        // reverse target; a public relvar reverse (a SQL replace) is deferred.
+        let Some(info) = self.relvars.get(name) else {
+            self.error(
+                self.token_span(&ident),
+                "T0033",
+                format!("cannot load a sequence into `{name}`: not an assignable relvar"),
+            );
+            return;
+        };
+        if matches!(info.kind, RelvarKind::Public) {
+            self.error(
+                self.token_span(&ident),
+                "T0084",
+                format!(
+                    "loading a sequence into public relvar `{name}` is not yet supported; \
+                     use a private relvar"
+                ),
+            );
+            return;
+        }
+        if !matches!(info.kind, RelvarKind::Private) {
+            self.error(
+                self.token_span(&ident),
+                "T0033",
+                format!("cannot load a sequence into `{name}`: not an assignable relvar"),
+            );
+            return;
+        }
+        let target_ty = Type::Relation(info.heading.clone());
+        scope.mark_used(name);
+
+        // The sealed relation is `Relation H` when the element is `Tuple H`; it must
+        // be assignable to the relvar's declared type. A scalar (non-tuple) element
+        // sequence has no relation form and mismatches the same way (T0075). An
+        // `Unknown` element (a source error) is not re-flagged.
+        if matches!(elem, Type::Unknown) {
+            return;
+        }
+        let sealed = match &elem {
+            Type::Tuple(h) => Type::Relation(h.clone()),
+            _ => Type::Sequence(Box::new(elem.clone())),
+        };
+        if !sealed.assignable_to(&target_ty) {
+            let source_ty = Type::Sequence(Box::new(elem));
+            self.error(
+                self.token_span(&ident),
+                "T0075",
+                format!("cannot load {source_ty} into `{name}`, declared {target_ty}"),
+            );
         }
     }
 
@@ -6765,6 +6861,87 @@ mod tests {
                    let _peek = names; \
                    load names from rnames order [asc name]; ];";
         assert!(codes(src).contains(&"T0079"), "got {:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn load_reverse_seals_sequence_into_private_relvar() {
+        // A `Sequence Tuple { name: Text }` (from a forward load) seals back into a
+        // matching private relvar — no `order`, no errors.
+        let src = "program p; \
+                   private relvar Names { name: Text } key { name }; \
+                   oper main {} [ \
+                   let rnames = Relation { { name: \"Alice\" } }; \
+                   var names; \
+                   load names from rnames order [asc name]; \
+                   load Names from names; ];";
+        let d = diagnostics(src);
+        assert!(
+            d.iter().all(|x| x.severity != coddl_diagnostics::Severity::Error),
+            "expected no errors, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn load_reverse_with_order_clause_is_t0083() {
+        // A relation is unordered — an `order` clause on the reverse form is a
+        // mistake.
+        let src = "program p; \
+                   private relvar Names { name: Text } key { name }; \
+                   oper main {} [ \
+                   let rnames = Relation { { name: \"Alice\" } }; \
+                   var names; \
+                   load names from rnames order [asc name]; \
+                   load Names from names order [asc name]; ];";
+        assert!(codes(src).contains(&"T0083"), "got {:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn load_reverse_heading_mismatch_is_t0075() {
+        // The sequence is `Sequence Tuple { name: Text }`; the relvar heading is
+        // `{ age: Integer }` — not assignable.
+        let src = "program p; \
+                   private relvar Ages { age: Integer } key { age }; \
+                   oper main {} [ \
+                   let rnames = Relation { { name: \"Alice\" } }; \
+                   var names; \
+                   load names from rnames order [asc name]; \
+                   load Ages from names; ];";
+        assert!(codes(src).contains(&"T0075"), "got {:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn load_reverse_scalar_sequence_is_t0075() {
+        // A `Sequence Integer` has no relation form — sealing it into a relvar is a
+        // type mismatch.
+        let src = "program p; \
+                   private relvar R { a: Integer } key { a }; \
+                   oper main {} [ \
+                   let s = Sequence [1, 2, 3]; \
+                   load R from s; ];";
+        assert!(codes(src).contains(&"T0075"), "got {:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn load_reverse_into_var_target_is_t0033() {
+        // A plain `var` is not a relvar — the reverse form needs a relvar target.
+        let src = "oper main {} [ \
+                   let s = Sequence [1, 2, 3]; \
+                   var x; \
+                   load x from s; ];";
+        assert!(codes(src).contains(&"T0033"), "got {:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn load_reverse_into_public_relvar_is_t0084() {
+        // Reverse into a public (SQL-backed) relvar is not yet wired.
+        let src = "program p; database d; \
+                   public relvar R { name: Text } key { name }; \
+                   oper main {} [ \
+                   let rnames = Relation { { name: \"Alice\" } }; \
+                   var names; \
+                   load names from rnames order [asc name]; \
+                   load R from names; ];";
+        assert!(codes(src).contains(&"T0084"), "got {:?}", diagnostics(src));
     }
 
     #[test]

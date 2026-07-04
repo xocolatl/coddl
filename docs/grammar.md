@@ -596,8 +596,11 @@ function that implements it.
                     -- infix operator nor a postfix trigger. The `order` clause is
                     -- an ORDERED bracket-list of <sort-item>s (sort precedence is
                     -- ordinal) and is optional — the reverse `load <relvar> from
-                    -- <sequence>` form carries none; the target's type
-                    -- disambiguates direction at typecheck. `load` has no
+                    -- <sequence>` form carries none; the SOURCE type disambiguates
+                    -- direction at typecheck (a `Relation` source is the forward
+                    -- form → ordered `Sequence` into a `var`; a `Sequence` source
+                    -- is the reverse form → seal into a private relvar as a set).
+                    -- `load` has no
                     -- projection slot: to keep only some attributes, project in
                     -- the source <expr> (`load n from (R project { a }) order
                     -- [asc a]`). `load`/`from`/`order` are contextual keywords

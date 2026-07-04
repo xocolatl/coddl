@@ -408,6 +408,19 @@ fn declare_runtime_rc_externs(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert("coddl_relation_tclose".into(), id);
     }
+    // coddl_relation_from_sequence(seq, desc) -> ptr. Reverse `load`: collect a
+    // Sequence into a relation set. Result heading == element heading ⇒ one desc.
+    {
+        let mut sig = obj.make_signature();
+        for _ in 0..2 {
+            sig.params.push(AbiParam::new(ptr_ty));
+        }
+        sig.returns.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_relation_from_sequence", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_relation_from_sequence".into(), id);
+    }
     // Private-relvar in-memory slots:
     //   coddl_relvar_slot_init_empty(desc: ptr, slot: ptr) -> ()
     //   coddl_relvar_slot_store(value: ptr, slot: ptr) -> ()
@@ -1986,6 +1999,23 @@ fn emit_inst(
             let call = builder
                 .ins()
                 .call(load_local, &[src_v, desc_val, keys_val, count_val]);
+            let result = builder.inst_results(call)[0];
+            values.insert(*dst, ValueRepr::Scalar(result));
+            Ok(())
+        }
+        Inst::Collect {
+            dst,
+            src,
+            heading_id,
+        } => {
+            let src_v = scalar_value(values, src)?;
+            let ptr_ty = obj.target_config().pointer_type();
+            let desc_id = heading_desc_ids[heading_id.0 as usize];
+            let desc_gv = obj.declare_data_in_func(desc_id, builder.func);
+            let desc_val = builder.ins().symbol_value(ptr_ty, desc_gv);
+            let collect_id = funcs["coddl_relation_from_sequence"];
+            let collect_local = obj.declare_func_in_func(collect_id, builder.func);
+            let call = builder.ins().call(collect_local, &[src_v, desc_val]);
             let result = builder.inst_results(call)[0];
             values.insert(*dst, ValueRepr::Scalar(result));
             Ok(())

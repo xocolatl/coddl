@@ -193,6 +193,22 @@ mod tests {
     }
 
     #[test]
+    fn formats_load_statement_and_order_clause() {
+        // The `load` statement formats via the generic rules: `order` keeps a
+        // space before `[` (it is a sort list, not an index), sort items and their
+        // direction keywords are single-spaced, commas separate keys, and the
+        // reverse `load <relvar> from <seq>` form (no `order`) formats too.
+        let src = "program p;\noper main {} [\n    load names from rnames order[asc name,desc age];\n    load R from names;\n];\n";
+        let got = fmt(src);
+        assert!(
+            got.contains("load names from rnames order [asc name, desc age];"),
+            "order list spacing, got:\n{got}"
+        );
+        assert!(got.contains("load R from names;"), "reverse form, got:\n{got}");
+        assert_eq!(fmt(&got), got, "load formatting must be idempotent");
+    }
+
+    #[test]
     fn formats_other_dialects_too() {
         // A `.cddb` catalog: spacing normalizes via the same printer.
         let src = "database greetings;\nbase relvar Greetings {id: Integer,message: Text} key {id};\n";

@@ -1337,6 +1337,54 @@ pub unsafe extern "C" fn coddl_load_ordered(
     out
 }
 
+/// Collect a `Sequence` back into a relation **set** (the reverse `load <relvar>
+/// from <sequence>` form). Returns a fresh RC-managed relation (rc=1, kind
+/// `Relation`) holding the sequence's element tuples with duplicates removed and
+/// the canonical tuple order restored (RM Pro 1, 3) — the set-ifying inverse of
+/// [`coddl_load_ordered`]. `seq` is left unchanged; its cells are copied by value
+/// and the surviving `Text` cells are retained so the relation co-owns them.
+///
+/// `desc` describes the element-tuple layout (the sequence's records *are* tuples
+/// of this heading, as produced by `coddl_load_ordered`). Records are copied,
+/// their `Text` cells retained, then [`coddl_relation_seal`] sorts + dedups in
+/// place (releasing each dropped duplicate's retained cells, so the reference
+/// count stays balanced — the same copy-then-seal shape as
+/// [`coddl_relation_rename`]). An empty sequence yields an empty relation.
+///
+/// # Safety
+/// `seq` must point to a payload from `coddl_rc_alloc` whose kind is `Sequence`
+/// and whose records match `desc`'s layout. `desc` must outlive this call.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_relation_from_sequence(
+    seq: *const u8,
+    desc: *const CoddlHeadingDesc,
+) -> *mut u8 {
+    if seq.is_null() || desc.is_null() {
+        return std::ptr::null_mut();
+    }
+    let header = seq.sub(HEADER_SIZE) as *const CoddlRcHeader;
+    let count = (*header).length as usize;
+    let record_size = (*desc).record_size as usize;
+
+    let out = crate::rc::coddl_rc_alloc(
+        record_size * count,
+        count as u32,
+        crate::rc::CoddlKind::Relation as u32,
+        desc,
+    );
+    if out.is_null() || count == 0 {
+        return out;
+    }
+
+    // Copy every record, retain its `Text` cells (the relation co-owns the shared
+    // payloads), then seal — sort + dedup, releasing each dropped duplicate's
+    // retained cells so the net references balance.
+    std::ptr::copy_nonoverlapping(seq, out, count * record_size);
+    retain_text_cells(out, count, desc);
+    coddl_relation_seal(out, desc);
+    out
+}
+
 /// Rename a relation's attributes in-process. Returns a fresh RC-managed
 /// relation (rc=1) whose heading is `dst_desc` — the renamed, re-sorted
 /// attributes — with each record's cells permuted from the source per `perm`.
@@ -2849,6 +2897,52 @@ mod tests {
             assert_eq!((*header).kind, CoddlKind::Sequence as u32);
             assert_eq!((*header).length, 0);
             coddl_rc_release(out);
+            coddl_rc_release(src);
+        }
+    }
+
+    #[test]
+    fn relation_from_sequence_dedups_and_seals() {
+        unsafe {
+            // A Sequence with duplicate rows in arbitrary order (built via the
+            // no-key `coddl_load_ordered`, which never dedups). Collecting it back
+            // must sort + drop duplicates (RM Pro 1, 3): the reverse `load`.
+            let (attrs, mut desc) = ab_desc();
+            desc.attrs = attrs.as_ptr();
+            let src = ab_src(&[(2, 1), (1, 2), (2, 1), (1, 2)], &desc);
+            let seq = coddl_load_ordered(src, &desc, std::ptr::null(), 0);
+            assert_eq!((*(seq.sub(HEADER_SIZE) as *const CoddlRcHeader)).length, 4);
+
+            let rel = coddl_relation_from_sequence(seq, &desc);
+            let header = rel.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*header).kind, CoddlKind::Relation as u32, "result is a Relation");
+            assert_eq!((*header).length, 2, "duplicates dropped");
+            assert_eq!(
+                [ab_row(rel, 0), ab_row(rel, 1)],
+                [(1, 2), (2, 1)],
+                "sorted into the canonical order",
+            );
+
+            coddl_rc_release(rel);
+            coddl_rc_release(seq);
+            coddl_rc_release(src);
+        }
+    }
+
+    #[test]
+    fn relation_from_sequence_empty_yields_empty_relation() {
+        unsafe {
+            let (attrs, mut desc) = ab_desc();
+            desc.attrs = attrs.as_ptr();
+            let src = ab_src(&[], &desc);
+            let seq = coddl_load_ordered(src, &desc, std::ptr::null(), 0);
+            let rel = coddl_relation_from_sequence(seq, &desc);
+            assert!(!rel.is_null());
+            let header = rel.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*header).kind, CoddlKind::Relation as u32);
+            assert_eq!((*header).length, 0);
+            coddl_rc_release(rel);
+            coddl_rc_release(seq);
             coddl_rc_release(src);
         }
     }

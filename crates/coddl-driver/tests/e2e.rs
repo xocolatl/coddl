@@ -4503,6 +4503,47 @@ oper main {} [
     run_both_backends_expect(src, "load-multi.cd", b"a\nb\na\n");
 }
 
+// ── reverse load (Sequence → relvar) + empty Sequence (Chunk 6) ───────
+
+#[test]
+fn load_reverse_round_trips_a_sequence_through_a_private_relvar() {
+    // Forward `load` orders a relation into a `Sequence`; the reverse `load`
+    // seals that sequence back into a private relvar (a set); a second forward
+    // `load` reads the relvar and re-orders it. Round-trips force → order →
+    // materialize → collect → store → read on both backends.
+    let src = "\
+program load_roundtrip;
+private relvar Names { n: Text } key { n };
+oper main {} [
+    let r = Relation { {n: \"beta\"}, {n: \"alpha\"}, {n: \"gamma\"} };
+    var xs;
+    load xs from r order [asc n];
+    load Names from xs;
+    var ys;
+    load ys from Names order [desc n];
+    for y in ys do [ write_line { message: y.n }; ];
+];
+";
+    // Sealed set {alpha, beta, gamma}, re-read `desc` → gamma, beta, alpha.
+    run_both_backends_expect(src, "load-reverse.cd", b"gamma\nbeta\nalpha\n");
+}
+
+#[test]
+fn empty_annotated_sequence_constructs_and_iterates_zero_times() {
+    // An empty `Sequence []` now constructs from its annotation (the retired
+    // T0064 gap); iterating it runs the body zero times.
+    let src = "\
+program empty_seq;
+oper main {} [
+    let e: Sequence Text = Sequence [];
+    write_line { message: \"before\" };
+    for x in e do [ write_line { message: x }; ];
+    write_line { message: \"after\" };
+];
+";
+    run_both_backends_expect(src, "empty-seq.cd", b"before\nafter\n");
+}
+
 /// Write the `greetings` companions and seed the table with three rows whose
 /// `message` order differs from both `id` and insertion order, so a pushed
 /// `ORDER BY "message"` is observably doing the sort. Returns the db path.
