@@ -1596,6 +1596,22 @@ oper main {} [
 }
 
 #[test]
+fn approximate_equality_prints_boolean() {
+    // `1.5e0 = 1.5e0` and `1.5e0 = 2.5e0` lower to a canonicalized-bit compare
+    // (bitcast the `double` to i64, then `icmp`); the Boolean results interpolate.
+    let src = "\
+program approx_eq;
+oper main {} [
+    let same = 1.5e0 = 1.5e0;
+    let diff = 1.5e0 = 2.5e0;
+    let message = format { template: f\"{same} {diff}\", args: { same: same, diff: diff } };
+    write_line { message };
+];
+";
+    run_both_backends_expect(src, "approx-eq.cd", b"true false\n");
+}
+
+#[test]
 fn format_interpolates_an_integer() {
     // An `Integer` placeholder exercises the `to_text { self: Integer }`
     // overload → `coddl_int_to_text` end to end (overloading across types).

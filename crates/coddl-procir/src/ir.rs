@@ -601,6 +601,11 @@ pub enum Const {
     /// A `Character` literal as its Unicode scalar value (escapes already
     /// decoded). Stored inline as a codepoint (`i32` at the ABI).
     Character(u32),
+    /// An `Approximate` value as its **canonical** IEEE-754 double bit
+    /// pattern (`u64`, not `f64`, so the enum stays `Eq`). NaN is collapsed
+    /// to one quiet-NaN pattern and `−0.0` to `+0.0` on ingest, so bit
+    /// equality is a proper (reflexive) equality. `double` at the ABI.
+    Approximate(u64),
     /// `true` / `false` — Boolean literal value.
     Boolean(bool),
     /// The `Tuple {}` value — produced where the source had `{}` or
@@ -702,6 +707,8 @@ impl fmt::Display for Const {
                 Some(c) => write!(f, "'{}'", c.escape_default()),
                 None => write!(f, "'\\u{{{cp:x}}}'"),
             },
+            // Print the exponent form so it re-reads as an `Approximate` literal.
+            Const::Approximate(bits) => write!(f, "{:e}", f64::from_bits(*bits)),
             Const::Boolean(b) => f.write_str(if *b { "true" } else { "false" }),
             Const::Unit => f.write_str("{}"),
         }

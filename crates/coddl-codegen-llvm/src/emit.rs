@@ -825,6 +825,22 @@ impl Emitter {
             }
             Inst::Const {
                 dst,
+                value: Const::Approximate(bits),
+                ty: ProcType::Approximate,
+            } => {
+                // An Approximate is a `double`; materialize the canonical bit
+                // pattern via LLVM's hex-float immediate form (exact, no parse).
+                self.values.insert(
+                    *dst,
+                    ValueRepr::Scalar {
+                        ty: "double".to_string(),
+                        op: format!("0x{bits:016X}"),
+                    },
+                );
+                Ok(())
+            }
+            Inst::Const {
+                dst,
                 value: Const::Boolean(b),
                 ty: ProcType::Boolean,
             } => {
@@ -1462,6 +1478,38 @@ impl Emitter {
             };
             let dst_name = format!("%v{}", dst.0);
             writeln!(self.body, "    {dst_name} = icmp {cmp} i8 {raw}, 0").unwrap();
+            self.values.insert(
+                dst,
+                ValueRepr::Scalar {
+                    ty: "i1".to_string(),
+                    op: dst_name,
+                },
+            );
+            return Ok(());
+        }
+        // Approximate `=`/`<>` is *canonicalized bit* equality, not IEEE `fcmp`:
+        // both operands already carry canonical bits (NaN → one pattern, `−0` →
+        // `+0`), so reinterpret each `double` as `i64` and integer-compare. This
+        // stays reflexive (NaN = NaN) — the basis for dedup/keys. (Only Eq/NotEq
+        // reach here on Approximate; ordering is Integer-only.)
+        if matches!(operand_type, ProcType::Approximate) {
+            let lhs_op = self.scalar_op(lhs)?;
+            let rhs_op = self.scalar_op(rhs)?;
+            let lb = format!("%v{}.lb", dst.0);
+            let rb = format!("%v{}.rb", dst.0);
+            writeln!(self.body, "    {lb} = bitcast double {lhs_op} to i64").unwrap();
+            writeln!(self.body, "    {rb} = bitcast double {rhs_op} to i64").unwrap();
+            let cmp = match op {
+                ScalarOp::Eq => "eq",
+                ScalarOp::NotEq => "ne",
+                other => {
+                    return Err(LlvmEmitError::UnsupportedInst(format!(
+                        "operator {other:?} not supported on Approximate"
+                    )))
+                }
+            };
+            let dst_name = format!("%v{}", dst.0);
+            writeln!(self.body, "    {dst_name} = icmp {cmp} i64 {lb}, {rb}").unwrap();
             self.values.insert(
                 dst,
                 ValueRepr::Scalar {

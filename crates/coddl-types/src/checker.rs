@@ -3551,7 +3551,7 @@ impl TypeChecker {
     }
 
     /// `lhs = rhs` / `lhs <> rhs` — operands must share a scalar type
-    /// (Integer, Text, Character, or Boolean for v1). Result is Boolean.
+    /// (Integer, Text, Character, Approximate, or Boolean for v1). Result is Boolean.
     fn check_equality_op(&mut self, bin: &BinaryExpr, op: BinaryOp, scope: &mut Scope) -> Type {
         let lhs_ty = match bin.lhs() {
             Some(e) => self.check_expr(&e, scope),
@@ -3564,7 +3564,12 @@ impl TypeChecker {
         let supported = |t: &Type| {
             matches!(
                 t,
-                Type::Integer | Type::Text | Type::Character | Type::Boolean | Type::Unknown
+                Type::Integer
+                    | Type::Text
+                    | Type::Character
+                    | Type::Approximate
+                    | Type::Boolean
+                    | Type::Unknown
             )
         };
         if !supported(&lhs_ty) || !supported(&rhs_ty) || !lhs_ty.assignable_to(&rhs_ty) {
@@ -3573,7 +3578,7 @@ impl TypeChecker {
                 self.node_span(bin.syntax()),
                 "T0021",
                 format!(
-                    "`{opname}` operands must share a scalar type (Integer, Text, Character, or Boolean); got {lhs_ty} vs {rhs_ty}"
+                    "`{opname}` operands must share a scalar type (Integer, Text, Character, Approximate, or Boolean); got {lhs_ty} vs {rhs_ty}"
                 ),
             );
         }
@@ -5875,6 +5880,21 @@ mod tests {
     fn character_integer_mismatch_diagnoses_t0021() {
         // `'x' = 1` mixes Character with Integer — T0021 fires.
         let src = "oper main {} [ let _b = 'x' = 1; ];";
+        assert!(codes(src).contains(&"T0021"));
+    }
+
+    #[test]
+    fn approximate_equality_typechecks() {
+        // `=` and `<>` accept matching Approximate operands (result Boolean); no T0021.
+        let src = "oper main {} [ let _a = 1.5e0 = 2.5e0; let _b = 1.5e0 <> 2.5e0; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn approximate_integer_mismatch_diagnoses_t0021() {
+        // `1.5e0 = 1` mixes Approximate with Integer — T0021 fires.
+        let src = "oper main {} [ let _b = 1.5e0 = 1; ];";
         assert!(codes(src).contains(&"T0021"));
     }
 

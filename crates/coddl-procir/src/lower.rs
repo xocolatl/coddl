@@ -4884,9 +4884,13 @@ impl Lowerer {
                 let cp = decode_char_literal(token.text());
                 (Const::Character(cp), ProcType::Character)
             }
-            // RATIONAL_LIT / APPROXIMATE_LIT land here as the language
-            // exercises them. The typechecker already accepts them; lowering
-            // catches up when the runtime grows to consume them.
+            SyntaxKind::APPROXIMATE_LIT => {
+                let bits = decode_approximate_literal(token.text());
+                (Const::Approximate(bits), ProcType::Approximate)
+            }
+            // RATIONAL_LIT lands here as the language exercises it. The
+            // typechecker already accepts it; lowering catches up when the
+            // numeric-cell representation lands.
             other => unreachable!("literal kind {other:?} not yet lowered"),
         };
         let dst = self.fresh_value();
@@ -5750,6 +5754,31 @@ fn parse_integer_literal(text: &str) -> i64 {
         (10, cleaned.as_str())
     };
     i64::from_str_radix(digits, radix).expect("lexer validated the digits")
+}
+
+/// Collapse an `f64` to the canonical IEEE-754 bit pattern for its Coddl
+/// `Approximate` *value*: all NaNs → one quiet-NaN pattern, `−0.0` → `+0.0`,
+/// everything else its own bits. This is what makes bitwise equality a proper
+/// (reflexive) equality — the same rule the runtime applies on SQL read-back.
+/// Mirror this rule anywhere else an `Approximate` enters the system.
+fn canonical_approx_bits(x: f64) -> u64 {
+    if x.is_nan() {
+        f64::NAN.to_bits()
+    } else if x == 0.0 {
+        // `x == 0.0` is true for both `+0.0` and `−0.0`; collapse to `+0.0`.
+        0
+    } else {
+        x.to_bits()
+    }
+}
+
+/// Decode an `Approximate` literal (`42e0`, `4.2e1`, `1e-9`) to its canonical
+/// bit pattern. Underscores are decoration (stripped like `parse_integer_literal`);
+/// the lexer already validated the mantissa/exponent shape.
+fn decode_approximate_literal(text: &str) -> u64 {
+    let cleaned: String = text.chars().filter(|c| *c != '_').collect();
+    let value: f64 = cleaned.parse().expect("lexer validated the approximate literal");
+    canonical_approx_bits(value)
 }
 
 #[cfg(test)]

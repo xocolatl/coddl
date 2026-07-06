@@ -1332,6 +1332,18 @@ fn emit_inst(
         }
         Inst::Const {
             dst,
+            value: Const::Approximate(bits),
+            ty: ProcType::Approximate,
+        } => {
+            // An Approximate is an F64 carrying the canonical bit pattern.
+            // `Ieee64::from(f64)` preserves bits exactly (via `to_bits`), so
+            // round-tripping a canonical NaN / signed zero keeps its bits.
+            let v = builder.ins().f64const(f64::from_bits(*bits));
+            values.insert(*dst, ValueRepr::Scalar(v));
+            Ok(())
+        }
+        Inst::Const {
+            dst,
             value: Const::Boolean(b),
             ty: ProcType::Boolean,
         } => {
@@ -1649,6 +1661,30 @@ fn emit_inst(
                     }
                 };
                 let result = builder.ins().icmp_imm(cc, raw, 0);
+                values.insert(*dst, ValueRepr::Scalar(result));
+                return Ok(());
+            }
+            // Approximate `=`/`<>` is *canonicalized bit* equality, not `fcmp`:
+            // both operands carry canonical bits (NaN → one pattern, `−0` →
+            // `+0`), so reinterpret each F64 as I64 and integer-compare. Stays
+            // reflexive (NaN = NaN) for dedup/keys. `bitcast` with a same-lane
+            // reinterpret accepts `MemFlags::new()`. (Only Eq/NotEq on Approximate.)
+            if matches!(operand_type, ProcType::Approximate) {
+                use cranelift_codegen::ir::condcodes::IntCC;
+                let lhs_v = scalar_value(values, lhs)?;
+                let rhs_v = scalar_value(values, rhs)?;
+                let lb = builder.ins().bitcast(types::I64, MemFlags::new(), lhs_v);
+                let rb = builder.ins().bitcast(types::I64, MemFlags::new(), rhs_v);
+                let cc = match op {
+                    ScalarOp::Eq => IntCC::Equal,
+                    ScalarOp::NotEq => IntCC::NotEqual,
+                    other => {
+                        return Err(CraneliftEmitError::UnsupportedInst(format!(
+                            "operator {other:?} not supported on Approximate"
+                        )))
+                    }
+                };
+                let result = builder.ins().icmp(cc, lb, rb);
                 values.insert(*dst, ValueRepr::Scalar(result));
                 return Ok(());
             }
