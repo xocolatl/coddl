@@ -3752,7 +3752,7 @@ impl Lowerer {
     }
 
     /// Convert a literal AST node to a RelIR `Literal`, or `None` for forms
-    /// the pushdown doesn't bind yet (rationals, characters, non-UTF-8 text).
+    /// the pushdown doesn't bind yet (rationals, non-UTF-8 text).
     fn literal_value(&self, expr: &Expr) -> Option<RelLiteral> {
         match expr {
             Expr::Literal(lit) => {
@@ -3764,6 +3764,9 @@ impl Lowerer {
                     SyntaxKind::STRING_LIT => {
                         let bytes = decode_string_literal(token.text());
                         String::from_utf8(bytes).ok().map(RelLiteral::Text)
+                    }
+                    SyntaxKind::CHAR_LIT => {
+                        Some(RelLiteral::Character(decode_char_literal(token.text())))
                     }
                     _ => None,
                 }
@@ -3808,6 +3811,7 @@ impl Lowerer {
             let (value, ty) = match v {
                 Value::Integer(n) => (Const::Integer(*n), ProcType::Integer),
                 Value::Text(s) => (Const::Text(s.clone().into_bytes()), ProcType::Text),
+                Value::Character(cp) => (Const::Character(*cp), ProcType::Character),
                 Value::Boolean(b) => (Const::Boolean(*b), ProcType::Boolean),
             };
             let dst = self.fresh_value();

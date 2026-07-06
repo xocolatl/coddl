@@ -91,12 +91,13 @@ impl Conn for SqliteConn {
 }
 
 /// Lower a storage `Value` to a rusqlite bind value. `Boolean` binds as the
-/// integer 0/1 SQLite stores it as.
+/// integer 0/1 SQLite stores it as; `Character` as its integer codepoint.
 fn value_to_sqlite(value: &Value) -> rusqlite::types::Value {
     use rusqlite::types::Value as Sql;
     match value {
         Value::Integer(n) => Sql::Integer(*n),
         Value::Text(s) => Sql::Text(s.clone()),
+        Value::Character(cp) => Sql::Integer(*cp as i64),
         Value::Boolean(b) => Sql::Integer(*b as i64),
     }
 }

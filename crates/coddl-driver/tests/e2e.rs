@@ -3588,6 +3588,78 @@ fn pushed_text_where_binds_a_text_param() {
     }
 }
 
+/// Seed a `grades` database whose `Character` column is stored as its integer
+/// codepoint (SQLite has no char type). `char` = 97 (`'a'`), 98 (`'b'`).
+fn seed_grades_fixtures(dir: &Path) -> PathBuf {
+    std::fs::write(
+        dir.join("grades.cddb"),
+        "database grades;\n\
+         base relvar Grades { id: Integer, grade: Character } key { id };\n",
+    )
+    .expect("write grades.cddb");
+    std::fs::write(
+        dir.join("grades.cdstore"),
+        "store for grades;\n\
+         backend sqlite { file: \"grades.sqlite\" };\n\
+         relvar Grades: table \"grades\" { columns: { id: \"id\", grade: \"grade\" } };\n",
+    )
+    .expect("write grades.cdstore");
+
+    let db = dir.join("grades.sqlite");
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "sqlite3 '{}' \"CREATE TABLE grades (id INTEGER NOT NULL, grade INTEGER NOT NULL, PRIMARY KEY (id)); INSERT INTO grades (id, grade) VALUES (1, 97), (2, 98);\"",
+            db.display()
+        ))
+        .status()
+        .expect("invoke sqlite3");
+    assert!(status.success(), "grades fixture seed failed");
+    db
+}
+
+#[test]
+fn pushed_char_where_binds_a_char_param() {
+    // `Grades where grade = 'a'` is relvar-rooted, so the Character literal
+    // pushes as a bound parameter — bound as its integer codepoint, so the
+    // audit log (SQLite's expanded SQL) shows `= 97`. The matching row's
+    // `grade` column reads back through `marshal_rows` into a Character cell,
+    // then interpolates to `a`.
+    for backend in ["llvm", "cranelift"] {
+        ensure_runtime_built();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = seed_grades_fixtures(tmp.path());
+        let cd = tmp.path().join("cw.cd");
+        std::fs::write(
+            &cd,
+            "program cw;\n\
+             database grades;\n\
+             public relvar Grades { id: Integer, grade: Character } key { id };\n\
+             oper main {} [ let row = transaction [ extract (Grades where grade = 'a') ]; write_line { message: format { template: f\"{c}\", args: { c: row.grade } } }; ];\n",
+        )
+        .expect("write cw.cd");
+        let log = tmp.path().join("audit.log");
+        let out = coddl()
+            .env("CODDL_GRADES_FILE", &db)
+            .env("CODDL_AUDIT_LOG", &log)
+            .args(["run", &format!("--backend={backend}")])
+            .arg(&cd)
+            .output()
+            .expect("spawn coddl");
+        assert!(
+            out.status.success(),
+            "pushed char where on {backend} failed: stderr=\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"a\n", "on {backend}");
+        let log_txt = std::fs::read_to_string(&log).expect("read audit log");
+        assert!(
+            log_txt.contains(r#"WHERE "grade" = 97"#),
+            "expected the char restriction pushed (as codepoint 97) on {backend}, got:\n{log_txt}"
+        );
+    }
+}
+
 /// In-process Text `where` over an in-memory relation literal (not relvar-
 /// rooted, so the cut declines) routes the comparison through the runtime's
 /// `coddl_text_eq` byte compare. Output is sealed in `{n, name}` order.

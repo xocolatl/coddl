@@ -84,6 +84,9 @@ pub struct Tuple;
 pub enum Value {
     Integer(i64),
     Text(String),
+    /// A `Character` as its Unicode scalar value. Binds/reads as an integer
+    /// codepoint (SQLite has no character type).
+    Character(u32),
     Boolean(bool),
 }
 
@@ -92,6 +95,7 @@ impl From<Literal> for Value {
         match lit {
             Literal::Integer(n) => Value::Integer(n),
             Literal::Text(s) => Value::Text(s),
+            Literal::Character(cp) => Value::Character(cp),
             Literal::Boolean(b) => Value::Boolean(b),
         }
     }
@@ -1501,6 +1505,27 @@ mod tests {
         );
         assert_eq!(q.sql.param_count, 1);
         assert_eq!(q.params, vec![Value::Text("hello world".to_string())]);
+    }
+
+    #[test]
+    fn restrict_on_character_binds_a_char_param() {
+        // A `Character` restriction pushes as a bound parameter, carried as
+        // `Value::Character` — the runtime binds it as an integer codepoint.
+        let expr = RelExpr::Restrict {
+            input: Box::new(greetings()),
+            pred: Predicate::AttrCmp {
+                op: CmpOp::Eq,
+                attr: "message".to_string(),
+                value: Literal::Character('a' as u32),
+            },
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id", "message" FROM "greetings" WHERE "message" = ?"#
+        );
+        assert_eq!(q.sql.param_count, 1);
+        assert_eq!(q.params, vec![Value::Character('a' as u32)]);
     }
 
     #[test]

@@ -391,6 +391,21 @@ unsafe fn marshal_rows(
                 };
                 let n: i64 = if v { 1 } else { 0 };
                 buf[offset..offset + 8].copy_from_slice(&n.to_ne_bytes());
+            } else if kind == CoddlAttrKind::Character as u32 {
+                // Stored as an integer codepoint; read it into the 8-byte cell
+                // exactly like Integer (the printer decodes it back to a char).
+                let v: i64 = match row.get(i) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let attr_name = read_attr_name(attr);
+                        eprintln!(
+                            "coddl: {}: column `{attr_name}` of {} is not Character/Integer (or is NULL): {err}",
+                            ctx.site, ctx.of_subject
+                        );
+                        std::process::abort();
+                    }
+                };
+                buf[offset..offset + 8].copy_from_slice(&v.to_ne_bytes());
             } else if kind == CoddlAttrKind::Text as u32 {
                 let s: String = match row.get(i) {
                     Ok(s) => s,
@@ -1066,7 +1081,11 @@ pub unsafe extern "C" fn coddl_exec_insert(
 /// For a Text param, `(ptr, len)` must describe valid bytes for the call.
 unsafe fn param_to_sqlite(p: &CoddlParam, plan_id: u32) -> rusqlite::types::Value {
     use rusqlite::types::Value;
-    if p.kind == CoddlAttrKind::Integer as u32 || p.kind == CoddlAttrKind::Boolean as u32 {
+    if p.kind == CoddlAttrKind::Integer as u32
+        || p.kind == CoddlAttrKind::Boolean as u32
+        || p.kind == CoddlAttrKind::Character as u32
+    {
+        // Character binds as its integer codepoint (SQLite has no char type).
         Value::Integer(p.i)
     } else if p.kind == CoddlAttrKind::Text as u32 {
         if p.ptr.is_null() {

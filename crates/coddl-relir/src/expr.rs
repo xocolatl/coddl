@@ -191,11 +191,13 @@ fn render_predicate(pred: &Predicate) -> String {
 }
 
 /// Render a scalar literal for `RelExpr::render`. `Text` is quoted so the
-/// rendered predicate is unambiguous; `Integer`/`Boolean` print bare.
+/// rendered predicate is unambiguous; `Integer`/`Boolean` print bare;
+/// `Character` prints as its codepoint (matching the integer it binds as).
 fn render_literal(lit: &Literal) -> String {
     match lit {
         Literal::Integer(n) => n.to_string(),
         Literal::Text(s) => format!("{s:?}"),
+        Literal::Character(cp) => cp.to_string(),
         Literal::Boolean(b) => b.to_string(),
     }
 }
@@ -276,6 +278,9 @@ impl CmpOp {
 pub enum Literal {
     Integer(i64),
     Text(String),
+    /// A `Character` literal as its Unicode scalar value. Binds/stores as an
+    /// integer codepoint in SQL (SQLite has no character type).
+    Character(u32),
     Boolean(bool),
 }
 

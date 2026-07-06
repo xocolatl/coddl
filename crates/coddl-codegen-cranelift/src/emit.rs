@@ -2064,6 +2064,12 @@ fn emit_inst(
                         let v = builder.ins().ireduce(types::I8, raw);
                         ValueRepr::Scalar(v)
                     }
+                    ProcType::Character => {
+                        let raw =
+                            builder.ins().load(types::I64, flags, record_ptr, offset);
+                        let v = builder.ins().ireduce(types::I32, raw);
+                        ValueRepr::Scalar(v)
+                    }
                     ProcType::Text => {
                         let ptr = builder.ins().load(ptr_ty, flags, record_ptr, offset);
                         let len = builder
@@ -2393,6 +2399,13 @@ fn build_coddl_param_array_cl(
                 let ext = builder.ins().uextend(types::I64, v);
                 builder.ins().stack_store(ext, slot, base);
             }
+            ProcType::Character => {
+                // Bind the codepoint as an integer in the `i` slot (SQLite has
+                // no char type); `param_to_sqlite` reads it back.
+                let v = scalar_value(values, vid)?; // I32
+                let ext = builder.ins().uextend(types::I64, v);
+                builder.ins().stack_store(ext, slot, base);
+            }
             ProcType::Text => {
                 let (ptr, len) = text_value(values, vid)?;
                 builder.ins().stack_store(ptr, slot, base + 8);
@@ -2417,6 +2430,7 @@ fn proc_type_from_kind_cl(kind: u32) -> ProcType {
     match kind {
         k if k == kind_tag::INTEGER => ProcType::Integer,
         k if k == kind_tag::BOOLEAN => ProcType::Boolean,
+        k if k == kind_tag::CHARACTER => ProcType::Character,
         k if k == kind_tag::TEXT => ProcType::Text,
         other => unreachable!("unsupported attr kind {other} in Extract"),
     }
@@ -2472,6 +2486,7 @@ fn kind_tag_for_cl(ty: &ProcType) -> Result<u32, CraneliftEmitError> {
     match ty {
         ProcType::Integer => Ok(kind_tag::INTEGER),
         ProcType::Boolean => Ok(kind_tag::BOOLEAN),
+        ProcType::Character => Ok(kind_tag::CHARACTER),
         ProcType::Text => Ok(kind_tag::TEXT),
         other => Err(CraneliftEmitError::UnsupportedInst(format!(
             "query param of type {other:?} has no CoddlParam kind"

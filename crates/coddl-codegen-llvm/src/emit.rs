@@ -1168,6 +1168,16 @@ impl Emitter {
                     let slot = self.gep_byte(&arr, base);
                     writeln!(self.body, "    store i64 {z}, ptr {slot}").unwrap();
                 }
+                ProcType::Character => {
+                    // Bind the codepoint as an integer in the `i` slot
+                    // (SQLite has no char type); `param_to_sqlite` reads it back.
+                    let op = self.scalar_op(vid)?;
+                    let z = format!("%qc.{}", self.next_str);
+                    self.next_str += 1;
+                    writeln!(self.body, "    {z} = zext i32 {op} to i64").unwrap();
+                    let slot = self.gep_byte(&arr, base);
+                    writeln!(self.body, "    store i64 {z}, ptr {slot}").unwrap();
+                }
                 ProcType::Text => {
                     let (ptr_op, len_op) = self.text_ops(vid)?;
                     let ptr_slot = self.gep_byte(&arr, base + 8);
@@ -2071,6 +2081,17 @@ impl Emitter {
                     op: name,
                 })
             }
+            ProcType::Character => {
+                let slot = self.gep_byte(base, byte_offset);
+                let raw = format!("%{name_hint}.raw");
+                writeln!(self.body, "    {raw} = load i64, ptr {slot}").unwrap();
+                let name = format!("%{name_hint}");
+                writeln!(self.body, "    {name} = trunc i64 {raw} to i32").unwrap();
+                Ok(ValueRepr::Scalar {
+                    ty: "i32".to_string(),
+                    op: name,
+                })
+            }
             ProcType::Text => {
                 let ptr_slot = self.gep_byte(base, byte_offset);
                 let len_slot = self.gep_byte(base, byte_offset + 8);
@@ -2583,6 +2604,7 @@ fn proc_type_from_kind_llvm(kind: u32) -> ProcType {
     match kind {
         k if k == kind_tag::INTEGER => ProcType::Integer,
         k if k == kind_tag::BOOLEAN => ProcType::Boolean,
+        k if k == kind_tag::CHARACTER => ProcType::Character,
         k if k == kind_tag::TEXT => ProcType::Text,
         other => unreachable!("unsupported attr kind {other} in Extract"),
     }
@@ -2594,6 +2616,7 @@ fn kind_tag_for(ty: &ProcType) -> Result<u32, LlvmEmitError> {
     match ty {
         ProcType::Integer => Ok(kind_tag::INTEGER),
         ProcType::Boolean => Ok(kind_tag::BOOLEAN),
+        ProcType::Character => Ok(kind_tag::CHARACTER),
         ProcType::Text => Ok(kind_tag::TEXT),
         other => Err(LlvmEmitError::UnsupportedInst(format!(
             "query param of type {other:?} has no CoddlParam kind"

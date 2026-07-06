@@ -34,6 +34,7 @@ These are not optimizations; they're correctness requirements imposed by TTM's P
 | `reltrue` / `relfalse` (nullary relations): emit as `(SELECT) WHERE TRUE` / `WHERE FALSE`. SQLite/Postgres tolerate this; non-conforming backends would need a synthesized dummy column. | RM Pro 5. |
 | Transitive closure (`tclose`) emits a two-CTE `WITH RECURSIVE` with the operand defined once (params appear once) and `UNION` (never `UNION ALL`) so the closure is a set. It is emitted only at the statement root — a `WITH`-prefixed query can't be a compound operand or a `FROM` subquery, so a nested/operand `TClose` declines and decomposes in-process. | RM Pro 3; the one irreducible Algebra-A operator. |
 | SQLite-specific: Coddl `Boolean` lowers to SQL `INTEGER CHECK (col IN (0, 1))`. Avoid the SQLite affinity-coercion footguns by always `CAST`-ing on `INSERT`. | dialect quirk. |
+| Coddl `Character` binds, stores, and reads back as its **integer Unicode codepoint** (`Value::Character` → `INTEGER`), never as a SQL `CHAR`/`CHARACTER` column. A pushed `where c = 'a'` renders `"c" = ?` bound to `97`; the result column reads back as an integer codepoint into a `Character` cell. Sidesteps the RM Pre 8 `CHAR`-padding footgun (row above) and needs no char type. | RM Pre 8; SQLite has no character type. |
 
 ### `DISTINCT` elision (key/cardinality-driven)
 
