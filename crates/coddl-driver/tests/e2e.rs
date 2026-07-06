@@ -1580,6 +1580,22 @@ oper main {} [
 }
 
 #[test]
+fn character_equality_prints_boolean() {
+    // `'a' = 'a'` and `'a' = 'b'` lower to `icmp` on the inline `i32` codepoint;
+    // the Boolean results interpolate via `to_text { self: Boolean }`.
+    let src = "\
+program char_eq;
+oper main {} [
+    let same = 'a' = 'a';
+    let diff = 'a' = 'b';
+    let message = format { template: f\"{same} {diff}\", args: { same: same, diff: diff } };
+    write_line { message };
+];
+";
+    run_both_backends_expect(src, "char-eq.cd", b"true false\n");
+}
+
+#[test]
 fn format_interpolates_an_integer() {
     // An `Integer` placeholder exercises the `to_text { self: Integer }`
     // overload → `coddl_int_to_text` end to end (overloading across types).
