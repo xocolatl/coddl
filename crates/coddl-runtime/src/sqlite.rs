@@ -431,6 +431,33 @@ unsafe fn marshal_rows(
                     }
                 };
                 buf[offset..offset + 8].copy_from_slice(&v.to_ne_bytes());
+            } else if kind == CoddlAttrKind::Rational as u32 {
+                // Stored as canonical `"n/d"` TEXT; parse to the reduced
+                // (numer, denom) i128 pair and write the 32-byte cell (num @ 0,
+                // den @ 16). Reduce defensively so a foreign non-canonical value
+                // still compares by value.
+                let s: String = match row.get(i) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        let attr_name = read_attr_name(attr);
+                        eprintln!(
+                            "coddl: {}: column `{attr_name}` of {} is not Rational/TEXT (or is NULL): {err}",
+                            ctx.site, ctx.of_subject
+                        );
+                        std::process::abort();
+                    }
+                };
+                let (num, den) = parse_rational(&s).unwrap_or_else(|| {
+                    eprintln!(
+                        "coddl: {}: column `{}` of {} is not a canonical rational `n/d`: {s:?}",
+                        ctx.site,
+                        read_attr_name(attr),
+                        ctx.of_subject
+                    );
+                    std::process::abort();
+                });
+                buf[offset..offset + 16].copy_from_slice(&num.to_ne_bytes());
+                buf[offset + 16..offset + 32].copy_from_slice(&den.to_ne_bytes());
             } else if kind == CoddlAttrKind::Text as u32 {
                 let s: String = match row.get(i) {
                     Ok(s) => s,
@@ -526,6 +553,36 @@ unsafe fn finalize_relation(
 unsafe fn read_attr_name(attr: &crate::relation::CoddlAttrDesc) -> &str {
     let slice = std::slice::from_raw_parts(attr.name, attr.name_len as usize);
     std::str::from_utf8(slice).unwrap_or("<invalid utf-8>")
+}
+
+/// Parse a `"n/d"` rational string to its **reduced** `(numer, denom)` i128
+/// pair (`gcd(|n|,d) = 1`, `d > 0`). Returns `None` on a malformed string or a
+/// zero denominator. Reduces defensively so a foreign non-canonical value
+/// (`34/10`) still compares by value.
+fn parse_rational(s: &str) -> Option<(i128, i128)> {
+    let (n_str, d_str) = s.split_once('/')?;
+    let n: i128 = n_str.trim().parse().ok()?;
+    let d: i128 = d_str.trim().parse().ok()?;
+    if d == 0 {
+        return None;
+    }
+    if n == 0 {
+        return Some((0, 1));
+    }
+    // gcd of magnitudes (Euclid).
+    let (mut a, mut b) = (n.unsigned_abs(), d.unsigned_abs());
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    let g = a as i128;
+    let (mut n, mut d) = (n / g, d / g);
+    if d < 0 {
+        n = -n;
+        d = -d;
+    }
+    Some((n, d))
 }
 
 /// Decode a UTF-8 byte slice the FFI handed us, or abort with a clear

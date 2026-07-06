@@ -90,6 +90,9 @@ pub enum Value {
     /// An `Approximate` as its canonical IEEE-754 double bit pattern (`u64`,
     /// so the enum stays `Eq`). Binds/reads as SQL `REAL`.
     Approximate(u64),
+    /// A bounded `Rational` as its reduced `(numer, denom)` pair. Binds/reads
+    /// as canonical SQL `TEXT "n/d"`.
+    Rational(i128, i128),
     Boolean(bool),
 }
 
@@ -100,6 +103,7 @@ impl From<Literal> for Value {
             Literal::Text(s) => Value::Text(s),
             Literal::Character(cp) => Value::Character(cp),
             Literal::Approximate(bits) => Value::Approximate(bits),
+            Literal::Rational(n, d) => Value::Rational(n, d),
             Literal::Boolean(b) => Value::Boolean(b),
         }
     }
@@ -1551,6 +1555,28 @@ mod tests {
         );
         assert_eq!(q.sql.param_count, 1);
         assert_eq!(q.params, vec![Value::Approximate(1.5f64.to_bits())]);
+    }
+
+    #[test]
+    fn restrict_on_rational_binds_a_text_param() {
+        // A `Rational` restriction pushes as a bound parameter, carried as
+        // `Value::Rational` (reduced pair) — the runtime binds it as the
+        // canonical `"n/d"` TEXT.
+        let expr = RelExpr::Restrict {
+            input: Box::new(greetings()),
+            pred: Predicate::AttrCmp {
+                op: CmpOp::Eq,
+                attr: "message".to_string(),
+                value: Literal::Rational(17, 5),
+            },
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id", "message" FROM "greetings" WHERE "message" = ?"#
+        );
+        assert_eq!(q.sql.param_count, 1);
+        assert_eq!(q.params, vec![Value::Rational(17, 5)]);
     }
 
     #[test]

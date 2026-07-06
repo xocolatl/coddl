@@ -2171,6 +2171,13 @@ fn emit_inst(
                         let v = builder.ins().load(types::F64, flags, record_ptr, offset);
                         ValueRepr::Scalar(v)
                     }
+                    ProcType::Rational => {
+                        let num = builder.ins().load(types::I128, flags, record_ptr, offset);
+                        let den = builder
+                            .ins()
+                            .load(types::I128, flags, record_ptr, offset + 16);
+                        ValueRepr::Rational { num, den }
+                    }
                     ProcType::Text => {
                         let ptr = builder.ins().load(ptr_ty, flags, record_ptr, offset);
                         let len = builder
@@ -2540,6 +2547,7 @@ fn proc_type_from_kind_cl(kind: u32) -> ProcType {
         k if k == kind_tag::BOOLEAN => ProcType::Boolean,
         k if k == kind_tag::CHARACTER => ProcType::Character,
         k if k == kind_tag::APPROXIMATE => ProcType::Approximate,
+        k if k == kind_tag::RATIONAL => ProcType::Rational,
         k if k == kind_tag::TEXT => ProcType::Text,
         other => unreachable!("unsupported attr kind {other} in Extract"),
     }

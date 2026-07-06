@@ -3824,6 +3824,77 @@ fn approximate_null_reads_back_as_nan_and_is_reflexive() {
     }
 }
 
+/// Seed a `rats` database whose `Rational` column is stored as canonical
+/// `"n/d"` TEXT. `17/5` = `3.4`, `3/2` = `1.5`.
+fn seed_rats_fixtures(dir: &Path) -> PathBuf {
+    std::fs::write(
+        dir.join("rats.cddb"),
+        "database rats;\n\
+         base relvar Rats { id: Integer, r: Rational } key { id };\n",
+    )
+    .expect("write rats.cddb");
+    std::fs::write(
+        dir.join("rats.cdstore"),
+        "store for rats;\n\
+         backend sqlite { file: \"rats.sqlite\" };\n\
+         relvar Rats: table \"rats\" { columns: { id: \"id\", r: \"r\" } };\n",
+    )
+    .expect("write rats.cdstore");
+    let db = dir.join("rats.sqlite");
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "sqlite3 '{}' \"CREATE TABLE rats (id INTEGER NOT NULL, r TEXT NOT NULL, PRIMARY KEY (id)); INSERT INTO rats (id, r) VALUES (1, '17/5'), (2, '3/2');\"",
+            db.display()
+        ))
+        .status()
+        .expect("invoke sqlite3");
+    assert!(status.success(), "rats fixture seed failed");
+    db
+}
+
+#[test]
+fn pushed_rational_where_binds_a_text_param() {
+    // `Rats where r = 3.4` is relvar-rooted, so the Rational literal pushes as a
+    // bound parameter — serialized to the canonical `"17/5"` string, so the audit
+    // log shows `= '17/5'`. The matching row's `r` column reads back through
+    // `marshal_rows` (parse `"n/d"`) into a Rational cell; `row.r = 3.4` confirms
+    // the round-trip (bind → TEXT → read-back → compare).
+    for backend in ["llvm", "cranelift"] {
+        ensure_runtime_built();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = seed_rats_fixtures(tmp.path());
+        let cd = tmp.path().join("rw.cd");
+        std::fs::write(
+            &cd,
+            "program rw;\n\
+             database rats;\n\
+             public relvar Rats { id: Integer, r: Rational } key { id };\n\
+             oper main {} [ let row = transaction [ extract (Rats where r = 3.4) ]; let ok = row.r = 3.4; write_line { message: format { template: f\"{ok}\", args: { ok: ok } } }; ];\n",
+        )
+        .expect("write rw.cd");
+        let log = tmp.path().join("audit.log");
+        let out = coddl()
+            .env("CODDL_RATS_FILE", &db)
+            .env("CODDL_AUDIT_LOG", &log)
+            .args(["run", &format!("--backend={backend}")])
+            .arg(&cd)
+            .output()
+            .expect("spawn coddl");
+        assert!(
+            out.status.success(),
+            "pushed rational where on {backend} failed: stderr=\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"true\n", "on {backend}");
+        let log_txt = std::fs::read_to_string(&log).expect("read audit log");
+        assert!(
+            log_txt.contains(r#"WHERE "r" = '17/5'"#),
+            "expected the rational restriction pushed (as '17/5') on {backend}, got:\n{log_txt}"
+        );
+    }
+}
+
 /// In-process Text `where` over an in-memory relation literal (not relvar-
 /// rooted, so the cut declines) routes the comparison through the runtime's
 /// `coddl_text_eq` byte compare. Output is sealed in `{n, name}` order.

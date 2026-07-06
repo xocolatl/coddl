@@ -3771,6 +3771,10 @@ impl Lowerer {
                     SyntaxKind::APPROXIMATE_LIT => {
                         Some(RelLiteral::Approximate(decode_approximate_literal(token.text())))
                     }
+                    SyntaxKind::RATIONAL_LIT => {
+                        let (n, d) = decode_rational_literal(token.text());
+                        Some(RelLiteral::Rational(n, d))
+                    }
                     _ => None,
                 }
             }
@@ -3816,6 +3820,13 @@ impl Lowerer {
                 Value::Text(s) => (Const::Text(s.clone().into_bytes()), ProcType::Text),
                 Value::Character(cp) => (Const::Character(*cp), ProcType::Character),
                 Value::Approximate(bits) => (Const::Approximate(*bits), ProcType::Approximate),
+                // A `Rational` bind param serializes to its canonical `"n/d"`
+                // string and rides the existing Text param path (SQLite has no
+                // exact-rational type; canonical text ⇒ text-`=` is value-`=`).
+                Value::Rational(n, d) => (
+                    Const::Text(format!("{n}/{d}").into_bytes()),
+                    ProcType::Text,
+                ),
                 Value::Boolean(b) => (Const::Boolean(*b), ProcType::Boolean),
             };
             let dst = self.fresh_value();

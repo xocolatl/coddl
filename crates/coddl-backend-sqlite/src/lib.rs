@@ -109,6 +109,9 @@ fn value_to_sqlite(value: &Value) -> rusqlite::types::Value {
                 Sql::Real(v)
             }
         }
+        // A Rational binds as its canonical `"n/d"` text (no native exact-rational
+        // type on SQLite); canonical form ⇒ text-`=` is value-`=`.
+        Value::Rational(n, d) => Sql::Text(format!("{n}/{d}")),
         Value::Boolean(b) => Sql::Integer(*b as i64),
     }
 }

@@ -2262,6 +2262,18 @@ impl Emitter {
                     op: name,
                 })
             }
+            ProcType::Rational => {
+                let num_slot = self.gep_byte(base, byte_offset);
+                let den_slot = self.gep_byte(base, byte_offset + 16);
+                let num_name = format!("%{name_hint}.num");
+                let den_name = format!("%{name_hint}.den");
+                writeln!(self.body, "    {num_name} = load i128, ptr {num_slot}").unwrap();
+                writeln!(self.body, "    {den_name} = load i128, ptr {den_slot}").unwrap();
+                Ok(ValueRepr::Rational {
+                    num_op: num_name,
+                    den_op: den_name,
+                })
+            }
             ProcType::Text => {
                 let ptr_slot = self.gep_byte(base, byte_offset);
                 let len_slot = self.gep_byte(base, byte_offset + 8);
@@ -2796,6 +2808,7 @@ fn proc_type_from_kind_llvm(kind: u32) -> ProcType {
         k if k == kind_tag::BOOLEAN => ProcType::Boolean,
         k if k == kind_tag::CHARACTER => ProcType::Character,
         k if k == kind_tag::APPROXIMATE => ProcType::Approximate,
+        k if k == kind_tag::RATIONAL => ProcType::Rational,
         k if k == kind_tag::TEXT => ProcType::Text,
         other => unreachable!("unsupported attr kind {other} in Extract"),
     }

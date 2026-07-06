@@ -199,6 +199,7 @@ fn render_literal(lit: &Literal) -> String {
         Literal::Text(s) => format!("{s:?}"),
         Literal::Character(cp) => cp.to_string(),
         Literal::Approximate(bits) => format!("{:e}", f64::from_bits(*bits)),
+        Literal::Rational(n, d) => format!("{n}/{d}"),
         Literal::Boolean(b) => b.to_string(),
     }
 }
@@ -285,6 +286,9 @@ pub enum Literal {
     /// An `Approximate` value as its **canonical** IEEE-754 double bit pattern
     /// (`u64`, not `f64`, so the enum stays `Eq`). Binds/stores as SQL `REAL`.
     Approximate(u64),
+    /// A bounded `Rational` as its reduced `(numer, denom)` pair. Binds/stores
+    /// as canonical SQL `TEXT "n/d"`.
+    Rational(i128, i128),
     Boolean(bool),
 }
 
