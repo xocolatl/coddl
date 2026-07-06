@@ -258,18 +258,8 @@ impl Emitter {
         ] {
             writeln!(self.body, "declare void @{f}(i128, i128, i128, i128, ptr, ptr)").unwrap();
         }
-        // Rational -> Approximate: (num, den) -> double.
-        writeln!(
-            self.body,
-            "declare double @coddl_rational_to_approx(i128, i128)"
-        )
-        .unwrap();
-        // Integer -> Rational widening: (a, out_num, out_den).
-        writeln!(
-            self.body,
-            "declare void @coddl_rational_from_int(i64, ptr, ptr)"
-        )
-        .unwrap();
+        // `coddl_rational_to_approx` (Rational → double) is declared by the
+        // generic builtin-call path (`to_approximate` ∈ BUILTIN_EXTERNS).
         // RC retain/release — emitted for any heap `Text` (immortal literals
         // see `rc == IMMORTAL_RC` and no-op) as well as relations.
         writeln!(self.body, "declare void @coddl_rc_retain(ptr)").unwrap();

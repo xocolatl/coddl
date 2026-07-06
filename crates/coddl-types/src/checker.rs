@@ -6032,6 +6032,26 @@ mod tests {
     }
 
     #[test]
+    fn rational_conversions_bridge_the_types() {
+        // `to_approximate: Rational → Approximate`; `to_rational: Integer → Rational`.
+        // No implicit mixing, so `to_rational` is how an Integer joins a rational
+        // sum: `to_rational { self: 1 } + 1/2` is Rational + Rational.
+        let src = "oper main {} [ \
+                   let _a = to_approximate { self: 1/2 } = 0.5e0; \
+                   let _r = to_rational { self: 1 } + 1/2; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn mixed_integer_rational_arithmetic_diagnoses_t0043() {
+        // No implicit coercion: `1 + 1/2` mixes Integer and Rational — T0043.
+        let src = "oper main {} [ let _b = 1 + 1/2; ];";
+        assert!(codes(src).contains(&"T0043"));
+    }
+
+    #[test]
     fn arithmetic_on_non_integer_diagnoses_t0043() {
         let src = "oper main {} [ let b = 1 + \"x\"; ];";
         assert!(codes(src).contains(&"T0043"));

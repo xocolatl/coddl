@@ -74,16 +74,6 @@ pub unsafe extern "C" fn coddl_rational_from_ints(
     *out_den = d;
 }
 
-/// `Integer → Rational` widening: `a → (a, 1)`. (`to_rational` on an Integer.)
-///
-/// # Safety
-/// `out_num`/`out_den` must point at writable `i128` slots.
-#[no_mangle]
-pub unsafe extern "C" fn coddl_rational_from_int(a: i64, out_num: *mut i128, out_den: *mut i128) {
-    *out_num = a as i128;
-    *out_den = 1;
-}
-
 macro_rules! rational_binop {
     ($name:ident, $num:expr, $den:expr, $doc:literal) => {
         #[doc = $doc]

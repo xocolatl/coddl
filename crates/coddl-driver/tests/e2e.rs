@@ -1755,6 +1755,20 @@ oper main {} [
 }
 
 #[test]
+fn rational_conversions() {
+    // `to_approximate` bridges Rational → Approximate (`1/2` → `5e-1`);
+    // `to_rational` widens Integer → Rational, composing with rational `+`
+    // (`to_rational(1) + 1/2` = `3/2`).
+    let src = "\
+program conv;
+oper main {} [
+    write_relation { rel: Relation { {a: to_approximate { self: 1 / 2 }, r: to_rational { self: 1 } + 1/2} } };
+];
+";
+    run_both_backends_expect(src, "conv.cd", b"{a: 5e-1, r: 3/2}\n");
+}
+
+#[test]
 fn division_by_zero_traps() {
     // `/ 0` on Integers traps at runtime (no rational infinity, unlike
     // Approximate's ±Inf) — the program aborts with a clear message.

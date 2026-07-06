@@ -138,6 +138,27 @@ impl Builtins {
                 },
             );
         }
+        // `to_approximate { self: Rational } -> Approximate` — the explicit
+        // exact→inexact bridge (correctly-rounded float division; no implicit
+        // coercion). Runtime `coddl_rational_to_approx`.
+        b.register(
+            "to_approximate",
+            OperSig {
+                params: vec![("self".into(), ParamKind::Concrete(Type::Rational))],
+                return_type: Type::Approximate,
+                purity: Purity::Pure,
+            },
+        );
+        // `to_rational { self: Integer } -> Rational` — the widening for mixed
+        // arithmetic (`to_rational(1) + 1/2`). `(i, 1)`, already reduced.
+        b.register(
+            "to_rational",
+            OperSig {
+                params: vec![("self".into(), ParamKind::Concrete(Type::Integer))],
+                return_type: Type::Rational,
+                purity: Purity::Pure,
+            },
+        );
         b
     }
 

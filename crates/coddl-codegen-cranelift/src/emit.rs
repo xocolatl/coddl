@@ -249,28 +249,9 @@ fn declare_scalar_text_externs(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert(name.into(), id);
     }
-    // coddl_rational_to_approx(num: i128, den: i128) -> f64
-    {
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(types::I128));
-        sig.params.push(AbiParam::new(types::I128));
-        sig.returns.push(AbiParam::new(types::F64));
-        let id = obj
-            .declare_function("coddl_rational_to_approx", Linkage::Import, &sig)
-            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
-        funcs.insert("coddl_rational_to_approx".into(), id);
-    }
-    // coddl_rational_from_int(a: i64, out_num: ptr, out_den: ptr)
-    {
-        let mut sig = obj.make_signature();
-        sig.params.push(AbiParam::new(types::I64));
-        sig.params.push(AbiParam::new(ptr_ty));
-        sig.params.push(AbiParam::new(ptr_ty));
-        let id = obj
-            .declare_function("coddl_rational_from_int", Linkage::Import, &sig)
-            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
-        funcs.insert("coddl_rational_from_int".into(), id);
-    }
+    // `coddl_rational_to_approx` (the `to_approximate` builtin) is an ensure_extern'd
+    // `BUILTIN_EXTERN`, so it's declared via the function-table loop / `cranelift_signature`
+    // (which flattens the Rational param to two I128) — not here.
     // coddl_utf8_len(codepoint: i32) -> i64
     {
         let mut sig = obj.make_signature();
@@ -1021,6 +1002,11 @@ fn push_param_types(
         ProcType::Text | ProcType::Binary => {
             out.push(AbiParam::new(ptr_ty));
             out.push(AbiParam::new(types::I64));
+        }
+        // A `Rational` is a compound `(num, den)` — two I128s, like `Text`'s pair.
+        ProcType::Rational => {
+            out.push(AbiParam::new(types::I128));
+            out.push(AbiParam::new(types::I128));
         }
         ProcType::Unit => {} // no value at the ABI level
         ProcType::Tuple(heading) => {

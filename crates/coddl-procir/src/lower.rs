@@ -73,6 +73,15 @@ const BUILTIN_EXTERNS: &[BuiltinExtern] = &[
         params: &[("self", ProcType::Relation(HeadingId(0)))],
         return_type: ProcType::Integer,
     },
+    // `to_approximate { self: Rational } -> Approximate`. The Rational arg
+    // flattens to two i128 operands (`push_call_operands`); the return is a
+    // plain `double`, so the generic call path handles it.
+    BuiltinExtern {
+        surface: "to_approximate",
+        linkage: "coddl_rational_to_approx",
+        params: &[("self", ProcType::Rational)],
+        return_type: ProcType::Approximate,
+    },
 ];
 
 struct BuiltinExtern {
@@ -4953,6 +4962,35 @@ impl Lowerer {
         }
         if surface == "to_text" {
             return self.lower_to_text_call(call, self_val);
+        }
+        // `to_rational { self: Integer } -> Rational` is exactly `self / 1`, so
+        // reuse the exact-division op (widen → reduce → `(i, 1)`).
+        if surface == "to_rational" {
+            let self_v = self_val.unwrap_or_else(|| {
+                let arg_list = call.args().expect("typechecked call has an arg list");
+                let arg = arg_list
+                    .args()
+                    .find(|a| a.name().map(|t| t.text().to_string()).as_deref() == Some("self"))
+                    .expect("typechecked to_rational has a `self` arg");
+                self.lower_expr(&arg.value().expect("typechecked named arg has a value"))
+            });
+            let one = self.fresh_value();
+            self.record_type(one, ProcType::Integer);
+            self.insts.push(Inst::Const {
+                dst: one,
+                value: Const::Integer(1),
+                ty: ProcType::Integer,
+            });
+            let dst = self.fresh_value();
+            self.record_type(dst, ProcType::Rational);
+            self.insts.push(Inst::ScalarOp {
+                dst,
+                op: ScalarOp::RatioFromInts,
+                operand_type: ProcType::Integer,
+                lhs: self_v,
+                rhs: one,
+            });
+            return dst;
         }
         // The `write_line { template, args }` overload: fold the template like
         // `format`, then write the resulting `Text`. Only reached for the
