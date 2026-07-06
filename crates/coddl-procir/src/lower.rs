@@ -3669,7 +3669,10 @@ impl Lowerer {
                     BinaryOp::Add => ScalarBinOp::Add,
                     BinaryOp::Sub => ScalarBinOp::Sub,
                     BinaryOp::Mul => ScalarBinOp::Mul,
-                    BinaryOp::Div => ScalarBinOp::Div,
+                    // `div` (truncating integer division) pushes as SQL `/` on
+                    // integer columns. Exact `/` yields a Rational and does not
+                    // push as a scalar expr (declines → in-process).
+                    BinaryOp::IntDiv => ScalarBinOp::Div,
                     BinaryOp::Concat => ScalarBinOp::Concat,
                     _ => return None,
                 };
@@ -4032,7 +4035,9 @@ impl Lowerer {
             BinaryOp::Add => ScalarOp::Add,
             BinaryOp::Sub => ScalarOp::Sub,
             BinaryOp::Mul => ScalarOp::Mul,
-            BinaryOp::Div => ScalarOp::Div,
+            // `/` is exact division → Rational; `div` is truncating integer div.
+            BinaryOp::Div => ScalarOp::RatioFromInts,
+            BinaryOp::IntDiv => ScalarOp::Div,
             BinaryOp::Concat => ScalarOp::Concat,
             BinaryOp::Where
             | BinaryOp::Join
@@ -4060,6 +4065,8 @@ impl Lowerer {
             ScalarOp::Add | ScalarOp::Sub | ScalarOp::Mul | ScalarOp::Div => {
                 (ProcType::Integer, ProcType::Integer)
             }
+            // Exact `/`: two Integer operands, a Rational result.
+            ScalarOp::RatioFromInts => (ProcType::Integer, ProcType::Rational),
             ScalarOp::Concat => {
                 lhs = self.coerce_to_text(lhs);
                 rhs = self.coerce_to_text(rhs);

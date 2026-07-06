@@ -242,6 +242,13 @@ impl Emitter {
         // `coddl_utf8_len` for the length.
         writeln!(self.body, "declare ptr @coddl_char_to_text(i32)").unwrap();
         writeln!(self.body, "declare i64 @coddl_utf8_len(i32)").unwrap();
+        // Exact `/`: (a, b) -> reduced Rational written through two i128
+        // out-pointers (num, den).
+        writeln!(
+            self.body,
+            "declare void @coddl_rational_from_ints(i64, i64, ptr, ptr)"
+        )
+        .unwrap();
         // RC retain/release — emitted for any heap `Text` (immortal literals
         // see `rc == IMMORTAL_RC` and no-op) as well as relations.
         writeln!(self.body, "declare void @coddl_rc_retain(ptr)").unwrap();
@@ -1498,6 +1505,35 @@ impl Emitter {
             );
             return Ok(());
         }
+        // Exact `/`: two Integer (i64) operands → a reduced `Rational`. The
+        // runtime helper writes `(num, den)` through two i128 out-pointers
+        // (the reduce/normalize/trap can't be inlined). Produces a compound
+        // `ValueRepr::Rational`.
+        if matches!(op, ScalarOp::RatioFromInts) {
+            let lhs_op = self.scalar_op(lhs)?;
+            let rhs_op = self.scalar_op(rhs)?;
+            let num_slot = format!("%v{}.rns", dst.0);
+            let den_slot = format!("%v{}.rds", dst.0);
+            writeln!(self.body, "    {num_slot} = alloca i128").unwrap();
+            writeln!(self.body, "    {den_slot} = alloca i128").unwrap();
+            writeln!(
+                self.body,
+                "    call void @coddl_rational_from_ints(i64 {lhs_op}, i64 {rhs_op}, ptr {num_slot}, ptr {den_slot})"
+            )
+            .unwrap();
+            let num_name = format!("%v{}.num", dst.0);
+            let den_name = format!("%v{}.den", dst.0);
+            writeln!(self.body, "    {num_name} = load i128, ptr {num_slot}").unwrap();
+            writeln!(self.body, "    {den_name} = load i128, ptr {den_slot}").unwrap();
+            self.values.insert(
+                dst,
+                ValueRepr::Rational {
+                    num_op: num_name,
+                    den_op: den_name,
+                },
+            );
+            return Ok(());
+        }
         // Text operands aren't inline scalars — a Text cell/value is a
         // `(ptr, len)` pair, so `=`/`<>` route through the runtime's
         // byte comparison instead of `icmp`. (The typechecker only admits
@@ -1667,6 +1703,9 @@ impl Emitter {
                 );
             }
             ScalarOp::Concat => unreachable!("Concat handled before the inline-scalar path"),
+            ScalarOp::RatioFromInts => {
+                unreachable!("RatioFromInts handled before the inline-scalar path")
+            }
         }
         Ok(())
     }

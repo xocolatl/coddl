@@ -1714,16 +1714,56 @@ oper main {} [
 
 #[test]
 fn integer_division_truncates_toward_zero() {
-    // `5 / 2 = 2` (not 2.5): the row survives the predicate, observably
-    // confirming integer (truncating) division.
+    // `5 div 2 = 2` (not 2.5): `div` is truncating integer division; the row
+    // survives the predicate, observably confirming truncation.
     let src = "\
 program div_trunc;
 oper main {} [
     let r = Relation { {a: 5} };
-    write_relation { rel: r where a / 2 = 2 };
+    write_relation { rel: r where a div 2 = 2 };
 ];
 ";
     run_both_backends_expect(src, "div-trunc.cd", b"{a: 5}\n");
+}
+
+#[test]
+fn exact_division_produces_a_rational() {
+    // `/` on Integers is exact division → a reduced Rational (via the
+    // `coddl_rational_from_ints` runtime helper). `6/4` reduces to `3/2`.
+    let src = "\
+program exact_div;
+oper main {} [
+    write_relation { rel: Relation { {r: 6 / 4} } };
+];
+";
+    run_both_backends_expect(src, "exact-div.cd", b"{r: 3/2}\n");
+}
+
+#[test]
+fn division_by_zero_traps() {
+    // `/ 0` on Integers traps at runtime (no rational infinity, unlike
+    // Approximate's ±Inf) — the program aborts with a clear message.
+    for backend in ["llvm", "cranelift"] {
+        ensure_runtime_built();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("divzero.cd");
+        std::fs::write(
+            &path,
+            "program divzero;\noper main {} [ write_relation { rel: Relation { {r: 1 / 0} } }; ];\n",
+        )
+        .expect("write divzero.cd");
+        let out = coddl()
+            .args(["run", &format!("--backend={backend}")])
+            .arg(&path)
+            .output()
+            .expect("spawn coddl");
+        assert!(!out.status.success(), "1/0 should trap on {backend}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("division by zero"),
+            "expected a division-by-zero trap on {backend}, got stderr:\n{stderr}"
+        );
+    }
 }
 
 // ── extract (Phase 21) ────────────────────────────────────────────────

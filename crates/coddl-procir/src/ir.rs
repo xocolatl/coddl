@@ -558,11 +558,16 @@ pub enum ScalarOp {
     GtEq,
     And,
     Or,
-    /// `Integer × Integer → Integer`. `Div` truncates toward zero.
+    /// `Integer × Integer → Integer`. `Div` truncates toward zero (surface
+    /// `div`).
     Add,
     Sub,
     Mul,
     Div,
+    /// `Integer × Integer → Rational` — exact division (surface `/`). Builds a
+    /// reduced fraction via the `coddl_rational_from_ints` runtime helper;
+    /// produces a compound `ValueRepr::Rational`.
+    RatioFromInts,
     /// `Text × Text → Text` (operands normalized to Text by the lowerer, so a
     /// `Character` operand is converted via [`Inst::CharToText`] first).
     Concat,
@@ -982,6 +987,7 @@ impl fmt::Display for ScalarOp {
             ScalarOp::Sub => "sub",
             ScalarOp::Mul => "mul",
             ScalarOp::Div => "sdiv",
+            ScalarOp::RatioFromInts => "ratio_from_ints",
             ScalarOp::Concat => "concat",
         })
     }

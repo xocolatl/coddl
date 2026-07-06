@@ -22,10 +22,12 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 mod audit;
+pub mod rational;
 pub mod rc;
 pub mod relation;
 pub mod sqlite;
 
+pub use rational::coddl_rational_from_ints;
 pub use rc::{
     coddl_rc_alloc, coddl_rc_length, coddl_rc_release, coddl_rc_retain, coddl_seq_index,
     live_allocations, CoddlKind, CoddlRcHeader, HEADER_SIZE, IMMORTAL_RC,

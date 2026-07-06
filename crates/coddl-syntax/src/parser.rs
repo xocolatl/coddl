@@ -1176,8 +1176,10 @@ impl<'a> Parser<'a> {
     /// `where` (0) (and the relational ops, also at 0).
     fn peek_infix_prec(&self) -> Option<u8> {
         match self.current() {
-            // Multiplicative — binds tightest among infix ops.
+            // Multiplicative — binds tightest among infix ops. `div` (truncating
+            // integer division) is a textual infix keyword at this level.
             SyntaxKind::STAR | SyntaxKind::SLASH => Some(5),
+            SyntaxKind::IDENT if self.at_keyword("div") => Some(5),
             // Additive, plus text/character concatenation (`||`). Disjoint
             // operand types, so `||`'s rank among level-4 ops is immaterial.
             SyntaxKind::PLUS | SyntaxKind::MINUS | SyntaxKind::PIPE_PIPE => Some(4),

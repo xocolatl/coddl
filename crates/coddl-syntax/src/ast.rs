@@ -916,13 +916,18 @@ pub enum BinaryOp {
     Intersect,
     Union,
     Minus,
-    /// Scalar arithmetic: `Integer × Integer → Integer` (integer division
-    /// truncates toward zero). The symbolic `-` (token `MINUS`) is `Sub`,
-    /// distinct from the relational `minus` keyword (`Minus`).
+    /// Scalar arithmetic: `Integer × Integer → Integer`. The symbolic `-`
+    /// (token `MINUS`) is `Sub`, distinct from the relational `minus`
+    /// keyword (`Minus`).
     Add,
     Sub,
     Mul,
+    /// True division `/`: `Integer × Integer → Rational` (exact). Truncating
+    /// integer division is the `div` keyword (`IntDiv`).
     Div,
+    /// Truncating integer division `div`: `Integer × Integer → Integer`
+    /// (toward zero). Textual infix keyword at multiplicative precedence.
+    IntDiv,
     /// Concatenation `||`: `(Text|Character) × (Text|Character) → Text`.
     Concat,
 }
@@ -966,7 +971,7 @@ impl BinaryExpr {
                         if matches!(
                             tok.text(),
                             "and" | "or" | "where" | "join" | "times" | "compose" | "intersect"
-                                | "union" | "minus"
+                                | "union" | "minus" | "div"
                         ) =>
                     {
                         return Some(tok);
@@ -1004,6 +1009,7 @@ impl BinaryExpr {
                 "intersect" => BinaryOp::Intersect,
                 "union" => BinaryOp::Union,
                 "minus" => BinaryOp::Minus,
+                "div" => BinaryOp::IntDiv,
                 _ => return None,
             },
             _ => return None,

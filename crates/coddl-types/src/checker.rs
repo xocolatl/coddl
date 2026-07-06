@@ -3203,7 +3203,7 @@ impl TypeChecker {
             BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => {
                 self.check_ordering_op(bin, op, scope)
             }
-            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::IntDiv => {
                 self.check_arith_op(bin, op, scope)
             }
             BinaryOp::Concat => self.check_concat_op(bin, scope),
@@ -3611,8 +3611,9 @@ impl TypeChecker {
     }
 
     /// `lhs + rhs` / `lhs - rhs` / `lhs * rhs` / `lhs / rhs` — scalar
-    /// arithmetic. Both operands must be Integer (integer division truncates
-    /// toward zero). Result is Integer. T0043 on a non-Integer operand.
+    /// arithmetic. Both operands must be Integer. `+ - *` and `div` (truncating
+    /// integer division, toward zero) return Integer; `/` is **exact** division
+    /// and returns Rational. T0043 on a non-Integer operand.
     fn check_arith_op(&mut self, bin: &BinaryExpr, op: BinaryOp, scope: &mut Scope) -> Type {
         let lhs_ty = match bin.lhs() {
             Some(e) => self.check_expr(&e, scope),
@@ -3621,6 +3622,12 @@ impl TypeChecker {
         let rhs_ty = match bin.rhs() {
             Some(e) => self.check_expr(&e, scope),
             None => Type::Unknown,
+        };
+        // `/` yields an exact `Rational`; `+ - * div` yield `Integer`.
+        let result = if matches!(op, BinaryOp::Div) {
+            Type::Rational
+        } else {
+            Type::Integer
         };
         let supported = |t: &Type| matches!(t, Type::Integer | Type::Unknown);
         if !supported(&lhs_ty) || !supported(&rhs_ty) {
@@ -3631,7 +3638,7 @@ impl TypeChecker {
                 format!("`{opname}` requires Integer operands; got {lhs_ty} vs {rhs_ty}"),
             );
         }
-        Type::Integer
+        result
     }
 
     /// `lhs || rhs` — text/character concatenation. Each operand must be Text
@@ -4453,6 +4460,7 @@ fn op_display(op: BinaryOp) -> &'static str {
         BinaryOp::Sub => "-",
         BinaryOp::Mul => "*",
         BinaryOp::Div => "/",
+        BinaryOp::IntDiv => "div",
         BinaryOp::Concat => "||",
     }
 }
@@ -5974,13 +5982,24 @@ mod tests {
 
     #[test]
     fn integer_arithmetic_typechecks_clean() {
-        // `+ - * /` on Integer operands are all Integer-typed; no diagnostic.
+        // `+ - *` and `div` (truncating) on Integer operands are Integer-typed;
+        // exact `/` yields a Rational. All diagnostic-free.
         let src = "oper main {} [ \
                    let _a = 1 + 2; \
                    let _b = 5 - 3; \
                    let _c = 4 * 6; \
-                   let _d = 5 / 2; \
+                   let _d = 5 div 2; \
+                   let _e = 5 / 2; \
                    ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn exact_division_is_rational_int_div_is_integer() {
+        // `/` on Integers is exact → Rational; `div` is truncating → Integer.
+        // `1/2 = 0.5` (both Rational) and `7 div 2 = 3` (both Integer) check clean.
+        let src = "oper main {} [ let _a = 1 / 2 = 0.5; let _b = 7 div 2 = 3; ];";
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "{diags:?}");
     }

@@ -217,6 +217,19 @@ fn declare_scalar_text_externs(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert("coddl_char_to_text".into(), id);
     }
+    // coddl_rational_from_ints(a: i64, b: i64, out_num: ptr, out_den: ptr)
+    // — exact `/`, writes the reduced Rational through two i128 out-pointers.
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_rational_from_ints", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_rational_from_ints".into(), id);
+    }
     // coddl_utf8_len(codepoint: i32) -> i64
     {
         let mut sig = obj.make_signature();
@@ -1658,6 +1671,30 @@ fn emit_inst(
                 values.insert(*dst, ValueRepr::Text { ptr, len });
                 return Ok(());
             }
+            // Exact `/`: two Integer (I64) operands → a reduced `Rational`. The
+            // runtime helper writes `(num, den)` through two i128 out-pointers
+            // into a 32-byte stack slot (num @ 0, den @ 16); load them back into
+            // a compound `ValueRepr::Rational`.
+            if matches!(op, ScalarOp::RatioFromInts) {
+                use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
+                let a = scalar_value(values, lhs)?;
+                let b = scalar_value(values, rhs)?;
+                let ptr_ty = obj.target_config().pointer_type();
+                let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    32,
+                    4,
+                ));
+                let num_addr = builder.ins().stack_addr(ptr_ty, slot, 0);
+                let den_addr = builder.ins().stack_addr(ptr_ty, slot, 16);
+                let fid = funcs["coddl_rational_from_ints"];
+                let local = obj.declare_func_in_func(fid, builder.func);
+                builder.ins().call(local, &[a, b, num_addr, den_addr]);
+                let num = builder.ins().stack_load(types::I128, slot, 0);
+                let den = builder.ins().stack_load(types::I128, slot, 16);
+                values.insert(*dst, ValueRepr::Rational { num, den });
+                return Ok(());
+            }
             // Text operands are (ptr, len) pairs, not inline scalars, so
             // `=`/`<>` call the runtime byte comparison instead of `icmp`.
             // (Only Eq/NotEq reach here on Text; ordering is Integer-only.)
@@ -1765,6 +1802,9 @@ fn emit_inst(
                 }
                 ScalarOp::Concat => {
                     unreachable!("Concat handled before the inline-scalar path")
+                }
+                ScalarOp::RatioFromInts => {
+                    unreachable!("RatioFromInts handled before the inline-scalar path")
                 }
             };
             values.insert(*dst, ValueRepr::Scalar(result));
