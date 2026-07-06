@@ -1680,6 +1680,20 @@ impl Emitter {
                 );
                 Ok(())
             }
+            ProcType::Approximate => {
+                let slot = self.gep_byte(&src_op, offset as usize);
+                // The 8-byte cell holds the canonical double bits directly.
+                let name = format!("%v{}", dst.0);
+                writeln!(self.body, "    {name} = load double, ptr {slot}").unwrap();
+                self.values.insert(
+                    dst,
+                    ValueRepr::Scalar {
+                        ty: "double".to_string(),
+                        op: name,
+                    },
+                );
+                Ok(())
+            }
             ProcType::Text => {
                 let ptr_slot = self.gep_byte(&src_op, offset as usize);
                 let len_slot = self.gep_byte(&src_op, offset as usize + 8);
@@ -2359,6 +2373,12 @@ impl Emitter {
                 writeln!(self.body, "    {wide} = zext i32 {op} to i64").unwrap();
                 let slot = self.gep_byte(base, byte_offset);
                 writeln!(self.body, "    store i64 {wide}, ptr {slot}").unwrap();
+                Ok(())
+            }
+            ValueRepr::Scalar { ty, op } if ty == "double" => {
+                // `Approximate`: store the double's 8 (canonical) bytes.
+                let slot = self.gep_byte(base, byte_offset);
+                writeln!(self.body, "    store double {op}, ptr {slot}").unwrap();
                 Ok(())
             }
             ValueRepr::Scalar { ty, .. } => Err(LlvmEmitError::UnsupportedInst(format!(

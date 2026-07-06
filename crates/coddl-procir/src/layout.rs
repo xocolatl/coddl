@@ -12,16 +12,17 @@
 //! | `Integer`      | 8             | i64 host-endian                |
 //! | `Boolean`      | 8             | i64 (0 / 1); sub-word later    |
 //! | `Character`    | 8             | codepoint zero-extended to i64 |
+//! | `Approximate`  | 8             | IEEE-754 double (canonical bits)|
 //! | `Text`         | 16            | (ptr: usize, len: usize)       |
 //! | `Tuple H`      | Σ components  | inline sub-region (recursive)  |
 //!
 //! A `Tuple`-valued attribute is an inline nested cell: a contiguous
 //! sub-region whose width is the sum of its components' widths, with
 //! the sub-layout carried on [`AttrLayout::sub`] (0-based offsets).
-//! The remaining surface types (`Rational`, `Approximate`, `Binary`,
-//! `Byte`, nested `Relation`) are reserved — hitting one in
-//! `record_layout` is a "future phase will widen this" `unreachable!`;
-//! the typechecker keeps them out of relation cells.
+//! The remaining surface types (`Rational`, `Binary`, `Byte`, nested
+//! `Relation`) are reserved — hitting one in `record_layout` is a
+//! "future phase will widen this" `unreachable!`; the typechecker keeps
+//! them out of relation cells.
 //!
 //! See `docs/runtime.md` for the kind-tag → cell-encoding contract
 //! the runtime relies on (and which this module must match).
@@ -38,6 +39,9 @@ pub mod kind_tag {
     /// `Character` cell: the Unicode scalar value zero-extended into an
     /// 8-byte inline slot (SQL binds/stores it as an integer codepoint).
     pub const CHARACTER: u32 = 3;
+    /// `Approximate` cell: an IEEE-754 double stored inline as its 8 bytes
+    /// (canonical bits — see the lowerer's `canonical_approx_bits`).
+    pub const APPROXIMATE: u32 = 4;
     /// Inline nested-tuple cell: a contiguous sub-region; the descriptor
     /// attribute carries a pointer to the tuple's own heading descriptor.
     pub const TUPLE: u32 = 10;
@@ -66,8 +70,8 @@ pub struct RecordLayout {
 }
 
 /// Width in bytes for a supported leaf type. Returns `Some(n)` for
-/// Integer/Boolean/Character/Text; `None` for types the printer /
-/// drop walker doesn't yet handle.
+/// Integer/Boolean/Character/Approximate/Text; `None` for types the
+/// printer / drop walker doesn't yet handle.
 pub fn cell_width(ty: &Type) -> Option<u32> {
     match ty {
         Type::Integer => Some(8),
@@ -75,6 +79,9 @@ pub fn cell_width(ty: &Type) -> Option<u32> {
         // Character is an inline codepoint zero-extended into an 8-byte slot
         // (matching Integer/Boolean), so `cmp_cell`'s byte compare stays valid.
         Type::Character => Some(8),
+        // Approximate is an inline IEEE-754 double (8 bytes), stored as its
+        // canonical bits so `cmp_cell`'s byte compare is a proper equality.
+        Type::Approximate => Some(8),
         Type::Text => Some(16),
         // Inline nested-tuple cell: the sum of its components' widths,
         // recursively (`Tuple {}` → 0). `None` propagates if any component
@@ -97,6 +104,7 @@ pub fn cell_kind(ty: &Type) -> Option<u32> {
         Type::Integer => Some(kind_tag::INTEGER),
         Type::Boolean => Some(kind_tag::BOOLEAN),
         Type::Character => Some(kind_tag::CHARACTER),
+        Type::Approximate => Some(kind_tag::APPROXIMATE),
         Type::Text => Some(kind_tag::TEXT),
         Type::Tuple(_) => Some(kind_tag::TUPLE),
         _ => None,
@@ -106,8 +114,8 @@ pub fn cell_kind(ty: &Type) -> Option<u32> {
 /// Compute the layout for `heading`. A `Tuple`-valued attribute lays out as a
 /// contiguous inline sub-region (recursively), carried on `AttrLayout.sub` with
 /// 0-based offsets. Panics if any attribute uses a type the runtime layout
-/// doesn't cover yet (Rational, Approximate, Binary, Byte, nested
-/// Relation). The typechecker doesn't reject those — they just don't reach
+/// doesn't cover yet (Rational, Binary, Byte, nested Relation). The
+/// typechecker doesn't reject those — they just don't reach
 /// codegen inside a relation cell yet. When the cell layout widens, add cases
 /// to `cell_width`/`cell_kind`.
 pub fn record_layout(heading: &Heading) -> RecordLayout {
@@ -179,6 +187,17 @@ mod tests {
         assert_eq!(l.attrs[0].offset, 0);
         assert_eq!(l.attrs[0].width, 8);
         assert_eq!(l.attrs[0].kind, kind_tag::CHARACTER);
+    }
+
+    #[test]
+    fn single_approximate_attr_is_eight_byte_double_cell() {
+        let h = heading(&[("x", Type::Approximate)]);
+        let l = record_layout(&h);
+        assert_eq!(l.record_size, 8);
+        assert_eq!(l.attrs[0].name, "x");
+        assert_eq!(l.attrs[0].offset, 0);
+        assert_eq!(l.attrs[0].width, 8);
+        assert_eq!(l.attrs[0].kind, kind_tag::APPROXIMATE);
     }
 
     #[test]

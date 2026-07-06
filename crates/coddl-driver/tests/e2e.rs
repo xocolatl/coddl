@@ -3782,6 +3782,59 @@ fn char_where_inprocess_neq_byte_identical() {
     assert_eq!(llvm, run_char_where_inprocess(CHAR_WHERE_NEQ_SRC, "cranelift"));
 }
 
+const APPROX_WHERE_EQ_SRC: &str = "\
+program approx_where_eq;
+oper main {} [
+    let r = Relation { {x: 1.5e0, n: 1}, {x: 2.5e0, n: 2} };
+    let s = r where x = 1.5e0;
+    write_relation { rel: s };
+];
+";
+
+const APPROX_WHERE_NEQ_SRC: &str = "\
+program approx_where_neq;
+oper main {} [
+    let r = Relation { {x: 1.5e0, n: 1}, {x: 2.5e0, n: 2} };
+    let s = r where x <> 1.5e0;
+    write_relation { rel: s };
+];
+";
+
+fn run_approx_where_inprocess(src: &str, backend: &str) -> Vec<u8> {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("approx-where.cd");
+    std::fs::write(&path, src).expect("write src");
+    let out = coddl()
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&path)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "in-process approx where on {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+#[test]
+fn approx_where_inprocess_eq_byte_identical() {
+    // An `Approximate` relation cell round-trips through construction (the
+    // 8 canonical double bytes), the in-process `where` (AttrLoad + bitcast +
+    // `icmp` on the bits), and printing (`1.5e0`, exponent form).
+    let llvm = run_approx_where_inprocess(APPROX_WHERE_EQ_SRC, "llvm");
+    assert_eq!(llvm, b"{n: 1, x: 1.5e0}\n");
+    assert_eq!(llvm, run_approx_where_inprocess(APPROX_WHERE_EQ_SRC, "cranelift"));
+}
+
+#[test]
+fn approx_where_inprocess_neq_byte_identical() {
+    let llvm = run_approx_where_inprocess(APPROX_WHERE_NEQ_SRC, "llvm");
+    assert_eq!(llvm, b"{n: 2, x: 2.5e0}\n");
+    assert_eq!(llvm, run_approx_where_inprocess(APPROX_WHERE_NEQ_SRC, "cranelift"));
+}
+
 // ── field-init shorthand (`{ name }` ≡ `{ name: name }`) ─────────────
 
 fn run_shorthand(src: &str, backend: &str) -> Vec<u8> {

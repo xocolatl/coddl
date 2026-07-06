@@ -1772,6 +1772,12 @@ fn emit_inst(
                     values.insert(*dst, ValueRepr::Scalar(v));
                     Ok(())
                 }
+                ProcType::Approximate => {
+                    // The 8-byte cell holds the canonical double bits directly.
+                    let v = builder.ins().load(types::F64, flags, src_v, *offset as i32);
+                    values.insert(*dst, ValueRepr::Scalar(v));
+                    Ok(())
+                }
                 ProcType::Text => {
                     let ptr_ty = obj.target_config().pointer_type();
                     let ptr = builder.ins().load(ptr_ty, flags, src_v, *offset as i32);

@@ -236,6 +236,7 @@ struct CoddlHeadingDesc {
 | 1     | `Boolean`   | 8                  | `i64`; 0 = false, 1 = true          |
 | 2     | `Text`      | 16                 | `(ptr: *const u8, len: usize)`      |
 | 3     | `Character` | 8                  | Unicode codepoint (`u32`) zero-extended to `i64`; SQL binds/stores it as an integer codepoint |
+| 4     | `Approximate` | 8                | IEEE-754 double, canonical bits (NaN → one pattern, `−0` → `+0`); SQL binds/stores/reads as `REAL`, with SQLite `NULL` as the encoding of `NaN` (retrieval decodes `NULL`→`NaN`) |
 | 10    | `Tuple`     | Σ components       | inline sub-region; `sub` → nested descriptor (0-based offsets) |
 
 A `Tuple` cell is an **inline nested cell**: its components occupy a
@@ -329,6 +330,8 @@ dispatches on `CoddlAttrKind`:
 - `Integer` / `Boolean` — decimal / `true`/`false`.
 - `Character` — `'c'`, single-quoted, escaping non-printables (matching
   the `Character` literal syntax).
+- `Approximate` — exponent form (`1.5e0`), which re-reads as an
+  `Approximate` literal.
 - `Text` — `"..."` with the raw bytes inside.
 - Tuple / Relation cells — print as `{...}` placeholder. The
   recursive printer lands when Phase 20+ workflows demand it.
