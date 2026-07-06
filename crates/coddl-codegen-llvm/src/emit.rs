@@ -68,6 +68,12 @@ enum ValueRepr {
         ptr_op: String,
         len_op: String,
     },
+    /// A `Rational` value — a `(numer, denom)` pair of `i128`s (a compound,
+    /// like `Text`; 32-byte cell). Both operands are `i128` spellings.
+    Rational {
+        num_op: String,
+        den_op: String,
+    },
     /// Heading-canonical, name-sorted (matches the ProcIR
     /// `Inst::TupleLit::heading`'s `attrs()` order).
     Tuple {
@@ -85,6 +91,10 @@ impl ValueRepr {
             ValueRepr::Text { ptr_op, len_op } => {
                 out.push(format!("ptr {ptr_op}"));
                 out.push(format!("i64 {len_op}"));
+            }
+            ValueRepr::Rational { num_op, den_op } => {
+                out.push(format!("i128 {num_op}"));
+                out.push(format!("i128 {den_op}"));
             }
             ValueRepr::Tuple { fields } => {
                 for (_, f) in fields {
@@ -841,6 +851,22 @@ impl Emitter {
             }
             Inst::Const {
                 dst,
+                value: Const::Rational(n, d),
+                ty: ProcType::Rational,
+            } => {
+                // A Rational is a compound `(i128, i128)`; LLVM IR text accepts
+                // arbitrary-width integer decimals directly as immediates.
+                self.values.insert(
+                    *dst,
+                    ValueRepr::Rational {
+                        num_op: format!("{n}"),
+                        den_op: format!("{d}"),
+                    },
+                );
+                Ok(())
+            }
+            Inst::Const {
+                dst,
                 value: Const::Boolean(b),
                 ty: ProcType::Boolean,
             } => {
@@ -1280,6 +1306,16 @@ impl Emitter {
         }
     }
 
+    /// The `(num, den)` i128 operand spellings of a `Rational` value.
+    fn rational_ops(&self, v: &ValueId) -> Result<(String, String), LlvmEmitError> {
+        match self.values.get(v) {
+            Some(ValueRepr::Rational { num_op, den_op }) => Ok((num_op.clone(), den_op.clone())),
+            other => Err(LlvmEmitError::UnsupportedInst(format!(
+                "expected Rational value, got {other:?}"
+            ))),
+        }
+    }
+
     /// Emit the materialization call for one public relvar. Resolves
     /// `CODDL_<DB>_FILE` via `coddl_resolve_op_field` first, then calls
     /// `coddl_sqlite_relvar_init` with the (name, env-resolved path,
@@ -1520,6 +1556,41 @@ impl Emitter {
             };
             let dst_name = format!("%v{}", dst.0);
             writeln!(self.body, "    {dst_name} = icmp {cmp} i64 {lb}, {rb}").unwrap();
+            self.values.insert(
+                dst,
+                ValueRepr::Scalar {
+                    ty: "i1".to_string(),
+                    op: dst_name,
+                },
+            );
+            return Ok(());
+        }
+        // Rational `=`/`<>` on canonical `(num, den)` pairs: equal iff both
+        // components are equal (reduced form makes this value-equality). Compare
+        // each i128 and `and` them; `<>` is the negation. (Only Eq/NotEq here.)
+        if matches!(operand_type, ProcType::Rational) {
+            let (lnum, lden) = self.rational_ops(lhs)?;
+            let (rnum, rden) = self.rational_ops(rhs)?;
+            let neq = format!("%v{}.ne", dst.0);
+            let deq = format!("%v{}.de", dst.0);
+            writeln!(self.body, "    {neq} = icmp eq i128 {lnum}, {rnum}").unwrap();
+            writeln!(self.body, "    {deq} = icmp eq i128 {lden}, {rden}").unwrap();
+            let both = format!("%v{}.eq", dst.0);
+            writeln!(self.body, "    {both} = and i1 {neq}, {deq}").unwrap();
+            let dst_name = format!("%v{}", dst.0);
+            match op {
+                ScalarOp::Eq => {
+                    writeln!(self.body, "    {dst_name} = and i1 {both}, true").unwrap();
+                }
+                ScalarOp::NotEq => {
+                    writeln!(self.body, "    {dst_name} = xor i1 {both}, true").unwrap();
+                }
+                other => {
+                    return Err(LlvmEmitError::UnsupportedInst(format!(
+                        "operator {other:?} not supported on Rational"
+                    )))
+                }
+            }
             self.values.insert(
                 dst,
                 ValueRepr::Scalar {
@@ -2415,6 +2486,15 @@ impl Emitter {
                 writeln!(self.body, "    call void @coddl_rc_retain(ptr {ptr_op})").unwrap();
                 Ok(())
             }
+            // A `Rational` cell is `(num, den)` — two i128s at offset/offset+16.
+            // No refcount (i128s own no heap).
+            ValueRepr::Rational { num_op, den_op } => {
+                let slot_num = self.gep_byte(base, byte_offset);
+                let slot_den = self.gep_byte(base, byte_offset + 16);
+                writeln!(self.body, "    store i128 {num_op}, ptr {slot_num}").unwrap();
+                writeln!(self.body, "    store i128 {den_op}, ptr {slot_den}").unwrap();
+                Ok(())
+            }
             // Inline nested-tuple cell: store each component into the sub-region
             // at `byte_offset + sub_attr.offset`, recursing (the sub-layout gives
             // offsets; the `ValueRepr::Tuple` gives values, both name-canonical).
@@ -2612,6 +2692,11 @@ impl Emitter {
                         // `%.ret_len_out` param (see `emit_function`).
                         writeln!(self.body, "    store i64 {len_op}, ptr %.ret_len_out").unwrap();
                         writeln!(self.body, "    ret ptr {ptr_op}").unwrap();
+                    }
+                    ValueRepr::Rational { .. } => {
+                        return Err(LlvmEmitError::UnsupportedInst(
+                            "returning Rational by value not yet supported".into(),
+                        ));
                     }
                     ValueRepr::Tuple { .. } => {
                         return Err(LlvmEmitError::UnsupportedInst(

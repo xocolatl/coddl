@@ -3551,7 +3551,8 @@ impl TypeChecker {
     }
 
     /// `lhs = rhs` / `lhs <> rhs` — operands must share a scalar type
-    /// (Integer, Text, Character, Approximate, or Boolean for v1). Result is Boolean.
+    /// (Integer, Text, Character, Approximate, Rational, or Boolean for v1).
+    /// Result is Boolean.
     fn check_equality_op(&mut self, bin: &BinaryExpr, op: BinaryOp, scope: &mut Scope) -> Type {
         let lhs_ty = match bin.lhs() {
             Some(e) => self.check_expr(&e, scope),
@@ -3568,6 +3569,7 @@ impl TypeChecker {
                     | Type::Text
                     | Type::Character
                     | Type::Approximate
+                    | Type::Rational
                     | Type::Boolean
                     | Type::Unknown
             )
@@ -3578,7 +3580,7 @@ impl TypeChecker {
                 self.node_span(bin.syntax()),
                 "T0021",
                 format!(
-                    "`{opname}` operands must share a scalar type (Integer, Text, Character, Approximate, or Boolean); got {lhs_ty} vs {rhs_ty}"
+                    "`{opname}` operands must share a scalar type (Integer, Text, Character, Approximate, Rational, or Boolean); got {lhs_ty} vs {rhs_ty}"
                 ),
             );
         }
@@ -5895,6 +5897,21 @@ mod tests {
     fn approximate_integer_mismatch_diagnoses_t0021() {
         // `1.5e0 = 1` mixes Approximate with Integer — T0021 fires.
         let src = "oper main {} [ let _b = 1.5e0 = 1; ];";
+        assert!(codes(src).contains(&"T0021"));
+    }
+
+    #[test]
+    fn rational_equality_typechecks() {
+        // `=` and `<>` accept matching Rational operands (result Boolean); no T0021.
+        let src = "oper main {} [ let _a = 3.4 = 1.5; let _b = 3.4 <> 1.5; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn rational_integer_mismatch_diagnoses_t0021() {
+        // `3.4 = 1` mixes Rational with Integer — T0021 fires.
+        let src = "oper main {} [ let _b = 3.4 = 1; ];";
         assert!(codes(src).contains(&"T0021"));
     }
 

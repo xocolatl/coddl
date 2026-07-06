@@ -4892,9 +4892,10 @@ impl Lowerer {
                 let bits = decode_approximate_literal(token.text());
                 (Const::Approximate(bits), ProcType::Approximate)
             }
-            // RATIONAL_LIT lands here as the language exercises it. The
-            // typechecker already accepts it; lowering catches up when the
-            // numeric-cell representation lands.
+            SyntaxKind::RATIONAL_LIT => {
+                let (n, d) = decode_rational_literal(token.text());
+                (Const::Rational(n, d), ProcType::Rational)
+            }
             other => unreachable!("literal kind {other:?} not yet lowered"),
         };
         let dst = self.fresh_value();
@@ -5786,6 +5787,57 @@ fn decode_approximate_literal(text: &str) -> u64 {
     canonical_approx_bits(value)
 }
 
+/// Greatest common divisor of two `i128` magnitudes (Euclid). `gcd(0, x) = |x|`.
+fn gcd_i128(mut a: i128, mut b: i128) -> i128 {
+    a = a.abs();
+    b = b.abs();
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
+}
+
+/// Reduce `(n, d)` to the canonical `Rational`: `gcd(|n|, d) = 1`, `d > 0`,
+/// `0 → (0, 1)`. Panics on `d == 0` (division by zero is not a rational) — the
+/// caller (literal decode) can't produce a zero denominator, but keep it total.
+/// Every `Rational`-producing path funnels through this (compile-time here; the
+/// runtime mirror lands with arithmetic).
+fn reduce_rational(n: i128, d: i128) -> (i128, i128) {
+    assert!(d != 0, "rational with zero denominator");
+    if n == 0 {
+        return (0, 1);
+    }
+    let g = gcd_i128(n, d);
+    let (mut n, mut d) = (n / g, d / g);
+    if d < 0 {
+        n = -n;
+        d = -d;
+    }
+    (n, d)
+}
+
+/// Decode a `Rational` literal (`3.4`, `42.0`, `3.1415926`) — the lexer's
+/// `digits . digits` form — to its reduced `(numer, denom)` pair. `d.ffff` with
+/// `k` fractional digits → `(all_digits, 10^k)`, reduced. Underscores are
+/// decoration. Overflow of a pathological (>38-digit) literal traps.
+fn decode_rational_literal(text: &str) -> (i128, i128) {
+    let cleaned: String = text.chars().filter(|c| *c != '_').collect();
+    let (int_part, frac_part) = match cleaned.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (cleaned.as_str(), ""),
+    };
+    let digits: String = format!("{int_part}{frac_part}");
+    let numer: i128 = digits
+        .parse()
+        .expect("rational literal numerator exceeds i128");
+    let denom: i128 = 10i128
+        .checked_pow(frac_part.len() as u32)
+        .expect("rational literal denominator exceeds i128");
+    reduce_rational(numer, denom)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6551,6 +6603,32 @@ oper main {}\n\
                 |i| matches!(i, Inst::Const { value: Const::Character(c), .. } if *c == 'a' as u32)
             ),
             "char literal lowers to Const::Character"
+        );
+    }
+
+    #[test]
+    fn rational_literal_decodes_to_reduced_pair() {
+        assert_eq!(decode_rational_literal("3.4"), (17, 5));
+        assert_eq!(decode_rational_literal("42.0"), (42, 1));
+        assert_eq!(decode_rational_literal("0.5"), (1, 2));
+        assert_eq!(decode_rational_literal("3.1415926"), (15707963, 5000000));
+        assert_eq!(decode_rational_literal("1_000.0"), (1000, 1));
+        // gcd/normalize edge: already-canonical stays; zero is (0,1).
+        assert_eq!(decode_rational_literal("0.0"), (0, 1));
+    }
+
+    #[test]
+    fn rational_literal_lowers_to_const_rational() {
+        let src = "oper main {} [ let _r = 3.4; ];";
+        let out = lower(src, FileId(0));
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let m = out.module.expect("module");
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        assert!(
+            main.blocks[0].insts.iter().any(
+                |i| matches!(i, Inst::Const { value: Const::Rational(n, d), .. } if *n == 17 && *d == 5)
+            ),
+            "rational literal lowers to Const::Rational(17, 5)"
         );
     }
 

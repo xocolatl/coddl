@@ -606,6 +606,10 @@ pub enum Const {
     /// to one quiet-NaN pattern and `−0.0` to `+0.0` on ingest, so bit
     /// equality is a proper (reflexive) equality. `double` at the ABI.
     Approximate(u64),
+    /// A bounded exact `Rational` as a **reduced** `(numer, denom)` pair
+    /// (`gcd(|n|,d) = 1`, `d > 0`, `0 = (0,1)`). Two `i128`s — a compound
+    /// value at the ABI (like `Text`'s `(ptr, len)`), 32-byte cell.
+    Rational(i128, i128),
     /// `true` / `false` — Boolean literal value.
     Boolean(bool),
     /// The `Tuple {}` value — produced where the source had `{}` or
@@ -709,6 +713,7 @@ impl fmt::Display for Const {
             },
             // Print the exponent form so it re-reads as an `Approximate` literal.
             Const::Approximate(bits) => write!(f, "{:e}", f64::from_bits(*bits)),
+            Const::Rational(n, d) => write!(f, "{n}/{d}"),
             Const::Boolean(b) => f.write_str(if *b { "true" } else { "false" }),
             Const::Unit => f.write_str("{}"),
         }

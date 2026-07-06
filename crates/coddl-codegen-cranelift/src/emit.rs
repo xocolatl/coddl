@@ -1051,6 +1051,12 @@ enum ValueRepr {
         ptr: CrValue,
         len: CrValue,
     },
+    /// A `Rational` value — a `(numer, denom)` pair of `I128`s (a compound,
+    /// like `Text`; 32-byte cell).
+    Rational {
+        num: CrValue,
+        den: CrValue,
+    },
     /// Compile-time grouping over per-field `ValueRepr`s, in canonical
     /// heading order. Flattens recursively into leaf operands at ABI
     /// boundaries.
@@ -1069,6 +1075,10 @@ impl ValueRepr {
             ValueRepr::Text { ptr, len } => {
                 out.push(*ptr);
                 out.push(*len);
+            }
+            ValueRepr::Rational { num, den } => {
+                out.push(*num);
+                out.push(*den);
             }
             ValueRepr::Tuple { fields } => {
                 for (_, f) in fields {
@@ -1340,6 +1350,18 @@ fn emit_inst(
             // round-tripping a canonical NaN / signed zero keeps its bits.
             let v = builder.ins().f64const(f64::from_bits(*bits));
             values.insert(*dst, ValueRepr::Scalar(v));
+            Ok(())
+        }
+        Inst::Const {
+            dst,
+            value: Const::Rational(n, d),
+            ty: ProcType::Rational,
+        } => {
+            // A Rational is a compound `(I128, I128)`; `iconst` is Imm64-only,
+            // so build each i128 from its lo/hi 64-bit halves via `iconcat`.
+            let num = i128_const(builder, *n);
+            let den = i128_const(builder, *d);
+            values.insert(*dst, ValueRepr::Rational { num, den });
             Ok(())
         }
         Inst::Const {
@@ -1685,6 +1707,29 @@ fn emit_inst(
                     }
                 };
                 let result = builder.ins().icmp(cc, lb, rb);
+                values.insert(*dst, ValueRepr::Scalar(result));
+                return Ok(());
+            }
+            // Rational `=`/`<>` on canonical `(num, den)` I128 pairs: equal iff
+            // both components are equal (reduced form ⇒ value-equality). `<>` is
+            // the negation. (Only Eq/NotEq reach here on Rational.)
+            if matches!(operand_type, ProcType::Rational) {
+                use cranelift_codegen::ir::condcodes::IntCC;
+                let (lnum, lden) = rational_value(values, lhs)?;
+                let (rnum, rden) = rational_value(values, rhs)?;
+                let neq = builder.ins().icmp(IntCC::Equal, lnum, rnum);
+                let deq = builder.ins().icmp(IntCC::Equal, lden, rden);
+                let both = builder.ins().band(neq, deq);
+                let result = match op {
+                    ScalarOp::Eq => both,
+                    // Cranelift I8 boolean: xor with 1 negates the low bit.
+                    ScalarOp::NotEq => builder.ins().bxor_imm(both, 1),
+                    other => {
+                        return Err(CraneliftEmitError::UnsupportedInst(format!(
+                            "operator {other:?} not supported on Rational"
+                        )))
+                    }
+                };
                 values.insert(*dst, ValueRepr::Scalar(result));
                 return Ok(());
             }
@@ -2534,6 +2579,26 @@ fn text_value(
     }
 }
 
+/// Materialize an `i128` constant. `iconst` only holds 64 bits, so build the
+/// value from its lo/hi halves with `iconcat`.
+fn i128_const(builder: &mut FunctionBuilder<'_>, value: i128) -> CrValue {
+    let lo = builder.ins().iconst(types::I64, value as u64 as i64);
+    let hi = builder.ins().iconst(types::I64, (value >> 64) as i64);
+    builder.ins().iconcat(lo, hi)
+}
+
+fn rational_value(
+    values: &HashMap<ValueId, ValueRepr>,
+    v: &ValueId,
+) -> Result<(CrValue, CrValue), CraneliftEmitError> {
+    match values.get(v) {
+        Some(ValueRepr::Rational { num, den }) => Ok((*num, *den)),
+        _ => Err(CraneliftEmitError::UnsupportedInst(format!(
+            "expected Rational value at {v:?}"
+        ))),
+    }
+}
+
 /// Map a scalar `ProcType` to its `CoddlAttrKind` tag for a `CoddlParam`.
 fn kind_tag_for_cl(ty: &ProcType) -> Result<u32, CraneliftEmitError> {
     use coddl_procir::kind_tag;
@@ -2580,6 +2645,13 @@ fn store_attr(
             // Immortal literals no-op; the lowerer balances an owned temp's
             // producer reference; the drop walker / dedup release the cell.
             builder.ins().call(retain_ref, &[*ptr]);
+            Ok(())
+        }
+        // A `Rational` cell is `(num, den)` — two I128s at offset/offset+16.
+        // No refcount (i128s own no heap).
+        ValueRepr::Rational { num, den } => {
+            builder.ins().store(flags, *num, payload, byte_offset);
+            builder.ins().store(flags, *den, payload, byte_offset + 16);
             Ok(())
         }
         // Inline nested-tuple cell: store each component into the sub-region at
@@ -2652,6 +2724,11 @@ fn emit_terminator(
                     .ins()
                     .store(MemFlags::trusted(), *len, len_out, 0);
                 builder.ins().return_(&[*ptr]);
+            }
+            Some(ValueRepr::Rational { .. }) => {
+                return Err(CraneliftEmitError::UnsupportedInst(
+                    "returning Rational by value not yet supported".into(),
+                ));
             }
             Some(ValueRepr::Tuple { .. }) | None => {
                 return Err(CraneliftEmitError::UnsupportedInst(format!(

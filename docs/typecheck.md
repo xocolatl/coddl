@@ -436,10 +436,12 @@ each `parse_<x>` has a corresponding `check_<x>`.
   `Inst::WriteRelation`'s `heading_id` field.
 - **`check_binary_expr`** — dispatches on the parsed `BinaryOp`:
   - **Comparison (`=`, `<>`)**: operands must share a scalar type
-    (Integer, Text, Character, Approximate, or Boolean for v1). Result
-    is `Boolean`. T0021 on mismatch. `Approximate` `=` is
+    (Integer, Text, Character, Approximate, Rational, or Boolean for
+    v1). Result is `Boolean`. T0021 on mismatch. `Approximate` `=` is
     canonicalized bit-equality (NaN → one value, `−0.0` = `+0.0`), not
     IEEE `oeq` — so it stays reflexive for dedup/keys (RM Pro 3).
+    `Rational` `=` compares the reduced `(numer, denom)` pair (canonical
+    lowest-terms form ⇒ value-equality).
   - **Ordering (`<`, `>`, `<=`, `>=`)**: both operands must be
     Integer. Result is `Boolean`. T0021 otherwise.
   - **Logical (`and`, `or`)**: both operands must be Boolean.

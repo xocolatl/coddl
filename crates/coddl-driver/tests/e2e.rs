@@ -1612,6 +1612,22 @@ oper main {} [
 }
 
 #[test]
+fn rational_equality_prints_boolean() {
+    // `3.4 = 3.4` and `3.4 = 1.5` compare the reduced `(num,den)` i128 pairs
+    // (two `icmp` + `and`); the Boolean results interpolate.
+    let src = "\
+program rat_eq;
+oper main {} [
+    let same = 3.4 = 3.4;
+    let diff = 3.4 = 1.5;
+    let message = format { template: f\"{same} {diff}\", args: { same: same, diff: diff } };
+    write_line { message };
+];
+";
+    run_both_backends_expect(src, "rat-eq.cd", b"true false\n");
+}
+
+#[test]
 fn format_interpolates_an_integer() {
     // An `Integer` placeholder exercises the `to_text { self: Integer }`
     // overload → `coddl_int_to_text` end to end (overloading across types).
