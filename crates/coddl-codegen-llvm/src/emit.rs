@@ -1775,6 +1775,24 @@ impl Emitter {
                 );
                 Ok(())
             }
+            ProcType::Rational => {
+                // The 32-byte cell holds two canonical i128s: num @ offset,
+                // den @ offset+16.
+                let num_slot = self.gep_byte(&src_op, offset as usize);
+                let den_slot = self.gep_byte(&src_op, offset as usize + 16);
+                let num_name = format!("%v{}.num", dst.0);
+                let den_name = format!("%v{}.den", dst.0);
+                writeln!(self.body, "    {num_name} = load i128, ptr {num_slot}").unwrap();
+                writeln!(self.body, "    {den_name} = load i128, ptr {den_slot}").unwrap();
+                self.values.insert(
+                    dst,
+                    ValueRepr::Rational {
+                        num_op: num_name,
+                        den_op: den_name,
+                    },
+                );
+                Ok(())
+            }
             ProcType::Text => {
                 let ptr_slot = self.gep_byte(&src_op, offset as usize);
                 let len_slot = self.gep_byte(&src_op, offset as usize + 8);

@@ -3983,6 +3983,59 @@ fn approx_where_inprocess_neq_byte_identical() {
     assert_eq!(llvm, run_approx_where_inprocess(APPROX_WHERE_NEQ_SRC, "cranelift"));
 }
 
+const RAT_WHERE_EQ_SRC: &str = "\
+program rat_where_eq;
+oper main {} [
+    let r = Relation { {q: 3.4, n: 1}, {q: 1.5, n: 2} };
+    let s = r where q = 3.4;
+    write_relation { rel: s };
+];
+";
+
+const RAT_WHERE_NEQ_SRC: &str = "\
+program rat_where_neq;
+oper main {} [
+    let r = Relation { {q: 3.4, n: 1}, {q: 1.5, n: 2} };
+    let s = r where q <> 3.4;
+    write_relation { rel: s };
+];
+";
+
+fn run_rat_where_inprocess(src: &str, backend: &str) -> Vec<u8> {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("rat-where.cd");
+    std::fs::write(&path, src).expect("write src");
+    let out = coddl()
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&path)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "in-process rational where on {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+#[test]
+fn rat_where_inprocess_eq_byte_identical() {
+    // A `Rational` relation cell round-trips through construction (two canonical
+    // i128s), the in-process `where` (AttrLoad + component `icmp`), and printing
+    // (`17/5`, reduced). `3.4` reduces to `(17,5)`.
+    let llvm = run_rat_where_inprocess(RAT_WHERE_EQ_SRC, "llvm");
+    assert_eq!(llvm, b"{n: 1, q: 17/5}\n");
+    assert_eq!(llvm, run_rat_where_inprocess(RAT_WHERE_EQ_SRC, "cranelift"));
+}
+
+#[test]
+fn rat_where_inprocess_neq_byte_identical() {
+    let llvm = run_rat_where_inprocess(RAT_WHERE_NEQ_SRC, "llvm");
+    assert_eq!(llvm, b"{n: 2, q: 3/2}\n");
+    assert_eq!(llvm, run_rat_where_inprocess(RAT_WHERE_NEQ_SRC, "cranelift"));
+}
+
 // ── field-init shorthand (`{ name }` ≡ `{ name: name }`) ─────────────
 
 fn run_shorthand(src: &str, backend: &str) -> Vec<u8> {

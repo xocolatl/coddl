@@ -1823,6 +1823,16 @@ fn emit_inst(
                     values.insert(*dst, ValueRepr::Scalar(v));
                     Ok(())
                 }
+                ProcType::Rational => {
+                    // The 32-byte cell holds two canonical I128s: num @ offset,
+                    // den @ offset+16.
+                    let num = builder.ins().load(types::I128, flags, src_v, *offset as i32);
+                    let den = builder
+                        .ins()
+                        .load(types::I128, flags, src_v, *offset as i32 + 16);
+                    values.insert(*dst, ValueRepr::Rational { num, den });
+                    Ok(())
+                }
                 ProcType::Text => {
                     let ptr_ty = obj.target_config().pointer_type();
                     let ptr = builder.ins().load(ptr_ty, flags, src_v, *offset as i32);
