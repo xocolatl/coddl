@@ -3791,6 +3791,22 @@ impl Lowerer {
                 }
             }
             Expr::BoolLit(b) => b.value().map(RelLiteral::Boolean),
+            // Exact `/` of two Integer literals is a compile-time Rational
+            // constant. Fold it locally so a `where a = 2/3` predicate can push
+            // (bound as `'2/3'` TEXT) — the division can never be a SQL op (the
+            // column is `TEXT "n/d"`; SQL `/` would be integer division). This
+            // is the idiomatic way to write a rational constant (there is no
+            // `2/3` literal token), so folding it is what makes such predicates
+            // pushable instead of hitting the in-process pushdown gap.
+            Expr::Binary(b) if b.op_kind() == Some(BinaryOp::Div) => {
+                let n = int_literal_i128(&b.lhs()?)?;
+                let d = int_literal_i128(&b.rhs()?)?;
+                if d == 0 {
+                    return None; // `2/0` is not a rational — decline the fold
+                }
+                let (n, d) = reduce_rational(n, d);
+                Some(RelLiteral::Rational(n, d))
+            }
             _ => None,
         }
     }
@@ -5833,6 +5849,18 @@ fn decode_approximate_literal(text: &str) -> u64 {
     let cleaned: String = text.chars().filter(|c| *c != '_').collect();
     let value: f64 = cleaned.parse().expect("lexer validated the approximate literal");
     canonical_approx_bits(value)
+}
+
+/// If `expr` is an integer literal, its value widened to `i128`; else `None`.
+/// Used to constant-fold `<int> / <int>` rational constants in the pushdown path.
+fn int_literal_i128(expr: &Expr) -> Option<i128> {
+    if let Expr::Literal(lit) = expr {
+        let tok = lit.token()?;
+        if tok.kind() == SyntaxKind::INTEGER_LIT {
+            return Some(parse_integer_literal(tok.text()) as i128);
+        }
+    }
+    None
 }
 
 /// Greatest common divisor of two `i128` magnitudes (Euclid). `gcd(0, x) = |x|`.

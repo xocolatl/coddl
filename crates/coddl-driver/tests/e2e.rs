@@ -3964,6 +3964,48 @@ fn pushed_rational_where_binds_a_text_param() {
     }
 }
 
+#[test]
+fn pushed_rational_where_folds_a_division() {
+    // `Rats where r = 34/10` — the RHS is a `/` *expression*, not a literal
+    // token. It's a compile-time-constant Rational, so `literal_value` folds it
+    // (`34/10` → reduced `17/5`) locally and the predicate pushes as
+    // `WHERE "r" = '17/5'` — the division can never be a SQL op. (Without the
+    // fold this hit the in-process pushdown-gap panic.)
+    for backend in ["llvm", "cranelift"] {
+        ensure_runtime_built();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = seed_rats_fixtures(tmp.path());
+        let cd = tmp.path().join("rwf.cd");
+        std::fs::write(
+            &cd,
+            "program rwf;\n\
+             database rats;\n\
+             public relvar Rats { id: Integer, r: Rational } key { id };\n\
+             oper main {} [ let row = transaction [ extract (Rats where r = 34/10) ]; let ok = row.r = 17/5; write_line { message: format { template: f\"{ok}\", args: { ok: ok } } }; ];\n",
+        )
+        .expect("write rwf.cd");
+        let log = tmp.path().join("audit.log");
+        let out = coddl()
+            .env("CODDL_RATS_FILE", &db)
+            .env("CODDL_AUDIT_LOG", &log)
+            .args(["run", &format!("--backend={backend}")])
+            .arg(&cd)
+            .output()
+            .expect("spawn coddl");
+        assert!(
+            out.status.success(),
+            "pushed folded rational where on {backend} failed: stderr=\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"true\n", "on {backend}");
+        let log_txt = std::fs::read_to_string(&log).expect("read audit log");
+        assert!(
+            log_txt.contains(r#"WHERE "r" = '17/5'"#),
+            "expected `34/10` folded to `'17/5'` and pushed on {backend}, got:\n{log_txt}"
+        );
+    }
+}
+
 /// In-process Text `where` over an in-memory relation literal (not relvar-
 /// rooted, so the cut declines) routes the comparison through the runtime's
 /// `coddl_text_eq` byte compare. Output is sealed in `{n, name}` order.

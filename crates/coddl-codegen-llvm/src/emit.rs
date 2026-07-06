@@ -1525,8 +1525,8 @@ impl Emitter {
             let rhs_op = self.scalar_op(rhs)?;
             let num_slot = format!("%v{}.rns", dst.0);
             let den_slot = format!("%v{}.rds", dst.0);
-            writeln!(self.body, "    {num_slot} = alloca i128").unwrap();
-            writeln!(self.body, "    {den_slot} = alloca i128").unwrap();
+            writeln!(self.body, "    {num_slot} = alloca i128, align 16").unwrap();
+            writeln!(self.body, "    {den_slot} = alloca i128, align 16").unwrap();
             writeln!(
                 self.body,
                 "    call void @coddl_rational_from_ints(i64 {lhs_op}, i64 {rhs_op}, ptr {num_slot}, ptr {den_slot})"
@@ -1534,8 +1534,8 @@ impl Emitter {
             .unwrap();
             let num_name = format!("%v{}.num", dst.0);
             let den_name = format!("%v{}.den", dst.0);
-            writeln!(self.body, "    {num_name} = load i128, ptr {num_slot}").unwrap();
-            writeln!(self.body, "    {den_name} = load i128, ptr {den_slot}").unwrap();
+            writeln!(self.body, "    {num_name} = load i128, ptr {num_slot}, align 8").unwrap();
+            writeln!(self.body, "    {den_name} = load i128, ptr {den_slot}, align 8").unwrap();
             self.values.insert(
                 dst,
                 ValueRepr::Rational {
@@ -1559,8 +1559,8 @@ impl Emitter {
             let (n2, d2) = self.rational_ops(rhs)?;
             let num_slot = format!("%v{}.rns", dst.0);
             let den_slot = format!("%v{}.rds", dst.0);
-            writeln!(self.body, "    {num_slot} = alloca i128").unwrap();
-            writeln!(self.body, "    {den_slot} = alloca i128").unwrap();
+            writeln!(self.body, "    {num_slot} = alloca i128, align 16").unwrap();
+            writeln!(self.body, "    {den_slot} = alloca i128, align 16").unwrap();
             writeln!(
                 self.body,
                 "    call void @{helper}(i128 {n1}, i128 {d1}, i128 {n2}, i128 {d2}, ptr {num_slot}, ptr {den_slot})"
@@ -1568,8 +1568,8 @@ impl Emitter {
             .unwrap();
             let num_name = format!("%v{}.num", dst.0);
             let den_name = format!("%v{}.den", dst.0);
-            writeln!(self.body, "    {num_name} = load i128, ptr {num_slot}").unwrap();
-            writeln!(self.body, "    {den_name} = load i128, ptr {den_slot}").unwrap();
+            writeln!(self.body, "    {num_name} = load i128, ptr {num_slot}, align 8").unwrap();
+            writeln!(self.body, "    {den_name} = load i128, ptr {den_slot}, align 8").unwrap();
             self.values.insert(
                 dst,
                 ValueRepr::Rational {
@@ -1870,8 +1870,8 @@ impl Emitter {
                 let den_slot = self.gep_byte(&src_op, offset as usize + 16);
                 let num_name = format!("%v{}.num", dst.0);
                 let den_name = format!("%v{}.den", dst.0);
-                writeln!(self.body, "    {num_name} = load i128, ptr {num_slot}").unwrap();
-                writeln!(self.body, "    {den_name} = load i128, ptr {den_slot}").unwrap();
+                writeln!(self.body, "    {num_name} = load i128, ptr {num_slot}, align 8").unwrap();
+                writeln!(self.body, "    {den_name} = load i128, ptr {den_slot}, align 8").unwrap();
                 self.values.insert(
                     dst,
                     ValueRepr::Rational {
@@ -2355,8 +2355,8 @@ impl Emitter {
                 let den_slot = self.gep_byte(base, byte_offset + 16);
                 let num_name = format!("%{name_hint}.num");
                 let den_name = format!("%{name_hint}.den");
-                writeln!(self.body, "    {num_name} = load i128, ptr {num_slot}").unwrap();
-                writeln!(self.body, "    {den_name} = load i128, ptr {den_slot}").unwrap();
+                writeln!(self.body, "    {num_name} = load i128, ptr {num_slot}, align 8").unwrap();
+                writeln!(self.body, "    {den_name} = load i128, ptr {den_slot}, align 8").unwrap();
                 Ok(ValueRepr::Rational {
                     num_op: num_name,
                     den_op: den_name,
@@ -2609,8 +2609,8 @@ impl Emitter {
             ValueRepr::Rational { num_op, den_op } => {
                 let slot_num = self.gep_byte(base, byte_offset);
                 let slot_den = self.gep_byte(base, byte_offset + 16);
-                writeln!(self.body, "    store i128 {num_op}, ptr {slot_num}").unwrap();
-                writeln!(self.body, "    store i128 {den_op}, ptr {slot_den}").unwrap();
+                writeln!(self.body, "    store i128 {num_op}, ptr {slot_num}, align 8").unwrap();
+                writeln!(self.body, "    store i128 {den_op}, ptr {slot_den}, align 8").unwrap();
                 Ok(())
             }
             // Inline nested-tuple cell: store each component into the sub-region
