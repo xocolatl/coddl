@@ -11,16 +11,17 @@
 //! |----------------|---------------|--------------------------------|
 //! | `Integer`      | 8             | i64 host-endian                |
 //! | `Boolean`      | 8             | i64 (0 / 1); sub-word later    |
+//! | `Character`    | 8             | codepoint zero-extended to i64 |
 //! | `Text`         | 16            | (ptr: usize, len: usize)       |
 //! | `Tuple H`      | Σ components  | inline sub-region (recursive)  |
 //!
 //! A `Tuple`-valued attribute is an inline nested cell: a contiguous
 //! sub-region whose width is the sum of its components' widths, with
 //! the sub-layout carried on [`AttrLayout::sub`] (0-based offsets).
-//! The remaining surface types (`Rational`, `Approximate`,
-//! `Character`, `Binary`, `Byte`, nested `Relation`) are reserved —
-//! hitting one in `record_layout` is a "future phase will widen this"
-//! `unreachable!`; the typechecker keeps them out of relation cells.
+//! The remaining surface types (`Rational`, `Approximate`, `Binary`,
+//! `Byte`, nested `Relation`) are reserved — hitting one in
+//! `record_layout` is a "future phase will widen this" `unreachable!`;
+//! the typechecker keeps them out of relation cells.
 //!
 //! See `docs/runtime.md` for the kind-tag → cell-encoding contract
 //! the runtime relies on (and which this module must match).
@@ -34,6 +35,9 @@ pub mod kind_tag {
     pub const INTEGER: u32 = 0;
     pub const BOOLEAN: u32 = 1;
     pub const TEXT: u32 = 2;
+    /// `Character` cell: the Unicode scalar value zero-extended into an
+    /// 8-byte inline slot (SQL binds/stores it as an integer codepoint).
+    pub const CHARACTER: u32 = 3;
     /// Inline nested-tuple cell: a contiguous sub-region; the descriptor
     /// attribute carries a pointer to the tuple's own heading descriptor.
     pub const TUPLE: u32 = 10;
@@ -61,13 +65,16 @@ pub struct RecordLayout {
     pub record_size: u32,
 }
 
-/// Width in bytes for a Phase-19-supported leaf type. Returns
-/// `Some(n)` for Integer/Boolean/Text; `None` for types Phase 19's
-/// printer / drop walker doesn't yet handle.
+/// Width in bytes for a supported leaf type. Returns `Some(n)` for
+/// Integer/Boolean/Character/Text; `None` for types the printer /
+/// drop walker doesn't yet handle.
 pub fn cell_width(ty: &Type) -> Option<u32> {
     match ty {
         Type::Integer => Some(8),
         Type::Boolean => Some(8),
+        // Character is an inline codepoint zero-extended into an 8-byte slot
+        // (matching Integer/Boolean), so `cmp_cell`'s byte compare stays valid.
+        Type::Character => Some(8),
         Type::Text => Some(16),
         // Inline nested-tuple cell: the sum of its components' widths,
         // recursively (`Tuple {}` → 0). `None` propagates if any component
@@ -89,6 +96,7 @@ pub fn cell_kind(ty: &Type) -> Option<u32> {
     match ty {
         Type::Integer => Some(kind_tag::INTEGER),
         Type::Boolean => Some(kind_tag::BOOLEAN),
+        Type::Character => Some(kind_tag::CHARACTER),
         Type::Text => Some(kind_tag::TEXT),
         Type::Tuple(_) => Some(kind_tag::TUPLE),
         _ => None,
@@ -98,7 +106,7 @@ pub fn cell_kind(ty: &Type) -> Option<u32> {
 /// Compute the layout for `heading`. A `Tuple`-valued attribute lays out as a
 /// contiguous inline sub-region (recursively), carried on `AttrLayout.sub` with
 /// 0-based offsets. Panics if any attribute uses a type the runtime layout
-/// doesn't cover yet (Rational, Approximate, Character, Binary, Byte, nested
+/// doesn't cover yet (Rational, Approximate, Binary, Byte, nested
 /// Relation). The typechecker doesn't reject those — they just don't reach
 /// codegen inside a relation cell yet. When the cell layout widens, add cases
 /// to `cell_width`/`cell_kind`.
@@ -160,6 +168,17 @@ mod tests {
         assert_eq!(l.attrs[0].offset, 0);
         assert_eq!(l.attrs[0].width, 8);
         assert_eq!(l.attrs[0].kind, kind_tag::INTEGER);
+    }
+
+    #[test]
+    fn single_character_attr_is_eight_byte_codepoint_cell() {
+        let h = heading(&[("c", Type::Character)]);
+        let l = record_layout(&h);
+        assert_eq!(l.record_size, 8);
+        assert_eq!(l.attrs[0].name, "c");
+        assert_eq!(l.attrs[0].offset, 0);
+        assert_eq!(l.attrs[0].width, 8);
+        assert_eq!(l.attrs[0].kind, kind_tag::CHARACTER);
     }
 
     #[test]

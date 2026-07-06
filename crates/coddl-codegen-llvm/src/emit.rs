@@ -1604,6 +1604,24 @@ impl Emitter {
                 );
                 Ok(())
             }
+            ProcType::Character => {
+                let slot = self.gep_byte(&src_op, offset as usize);
+                // The relation cell stores the codepoint zero-extended to
+                // i64; pull the raw 64-bit slot and truncate to the i32
+                // `Character` repr.
+                let raw = format!("%v{}.raw", dst.0);
+                writeln!(self.body, "    {raw} = load i64, ptr {slot}").unwrap();
+                let name = format!("%v{}", dst.0);
+                writeln!(self.body, "    {name} = trunc i64 {raw} to i32").unwrap();
+                self.values.insert(
+                    dst,
+                    ValueRepr::Scalar {
+                        ty: "i32".to_string(),
+                        op: name,
+                    },
+                );
+                Ok(())
+            }
             ProcType::Text => {
                 let ptr_slot = self.gep_byte(&src_op, offset as usize);
                 let len_slot = self.gep_byte(&src_op, offset as usize + 8);
@@ -2248,8 +2266,9 @@ impl Emitter {
     }
 
     /// Store one attribute's flattened operands into the relation's
-    /// payload at `byte_offset`. Integer/Boolean: one i64 store.
-    /// Text: two stores (ptr, i64) at byte_offset and byte_offset+8.
+    /// payload at `byte_offset`. Integer: one i64 store. Character: the
+    /// i32 codepoint zero-extended into the 8-byte cell. Text: two stores
+    /// (ptr, i64) at byte_offset and byte_offset+8.
     fn emit_attr_store(
         &mut self,
         base: &str,
@@ -2261,6 +2280,16 @@ impl Emitter {
             ValueRepr::Scalar { ty, op } if ty == "i64" => {
                 let slot = self.gep_byte(base, byte_offset);
                 writeln!(self.body, "    store i64 {op}, ptr {slot}").unwrap();
+                Ok(())
+            }
+            ValueRepr::Scalar { ty, op } if ty == "i32" => {
+                // `Character`: zero-extend the codepoint to fill the 8-byte
+                // cell, so `cmp_cell`'s byte compare and dedup stay valid.
+                let wide = format!("%zext.{}", self.next_str);
+                self.next_str += 1;
+                writeln!(self.body, "    {wide} = zext i32 {op} to i64").unwrap();
+                let slot = self.gep_byte(base, byte_offset);
+                writeln!(self.body, "    store i64 {wide}, ptr {slot}").unwrap();
                 Ok(())
             }
             ValueRepr::Scalar { ty, .. } => Err(LlvmEmitError::UnsupportedInst(format!(

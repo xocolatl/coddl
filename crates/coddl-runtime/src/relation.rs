@@ -13,12 +13,12 @@
 //! |-----------------|----------|-----------------------------------------|
 //! | `Integer`       | 8 bytes  | `i64` little-endian (host)              |
 //! | `Boolean`       | 8 bytes  | `i64`; 0 = false, 1 = true              |
+//! | `Character`     | 8 bytes  | codepoint (`u32`) zero-extended to `i64`|
 //! | `Text`          | 16 bytes | `(ptr: *const u8, len: usize)`          |
 //!
-//! Phase 19 ships these three. Other scalar types and recursive
-//! Tuple / Relation cells slot in as later phases need them; the
-//! descriptor format already has the `Tuple` and `Relation` kind
-//! tags reserved.
+//! Other scalar types and recursive Tuple / Relation cells slot in as
+//! later phases need them; the descriptor format already has the
+//! `Tuple` and `Relation` kind tags reserved.
 //!
 //! ## Seal discipline (RM Pro 3)
 //!
@@ -55,6 +55,10 @@ pub enum CoddlAttrKind {
     Integer = 0,
     Boolean = 1,
     Text = 2,
+    /// Inline `Character` cell: the Unicode scalar value zero-extended into
+    /// an 8-byte slot. Compares as raw bytes (like Integer); prints as a
+    /// single-quoted escaped codepoint.
+    Character = 3,
     /// Inline nested-tuple cell: a contiguous sub-region. The attribute's
     /// `sub` descriptor describes the tuple's components (0-based offsets);
     /// the printer / comparator recurse through it.
@@ -629,6 +633,20 @@ unsafe fn print_cell<W: Write>(w: &mut W, attr: &CoddlAttrDesc, record: &[u8], b
         let bytes: [u8; 8] = record[offset..offset + 8].try_into().unwrap();
         let value = i64::from_ne_bytes(bytes);
         let _ = w.write_all(if value != 0 { b"true" } else { b"false" });
+    } else if attr.kind == CoddlAttrKind::Character as u32 {
+        // Inline codepoint zero-extended into the 8-byte slot. Print it
+        // single-quoted with escaping, matching the `Character` literal
+        // syntax (and `Const::Character`'s `Display`).
+        let bytes: [u8; 8] = record[offset..offset + 8].try_into().unwrap();
+        let cp = u64::from_ne_bytes(bytes) as u32;
+        match char::from_u32(cp) {
+            Some(c) => {
+                let _ = write!(w, "'{}'", c.escape_default());
+            }
+            None => {
+                let _ = write!(w, "'\\u{{{cp:x}}}'");
+            }
+        }
     } else if attr.kind == CoddlAttrKind::Text as u32 {
         let ptr_bytes: [u8; 8] = record[offset..offset + 8].try_into().unwrap();
         let len_bytes: [u8; 8] = record[offset + 8..offset + 16].try_into().unwrap();
@@ -2653,6 +2671,30 @@ mod tests {
             CoddlAttrDesc { name: b"pt".as_ptr(), name_len: 2, kind: CoddlAttrKind::Tuple as u32, offset: 8, sub: std::ptr::null() },
         ];
         (sub_attrs, sub_desc, top_attrs)
+    }
+
+    #[test]
+    fn print_cell_renders_character_single_quoted() {
+        // A `Character` cell stores the codepoint zero-extended into 8 bytes
+        // and prints single-quoted (with escaping for non-printables).
+        let attr = CoddlAttrDesc {
+            name: b"c".as_ptr(),
+            name_len: 1,
+            kind: CoddlAttrKind::Character as u32,
+            offset: 0,
+            sub: std::ptr::null(),
+        };
+        let mut record = vec![0u8; 8];
+        record[0..8].copy_from_slice(&(u64::from('a' as u32)).to_ne_bytes());
+        let mut buf: Vec<u8> = Vec::new();
+        unsafe { print_cell(&mut buf, &attr, &record, 0) };
+        assert_eq!(buf, b"'a'");
+
+        // A newline codepoint escapes rather than emitting a raw control byte.
+        record[0..8].copy_from_slice(&(u64::from('\n' as u32)).to_ne_bytes());
+        let mut buf2: Vec<u8> = Vec::new();
+        unsafe { print_cell(&mut buf2, &attr, &record, 0) };
+        assert_eq!(buf2, b"'\\n'");
     }
 
     #[test]

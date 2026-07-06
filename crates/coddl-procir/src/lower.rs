@@ -5452,6 +5452,7 @@ fn proc_type_from_kind(kind: u32) -> ProcType {
     match kind {
         k if k == kind_tag::INTEGER => ProcType::Integer,
         k if k == kind_tag::BOOLEAN => ProcType::Boolean,
+        k if k == kind_tag::CHARACTER => ProcType::Character,
         k if k == kind_tag::TEXT => ProcType::Text,
         other => unreachable!("unsupported attr kind {other} in predicate"),
     }

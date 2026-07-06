@@ -3641,6 +3641,59 @@ fn text_where_inprocess_neq_byte_identical() {
     assert_eq!(llvm, run_text_where_inprocess(TEXT_WHERE_NEQ_SRC, "cranelift"));
 }
 
+const CHAR_WHERE_EQ_SRC: &str = "\
+program char_where_eq;
+oper main {} [
+    let r = Relation { {c: 'a', n: 1}, {c: 'b', n: 2} };
+    let s = r where c = 'b';
+    write_relation { rel: s };
+];
+";
+
+const CHAR_WHERE_NEQ_SRC: &str = "\
+program char_where_neq;
+oper main {} [
+    let r = Relation { {c: 'a', n: 1}, {c: 'b', n: 2} };
+    let s = r where c <> 'b';
+    write_relation { rel: s };
+];
+";
+
+fn run_char_where_inprocess(src: &str, backend: &str) -> Vec<u8> {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("char-where.cd");
+    std::fs::write(&path, src).expect("write src");
+    let out = coddl()
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&path)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "in-process char where on {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+#[test]
+fn char_where_inprocess_eq_byte_identical() {
+    // A `Character` relation cell round-trips through construction (i32
+    // codepoint zero-extended to 8 bytes), the in-process `where` (AttrLoad
+    // + `icmp` on the codepoint), and printing (`'b'`, single-quoted).
+    let llvm = run_char_where_inprocess(CHAR_WHERE_EQ_SRC, "llvm");
+    assert_eq!(llvm, b"{c: 'b', n: 2}\n");
+    assert_eq!(llvm, run_char_where_inprocess(CHAR_WHERE_EQ_SRC, "cranelift"));
+}
+
+#[test]
+fn char_where_inprocess_neq_byte_identical() {
+    let llvm = run_char_where_inprocess(CHAR_WHERE_NEQ_SRC, "llvm");
+    assert_eq!(llvm, b"{c: 'a', n: 1}\n");
+    assert_eq!(llvm, run_char_where_inprocess(CHAR_WHERE_NEQ_SRC, "cranelift"));
+}
+
 // ── field-init shorthand (`{ name }` ≡ `{ name: name }`) ─────────────
 
 fn run_shorthand(src: &str, backend: &str) -> Vec<u8> {

@@ -1727,6 +1727,15 @@ fn emit_inst(
                     values.insert(*dst, ValueRepr::Scalar(v));
                     Ok(())
                 }
+                ProcType::Character => {
+                    // Record cell stores the codepoint zero-extended to 8
+                    // bytes; reduce to the I32 `Character` SSA repr.
+                    let raw =
+                        builder.ins().load(types::I64, flags, src_v, *offset as i32);
+                    let v = builder.ins().ireduce(types::I32, raw);
+                    values.insert(*dst, ValueRepr::Scalar(v));
+                    Ok(())
+                }
                 ProcType::Text => {
                     let ptr_ty = obj.target_config().pointer_type();
                     let ptr = builder.ins().load(ptr_ty, flags, src_v, *offset as i32);
@@ -2483,9 +2492,15 @@ fn store_attr(
     let flags = MemFlags::trusted();
     match repr {
         ValueRepr::Scalar(v) => {
-            // Phase 19 supports Integer / Boolean (both 8-byte) as
-            // relation cells. Future widths land here.
-            builder.ins().store(flags, *v, payload, byte_offset);
+            // Integer cells are 8-byte i64. A `Character` value is an inline
+            // I32 codepoint; zero-extend it to fill the 8-byte cell so
+            // `cmp_cell`'s byte compare and dedup stay valid.
+            let stored = if builder.func.dfg.value_type(*v) == types::I32 {
+                builder.ins().uextend(types::I64, *v)
+            } else {
+                *v
+            };
+            builder.ins().store(flags, stored, payload, byte_offset);
             Ok(())
         }
         ValueRepr::Text { ptr, len } => {
