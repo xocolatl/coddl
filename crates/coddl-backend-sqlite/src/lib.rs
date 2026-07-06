@@ -91,13 +91,24 @@ impl Conn for SqliteConn {
 }
 
 /// Lower a storage `Value` to a rusqlite bind value. `Boolean` binds as the
-/// integer 0/1 SQLite stores it as; `Character` as its integer codepoint.
+/// integer 0/1 SQLite stores it as; `Character` as its integer codepoint;
+/// `Approximate` as a REAL from its canonical bits.
 fn value_to_sqlite(value: &Value) -> rusqlite::types::Value {
     use rusqlite::types::Value as Sql;
     match value {
         Value::Integer(n) => Sql::Integer(*n),
         Value::Text(s) => Sql::Text(s.clone()),
         Value::Character(cp) => Sql::Integer(*cp as i64),
+        // SQLite encodes the NaN value as NULL (it can't store NaN); finite/±Inf
+        // binds as REAL. The reverse of `cell_to_value`'s Null/Real handling.
+        Value::Approximate(bits) => {
+            let v = f64::from_bits(*bits);
+            if v.is_nan() {
+                Sql::Null
+            } else {
+                Sql::Real(v)
+            }
+        }
         Value::Boolean(b) => Sql::Integer(*b as i64),
     }
 }
@@ -113,9 +124,26 @@ fn cell_to_value(row: &rusqlite::Row<'_>, i: usize) -> Result<Value> {
         .map_err(|e| BackendError::Step(e.to_string()))?
     {
         ValueRef::Integer(n) => Ok(Value::Integer(n)),
+        // A REAL surfaces as `Approximate` (canonical bits); the runtime refines
+        // it against the result heading, same as Integer→Boolean/Character.
+        ValueRef::Real(f) => {
+            let bits = if f.is_nan() {
+                f64::NAN.to_bits()
+            } else if f == 0.0 {
+                0
+            } else {
+                f.to_bits()
+            };
+            Ok(Value::Approximate(bits))
+        }
         ValueRef::Text(bytes) => std::str::from_utf8(bytes)
             .map(|s| Value::Text(s.to_string()))
             .map_err(|e| BackendError::Step(format!("non-UTF-8 text cell: {e}"))),
+        // A NULL in an `Approximate` column is the encoding of `NaN` and is
+        // decoded there by the heading-aware runtime path (`marshal_rows`). This
+        // storage-class-only path has no heading to distinguish that from a
+        // genuine (forbidden) missing value, so it treats a bare NULL as a
+        // violation (RM Pro 4: no nulls).
         ValueRef::Null => Err(BackendError::Step(
             "unexpected NULL cell (RM Pro 4: no nulls)".to_string(),
         )),
@@ -128,6 +156,25 @@ fn cell_to_value(row: &rusqlite::Row<'_>, i: usize) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approximate_store_encoding_nan_to_null_finite_to_real() {
+        use rusqlite::types::Value as Sql;
+        // Finite / ±Inf bind as REAL; the NaN *value* encodes as SQL NULL
+        // (SQLite can't store NaN). `marshal_rows` reverses this on retrieval.
+        assert_eq!(
+            value_to_sqlite(&Value::Approximate(1.5f64.to_bits())),
+            Sql::Real(1.5)
+        );
+        assert_eq!(
+            value_to_sqlite(&Value::Approximate(f64::INFINITY.to_bits())),
+            Sql::Real(f64::INFINITY)
+        );
+        assert_eq!(
+            value_to_sqlite(&Value::Approximate(f64::NAN.to_bits())),
+            Sql::Null
+        );
+    }
 
     /// Seed a one-row db, then run the exact SELECT `coddl-sqlemit` emits for
     /// `Greetings where id = 1`, bind `1`, and check the row comes back.

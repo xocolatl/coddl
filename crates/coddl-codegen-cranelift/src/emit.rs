@@ -2112,6 +2112,10 @@ fn emit_inst(
                         let v = builder.ins().ireduce(types::I32, raw);
                         ValueRepr::Scalar(v)
                     }
+                    ProcType::Approximate => {
+                        let v = builder.ins().load(types::F64, flags, record_ptr, offset);
+                        ValueRepr::Scalar(v)
+                    }
                     ProcType::Text => {
                         let ptr = builder.ins().load(ptr_ty, flags, record_ptr, offset);
                         let len = builder
@@ -2448,6 +2452,13 @@ fn build_coddl_param_array_cl(
                 let ext = builder.ins().uextend(types::I64, v);
                 builder.ins().stack_store(ext, slot, base);
             }
+            ProcType::Approximate => {
+                // Reinterpret the double's canonical bits as I64 into the `i`
+                // slot; `param_to_sqlite` reads them back as a REAL.
+                let v = scalar_value(values, vid)?; // F64
+                let bits = builder.ins().bitcast(types::I64, MemFlags::new(), v);
+                builder.ins().stack_store(bits, slot, base);
+            }
             ProcType::Text => {
                 let (ptr, len) = text_value(values, vid)?;
                 builder.ins().stack_store(ptr, slot, base + 8);
@@ -2473,6 +2484,7 @@ fn proc_type_from_kind_cl(kind: u32) -> ProcType {
         k if k == kind_tag::INTEGER => ProcType::Integer,
         k if k == kind_tag::BOOLEAN => ProcType::Boolean,
         k if k == kind_tag::CHARACTER => ProcType::Character,
+        k if k == kind_tag::APPROXIMATE => ProcType::Approximate,
         k if k == kind_tag::TEXT => ProcType::Text,
         other => unreachable!("unsupported attr kind {other} in Extract"),
     }
@@ -2529,6 +2541,7 @@ fn kind_tag_for_cl(ty: &ProcType) -> Result<u32, CraneliftEmitError> {
         ProcType::Integer => Ok(kind_tag::INTEGER),
         ProcType::Boolean => Ok(kind_tag::BOOLEAN),
         ProcType::Character => Ok(kind_tag::CHARACTER),
+        ProcType::Approximate => Ok(kind_tag::APPROXIMATE),
         ProcType::Text => Ok(kind_tag::TEXT),
         other => Err(CraneliftEmitError::UnsupportedInst(format!(
             "query param of type {other:?} has no CoddlParam kind"

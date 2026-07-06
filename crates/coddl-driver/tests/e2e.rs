@@ -3676,6 +3676,138 @@ fn pushed_char_where_binds_a_char_param() {
     }
 }
 
+/// Seed a `prices` database with an `Approximate` column stored as SQLite
+/// `REAL`. Values are exactly representable so `REAL = ?` is an exact compare.
+fn seed_prices_fixtures(dir: &Path) -> PathBuf {
+    std::fs::write(
+        dir.join("prices.cddb"),
+        "database prices;\n\
+         base relvar Prices { id: Integer, price: Approximate } key { id };\n",
+    )
+    .expect("write prices.cddb");
+    std::fs::write(
+        dir.join("prices.cdstore"),
+        "store for prices;\n\
+         backend sqlite { file: \"prices.sqlite\" };\n\
+         relvar Prices: table \"prices\" { columns: { id: \"id\", price: \"price\" } };\n",
+    )
+    .expect("write prices.cdstore");
+
+    let db = dir.join("prices.sqlite");
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "sqlite3 '{}' \"CREATE TABLE prices (id INTEGER NOT NULL, price REAL NOT NULL, PRIMARY KEY (id)); INSERT INTO prices (id, price) VALUES (1, 1.5), (2, 2.5);\"",
+            db.display()
+        ))
+        .status()
+        .expect("invoke sqlite3");
+    assert!(status.success(), "prices fixture seed failed");
+    db
+}
+
+#[test]
+fn pushed_approximate_where_binds_a_real_param() {
+    // `Prices where price = 1.5e0` is relvar-rooted, so the Approximate literal
+    // pushes as a bound REAL parameter — the audit log (SQLite's expanded SQL)
+    // shows `= 1.5`. The matching row's `price` reads back through `marshal_rows`
+    // into an Approximate cell, and `matched.price = 1.5e0` (interpolated) confirms
+    // the canonicalized-bit round-trip (bind → REAL → read-back → compare).
+    for backend in ["llvm", "cranelift"] {
+        ensure_runtime_built();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = seed_prices_fixtures(tmp.path());
+        let cd = tmp.path().join("aw.cd");
+        std::fs::write(
+            &cd,
+            "program aw;\n\
+             database prices;\n\
+             public relvar Prices { id: Integer, price: Approximate } key { id };\n\
+             oper main {} [ let matched = transaction [ extract (Prices where price = 1.5e0) ]; let ok = matched.price = 1.5e0; write_line { message: format { template: f\"{ok}\", args: { ok: ok } } }; ];\n",
+        )
+        .expect("write aw.cd");
+        let log = tmp.path().join("audit.log");
+        let out = coddl()
+            .env("CODDL_PRICES_FILE", &db)
+            .env("CODDL_AUDIT_LOG", &log)
+            .args(["run", &format!("--backend={backend}")])
+            .arg(&cd)
+            .output()
+            .expect("spawn coddl");
+        assert!(
+            out.status.success(),
+            "pushed approx where on {backend} failed: stderr=\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"true\n", "on {backend}");
+        let log_txt = std::fs::read_to_string(&log).expect("read audit log");
+        assert!(
+            log_txt.contains(r#"WHERE "price" = 1.5"#),
+            "expected the approx restriction pushed (as REAL 1.5) on {backend}, got:\n{log_txt}"
+        );
+    }
+}
+
+#[test]
+fn approximate_null_reads_back_as_nan_and_is_reflexive() {
+    // SQLite encodes the Approximate NaN value as SQL NULL (it can't store
+    // NaN). Reading a NULL back decodes it to NaN — and because Approximate
+    // `=` is canonicalized bit-equality, `nan = nan` is TRUE (reflexive), the
+    // whole reason we didn't use IEEE `oeq`. This is an encoding, not a Coddl
+    // null: the relvar is total (RM Pro 4).
+    for backend in ["llvm", "cranelift"] {
+        ensure_runtime_built();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Same db name / .cddb / .cdstore as the finite fixture, but a nullable
+        // column holding a NULL — i.e. a stored NaN.
+        std::fs::write(
+            tmp.path().join("prices.cddb"),
+            "database prices;\n\
+             base relvar Prices { id: Integer, price: Approximate } key { id };\n",
+        )
+        .expect("write prices.cddb");
+        std::fs::write(
+            tmp.path().join("prices.cdstore"),
+            "store for prices;\n\
+             backend sqlite { file: \"prices.sqlite\" };\n\
+             relvar Prices: table \"prices\" { columns: { id: \"id\", price: \"price\" } };\n",
+        )
+        .expect("write prices.cdstore");
+        let db = tmp.path().join("prices.sqlite");
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "sqlite3 '{}' \"CREATE TABLE prices (id INTEGER NOT NULL, price REAL, PRIMARY KEY (id)); INSERT INTO prices (id, price) VALUES (3, NULL);\"",
+                db.display()
+            ))
+            .status()
+            .expect("invoke sqlite3");
+        assert!(status.success(), "prices NaN fixture seed failed");
+
+        let cd = tmp.path().join("anan.cd");
+        std::fs::write(
+            &cd,
+            "program anan;\n\
+             database prices;\n\
+             public relvar Prices { id: Integer, price: Approximate } key { id };\n\
+             oper main {} [ let row = transaction [ extract (Prices where id = 3) ]; let refl = row.price = row.price; write_line { message: format { template: f\"{refl}\", args: { refl: refl } } }; ];\n",
+        )
+        .expect("write anan.cd");
+        let out = coddl()
+            .env("CODDL_PRICES_FILE", &db)
+            .args(["run", &format!("--backend={backend}")])
+            .arg(&cd)
+            .output()
+            .expect("spawn coddl");
+        assert!(
+            out.status.success(),
+            "approx NaN round-trip on {backend} failed: stderr=\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, b"true\n", "nan = nan should be true on {backend}");
+    }
+}
+
 /// In-process Text `where` over an in-memory relation literal (not relvar-
 /// rooted, so the cut declines) routes the comparison through the runtime's
 /// `coddl_text_eq` byte compare. Output is sealed in `{n, name}` order.

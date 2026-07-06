@@ -1194,6 +1194,16 @@ impl Emitter {
                     let slot = self.gep_byte(&arr, base);
                     writeln!(self.body, "    store i64 {z}, ptr {slot}").unwrap();
                 }
+                ProcType::Approximate => {
+                    // Reinterpret the double's canonical bits as i64 into the
+                    // `i` slot; `param_to_sqlite` reads them back as a REAL.
+                    let op = self.scalar_op(vid)?;
+                    let z = format!("%qa.{}", self.next_str);
+                    self.next_str += 1;
+                    writeln!(self.body, "    {z} = bitcast double {op} to i64").unwrap();
+                    let slot = self.gep_byte(&arr, base);
+                    writeln!(self.body, "    store i64 {z}, ptr {slot}").unwrap();
+                }
                 ProcType::Text => {
                     let (ptr_op, len_op) = self.text_ops(vid)?;
                     let ptr_slot = self.gep_byte(&arr, base + 8);
@@ -2154,6 +2164,15 @@ impl Emitter {
                     op: name,
                 })
             }
+            ProcType::Approximate => {
+                let slot = self.gep_byte(base, byte_offset);
+                let name = format!("%{name_hint}");
+                writeln!(self.body, "    {name} = load double, ptr {slot}").unwrap();
+                Ok(ValueRepr::Scalar {
+                    ty: "double".to_string(),
+                    op: name,
+                })
+            }
             ProcType::Text => {
                 let ptr_slot = self.gep_byte(base, byte_offset);
                 let len_slot = self.gep_byte(base, byte_offset + 8);
@@ -2350,8 +2369,8 @@ impl Emitter {
 
     /// Store one attribute's flattened operands into the relation's
     /// payload at `byte_offset`. Integer: one i64 store. Character: the
-    /// i32 codepoint zero-extended into the 8-byte cell. Text: two stores
-    /// (ptr, i64) at byte_offset and byte_offset+8.
+    /// i32 codepoint zero-extended into the 8-byte cell. Approximate: one
+    /// double store. Text: two stores (ptr, i64) at byte_offset and byte_offset+8.
     fn emit_attr_store(
         &mut self,
         base: &str,
@@ -2673,6 +2692,7 @@ fn proc_type_from_kind_llvm(kind: u32) -> ProcType {
         k if k == kind_tag::INTEGER => ProcType::Integer,
         k if k == kind_tag::BOOLEAN => ProcType::Boolean,
         k if k == kind_tag::CHARACTER => ProcType::Character,
+        k if k == kind_tag::APPROXIMATE => ProcType::Approximate,
         k if k == kind_tag::TEXT => ProcType::Text,
         other => unreachable!("unsupported attr kind {other} in Extract"),
     }
@@ -2685,6 +2705,7 @@ fn kind_tag_for(ty: &ProcType) -> Result<u32, LlvmEmitError> {
         ProcType::Integer => Ok(kind_tag::INTEGER),
         ProcType::Boolean => Ok(kind_tag::BOOLEAN),
         ProcType::Character => Ok(kind_tag::CHARACTER),
+        ProcType::Approximate => Ok(kind_tag::APPROXIMATE),
         ProcType::Text => Ok(kind_tag::TEXT),
         other => Err(LlvmEmitError::UnsupportedInst(format!(
             "query param of type {other:?} has no CoddlParam kind"

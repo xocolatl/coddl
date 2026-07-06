@@ -391,6 +391,31 @@ unsafe fn marshal_rows(
                 };
                 let n: i64 = if v { 1 } else { 0 };
                 buf[offset..offset + 8].copy_from_slice(&n.to_ne_bytes());
+            } else if kind == CoddlAttrKind::Approximate as u32 {
+                // SQLite has no NaN storage — it *encodes* the Approximate NaN
+                // value as SQL NULL. So a NULL here decodes back to NaN; a real
+                // value stores its canonical bits (`−0` → `+0`). This is an
+                // encoding of a value, not a Coddl null: the relvar is total
+                // (RM Pro 4), and NULL is just SQLite's byte-pattern for NaN.
+                let v: Option<f64> = match row.get(i) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let attr_name = read_attr_name(attr);
+                        eprintln!(
+                            "coddl: {}: column `{attr_name}` of {} is not Approximate/REAL: {err}",
+                            ctx.site, ctx.of_subject
+                        );
+                        std::process::abort();
+                    }
+                };
+                let bits = match v {
+                    None => f64::NAN.to_bits(), // SQLite NULL ⇒ our NaN
+                    Some(x) if x == 0.0 => 0,   // collapse ±0
+                    // SQLite can't return a NaN REAL (it stored it as NULL), so
+                    // `Some` is always finite or ±Inf here.
+                    Some(x) => x.to_bits(),
+                };
+                buf[offset..offset + 8].copy_from_slice(&bits.to_ne_bytes());
             } else if kind == CoddlAttrKind::Character as u32 {
                 // Stored as an integer codepoint; read it into the 8-byte cell
                 // exactly like Integer (the printer decodes it back to a char).
@@ -1087,6 +1112,16 @@ unsafe fn param_to_sqlite(p: &CoddlParam, plan_id: u32) -> rusqlite::types::Valu
     {
         // Character binds as its integer codepoint (SQLite has no char type).
         Value::Integer(p.i)
+    } else if p.kind == CoddlAttrKind::Approximate as u32 {
+        // The `i` slot carries the double's canonical bits. SQLite encodes the
+        // NaN *value* as SQL NULL (it can't store NaN), so a NaN binds as NULL
+        // and a finite/±Inf value binds as REAL. The reverse of `marshal_rows`.
+        let v = f64::from_bits(p.i as u64);
+        if v.is_nan() {
+            Value::Null
+        } else {
+            Value::Real(v)
+        }
     } else if p.kind == CoddlAttrKind::Text as u32 {
         if p.ptr.is_null() {
             return Value::Text(String::new());

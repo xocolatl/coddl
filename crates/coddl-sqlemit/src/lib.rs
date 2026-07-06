@@ -87,6 +87,9 @@ pub enum Value {
     /// A `Character` as its Unicode scalar value. Binds/reads as an integer
     /// codepoint (SQLite has no character type).
     Character(u32),
+    /// An `Approximate` as its canonical IEEE-754 double bit pattern (`u64`,
+    /// so the enum stays `Eq`). Binds/reads as SQL `REAL`.
+    Approximate(u64),
     Boolean(bool),
 }
 
@@ -96,6 +99,7 @@ impl From<Literal> for Value {
             Literal::Integer(n) => Value::Integer(n),
             Literal::Text(s) => Value::Text(s),
             Literal::Character(cp) => Value::Character(cp),
+            Literal::Approximate(bits) => Value::Approximate(bits),
             Literal::Boolean(b) => Value::Boolean(b),
         }
     }
@@ -1526,6 +1530,27 @@ mod tests {
         );
         assert_eq!(q.sql.param_count, 1);
         assert_eq!(q.params, vec![Value::Character('a' as u32)]);
+    }
+
+    #[test]
+    fn restrict_on_approximate_binds_a_real_param() {
+        // An `Approximate` restriction pushes as a bound parameter, carried as
+        // `Value::Approximate` (canonical bits) — the runtime binds it as REAL.
+        let expr = RelExpr::Restrict {
+            input: Box::new(greetings()),
+            pred: Predicate::AttrCmp {
+                op: CmpOp::Eq,
+                attr: "message".to_string(),
+                value: Literal::Approximate(1.5f64.to_bits()),
+            },
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id", "message" FROM "greetings" WHERE "message" = ?"#
+        );
+        assert_eq!(q.sql.param_count, 1);
+        assert_eq!(q.params, vec![Value::Approximate(1.5f64.to_bits())]);
     }
 
     #[test]

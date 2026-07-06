@@ -198,6 +198,7 @@ fn render_literal(lit: &Literal) -> String {
         Literal::Integer(n) => n.to_string(),
         Literal::Text(s) => format!("{s:?}"),
         Literal::Character(cp) => cp.to_string(),
+        Literal::Approximate(bits) => format!("{:e}", f64::from_bits(*bits)),
         Literal::Boolean(b) => b.to_string(),
     }
 }
@@ -281,6 +282,9 @@ pub enum Literal {
     /// A `Character` literal as its Unicode scalar value. Binds/stores as an
     /// integer codepoint in SQL (SQLite has no character type).
     Character(u32),
+    /// An `Approximate` value as its **canonical** IEEE-754 double bit pattern
+    /// (`u64`, not `f64`, so the enum stays `Eq`). Binds/stores as SQL `REAL`.
+    Approximate(u64),
     Boolean(bool),
 }
 

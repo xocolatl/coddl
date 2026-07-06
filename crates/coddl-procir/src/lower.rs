@@ -3768,6 +3768,9 @@ impl Lowerer {
                     SyntaxKind::CHAR_LIT => {
                         Some(RelLiteral::Character(decode_char_literal(token.text())))
                     }
+                    SyntaxKind::APPROXIMATE_LIT => {
+                        Some(RelLiteral::Approximate(decode_approximate_literal(token.text())))
+                    }
                     _ => None,
                 }
             }
@@ -3812,6 +3815,7 @@ impl Lowerer {
                 Value::Integer(n) => (Const::Integer(*n), ProcType::Integer),
                 Value::Text(s) => (Const::Text(s.clone().into_bytes()), ProcType::Text),
                 Value::Character(cp) => (Const::Character(*cp), ProcType::Character),
+                Value::Approximate(bits) => (Const::Approximate(*bits), ProcType::Approximate),
                 Value::Boolean(b) => (Const::Boolean(*b), ProcType::Boolean),
             };
             let dst = self.fresh_value();
