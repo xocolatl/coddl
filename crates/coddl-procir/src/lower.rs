@@ -4023,22 +4023,45 @@ impl Lowerer {
         ) {
             return self.lower_join_inprocess(bin);
         }
-        let scalar_op = match op {
-            BinaryOp::Eq => ScalarOp::Eq,
-            BinaryOp::NotEq => ScalarOp::NotEq,
-            BinaryOp::Lt => ScalarOp::Lt,
-            BinaryOp::Gt => ScalarOp::Gt,
-            BinaryOp::LtEq => ScalarOp::LtEq,
-            BinaryOp::GtEq => ScalarOp::GtEq,
-            BinaryOp::And => ScalarOp::And,
-            BinaryOp::Or => ScalarOp::Or,
-            BinaryOp::Add => ScalarOp::Add,
-            BinaryOp::Sub => ScalarOp::Sub,
-            BinaryOp::Mul => ScalarOp::Mul,
-            // `/` is exact division → Rational; `div` is truncating integer div.
-            BinaryOp::Div => ScalarOp::RatioFromInts,
-            BinaryOp::IntDiv => ScalarOp::Div,
-            BinaryOp::Concat => ScalarOp::Concat,
+        // Lower operands first — arithmetic (`+ - * /`) dispatches on operand
+        // type (Integer vs Rational), and comparisons take the operand's type.
+        let mut lhs = bin
+            .lhs()
+            .map(|e| self.lower_expr(&e))
+            .unwrap_or_else(|| self.fresh_value());
+        let mut rhs = bin
+            .rhs()
+            .map(|e| self.lower_expr(&e))
+            .unwrap_or_else(|| self.fresh_value());
+        let rat = matches!(self.value_type(lhs), ProcType::Rational);
+        // comparison/logical compare arbitrary scalars → Boolean; `+ - *` are
+        // Integer→Integer or Rational→Rational; `/` is exact (Integer→Rational,
+        // Rational→Rational); `div` truncates (Integer→Integer); concat
+        // normalizes Character operands to Text.
+        let (scalar_op, operand_type, result_type) = match op {
+            BinaryOp::Eq => (ScalarOp::Eq, self.value_type(lhs), ProcType::Boolean),
+            BinaryOp::NotEq => (ScalarOp::NotEq, self.value_type(lhs), ProcType::Boolean),
+            BinaryOp::Lt => (ScalarOp::Lt, self.value_type(lhs), ProcType::Boolean),
+            BinaryOp::Gt => (ScalarOp::Gt, self.value_type(lhs), ProcType::Boolean),
+            BinaryOp::LtEq => (ScalarOp::LtEq, self.value_type(lhs), ProcType::Boolean),
+            BinaryOp::GtEq => (ScalarOp::GtEq, self.value_type(lhs), ProcType::Boolean),
+            BinaryOp::And => (ScalarOp::And, ProcType::Boolean, ProcType::Boolean),
+            BinaryOp::Or => (ScalarOp::Or, ProcType::Boolean, ProcType::Boolean),
+            BinaryOp::Add if rat => (ScalarOp::RationalAdd, ProcType::Rational, ProcType::Rational),
+            BinaryOp::Add => (ScalarOp::Add, ProcType::Integer, ProcType::Integer),
+            BinaryOp::Sub if rat => (ScalarOp::RationalSub, ProcType::Rational, ProcType::Rational),
+            BinaryOp::Sub => (ScalarOp::Sub, ProcType::Integer, ProcType::Integer),
+            BinaryOp::Mul if rat => (ScalarOp::RationalMul, ProcType::Rational, ProcType::Rational),
+            BinaryOp::Mul => (ScalarOp::Mul, ProcType::Integer, ProcType::Integer),
+            BinaryOp::Div if rat => (ScalarOp::RationalDiv, ProcType::Rational, ProcType::Rational),
+            // Integer `/` is exact: two Integer operands, a Rational result.
+            BinaryOp::Div => (ScalarOp::RatioFromInts, ProcType::Integer, ProcType::Rational),
+            BinaryOp::IntDiv => (ScalarOp::Div, ProcType::Integer, ProcType::Integer),
+            BinaryOp::Concat => {
+                lhs = self.coerce_to_text(lhs);
+                rhs = self.coerce_to_text(rhs);
+                (ScalarOp::Concat, ProcType::Text, ProcType::Text)
+            }
             BinaryOp::Where
             | BinaryOp::Join
             | BinaryOp::Times
@@ -4048,38 +4071,6 @@ impl Lowerer {
             | BinaryOp::Minus => {
                 unreachable!("handled above")
             }
-        };
-        let mut lhs = bin
-            .lhs()
-            .map(|e| self.lower_expr(&e))
-            .unwrap_or_else(|| self.fresh_value());
-        let mut rhs = bin
-            .rhs()
-            .map(|e| self.lower_expr(&e))
-            .unwrap_or_else(|| self.fresh_value());
-        // The operand machine type and the result type depend on the op:
-        // comparison/logical compare arbitrary scalars → Boolean; arithmetic
-        // is Integer → Integer; concat normalizes Character operands to Text →
-        // Text (so `ScalarOp::Concat` always sees Text operands).
-        let (operand_type, result_type) = match scalar_op {
-            ScalarOp::Add | ScalarOp::Sub | ScalarOp::Mul | ScalarOp::Div => {
-                (ProcType::Integer, ProcType::Integer)
-            }
-            // Exact `/`: two Integer operands, a Rational result.
-            ScalarOp::RatioFromInts => (ProcType::Integer, ProcType::Rational),
-            ScalarOp::Concat => {
-                lhs = self.coerce_to_text(lhs);
-                rhs = self.coerce_to_text(rhs);
-                (ProcType::Text, ProcType::Text)
-            }
-            ScalarOp::Eq
-            | ScalarOp::NotEq
-            | ScalarOp::Lt
-            | ScalarOp::Gt
-            | ScalarOp::LtEq
-            | ScalarOp::GtEq
-            | ScalarOp::And
-            | ScalarOp::Or => (self.value_type(lhs), ProcType::Boolean),
         };
         let dst = self.fresh_value();
         self.record_type(dst, result_type.clone());

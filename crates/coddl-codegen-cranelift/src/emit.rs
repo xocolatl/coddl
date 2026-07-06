@@ -230,6 +230,47 @@ fn declare_scalar_text_externs(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert("coddl_rational_from_ints".into(), id);
     }
+    // Rational arithmetic: (n1, d1, n2, d2, out_num, out_den) — four I128s in,
+    // reduced pair out through two i128 pointers.
+    for name in [
+        "coddl_rational_add",
+        "coddl_rational_sub",
+        "coddl_rational_mul",
+        "coddl_rational_div",
+    ] {
+        let mut sig = obj.make_signature();
+        for _ in 0..4 {
+            sig.params.push(AbiParam::new(types::I128));
+        }
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function(name, Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert(name.into(), id);
+    }
+    // coddl_rational_to_approx(num: i128, den: i128) -> f64
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(types::I128));
+        sig.params.push(AbiParam::new(types::I128));
+        sig.returns.push(AbiParam::new(types::F64));
+        let id = obj
+            .declare_function("coddl_rational_to_approx", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_rational_to_approx".into(), id);
+    }
+    // coddl_rational_from_int(a: i64, out_num: ptr, out_den: ptr)
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_rational_from_int", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_rational_from_int".into(), id);
+    }
     // coddl_utf8_len(codepoint: i32) -> i64
     {
         let mut sig = obj.make_signature();
@@ -1695,6 +1736,36 @@ fn emit_inst(
                 values.insert(*dst, ValueRepr::Rational { num, den });
                 return Ok(());
             }
+            // Rational arithmetic `+ - * /`: two `(num, den)` operands → a
+            // reduced Rational via the matching helper (i128 args, out-pointers).
+            if let Some(helper) = match op {
+                ScalarOp::RationalAdd => Some("coddl_rational_add"),
+                ScalarOp::RationalSub => Some("coddl_rational_sub"),
+                ScalarOp::RationalMul => Some("coddl_rational_mul"),
+                ScalarOp::RationalDiv => Some("coddl_rational_div"),
+                _ => None,
+            } {
+                use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
+                let (n1, d1) = rational_value(values, lhs)?;
+                let (n2, d2) = rational_value(values, rhs)?;
+                let ptr_ty = obj.target_config().pointer_type();
+                let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    32,
+                    4,
+                ));
+                let num_addr = builder.ins().stack_addr(ptr_ty, slot, 0);
+                let den_addr = builder.ins().stack_addr(ptr_ty, slot, 16);
+                let fid = funcs[helper];
+                let local = obj.declare_func_in_func(fid, builder.func);
+                builder
+                    .ins()
+                    .call(local, &[n1, d1, n2, d2, num_addr, den_addr]);
+                let num = builder.ins().stack_load(types::I128, slot, 0);
+                let den = builder.ins().stack_load(types::I128, slot, 16);
+                values.insert(*dst, ValueRepr::Rational { num, den });
+                return Ok(());
+            }
             // Text operands are (ptr, len) pairs, not inline scalars, so
             // `=`/`<>` call the runtime byte comparison instead of `icmp`.
             // (Only Eq/NotEq reach here on Text; ordering is Integer-only.)
@@ -1803,8 +1874,12 @@ fn emit_inst(
                 ScalarOp::Concat => {
                     unreachable!("Concat handled before the inline-scalar path")
                 }
-                ScalarOp::RatioFromInts => {
-                    unreachable!("RatioFromInts handled before the inline-scalar path")
+                ScalarOp::RatioFromInts
+                | ScalarOp::RationalAdd
+                | ScalarOp::RationalSub
+                | ScalarOp::RationalMul
+                | ScalarOp::RationalDiv => {
+                    unreachable!("Rational ops handled before the inline-scalar path")
                 }
             };
             values.insert(*dst, ValueRepr::Scalar(result));

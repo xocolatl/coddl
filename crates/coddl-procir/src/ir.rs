@@ -568,6 +568,13 @@ pub enum ScalarOp {
     /// reduced fraction via the `coddl_rational_from_ints` runtime helper;
     /// produces a compound `ValueRepr::Rational`.
     RatioFromInts,
+    /// `Rational × Rational → Rational` arithmetic (surface `+ - * /` on
+    /// Rationals). Each lowers to a `coddl_rational_{add,sub,mul,div}` helper
+    /// call producing a compound `ValueRepr::Rational`.
+    RationalAdd,
+    RationalSub,
+    RationalMul,
+    RationalDiv,
     /// `Text × Text → Text` (operands normalized to Text by the lowerer, so a
     /// `Character` operand is converted via [`Inst::CharToText`] first).
     Concat,
@@ -988,6 +995,10 @@ impl fmt::Display for ScalarOp {
             ScalarOp::Mul => "mul",
             ScalarOp::Div => "sdiv",
             ScalarOp::RatioFromInts => "ratio_from_ints",
+            ScalarOp::RationalAdd => "rat_add",
+            ScalarOp::RationalSub => "rat_sub",
+            ScalarOp::RationalMul => "rat_mul",
+            ScalarOp::RationalDiv => "rat_div",
             ScalarOp::Concat => "concat",
         })
     }

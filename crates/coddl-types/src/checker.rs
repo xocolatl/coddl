@@ -3611,9 +3611,10 @@ impl TypeChecker {
     }
 
     /// `lhs + rhs` / `lhs - rhs` / `lhs * rhs` / `lhs / rhs` — scalar
-    /// arithmetic. Both operands must be Integer. `+ - *` and `div` (truncating
-    /// integer division, toward zero) return Integer; `/` is **exact** division
-    /// and returns Rational. T0043 on a non-Integer operand.
+    /// arithmetic. `div` (truncating integer division, toward zero) is
+    /// Integer-only → Integer. `+ - * /` accept either two Integers or two
+    /// Rationals (no implicit mixing); `/` on Integers is **exact** and yields
+    /// Rational, and every op on Rationals yields Rational. T0043 otherwise.
     fn check_arith_op(&mut self, bin: &BinaryExpr, op: BinaryOp, scope: &mut Scope) -> Type {
         let lhs_ty = match bin.lhs() {
             Some(e) => self.check_expr(&e, scope),
@@ -3623,22 +3624,48 @@ impl TypeChecker {
             Some(e) => self.check_expr(&e, scope),
             None => Type::Unknown,
         };
-        // `/` yields an exact `Rational`; `+ - * div` yield `Integer`.
-        let result = if matches!(op, BinaryOp::Div) {
+        let is_int = |t: &Type| matches!(t, Type::Integer | Type::Unknown);
+        let is_rat = |t: &Type| matches!(t, Type::Rational | Type::Unknown);
+
+        // `div` — truncating integer division, Integer only.
+        if matches!(op, BinaryOp::IntDiv) {
+            if !is_int(&lhs_ty) || !is_int(&rhs_ty) {
+                self.error(
+                    self.node_span(bin.syntax()),
+                    "T0043",
+                    format!("`div` requires Integer operands; got {lhs_ty} vs {rhs_ty}"),
+                );
+            }
+            return Type::Integer;
+        }
+
+        // `+ - * /`: both Integer, or both Rational (no mixing).
+        let both_rat = is_rat(&lhs_ty)
+            && is_rat(&rhs_ty)
+            && (matches!(lhs_ty, Type::Rational) || matches!(rhs_ty, Type::Rational));
+        if both_rat {
+            return Type::Rational;
+        }
+        if is_int(&lhs_ty) && is_int(&rhs_ty) {
+            // Integer operands: `/` is exact → Rational, `+ - *` stay Integer.
+            return if matches!(op, BinaryOp::Div) {
+                Type::Rational
+            } else {
+                Type::Integer
+            };
+        }
+        // Mixed or unsupported operand types.
+        let opname = op_display(op);
+        self.error(
+            self.node_span(bin.syntax()),
+            "T0043",
+            format!("`{opname}` requires two Integer or two Rational operands; got {lhs_ty} vs {rhs_ty}"),
+        );
+        if matches!(op, BinaryOp::Div) {
             Type::Rational
         } else {
             Type::Integer
-        };
-        let supported = |t: &Type| matches!(t, Type::Integer | Type::Unknown);
-        if !supported(&lhs_ty) || !supported(&rhs_ty) {
-            let opname = op_display(op);
-            self.error(
-                self.node_span(bin.syntax()),
-                "T0043",
-                format!("`{opname}` requires Integer operands; got {lhs_ty} vs {rhs_ty}"),
-            );
         }
-        result
     }
 
     /// `lhs || rhs` — text/character concatenation. Each operand must be Text

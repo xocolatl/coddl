@@ -44,6 +44,19 @@ pub(crate) fn reduce(n: i128, d: i128) -> (i128, i128) {
     (n, d)
 }
 
+/// Multiply, trapping on i128 overflow (a bounded exact type errors rather than
+/// wrapping).
+fn mul(a: i128, b: i128) -> i128 {
+    a.checked_mul(b)
+        .unwrap_or_else(|| trap("rational: overflow"))
+}
+
+/// Add, trapping on overflow.
+fn add(a: i128, b: i128) -> i128 {
+    a.checked_add(b)
+        .unwrap_or_else(|| trap("rational: overflow"))
+}
+
 /// Exact division of two `Integer`s (surface `/`) → a reduced `Rational`.
 /// Widening `i64 → i128` never overflows; `reduce` traps on a zero divisor.
 ///
@@ -59,6 +72,75 @@ pub unsafe extern "C" fn coddl_rational_from_ints(
     let (n, d) = reduce(a as i128, b as i128);
     *out_num = n;
     *out_den = d;
+}
+
+/// `Integer → Rational` widening: `a → (a, 1)`. (`to_rational` on an Integer.)
+///
+/// # Safety
+/// `out_num`/`out_den` must point at writable `i128` slots.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_rational_from_int(a: i64, out_num: *mut i128, out_den: *mut i128) {
+    *out_num = a as i128;
+    *out_den = 1;
+}
+
+macro_rules! rational_binop {
+    ($name:ident, $num:expr, $den:expr, $doc:literal) => {
+        #[doc = $doc]
+        ///
+        /// # Safety
+        /// `out_num`/`out_den` must point at writable `i128` slots.
+        #[no_mangle]
+        pub unsafe extern "C" fn $name(
+            n1: i128,
+            d1: i128,
+            n2: i128,
+            d2: i128,
+            out_num: *mut i128,
+            out_den: *mut i128,
+        ) {
+            let num = $num(n1, d1, n2, d2);
+            let den = $den(n1, d1, n2, d2);
+            let (n, d) = reduce(num, den);
+            *out_num = n;
+            *out_den = d;
+        }
+    };
+}
+
+// `a/b + c/d = (ad + bc)/(bd)`; overflow / zero-denominator trap.
+rational_binop!(
+    coddl_rational_add,
+    |n1, d1, n2, d2| add(mul(n1, d2), mul(n2, d1)),
+    |_, d1, _, d2| mul(d1, d2),
+    "Rational `+`."
+);
+rational_binop!(
+    coddl_rational_sub,
+    |n1, d1, n2, d2| add(mul(n1, d2), -mul(n2, d1)),
+    |_, d1, _, d2| mul(d1, d2),
+    "Rational `-`."
+);
+rational_binop!(
+    coddl_rational_mul,
+    |n1, _, n2, _| mul(n1, n2),
+    |_, d1, _, d2| mul(d1, d2),
+    "Rational `*`."
+);
+// `(a/b) / (c/d) = (ad)/(bc)`; `reduce` traps if the divisor is `0` (bc == 0).
+rational_binop!(
+    coddl_rational_div,
+    |n1, _, _, d2| mul(n1, d2),
+    |_, d1, n2, _| mul(d1, n2),
+    "Rational `/` (exact division)."
+);
+
+/// `Rational → Approximate`: the correctly-rounded `f64` value of `n/d`. Uses a
+/// widening `i128 → f64` on each component; for components beyond f64's exact
+/// range this rounds (the whole point of `to_approximate`). Returns the raw f64.
+#[no_mangle]
+pub extern "C" fn coddl_rational_to_approx(num: i128, den: i128) -> f64 {
+    num as f64 / den as f64
 }
 
 #[cfg(test)]
@@ -80,5 +162,29 @@ mod tests {
         assert_eq!((n, d), (1, 3));
         unsafe { coddl_rational_from_ints(6, 4, &mut n, &mut d) };
         assert_eq!((n, d), (3, 2));
+    }
+
+    fn run(
+        f: unsafe extern "C" fn(i128, i128, i128, i128, *mut i128, *mut i128),
+        a: (i128, i128),
+        b: (i128, i128),
+    ) -> (i128, i128) {
+        let (mut n, mut d) = (0i128, 0i128);
+        unsafe { f(a.0, a.1, b.0, b.1, &mut n, &mut d) };
+        (n, d)
+    }
+
+    #[test]
+    fn arithmetic_reduces() {
+        assert_eq!(run(coddl_rational_add, (1, 2), (1, 3)), (5, 6));
+        assert_eq!(run(coddl_rational_sub, (3, 4), (1, 4)), (1, 2));
+        assert_eq!(run(coddl_rational_mul, (1, 2), (2, 3)), (1, 3));
+        assert_eq!(run(coddl_rational_div, (1, 2), (3, 4)), (2, 3));
+    }
+
+    #[test]
+    fn to_approx_rounds() {
+        assert_eq!(coddl_rational_to_approx(1, 2), 0.5);
+        assert_eq!(coddl_rational_to_approx(3, 4), 0.75);
     }
 }

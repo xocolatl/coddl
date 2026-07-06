@@ -249,6 +249,27 @@ impl Emitter {
             "declare void @coddl_rational_from_ints(i64, i64, ptr, ptr)"
         )
         .unwrap();
+        // Rational arithmetic: (n1, d1, n2, d2, out_num, out_den).
+        for f in [
+            "coddl_rational_add",
+            "coddl_rational_sub",
+            "coddl_rational_mul",
+            "coddl_rational_div",
+        ] {
+            writeln!(self.body, "declare void @{f}(i128, i128, i128, i128, ptr, ptr)").unwrap();
+        }
+        // Rational -> Approximate: (num, den) -> double.
+        writeln!(
+            self.body,
+            "declare double @coddl_rational_to_approx(i128, i128)"
+        )
+        .unwrap();
+        // Integer -> Rational widening: (a, out_num, out_den).
+        writeln!(
+            self.body,
+            "declare void @coddl_rational_from_int(i64, ptr, ptr)"
+        )
+        .unwrap();
         // RC retain/release — emitted for any heap `Text` (immortal literals
         // see `rc == IMMORTAL_RC` and no-op) as well as relations.
         writeln!(self.body, "declare void @coddl_rc_retain(ptr)").unwrap();
@@ -1534,6 +1555,40 @@ impl Emitter {
             );
             return Ok(());
         }
+        // Rational arithmetic `+ - * /`: two `(num, den)` operands → a reduced
+        // Rational via the matching runtime helper (out-pointers), like
+        // `RatioFromInts` but with i128 args.
+        if let Some(helper) = match op {
+            ScalarOp::RationalAdd => Some("coddl_rational_add"),
+            ScalarOp::RationalSub => Some("coddl_rational_sub"),
+            ScalarOp::RationalMul => Some("coddl_rational_mul"),
+            ScalarOp::RationalDiv => Some("coddl_rational_div"),
+            _ => None,
+        } {
+            let (n1, d1) = self.rational_ops(lhs)?;
+            let (n2, d2) = self.rational_ops(rhs)?;
+            let num_slot = format!("%v{}.rns", dst.0);
+            let den_slot = format!("%v{}.rds", dst.0);
+            writeln!(self.body, "    {num_slot} = alloca i128").unwrap();
+            writeln!(self.body, "    {den_slot} = alloca i128").unwrap();
+            writeln!(
+                self.body,
+                "    call void @{helper}(i128 {n1}, i128 {d1}, i128 {n2}, i128 {d2}, ptr {num_slot}, ptr {den_slot})"
+            )
+            .unwrap();
+            let num_name = format!("%v{}.num", dst.0);
+            let den_name = format!("%v{}.den", dst.0);
+            writeln!(self.body, "    {num_name} = load i128, ptr {num_slot}").unwrap();
+            writeln!(self.body, "    {den_name} = load i128, ptr {den_slot}").unwrap();
+            self.values.insert(
+                dst,
+                ValueRepr::Rational {
+                    num_op: num_name,
+                    den_op: den_name,
+                },
+            );
+            return Ok(());
+        }
         // Text operands aren't inline scalars — a Text cell/value is a
         // `(ptr, len)` pair, so `=`/`<>` route through the runtime's
         // byte comparison instead of `icmp`. (The typechecker only admits
@@ -1703,8 +1758,12 @@ impl Emitter {
                 );
             }
             ScalarOp::Concat => unreachable!("Concat handled before the inline-scalar path"),
-            ScalarOp::RatioFromInts => {
-                unreachable!("RatioFromInts handled before the inline-scalar path")
+            ScalarOp::RatioFromInts
+            | ScalarOp::RationalAdd
+            | ScalarOp::RationalSub
+            | ScalarOp::RationalMul
+            | ScalarOp::RationalDiv => {
+                unreachable!("Rational ops handled before the inline-scalar path")
             }
         }
         Ok(())

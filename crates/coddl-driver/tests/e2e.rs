@@ -1740,6 +1740,21 @@ oper main {} [
 }
 
 #[test]
+fn rational_arithmetic_reduces() {
+    // `+ - * /` on Rationals call the runtime helpers and reduce. `/` binds
+    // tighter than `+`, so `1/2 + 1/3` is `(1/2)+(1/3)` = `5/6`; the product
+    // needs explicit grouping since `*` and `/` share precedence (no implicit
+    // Integer↔Rational mixing): `(1/2) * (2/3)` = `1/3`.
+    let src = "\
+program rat_arith;
+oper main {} [
+    write_relation { rel: Relation { {s: 1/2 + 1/3, p: (1/2) * (2/3)} } };
+];
+";
+    run_both_backends_expect(src, "rat-arith.cd", b"{p: 1/3, s: 5/6}\n");
+}
+
+#[test]
 fn division_by_zero_traps() {
     // `/ 0` on Integers traps at runtime (no rational infinity, unlike
     // Approximate's ±Inf) — the program aborts with a clear message.
