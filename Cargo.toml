@@ -30,7 +30,7 @@ publish = false
 [workspace.dependencies]
 rowan = "0.16"
 unicode-ident = "1"
-rusqlite = { version = "0.31", features = ["bundled", "trace"] }
+rusqlite = { version = "0.31", features = ["bundled", "trace", "collation"] }
 postgres = "0.19"
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["io-std", "rt-multi-thread", "macros"] }

@@ -279,7 +279,7 @@ fn emit_delete(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
     let mut wheres: Vec<(String, CmpOp, Literal)> = Vec::new();
     let (from_clause, _cols) = resolve(expr, &mut wheres)?;
     let mut params: Vec<Value> = Vec::new();
-    let where_sql = render_where_clause(&wheres, dialect, 0, &mut params);
+    let where_sql = render_where_clause(&wheres, dialect, 0, &mut params)?;
     let text = format!("DELETE FROM {from_clause}{where_sql}");
     let plan_id = PlanId(fnv1a(dialect, &text));
     Ok(SqlQuery {
@@ -582,7 +582,7 @@ fn emit_update(target: &RelExpr, rhs: &RelExpr, dialect: Dialect) -> Result<SqlQ
     }
 
     let mut params: Vec<Value> = Vec::new();
-    let where_sql = render_where_clause(&wheres, dialect, 0, &mut params);
+    let where_sql = render_where_clause(&wheres, dialect, 0, &mut params)?;
     let text = format!("UPDATE {from_clause} SET {}{where_sql}", set_sql.join(", "));
     let plan_id = PlanId(fnv1a(dialect, &text));
     Ok(SqlQuery {
@@ -947,24 +947,33 @@ fn emit_select_offset(
     // predicate was resolved to its physical column at its own level in the
     // tree (so a `where` above a `rename` resolves through the rename).
     let mut params: Vec<Value> = Vec::new();
-    text.push_str(&render_where_clause(&wheres, dialect, param_offset, &mut params));
+    text.push_str(&render_where_clause(&wheres, dialect, param_offset, &mut params)?);
 
     // Trailing `ORDER BY` for the `load … order [ … ]` boundary: order by the
     // output columns (named by attribute), `DESC` where requested, `ASC` (SQL's
     // default) omitted. Appended before the `plan_id` hash so an ordered query
     // caches distinctly from its unordered twin.
     if !order.is_empty() {
-        let terms: Vec<String> = order
-            .iter()
-            .map(|(attr, is_desc)| {
-                let col = quote_ident(attr);
-                if *is_desc {
-                    format!("{col} DESC")
-                } else {
-                    col
-                }
-            })
-            .collect();
+        let mut terms = Vec::with_capacity(order.len());
+        for (attr, is_desc) in order {
+            let col = quote_ident(attr);
+            // A `Rational` key orders by numeric value, not the lexicographic
+            // order of its `"n/d"` TEXT — same collation as a Rational range
+            // restriction. (`heading` carries the output attribute types.)
+            let is_rational = heading
+                .attrs()
+                .iter()
+                .any(|(a, ty)| a == attr && matches!(ty, Type::Rational));
+            let collate = if is_rational {
+                rational_order_collation(dialect)?
+            } else {
+                ""
+            };
+            terms.push(match (*is_desc, collate) {
+                (true, c) => format!("{col}{c} DESC"),
+                (false, c) => format!("{col}{c}"),
+            });
+        }
         text.push_str(" ORDER BY ");
         text.push_str(&terms.join(", "));
     }
@@ -1161,9 +1170,9 @@ fn render_where_clause(
     dialect: Dialect,
     param_offset: u32,
     params: &mut Vec<Value>,
-) -> String {
+) -> Result<String> {
     if wheres.is_empty() {
-        return String::new();
+        return Ok(String::new());
     }
     let mut conjuncts = Vec::with_capacity(wheres.len());
     for (col, op, value) in wheres {
@@ -1171,10 +1180,45 @@ fn render_where_clause(
             Dialect::SQLite => "?".to_string(),
             Dialect::Postgres => format!("${}", param_offset as usize + params.len() + 1),
         };
-        conjuncts.push(format!("{} {} {placeholder}", quote_ident(col), op.sql()));
+        // A `Rational` *ordering* restriction (`< <= > >=`) compares canonical
+        // `"n/d"` TEXT, which sorts lexicographically — wrong for rationals. Sort
+        // by numeric value via the `coddl_rational` collation. Equality (`= <>`)
+        // needs no collation (canonical text `=` already is value-equality).
+        let collate = if matches!(value, Literal::Rational(..)) && is_ordering(*op) {
+            rational_order_collation(dialect)?
+        } else {
+            ""
+        };
+        conjuncts.push(format!(
+            "{} {} {placeholder}{collate}",
+            quote_ident(col),
+            op.sql()
+        ));
         params.push(Value::from(value.clone()));
     }
-    format!(" WHERE {}", conjuncts.join(" AND "))
+    Ok(format!(" WHERE {}", conjuncts.join(" AND ")))
+}
+
+/// True for the ordering comparisons (`< <= > >=`) — the ones whose result
+/// depends on sort order (unlike `= <>`, which are value-identity).
+fn is_ordering(op: CmpOp) -> bool {
+    matches!(op, CmpOp::Lt | CmpOp::LtEq | CmpOp::Gt | CmpOp::GtEq)
+}
+
+/// The `COLLATE` suffix that orders a `Rational` column (`TEXT "n/d"`) by
+/// numeric value. SQLite registers `coddl_rational` on every connection.
+/// Postgres has no backend yet — a real `rational` type / operator class is the
+/// eventual answer there — so ordering a Rational under Postgres is a hard
+/// error, never a silently-wrong lexicographic sort.
+fn rational_order_collation(dialect: Dialect) -> Result<&'static str> {
+    match dialect {
+        Dialect::SQLite => Ok(" COLLATE coddl_rational"),
+        Dialect::Postgres => Err(BackendError::Other(
+            "Rational ordering pushdown is not supported on Postgres yet \
+             (needs a rational type / operator class)"
+                .to_string(),
+        )),
+    }
 }
 
 fn push_leaf_cols(
@@ -1577,6 +1621,43 @@ mod tests {
         );
         assert_eq!(q.sql.param_count, 1);
         assert_eq!(q.params, vec![Value::Rational(17, 5)]);
+    }
+
+    #[test]
+    fn restrict_on_rational_ordering_adds_the_numeric_collation() {
+        // A Rational *ordering* restriction can't compare `"n/d"` TEXT
+        // lexicographically, so it pushes with `COLLATE coddl_rational` (SQLite
+        // sorts by numeric value). Equality stays collation-free (above).
+        let expr = RelExpr::Restrict {
+            input: Box::new(greetings()),
+            pred: Predicate::AttrCmp {
+                op: CmpOp::Lt,
+                attr: "message".to_string(),
+                value: Literal::Rational(1, 2),
+            },
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id", "message" FROM "greetings" WHERE "message" < ? COLLATE coddl_rational"#
+        );
+        assert_eq!(q.params, vec![Value::Rational(1, 2)]);
+    }
+
+    #[test]
+    fn rational_ordering_pushdown_errors_on_postgres() {
+        // No Postgres backend yet; a real `rational` type / operator class is the
+        // eventual answer, so a Rational ordering restriction is a hard error
+        // there rather than a silently-wrong lexicographic sort.
+        let expr = RelExpr::Restrict {
+            input: Box::new(greetings()),
+            pred: Predicate::AttrCmp {
+                op: CmpOp::Gt,
+                attr: "message".to_string(),
+                value: Literal::Rational(1, 2),
+            },
+        };
+        assert!(emit_select(&expr, Dialect::Postgres).is_err());
     }
 
     #[test]

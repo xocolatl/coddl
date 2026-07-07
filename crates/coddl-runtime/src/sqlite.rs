@@ -630,7 +630,34 @@ fn ensure_connection(path: &str) -> () {
     // `trace` callback delivers the *expanded* SQL (bound values inlined):
     // handy for self-audit, but it can leak PII/secrets from filter values.
     conn.trace(Some(audit_sqlite_trace));
+    // Register the `coddl_rational` collation so pushed `Rational` ordering
+    // (`WHERE r < ? COLLATE coddl_rational`, `ORDER BY r COLLATE ...`) sorts by
+    // numeric value, not lexicographically. Equality never uses it (canonical
+    // `"n/d"` text `=` already agrees with value-equality).
+    if let Err(err) = conn.create_collation("coddl_rational", rational_collation) {
+        eprintln!("coddl: cannot register `coddl_rational` collation on `{path}`: {err}");
+        std::process::abort();
+    }
     guard.insert(path.to_string(), conn);
+}
+
+/// Numeric collation over two canonical `"n/d"` rational strings — the body of
+/// `COLLATE coddl_rational`. Parses each and defers to the same
+/// [`crate::rational::coddl_rational_cmp`] the in-process `<` operator uses, so
+/// pushed and in-process ordering agree exactly. A malformed operand (shouldn't
+/// occur — the column holds canonical text) falls back to a raw byte compare.
+fn rational_collation(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (parse_rational(a), parse_rational(b)) {
+        (Some((n1, d1)), Some((n2, d2))) => {
+            match crate::rational::coddl_rational_cmp(n1, d1, n2, d2) {
+                c if c < 0 => Ordering::Less,
+                c if c > 0 => Ordering::Greater,
+                _ => Ordering::Equal,
+            }
+        }
+        _ => a.cmp(b),
+    }
 }
 
 /// `rusqlite` trace callback. It is a bare `fn` (not a closure — it cannot
