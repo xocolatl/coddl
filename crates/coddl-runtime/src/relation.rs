@@ -15,7 +15,7 @@
 //! | `Boolean`       | 8 bytes  | `i64`; 0 = false, 1 = true              |
 //! | `Character`     | 8 bytes  | codepoint (`u32`) zero-extended to `i64`|
 //! | `Approximate`   | 8 bytes  | IEEE-754 double, canonical bits         |
-//! | `Rational`      | 32 bytes | reduced `(i128 numer, i128 denom)`      |
+//! | `Rational`      | 16 bytes | reduced `(i64 numer, i64 denom)`        |
 //! | `Text`          | 16 bytes | `(ptr: *const u8, len: usize)`          |
 //!
 //! Other scalar types and recursive Tuple / Relation cells slot in as
@@ -65,8 +65,8 @@ pub enum CoddlAttrKind {
     /// bytes (NaN → one pattern, `−0` → `+0` on ingest), so raw-byte compare is
     /// a proper equality. Prints in exponent form (`1.5e0`).
     Approximate = 4,
-    /// Inline `Rational` cell: a reduced `(numer, denom)` pair of `i128`s, 32
-    /// bytes (num @ 0, den @ 16). Canonical form ⇒ raw-byte compare is value
+    /// Inline `Rational` cell: a reduced `(numer, denom)` pair of `i64`s, 16
+    /// bytes (num @ 0, den @ 8). Canonical form ⇒ raw-byte compare is value
     /// equality. Prints as `n/d`.
     Rational = 5,
     /// Inline nested-tuple cell: a contiguous sub-region. The attribute's
@@ -664,12 +664,12 @@ unsafe fn print_cell<W: Write>(w: &mut W, attr: &CoddlAttrDesc, record: &[u8], b
         let value = f64::from_ne_bytes(bytes);
         let _ = write!(w, "{value:e}");
     } else if attr.kind == CoddlAttrKind::Rational as u32 {
-        // 32-byte reduced `(numer, denom)` i128 pair (num @ 0, den @ 16).
+        // 16-byte reduced `(numer, denom)` i64 pair (num @ 0, den @ 8).
         // Prints as `n/d`.
-        let num_bytes: [u8; 16] = record[offset..offset + 16].try_into().unwrap();
-        let den_bytes: [u8; 16] = record[offset + 16..offset + 32].try_into().unwrap();
-        let num = i128::from_ne_bytes(num_bytes);
-        let den = i128::from_ne_bytes(den_bytes);
+        let num_bytes: [u8; 8] = record[offset..offset + 8].try_into().unwrap();
+        let den_bytes: [u8; 8] = record[offset + 8..offset + 16].try_into().unwrap();
+        let num = i64::from_ne_bytes(num_bytes);
+        let den = i64::from_ne_bytes(den_bytes);
         let _ = write!(w, "{num}/{den}");
     } else if attr.kind == CoddlAttrKind::Text as u32 {
         let ptr_bytes: [u8; 8] = record[offset..offset + 8].try_into().unwrap();
@@ -2748,7 +2748,7 @@ mod tests {
 
     #[test]
     fn print_cell_renders_rational_as_n_slash_d() {
-        // A `Rational` cell is two i128s (num @ 0, den @ 16) and prints `n/d`.
+        // A `Rational` cell is two i64s (num @ 0, den @ 8) and prints `n/d`.
         let attr = CoddlAttrDesc {
             name: b"r".as_ptr(),
             name_len: 1,
@@ -2756,16 +2756,16 @@ mod tests {
             offset: 0,
             sub: std::ptr::null(),
         };
-        let mut record = vec![0u8; 32];
-        record[0..16].copy_from_slice(&17i128.to_ne_bytes());
-        record[16..32].copy_from_slice(&5i128.to_ne_bytes());
+        let mut record = vec![0u8; 16];
+        record[0..8].copy_from_slice(&17i64.to_ne_bytes());
+        record[8..16].copy_from_slice(&5i64.to_ne_bytes());
         let mut buf: Vec<u8> = Vec::new();
         unsafe { print_cell(&mut buf, &attr, &record, 0) };
         assert_eq!(buf, b"17/5");
 
         // A negative numerator (sign lives on num).
-        record[0..16].copy_from_slice(&(-3i128).to_ne_bytes());
-        record[16..32].copy_from_slice(&4i128.to_ne_bytes());
+        record[0..8].copy_from_slice(&(-3i64).to_ne_bytes());
+        record[8..16].copy_from_slice(&4i64.to_ne_bytes());
         let mut buf2: Vec<u8> = Vec::new();
         unsafe { print_cell(&mut buf2, &attr, &record, 0) };
         assert_eq!(buf2, b"-3/4");

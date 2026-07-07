@@ -288,7 +288,7 @@ pub enum Literal {
     Approximate(u64),
     /// A bounded `Rational` as its reduced `(numer, denom)` pair. Binds/stores
     /// as canonical SQL `TEXT "n/d"`.
-    Rational(i128, i128),
+    Rational(i64, i64),
     Boolean(bool),
 }
 

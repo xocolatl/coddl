@@ -68,8 +68,8 @@ enum ValueRepr {
         ptr_op: String,
         len_op: String,
     },
-    /// A `Rational` value — a `(numer, denom)` pair of `i128`s (a compound,
-    /// like `Text`; 32-byte cell). Both operands are `i128` spellings.
+    /// A `Rational` value — a `(numer, denom)` pair of `i64`s (a compound,
+    /// like `Text`; 16-byte cell). Both operands are `i64` spellings.
     Rational {
         num_op: String,
         den_op: String,
@@ -93,8 +93,8 @@ impl ValueRepr {
                 out.push(format!("i64 {len_op}"));
             }
             ValueRepr::Rational { num_op, den_op } => {
-                out.push(format!("i128 {num_op}"));
-                out.push(format!("i128 {den_op}"));
+                out.push(format!("i64 {num_op}"));
+                out.push(format!("i64 {den_op}"));
             }
             ValueRepr::Tuple { fields } => {
                 for (_, f) in fields {
@@ -242,7 +242,7 @@ impl Emitter {
         // `coddl_utf8_len` for the length.
         writeln!(self.body, "declare ptr @coddl_char_to_text(i32)").unwrap();
         writeln!(self.body, "declare i64 @coddl_utf8_len(i32)").unwrap();
-        // Exact `/`: (a, b) -> reduced Rational written through two i128
+        // Exact `/`: (a, b) -> reduced Rational written through two i64
         // out-pointers (num, den).
         writeln!(
             self.body,
@@ -256,7 +256,7 @@ impl Emitter {
             "coddl_rational_mul",
             "coddl_rational_div",
         ] {
-            writeln!(self.body, "declare void @{f}(i128, i128, i128, i128, ptr, ptr)").unwrap();
+            writeln!(self.body, "declare void @{f}(i64, i64, i64, i64, ptr, ptr)").unwrap();
         }
         // `coddl_rational_to_approx` (Rational → double) is declared by the
         // generic builtin-call path (`to_approximate` ∈ BUILTIN_EXTERNS).
@@ -872,8 +872,8 @@ impl Emitter {
                 value: Const::Rational(n, d),
                 ty: ProcType::Rational,
             } => {
-                // A Rational is a compound `(i128, i128)`; LLVM IR text accepts
-                // arbitrary-width integer decimals directly as immediates.
+                // A Rational is a compound `(i64, i64)`; the two components are
+                // emitted as plain i64 decimal immediates.
                 self.values.insert(
                     *dst,
                     ValueRepr::Rational {
@@ -1324,7 +1324,7 @@ impl Emitter {
         }
     }
 
-    /// The `(num, den)` i128 operand spellings of a `Rational` value.
+    /// The `(num, den)` i64 operand spellings of a `Rational` value.
     fn rational_ops(&self, v: &ValueId) -> Result<(String, String), LlvmEmitError> {
         match self.values.get(v) {
             Some(ValueRepr::Rational { num_op, den_op }) => Ok((num_op.clone(), den_op.clone())),
@@ -1517,7 +1517,7 @@ impl Emitter {
             return Ok(());
         }
         // Exact `/`: two Integer (i64) operands → a reduced `Rational`. The
-        // runtime helper writes `(num, den)` through two i128 out-pointers
+        // runtime helper writes `(num, den)` through two i64 out-pointers
         // (the reduce/normalize/trap can't be inlined). Produces a compound
         // `ValueRepr::Rational`.
         if matches!(op, ScalarOp::RatioFromInts) {
@@ -1525,8 +1525,8 @@ impl Emitter {
             let rhs_op = self.scalar_op(rhs)?;
             let num_slot = format!("%v{}.rns", dst.0);
             let den_slot = format!("%v{}.rds", dst.0);
-            writeln!(self.body, "    {num_slot} = alloca i128, align 16").unwrap();
-            writeln!(self.body, "    {den_slot} = alloca i128, align 16").unwrap();
+            writeln!(self.body, "    {num_slot} = alloca i64").unwrap();
+            writeln!(self.body, "    {den_slot} = alloca i64").unwrap();
             writeln!(
                 self.body,
                 "    call void @coddl_rational_from_ints(i64 {lhs_op}, i64 {rhs_op}, ptr {num_slot}, ptr {den_slot})"
@@ -1534,8 +1534,8 @@ impl Emitter {
             .unwrap();
             let num_name = format!("%v{}.num", dst.0);
             let den_name = format!("%v{}.den", dst.0);
-            writeln!(self.body, "    {num_name} = load i128, ptr {num_slot}, align 8").unwrap();
-            writeln!(self.body, "    {den_name} = load i128, ptr {den_slot}, align 8").unwrap();
+            writeln!(self.body, "    {num_name} = load i64, ptr {num_slot}").unwrap();
+            writeln!(self.body, "    {den_name} = load i64, ptr {den_slot}").unwrap();
             self.values.insert(
                 dst,
                 ValueRepr::Rational {
@@ -1547,7 +1547,7 @@ impl Emitter {
         }
         // Rational arithmetic `+ - * /`: two `(num, den)` operands → a reduced
         // Rational via the matching runtime helper (out-pointers), like
-        // `RatioFromInts` but with i128 args.
+        // `RatioFromInts` but with two Rational operands (four i64 args).
         if let Some(helper) = match op {
             ScalarOp::RationalAdd => Some("coddl_rational_add"),
             ScalarOp::RationalSub => Some("coddl_rational_sub"),
@@ -1559,17 +1559,17 @@ impl Emitter {
             let (n2, d2) = self.rational_ops(rhs)?;
             let num_slot = format!("%v{}.rns", dst.0);
             let den_slot = format!("%v{}.rds", dst.0);
-            writeln!(self.body, "    {num_slot} = alloca i128, align 16").unwrap();
-            writeln!(self.body, "    {den_slot} = alloca i128, align 16").unwrap();
+            writeln!(self.body, "    {num_slot} = alloca i64").unwrap();
+            writeln!(self.body, "    {den_slot} = alloca i64").unwrap();
             writeln!(
                 self.body,
-                "    call void @{helper}(i128 {n1}, i128 {d1}, i128 {n2}, i128 {d2}, ptr {num_slot}, ptr {den_slot})"
+                "    call void @{helper}(i64 {n1}, i64 {d1}, i64 {n2}, i64 {d2}, ptr {num_slot}, ptr {den_slot})"
             )
             .unwrap();
             let num_name = format!("%v{}.num", dst.0);
             let den_name = format!("%v{}.den", dst.0);
-            writeln!(self.body, "    {num_name} = load i128, ptr {num_slot}, align 8").unwrap();
-            writeln!(self.body, "    {den_name} = load i128, ptr {den_slot}, align 8").unwrap();
+            writeln!(self.body, "    {num_name} = load i64, ptr {num_slot}").unwrap();
+            writeln!(self.body, "    {den_name} = load i64, ptr {den_slot}").unwrap();
             self.values.insert(
                 dst,
                 ValueRepr::Rational {
@@ -1648,14 +1648,14 @@ impl Emitter {
         }
         // Rational `=`/`<>` on canonical `(num, den)` pairs: equal iff both
         // components are equal (reduced form makes this value-equality). Compare
-        // each i128 and `and` them; `<>` is the negation. (Only Eq/NotEq here.)
+        // each i64 and `and` them; `<>` is the negation. (Only Eq/NotEq here.)
         if matches!(operand_type, ProcType::Rational) {
             let (lnum, lden) = self.rational_ops(lhs)?;
             let (rnum, rden) = self.rational_ops(rhs)?;
             let neq = format!("%v{}.ne", dst.0);
             let deq = format!("%v{}.de", dst.0);
-            writeln!(self.body, "    {neq} = icmp eq i128 {lnum}, {rnum}").unwrap();
-            writeln!(self.body, "    {deq} = icmp eq i128 {lden}, {rden}").unwrap();
+            writeln!(self.body, "    {neq} = icmp eq i64 {lnum}, {rnum}").unwrap();
+            writeln!(self.body, "    {deq} = icmp eq i64 {lden}, {rden}").unwrap();
             let both = format!("%v{}.eq", dst.0);
             writeln!(self.body, "    {both} = and i1 {neq}, {deq}").unwrap();
             let dst_name = format!("%v{}", dst.0);
@@ -1864,14 +1864,14 @@ impl Emitter {
                 Ok(())
             }
             ProcType::Rational => {
-                // The 32-byte cell holds two canonical i128s: num @ offset,
-                // den @ offset+16.
+                // The 16-byte cell holds two canonical i64s: num @ offset,
+                // den @ offset+8.
                 let num_slot = self.gep_byte(&src_op, offset as usize);
-                let den_slot = self.gep_byte(&src_op, offset as usize + 16);
+                let den_slot = self.gep_byte(&src_op, offset as usize + 8);
                 let num_name = format!("%v{}.num", dst.0);
                 let den_name = format!("%v{}.den", dst.0);
-                writeln!(self.body, "    {num_name} = load i128, ptr {num_slot}, align 8").unwrap();
-                writeln!(self.body, "    {den_name} = load i128, ptr {den_slot}, align 8").unwrap();
+                writeln!(self.body, "    {num_name} = load i64, ptr {num_slot}").unwrap();
+                writeln!(self.body, "    {den_name} = load i64, ptr {den_slot}").unwrap();
                 self.values.insert(
                     dst,
                     ValueRepr::Rational {
@@ -2352,11 +2352,11 @@ impl Emitter {
             }
             ProcType::Rational => {
                 let num_slot = self.gep_byte(base, byte_offset);
-                let den_slot = self.gep_byte(base, byte_offset + 16);
+                let den_slot = self.gep_byte(base, byte_offset + 8);
                 let num_name = format!("%{name_hint}.num");
                 let den_name = format!("%{name_hint}.den");
-                writeln!(self.body, "    {num_name} = load i128, ptr {num_slot}, align 8").unwrap();
-                writeln!(self.body, "    {den_name} = load i128, ptr {den_slot}, align 8").unwrap();
+                writeln!(self.body, "    {num_name} = load i64, ptr {num_slot}").unwrap();
+                writeln!(self.body, "    {den_name} = load i64, ptr {den_slot}").unwrap();
                 Ok(ValueRepr::Rational {
                     num_op: num_name,
                     den_op: den_name,
@@ -2604,13 +2604,13 @@ impl Emitter {
                 writeln!(self.body, "    call void @coddl_rc_retain(ptr {ptr_op})").unwrap();
                 Ok(())
             }
-            // A `Rational` cell is `(num, den)` — two i128s at offset/offset+16.
-            // No refcount (i128s own no heap).
+            // A `Rational` cell is `(num, den)` — two i64s at offset/offset+8.
+            // No refcount (i64s own no heap).
             ValueRepr::Rational { num_op, den_op } => {
                 let slot_num = self.gep_byte(base, byte_offset);
-                let slot_den = self.gep_byte(base, byte_offset + 16);
-                writeln!(self.body, "    store i128 {num_op}, ptr {slot_num}, align 8").unwrap();
-                writeln!(self.body, "    store i128 {den_op}, ptr {slot_den}, align 8").unwrap();
+                let slot_den = self.gep_byte(base, byte_offset + 8);
+                writeln!(self.body, "    store i64 {num_op}, ptr {slot_num}").unwrap();
+                writeln!(self.body, "    store i64 {den_op}, ptr {slot_den}").unwrap();
                 Ok(())
             }
             // Inline nested-tuple cell: store each component into the sub-region

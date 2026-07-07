@@ -13,7 +13,7 @@
 //! | `Boolean`      | 8             | i64 (0 / 1); sub-word later    |
 //! | `Character`    | 8             | codepoint zero-extended to i64 |
 //! | `Approximate`  | 8             | IEEE-754 double (canonical bits)|
-//! | `Rational`     | 32            | reduced `(i128 numer, i128 denom)` |
+//! | `Rational`     | 16            | reduced `(i64 numer, i64 denom)` |
 //! | `Text`         | 16            | (ptr: usize, len: usize)       |
 //! | `Tuple H`      | Σ components  | inline sub-region (recursive)  |
 //!
@@ -43,8 +43,8 @@ pub mod kind_tag {
     /// `Approximate` cell: an IEEE-754 double stored inline as its 8 bytes
     /// (canonical bits — see the lowerer's `canonical_approx_bits`).
     pub const APPROXIMATE: u32 = 4;
-    /// `Rational` cell: a reduced `(numer, denom)` pair of `i128`s, 32 bytes
-    /// (num @ 0, den @ 16). Canonical form ⇒ byte-compare is value-equality.
+    /// `Rational` cell: a reduced `(numer, denom)` pair of `i64`s, 16 bytes
+    /// (num @ 0, den @ 8). Canonical form ⇒ byte-compare is value-equality.
     pub const RATIONAL: u32 = 5;
     /// Inline nested-tuple cell: a contiguous sub-region; the descriptor
     /// attribute carries a pointer to the tuple's own heading descriptor.
@@ -86,8 +86,8 @@ pub fn cell_width(ty: &Type) -> Option<u32> {
         // Approximate is an inline IEEE-754 double (8 bytes), stored as its
         // canonical bits so `cmp_cell`'s byte compare is a proper equality.
         Type::Approximate => Some(8),
-        // Rational is a reduced (numer, denom) pair of i128s — 32 bytes.
-        Type::Rational => Some(32),
+        // Rational is a reduced (numer, denom) pair of i64s — 16 bytes.
+        Type::Rational => Some(16),
         Type::Text => Some(16),
         // Inline nested-tuple cell: the sum of its components' widths,
         // recursively (`Tuple {}` → 0). `None` propagates if any component
@@ -208,13 +208,13 @@ mod tests {
     }
 
     #[test]
-    fn single_rational_attr_is_thirty_two_byte_cell() {
+    fn single_rational_attr_is_sixteen_byte_cell() {
         let h = heading(&[("r", Type::Rational)]);
         let l = record_layout(&h);
-        assert_eq!(l.record_size, 32);
+        assert_eq!(l.record_size, 16);
         assert_eq!(l.attrs[0].name, "r");
         assert_eq!(l.attrs[0].offset, 0);
-        assert_eq!(l.attrs[0].width, 32);
+        assert_eq!(l.attrs[0].width, 16);
         assert_eq!(l.attrs[0].kind, kind_tag::RATIONAL);
     }
 

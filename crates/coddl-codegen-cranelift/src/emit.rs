@@ -218,7 +218,7 @@ fn declare_scalar_text_externs(
         funcs.insert("coddl_char_to_text".into(), id);
     }
     // coddl_rational_from_ints(a: i64, b: i64, out_num: ptr, out_den: ptr)
-    // — exact `/`, writes the reduced Rational through two i128 out-pointers.
+    // — exact `/`, writes the reduced Rational through two i64 out-pointers.
     {
         let mut sig = obj.make_signature();
         sig.params.push(AbiParam::new(types::I64));
@@ -230,8 +230,8 @@ fn declare_scalar_text_externs(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert("coddl_rational_from_ints".into(), id);
     }
-    // Rational arithmetic: (n1, d1, n2, d2, out_num, out_den) — four I128s in,
-    // reduced pair out through two i128 pointers.
+    // Rational arithmetic: (n1, d1, n2, d2, out_num, out_den) — four I64s in,
+    // reduced pair out through two i64 pointers.
     for name in [
         "coddl_rational_add",
         "coddl_rational_sub",
@@ -240,7 +240,7 @@ fn declare_scalar_text_externs(
     ] {
         let mut sig = obj.make_signature();
         for _ in 0..4 {
-            sig.params.push(AbiParam::new(types::I128));
+            sig.params.push(AbiParam::new(types::I64));
         }
         sig.params.push(AbiParam::new(ptr_ty));
         sig.params.push(AbiParam::new(ptr_ty));
@@ -251,7 +251,7 @@ fn declare_scalar_text_externs(
     }
     // `coddl_rational_to_approx` (the `to_approximate` builtin) is an ensure_extern'd
     // `BUILTIN_EXTERN`, so it's declared via the function-table loop / `cranelift_signature`
-    // (which flattens the Rational param to two I128) — not here.
+    // (which flattens the Rational param to two I64) — not here.
     // coddl_utf8_len(codepoint: i32) -> i64
     {
         let mut sig = obj.make_signature();
@@ -1003,10 +1003,10 @@ fn push_param_types(
             out.push(AbiParam::new(ptr_ty));
             out.push(AbiParam::new(types::I64));
         }
-        // A `Rational` is a compound `(num, den)` — two I128s, like `Text`'s pair.
+        // A `Rational` is a compound `(num, den)` — two I64s, like `Text`'s pair.
         ProcType::Rational => {
-            out.push(AbiParam::new(types::I128));
-            out.push(AbiParam::new(types::I128));
+            out.push(AbiParam::new(types::I64));
+            out.push(AbiParam::new(types::I64));
         }
         ProcType::Unit => {} // no value at the ABI level
         ProcType::Tuple(heading) => {
@@ -1091,8 +1091,8 @@ enum ValueRepr {
         ptr: CrValue,
         len: CrValue,
     },
-    /// A `Rational` value — a `(numer, denom)` pair of `I128`s (a compound,
-    /// like `Text`; 32-byte cell).
+    /// A `Rational` value — a `(numer, denom)` pair of `I64`s (a compound,
+    /// like `Text`; 16-byte cell).
     Rational {
         num: CrValue,
         den: CrValue,
@@ -1397,10 +1397,10 @@ fn emit_inst(
             value: Const::Rational(n, d),
             ty: ProcType::Rational,
         } => {
-            // A Rational is a compound `(I128, I128)`; `iconst` is Imm64-only,
-            // so build each i128 from its lo/hi 64-bit halves via `iconcat`.
-            let num = i128_const(builder, *n);
-            let den = i128_const(builder, *d);
+            // A Rational is a compound `(I64, I64)`; each component is a plain
+            // `iconst` (Imm64 holds a full i64).
+            let num = builder.ins().iconst(types::I64, *n);
+            let den = builder.ins().iconst(types::I64, *d);
             values.insert(*dst, ValueRepr::Rational { num, den });
             Ok(())
         }
@@ -1699,8 +1699,8 @@ fn emit_inst(
                 return Ok(());
             }
             // Exact `/`: two Integer (I64) operands → a reduced `Rational`. The
-            // runtime helper writes `(num, den)` through two i128 out-pointers
-            // into a 32-byte stack slot (num @ 0, den @ 16); load them back into
+            // runtime helper writes `(num, den)` through two i64 out-pointers
+            // into a 16-byte stack slot (num @ 0, den @ 8); load them back into
             // a compound `ValueRepr::Rational`.
             if matches!(op, ScalarOp::RatioFromInts) {
                 use cranelift_codegen::ir::{StackSlotData, StackSlotKind};
@@ -1709,21 +1709,21 @@ fn emit_inst(
                 let ptr_ty = obj.target_config().pointer_type();
                 let slot = builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
-                    32,
-                    4,
+                    16,
+                    3,
                 ));
                 let num_addr = builder.ins().stack_addr(ptr_ty, slot, 0);
-                let den_addr = builder.ins().stack_addr(ptr_ty, slot, 16);
+                let den_addr = builder.ins().stack_addr(ptr_ty, slot, 8);
                 let fid = funcs["coddl_rational_from_ints"];
                 let local = obj.declare_func_in_func(fid, builder.func);
                 builder.ins().call(local, &[a, b, num_addr, den_addr]);
-                let num = builder.ins().stack_load(types::I128, slot, 0);
-                let den = builder.ins().stack_load(types::I128, slot, 16);
+                let num = builder.ins().stack_load(types::I64, slot, 0);
+                let den = builder.ins().stack_load(types::I64, slot, 8);
                 values.insert(*dst, ValueRepr::Rational { num, den });
                 return Ok(());
             }
             // Rational arithmetic `+ - * /`: two `(num, den)` operands → a
-            // reduced Rational via the matching helper (i128 args, out-pointers).
+            // reduced Rational via the matching helper (i64 args, out-pointers).
             if let Some(helper) = match op {
                 ScalarOp::RationalAdd => Some("coddl_rational_add"),
                 ScalarOp::RationalSub => Some("coddl_rational_sub"),
@@ -1737,18 +1737,18 @@ fn emit_inst(
                 let ptr_ty = obj.target_config().pointer_type();
                 let slot = builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
-                    32,
-                    4,
+                    16,
+                    3,
                 ));
                 let num_addr = builder.ins().stack_addr(ptr_ty, slot, 0);
-                let den_addr = builder.ins().stack_addr(ptr_ty, slot, 16);
+                let den_addr = builder.ins().stack_addr(ptr_ty, slot, 8);
                 let fid = funcs[helper];
                 let local = obj.declare_func_in_func(fid, builder.func);
                 builder
                     .ins()
                     .call(local, &[n1, d1, n2, d2, num_addr, den_addr]);
-                let num = builder.ins().stack_load(types::I128, slot, 0);
-                let den = builder.ins().stack_load(types::I128, slot, 16);
+                let num = builder.ins().stack_load(types::I64, slot, 0);
+                let den = builder.ins().stack_load(types::I64, slot, 8);
                 values.insert(*dst, ValueRepr::Rational { num, den });
                 return Ok(());
             }
@@ -1804,7 +1804,7 @@ fn emit_inst(
                 values.insert(*dst, ValueRepr::Scalar(result));
                 return Ok(());
             }
-            // Rational `=`/`<>` on canonical `(num, den)` I128 pairs: equal iff
+            // Rational `=`/`<>` on canonical `(num, den)` I64 pairs: equal iff
             // both components are equal (reduced form ⇒ value-equality). `<>` is
             // the negation. (Only Eq/NotEq reach here on Rational.)
             if matches!(operand_type, ProcType::Rational) {
@@ -1925,12 +1925,12 @@ fn emit_inst(
                     Ok(())
                 }
                 ProcType::Rational => {
-                    // The 32-byte cell holds two canonical I128s: num @ offset,
-                    // den @ offset+16.
-                    let num = builder.ins().load(types::I128, flags, src_v, *offset as i32);
+                    // The 16-byte cell holds two canonical I64s: num @ offset,
+                    // den @ offset+8.
+                    let num = builder.ins().load(types::I64, flags, src_v, *offset as i32);
                     let den = builder
                         .ins()
-                        .load(types::I128, flags, src_v, *offset as i32 + 16);
+                        .load(types::I64, flags, src_v, *offset as i32 + 8);
                     values.insert(*dst, ValueRepr::Rational { num, den });
                     Ok(())
                 }
@@ -2273,10 +2273,10 @@ fn emit_inst(
                         ValueRepr::Scalar(v)
                     }
                     ProcType::Rational => {
-                        let num = builder.ins().load(types::I128, flags, record_ptr, offset);
+                        let num = builder.ins().load(types::I64, flags, record_ptr, offset);
                         let den = builder
                             .ins()
-                            .load(types::I128, flags, record_ptr, offset + 16);
+                            .load(types::I64, flags, record_ptr, offset + 8);
                         ValueRepr::Rational { num, den }
                     }
                     ProcType::Text => {
@@ -2698,14 +2698,6 @@ fn text_value(
     }
 }
 
-/// Materialize an `i128` constant. `iconst` only holds 64 bits, so build the
-/// value from its lo/hi halves with `iconcat`.
-fn i128_const(builder: &mut FunctionBuilder<'_>, value: i128) -> CrValue {
-    let lo = builder.ins().iconst(types::I64, value as u64 as i64);
-    let hi = builder.ins().iconst(types::I64, (value >> 64) as i64);
-    builder.ins().iconcat(lo, hi)
-}
-
 fn rational_value(
     values: &HashMap<ValueId, ValueRepr>,
     v: &ValueId,
@@ -2766,11 +2758,11 @@ fn store_attr(
             builder.ins().call(retain_ref, &[*ptr]);
             Ok(())
         }
-        // A `Rational` cell is `(num, den)` — two I128s at offset/offset+16.
-        // No refcount (i128s own no heap).
+        // A `Rational` cell is `(num, den)` — two I64s at offset/offset+8.
+        // No refcount (i64s own no heap).
         ValueRepr::Rational { num, den } => {
             builder.ins().store(flags, *num, payload, byte_offset);
-            builder.ins().store(flags, *den, payload, byte_offset + 16);
+            builder.ins().store(flags, *den, payload, byte_offset + 8);
             Ok(())
         }
         // Inline nested-tuple cell: store each component into the sub-region at

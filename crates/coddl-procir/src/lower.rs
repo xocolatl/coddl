@@ -74,7 +74,7 @@ const BUILTIN_EXTERNS: &[BuiltinExtern] = &[
         return_type: ProcType::Integer,
     },
     // `to_approximate { self: Rational } -> Approximate`. The Rational arg
-    // flattens to two i128 operands (`push_call_operands`); the return is a
+    // flattens to two i64 operands (`push_call_operands`); the return is a
     // plain `double`, so the generic call path handles it.
     BuiltinExtern {
         surface: "to_approximate",
@@ -3799,12 +3799,12 @@ impl Lowerer {
             // `2/3` literal token), so folding it is what makes such predicates
             // pushable instead of hitting the in-process pushdown gap.
             Expr::Binary(b) if b.op_kind() == Some(BinaryOp::Div) => {
-                let n = int_literal_i128(&b.lhs()?)?;
-                let d = int_literal_i128(&b.rhs()?)?;
+                let n = int_literal_i64(&b.lhs()?)?;
+                let d = int_literal_i64(&b.rhs()?)?;
                 if d == 0 {
                     return None; // `2/0` is not a rational — decline the fold
                 }
-                let (n, d) = reduce_rational(n, d);
+                let (n, d) = reduce_rational(n as i128, d as i128);
                 Some(RelLiteral::Rational(n, d))
             }
             _ => None,
@@ -5851,13 +5851,13 @@ fn decode_approximate_literal(text: &str) -> u64 {
     canonical_approx_bits(value)
 }
 
-/// If `expr` is an integer literal, its value widened to `i128`; else `None`.
+/// If `expr` is an integer literal, its `i64` value; else `None`.
 /// Used to constant-fold `<int> / <int>` rational constants in the pushdown path.
-fn int_literal_i128(expr: &Expr) -> Option<i128> {
+fn int_literal_i64(expr: &Expr) -> Option<i64> {
     if let Expr::Literal(lit) = expr {
         let tok = lit.token()?;
         if tok.kind() == SyntaxKind::INTEGER_LIT {
-            return Some(parse_integer_literal(tok.text()) as i128);
+            return Some(parse_integer_literal(tok.text()) as i64);
         }
     }
     None
@@ -5875,12 +5875,13 @@ fn gcd_i128(mut a: i128, mut b: i128) -> i128 {
     a
 }
 
-/// Reduce `(n, d)` to the canonical `Rational`: `gcd(|n|, d) = 1`, `d > 0`,
-/// `0 → (0, 1)`. Panics on `d == 0` (division by zero is not a rational) — the
-/// caller (literal decode) can't produce a zero denominator, but keep it total.
-/// Every `Rational`-producing path funnels through this (compile-time here; the
-/// runtime mirror lands with arithmetic).
-fn reduce_rational(n: i128, d: i128) -> (i128, i128) {
+/// Reduce `(n, d)` to the canonical `i64` `Rational`: `gcd(|n|, d) = 1`,
+/// `d > 0`, `0 → (0, 1)`. Reduces in `i128` (so decode's `10^k` intermediate
+/// can't wrap) then narrows to `i64`. Panics on `d == 0` (division by zero is
+/// not a rational) and on a reduced component that exceeds `i64` (a literal past
+/// the bounded type's range). Every compile-time `Rational` funnels through
+/// this; the runtime mirror (`reduce_to_i64`) handles the same narrowing.
+fn reduce_rational(n: i128, d: i128) -> (i64, i64) {
     assert!(d != 0, "rational with zero denominator");
     if n == 0 {
         return (0, 1);
@@ -5891,14 +5892,15 @@ fn reduce_rational(n: i128, d: i128) -> (i128, i128) {
         n = -n;
         d = -d;
     }
-    (n, d)
+    let narrow = |v: i128| i64::try_from(v).expect("rational component exceeds i64");
+    (narrow(n), narrow(d))
 }
 
 /// Decode a `Rational` literal (`3.4`, `42.0`, `3.1415926`) — the lexer's
 /// `digits . digits` form — to its reduced `(numer, denom)` pair. `d.ffff` with
 /// `k` fractional digits → `(all_digits, 10^k)`, reduced. Underscores are
-/// decoration. Overflow of a pathological (>38-digit) literal traps.
-fn decode_rational_literal(text: &str) -> (i128, i128) {
+/// decoration. A literal whose reduced form exceeds `i64` (≳19 digits) traps.
+fn decode_rational_literal(text: &str) -> (i64, i64) {
     let cleaned: String = text.chars().filter(|c| *c != '_').collect();
     let (int_part, frac_part) = match cleaned.split_once('.') {
         Some((i, f)) => (i, f),

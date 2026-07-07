@@ -619,9 +619,9 @@ pub enum Const {
     /// equality is a proper (reflexive) equality. `double` at the ABI.
     Approximate(u64),
     /// A bounded exact `Rational` as a **reduced** `(numer, denom)` pair
-    /// (`gcd(|n|,d) = 1`, `d > 0`, `0 = (0,1)`). Two `i128`s — a compound
-    /// value at the ABI (like `Text`'s `(ptr, len)`), 32-byte cell.
-    Rational(i128, i128),
+    /// (`gcd(|n|,d) = 1`, `d > 0`, `0 = (0,1)`). Two `i64`s — a compound
+    /// value at the ABI (like `Text`'s `(ptr, len)`), 16-byte cell.
+    Rational(i64, i64),
     /// `true` / `false` — Boolean literal value.
     Boolean(bool),
     /// The `Tuple {}` value — produced where the source had `{}` or
