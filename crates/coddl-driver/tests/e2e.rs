@@ -1613,7 +1613,7 @@ oper main {} [
 
 #[test]
 fn rational_equality_prints_boolean() {
-    // `3.4 = 3.4` and `3.4 = 1.5` compare the reduced `(num,den)` i128 pairs
+    // `3.4 = 3.4` and `3.4 = 1.5` compare the reduced `(num,den)` i64 pairs
     // (two `icmp` + `and`); the Boolean results interpolate.
     let src = "\
 program rat_eq;
@@ -1625,6 +1625,26 @@ oper main {} [
 ];
 ";
     run_both_backends_expect(src, "rat-eq.cd", b"true false\n");
+}
+
+#[test]
+fn rational_ordering_compares_by_value() {
+    // `< > <= >=` on Rationals route through the runtime cross-multiply
+    // comparator (`a/b ⋛ c/d ⟺ a·d ⋛ c·b`), not lexicographic text order.
+    // The last case exercises a cross-product that overflows i64 (`4e9/1` vs
+    // `1/4e9`) but fits the i128 intermediate — `4e9/1 > 1/4e9` is `true`.
+    let src = "\
+program rat_ord;
+oper main {} [
+    let a = 1/3 < 1/2;
+    let b = 1/2 <= 1/2;
+    let c = 3/4 > 5/6;
+    let d = 4000000000/1 > 1/4000000000;
+    let message = format { template: f\"{a} {b} {c} {d}\", args: { a: a, b: b, c: c, d: d } };
+    write_line { message };
+];
+";
+    run_both_backends_expect(src, "rat-ord.cd", b"true true false true\n");
 }
 
 #[test]

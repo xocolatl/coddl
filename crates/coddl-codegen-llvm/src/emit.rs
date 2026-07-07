@@ -258,6 +258,8 @@ impl Emitter {
         ] {
             writeln!(self.body, "declare void @{f}(i64, i64, i64, i64, ptr, ptr)").unwrap();
         }
+        // Rational three-way compare: (n1, d1, n2, d2) -> i32 (-1/0/+1).
+        writeln!(self.body, "declare i32 @coddl_rational_cmp(i64, i64, i64, i64)").unwrap();
         // `coddl_rational_to_approx` (Rational → double) is declared by the
         // generic builtin-call path (`to_approximate` ∈ BUILTIN_EXTERNS).
         // RC retain/release — emitted for any heap `Text` (immortal literals
@@ -1646,19 +1648,45 @@ impl Emitter {
             );
             return Ok(());
         }
-        // Rational `=`/`<>` on canonical `(num, den)` pairs: equal iff both
-        // components are equal (reduced form makes this value-equality). Compare
-        // each i64 and `and` them; `<>` is the negation. (Only Eq/NotEq here.)
+        // Rational comparisons on canonical `(num, den)` pairs.
         if matches!(operand_type, ProcType::Rational) {
             let (lnum, lden) = self.rational_ops(lhs)?;
             let (rnum, rden) = self.rational_ops(rhs)?;
+            let dst_name = format!("%v{}", dst.0);
+            // Ordering `< > <= >=` routes through the runtime's cross-multiply
+            // comparator (returns -1/0/+1), then compares the verdict to 0.
+            // Text `=`-style lexicographic order would be wrong here.
+            if let Some(cond) = match op {
+                ScalarOp::Lt => Some("slt"),
+                ScalarOp::Gt => Some("sgt"),
+                ScalarOp::LtEq => Some("sle"),
+                ScalarOp::GtEq => Some("sge"),
+                _ => None,
+            } {
+                let cmp = format!("%v{}.cmp", dst.0);
+                writeln!(
+                    self.body,
+                    "    {cmp} = call i32 @coddl_rational_cmp(i64 {lnum}, i64 {lden}, i64 {rnum}, i64 {rden})"
+                )
+                .unwrap();
+                writeln!(self.body, "    {dst_name} = icmp {cond} i32 {cmp}, 0").unwrap();
+                self.values.insert(
+                    dst,
+                    ValueRepr::Scalar {
+                        ty: "i1".to_string(),
+                        op: dst_name,
+                    },
+                );
+                return Ok(());
+            }
+            // `=`/`<>`: equal iff both components are equal (reduced form makes
+            // this value-equality). Compare each i64 and `and` them; `<>` negates.
             let neq = format!("%v{}.ne", dst.0);
             let deq = format!("%v{}.de", dst.0);
             writeln!(self.body, "    {neq} = icmp eq i64 {lnum}, {rnum}").unwrap();
             writeln!(self.body, "    {deq} = icmp eq i64 {lden}, {rden}").unwrap();
             let both = format!("%v{}.eq", dst.0);
             writeln!(self.body, "    {both} = and i1 {neq}, {deq}").unwrap();
-            let dst_name = format!("%v{}", dst.0);
             match op {
                 ScalarOp::Eq => {
                     writeln!(self.body, "    {dst_name} = and i1 {both}, true").unwrap();

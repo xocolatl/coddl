@@ -135,6 +135,22 @@ rational_binop!(
     "Rational `/` (exact division)."
 );
 
+/// Three-way compare of two rationals `a/b` and `c/d` (both reduced, `d > 0`):
+/// `-1` if `a/b < c/d`, `0` if equal, `+1` if greater. Since `b, d > 0`,
+/// `a/b ⋛ c/d  ⟺  a·d ⋛ c·b`; both cross products are `i64 × i64`, which fit
+/// `i128` exactly — so the comparison never overflows and never traps. (Unlike
+/// arithmetic, comparing two valid rationals is always well-defined.)
+#[no_mangle]
+pub extern "C" fn coddl_rational_cmp(n1: i64, d1: i64, n2: i64, d2: i64) -> i32 {
+    let lhs = (n1 as i128) * (d2 as i128);
+    let rhs = (n2 as i128) * (d1 as i128);
+    match lhs.cmp(&rhs) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
 /// `Rational → Approximate`: the correctly-rounded `f64` value of `n/d` via an
 /// `i64 → f64` widening on each component (each is exactly representable up to
 /// f64's 53-bit mantissa; the division then rounds, which is the point of
@@ -197,5 +213,16 @@ mod tests {
     fn to_approx_rounds() {
         assert_eq!(coddl_rational_to_approx(1, 2), 0.5);
         assert_eq!(coddl_rational_to_approx(3, 4), 0.75);
+    }
+
+    #[test]
+    fn cmp_orders_rationals() {
+        assert_eq!(coddl_rational_cmp(1, 3, 1, 2), -1); // 1/3 < 1/2
+        assert_eq!(coddl_rational_cmp(1, 2, 1, 2), 0);
+        assert_eq!(coddl_rational_cmp(2, 3, 1, 2), 1); // 2/3 > 1/2
+        assert_eq!(coddl_rational_cmp(-1, 2, 1, 2), -1); // sign on numerator
+        // Cross-product `4e9 * 4e9 = 1.6e19` overflows i64 but fits i128:
+        // `4e9/1` is far greater than `1/4e9`.
+        assert_eq!(coddl_rational_cmp(4_000_000_000, 1, 1, 4_000_000_000), 1);
     }
 }

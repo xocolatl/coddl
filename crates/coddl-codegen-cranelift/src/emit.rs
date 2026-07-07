@@ -249,6 +249,18 @@ fn declare_scalar_text_externs(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert(name.into(), id);
     }
+    // coddl_rational_cmp(n1, d1, n2, d2) -> i32 (-1/0/+1)
+    {
+        let mut sig = obj.make_signature();
+        for _ in 0..4 {
+            sig.params.push(AbiParam::new(types::I64));
+        }
+        sig.returns.push(AbiParam::new(types::I32));
+        let id = obj
+            .declare_function("coddl_rational_cmp", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_rational_cmp".into(), id);
+    }
     // `coddl_rational_to_approx` (the `to_approximate` builtin) is an ensure_extern'd
     // `BUILTIN_EXTERN`, so it's declared via the function-table loop / `cranelift_signature`
     // (which flattens the Rational param to two I64) — not here.
@@ -1804,13 +1816,31 @@ fn emit_inst(
                 values.insert(*dst, ValueRepr::Scalar(result));
                 return Ok(());
             }
-            // Rational `=`/`<>` on canonical `(num, den)` I64 pairs: equal iff
-            // both components are equal (reduced form ⇒ value-equality). `<>` is
-            // the negation. (Only Eq/NotEq reach here on Rational.)
+            // Rational comparisons on canonical `(num, den)` I64 pairs.
             if matches!(operand_type, ProcType::Rational) {
                 use cranelift_codegen::ir::condcodes::IntCC;
                 let (lnum, lden) = rational_value(values, lhs)?;
                 let (rnum, rden) = rational_value(values, rhs)?;
+                // Ordering `< > <= >=` via the runtime cross-multiply comparator
+                // (-1/0/+1), compared against 0. Lexicographic text order is wrong.
+                if let Some(cc) = match op {
+                    ScalarOp::Lt => Some(IntCC::SignedLessThan),
+                    ScalarOp::Gt => Some(IntCC::SignedGreaterThan),
+                    ScalarOp::LtEq => Some(IntCC::SignedLessThanOrEqual),
+                    ScalarOp::GtEq => Some(IntCC::SignedGreaterThanOrEqual),
+                    _ => None,
+                } {
+                    let fid = funcs["coddl_rational_cmp"];
+                    let local = obj.declare_func_in_func(fid, builder.func);
+                    let call = builder.ins().call(local, &[lnum, lden, rnum, rden]);
+                    let verdict = builder.inst_results(call)[0];
+                    let zero = builder.ins().iconst(types::I32, 0);
+                    let result = builder.ins().icmp(cc, verdict, zero);
+                    values.insert(*dst, ValueRepr::Scalar(result));
+                    return Ok(());
+                }
+                // `=`/`<>`: equal iff both components are equal (reduced form ⇒
+                // value-equality); `<>` negates.
                 let neq = builder.ins().icmp(IntCC::Equal, lnum, rnum);
                 let deq = builder.ins().icmp(IntCC::Equal, lden, rden);
                 let both = builder.ins().band(neq, deq);

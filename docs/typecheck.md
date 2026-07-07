@@ -442,8 +442,11 @@ each `parse_<x>` has a corresponding `check_<x>`.
     IEEE `oeq` — so it stays reflexive for dedup/keys (RM Pro 3).
     `Rational` `=` compares the reduced `(numer, denom)` pair (canonical
     lowest-terms form ⇒ value-equality).
-  - **Ordering (`<`, `>`, `<=`, `>=`)**: both operands must be
-    Integer. Result is `Boolean`. T0021 otherwise.
+  - **Ordering (`<`, `>`, `<=`, `>=`)**: both operands must be the same
+    scalar type — two Integer or two Rational (no mixing). Result is
+    `Boolean`. T0021 otherwise. `Rational` ordering routes through the
+    runtime's cross-multiply comparator (`a/b ⋛ c/d ⟺ a·d ⋛ c·b`, both
+    products fitting the i128 intermediate), never lexicographic text order.
   - **Logical (`and`, `or`)**: both operands must be Boolean.
     Result is `Boolean`. T0021 otherwise.
   - **Arithmetic (`+`, `-`, `*`, `/`)**: both operands must be

@@ -3598,13 +3598,23 @@ impl TypeChecker {
             Some(e) => self.check_expr(&e, scope),
             None => Type::Unknown,
         };
-        let supported = |t: &Type| matches!(t, Type::Integer | Type::Unknown);
-        if !supported(&lhs_ty) || !supported(&rhs_ty) {
+        // Ordering is defined on Integer and Rational scalars (no mixing).
+        // Rational compares via the runtime's cross-multiply comparator; both
+        // must be the same scalar type.
+        let supported = |t: &Type| matches!(t, Type::Integer | Type::Rational | Type::Unknown);
+        let same_kind = matches!(
+            (&lhs_ty, &rhs_ty),
+            (Type::Integer, Type::Integer)
+                | (Type::Rational, Type::Rational)
+                | (Type::Unknown, _)
+                | (_, Type::Unknown)
+        );
+        if !supported(&lhs_ty) || !supported(&rhs_ty) || !same_kind {
             let opname = op_display(op);
             self.error(
                 self.node_span(bin.syntax()),
                 "T0021",
-                format!("`{opname}` requires Integer operands; got {lhs_ty} vs {rhs_ty}"),
+                format!("`{opname}` requires two Integer or two Rational operands; got {lhs_ty} vs {rhs_ty}"),
             );
         }
         Type::Boolean
@@ -5947,6 +5957,21 @@ mod tests {
     fn rational_integer_mismatch_diagnoses_t0021() {
         // `3.4 = 1` mixes Rational with Integer — T0021 fires.
         let src = "oper main {} [ let _b = 3.4 = 1; ];";
+        assert!(codes(src).contains(&"T0021"));
+    }
+
+    #[test]
+    fn rational_ordering_typechecks() {
+        // `< > <= >=` accept matching Rational operands (result Boolean); no T0021.
+        let src = "oper main {} [ let _a = 1.5 < 3.4; let _b = 3.4 >= 1.5; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn ordering_mixed_integer_rational_diagnoses_t0021() {
+        // `1 < 3.4` mixes Integer with Rational — ordering forbids the mix.
+        let src = "oper main {} [ let _b = 1 < 3.4; ];";
         assert!(codes(src).contains(&"T0021"));
     }
 

@@ -28,8 +28,8 @@ pub mod relation;
 pub mod sqlite;
 
 pub use rational::{
-    coddl_rational_add, coddl_rational_div, coddl_rational_from_ints, coddl_rational_mul,
-    coddl_rational_sub, coddl_rational_to_approx,
+    coddl_rational_add, coddl_rational_cmp, coddl_rational_div, coddl_rational_from_ints,
+    coddl_rational_mul, coddl_rational_sub, coddl_rational_to_approx,
 };
 pub use rc::{
     coddl_rc_alloc, coddl_rc_length, coddl_rc_release, coddl_rc_retain, coddl_seq_index,
