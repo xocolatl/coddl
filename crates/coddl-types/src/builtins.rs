@@ -1,13 +1,21 @@
 //! Built-in operator registry.
 //!
-//! A tiny table mapping operator names to their signatures. The
-//! typechecker consults it whenever a `Call` expression's callee is a
-//! `NameRef`. The current set is the I/O builtins — `write_line`,
-//! `write_relation`, and `read_line`; more arrive as the runtime grows.
+//! Maps operator names to their signatures; the typechecker consults it
+//! whenever a `Call` expression's callee is a `NameRef`. Monomorphic
+//! signatures are **loaded from the Coddl prelude** (`prelude.cd`, the source
+//! of truth — see docs/prelude.md); the heading-polymorphic printers/counters,
+//! which have no surface spelling yet, are registered here in Rust. The
+//! prelude gives the *signature*; purity and the lowering strategy stay
+//! compiler-side, keyed by name.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 
+use coddl_diagnostics::FileId;
+use coddl_syntax::ast::{AstNode, Item, Root};
+use coddl_syntax::{parse, FileKind};
+
+use crate::checker::resolve_type_ref_quiet;
 use crate::ty::{Heading, Type};
 
 /// What a built-in operator's parameter accepts.
@@ -69,68 +77,89 @@ pub struct OperSig {
 /// in this table; the checker special-cases it (it needs a cross-argument
 /// placeholders-↔-heading check and has no runtime symbol).
 pub struct Builtins {
-    opers: HashMap<&'static str, Vec<OperSig>>,
+    opers: HashMap<String, Vec<OperSig>>,
 }
 
 impl Builtins {
-    /// Populate with the current built-in set.
+    /// Populate the registry. The monomorphic operators are loaded from the
+    /// Coddl prelude (`prelude.cd` — the signature source of truth); the
+    /// heading-polymorphic printers/counters, which have no surface spelling
+    /// yet, are registered in Rust.
     pub fn new() -> Self {
         let mut b = Builtins {
             opers: HashMap::new(),
         };
-        b.register(
-            "write_line",
-            OperSig {
-                params: vec![("message".into(), ParamKind::Concrete(Type::Text))],
-                return_type: Type::unit(),
-                purity: Purity::SideEffecting,
-            },
-        );
-        // `write_relation { rel: Relation H }` — polymorphic; the
-        // backend supplies a per-call-site heading descriptor.
-        b.register(
-            "write_relation",
+        b.load_prelude();
+        b.register_polymorphic();
+        b
+    }
+
+    /// Load the monomorphic `builtin oper` signatures from the embedded
+    /// prelude source. The prelude gives the *signature* (params + return);
+    /// purity is compiler-side metadata keyed by name ([`prelude_purity`]) and
+    /// the lowering strategy lives in the codegen crates. Parser error
+    /// recovery keeps this robust to the prelude's not-yet-parseable `type`
+    /// declarations — only `builtin oper` items are consumed.
+    fn load_prelude(&mut self) {
+        const PRELUDE: &str = include_str!("../prelude.cd");
+        let out = parse(PRELUDE, FileId(0), FileKind::Cd);
+        let Some(root) = Root::cast(out.tree) else {
+            return;
+        };
+        for item in root.items() {
+            let Item::OperDecl(decl) = item else { continue };
+            if !decl.is_builtin() {
+                continue;
+            }
+            let Some(name_tok) = decl.name() else { continue };
+            let name = name_tok.text().to_string();
+
+            let mut params: Vec<(Cow<'static, str>, ParamKind)> = Vec::new();
+            if let Some(heading) = decl.heading() {
+                for param in heading.params() {
+                    let Some(pname) = param.name() else { continue };
+                    let pty = param
+                        .type_ref()
+                        .map(|tr| resolve_type_ref_quiet(&tr))
+                        .unwrap_or(Type::Unknown);
+                    params.push((
+                        Cow::Owned(pname.text().to_string()),
+                        ParamKind::Concrete(pty),
+                    ));
+                }
+            }
+            let return_type = decl
+                .return_type()
+                .map(|tr| resolve_type_ref_quiet(&tr))
+                .unwrap_or_else(Type::unit);
+
+            let purity = prelude_purity(&name);
+            self.register(name, OperSig { params, return_type, purity });
+        }
+    }
+
+    /// Register the built-ins that can't be spelled in the prelude yet: the
+    /// heading- and element-polymorphic printer/counter operators. Heading
+    /// polymorphism has no surface syntax (see docs/risks.md), so these stay
+    /// hand-written. (`format` is a checker intrinsic outside the registry.)
+    fn register_polymorphic(&mut self) {
+        // `write_relation { rel: Relation H }` — the backend supplies a
+        // per-call-site heading descriptor.
+        self.register(
+            "write_relation".to_string(),
             OperSig {
                 params: vec![("rel".into(), ParamKind::AnyRelation)],
                 return_type: Type::unit(),
                 purity: Purity::SideEffecting,
             },
         );
-        // `read_line { prompt: Text } -> Text` — prints the prompt, reads
-        // one line from stdin (newline stripped). Side-effecting: it
-        // touches the outside world, so it's barred inside a transaction.
-        b.register(
-            "read_line",
-            OperSig {
-                params: vec![("prompt".into(), ParamKind::Concrete(Type::Text))],
-                return_type: Type::Text,
-                purity: Purity::SideEffecting,
-            },
-        );
-        // `to_text { self: <scalar> } -> Text` — the overloaded conversion
-        // string interpolation desugars to, and the first multi-signature
-        // builtin. One monomorphic signature per scalar type; the checker
-        // picks by the static type of `self`. `Text` is an identity and
-        // `Character` reuses `CharToText`; `Integer` / `Boolean` carry their
-        // own runtime conversions (`coddl_int_to_text` / `coddl_bool_to_text`).
-        for self_ty in [Type::Text, Type::Character, Type::Integer, Type::Boolean] {
-            b.register(
-                "to_text",
-                OperSig {
-                    params: vec![("self".into(), ParamKind::Concrete(self_ty))],
-                    return_type: Type::Text,
-                    purity: Purity::Pure,
-                },
-            );
-        }
-        // `cardinality { self } -> Integer` — the element/tuple count, read
-        // from the RC header's `length` field. Polymorphic over both
-        // `Relation H` (the natural TTM `COUNT`) and `Sequence T`; the count
-        // lives in the same header slot for both, so one runtime read serves
-        // either. Pure — it only inspects the header.
+        // `cardinality { self } -> Integer` — the element/tuple count read from
+        // the RC header's `length` field. Polymorphic over both `Relation H`
+        // (the natural TTM `COUNT`) and `Sequence T`; the count lives in the
+        // same header slot for both. Pure — it only inspects the header.
         for self_kind in [ParamKind::AnyRelation, ParamKind::AnySequence] {
-            b.register(
-                "cardinality",
+            self.register(
+                "cardinality".to_string(),
                 OperSig {
                     params: vec![("self".into(), self_kind)],
                     return_type: Type::Integer,
@@ -138,31 +167,9 @@ impl Builtins {
                 },
             );
         }
-        // `to_approximate { self: Rational } -> Approximate` — the explicit
-        // exact→inexact bridge (correctly-rounded float division; no implicit
-        // coercion). Runtime `coddl_rational_to_approx`.
-        b.register(
-            "to_approximate",
-            OperSig {
-                params: vec![("self".into(), ParamKind::Concrete(Type::Rational))],
-                return_type: Type::Approximate,
-                purity: Purity::Pure,
-            },
-        );
-        // `to_rational { self: Integer } -> Rational` — the widening for mixed
-        // arithmetic (`to_rational(1) + 1/2`). `(i, 1)`, already reduced.
-        b.register(
-            "to_rational",
-            OperSig {
-                params: vec![("self".into(), ParamKind::Concrete(Type::Integer))],
-                return_type: Type::Rational,
-                purity: Purity::Pure,
-            },
-        );
-        b
     }
 
-    fn register(&mut self, name: &'static str, sig: OperSig) {
+    fn register(&mut self, name: String, sig: OperSig) {
         self.opers.entry(name).or_default().push(sig);
     }
 
@@ -196,6 +203,17 @@ impl Builtins {
 impl Default for Builtins {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Purity for a prelude-declared built-in. The prelude expresses only
+/// signatures; purity — whether a call is legal inside a `transaction [...]`
+/// (RM Pre 14 / OO Pre 4) — is compiler-side metadata keyed by name.
+/// Everything the prelude declares is `Pure` except the two stdio operators.
+fn prelude_purity(name: &str) -> Purity {
+    match name {
+        "write_line" | "read_line" => Purity::SideEffecting,
+        _ => Purity::Pure,
     }
 }
 
@@ -297,5 +315,28 @@ mod tests {
         let kinds: Vec<_> = sigs.iter().map(|s| s.params[0].1.clone()).collect();
         assert!(kinds.contains(&ParamKind::AnyRelation));
         assert!(kinds.contains(&ParamKind::AnySequence));
+    }
+
+    // The conversions are prelude-only (no hand-written Rust registration),
+    // so these also prove the loader actually parses `prelude.cd` — and that
+    // the parse is robust to the prelude's not-yet-parseable `type` decls.
+    #[test]
+    fn to_approximate_loaded_from_prelude() {
+        let b = Builtins::new();
+        let sig = b.oper("to_approximate").expect("to_approximate should exist");
+        assert_eq!(sig.params.len(), 1);
+        assert_eq!(sig.params[0].0.as_ref(), "self");
+        assert!(matches!(sig.params[0].1, ParamKind::Concrete(Type::Rational)));
+        assert!(matches!(sig.return_type, Type::Approximate));
+        assert_eq!(sig.purity, Purity::Pure);
+    }
+
+    #[test]
+    fn to_rational_loaded_from_prelude() {
+        let b = Builtins::new();
+        let sig = b.oper("to_rational").expect("to_rational should exist");
+        assert!(matches!(sig.params[0].1, ParamKind::Concrete(Type::Integer)));
+        assert!(matches!(sig.return_type, Type::Rational));
+        assert_eq!(sig.purity, Purity::Pure);
     }
 }
