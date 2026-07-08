@@ -151,6 +151,29 @@ impl<'a> Parser<'a> {
         SyntaxKind::EOF
     }
 
+    /// True iff the `n`-th non-trivia token from the cursor is an identifier
+    /// whose lexeme is `lexeme` (`n == 0` is the current token). The lookahead
+    /// analogue of [`at_keyword`], used to disambiguate `builtin relvar` from
+    /// `builtin oper` at the item-dispatch site.
+    pub(crate) fn nth_at_keyword(&self, n: usize, lexeme: &str) -> bool {
+        let mut i = self.pos;
+        let mut seen = 0;
+        while i < self.tokens.len() {
+            if !self.tokens[i].kind.is_trivia() {
+                if seen == n {
+                    if self.tokens[i].kind != TokenKind::Ident {
+                        return false;
+                    }
+                    let span = self.tokens[i].span;
+                    return &self.source[span.start as usize..span.end as usize] == lexeme;
+                }
+                seen += 1;
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// Emit every trivia token at the cursor into the current node.
     pub(crate) fn bump_trivia(&mut self) {
         while self.pos < self.tokens.len() && self.tokens[self.pos].kind.is_trivia() {
@@ -293,7 +316,15 @@ impl<'a> Parser<'a> {
             crate::parser_cddb::parse_base_relvar_decl(self);
         } else if self.at_keyword("virtual") {
             crate::parser_cddb::parse_virtual_relvar_decl(self);
-        } else if self.at_keyword("oper") || self.at_keyword("builtin") {
+        } else if self.at_keyword("builtin") {
+            // `builtin` qualifies either an `oper` (the prelude) or a `relvar`
+            // (a stdlib runtime-backed relvar). Disambiguate on the next word.
+            if self.nth_at_keyword(1, "relvar") {
+                self.parse_builtin_relvar_decl();
+            } else {
+                self.parse_oper_decl();
+            }
+        } else if self.at_keyword("oper") {
             self.parse_oper_decl();
         } else if self.at_keyword("type") {
             self.parse_type_decl();
@@ -426,7 +457,7 @@ impl<'a> Parser<'a> {
             if self.at_keyword("oper") {
                 self.bump(); // "oper"
             } else {
-                self.error("P0079", "expected `oper` after `builtin`");
+                self.error("P0079", "expected `oper` or `relvar` after `builtin`");
             }
         } else {
             self.bump(); // "oper"
@@ -1672,6 +1703,16 @@ impl<'a> Parser<'a> {
         self.parse_relvar_with_heading(SyntaxKind::PRIVATE_RELVAR_DECL);
     }
 
+    /// `builtin relvar <Name> <heading> { <key-clause> } ;` — a compiler-
+    /// provided relvar whose backing the runtime supplies (the stdlib; see
+    /// docs/prelude.md). Reuses the shared relvar tail with `builtin` in the
+    /// kind-keyword slot. Dispatched from `parse_item` when `builtin` is
+    /// followed by `relvar`.
+    fn parse_builtin_relvar_decl(&mut self) {
+        debug_assert!(self.at_keyword("builtin"));
+        self.parse_relvar_with_heading(SyntaxKind::BUILTIN_RELVAR_DECL);
+    }
+
     /// Shared shape: `<KIND> relvar <Name> <heading> <key-clause>* ;`.
     /// Caller has already verified the cursor is at the kind keyword
     /// (`public` or `private`); this routine bumps it and parses the
@@ -2180,6 +2221,33 @@ mod tests {
         let out = parse_str("use module coddl::core");
         assert!(
             out.diagnostics.iter().any(|d| d.code == "P0085"),
+            "{:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn builtin_relvar_parses_clean() {
+        let out = parse_str("builtin relvar Environment { name: Text, value: Text } key { name };");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let kinds: Vec<_> = out.tree.children().map(|n| n.kind()).collect();
+        assert_eq!(kinds, vec![SyntaxKind::BUILTIN_RELVAR_DECL]);
+    }
+
+    #[test]
+    fn builtin_oper_still_parses_as_oper() {
+        // The `builtin` dispatch lookahead must not steal `builtin oper`.
+        let out = parse_str("builtin oper foo {};");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let kinds: Vec<_> = out.tree.children().map(|n| n.kind()).collect();
+        assert_eq!(kinds, vec![SyntaxKind::OPER_DECL]);
+    }
+
+    #[test]
+    fn builtin_followed_by_neither_diagnoses_p0079() {
+        let out = parse_str("builtin foo {};");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0079"),
             "{:?}",
             out.diagnostics
         );

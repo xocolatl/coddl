@@ -12,14 +12,19 @@ use coddl_diagnostics::Span;
 
 use crate::ty::Heading;
 
-/// Discriminates the four relvar kinds. Each one belongs to exactly
-/// one dialect; mixing them is T0014.
+/// Discriminates the relvar kinds. Each one belongs to exactly one
+/// dialect; mixing `.cd` and `.cddb` kinds is T0014.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelvarKind {
     /// `.cd` — exposed to the catalog (planned for materialization).
     Public,
     /// `.cd` — internal to the program.
     Private,
+    /// `.cd` — a stdlib relvar whose backing the runtime supplies via FFI
+    /// (e.g. `coddl::env`'s `Environment`, backed by the OS environment).
+    /// Registered only from an imported stdlib module; a `builtin relvar`
+    /// in a user file is rejected (T0091).
+    Builtin,
     /// `.cddb` — persistent catalog relvar.
     Base,
     /// `.cddb` — derived catalog view (a `Relation`-typed expression).
@@ -33,6 +38,7 @@ impl RelvarKind {
         match self {
             RelvarKind::Public => "public",
             RelvarKind::Private => "private",
+            RelvarKind::Builtin => "builtin",
             RelvarKind::Base => "base",
             RelvarKind::Virtual => "virtual",
         }

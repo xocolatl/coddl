@@ -281,6 +281,13 @@ pub enum SyntaxKind {
     /// discriminants stable.
     MODULE_PATH,
 
+    /// `builtin relvar <Name> <heading> { <key-clause> };` — a compiler-provided
+    /// relvar whose backing the runtime supplies (the stdlib; e.g. `coddl::env`'s
+    /// `Environment`). Same shape as `public`/`private` relvar decls with a
+    /// leading `builtin`. Placed at the end of the enum to keep existing
+    /// discriminants stable.
+    BUILTIN_RELVAR_DECL,
+
     /// A range of source whose intended structure couldn't be
     /// recovered. The parser still wraps the tokens so the tree stays
     /// well-formed and downstream passes can keep going.
@@ -444,6 +451,7 @@ mod tests {
             SyntaxKind::SORT_ITEM,
             SyntaxKind::USE_DECL,
             SyntaxKind::MODULE_PATH,
+            SyntaxKind::BUILTIN_RELVAR_DECL,
             SyntaxKind::PARSE_ERROR,
         ] {
             assert!(!sk.is_token(), "{sk:?} should be a node kind");

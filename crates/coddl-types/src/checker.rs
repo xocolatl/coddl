@@ -18,7 +18,7 @@ use coddl_syntax::ast::{
     InsertStmt,
     ExtendExpr, FieldAccess, ForStmt, Heading as AstHeading, IfExpr, IndexExpr, Item, KeyClause,
     LetStmt, LoadStmt,
-    NamedArg, OperDecl,
+    BuiltinRelvarDecl, NamedArg, OperDecl,
     PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr,
     ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
     TypeDecl, TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WhileStmt, WrapExpr,
@@ -347,6 +347,7 @@ pub fn check(source: &str, file: FileId, file_kind: FileKind) -> CheckOutput {
         active_modules: HashSet::new(),
         stdlib_oper_owner: HashMap::new(),
         stdlib_type_owner: HashMap::new(),
+        stdlib_relvar_owner: HashMap::new(),
     };
     match file_kind {
         FileKind::Cd => {
@@ -472,6 +473,10 @@ struct TypeChecker {
     /// Every opt-in (non-`core`) stdlib type name → its owning module. The type
     /// analogue of [`Self::stdlib_oper_owner`]; upgrades T0005 → T0088.
     stdlib_type_owner: HashMap<String, ModulePath>,
+    /// Every opt-in (non-`core`) stdlib `builtin relvar` name → its owning
+    /// module. The relvar analogue of [`Self::stdlib_oper_owner`]; upgrades an
+    /// unresolved `NameRef` → T0090.
+    stdlib_relvar_owner: HashMap<String, ModulePath>,
 }
 
 impl TypeChecker {
@@ -545,6 +550,11 @@ impl TypeChecker {
     // ── Walks ────────────────────────────────────────────────────────
 
     fn check_root(&mut self, root: &Root) {
+        // Pre-pass: resolve `use module …` imports FIRST. This registers an
+        // imported stdlib module's builtin relvars / type aliases / operators,
+        // so a same-named user declaration in the pre-passes below collides
+        // (T0012 / T0086 / T0060) and bodies see the imported names.
+        self.resolve_modules(root);
         // Pre-pass: collect every relvar declaration into the table.
         // This runs before any operator body is walked so that future
         // phases (Phase 18+) can resolve relvar references in
@@ -553,17 +563,12 @@ impl TypeChecker {
             match item {
                 Item::PublicRelvarDecl(d) => self.check_public_relvar_decl(&d),
                 Item::PrivateRelvarDecl(d) => self.check_private_relvar_decl(&d),
+                Item::BuiltinRelvarDecl(d) => self.check_builtin_relvar_decl(&d),
                 Item::BaseRelvarDecl(d) => self.check_base_relvar_decl(&d),
                 Item::VirtualRelvarDecl(d) => self.check_virtual_relvar_decl(&d),
                 _ => {}
             }
         }
-        // Pre-pass: resolve `use module …` imports and bring the opt-in stdlib
-        // modules they name into scope (registering those modules' operators and
-        // type aliases). Runs before the user type-alias / operator pre-passes so
-        // an imported `Request` collides with a same-named user `type` (T0086)
-        // and so bodies see the imported names.
-        self.resolve_modules(root);
         // Pre-pass: register user-defined type aliases (`type Name = …;`) so
         // a later type reference resolves regardless of declaration order.
         // Runs before the operator pre-pass so operator param/return types can
@@ -600,6 +605,7 @@ impl TypeChecker {
                 }
                 Item::PublicRelvarDecl(_)
                 | Item::PrivateRelvarDecl(_)
+                | Item::BuiltinRelvarDecl(_)
                 | Item::BaseRelvarDecl(_)
                 | Item::VirtualRelvarDecl(_) => {
                     // Relvar items walked in the pre-pass above.
@@ -665,6 +671,24 @@ impl TypeChecker {
             decl.heading(),
             decl.key_clauses().collect(),
             decl.syntax(),
+        );
+    }
+
+    /// A `builtin relvar` in a **user** file is not legitimate — a `builtin`
+    /// relvar's backing is compiler-provided (the stdlib), and there is no
+    /// runtime symbol to lower a user-declared one to. Reject it (T0091) rather
+    /// than register it; the real stdlib relvars (`coddl::env`'s `Environment`)
+    /// are registered from their module by `resolve_modules`, never through
+    /// this user-file path. Mirrors how a user `builtin oper` is inert.
+    fn check_builtin_relvar_decl(&mut self, decl: &BuiltinRelvarDecl) {
+        let span = decl
+            .name()
+            .map(|t| self.token_span(&t))
+            .unwrap_or_else(|| self.node_span(decl.syntax()));
+        self.error(
+            span,
+            "T0091",
+            "`builtin relvar` is reserved for the standard library — use `private relvar`",
         );
     }
 
@@ -930,6 +954,32 @@ impl TypeChecker {
                             }
                         }
                     }
+                    Item::BuiltinRelvarDecl(d) => {
+                        if let Some(n) = d.name() {
+                            let name = n.text().to_string();
+                            self.stdlib_relvar_owner
+                                .insert(name.clone(), module.path.clone());
+                            if active {
+                                // A stdlib module's source is curated + valid, so
+                                // resolving its heading/keys here emits nothing.
+                                let heading = match d.heading() {
+                                    Some(h) => self.resolve_heading(&h),
+                                    None => Heading::empty(),
+                                };
+                                let keys: Vec<Vec<String>> = d
+                                    .key_clauses()
+                                    .map(|k| self.validate_key_clause(&k, &heading))
+                                    .collect();
+                                let info = RelvarInfo {
+                                    kind: RelvarKind::Builtin,
+                                    heading,
+                                    keys,
+                                    span: self.token_span(&n),
+                                };
+                                let _ = self.relvars.try_insert(name, info);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1094,9 +1144,14 @@ impl TypeChecker {
         // `transaction [...]`). Private relvars are in-memory — no transaction.
         self.public_relvars.clear();
         for (name, info) in self.relvars.iter() {
-            if matches!(info.kind, RelvarKind::Public | RelvarKind::Private) {
+            if matches!(
+                info.kind,
+                RelvarKind::Public | RelvarKind::Private | RelvarKind::Builtin
+            ) {
                 let ty = Type::Relation(info.heading.clone());
                 scope.insert(name.to_string(), ty, Span::default(), BindingOrigin::Relvar);
+                // Only `public` relvars carry the transaction gate (T0025); a
+                // `builtin` relvar is FFI-backed, not a persistent DB relvar.
                 if matches!(info.kind, RelvarKind::Public) {
                     self.public_relvars.insert(name.to_string());
                 }
@@ -2321,6 +2376,16 @@ impl TypeChecker {
                         return Type::Unknown;
                     }
                     return ty;
+                }
+                // Not in scope. If it's an opt-in stdlib builtin relvar, point
+                // at the import rather than reporting a plain unresolved name.
+                if let Some(module) = self.stdlib_relvar_owner.get(name).cloned() {
+                    self.error(
+                        self.token_span(&ident),
+                        "T0090",
+                        format!("builtin relvar `{name}` requires `use module {module};`"),
+                    );
+                    return Type::Unknown;
                 }
                 self.error(
                     self.token_span(&ident),
@@ -5351,6 +5416,50 @@ mod tests {
         // user `type` is a genuine duplicate (T0086).
         let src = "program p; use module coddl::web; type Request = Integer;";
         assert!(codes(src).contains(&"T0086"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn builtin_relvar_without_import_diagnoses_t0090() {
+        // `Environment` belongs to opt-in `coddl::env`; unimported → T0090, not
+        // the generic unresolved-name T0001.
+        let src = "program p; oper main {} [ write_relation { rel: Environment }; ];";
+        let cs = codes(src);
+        assert!(cs.contains(&"T0090"), "{:?}", cs);
+        assert!(!cs.contains(&"T0001"), "should be T0090, not T0001: {:?}", cs);
+    }
+
+    #[test]
+    fn builtin_relvar_with_import_resolves_clean() {
+        // Importing `coddl::env` brings `Environment` (a relation) into scope.
+        let src = "program p; use module coddl::env; \
+                   oper main {} [ write_relation { rel: Environment }; ];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn user_builtin_relvar_is_rejected_t0091() {
+        // `builtin relvar` is reserved for the standard library.
+        let src = "program p; builtin relvar Foo { a: Integer } key { a };";
+        assert!(codes(src).contains(&"T0091"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn user_may_name_a_relvar_environment_without_import() {
+        // No reserved words: without importing `coddl::env`, `Environment` is a
+        // free name a user may claim for their own relvar.
+        let src = "program p; \
+                   private relvar Environment { name: Text } key { name }; \
+                   oper main {} [];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn importing_env_makes_environment_collide_with_user_relvar_t0012() {
+        // With `coddl::env` imported, `Environment` is defined — a same-named
+        // user relvar is a genuine duplicate (T0012).
+        let src = "program p; use module coddl::env; \
+                   private relvar Environment { name: Text } key { name };";
+        assert!(codes(src).contains(&"T0012"), "{:?}", codes(src));
     }
 
     #[test]

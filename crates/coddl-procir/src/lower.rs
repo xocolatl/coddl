@@ -923,6 +923,11 @@ impl Lowerer {
                     // `use module …` is a compile-time import directive
                     // resolved by the typechecker; nothing to lower.
                 }
+                Item::BuiltinRelvarDecl(_) => {
+                    // A user `builtin relvar` is rejected by the typechecker
+                    // (T0091); the real stdlib relvars come from imported
+                    // modules, not the lowered file's items. Nothing to lower.
+                }
             }
         }
         // Now that every function is lowered (so `plans` and

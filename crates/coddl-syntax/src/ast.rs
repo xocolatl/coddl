@@ -96,6 +96,7 @@ pub enum Item {
     DatabaseBinding(DatabaseBinding),
     PublicRelvarDecl(PublicRelvarDecl),
     PrivateRelvarDecl(PrivateRelvarDecl),
+    BuiltinRelvarDecl(BuiltinRelvarDecl),
     BaseRelvarDecl(crate::ast_cddb::BaseRelvarDecl),
     VirtualRelvarDecl(crate::ast_cddb::VirtualRelvarDecl),
     OperDecl(OperDecl),
@@ -113,6 +114,9 @@ impl Item {
             }
             SyntaxKind::PRIVATE_RELVAR_DECL => {
                 Item::PrivateRelvarDecl(PrivateRelvarDecl::cast(syntax)?)
+            }
+            SyntaxKind::BUILTIN_RELVAR_DECL => {
+                Item::BuiltinRelvarDecl(BuiltinRelvarDecl::cast(syntax)?)
             }
             SyntaxKind::BASE_RELVAR_DECL => {
                 Item::BaseRelvarDecl(crate::ast_cddb::BaseRelvarDecl::cast(syntax)?)
@@ -133,6 +137,7 @@ impl Item {
             Item::DatabaseBinding(d) => d.syntax(),
             Item::PublicRelvarDecl(d) => d.syntax(),
             Item::PrivateRelvarDecl(d) => d.syntax(),
+            Item::BuiltinRelvarDecl(d) => d.syntax(),
             Item::BaseRelvarDecl(d) => d.syntax(),
             Item::VirtualRelvarDecl(d) => d.syntax(),
             Item::OperDecl(d) => d.syntax(),
@@ -195,6 +200,27 @@ ast_node!(pub PrivateRelvarDecl, PRIVATE_RELVAR_DECL);
 impl PrivateRelvarDecl {
     /// The declared relvar name. Keywords `private` and `relvar`
     /// occupy the first two IDENT slots; the name is the third.
+    pub fn name(&self) -> Option<SyntaxToken> {
+        nth_token(&self.syntax, SyntaxKind::IDENT, 2)
+    }
+
+    /// The relvar's heading (`{ a: T, b: U, … }`).
+    pub fn heading(&self) -> Option<Heading> {
+        child(&self.syntax)
+    }
+
+    /// All candidate-key clauses in source order.
+    pub fn key_clauses(&self) -> impl Iterator<Item = KeyClause> + '_ {
+        children(&self.syntax)
+    }
+}
+
+ast_node!(pub BuiltinRelvarDecl, BUILTIN_RELVAR_DECL);
+
+impl BuiltinRelvarDecl {
+    /// The declared relvar name. Keywords `builtin` and `relvar` occupy the
+    /// first two IDENT slots; the name is the third (same shape as
+    /// `public`/`private` relvar decls).
     pub fn name(&self) -> Option<SyntaxToken> {
         nth_token(&self.syntax, SyntaxKind::IDENT, 2)
     }
@@ -1478,6 +1504,7 @@ mod tests {
                 Item::DatabaseBinding(_) => "database",
                 Item::PublicRelvarDecl(_) => "public_relvar",
                 Item::PrivateRelvarDecl(_) => "private_relvar",
+                Item::BuiltinRelvarDecl(_) => "builtin_relvar",
                 Item::BaseRelvarDecl(_) => "base_relvar",
                 Item::VirtualRelvarDecl(_) => "virtual_relvar",
                 Item::OperDecl(_) => "oper",

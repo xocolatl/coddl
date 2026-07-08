@@ -84,8 +84,10 @@ const EMBEDDED: &[Embedded] = &[
         path: "coddl::web",
         source: include_str!("../modules/coddl/web.cd"),
     },
-    // `coddl::env` (a `builtin relvar`) is wired in once the `builtin relvar`
-    // item form parses — see the module-system plan, Phase 4.
+    Embedded {
+        path: "coddl::env",
+        source: include_str!("../modules/coddl/env.cd"),
+    },
 ];
 
 /// Resolve a module path to its source, or `None` if no provider owns it.

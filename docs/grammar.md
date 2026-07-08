@@ -354,6 +354,7 @@ function that implements it.
                   | <database-binding>
                   | <public-relvar-decl>
                   | <private-relvar-decl>
+                  | <builtin-relvar-decl>
                   | <oper-decl>
                   | <type-decl>
                   | <use-decl>
@@ -373,11 +374,19 @@ function that implements it.
 <private-relvar-decl> ::= 'private' <relvar-with-heading> ;       -- parse_private_relvar_decl
                           -- Application-side relvar internal to the program.
 
+<builtin-relvar-decl> ::= 'builtin' <relvar-with-heading> ;      -- parse_builtin_relvar_decl
+                          -- A compiler-provided relvar whose backing the
+                          -- runtime supplies (the stdlib; e.g. `coddl::env`'s
+                          -- `Environment`). Dispatched when `builtin` is
+                          -- followed by `relvar` (vs `oper`). `.cd` dialect;
+                          -- the typechecker rejects it in a user file (T0091 —
+                          -- reserved for the standard library).
+
 <relvar-with-heading> ::= 'relvar' <identifier>
                           <heading>
                           { <key-clause> }
                           ';' ;                                -- parse_relvar_with_heading
-                          -- Shared tail of the `public` / `private`
+                          -- Shared tail of the `public` / `private` / `builtin`
                           -- relvar productions. The kind keyword has
                           -- been consumed at the dispatch site.
 
@@ -394,9 +403,11 @@ function that implements it.
                     -- absent). A leading `builtin` qualifier marks a
                     -- compiler-provided operator (the prelude — see
                     -- docs/prelude.md) that carries no body: a <block> after
-                    -- it is P0078, and `builtin` not followed by `oper` is
-                    -- P0079. Mirrors the leading `public` / `private`
-                    -- relvar qualifiers.
+                    -- it is P0078. `builtin` also qualifies a relvar
+                    -- (<builtin-relvar-decl>), so item dispatch picks that on a
+                    -- following `relvar`; `builtin` followed by neither `oper`
+                    -- nor `relvar` is P0079. Mirrors the leading `public` /
+                    -- `private` relvar qualifiers.
 <return-clause> ::= '->' <type-ref> ;                          -- parse_return_clause
 
 <type-decl>     ::= 'type' <identifier> '=' <type-ref> ';' ;   -- parse_type_decl
@@ -1003,7 +1014,7 @@ enforces that.
 | P0076 | Expected `]` to close the `load` order list             |
 | P0077 | Expected an attribute name in the order key             |
 | P0078 | `builtin` operator must not have a body                 |
-| P0079 | Expected `oper` after `builtin`                         |
+| P0079 | Expected `oper` or `relvar` after `builtin`              |
 | P0080 | Expected type name after `type`                         |
 | P0081 | Expected `=` in type declaration                        |
 | P0082 | Expected `;` after type declaration                     |
