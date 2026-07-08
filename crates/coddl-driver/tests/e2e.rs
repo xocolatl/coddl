@@ -54,6 +54,7 @@ fn fixtures_dir() -> &'static Path {
             ("join-times-compose", JOIN_TIMES_COMPOSE_SRC),
             ("union-intersect-minus", UNION_INTERSECT_MINUS_SRC),
             ("transitive-closure", TCLOSE_SRC),
+            ("handle-mainless", HANDLE_MAINLESS_SRC),
         ] {
             std::fs::write(tmp.path().join(format!("{name}.cd")), src)
                 .unwrap_or_else(|e| panic!("write {name}.cd fixture: {e}"));
@@ -77,6 +78,41 @@ program hello_world;
 oper main {} [
     write_line { message: \"Hello, world!\" };
 ];
+";
+
+// The web-host spine: a *mainless* module — one handler `oper`, no `main`.
+// Emitted to an object with `emit-obj`, it is meant to be linked into a foreign
+// host (a C `main`, not a Coddl one) that calls the handler across the C ABI.
+// This is the shape `docs/webhost.md` builds toward; the test below links it
+// into a C host exactly as that doc's verification spike prescribes.
+const HANDLE_MAINLESS_SRC: &str = "\
+program p;
+oper handle {} -> Text [ \"hello\\n\" ];
+";
+
+// A minimal C host that stands in for `coddl-web`: it owns `main`, calls the
+// mainless handler across the C ABI, writes the returned bytes, and releases the
+// payload. A `Text`-returning oper takes one trailing length-out pointer and
+// returns the payload pointer (`define ptr @handle(ptr %.ret_len_out)`), and the
+// surface name is the linkage name (no mangling). `coddl_rc_release` no-ops on
+// the immortal string literal, so the uniform release is always safe.
+const SMALL_HOST_C: &str = "\
+#include <stddef.h>
+#include <unistd.h>
+extern char *handle(size_t *ret_len_out);
+extern void coddl_rc_release(char *ptr);
+int main(void) {
+    size_t len = 0;
+    char *body = handle(&len);
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(1, body + off, len - off);
+        if (n <= 0) break;
+        off += (size_t)n;
+    }
+    coddl_rc_release(body);
+    return 0;
+}
 ";
 
 // `coddl::env`'s `Environment` builtin relvar: the process environment read as
@@ -1205,6 +1241,65 @@ fn coddl_compile_cranelift_produces_runnable_binary() {
     let run = Command::new(&bin).output().expect("run binary");
     assert!(run.status.success(), "binary exit {}", run.status);
     assert_eq!(run.stdout, b"Hello, world!\n");
+}
+
+/// The web-host spine (`docs/webhost.md`): the single riskiest assumption is
+/// that a *foreign* host owning `main` can link a **mainless** Coddl object
+/// against `libcoddl_runtime.a` and call a handler across the C ABI. Every
+/// other e2e test drives a program *with* a `main`; this one proves the
+/// boundary the web host stands on. Linking alone proves mainless emission +
+/// symbol export (surface name == linkage name) + staticlib-into-foreign-host
+/// linkage; running it proves the `Text`-return out-param ABI end-to-end and
+/// the immortal-literal release. This is the doc's verification spike, automated.
+#[test]
+fn web_spine_mainless_handler_links_into_c_host() {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let obj = tmp.path().join("handle.o");
+    let host_c = tmp.path().join("small_host.c");
+    let bin = tmp.path().join("spine_host");
+
+    // 1. Emit the mainless handler to an object file.
+    let emit = coddl()
+        .args(["emit-obj"])
+        .arg(fixture_path("handle-mainless"))
+        .arg("-o")
+        .arg(&obj)
+        .output()
+        .expect("spawn coddl emit-obj");
+    assert!(
+        emit.status.success(),
+        "emit-obj failed: stderr=\n{}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    assert!(obj.exists(), "expected object at {}", obj.display());
+
+    // 2. Link that object + the runtime staticlib + a C host into a binary.
+    std::fs::write(&host_c, SMALL_HOST_C).expect("write small_host.c");
+    let runtime = workspace_root().join("target/debug/libcoddl_runtime.a");
+    let link = Command::new("cc")
+        .arg(&obj)
+        .arg(&runtime)
+        .arg(&host_c)
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .expect("spawn cc");
+    assert!(
+        link.status.success(),
+        "cc link failed: stderr=\n{}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    // 3. Run the foreign host; the handler's Text return crosses the C ABI.
+    let run = Command::new(&bin).output().expect("run spine host");
+    assert!(
+        run.status.success(),
+        "spine host exit {}: stderr=\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"hello\n");
 }
 
 /// The cross-backend equivalence invariant: for any source program,

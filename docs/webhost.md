@@ -5,12 +5,14 @@ HTTP parsing, routing, and JSON; Coddl provides the **models** (relvars) and the
 compiled as a host-callable library. The host builds a request value, calls a handler, and serializes the
 response it gets back.
 
-> **Status.** *Partly built.* The vocabulary this doc marshals — `Request` / `Response` — is now real: it
+> **Status.** *Spine built.* The vocabulary this doc marshals — `Request` / `Response` — is real: it
 > lives in the opt-in [`coddl::web`](prelude.md) standard-library module, brought into scope with
-> `use module coddl::web;`. The *host* (`coddl-web`, the socket loop) is still planned; this doc remains the
-> work plan for it. It extends the first milestone: everything it relies on — the frontend, RelIR → SQL,
-> ProcIR → native codegen, the `staticlib` runtime, user `oper`s with the C-ABI return convention — is
-> assumed already end-to-end per [milestone.md](milestone.md).
+> `use module coddl::web;`. **P1a and the Spine (below) have landed:** `coddl emit-obj` already produces a
+> mainless object, and the `coddl-web` crate is a single-threaded `TcpListener` that calls a handler across
+> the C ABI and serves a fixed `200 OK`. What remains is the richer request/response and routing (P2/P3),
+> lifecycle synthesis (P1b), and the relvar-backed payoff (P4). It extends the first milestone: everything it
+> relies on — the frontend, RelIR → SQL, ProcIR → native codegen, the `staticlib` runtime, user `oper`s with
+> the C-ABI return convention — is assumed already end-to-end per [milestone.md](milestone.md).
 
 **Last sync:** validated against `8ac70d9`; the `Request` / `Response` vocabulary has since landed as the
 `coddl::web` module. Revalidate the file:line and ABI claims below when the entry model, the calling
@@ -236,18 +238,22 @@ dependency of the database payoff (P4), **not** of the request/response plumbing
    allocated count in the header and free against it) before per-request relation churn, and keep the
    host-releases-every-returned-payload discipline.
 
-2. **P1a — mainless library emission.** A `.cd` with only handler `oper`s and no `main` already lowers (the
-   prologue synthesis early-returns when no `main` exists) and both backends emit each `oper` as its own C
-   symbol (no name mangling — the surface name *is* the linkage name). The only new driver work is an
-   emission mode that stops at the object file and lets the host's build link it against
-   `libcoddl_runtime.a`, instead of [`coddl compile`](driver.md) linking an executable. This is the one true
-   universal prerequisite, and it is nearly free.
+2. **P1a — mainless library emission. DONE.** A `.cd` with only handler `oper`s and no `main` already lowers
+   (the prologue synthesis early-returns when no `main` exists) and both backends emit each `oper` as its own
+   C symbol (no name mangling — the surface name *is* the linkage name). No new driver work was needed: the
+   emission mode that stops at the object file is [`coddl emit-obj`](driver.md) (Cranelift object), which
+   already existed. A host build links its output against `libcoddl_runtime.a` instead of
+   [`coddl compile`](driver.md) linking an executable. (An LLVM-quality `.o` via `llc`/`clang -c` remains
+   net-new driver work, deferred; the spine uses the Cranelift object.)
 
-3. **Spine.** `oper handle {} -> Text [ "hello\n" ]` plus a ~40-line single-threaded `TcpListener` stub that
-   ignores the request, calls the handler, writes a fixed `200 OK`, releases the payload, loops. This proves
-   the entire FFI boundary — mainless codegen, handler symbol linkage, the `Text`-return ABI, staticlib
-   linkage into a foreign host, immortal-literal RC — with no relvar in sight. It is also the de-risking spike
-   (see Verification).
+3. **Spine. DONE.** The `coddl-web` crate: a single-threaded `TcpListener` that ignores the request, calls
+   the handler, writes a fixed `200 OK`, copies the body out, releases the payload, loops. It links a handler
+   two ways — a built-in `hello\n` default (so `cargo run -p coddl-web` serves out of the box) or, with
+   `CODDL_APP_OBJ` set, a separately-compiled `oper handle {} -> Text` object. This proves the entire FFI
+   boundary — mainless codegen, handler symbol linkage, the `Text`-return ABI, staticlib linkage into a
+   foreign host, immortal-literal RC — with no relvar in sight. The de-risking spike (see Verification) is
+   automated as the driver e2e test `web_spine_mainless_handler_links_into_c_host`, which links a mainless
+   object into a C host exactly as the spike prescribes.
 
 4. **P2 — richer request/response.** Add the `Request` `Tuple` parameter (existing flatten) and promote the
    result to a single-tuple `Relation` (`Response`, return option 2). Land the three sharp-edge mitigations.

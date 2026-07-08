@@ -17,6 +17,7 @@ members = [
     "crates/coddl-codegen-wasm",
     "crates/coddl-runtime",
     "crates/coddl-driver",
+    "crates/coddl-web",
     "crates/coddl-lsp",
     "crates/coddl-fmt",
 ]

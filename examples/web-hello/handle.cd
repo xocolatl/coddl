@@ -1,0 +1,16 @@
+program web_hello;
+
+// A web handler is an ordinary `oper` — nothing about it is web-specific except
+// the shape of its result. This is the web-host spine's handler (docs/webhost.md):
+// no request parameter yet, and a bare `Text` body (status/headers are hardcoded
+// host-side). `Request`/`Response` marshalling arrives with P2.
+//
+// There is no `main`: a handler module is compiled *mainless* and linked into a
+// foreign host that owns the socket loop. Build the demo server with:
+//
+//   coddl emit-obj examples/web-hello/handle.cd -o /tmp/handle.o
+//   CODDL_APP_OBJ=/tmp/handle.o cargo run -p coddl-web
+//   curl -s localhost:8000        # => hello
+oper handle{} -> Text [
+    "hello\n"
+];

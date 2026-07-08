@@ -1,0 +1,21 @@
+[package]
+name = "coddl-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Coddl web host: a TCP listener that calls compiled Coddl handlers across the C ABI. See docs/webhost.md."
+
+[[bin]]
+name = "coddl-web"
+path = "src/main.rs"
+
+[dependencies]
+# The runtime rlib links `libcoddl_runtime` statically into this binary (the
+# "one self-contained native binary" of docs/webhost.md) and exposes the RC API
+# the built-in handler and the payload-release path use.
+coddl-runtime.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

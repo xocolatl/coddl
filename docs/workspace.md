@@ -21,6 +21,7 @@ coddl/
     coddl-codegen-wasm/            # ProcIR → wasm-encoder (optional; revisit when needed)
     coddl-runtime/                 # extern "C" staticlib linked into compiled binaries (see runtime.md)
     coddl-driver/                  # CLI: compile, run, repl, fmt (see driver.md)
+    coddl-web/                     # web host: TcpListener calling compiled handlers over the C ABI (see webhost.md)
     coddl-lsp/                     # tower-lsp language server; thin adapter over the frontend crates (see lsp.md)
     coddl-fmt/                     # canonical formatter library; same library behind `coddl fmt` and the LSP (see fmt.md)
   editors/
