@@ -9,7 +9,7 @@
 
 use std::sync::OnceLock;
 
-use crate::rc::{coddl_rc_alloc, CoddlKind};
+use crate::rc::{coddl_rc_alloc, CoddlKind, CoddlRcHeader, HEADER_SIZE};
 use crate::relation::{CoddlAttrDesc, CoddlAttrKind, CoddlHeadingDesc};
 
 /// Two `Text` cells, name-sorted (`name` @ 0, `value` @ 16); each is 16 bytes
@@ -104,4 +104,49 @@ pub unsafe extern "C" fn coddl_env_snapshot() -> *mut u8 {
         std::ptr::write(rec.add(24) as *mut usize, value.len());
     }
     payload
+}
+
+/// Read a `Text` cell `(ptr @ 0, len @ 8)` as a `&str`. The bytes are UTF-8:
+/// they came from a Coddl `Text` literal or a value this module wrote.
+unsafe fn text_cell(cell: *const u8) -> &'static str {
+    let ptr = std::ptr::read(cell as *const usize) as *const u8;
+    let len = std::ptr::read(cell.add(8) as *const usize);
+    std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len))
+}
+
+/// Number of records in a relation payload (from its RC header's `length`).
+unsafe fn record_count(rel: *const u8) -> usize {
+    (*(rel.sub(HEADER_SIZE) as *const CoddlRcHeader)).length as usize
+}
+
+/// Apply an `insert`/`update` write to the environment: set each
+/// `{ name, value }` record's variable (`setenv`; overwrites, so `update` and
+/// `insert` share this path). The relation is borrowed, not consumed.
+///
+/// # Safety
+/// `rel` must be null or a valid `Relation { name: Text, value: Text }` payload.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_env_insert(rel: *const u8) {
+    if rel.is_null() {
+        return;
+    }
+    for i in 0..record_count(rel) {
+        let rec = rel.add(i * RECORD_SIZE);
+        std::env::set_var(text_cell(rec), text_cell(rec.add(16)));
+    }
+}
+
+/// Apply a `delete` write: unset each record's variable (`unsetenv`). Only the
+/// `name` column is read.
+///
+/// # Safety
+/// `rel` must be null or a valid `Relation { name: Text, value: Text }` payload.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_env_unset(rel: *const u8) {
+    if rel.is_null() {
+        return;
+    }
+    for i in 0..record_count(rel) {
+        std::env::remove_var(text_cell(rel.add(i * RECORD_SIZE)));
+    }
 }

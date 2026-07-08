@@ -62,6 +62,7 @@ change.
 | `hello-world`    | `examples/hello-world/hello-world.cd`                                          | Single-file program: lex → parse → typecheck → lower → both backends → link → `coddl_write_line`. The seed example (Phase 9).                    |
 | `hello-world-db` | `examples/hello-world/{hello-world-db.cd, greetings.cddb, greetings.cdstore}` + locally-seeded `greetings.sqlite` | Four-file `.cd` family: Phase 16 plan discovery, public-relvar materialization from SQLite at startup, `transaction [...]` brackets, `extract (R where p)` reading one row, field access on the extracted tuple. Adds Phase 22's storage path to the equivalence proof. |
 | `use-module`     | `examples/use-module/use-module.cd`                                            | Opt-in modules: `use module coddl::env;` → the `builtin relvar` `Environment` (the process environment as a relation, read via the FFI `coddl_env_snapshot`) → `where` → `load … order` → `for … in` → field access. The three e2e tests set `CODDL_DEMO` on the child process for deterministic stdout. |
+| `env-write`      | `examples/env-write/env-write.cd`                                              | Writing a `builtin relvar`: `insert` / `update` / `delete` on `Environment` map to `setenv` / `setenv` / `unsetenv` (`coddl_env_insert` / `coddl_env_unset`), read back within the same process. Program-set `CODDL_OUT`, so no harness var. |
 
 Each canonical example contributes the three e2e tests in
 `crates/coddl-driver/tests/e2e.rs`. The hello-world-db trio also has

@@ -1951,7 +1951,12 @@ impl TypeChecker {
         let assignable = self
             .relvars
             .get(name)
-            .is_some_and(|i| matches!(i.kind, RelvarKind::Public | RelvarKind::Private));
+            .is_some_and(|i| {
+                matches!(
+                    i.kind,
+                    RelvarKind::Public | RelvarKind::Private | RelvarKind::Builtin
+                )
+            });
         if !assignable {
             self.error(
                 self.token_span(&ident),
@@ -1996,7 +2001,11 @@ impl TypeChecker {
 
         // … bound to an assignable relvar (public or private).
         let lookup = self.relvars.get(name).and_then(|i| {
-            matches!(i.kind, RelvarKind::Public | RelvarKind::Private).then(|| i.heading.clone())
+            matches!(
+                i.kind,
+                RelvarKind::Public | RelvarKind::Private | RelvarKind::Builtin
+            )
+            .then(|| i.heading.clone())
         });
         let Some(heading) = lookup else {
             self.error(
@@ -2069,7 +2078,11 @@ impl TypeChecker {
 
         // … bound to an assignable relvar (public or private).
         let lookup = self.relvars.get(name).and_then(|i| {
-            matches!(i.kind, RelvarKind::Public | RelvarKind::Private).then(|| i.heading.clone())
+            matches!(
+                i.kind,
+                RelvarKind::Public | RelvarKind::Private | RelvarKind::Builtin
+            )
+            .then(|| i.heading.clone())
         });
         let Some(heading) = lookup else {
             self.error(
@@ -5460,6 +5473,27 @@ mod tests {
         let src = "program p; use module coddl::env; \
                    private relvar Environment { name: Text } key { name };";
         assert!(codes(src).contains(&"T0012"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn env_builtin_relvar_is_writable_via_dml() {
+        // insert / update / delete on `Environment` are allowed (RelvarKind::Builtin
+        // is a writable target); no T0033. No transaction gate either (it's not a
+        // public relvar).
+        let src = "program p; use module coddl::env; oper main {} [ \
+                   insert Environment { { name: \"X\", value: \"y\" } }; \
+                   update Environment where name = \"X\" { value: \"z\" }; \
+                   delete Environment where name = \"X\"; ];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn env_builtin_relvar_general_assign_is_rejected_t0033() {
+        // The general `R := …` surgical form on a builtin relvar is deferred —
+        // use insert/update/delete instead.
+        let src = "program p; use module coddl::env; \
+                   oper main {} [ Environment := Environment; ];";
+        assert!(codes(src).contains(&"T0033"), "{:?}", codes(src));
     }
 
     #[test]

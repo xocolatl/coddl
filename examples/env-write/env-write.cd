@@ -1,0 +1,32 @@
+program env_write;
+
+// Writing the environment: because `coddl::env`'s `Environment` is a relvar,
+// the ordinary relvar DML applies — and it maps straight to the OS:
+//   insert → setenv, update → setenv (overwrite), delete → unsetenv.
+// The writes hit this program's own process, so a later read sees them.
+//
+//   coddl run examples/env-write/env-write.cd
+//   => two
+//      done
+use module coddl::env;
+
+oper main{} [
+    insert Environment { { name: "CODDL_OUT", value: "one" } };
+    update Environment where name = "CODDL_OUT" { value: "two" };
+
+    var a;
+    load a from Environment where name = "CODDL_OUT" order [name];
+    for v in a do [
+        write_line{ message: v.value };
+    ];
+
+    delete Environment where name = "CODDL_OUT";
+
+    var b;
+    load b from Environment where name = "CODDL_OUT" order [name];
+    for v in b do [
+        write_line{ message: v.value };
+    ];
+
+    write_line{ message: "done" };
+];

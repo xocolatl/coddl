@@ -1416,6 +1416,15 @@ impl Lowerer {
         let Some(name_tok) = target.ident() else { return };
         let name = name_tok.text().to_string();
 
+        // Builtin (FFI-backed) target → unset each matched variable. The rows to
+        // remove are `Environment where p` (the operand); the runtime walks them
+        // and calls `unsetenv`.
+        if self.builtin_relvars.contains_key(&name) {
+            let rel = self.lower_expr(&operand);
+            self.emit_env_write("coddl_env_unset", rel);
+            return;
+        }
+
         // Public target → surgical `DELETE FROM t WHERE p` via the
         // `R := R minus (R where p)` shape.
         if self.public_relvars.contains_key(&name) {
@@ -1471,6 +1480,14 @@ impl Lowerer {
         let Some(name_tok) = target.ident() else { return };
         let name = name_tok.text().to_string();
         let Some(source_expr) = stmt.source() else { return };
+
+        // Builtin (FFI-backed) target → set each source tuple's variable. The
+        // runtime walks the source relation and calls `setenv`.
+        if self.builtin_relvars.contains_key(&name) {
+            let src = self.lower_expr(&source_expr);
+            self.emit_env_write("coddl_env_insert", src);
+            return;
+        }
 
         // Public target → idempotent INSERT via the `R := R union source` shape.
         if self.public_relvars.contains_key(&name) {
@@ -1545,6 +1562,35 @@ impl Lowerer {
         true
     }
 
+    /// Emit a `coddl::env` write: call `symbol` (`coddl_env_insert` /
+    /// `coddl_env_unset`) with the `{name,value}` relation `rel`, which the
+    /// runtime walks record-by-record (`setenv` / `unsetenv`). The runtime only
+    /// reads the relation, so `rel` — a temporary from a literal / restriction /
+    /// substitute — is released here (the fresh-source discipline).
+    fn emit_env_write(&mut self, symbol: &'static str, rel: ValueId) {
+        let ProcType::Relation(hid) = self.value_type(rel) else {
+            return;
+        };
+        self.ensure_runtime_extern(
+            symbol,
+            vec![("rel".to_string(), ProcType::Relation(hid))],
+            ProcType::Unit,
+        );
+        self.insts.push(Inst::Call {
+            dst: None,
+            callee: symbol.to_string(),
+            args: vec![rel],
+            return_type: ProcType::Unit,
+        });
+        let is_owned = self
+            .locals
+            .iter()
+            .any(|layer| layer.values().any(|(vid, _)| *vid == rel));
+        if !is_owned {
+            self.insts.push(Inst::Release { src: rel });
+        }
+    }
+
     /// Lower `update R where p { c: e };` — overwrite named attributes of the
     /// matching tuples. It desugars to `R := (R where ¬p) union ((R where p)
     /// «sub»)` (`UPDATE t SET … WHERE p`), or a bare substitute over `R` for
@@ -1576,6 +1622,21 @@ impl Lowerer {
         // `update` overwrites the target attributes — drop them (regardless of
         // what the values read), unlike `replace` which drops the read attrs.
         let removed: HashSet<String> = pairs.iter().map(|(n, _)| n.clone()).collect();
+
+        // Builtin (FFI-backed) target → set each matched variable to its new
+        // value. Compute the changed rows (matching rows with the substitute
+        // applied) and `setenv` them; unchanged rows keep their values, so only
+        // the changed set is written.
+        if self.builtin_relvars.contains_key(&name) {
+            let matching = if has_where {
+                self.lower_expr(&operand)
+            } else {
+                self.lower_expr(&root_expr)
+            };
+            let changed = self.emit_substitute(matching, pairs, removed);
+            self.emit_env_write("coddl_env_insert", changed);
+            return;
+        }
 
         // Public target → surgical UPDATE via the substitute-union shape.
         if self.public_relvars.contains_key(&name) {

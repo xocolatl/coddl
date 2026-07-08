@@ -33,6 +33,7 @@ fn fixtures_dir() -> &'static Path {
         for (name, src) in [
             ("hello-world", HELLO_WORLD_SRC),
             ("use-module", USE_MODULE_ENV_SRC),
+            ("env-write", ENV_WRITE_SRC),
             ("sequence-construct", SEQUENCE_CONSTRUCT_SRC),
             ("hello-everyone", HELLO_EVERYONE_SRC),
             ("param-echo", PARAM_ECHO_SRC),
@@ -93,6 +94,28 @@ oper main {} [
     var vars;
     load vars from Environment where name = \"CODDL_DEMO\" order [ name ];
     for v in vars do [ write_line { message: v.value }; ];
+];
+";
+
+// `coddl::env` writes: DML on the `Environment` builtin relvar maps to the OS.
+// insert → setenv, update → setenv (overwrite), delete → unsetenv — each on the
+// program's own process, read back within the same run. `CODDL_OUT` is
+// program-set, so no harness var is needed. Expected stdout: `two\ndone\n`
+// (insert one → update to two → read → delete → read empty → done).
+const ENV_WRITE_SRC: &str = "\
+program env_write;
+use module coddl::env;
+oper main {} [
+    insert Environment { { name: \"CODDL_OUT\", value: \"one\" } };
+    update Environment where name = \"CODDL_OUT\" { value: \"two\" };
+    var a;
+    load a from Environment where name = \"CODDL_OUT\" order [ name ];
+    for v in a do [ write_line { message: v.value }; ];
+    delete Environment where name = \"CODDL_OUT\";
+    var b;
+    load b from Environment where name = \"CODDL_OUT\" order [ name ];
+    for v in b do [ write_line { message: v.value }; ];
+    write_line { message: \"done\" };
 ];
 ";
 
@@ -533,6 +556,38 @@ fn coddl_run_llvm_reads_env_builtin_relvar() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.stdout, b"hello from the environment\n");
+}
+
+#[test]
+fn coddl_run_llvm_writes_env_builtin_relvar() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("env-write"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=llvm failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"two\ndone\n");
+}
+
+#[test]
+fn coddl_run_cranelift_writes_env_builtin_relvar() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("env-write"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"two\ndone\n");
 }
 
 #[test]

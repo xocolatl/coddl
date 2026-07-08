@@ -110,8 +110,10 @@ live in **opt-in** modules a file brings in with `use module <path>;`. Live toda
 - **`coddl::web`** — the `Request` / `Response` vocabulary the web host marshals across the C ABI
   ([webhost.md](webhost.md)). A CLI program that never imports it does not have `Request` in scope.
 - **`coddl::env`** — the process environment as a `builtin relvar Environment { name: Text, value: Text }`:
-  a *new relvar kind* whose backing the runtime supplies via FFI (`coddl_env_snapshot`). Read as any relation
-  (`Environment where name = …`); writes (DML → `setenv`/`unsetenv`) land next.
+  a *new relvar kind* whose backing the runtime supplies via FFI. Read as any relation
+  (`Environment where name = …`, via `coddl_env_snapshot`); written with the ordinary relvar DML —
+  `insert`→`setenv`, `update`→`setenv`, `delete`→`unsetenv` (`coddl_env_insert` / `coddl_env_unset`). The
+  general `R := …` surgical form is not yet wired for builtin relvars (T0033).
 
 `coddl::` is a closed, compiler-owned, embedded root; module sources live in `coddl-stdlib`
 ([workspace.md](workspace.md)). Opt-in names are registered **lazily** — only in a file that `use`s their
