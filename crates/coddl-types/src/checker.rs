@@ -18,7 +18,7 @@ use coddl_syntax::ast::{
     InsertStmt,
     ExtendExpr, FieldAccess, ForStmt, Heading as AstHeading, IfExpr, IndexExpr, Item, KeyClause,
     LetStmt, LoadStmt,
-    BuiltinRelvarDecl, NamedArg, OperDecl,
+    NamedArg, OperDecl,
     PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr,
     ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
     TypeDecl, TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WhileStmt, WrapExpr,
@@ -563,9 +563,10 @@ impl TypeChecker {
             match item {
                 Item::PublicRelvarDecl(d) => self.check_public_relvar_decl(&d),
                 Item::PrivateRelvarDecl(d) => self.check_private_relvar_decl(&d),
-                Item::BuiltinRelvarDecl(d) => self.check_builtin_relvar_decl(&d),
                 Item::BaseRelvarDecl(d) => self.check_base_relvar_decl(&d),
                 Item::VirtualRelvarDecl(d) => self.check_virtual_relvar_decl(&d),
+                // `builtin relvar` is inert in a checked file — see the main-pass
+                // arm below. The real stdlib relvars register via `resolve_modules`.
                 _ => {}
             }
         }
@@ -605,10 +606,19 @@ impl TypeChecker {
                 }
                 Item::PublicRelvarDecl(_)
                 | Item::PrivateRelvarDecl(_)
-                | Item::BuiltinRelvarDecl(_)
                 | Item::BaseRelvarDecl(_)
                 | Item::VirtualRelvarDecl(_) => {
                     // Relvar items walked in the pre-pass above.
+                }
+                Item::BuiltinRelvarDecl(_) => {
+                    // A `builtin relvar` is only meaningful inside a stdlib
+                    // module, where it registers via `resolve_modules` when the
+                    // module is imported. In an ordinary checked file it is
+                    // **inert** — exactly like a user `builtin oper` — so that a
+                    // stdlib module's own source (e.g. `coddl::env`'s `env.cd`)
+                    // opened in the editor typechecks clean, and a stray user
+                    // `builtin relvar` simply fails to resolve at its use site
+                    // rather than tripping a decl-site error the LSP can't scope.
                 }
             }
         }
@@ -671,24 +681,6 @@ impl TypeChecker {
             decl.heading(),
             decl.key_clauses().collect(),
             decl.syntax(),
-        );
-    }
-
-    /// A `builtin relvar` in a **user** file is not legitimate — a `builtin`
-    /// relvar's backing is compiler-provided (the stdlib), and there is no
-    /// runtime symbol to lower a user-declared one to. Reject it (T0091) rather
-    /// than register it; the real stdlib relvars (`coddl::env`'s `Environment`)
-    /// are registered from their module by `resolve_modules`, never through
-    /// this user-file path. Mirrors how a user `builtin oper` is inert.
-    fn check_builtin_relvar_decl(&mut self, decl: &BuiltinRelvarDecl) {
-        let span = decl
-            .name()
-            .map(|t| self.token_span(&t))
-            .unwrap_or_else(|| self.node_span(decl.syntax()));
-        self.error(
-            span,
-            "T0091",
-            "`builtin relvar` is reserved for the standard library — use `private relvar`",
         );
     }
 
@@ -5450,10 +5442,22 @@ mod tests {
     }
 
     #[test]
-    fn user_builtin_relvar_is_rejected_t0091() {
-        // `builtin relvar` is reserved for the standard library.
+    fn builtin_relvar_in_a_checked_file_is_inert() {
+        // A stdlib module's own source (`env.cd`, a `builtin relvar` decl) opened
+        // in the editor must typecheck clean — the `builtin relvar` is inert
+        // here, like a user `builtin oper`. Regression: it used to trip a bogus
+        // decl-site error that surfaced in the LSP when env.cd was opened.
+        let env = coddl_stdlib::resolve(&coddl_stdlib::ModulePath::parse("coddl::env"))
+            .expect("coddl::env is embedded");
+        assert!(
+            diagnostics(env.source).is_empty(),
+            "coddl::env source should check clean: {:?}",
+            diagnostics(env.source)
+        );
+        // A stray user `builtin relvar` is likewise not a decl-site error; it is
+        // inert (unregistered), so a *reference* to it is what fails to resolve.
         let src = "program p; builtin relvar Foo { a: Integer } key { a };";
-        assert!(codes(src).contains(&"T0091"), "{:?}", codes(src));
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
     }
 
     #[test]

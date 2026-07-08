@@ -741,4 +741,3 @@ check script enforces that.
 | T0088 | a type that belongs to an opt-in stdlib module is named without importing it — add `use module <path>;` (e.g. `Request` needs `use module coddl::web;`) |
 | T0089 | a `use module <path>;` names a module that does not exist under the reserved `coddl::` root |
 | T0090 | a `builtin relvar` from an opt-in stdlib module is referenced without importing it — add `use module <path>;` (e.g. `Environment` needs `use module coddl::env;`) |
-| T0091 | a `builtin relvar` is declared in a user file — `builtin` relvars are reserved for the standard library (use `private relvar`) |

@@ -378,9 +378,9 @@ function that implements it.
                           -- A compiler-provided relvar whose backing the
                           -- runtime supplies (the stdlib; e.g. `coddl::env`'s
                           -- `Environment`). Dispatched when `builtin` is
-                          -- followed by `relvar` (vs `oper`). `.cd` dialect;
-                          -- the typechecker rejects it in a user file (T0091 —
-                          -- reserved for the standard library).
+                          -- followed by `relvar` (vs `oper`). Registered from an
+                          -- imported stdlib module by the typechecker; inert in
+                          -- an ordinary checked file (like a user `builtin oper`).
 
 <relvar-with-heading> ::= 'relvar' <identifier>
                           <heading>
