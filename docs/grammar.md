@@ -384,9 +384,16 @@ function that implements it.
 -- those kinds belong in `.cddb`. See docs/cddb-grammar.md for those
 -- productions.
 
-<oper-decl>     ::= 'oper' <identifier> <heading>
+<oper-decl>     ::= [ 'builtin' ] 'oper' <identifier> <heading>
                     [ <return-clause> ]
-                    <block> ';' ;                              -- parse_oper_decl
+                    [ <block> ] ';' ;                          -- parse_oper_decl
+                    -- A plain `oper` requires a <block> body (P0006 if
+                    -- absent). A leading `builtin` qualifier marks a
+                    -- compiler-provided operator (the prelude — see
+                    -- docs/prelude.md) that carries no body: a <block> after
+                    -- it is P0078, and `builtin` not followed by `oper` is
+                    -- P0079. Mirrors the leading `public` / `private`
+                    -- relvar qualifiers.
 <return-clause> ::= '->' <type-ref> ;                          -- parse_return_clause
 
 <heading>       ::= '{' [ <param> commalist ] '}' ;            -- parse_heading
@@ -968,6 +975,8 @@ enforces that.
 | P0075 | Expected `[` to open the `load` order list              |
 | P0076 | Expected `]` to close the `load` order list             |
 | P0077 | Expected an attribute name in the order key             |
+| P0078 | `builtin` operator must not have a body                 |
+| P0079 | Expected `oper` after `builtin`                         |
 
 Note: missing-type-after-`:` (let annotation), missing-type-after-`->`
 (operator return clause), and missing-element-after-`Sequence` all

@@ -209,10 +209,22 @@ impl PrivateRelvarDecl {
 ast_node!(pub OperDecl, OPER_DECL);
 
 impl OperDecl {
+    /// `true` if this is a `builtin` declaration — a compiler-provided
+    /// operator with no `[ … ]` body (the prelude; see docs/prelude.md).
+    /// Detected from a leading contextual `builtin` keyword token.
+    pub fn is_builtin(&self) -> bool {
+        nth_token(&self.syntax, SyntaxKind::IDENT, 0)
+            .map(|t| t.text() == "builtin")
+            .unwrap_or(false)
+    }
+
     /// The operator's name — the IDENT immediately after the contextual
-    /// `oper` keyword.
+    /// `oper` keyword. A leading `builtin` qualifier shifts the keyword
+    /// tokens by one (`builtin`, `oper`, then the name), so the name is at
+    /// index 2 in that case and index 1 otherwise.
     pub fn name(&self) -> Option<SyntaxToken> {
-        nth_token(&self.syntax, SyntaxKind::IDENT, 1)
+        let idx = if self.is_builtin() { 2 } else { 1 };
+        nth_token(&self.syntax, SyntaxKind::IDENT, idx)
     }
 
     /// The parameter heading `{ … }`. `None` only if parsing recovered
@@ -1433,6 +1445,30 @@ mod tests {
         let keys: Vec<_> = decl.key_clauses().collect();
         assert_eq!(keys.len(), 1);
         assert!(keys[0].attrs().any(|t| t.text() == "id"));
+    }
+
+    #[test]
+    fn builtin_oper_is_flagged_and_names_past_the_qualifier() {
+        let root = ast("builtin oper to_text { self: Integer } -> Text;");
+        let Item::OperDecl(decl) = root.items().next().unwrap() else {
+            panic!("expected OperDecl");
+        };
+        assert!(decl.is_builtin());
+        // The leading `builtin` shifts the keyword tokens; name/return must
+        // still resolve to `to_text` / `Text`, and there is no body.
+        assert_eq!(decl.name().unwrap().text(), "to_text");
+        assert!(decl.return_type().is_some());
+        assert!(decl.body().is_none());
+    }
+
+    #[test]
+    fn plain_oper_is_not_builtin() {
+        let root = ast("oper f { x: Integer } [];");
+        let Item::OperDecl(decl) = root.items().next().unwrap() else {
+            panic!("expected OperDecl");
+        };
+        assert!(!decl.is_builtin());
+        assert_eq!(decl.name().unwrap().text(), "f");
     }
 
     #[test]

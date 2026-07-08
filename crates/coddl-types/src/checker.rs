@@ -823,6 +823,12 @@ impl TypeChecker {
     /// names a builtin or an earlier user op is rejected with T0060 and the
     /// first definition wins.
     fn register_user_oper(&mut self, decl: &OperDecl) {
+        // `builtin` declarations are compiler-provided signatures (the
+        // prelude — see docs/prelude.md), not user definitions. They are
+        // inert to user-oper registration until the prelude loader lands.
+        if decl.is_builtin() {
+            return;
+        }
         let Some(name_tok) = decl.name() else { return };
         let name = name_tok.text().to_string();
 
@@ -914,6 +920,11 @@ impl TypeChecker {
     }
 
     fn check_oper_decl(&mut self, decl: &OperDecl) {
+        // A `builtin` declaration carries no body to check — the compiler
+        // provides the implementation (see register_user_oper).
+        if decl.is_builtin() {
+            return;
+        }
         let mut scope = Scope::default();
         scope.push(); // operator parameter layer
 

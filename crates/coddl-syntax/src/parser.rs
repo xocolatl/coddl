@@ -293,7 +293,7 @@ impl<'a> Parser<'a> {
             crate::parser_cddb::parse_base_relvar_decl(self);
         } else if self.at_keyword("virtual") {
             crate::parser_cddb::parse_virtual_relvar_decl(self);
-        } else if self.at_keyword("oper") {
+        } else if self.at_keyword("oper") || self.at_keyword("builtin") {
             self.parse_oper_decl();
         } else {
             self.parse_unknown_item();
@@ -343,9 +343,24 @@ impl<'a> Parser<'a> {
     /// trigger the "expected `[`" or "expected `;`" diagnostic on the
     /// stray punctuation.
     fn parse_oper_decl(&mut self) {
-        debug_assert!(self.at_keyword("oper"));
+        debug_assert!(self.at_keyword("oper") || self.at_keyword("builtin"));
         self.start_node(SyntaxKind::OPER_DECL);
-        self.bump(); // "oper"
+
+        // Optional leading `builtin` qualifier: the operator is
+        // compiler-provided (the prelude — see docs/prelude.md) and carries
+        // no `[ … ]` body. Parsed here in item dispatch, mirroring the
+        // leading `public` / `private` relvar qualifiers.
+        let is_builtin = self.at_keyword("builtin");
+        if is_builtin {
+            self.bump(); // "builtin"
+            if self.at_keyword("oper") {
+                self.bump(); // "oper"
+            } else {
+                self.error("P0079", "expected `oper` after `builtin`");
+            }
+        } else {
+            self.bump(); // "oper"
+        }
 
         if !self.eat(SyntaxKind::IDENT) {
             self.error("P0004", "expected operator name");
@@ -363,7 +378,14 @@ impl<'a> Parser<'a> {
             self.parse_return_clause();
         }
 
-        if self.at(SyntaxKind::L_BRACKET) {
+        if is_builtin {
+            // A `builtin` operator has no body; the compiler provides the
+            // implementation. A stray `[ … ]` here is an error.
+            if self.at(SyntaxKind::L_BRACKET) {
+                self.error("P0078", "builtin operator must not have a body");
+                self.parse_block(); // consume for recovery
+            }
+        } else if self.at(SyntaxKind::L_BRACKET) {
             self.parse_block();
         } else {
             self.error("P0006", "expected `[` to start operator body");
@@ -5061,6 +5083,50 @@ mod tests {
     fn missing_param_type_diagnoses() {
         let out = parse_str("oper f { x: } [];");
         assert!(out.diagnostics.iter().any(|d| d.code == "P0011"));
+    }
+
+    #[test]
+    fn builtin_oper_decl_parses() {
+        let out = parse_str("builtin oper to_text { self: Integer } -> Text;");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.tree.text(), "builtin oper to_text { self: Integer } -> Text;");
+
+        let decl = out.tree.first_child().unwrap();
+        assert_eq!(decl.kind(), SyntaxKind::OPER_DECL);
+        let child_kinds: Vec<_> = decl
+            .children_with_tokens()
+            .map(|el| el.kind())
+            .filter(|k| !k.is_trivia())
+            .collect();
+        assert_eq!(
+            child_kinds,
+            vec![
+                SyntaxKind::IDENT, // "builtin"
+                SyntaxKind::IDENT, // "oper"
+                SyntaxKind::IDENT, // "to_text"
+                SyntaxKind::HEADING,
+                SyntaxKind::RETURN_CLAUSE,
+                SyntaxKind::SEMICOLON,
+            ]
+        );
+    }
+
+    #[test]
+    fn builtin_oper_unit_return_parses() {
+        let out = parse_str("builtin oper write_line { message: Text };");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    #[test]
+    fn builtin_oper_with_body_diagnoses_p0078() {
+        let out = parse_str("builtin oper f {} [];");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0078"));
+    }
+
+    #[test]
+    fn builtin_without_oper_diagnoses_p0079() {
+        let out = parse_str("builtin f {};");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0079"));
     }
 
     #[test]
