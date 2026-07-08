@@ -8,6 +8,7 @@ coddl/
   crates/
     coddl-diagnostics/             # shared span + diagnostic types (used by every frontend crate)
     coddl-syntax/                  # lexer + recursive-descent parser, CST (rowan) + AST view
+    coddl-stdlib/                  # embedded standard-library module sources (coddl::core, …) + path→source resolver
     coddl-types/                   # type checker, type representation
     coddl-relir/                   # relational IR + optimizer (see relir.md)
     coddl-procir/                  # procedural IR — backend-agnostic SSA (see procir.md)
@@ -41,5 +42,7 @@ coddl/
 ## Why this many crates
 
 Each crate corresponds to a subsystem with a stable interface. The boundary between `coddl-syntax` (CST + AST view) and `coddl-types` (type checker) is the AST. The boundary between `coddl-relir` and `coddl-procir` is the RelIR → ProcIR lowering, with `coddl-sqlemit` and `coddl-execlocal` as peer consumers of RelIR (see [relir.md](relir.md) for the cut decision). The boundary between `coddl-procir` and `coddl-codegen-llvm` is ProcIR text. The boundary between the compiler and the runtime is the `extern "C"` ABI (see [runtime.md](runtime.md)).
+
+`coddl-stdlib` sits *below* `coddl-types`: it owns the embedded standard-library module sources (`coddl::core` today; opt-in modules like `coddl::web` / `coddl::env` as the module system lands) plus a `path → source` resolver, and hands back plain source text — the typechecker interprets it. The arrow runs `coddl-types → coddl-stdlib` only; the stdlib never depends on the typechecker (it would be a dependency cycle, and it would cross the self-hosting seam backwards — see [principles.md](principles.md)).
 
 Keeping these boundaries semantic — not "this is what currently fits" — is what lets new backends and deferred Manifesto features land without rewriting the world.

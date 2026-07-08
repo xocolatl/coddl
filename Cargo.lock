@@ -305,6 +305,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "coddl-stdlib"
+version = "0.0.0"
+
+[[package]]
 name = "coddl-syntax"
 version = "0.0.0"
 dependencies = [
@@ -318,6 +322,7 @@ name = "coddl-types"
 version = "0.0.0"
 dependencies = [
  "coddl-diagnostics",
+ "coddl-stdlib",
  "coddl-syntax",
 ]
 

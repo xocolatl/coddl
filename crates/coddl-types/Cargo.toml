@@ -9,4 +9,5 @@ description = "Type checker and type representation. See docs/typecheck.md."
 
 [dependencies]
 coddl-diagnostics.workspace = true
+coddl-stdlib.workspace = true
 coddl-syntax.workspace = true

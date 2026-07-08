@@ -1,0 +1,10 @@
+[package]
+name = "coddl-stdlib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The Coddl standard library: embedded module sources + a path→source resolver. See docs/prelude.md."
+
+[dependencies]

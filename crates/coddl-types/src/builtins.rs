@@ -2,8 +2,8 @@
 //!
 //! Maps operator names to their signatures; the typechecker consults it
 //! whenever a `Call` expression's callee is a `NameRef`. Monomorphic
-//! signatures are **loaded from the Coddl prelude** (`prelude.cd`, the source
-//! of truth — see docs/prelude.md); the heading-polymorphic printers/counters,
+//! signatures are **loaded from the Coddl prelude** (`coddl::core`, embedded in
+//! `coddl-stdlib` — see docs/prelude.md); the heading-polymorphic printers/counters,
 //! which have no surface spelling yet, are registered here in Rust. The
 //! prelude gives the *signature*; purity and the lowering strategy stay
 //! compiler-side, keyed by name.
@@ -82,7 +82,7 @@ pub struct Builtins {
 
 impl Builtins {
     /// Populate the registry. The monomorphic operators are loaded from the
-    /// Coddl prelude (`prelude.cd` — the signature source of truth); the
+    /// Coddl prelude (`coddl::core` — the signature source of truth); the
     /// heading-polymorphic printers/counters, which have no surface spelling
     /// yet, are registered in Rust.
     pub fn new() -> Self {
@@ -94,15 +94,16 @@ impl Builtins {
         b
     }
 
-    /// Load the monomorphic `builtin oper` signatures from the embedded
-    /// prelude source. The prelude gives the *signature* (params + return);
-    /// purity is compiler-side metadata keyed by name ([`prelude_purity`]) and
-    /// the lowering strategy lives in the codegen crates. Parser error
-    /// recovery keeps this robust to the prelude's not-yet-parseable `type`
-    /// declarations — only `builtin oper` items are consumed.
+    /// Load the monomorphic `builtin oper` signatures from the `coddl::core`
+    /// source (resolved from the embedded stdlib). The prelude gives the
+    /// *signature* (params + return); purity is compiler-side metadata keyed by
+    /// name ([`prelude_purity`]) and the lowering strategy lives in the codegen
+    /// crates. Only `builtin oper` items are consumed here; any other items
+    /// (e.g. `type` aliases) are ignored.
     fn load_prelude(&mut self) {
-        const PRELUDE: &str = include_str!("../prelude.cd");
-        let out = parse(PRELUDE, FileId(0), FileKind::Cd);
+        let core = coddl_stdlib::resolve(&coddl_stdlib::ModulePath::parse("coddl::core"))
+            .expect("coddl::core is always embedded in coddl-stdlib");
+        let out = parse(core.source, FileId(0), FileKind::Cd);
         let Some(root) = Root::cast(out.tree) else {
             return;
         };
@@ -318,8 +319,7 @@ mod tests {
     }
 
     // The conversions are prelude-only (no hand-written Rust registration),
-    // so these also prove the loader actually parses `prelude.cd` — and that
-    // the parse is robust to the prelude's not-yet-parseable `type` decls.
+    // so these also prove the loader actually parses `coddl::core`.
     #[test]
     fn to_approximate_loaded_from_prelude() {
         let b = Builtins::new();

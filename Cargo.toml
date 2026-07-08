@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/coddl-diagnostics",
     "crates/coddl-syntax",
+    "crates/coddl-stdlib",
     "crates/coddl-types",
     "crates/coddl-plan",
     "crates/coddl-relir",
@@ -49,6 +50,7 @@ tempfile = "3"
 
 coddl-diagnostics = { path = "crates/coddl-diagnostics" }
 coddl-syntax = { path = "crates/coddl-syntax" }
+coddl-stdlib = { path = "crates/coddl-stdlib" }
 coddl-types = { path = "crates/coddl-types" }
 coddl-plan = { path = "crates/coddl-plan" }
 coddl-relir = { path = "crates/coddl-relir" }

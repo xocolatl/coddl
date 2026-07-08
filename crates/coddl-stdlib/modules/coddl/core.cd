@@ -1,11 +1,13 @@
-// Coddl prelude — the built-in surface, in Coddl source.
+// coddl::core — the built-in surface, in Coddl source.
 //
-// Loaded at typechecker construction (crates/coddl-types/src/builtins.rs) as
-// the signature source of truth for the monomorphic built-in operators. The
-// `builtin` qualifier means "no Coddl body; the compiler provides the
-// implementation." How it lowers (a runtime symbol vs an inline intrinsic) and
-// its purity are compiler-side metadata keyed by name — this file is the
-// SIGNATURE source, not the full metadata source. See docs/prelude.md.
+// The always-in-scope core module (no `use module` needed). Resolved from the
+// embedded stdlib (crates/coddl-stdlib) and loaded at typechecker construction
+// (crates/coddl-types/src/builtins.rs) as the signature source of truth for the
+// monomorphic built-in operators. The `builtin` qualifier means "no Coddl body;
+// the compiler provides the implementation." How it lowers (a runtime symbol vs
+// an inline intrinsic) and its purity are compiler-side metadata keyed by name
+// — this file is the SIGNATURE source, not the full metadata source. See
+// docs/prelude.md.
 //
 // Deliberately NOT declared here (stay compiler-registered, cannot be spelled
 // in Coddl yet):

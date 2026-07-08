@@ -5162,12 +5162,13 @@ mod tests {
 
     #[test]
     fn prelude_checks_clean() {
-        // The embedded prelude — `builtin oper` signatures plus the
-        // `Request` / `Response` `type` declarations — must now fully parse
-        // and typecheck with zero diagnostics.
-        const PRELUDE: &str = include_str!("../prelude.cd");
-        let diags = diagnostics(PRELUDE);
-        assert!(diags.is_empty(), "prelude has diagnostics: {diags:?}");
+        // The `coddl::core` prelude (embedded in coddl-stdlib) — the
+        // `builtin oper` signatures — must fully parse and typecheck with zero
+        // diagnostics.
+        let core = coddl_stdlib::resolve(&coddl_stdlib::ModulePath::parse("coddl::core"))
+            .expect("coddl::core is always embedded");
+        let diags = diagnostics(core.source);
+        assert!(diags.is_empty(), "coddl::core has diagnostics: {diags:?}");
     }
 
     #[test]

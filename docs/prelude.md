@@ -13,12 +13,14 @@ builds its `OperSig` registry from the result, and the user reads the exact decl
 enforces. This is the `external` / `.d.ts` / prelude pattern (OCaml `external`, C headers, TypeScript
 `.d.ts`, the Rust/Haskell preludes).
 
-> **Status.** *Live.* [`crates/coddl-types/prelude.cd`](../crates/coddl-types/prelude.cd) is parsed and its
-> `builtin oper` signatures loaded at typechecker construction (`Builtins::new`), embedded via `include_str!`
-> so the compiler stays self-contained.
+> **Status.** *Live.* The prelude source is [`coddl::core`](../crates/coddl-stdlib/modules/coddl/core.cd),
+> embedded in the [`coddl-stdlib`](workspace.md) crate. Its `builtin oper` signatures are resolved via
+> `coddl_stdlib::resolve` and loaded at typechecker construction (`Builtins::new`); `coddl-stdlib` embeds the
+> source via `include_str!` so the compiler stays self-contained. `coddl-types` depends on `coddl-stdlib`
+> (never the reverse — a cycle): the stdlib hands back source text, the typechecker interprets it.
 
 **Last sync:** `31d3e74`. Every builtin-set or grammar change that touches the prelude surface updates this
-doc and `prelude.cd` in the same commit.
+doc and `coddl::core` in the same commit.
 
 ## Why do this
 
@@ -103,13 +105,13 @@ build error instead of a silent lie. (This closed-set check is not yet wired —
 ## Modules (deferred)
 
 Ideally the core conversions / `to_text` are always in scope while library-specific types live in opt-in
-modules. But there is no module/import mechanism today, so everything sits in one `prelude.cd`. A
+modules. But there is no module/import mechanism today, so everything sits in one `coddl::core`. A
 core-vs-library split rides on the general module decision (the namespace question the `catalog-design` work
 also gates).
 
 ## What's here, and what's deferred
 
-Landed: the `builtin` qualifier grammar, the loader (signatures parsed from `prelude.cd`), and the `type`
+Landed: the `builtin` qualifier grammar, the loader (signatures parsed from `coddl::core`), and the `type`
 alias production. Still open:
 
 - **Quiet-path alias resolution** — the free `resolve_type_ref_quiet` (user-oper pre-pass, ProcIR lowerer)
