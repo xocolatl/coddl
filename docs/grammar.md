@@ -296,6 +296,7 @@ Unterminated `'…` or `"…` emits **E0005** and **E0003** respectively.
 | `Dot`         | `.`                                             |
 | `Assign`      | `:=`                                            |
 | `Arrow`       | `->`                                            |
+| `ColonColon`  | `::`  (module-path separator; `use` paths only) |
 | `Eq`          | `=`                                             |
 | `NotEq`       | `<>`, `≠`                                       |
 | `Lt`          | `<`, `⊂`                                        |
@@ -355,6 +356,7 @@ function that implements it.
                   | <private-relvar-decl>
                   | <oper-decl>
                   | <type-decl>
+                  | <use-decl>
                   | <unknown-item> ;                          -- parse_item
 
 <program-decl>  ::= 'program' <identifier> ';' ;              -- parse_program_decl
@@ -404,6 +406,22 @@ function that implements it.
                     -- Missing name is P0080, missing `=` is P0081, missing
                     -- `;` is P0082. The checker rejects shadowing a built-in
                     -- type name (T0085) and a duplicate declaration (T0086).
+
+<use-decl>      ::= 'use' 'module' <module-path> ';' ;         -- parse_use_decl
+                    -- A module import. `module` is the only category today;
+                    -- `use database …` is reserved for a later item form, so
+                    -- the category word is spelled out rather than implied.
+                    -- `use` and `module` are contextual keywords. Dispatched on
+                    -- the leading contextual `use`. Missing `module` is P0083,
+                    -- missing `;` is P0085. Imports bring the module's names
+                    -- into scope UNQUALIFIED (bring-bare-names) — `::` is not
+                    -- accepted in expression or type position. See
+                    -- docs/prelude.md.
+
+<module-path>   ::= <identifier> { '::' <identifier> } ;      -- parse_module_path
+                    -- A `::`-separated module path (`coddl::core`). Wrapped in a
+                    -- MODULE_PATH node. A missing segment — leading, or after a
+                    -- `::` — is P0084.
 
 <heading>       ::= '{' [ <param> commalist ] '}' ;            -- parse_heading
 <param>         ::= <identifier> ':' <type-ref> ;              -- parse_param
@@ -989,6 +1007,9 @@ enforces that.
 | P0080 | Expected type name after `type`                         |
 | P0081 | Expected `=` in type declaration                        |
 | P0082 | Expected `;` after type declaration                     |
+| P0083 | Expected `module` after `use`                           |
+| P0084 | Expected module name (leading, or after `::`)           |
+| P0085 | Expected `;` after `use module <path>`                  |
 
 Note: missing-type-after-`:` (let annotation), missing-type-after-`->`
 (operator return clause), and missing-element-after-`Sequence` all

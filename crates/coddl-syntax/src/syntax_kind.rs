@@ -42,6 +42,7 @@ pub enum SyntaxKind {
     DOT,
     ASSIGN,
     ARROW,
+    COLON_COLON,
 
     EQ,
     NOT_EQ,
@@ -268,6 +269,18 @@ pub enum SyntaxKind {
     /// keep existing discriminants stable.
     SORT_ITEM,
 
+    /// `use module <module-path> ;` — a module import. Holds the `use` and
+    /// `module` contextual keywords (IDENTs), a `MODULE_PATH` child, and the
+    /// trailing `;`. Placed at the end of the enum to keep existing
+    /// discriminants stable.
+    USE_DECL,
+
+    /// `<ident> { :: <ident> }` — the `::`-separated module path inside a
+    /// `USE_DECL` (`coddl::core`). Segment identifiers interleave with
+    /// `COLON_COLON` tokens. Placed at the end of the enum to keep existing
+    /// discriminants stable.
+    MODULE_PATH,
+
     /// A range of source whose intended structure couldn't be
     /// recovered. The parser still wraps the tokens so the tree stays
     /// well-formed and downstream passes can keep going.
@@ -315,6 +328,7 @@ impl From<TokenKind> for SyntaxKind {
             TokenKind::Dot => SyntaxKind::DOT,
             TokenKind::Assign => SyntaxKind::ASSIGN,
             TokenKind::Arrow => SyntaxKind::ARROW,
+            TokenKind::ColonColon => SyntaxKind::COLON_COLON,
 
             TokenKind::Eq => SyntaxKind::EQ,
             TokenKind::NotEq => SyntaxKind::NOT_EQ,
@@ -366,6 +380,8 @@ mod tests {
             TokenKind::Colon,
             TokenKind::Dot,
             TokenKind::Assign,
+            TokenKind::Arrow,
+            TokenKind::ColonColon,
             TokenKind::Eq,
             TokenKind::NotEq,
             TokenKind::Lt,
@@ -426,6 +442,8 @@ mod tests {
             SyntaxKind::UNWRAP_EXPR,
             SyntaxKind::LOAD_STMT,
             SyntaxKind::SORT_ITEM,
+            SyntaxKind::USE_DECL,
+            SyntaxKind::MODULE_PATH,
             SyntaxKind::PARSE_ERROR,
         ] {
             assert!(!sk.is_token(), "{sk:?} should be a node kind");

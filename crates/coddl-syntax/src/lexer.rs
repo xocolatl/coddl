@@ -199,11 +199,16 @@ impl<'a> Lexer<'a> {
 
     fn lex_colon(&mut self, start: usize) {
         self.bump(); // ':'
-        if self.peek() == Some('=') {
-            self.bump();
-            self.emit(TokenKind::Assign, start);
-        } else {
-            self.emit(TokenKind::Colon, start);
+        match self.peek() {
+            Some('=') => {
+                self.bump();
+                self.emit(TokenKind::Assign, start);
+            }
+            Some(':') => {
+                self.bump();
+                self.emit(TokenKind::ColonColon, start);
+            }
+            _ => self.emit(TokenKind::Colon, start),
         }
     }
 
@@ -573,6 +578,27 @@ mod tests {
         let kinds: Vec<_> = out.tokens.iter().map(|t| t.kind).collect();
         assert_eq!(kinds, vec![TokenKind::Whitespace, TokenKind::Eof]);
         assert!(out.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn colon_colon_lexes_as_one_token() {
+        assert_eq!(lex_kinds("::"), vec![TokenKind::ColonColon, TokenKind::Eof]);
+        // Maximal munch: `:::` is `::` then `:`; `:=` still wins over `:`.
+        assert_eq!(
+            lex_kinds(":::"),
+            vec![TokenKind::ColonColon, TokenKind::Colon, TokenKind::Eof]
+        );
+        assert_eq!(lex_kinds(":="), vec![TokenKind::Assign, TokenKind::Eof]);
+        // A module path lexes as ident :: ident.
+        assert_eq!(
+            lex_kinds("coddl::core"),
+            vec![
+                TokenKind::Ident,
+                TokenKind::ColonColon,
+                TokenKind::Ident,
+                TokenKind::Eof
+            ]
+        );
     }
 
     #[test]

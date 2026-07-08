@@ -86,6 +86,9 @@ pub enum TokenKind {
     Assign,
     /// `->`  — operator return-type clause, future infix arrow.
     Arrow,
+    /// `::`  — module-path separator (`coddl::core`). Used only in a
+    /// `use module` path; never in expression or type position.
+    ColonColon,
 
     // ── comparison ───────────────────────────────────────────────────────
     /// `=`

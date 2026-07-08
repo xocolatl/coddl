@@ -100,6 +100,7 @@ pub enum Item {
     VirtualRelvarDecl(crate::ast_cddb::VirtualRelvarDecl),
     OperDecl(OperDecl),
     TypeDecl(TypeDecl),
+    UseDecl(UseDecl),
 }
 
 impl Item {
@@ -121,6 +122,7 @@ impl Item {
             }
             SyntaxKind::OPER_DECL => Item::OperDecl(OperDecl { syntax }),
             SyntaxKind::TYPE_DECL => Item::TypeDecl(TypeDecl { syntax }),
+            SyntaxKind::USE_DECL => Item::UseDecl(UseDecl { syntax }),
             _ => return None,
         })
     }
@@ -135,6 +137,7 @@ impl Item {
             Item::VirtualRelvarDecl(d) => d.syntax(),
             Item::OperDecl(d) => d.syntax(),
             Item::TypeDecl(d) => d.syntax(),
+            Item::UseDecl(d) => d.syntax(),
         }
     }
 }
@@ -265,6 +268,37 @@ impl TypeDecl {
     /// The aliased type — the `<type-ref>` on the right of `=`.
     pub fn aliased_type(&self) -> Option<TypeRef> {
         child(&self.syntax)
+    }
+}
+
+// ── UseDecl ──────────────────────────────────────────────────────────────
+
+ast_node!(pub UseDecl, USE_DECL);
+
+impl UseDecl {
+    /// The category keyword after `use` — `module` today (`use database` is
+    /// reserved for later). `use` occupies the first direct IDENT slot; the
+    /// category is the second. `None` if it was omitted (P0083). The path
+    /// identifiers live in the `MODULE_PATH` child, so they are not direct
+    /// IDENT tokens of this node and do not interfere with this index.
+    pub fn category(&self) -> Option<SyntaxToken> {
+        nth_token(&self.syntax, SyntaxKind::IDENT, 1)
+    }
+
+    /// The imported module path segments, in order — the identifiers of the
+    /// `MODULE_PATH` child (`coddl`, `core` for `coddl::core`). Empty if the
+    /// path was malformed. The typechecker builds a `coddl_stdlib::ModulePath`
+    /// from these.
+    pub fn segments(&self) -> impl Iterator<Item = SyntaxToken> + '_ {
+        self.syntax
+            .children()
+            .find(|n| n.kind() == SyntaxKind::MODULE_PATH)
+            .into_iter()
+            .flat_map(|path| {
+                path.children_with_tokens()
+                    .filter_map(|el| el.into_token())
+                    .filter(|t| t.kind() == SyntaxKind::IDENT)
+            })
     }
 }
 
@@ -1448,6 +1482,7 @@ mod tests {
                 Item::VirtualRelvarDecl(_) => "virtual_relvar",
                 Item::OperDecl(_) => "oper",
                 Item::TypeDecl(_) => "type",
+                Item::UseDecl(_) => "use",
             })
             .collect();
         assert_eq!(kinds, vec!["program", "database", "oper"]);

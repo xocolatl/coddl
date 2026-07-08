@@ -166,11 +166,11 @@ fn separator(
     }
 
     // No space before these.
-    if matches!(ck, COMMA | SEMICOLON | COLON | DOT | R_PAREN | R_BRACKET) {
+    if matches!(ck, COMMA | SEMICOLON | COLON | DOT | COLON_COLON | R_PAREN | R_BRACKET) {
         return Sep::None;
     }
-    // No space after these.
-    if matches!(pk, DOT | L_PAREN | L_BRACKET) {
+    // No space after these. `::` is tight on both sides: `coddl::core`.
+    if matches!(pk, DOT | COLON_COLON | L_PAREN | L_BRACKET) {
         return Sep::None;
     }
     // Empty braces stay tight: `{}`.

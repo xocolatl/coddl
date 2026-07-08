@@ -919,6 +919,10 @@ impl Lowerer {
                     // Type aliases are compile-time only — the typechecker
                     // resolves them; there is nothing to lower.
                 }
+                Item::UseDecl(_) => {
+                    // `use module …` is a compile-time import directive
+                    // resolved by the typechecker; nothing to lower.
+                }
             }
         }
         // Now that every function is lowered (so `plans` and

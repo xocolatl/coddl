@@ -92,6 +92,16 @@ mod tests {
     }
 
     #[test]
+    fn use_module_path_is_tight_and_idempotent() {
+        // `::` glues its segments; the whole decl is a fixpoint.
+        let src = "program p;\nuse module coddl::web;\n";
+        assert_eq!(fmt(src), src, "got:\n{}", fmt(src));
+        // Messy spacing canonicalizes to the tight form.
+        let messy = "program p;\nuse  module  coddl :: web ;\n";
+        assert_eq!(fmt(messy), src, "got:\n{}", fmt(messy));
+    }
+
+    #[test]
     fn reformats_messy_into_canonical() {
         let src = "program p;\noper   main {}[ write_line{message:\"hi\"} ; ];\n";
         let want = "program p;\noper main{} [\n    write_line{ message: \"hi\" };\n];\n";

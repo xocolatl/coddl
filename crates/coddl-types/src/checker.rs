@@ -567,6 +567,10 @@ impl TypeChecker {
                 Item::TypeDecl(_) => {
                     // Type aliases are validated in the pre-pass above.
                 }
+                Item::UseDecl(_) => {
+                    // `use module …` parses today but has no semantics yet;
+                    // module resolution + opt-in scoping land in a later phase.
+                }
                 Item::PublicRelvarDecl(_)
                 | Item::PrivateRelvarDecl(_)
                 | Item::BaseRelvarDecl(_)

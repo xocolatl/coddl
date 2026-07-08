@@ -297,6 +297,8 @@ impl<'a> Parser<'a> {
             self.parse_oper_decl();
         } else if self.at_keyword("type") {
             self.parse_type_decl();
+        } else if self.at_keyword("use") {
+            self.parse_use_decl();
         } else {
             self.parse_unknown_item();
         }
@@ -359,6 +361,49 @@ impl<'a> Parser<'a> {
             self.error("P0082", "expected `;` after type declaration");
         }
 
+        self.finish_node();
+    }
+
+    /// `use module <module-path> ;` — a module import. `module` is the only
+    /// category today; `use database …` is reserved for a later item form
+    /// (which is why the category word is spelled out rather than implied).
+    /// Dispatched on the leading contextual `use` keyword. Missing `module`
+    /// is P0083; the path/`;` diagnostics come from the helpers.
+    fn parse_use_decl(&mut self) {
+        debug_assert!(self.at_keyword("use"));
+        self.start_node(SyntaxKind::USE_DECL);
+        self.bump(); // "use"
+
+        if self.at_keyword("module") {
+            self.bump(); // "module"
+        } else {
+            self.error("P0083", "expected `module` after `use`");
+        }
+
+        self.parse_module_path();
+
+        if !self.eat(SyntaxKind::SEMICOLON) {
+            self.error("P0085", "expected `;` after `use module <path>`");
+        }
+
+        self.finish_node();
+    }
+
+    /// `<identifier> { '::' <identifier> }` — a `::`-separated module path
+    /// (`coddl::core`). `::` appears only here; it is not accepted in
+    /// expression or type position. A missing segment (leading or after a
+    /// `::`) is P0084.
+    fn parse_module_path(&mut self) {
+        self.start_node(SyntaxKind::MODULE_PATH);
+        if !self.eat(SyntaxKind::IDENT) {
+            self.error("P0084", "expected module name");
+        }
+        while self.at(SyntaxKind::COLON_COLON) {
+            self.bump(); // "::"
+            if !self.eat(SyntaxKind::IDENT) {
+                self.error("P0084", "expected module name after `::`");
+            }
+        }
         self.finish_node();
     }
 
@@ -2073,6 +2118,71 @@ mod tests {
     fn database_binding_missing_semicolon_diagnoses_p0021() {
         let out = parse_str("database greetings");
         assert!(out.diagnostics.iter().any(|d| d.code == "P0021"));
+    }
+
+    #[test]
+    fn use_module_parses_clean() {
+        let out = parse_str("use module coddl::web;");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let kinds: Vec<_> = out.tree.children().map(|n| n.kind()).collect();
+        assert_eq!(kinds, vec![SyntaxKind::USE_DECL]);
+        // Lossless round-trip (the `::` survives in the CST).
+        assert_eq!(out.tree.text(), "use module coddl::web;");
+    }
+
+    #[test]
+    fn use_module_path_segments_via_ast() {
+        use crate::ast::{AstNode, Item, Root};
+        let out = parse_str("use module a::b::c;");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let root = Root::cast(out.tree).unwrap();
+        let Some(Item::UseDecl(u)) = root.items().next() else {
+            panic!("expected a use decl");
+        };
+        assert_eq!(u.category().map(|t| t.text().to_string()).as_deref(), Some("module"));
+        let segs: Vec<String> = u.segments().map(|t| t.text().to_string()).collect();
+        assert_eq!(segs, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn use_missing_module_keyword_diagnoses_p0083() {
+        // `use coddl::core;` (forgot `module`) — one P0083; the path recovers.
+        let out = parse_str("use coddl::core;");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0083"),
+            "{:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn use_missing_path_diagnoses_p0084() {
+        let out = parse_str("use module ;");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0084"),
+            "{:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn use_trailing_coloncolon_diagnoses_p0084() {
+        let out = parse_str("use module coddl::;");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0084"),
+            "{:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn use_missing_semicolon_diagnoses_p0085() {
+        let out = parse_str("use module coddl::core");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0085"),
+            "{:?}",
+            out.diagnostics
+        );
     }
 
     #[test]
