@@ -99,6 +99,7 @@ pub enum Item {
     BaseRelvarDecl(crate::ast_cddb::BaseRelvarDecl),
     VirtualRelvarDecl(crate::ast_cddb::VirtualRelvarDecl),
     OperDecl(OperDecl),
+    TypeDecl(TypeDecl),
 }
 
 impl Item {
@@ -119,6 +120,7 @@ impl Item {
                 Item::VirtualRelvarDecl(crate::ast_cddb::VirtualRelvarDecl::cast(syntax)?)
             }
             SyntaxKind::OPER_DECL => Item::OperDecl(OperDecl { syntax }),
+            SyntaxKind::TYPE_DECL => Item::TypeDecl(TypeDecl { syntax }),
             _ => return None,
         })
     }
@@ -132,6 +134,7 @@ impl Item {
             Item::BaseRelvarDecl(d) => d.syntax(),
             Item::VirtualRelvarDecl(d) => d.syntax(),
             Item::OperDecl(d) => d.syntax(),
+            Item::TypeDecl(d) => d.syntax(),
         }
     }
 }
@@ -247,6 +250,23 @@ impl OperDecl {
 }
 
 ast_node!(pub ReturnClause, RETURN_CLAUSE);
+
+// ── TypeDecl ─────────────────────────────────────────────────────────────
+
+ast_node!(pub TypeDecl, TYPE_DECL);
+
+impl TypeDecl {
+    /// The declared type name. `type` is itself an IDENT in the tree
+    /// (contextual keyword) at index 0, so the name is the *second* IDENT.
+    pub fn name(&self) -> Option<SyntaxToken> {
+        nth_token(&self.syntax, SyntaxKind::IDENT, 1)
+    }
+
+    /// The aliased type — the `<type-ref>` on the right of `=`.
+    pub fn aliased_type(&self) -> Option<TypeRef> {
+        child(&self.syntax)
+    }
+}
 
 // ── Heading + Param ──────────────────────────────────────────────────────
 
@@ -1427,6 +1447,7 @@ mod tests {
                 Item::BaseRelvarDecl(_) => "base_relvar",
                 Item::VirtualRelvarDecl(_) => "virtual_relvar",
                 Item::OperDecl(_) => "oper",
+                Item::TypeDecl(_) => "type",
             })
             .collect();
         assert_eq!(kinds, vec!["program", "database", "oper"]);
@@ -1469,6 +1490,16 @@ mod tests {
         };
         assert!(!decl.is_builtin());
         assert_eq!(decl.name().unwrap().text(), "f");
+    }
+
+    #[test]
+    fn type_decl_names_and_aliases() {
+        let root = ast("type Request = Tuple { method: Text };");
+        let Item::TypeDecl(decl) = root.items().next().unwrap() else {
+            panic!("expected TypeDecl");
+        };
+        assert_eq!(decl.name().unwrap().text(), "Request");
+        assert!(decl.aliased_type().is_some());
     }
 
     #[test]

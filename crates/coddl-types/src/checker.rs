@@ -21,7 +21,7 @@ use coddl_syntax::ast::{
     NamedArg, OperDecl,
     PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr,
     ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
-    TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WhileStmt, WrapExpr,
+    TypeDecl, TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WhileStmt, WrapExpr,
 };
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
@@ -342,6 +342,7 @@ pub fn check(source: &str, file: FileId, file_kind: FileKind) -> CheckOutput {
         transaction_depth: 0,
         public_relvars: HashSet::new(),
         user_opers: HashMap::new(),
+        type_aliases: HashMap::new(),
     };
     match file_kind {
         FileKind::Cd => {
@@ -442,6 +443,14 @@ struct TypeChecker {
     /// path as a single-signature builtin. Names are unique across builtins ∪
     /// user ops — a collision is rejected at registration with T0060.
     user_opers: HashMap<String, crate::builtins::OperSig>,
+    /// User-defined type aliases (`type Name = <type-ref>;`), collected in a
+    /// pre-pass so a later type reference resolves regardless of declaration
+    /// order. Consulted by `resolve_type_name` after the built-in type names.
+    /// The *loud* resolution path (`resolve_type_ref`) reads this; the quiet
+    /// free `resolve_type_ref_quiet` (user-oper pre-pass, ProcIR lowerer) does
+    /// not yet, so an alias used as a user-oper param type resolves quietly to
+    /// `Unknown` until that path is threaded through.
+    type_aliases: HashMap<String, Type>,
 }
 
 impl TypeChecker {
@@ -528,6 +537,15 @@ impl TypeChecker {
                 _ => {}
             }
         }
+        // Pre-pass: register user-defined type aliases (`type Name = …;`) so
+        // a later type reference resolves regardless of declaration order.
+        // Runs before the operator pre-pass so operator param/return types can
+        // name an alias.
+        for item in root.items() {
+            if let Item::TypeDecl(d) = item {
+                self.register_type_alias(&d);
+            }
+        }
         // Pre-pass: collect every user-defined operator's signature so a
         // call site resolves regardless of declaration order (forward
         // references). Bodies are still walked in the main pass below.
@@ -546,6 +564,9 @@ impl TypeChecker {
                     // semantic constraints from the typechecker yet.
                 }
                 Item::OperDecl(o) => self.check_oper_decl(&o),
+                Item::TypeDecl(_) => {
+                    // Type aliases are validated in the pre-pass above.
+                }
                 Item::PublicRelvarDecl(_)
                 | Item::PrivateRelvarDecl(_)
                 | Item::BaseRelvarDecl(_)
@@ -822,6 +843,39 @@ impl TypeChecker {
     /// gate (T0026) until body-derived purity lands. A name that already
     /// names a builtin or an earlier user op is rejected with T0060 and the
     /// first definition wins.
+    /// Register a `type Name = <type-ref>;` alias. Rejects shadowing a
+    /// built-in type name (T0085) and a duplicate declaration (T0086); a bad
+    /// component of the aliased type surfaces T0005 once, here. The aliased
+    /// type resolves loudly, so it may name an alias registered earlier in
+    /// source order.
+    fn register_type_alias(&mut self, decl: &TypeDecl) {
+        let Some(name_tok) = decl.name() else { return };
+        let name = name_tok.text().to_string();
+
+        if Type::from_builtin_name(&name).is_some() {
+            self.error(
+                self.token_span(&name_tok),
+                "T0085",
+                format!("cannot redefine built-in type `{name}`"),
+            );
+            return;
+        }
+        if self.type_aliases.contains_key(&name) {
+            self.error(
+                self.token_span(&name_tok),
+                "T0086",
+                format!("type `{name}` is already defined"),
+            );
+            return;
+        }
+
+        let ty = match decl.aliased_type() {
+            Some(tr) => self.resolve_type_ref(&tr),
+            None => Type::Unknown,
+        };
+        self.type_aliases.insert(name, ty);
+    }
+
     fn register_user_oper(&mut self, decl: &OperDecl) {
         // `builtin` declarations are compiler-provided signatures (the
         // prelude — see docs/prelude.md), not user definitions. They are
@@ -1051,17 +1105,19 @@ impl TypeChecker {
 
     fn resolve_type_name(&mut self, token: &SyntaxToken) -> Type {
         let name = token.text();
-        match Type::from_builtin_name(name) {
-            Some(t) => t,
-            None => {
-                self.error(
-                    self.token_span(token),
-                    "T0005",
-                    format!("unknown type `{name}`"),
-                );
-                Type::Unknown
-            }
+        if let Some(t) = Type::from_builtin_name(name) {
+            return t;
         }
+        // A user-defined `type Name = …;` alias (registered in the pre-pass).
+        if let Some(t) = self.type_aliases.get(name) {
+            return t.clone();
+        }
+        self.error(
+            self.token_span(token),
+            "T0005",
+            format!("unknown type `{name}`"),
+        );
+        Type::Unknown
     }
 
     /// Resolve a (possibly generator-applied) `TypeRef` to a `Type`.
@@ -1487,7 +1543,7 @@ impl TypeChecker {
     /// in-memory slot; a **public** target is a write to its SQL-backed table —
     /// the RHS shape is recognized and emitted as surgical DML at lowering,
     /// which is where a non-writable view (T0050) or an unsupported RHS shape
-    /// (T0049) is caught. A public-relvar reference forces a transaction
+    /// (T0086) is caught. A public-relvar reference forces a transaction
     /// (T0025) via the (self-referencing) RHS, checked below.
     fn check_assignment_stmt(&mut self, stmt: &AssignStmt, scope: &mut Scope) {
         // Check the RHS first so its own diagnostics surface regardless of
@@ -5102,6 +5158,55 @@ mod tests {
                    private relvar S { a: Integer, c: Text } key { a }; \
                    oper main {} [ write_relation { rel: R union S }; ];";
         assert!(codes(src).contains(&"T0038"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn prelude_checks_clean() {
+        // The embedded prelude — `builtin oper` signatures plus the
+        // `Request` / `Response` `type` declarations — must now fully parse
+        // and typecheck with zero diagnostics.
+        const PRELUDE: &str = include_str!("../prelude.cd");
+        let diags = diagnostics(PRELUDE);
+        assert!(diags.is_empty(), "prelude has diagnostics: {diags:?}");
+    }
+
+    #[test]
+    fn type_alias_resolves_when_used() {
+        // `type Foo = Integer;` — a param typed `Foo` resolves to Integer, so
+        // the body's use of it typechecks with no unknown-type error.
+        let src = "program p; \
+                   type Foo = Integer; \
+                   oper f { x: Foo } -> Integer [ x ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn unknown_type_still_errors() {
+        let src = "program p; oper f { x: Bar } [];";
+        assert!(codes(src).contains(&"T0005"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn type_alias_cannot_shadow_builtin() {
+        let src = "program p; type Integer = Text;";
+        assert!(codes(src).contains(&"T0085"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn duplicate_type_alias_errors() {
+        let src = "program p; type Foo = Integer; type Foo = Text;";
+        assert!(codes(src).contains(&"T0086"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn tuple_type_alias_checks_clean() {
+        // The prelude's Request shape: a Tuple alias with a nested Relation.
+        let src = "program p; \
+                   type Request = Tuple { method: Text, \
+                   headers: Relation { name: Text, value: Text }, body: Text };";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
     }
 
     #[test]

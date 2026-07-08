@@ -915,6 +915,10 @@ impl Lowerer {
                     let func = self.lower_oper_decl(&o);
                     self.functions.push(func);
                 }
+                Item::TypeDecl(_) => {
+                    // Type aliases are compile-time only — the typechecker
+                    // resolves them; there is nothing to lower.
+                }
             }
         }
         // Now that every function is lowered (so `plans` and

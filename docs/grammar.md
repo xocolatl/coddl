@@ -354,6 +354,7 @@ function that implements it.
                   | <public-relvar-decl>
                   | <private-relvar-decl>
                   | <oper-decl>
+                  | <type-decl>
                   | <unknown-item> ;                          -- parse_item
 
 <program-decl>  ::= 'program' <identifier> ';' ;              -- parse_program_decl
@@ -395,6 +396,14 @@ function that implements it.
                     -- P0079. Mirrors the leading `public` / `private`
                     -- relvar qualifiers.
 <return-clause> ::= '->' <type-ref> ;                          -- parse_return_clause
+
+<type-decl>     ::= 'type' <identifier> '=' <type-ref> ';' ;   -- parse_type_decl
+                    -- A type alias — names a structural type (e.g. the
+                    -- prelude's `Request` / `Response`, docs/prelude.md).
+                    -- Dispatched on the leading contextual `type` keyword.
+                    -- Missing name is P0080, missing `=` is P0081, missing
+                    -- `;` is P0082. The checker rejects shadowing a built-in
+                    -- type name (T0085) and a duplicate declaration (T0086).
 
 <heading>       ::= '{' [ <param> commalist ] '}' ;            -- parse_heading
 <param>         ::= <identifier> ':' <type-ref> ;              -- parse_param
@@ -977,6 +986,9 @@ enforces that.
 | P0077 | Expected an attribute name in the order key             |
 | P0078 | `builtin` operator must not have a body                 |
 | P0079 | Expected `oper` after `builtin`                         |
+| P0080 | Expected type name after `type`                         |
+| P0081 | Expected `=` in type declaration                        |
+| P0082 | Expected `;` after type declaration                     |
 
 Note: missing-type-after-`:` (let annotation), missing-type-after-`->`
 (operator return clause), and missing-element-after-`Sequence` all

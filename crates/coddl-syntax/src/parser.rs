@@ -295,6 +295,8 @@ impl<'a> Parser<'a> {
             crate::parser_cddb::parse_virtual_relvar_decl(self);
         } else if self.at_keyword("oper") || self.at_keyword("builtin") {
             self.parse_oper_decl();
+        } else if self.at_keyword("type") {
+            self.parse_type_decl();
         } else {
             self.parse_unknown_item();
         }
@@ -332,6 +334,29 @@ impl<'a> Parser<'a> {
         }
         if !self.eat(SyntaxKind::SEMICOLON) {
             self.error("P0003", "expected `;` after program declaration");
+        }
+
+        self.finish_node();
+    }
+
+    /// `type <identifier> = <type-ref> ;` — a type alias (currently the only
+    /// `TYPE_DECL` form). Names a structural type, e.g. the prelude's
+    /// `Request` / `Response` (docs/prelude.md). Dispatched on the leading
+    /// contextual `type` keyword, like the other item forms.
+    fn parse_type_decl(&mut self) {
+        debug_assert!(self.at_keyword("type"));
+        self.start_node(SyntaxKind::TYPE_DECL);
+        self.bump(); // "type"
+
+        if !self.eat(SyntaxKind::IDENT) {
+            self.error("P0080", "expected type name after `type`");
+        }
+        if !self.eat(SyntaxKind::EQ) {
+            self.error("P0081", "expected `=` in type declaration");
+        }
+        self.parse_type_ref();
+        if !self.eat(SyntaxKind::SEMICOLON) {
+            self.error("P0082", "expected `;` after type declaration");
         }
 
         self.finish_node();
@@ -5127,6 +5152,32 @@ mod tests {
     fn builtin_without_oper_diagnoses_p0079() {
         let out = parse_str("builtin f {};");
         assert!(out.diagnostics.iter().any(|d| d.code == "P0079"));
+    }
+
+    #[test]
+    fn type_decl_parses() {
+        let out = parse_str("type Request = Tuple { method: Text };");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let decl = out.tree.first_child().unwrap();
+        assert_eq!(decl.kind(), SyntaxKind::TYPE_DECL);
+    }
+
+    #[test]
+    fn type_decl_missing_name_diagnoses_p0080() {
+        let out = parse_str("type = Integer;");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0080"));
+    }
+
+    #[test]
+    fn type_decl_missing_eq_diagnoses_p0081() {
+        let out = parse_str("type Foo Integer;");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0081"));
+    }
+
+    #[test]
+    fn type_decl_missing_semicolon_diagnoses_p0082() {
+        let out = parse_str("type Foo = Integer");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0082"));
     }
 
     #[test]
