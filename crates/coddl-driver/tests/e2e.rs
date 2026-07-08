@@ -97,27 +97,40 @@ oper main {} [
 ];
 ";
 
-// `coddl::env` writes: DML on the `Environment` builtin relvar maps to the OS.
-// insert → setenv, update → setenv (overwrite), delete → unsetenv — each on the
-// program's own process, read back within the same run. `CODDL_OUT` is
-// program-set, so no harness var is needed. Expected stdout: `two\ndone\n`
-// (insert one → update to two → read → delete → read empty → done).
+// `coddl::env` writes: DML on the `Environment` builtin relvar maps to the OS
+// (insert → setenv, update → setenv, delete → unsetenv), each on the program's
+// own process and read back within the same run. `write_env` reads the key
+// `CODDL_OUT` back after every step; `name` is the key so the lookup is ≤1 tuple
+// — `cardinality {} = 0` guards the absent case rather than `extract`ing a row
+// that might not exist. Program-set, so no harness var. Mirrors
+// `examples/env-write/env-write.cd`.
 const ENV_WRITE_SRC: &str = "\
 program env_write;
 use module coddl::env;
-oper main {} [
+oper write_env{ message: Text } [
+    write_line{ message };
+    let env = Environment where name = \"CODDL_OUT\";
+    if env.cardinality{} = 0 then [
+        write_line{ message: \"<empty>\" };
+    ] else [
+        let v = extract env;
+        write_line{ message: v.value };
+    ]
+];
+oper main{} [
+    write_env{ message: \"initial value (should be blank)\" };
     insert Environment { { name: \"CODDL_OUT\", value: \"one\" } };
+    write_env{ message: \"after insert\" };
     update Environment where name = \"CODDL_OUT\" { value: \"two\" };
-    var a;
-    load a from Environment where name = \"CODDL_OUT\" order [ name ];
-    for v in a do [ write_line { message: v.value }; ];
+    write_env{ message: \"after update\" };
     delete Environment where name = \"CODDL_OUT\";
-    var b;
-    load b from Environment where name = \"CODDL_OUT\" order [ name ];
-    for v in b do [ write_line { message: v.value }; ];
-    write_line { message: \"done\" };
+    write_env{ message: \"after delete\" };
+    write_line{ message: \"done\" };
 ];
 ";
+
+const ENV_WRITE_EXPECTED: &[u8] =
+    b"initial value (should be blank)\n<empty>\nafter insert\none\nafter update\ntwo\nafter delete\n<empty>\ndone\n";
 
 const SEQUENCE_CONSTRUCT_SRC: &str = "\
 program sequence_construct;
@@ -571,7 +584,7 @@ fn coddl_run_llvm_writes_env_builtin_relvar() {
         "coddl run --backend=llvm failed: stderr=\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(out.stdout, b"two\ndone\n");
+    assert_eq!(out.stdout, ENV_WRITE_EXPECTED);
 }
 
 #[test]
@@ -587,7 +600,7 @@ fn coddl_run_cranelift_writes_env_builtin_relvar() {
         "coddl run --backend=cranelift failed: stderr=\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(out.stdout, b"two\ndone\n");
+    assert_eq!(out.stdout, ENV_WRITE_EXPECTED);
 }
 
 #[test]

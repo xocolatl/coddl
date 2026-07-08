@@ -5,28 +5,46 @@ program env_write;
 //   insert → setenv, update → setenv (overwrite), delete → unsetenv.
 // The writes hit this program's own process, so a later read sees them.
 //
+// `write_env` reads the variable back after each step. `name` is the key, so
+// the lookup yields at most one tuple: `cardinality {} = 0` tests the absent
+// case rather than `extract`ing a row that might not be there.
+//
 //   coddl run examples/env-write/env-write.cd
-//   => two
+//   => initial value (should be blank)
+//      <empty>
+//      after insert
+//      one
+//      after update
+//      two
+//      after delete
+//      <empty>
 //      done
 use module coddl::env;
 
-oper main{} [
-    insert Environment { { name: "CODDL_OUT", value: "one" } };
-    update Environment where name = "CODDL_OUT" { value: "two" };
+oper write_env{ message: Text } [
+    write_line{ message };
 
-    var a;
-    load a from Environment where name = "CODDL_OUT" order [name];
-    for v in a do [
+    let env = Environment where name = "CODDL_OUT";
+
+    if env.cardinality{} = 0 then [
+        write_line{ message: "<empty>" };
+    ] else [
+        let v = extract env;
         write_line{ message: v.value };
-    ];
+    ]
+];
+
+oper main{} [
+    write_env{ message: "initial value (should be blank)" };
+
+    insert Environment { { name: "CODDL_OUT", value: "one" } };
+    write_env{ message: "after insert" };
+
+    update Environment where name = "CODDL_OUT" { value: "two" };
+    write_env{ message: "after update" };
 
     delete Environment where name = "CODDL_OUT";
-
-    var b;
-    load b from Environment where name = "CODDL_OUT" order [name];
-    for v in b do [
-        write_line{ message: v.value };
-    ];
+    write_env{ message: "after delete" };
 
     write_line{ message: "done" };
 ];
