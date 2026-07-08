@@ -75,10 +75,18 @@ struct Embedded {
 /// The embedded `coddl` root. Every module under the reserved `coddl::`
 /// namespace lives here, compiled into the binary so the toolchain stays
 /// self-contained. Listed in load order.
-const EMBEDDED: &[Embedded] = &[Embedded {
-    path: "coddl::core",
-    source: include_str!("../modules/coddl/core.cd"),
-}];
+const EMBEDDED: &[Embedded] = &[
+    Embedded {
+        path: "coddl::core",
+        source: include_str!("../modules/coddl/core.cd"),
+    },
+    Embedded {
+        path: "coddl::web",
+        source: include_str!("../modules/coddl/web.cd"),
+    },
+    // `coddl::env` (a `builtin relvar`) is wired in once the `builtin relvar`
+    // item form parses — see the module-system plan, Phase 4.
+];
 
 /// Resolve a module path to its source, or `None` if no provider owns it.
 ///

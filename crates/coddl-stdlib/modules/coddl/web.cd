@@ -1,0 +1,26 @@
+// coddl::web — the web-host vocabulary (opt-in).
+//
+// A type/vocabulary module: the Request/Response shapes a Rust host marshals
+// across the C ABI to compiled Coddl handlers (see docs/webhost.md). Opt-in via
+// `use module coddl::web;` — a CLI program must not have `Request` in scope.
+//
+// There is no callable operator here: the "server" is host-side (the app
+// developer writes handlers, not a socket loop). Coddl provides the models
+// (relvars) and the handler `oper`s; this module provides their vocabulary.
+//
+// Eventually a `Routes` relvar joins these — forward dispatch is a restriction,
+// reverse URL resolution a lookup — so routing is relational (docs/webhost.md,
+// "Routes as data").
+
+type Request = Tuple {
+    method: Text,
+    path: Text,
+    headers: Relation { name: Text, value: Text },
+    body: Text
+};
+
+type Response = Tuple {
+    status: Integer,
+    headers: Relation { name: Text, value: Text },
+    body: Text
+};

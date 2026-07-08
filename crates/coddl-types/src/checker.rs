@@ -23,6 +23,7 @@ use coddl_syntax::ast::{
     ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
     TypeDecl, TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WhileStmt, WrapExpr,
 };
+use coddl_stdlib::ModulePath;
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
 use coddl_syntax::{parse, parse_format_template, FileKind, SyntaxKind, TemplateChunk};
@@ -343,6 +344,9 @@ pub fn check(source: &str, file: FileId, file_kind: FileKind) -> CheckOutput {
         public_relvars: HashSet::new(),
         user_opers: HashMap::new(),
         type_aliases: HashMap::new(),
+        active_modules: HashSet::new(),
+        stdlib_oper_owner: HashMap::new(),
+        stdlib_type_owner: HashMap::new(),
     };
     match file_kind {
         FileKind::Cd => {
@@ -449,8 +453,25 @@ struct TypeChecker {
     /// The *loud* resolution path (`resolve_type_ref`) reads this; the quiet
     /// free `resolve_type_ref_quiet` (user-oper pre-pass, ProcIR lowerer) does
     /// not yet, so an alias used as a user-oper param type resolves quietly to
-    /// `Unknown` until that path is threaded through.
+    /// `Unknown` until that path is threaded through. Once a file `use`s an
+    /// opt-in stdlib module, that module's aliases are inserted here too.
     type_aliases: HashMap<String, Type>,
+    /// The opt-in stdlib modules this file has brought into scope with
+    /// `use module <path>;`. `coddl::core` is always in scope and is not
+    /// required here. Populated by [`Self::resolve_modules`] before any body is
+    /// walked; consulted when deciding whether an opt-in module's operators /
+    /// types are visible.
+    active_modules: HashSet<ModulePath>,
+    /// Every opt-in (non-`core`) stdlib operator name → the module that owns it.
+    /// Built from the embedded stdlib regardless of what this file imports, and
+    /// consulted **only** to upgrade an unresolved-name error (T0001) into the
+    /// actionable "add `use module …`" hint (T0087). It never puts a name in
+    /// scope — that is [`Self::active_modules`]'s job — so an un-imported stdlib
+    /// name stays a free identifier the user may define themselves.
+    stdlib_oper_owner: HashMap<String, ModulePath>,
+    /// Every opt-in (non-`core`) stdlib type name → its owning module. The type
+    /// analogue of [`Self::stdlib_oper_owner`]; upgrades T0005 → T0088.
+    stdlib_type_owner: HashMap<String, ModulePath>,
 }
 
 impl TypeChecker {
@@ -537,6 +558,12 @@ impl TypeChecker {
                 _ => {}
             }
         }
+        // Pre-pass: resolve `use module …` imports and bring the opt-in stdlib
+        // modules they name into scope (registering those modules' operators and
+        // type aliases). Runs before the user type-alias / operator pre-passes so
+        // an imported `Request` collides with a same-named user `type` (T0086)
+        // and so bodies see the imported names.
+        self.resolve_modules(root);
         // Pre-pass: register user-defined type aliases (`type Name = …;`) so
         // a later type reference resolves regardless of declaration order.
         // Runs before the operator pre-pass so operator param/return types can
@@ -568,8 +595,8 @@ impl TypeChecker {
                     // Type aliases are validated in the pre-pass above.
                 }
                 Item::UseDecl(_) => {
-                    // `use module …` parses today but has no semantics yet;
-                    // module resolution + opt-in scoping land in a later phase.
+                    // Imports are resolved in the `resolve_modules` pre-pass
+                    // above (opt-in scoping); nothing to do in the main walk.
                 }
                 Item::PublicRelvarDecl(_)
                 | Item::PrivateRelvarDecl(_)
@@ -835,6 +862,78 @@ impl TypeChecker {
             attrs.push(name);
         }
         attrs
+    }
+
+    /// Resolve `use module …` imports — opt-in module scoping. Two steps, in
+    /// order:
+    ///   1. Each `use module <path>;` names an embedded stdlib module. An
+    ///      unknown path is **T0089**; `coddl::core` is implicit, so importing
+    ///      it is a harmless no-op. The rest populate [`Self::active_modules`].
+    ///   2. Every non-`core` stdlib module is scanned to build the hint catalogs
+    ///      ([`Self::stdlib_oper_owner`] / [`Self::stdlib_type_owner`]), and the
+    ///      *active* ones have their operators (into `builtins`) and type aliases
+    ///      (into `type_aliases`) registered — lazily, so an un-imported module's
+    ///      names never enter this file's namespace.
+    fn resolve_modules(&mut self, root: &Root) {
+        let core = ModulePath::parse("coddl::core");
+
+        // (1) Collect the imports.
+        for item in root.items() {
+            let Item::UseDecl(u) = item else { continue };
+            let segs: Vec<String> = u.segments().map(|t| t.text().to_string()).collect();
+            if segs.is_empty() {
+                continue; // malformed path — the parser already reported it
+            }
+            let path = ModulePath::new(segs);
+            if coddl_stdlib::resolve(&path).is_none() {
+                self.error(
+                    self.node_span(u.syntax()),
+                    "T0089",
+                    format!("unknown module `{path}` — no such module under `coddl::`"),
+                );
+                continue;
+            }
+            self.active_modules.insert(path);
+        }
+
+        // (2) Build the hint catalogs, and load the active modules' contents.
+        for module in coddl_stdlib::stdlib_modules() {
+            if module.path == core {
+                continue; // core is always loaded (Builtins::new) and always in scope
+            }
+            let active = self.active_modules.contains(&module.path);
+            if active {
+                // Register this module's `builtin oper` signatures.
+                self.builtins.load_module(module.source);
+            }
+            let out = parse(module.source, FileId(0), FileKind::Cd);
+            let Some(mroot) = Root::cast(out.tree) else { continue };
+            for item in mroot.items() {
+                match item {
+                    Item::OperDecl(o) if o.is_builtin() => {
+                        if let Some(n) = o.name() {
+                            self.stdlib_oper_owner
+                                .insert(n.text().to_string(), module.path.clone());
+                        }
+                    }
+                    Item::TypeDecl(d) => {
+                        if let Some(n) = d.name() {
+                            let name = n.text().to_string();
+                            self.stdlib_type_owner
+                                .insert(name.clone(), module.path.clone());
+                            if active {
+                                let ty = d
+                                    .aliased_type()
+                                    .map(|tr| resolve_type_ref_quiet(&tr))
+                                    .unwrap_or(Type::Unknown);
+                                self.type_aliases.insert(name, ty);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Collect one user `oper`'s signature into `user_opers`. Param and
@@ -1112,9 +1211,20 @@ impl TypeChecker {
         if let Some(t) = Type::from_builtin_name(name) {
             return t;
         }
-        // A user-defined `type Name = …;` alias (registered in the pre-pass).
+        // A user-defined `type Name = …;` alias, or an imported opt-in stdlib
+        // alias (both registered in the pre-pass).
         if let Some(t) = self.type_aliases.get(name) {
             return t.clone();
+        }
+        // Not in scope. If it's an opt-in stdlib type, point at the import
+        // rather than reporting a plain unknown-type.
+        if let Some(module) = self.stdlib_type_owner.get(name).cloned() {
+            self.error(
+                self.token_span(token),
+                "T0088",
+                format!("type `{name}` requires `use module {module};`"),
+            );
+            return Type::Unknown;
         }
         self.error(
             self.token_span(token),
@@ -3882,11 +3992,21 @@ impl TypeChecker {
 
         match candidates.len() {
             0 => {
-                self.error(
-                    self.token_span(&callee_name_tok),
-                    "T0001",
-                    format!("cannot resolve name `{callee_name}`"),
-                );
+                // If the name is an opt-in stdlib operator, point at the import
+                // rather than reporting a plain unresolved name.
+                if let Some(module) = self.stdlib_oper_owner.get(&callee_name).cloned() {
+                    self.error(
+                        self.token_span(&callee_name_tok),
+                        "T0087",
+                        format!("operator `{callee_name}` requires `use module {module};`"),
+                    );
+                } else {
+                    self.error(
+                        self.token_span(&callee_name_tok),
+                        "T0001",
+                        format!("cannot resolve name `{callee_name}`"),
+                    );
+                }
                 Type::Unknown
             }
             // Fast path for the common single-signature case — behavior is
@@ -5173,6 +5293,64 @@ mod tests {
             .expect("coddl::core is always embedded");
         let diags = diagnostics(core.source);
         assert!(diags.is_empty(), "coddl::core has diagnostics: {diags:?}");
+    }
+
+    // ── Module system — opt-in `use module …` scoping ────────────────────
+
+    #[test]
+    fn core_operators_visible_without_imports() {
+        // `coddl::core` is always in scope — no `use module` needed.
+        let src = "program p; oper main {} [ write_line { message: to_text { self: 1 } }; ];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn unknown_module_diagnoses_t0089() {
+        let src = "program p; use module coddl::bogus; oper main {} [];";
+        assert!(codes(src).contains(&"T0089"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn importing_core_is_a_noop() {
+        let src = "program p; use module coddl::core; oper main {} [];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn web_type_without_import_diagnoses_t0088() {
+        // `Request` belongs to opt-in `coddl::web`; unimported → T0088, not the
+        // generic unknown-type T0005.
+        let src = "program p; oper handle { req: Request } [];";
+        let cs = codes(src);
+        assert!(cs.contains(&"T0088"), "{:?}", cs);
+        assert!(!cs.contains(&"T0005"), "should be T0088, not T0005: {:?}", cs);
+    }
+
+    #[test]
+    fn web_type_with_import_resolves_clean() {
+        // Importing `coddl::web` brings `Request` into scope; its fields resolve.
+        let src = "program p; use module coddl::web; \
+                   oper handle { req: Request } -> Text [ req.body ];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn unimported_module_name_is_a_free_identifier() {
+        // No reserved words: without importing `coddl::web`, a user may define
+        // their own `Request` type (the opt-in web name) freely.
+        let src = "program p; \
+                   type Request = Integer; \
+                   oper f { x: Request } -> Request [ x ]; \
+                   oper main {} [];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn importing_web_makes_request_collide_with_user_type_t0086() {
+        // Once `coddl::web` is imported, `Request` is defined — a same-named
+        // user `type` is a genuine duplicate (T0086).
+        let src = "program p; use module coddl::web; type Request = Integer;";
+        assert!(codes(src).contains(&"T0086"), "{:?}", codes(src));
     }
 
     #[test]

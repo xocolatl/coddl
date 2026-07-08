@@ -737,3 +737,6 @@ check script enforces that.
 | T0084 | the reverse `load` target is a **public** (SQL-backed) relvar — sealing a sequence into a public relvar (a DML replace) is not yet wired; use a private relvar |
 | T0085 | a `type Name = …;` declaration shadows a built-in type name (`Integer`, `Text`, …) |
 | T0086 | a `type Name = …;` declaration re-declares a name already given a type alias |
+| T0087 | an operator that belongs to an opt-in stdlib module is called without importing it — add `use module <path>;` (e.g. `environment` needs `use module coddl::env;`) |
+| T0088 | a type that belongs to an opt-in stdlib module is named without importing it — add `use module <path>;` (e.g. `Request` needs `use module coddl::web;`) |
+| T0089 | a `use module <path>;` names a module that does not exist under the reserved `coddl::` root |

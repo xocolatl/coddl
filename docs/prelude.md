@@ -102,12 +102,25 @@ name." That is a smaller, closed, checkable set: a startup assertion that every 
 has a codegen handler and a purity entry, and every codegen builtin has a prelude signature. Drift becomes a
 build error instead of a silent lie. (This closed-set check is not yet wired — see below.)
 
-## Modules (deferred)
+## Modules
 
-Ideally the core conversions / `to_text` are always in scope while library-specific types live in opt-in
-modules. But there is no module/import mechanism today, so everything sits in one `coddl::core`. A
-core-vs-library split rides on the general module decision (the namespace question the `catalog-design` work
-also gates).
+The core conversions / `to_text` / arithmetic are `coddl::core`, always in scope; library-specific surfaces
+live in **opt-in** modules a file brings in with `use module <path>;`. Live today:
+
+- **`coddl::web`** — the `Request` / `Response` vocabulary the web host marshals across the C ABI
+  ([webhost.md](webhost.md)). A CLI program that never imports it does not have `Request` in scope.
+
+Coming next: **`coddl::env`** — the process environment as a `builtin relvar Environment { name, value }`
+(readable as a relation; writable via DML → `setenv`/`unsetenv`), landing with the `builtin relvar` item form.
+
+`coddl::` is a closed, compiler-owned, embedded root; module sources live in `coddl-stdlib`
+([workspace.md](workspace.md)). Opt-in names are registered **lazily** — only in a file that `use`s their
+module — so an un-imported stdlib name (`Request`) stays a free identifier the user may define
+themselves (no reserved words, [grammar.md](grammar.md)). Referencing one without the import is not a plain
+unknown-name error but an actionable **T0087** (operator) / **T0088** (type) pointing at the missing
+`use module`; an unknown module path is **T0089**. Imports are **bring-bare-names**: `::` is a module-path
+separator only, never used in expression or type position, so after `use module coddl::web;` you write
+`Request`, not `web::Request`. See [grammar.md](grammar.md) for the `use module` / `::` grammar.
 
 ## What's here, and what's deferred
 

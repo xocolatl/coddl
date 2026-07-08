@@ -103,7 +103,19 @@ impl Builtins {
     fn load_prelude(&mut self) {
         let core = coddl_stdlib::resolve(&coddl_stdlib::ModulePath::parse("coddl::core"))
             .expect("coddl::core is always embedded in coddl-stdlib");
-        let out = parse(core.source, FileId(0), FileKind::Cd);
+        self.load_module(core.source);
+    }
+
+    /// Parse one stdlib module's source and register its `builtin oper`
+    /// signatures. `coddl::core` is loaded eagerly at construction; the opt-in
+    /// modules (`coddl::env`, …) are loaded on demand by the typechecker when a
+    /// file `use`s them — registering an opt-in module's operators only when
+    /// imported keeps its names out of a file's namespace until it asks for
+    /// them (so a user may freely name an `oper environment` when `coddl::env`
+    /// is not in scope). Only `builtin oper` items are consumed here; other
+    /// items (e.g. `type` aliases) are handled by the checker.
+    pub(crate) fn load_module(&mut self, source: &str) {
+        let out = parse(source, FileId(0), FileKind::Cd);
         let Some(root) = Root::cast(out.tree) else {
             return;
         };
