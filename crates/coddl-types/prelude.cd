@@ -1,0 +1,33 @@
+// Coddl prelude — the built-in surface, in Coddl source.
+//
+// Loaded at typechecker construction (crates/coddl-types/src/builtins.rs) as
+// the signature source of truth for the monomorphic built-in operators. The
+// `builtin` qualifier means "no Coddl body; the compiler provides the
+// implementation." How it lowers (a runtime symbol vs an inline intrinsic) and
+// its purity are compiler-side metadata keyed by name — this file is the
+// SIGNATURE source, not the full metadata source. See docs/prelude.md.
+//
+// Deliberately NOT declared here (stay compiler-registered, cannot be spelled
+// in Coddl yet):
+//   * format         — variadic FormatText template; a checker intrinsic with
+//                       no ordinary signature.
+//   * write_relation — `rel: Relation H`, heading-polymorphic.
+//   * cardinality    — `self: Relation H | Sequence T`, heading/element-poly.
+//                       Heading polymorphism has no surface syntax; deferred
+//                       (see docs/risks.md, "Heading polymorphism design space").
+//   * the infix / symbolic operators (`+ - * / div mod = <> < > <= >= join
+//     times intersect union minus compose where …`) — recognized directly by
+//     the parser and checker, not `name { }` calls.
+
+// ---- Conversions & I/O ----------------------------------------------------
+
+builtin oper write_line{ message: Text };
+builtin oper read_line{ prompt: Text } -> Text;
+
+builtin oper to_text{ self: Text } -> Text;
+builtin oper to_text{ self: Character } -> Text;
+builtin oper to_text{ self: Integer } -> Text;
+builtin oper to_text{ self: Boolean } -> Text;
+
+builtin oper to_approximate{ self: Rational } -> Approximate;
+builtin oper to_rational{ self: Integer } -> Rational;
