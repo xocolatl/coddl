@@ -91,6 +91,29 @@ struct BuiltinExtern {
     return_type: ProcType,
 }
 
+/// Compiler-side metadata for a `builtin relvar` — the runtime symbols its
+/// read (and, in a later phase, write) lowering targets. The relvar analogue of
+/// [`BUILTIN_EXTERNS`]: the surface name is spelled in the stdlib `.cd`, the
+/// symbols are compiler-side (keyed by name, like a `builtin oper`'s linkage).
+struct BuiltinRelvar {
+    surface: &'static str,
+    /// Returns the relvar's current value as a fresh RC `Relation` payload.
+    read: &'static str,
+}
+
+const BUILTIN_RELVARS: &[BuiltinRelvar] = &[BuiltinRelvar {
+    surface: "Environment",
+    read: "coddl_env_snapshot",
+}];
+
+/// The runtime symbol a read of `builtin relvar` `name` lowers to a call of.
+fn builtin_relvar_read_symbol(name: &str) -> Option<&'static str> {
+    BUILTIN_RELVARS
+        .iter()
+        .find(|r| r.surface == name)
+        .map(|r| r.read)
+}
+
 /// A user-defined operator's lowered signature, collected in a pre-pass over
 /// the program's `oper` declarations so a call site (`lower_call`) can resolve
 /// a non-builtin callee regardless of declaration order. Unlike a
@@ -195,6 +218,7 @@ fn lower_impl(
         lowerer.absorb_plan(plan);
     }
     lowerer.absorb_private_relvars(&check_out.relvars);
+    lowerer.absorb_builtin_relvars(&check_out.relvars);
     let module = lowerer.lower_root(&root);
     let relir = std::mem::take(&mut lowerer.relir);
     // Merge in any diagnostics the lowerer itself emitted (e.g.
@@ -345,6 +369,11 @@ struct Lowerer {
     /// Private relvars actually read or assigned; only these get a slot
     /// init/release in `main`.
     used_private_relvars: HashSet<String>,
+    /// `builtin` relvars in scope: surface name → interned heading id. Absorbed
+    /// from an imported stdlib module's relvar table. Unlike private relvars,
+    /// they have no in-memory slot — a read calls the module's runtime snapshot
+    /// symbol ([`builtin_relvar_read_symbol`]) and never touches SQL.
+    builtin_relvars: HashMap<String, HeadingId>,
     /// SSA values that are *owned* heap `Text` payloads — produced by `||`
     /// (`Concat`/`CharToText`), `read_line`, or a retained `Text` alias. Only
     /// these are auto-released (at scope exit, or as consumed temporaries):
@@ -422,6 +451,7 @@ impl Lowerer {
             private_relvars: HashMap::new(),
             private_relvar_order: Vec::new(),
             used_private_relvars: HashSet::new(),
+            builtin_relvars: HashMap::new(),
             owned_texts: HashSet::new(),
             param_value_ids: Vec::new(),
             tuple_cell_text_temps: HashMap::new(),
@@ -473,6 +503,21 @@ impl Lowerer {
             let heading_id = self.intern_heading(&info.heading);
             self.private_relvar_order.push(name.to_string());
             self.private_relvars.insert(name.to_string(), heading_id);
+        }
+    }
+
+    /// Absorb `builtin` relvars from the typechecker's relvar table: intern each
+    /// heading so a read lowers to a call of the relvar's runtime snapshot
+    /// symbol returning that heading. No slot, no plan — an FFI read, never SQL.
+    fn absorb_builtin_relvars(&mut self, relvars: &RelvarTable) {
+        let mut builtins: Vec<_> = relvars
+            .iter()
+            .filter(|(_, info)| matches!(info.kind, RelvarKind::Builtin))
+            .collect();
+        builtins.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, info) in builtins {
+            let heading_id = self.intern_heading(&info.heading);
+            self.builtin_relvars.insert(name.to_string(), heading_id);
         }
     }
 
@@ -3976,6 +4021,26 @@ impl Lowerer {
             );
             if let Some((v, _ty)) = self.lookup_local(name) {
                 return v;
+            }
+            // Builtin (FFI-backed) relvar reference: read it by calling the
+            // module's runtime snapshot symbol, which returns a fresh RC
+            // relation of the relvar's heading. Never a slot load, never SQL —
+            // intercepted before the private/public paths (the cut already
+            // declines it: `build_rel_expr` returns `None` for a non-private,
+            // non-public name).
+            if let Some(&heading_id) = self.builtin_relvars.get(name) {
+                let read = builtin_relvar_read_symbol(name)
+                    .expect("an absorbed builtin relvar has a read symbol");
+                self.ensure_runtime_extern(read, vec![], ProcType::Relation(heading_id));
+                let dst = self.fresh_value();
+                self.record_type(dst, ProcType::Relation(heading_id));
+                self.insts.push(Inst::Call {
+                    dst: Some(dst),
+                    callee: read.to_string(),
+                    args: vec![],
+                    return_type: ProcType::Relation(heading_id),
+                });
+                return dst;
             }
             // Public relvar reference: emit a slot load + retain. The
             // typechecker has already enforced this only happens inside

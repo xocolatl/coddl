@@ -56,6 +56,8 @@ ProcIR's tuple/value layout, the Rust runtime's `#[repr(C)]` types, and the LLVM
 
 Build a single layout description (a Rust type with derives that generates both the LLVM struct emission and the matching `#[repr(C)]` declaration) before the second value type lands. Same for the tagged-union row representation. This is a long-term-planning bill we pay now or pay tenfold later.
 
+New drift site (`coddl::env`): the runtime `coddl_env_snapshot` hand-writes a `CoddlHeadingDesc` for `{ name: Text, value: Text }` (`crates/coddl-runtime/src/env.rs`) — the first descriptor built *inside* the runtime rather than emitted by codegen from `layout.rs`. It must match the `{name, value}` layout codegen interns for that heading (name @ 0, value @ 16, record_size 32). Once a second `builtin relvar` (or the generalized descriptor-passing path) arrives, fold this into the single-source-of-truth layout so the runtime stops re-deriving it by hand.
+
 ## 9. `Integer` precision and arithmetic cost
 
 TTM's `INTEGER` (Coddl's `Integer`) is mathematically unbounded; shipping it as the only integer built-in forces bignum arithmetic on what 99% of users will use as a machine int.

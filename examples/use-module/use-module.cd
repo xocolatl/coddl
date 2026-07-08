@@ -1,0 +1,22 @@
+program use_module;
+
+// Opt-in modules: `use module coddl::env;` brings the standard library's
+// `Environment` relvar into scope. The process environment is a `builtin relvar`
+// — a relation of `{ name, value }` — so it is queried like any other relation.
+//
+// `name` is the key, so restricting on it yields at most one tuple — but a
+// variable may be absent (zero tuples). `extract` errors on an empty relation,
+// so we `load` + iterate (zero rows prints nothing, no error) rather than
+// `extract` a row that might not be there.
+//
+//   CODDL_DEMO="hello from the environment" coddl run examples/use-module/use-module.cd
+//   => hello from the environment
+use module coddl::env;
+
+oper main{} [
+    var vars;
+    load vars from Environment where name = "CODDL_DEMO" order [name];
+    for v in vars do [
+        write_line{ message: v.value };
+    ];
+];

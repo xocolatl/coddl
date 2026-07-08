@@ -22,6 +22,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 mod audit;
+pub mod env;
 pub mod rational;
 pub mod rc;
 pub mod relation;

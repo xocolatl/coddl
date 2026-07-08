@@ -32,6 +32,7 @@ fn fixtures_dir() -> &'static Path {
         let tmp = tempfile::tempdir().expect("fixtures tempdir");
         for (name, src) in [
             ("hello-world", HELLO_WORLD_SRC),
+            ("use-module", USE_MODULE_ENV_SRC),
             ("sequence-construct", SEQUENCE_CONSTRUCT_SRC),
             ("hello-everyone", HELLO_EVERYONE_SRC),
             ("param-echo", PARAM_ECHO_SRC),
@@ -74,6 +75,24 @@ const HELLO_WORLD_SRC: &str = "\
 program hello_world;
 oper main {} [
     write_line { message: \"Hello, world!\" };
+];
+";
+
+// `coddl::env`'s `Environment` builtin relvar: the process environment read as
+// a relation. Restricted to a harness-set variable so stdout is deterministic
+// (the raw environment is machine-dependent). `name` is the key, so the
+// restriction yields at most one tuple — but a variable may be *absent* (zero
+// tuples), and `extract` errors on an empty relation, so we `load` + iterate
+// (zero rows → zero output, no error) rather than `extract`. Exercises the
+// chain: `use module` → builtin-relvar read → `where` → `load`/`order` → `for`
+// → field access.
+const USE_MODULE_ENV_SRC: &str = "\
+program use_module;
+use module coddl::env;
+oper main {} [
+    var vars;
+    load vars from Environment where name = \"CODDL_DEMO\" order [ name ];
+    for v in vars do [ write_line { message: v.value }; ];
 ];
 ";
 
@@ -497,6 +516,60 @@ fn coddl_run_cranelift_backend_prints_hello_world() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.stdout, b"Hello, world!\n");
+}
+
+#[test]
+fn coddl_run_llvm_reads_env_builtin_relvar() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("use-module"))
+        .env("CODDL_DEMO", "hello from the environment")
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=llvm failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"hello from the environment\n");
+}
+
+#[test]
+fn coddl_run_cranelift_reads_env_builtin_relvar() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("use-module"))
+        .env("CODDL_DEMO", "hello from the environment")
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"hello from the environment\n");
+}
+
+#[test]
+fn env_builtin_relvar_byte_identical_across_backends() {
+    ensure_runtime_built();
+    let run = |backend: &str| {
+        let out = coddl()
+            .args(["run", &format!("--backend={backend}")])
+            .arg(fixture_path("use-module"))
+            .env("CODDL_DEMO", "shared value")
+            .output()
+            .expect("spawn coddl");
+        assert!(
+            out.status.success(),
+            "{backend} failed: stderr=\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    };
+    assert_eq!(run("llvm"), run("cranelift"));
 }
 
 #[test]
