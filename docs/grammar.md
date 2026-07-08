@@ -398,9 +398,9 @@ function that implements it.
 <return-clause> ::= '->' <type-ref> ;                          -- parse_return_clause
 
 <type-decl>     ::= 'type' <identifier> '=' <type-ref> ';' ;   -- parse_type_decl
-                    -- A type alias — names a structural type (e.g. the
-                    -- prelude's `Request` / `Response`, docs/prelude.md).
-                    -- Dispatched on the leading contextual `type` keyword.
+                    -- A type alias — names a structural type (see
+                    -- docs/prelude.md). Dispatched on the leading contextual
+                    -- `type` keyword.
                     -- Missing name is P0080, missing `=` is P0081, missing
                     -- `;` is P0082. The checker rejects shadowing a built-in
                     -- type name (T0085) and a duplicate declaration (T0086).

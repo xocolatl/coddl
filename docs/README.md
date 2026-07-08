@@ -67,6 +67,7 @@ Every frontend pass also returns a `Vec<Diagnostic>` alongside its (possibly par
 |---|---|
 | [grammar.md](grammar.md) | Surface syntax — lexer, parser, every production, comments, identifiers, literals, methods, glyphs |
 | [typecheck.md](typecheck.md) | Type system — possreps, headings, generators, `reltrue` / `relfalse`, type / constraint inference |
+| [prelude.md](prelude.md) | The builtin surface in Coddl source — the `builtin` qualifier, signatures loaded from `prelude.cd` |
 | [relir.md](relir.md) | RelIR — Algebra A core, sugar layer, storage-origin flag, the SQL vs in-process cut |
 | [procir.md](procir.md) | ProcIR — procedural SSA, runtime call sites, no relational algebra |
 | [sqlemit.md](sqlemit.md) | `coddl-sqlemit` — RelIR → SQL, mandatory emission rules, dialect surface |
