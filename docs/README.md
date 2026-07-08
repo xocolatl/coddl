@@ -86,6 +86,7 @@ Every frontend pass also returns a `Vec<Diagnostic>` alongside its (possibly par
 | Doc | Subject |
 |---|---|
 | [milestone.md](milestone.md) | First end-to-end milestone — the work plan |
+| [webhost.md](webhost.md) | Web host — compiled Coddl behind an HTTP server; the `coddl::web` `Request`/`Response` vocabulary + `coddl-web` host plan |
 | [risks.md](risks.md) | Open design decisions worth tracking |
 | [validation.md](validation.md) | Cross-backend equivalence matrix |
 
