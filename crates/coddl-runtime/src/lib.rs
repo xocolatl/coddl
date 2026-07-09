@@ -115,7 +115,14 @@ pub unsafe extern "C" fn coddl_runtime_shutdown() -> CoddlStatus {
         if std::env::var_os("CODDL_LEAK_CHECK").is_some() {
             let live = live_allocations();
             if live != 0 {
+                // Flush stdout first (line-buffered, but be safe) so the
+                // program's real output isn't lost, then fail the process —
+                // `coddl run` forwards this code, so any e2e test asserting
+                // `status.success()` catches the leak. Env-gated + debug-only.
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
                 eprintln!("coddl: leaked {live} allocation(s)");
+                std::process::exit(101);
             }
         }
     }

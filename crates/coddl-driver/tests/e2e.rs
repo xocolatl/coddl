@@ -685,7 +685,15 @@ fn ensure_runtime_built() {
 }
 
 fn coddl() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_coddl"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_coddl"));
+    // Leak-check every program this suite runs: the debug runtime reports a
+    // non-zero refcount balance at shutdown and *exits non-zero* under this
+    // var, and `coddl run` forwards the code — so a leaking program trips the
+    // `status.success()` assert every `run` test already makes. `coddl run`
+    // inherits the env down to the compiled binary it spawns; harmless on
+    // non-running subcommands (lex/parse/check/…).
+    cmd.env("CODDL_LEAK_CHECK", "1");
+    cmd
 }
 
 #[test]
@@ -1361,7 +1369,7 @@ fn coddl_compile_llvm_produces_runnable_binary() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let run = Command::new(&bin).output().expect("run binary");
+    let run = Command::new(&bin).env("CODDL_LEAK_CHECK", "1").output().expect("run binary");
     assert!(run.status.success(), "binary exit {}", run.status);
     assert_eq!(run.stdout, b"Hello, world!\n");
 }
@@ -1384,7 +1392,7 @@ fn coddl_compile_cranelift_produces_runnable_binary() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let run = Command::new(&bin).output().expect("run binary");
+    let run = Command::new(&bin).env("CODDL_LEAK_CHECK", "1").output().expect("run binary");
     assert!(run.status.success(), "binary exit {}", run.status);
     assert_eq!(run.stdout, b"Hello, world!\n");
 }
@@ -1503,25 +1511,18 @@ fn assert_both_backends(fixture: &str, expected: &[u8]) {
     ensure_runtime_built();
     let mut outs = Vec::new();
     for backend in ["llvm", "cranelift"] {
-        // `CODDL_LEAK_CHECK=1` makes the runtime's `coddl_runtime_shutdown`
-        // report a non-zero refcount balance to stderr (debug builds). It
-        // propagates through `coddl run` to the compiled binary it spawns, so a
-        // leaking program prints `coddl: leaked N` — which we assert against.
+        // `coddl()` sets `CODDL_LEAK_CHECK=1`, so a leaking program exits
+        // non-zero and trips the `status.success()` assert below (its stderr
+        // carries the `coddl: leaked N` line for the failure message).
         let out = coddl()
             .args(["run", &format!("--backend={backend}")])
             .arg(fixture_path(fixture))
-            .env("CODDL_LEAK_CHECK", "1")
             .output()
             .unwrap_or_else(|e| panic!("spawn coddl run --backend={backend}: {e}"));
         assert!(
             out.status.success(),
             "{fixture} {backend} run failed: stderr=\n{}",
             String::from_utf8_lossy(&out.stderr)
-        );
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            !stderr.contains("coddl: leaked"),
-            "{fixture} {backend} leaked memory: {stderr}"
         );
         outs.push(out.stdout);
     }

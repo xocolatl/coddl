@@ -356,10 +356,16 @@ program end — every `coddl_rc_alloc` is matched by a release before
 epilogue). So, under `cfg(debug_assertions)` and gated by the
 `CODDL_LEAK_CHECK` env var, `coddl_runtime_shutdown` reads
 `live_allocations()` and, when non-zero, prints
-`coddl: leaked <N> allocation(s)` to stderr. The driver e2e tests
-compile the program against the **debug** runtime staticlib and run it
-via `coddl run` (which inherits the env down to the binary), so
-`assert_both_backends` sets `CODDL_LEAK_CHECK=1` and fails on any leak
-line — turning a refcount imbalance into a red test instead of silent
-memory growth. The gate is opt-in (env-gated) and compiles out of
+`coddl: leaked <N> allocation(s)` to stderr and **exits non-zero**.
+The driver e2e tests compile the program against the **debug** runtime
+staticlib; the `coddl()` test helper sets `CODDL_LEAK_CHECK=1` on every
+invocation (it inherits down to the binary `coddl run` spawns), so the
+gate is **default-on across the whole e2e suite** — a leaking program
+exits non-zero and trips the `status.success()` assert every run test
+already makes, turning a refcount imbalance into a red test instead of
+silent memory growth. Caveats worth remembering: it is dynamic (only
+paths a test runs), counts only `coddl_rc_alloc` blocks (not the
+runtime's Rust-side registries), fires only at `main` shutdown (mainless
+`coddl-web` handlers are uncovered), and a zero balance can still hide
+two compensating errors. The gate is env-gated and compiles out of
 release builds entirely.

@@ -4486,20 +4486,30 @@ impl Lowerer {
             // `union` / `minus` are set ops, not joins — dispatch before
             // `emit_join`. (The primary path above handles the common case; this
             // fallback fires for shapes the RelExpr consumer declines, e.g. a
-            // relation-literal operand.)
-            if matches!(bin.op_kind(), Some(BinaryOp::Union)) {
-                return self.emit_union(lhs, rhs);
-            }
-            if matches!(bin.op_kind(), Some(BinaryOp::Minus)) {
-                return self.emit_minus(lhs, rhs);
-            }
-            let joined = self.emit_join(lhs, rhs);
-            // `compose` removes the shared attributes after the join.
-            if matches!(bin.op_kind(), Some(BinaryOp::Compose)) {
-                let keep = self.compose_keep(lhs, rhs);
-                return self.emit_project(joined, &keep);
-            }
-            return joined;
+            // relation-literal or wrap-result operand.)
+            let result = if matches!(bin.op_kind(), Some(BinaryOp::Union)) {
+                self.emit_union(lhs, rhs)
+            } else if matches!(bin.op_kind(), Some(BinaryOp::Minus)) {
+                self.emit_minus(lhs, rhs)
+            } else {
+                let joined = self.emit_join(lhs, rhs);
+                // `compose` removes the shared attributes after the join.
+                if matches!(bin.op_kind(), Some(BinaryOp::Compose)) {
+                    let keep = self.compose_keep(lhs, rhs);
+                    let projected = self.emit_project(joined, &keep);
+                    self.release_call_arg_temp(joined); // the intermediate join
+                    projected
+                } else {
+                    joined
+                }
+            };
+            // The op read its operands and produced a fresh result; release each
+            // operand temp (a bound local / parameter is skipped by
+            // `release_call_arg_temp`), else a fresh operand — a relation literal
+            // or a `wrap` result — leaks.
+            self.release_call_arg_temp(lhs);
+            self.release_call_arg_temp(rhs);
+            return result;
         }
         let v = self.fresh_value();
         self.record_type(v, ProcType::Unit);
@@ -4543,36 +4553,58 @@ impl Lowerer {
                 });
                 Some(dst)
             }
+            // Each binary/unary op reads its operand relation(s) and produces a
+            // fresh rc=1 result (copying cells with retain-on-copy). The operands
+            // are always fresh temps from the recursion (a `RelvarRead` or a
+            // nested op result), never bound locals, so release them once the op
+            // has consumed them — otherwise every in-process relop leaks its
+            // inputs. `release_call_arg_temp` no-ops on the (impossible here)
+            // bound-local / parameter case.
             RelExpr::And { lhs, rhs } => {
                 let l = self.lower_relexpr_inprocess(lhs)?;
                 let r = self.lower_relexpr_inprocess(rhs)?;
-                Some(self.emit_join(l, r))
+                let dst = self.emit_join(l, r);
+                self.release_call_arg_temp(l);
+                self.release_call_arg_temp(r);
+                Some(dst)
             }
             RelExpr::Or { lhs, rhs } => {
                 let l = self.lower_relexpr_inprocess(lhs)?;
                 let r = self.lower_relexpr_inprocess(rhs)?;
-                Some(self.emit_union(l, r))
+                let dst = self.emit_union(l, r);
+                self.release_call_arg_temp(l);
+                self.release_call_arg_temp(r);
+                Some(dst)
             }
             RelExpr::Minus { lhs, rhs } => {
                 let l = self.lower_relexpr_inprocess(lhs)?;
                 let r = self.lower_relexpr_inprocess(rhs)?;
-                Some(self.emit_minus(l, r))
+                let dst = self.emit_minus(l, r);
+                self.release_call_arg_temp(l);
+                self.release_call_arg_temp(r);
+                Some(dst)
             }
             // `compose` lowers to `Project{And}`: lower the join, then narrow to
             // the kept attributes via `Inst::Project`.
             RelExpr::Project { input, keep } => {
                 let src = self.lower_relexpr_inprocess(input)?;
-                Some(self.emit_project(src, keep))
+                let dst = self.emit_project(src, keep);
+                self.release_call_arg_temp(src);
+                Some(dst)
             }
             RelExpr::TClose { input } => {
                 let src = self.lower_relexpr_inprocess(input)?;
-                Some(self.emit_tclose(src))
+                let dst = self.emit_tclose(src);
+                self.release_call_arg_temp(src);
+                Some(dst)
             }
             // wrap/unwrap restructure into the node's (already-computed) heading.
             RelExpr::Wrap { input, .. } | RelExpr::Unwrap { input, .. } => {
                 let src = self.lower_relexpr_inprocess(input)?;
                 let dst_heading = rel.heading();
-                Some(self.emit_restructure(src, dst_heading))
+                let dst = self.emit_restructure(src, dst_heading);
+                self.release_call_arg_temp(src);
+                Some(dst)
             }
             _ => None,
         }
