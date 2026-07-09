@@ -55,6 +55,16 @@ fn fixtures_dir() -> &'static Path {
             ("union-intersect-minus", UNION_INTERSECT_MINUS_SRC),
             ("transitive-closure", TCLOSE_SRC),
             ("handle-mainless", HANDLE_MAINLESS_SRC),
+            ("tuple-relation-params", TUPLE_RELATION_PARAMS_SRC),
+            ("tuple-through-if", TUPLE_THROUGH_IF_SRC),
+            ("handler-shape", HANDLER_SHAPE_SRC),
+            ("wide-tuple-param", WIDE_TUPLE_PARAM_SRC),
+            ("small-tuple-return", SMALL_TUPLE_RETURN_SRC),
+            ("large-tuple-return", LARGE_TUPLE_RETURN_SRC),
+            ("relation-in-tuple-return", RELATION_IN_TUPLE_RETURN_SRC),
+            ("boxed-tuple-through-if", BOXED_TUPLE_THROUGH_IF_SRC),
+            ("boxed-tuple-transient-fields", BOXED_TUPLE_TRANSIENT_FIELDS_SRC),
+            ("fresh-relation-write", FRESH_RELATION_WRITE_SRC),
         ] {
             std::fs::write(tmp.path().join(format!("{name}.cd")), src)
                 .unwrap_or_else(|e| panic!("write {name}.cd fixture: {e}"));
@@ -96,6 +106,142 @@ oper handle {} -> Text [ \"hello\\n\" ];
 // returns the payload pointer (`define ptr @handle(ptr %.ret_len_out)`), and the
 // surface name is the linkage name (no mangling). `coddl_rc_release` no-ops on
 // the immortal string literal, so the uniform release is always safe.
+// Tuple- and relation-valued operator parameters and a relation result. `t`
+// is a `Tuple` parameter (flattened per-attribute across the ABI); `t.b` reads
+// the `Text` field back out. `echo_rel` takes a `Relation` parameter (one
+// pointer) and returns it (escape-retained). Both callees receive an *owned
+// temporary* argument — the tuple/relation literal — exercising the borrow-and-
+// release-owned-temp ownership discipline.
+const TUPLE_RELATION_PARAMS_SRC: &str = "\
+program tuprel;
+oper describe { t: Tuple { a: Integer, b: Text } } -> Text [ t.b ];
+oper echo_rel { r: Relation { a: Integer } } -> Relation { a: Integer } [ r ];
+oper main {} [
+    write_line { message: describe { t: { a: 1, b: \"hello tuple\" } } };
+    write_relation { rel: echo_rel { r: Relation { { a: 1 }, { a: 2 } } } };
+];
+";
+
+// A `Tuple` value flowing through an `if`-merge: `t` is the join value of the
+// two arms, then `t.x` reads a field of the merged tuple. Exercises the tuple
+// block-parameter (phi) path in both backends.
+const TUPLE_THROUGH_IF_SRC: &str = "\
+program tup_if;
+oper choose { flag: Boolean, a: Tuple { x: Text }, b: Tuple { x: Text } } -> Text [
+    let t = if flag then [ a ] else [ b ];
+    t.x
+];
+oper main {} [
+    write_line { message: choose { flag: true, a: { x: \"yes\" }, b: { x: \"no\" } } };
+    write_line { message: choose { flag: false, a: { x: \"yes\" }, b: { x: \"no\" } } };
+];
+";
+
+// The web-host P2 handler shape without the host: a `Tuple` parameter in, a
+// single-tuple `Relation` result out, built from a field of the request tuple.
+const HANDLER_SHAPE_SRC: &str = "\
+program handler_shape;
+oper handle { req: Tuple { path: Text, n: Integer } } -> Relation { line: Text } [
+    Relation { { line: req.path } }
+];
+oper main {} [
+    write_relation { rel: handle { req: { path: \"/users\", n: 3 } } };
+];
+";
+
+// A *wide* tuple (4 `Text` = 64 bytes ≥ the boxing threshold) as a parameter:
+// it crosses the ABI as one boxed pointer, and `t.c` reads a field back with an
+// `AttrLoad` from the heap record — not the flattened per-attribute passing a
+// small tuple gets.
+const WIDE_TUPLE_PARAM_SRC: &str = "\
+program wide_tuple_param;
+oper describe { t: Tuple { a: Text, b: Text, c: Text, d: Text } } -> Text [ t.c ];
+oper main {} [
+    write_line { message: describe { t: { a: \"one\", b: \"two\", c: \"three\", d: \"four\" } } };
+];
+";
+
+// Returning a *small* tuple: below the threshold it's flattened, so the return
+// ABI boxes it and the caller unboxes the result. The `Text` field is a
+// non-immortal (`||`) cell to exercise the retain/drop balance across the box.
+const SMALL_TUPLE_RETURN_SRC: &str = "\
+program small_tuple_return;
+oper mk {} -> Tuple { x: Text, y: Integer } [ { x: \"h\" || \"i\", y: 7 } ];
+oper main {} [
+    let t = mk {};
+    write_line { message: t.x };
+];
+";
+
+// Returning a *large* (boxed) tuple: it stays a boxed pointer end-to-end (no
+// box/unbox round-trip); the caller reads a field with `AttrLoad`.
+const LARGE_TUPLE_RETURN_SRC: &str = "\
+program large_tuple_return;
+oper mk {} -> Tuple { a: Text, b: Text, c: Text, d: Text } [
+    { a: \"1\", b: \"2\", c: \"3\", d: \"4\" }
+];
+oper main {} [
+    let t = mk {};
+    write_line { message: t.c };
+];
+";
+
+// The web `Response` shape: a tuple **containing a relation** returned, then
+// both its `Text` and its `Relation` field used. Exercises relation-valued
+// attributes in the record (store + retain, read, drop) through box-on-return.
+const RELATION_IN_TUPLE_RETURN_SRC: &str = "\
+program relation_in_tuple_return;
+oper mk {} -> Tuple { r: Relation { a: Integer }, tag: Text } [
+    { r: Relation { { a: 1 }, { a: 2 } }, tag: \"response\" }
+];
+oper main {} [
+    let t = mk {};
+    write_line { message: t.tag };
+    write_relation { rel: t.r };
+];
+";
+
+// A *boxed* tuple value flowing through an `if`-merge: the join value `t` is a
+// wide (boxed) tuple, phi'd as one pointer, then a field read.
+const BOXED_TUPLE_THROUGH_IF_SRC: &str = "\
+program boxed_tuple_through_if;
+oper choose { flag: Boolean, a: Tuple { p: Text, q: Text, r: Text, s: Text }, b: Tuple { p: Text, q: Text, r: Text, s: Text } } -> Text [
+    let t = if flag then [ a ] else [ b ];
+    t.q
+];
+oper main {} [
+    let hi = { p: \"p1\", q: \"yes\", r: \"r1\", s: \"s1\" };
+    let lo = { p: \"p2\", q: \"no\", r: \"r2\", s: \"s2\" };
+    write_line { message: choose { flag: true, a: hi, b: lo } };
+    write_line { message: choose { flag: false, a: hi, b: lo } };
+];
+";
+
+// Transient use of heap fields read out of a *boxed* tuple: a large tuple with
+// a relation cell and Text cells, whose `Text` and `Relation` fields are read
+// and handed to a builtin (`write_line` / `write_relation`) without being bound
+// or returned. The retain-on-read copy must be released by the consumer — this
+// is the refcount-balance case the leak check guards (see `assert_both_backends`
+// setting `CODDL_LEAK_CHECK`). Exercises relation-valued attributes in the box.
+const BOXED_TUPLE_TRANSIENT_FIELDS_SRC: &str = "\
+program boxed_tuple_transient_fields;
+oper main {} [
+    let bt = { rel: Relation { { a: 1 } }, a: \"aa\", b: \"bb\", c: \"cc\", d: \"dd\" };
+    write_line { message: bt.a };
+    write_relation { rel: bt.rel };
+];
+";
+
+// A fresh relation temporary handed straight to `write_relation` (no binding):
+// the builtin borrows it, so the lowerer must release it after. Isolates the
+// relation-temp release path independent of boxing.
+const FRESH_RELATION_WRITE_SRC: &str = "\
+program fresh_relation_write;
+oper main {} [
+    write_relation { rel: Relation { { a: 1 }, { a: 2 } } };
+];
+";
+
 const SMALL_HOST_C: &str = "\
 #include <stddef.h>
 #include <unistd.h>
@@ -1346,6 +1492,107 @@ fn hello_world_byte_identical_across_backends() {
         "both backends produced unexpected stdout: {:?}",
         String::from_utf8_lossy(&llvm.stdout)
     );
+}
+
+// ── Tuple/relation operator parameters and results ────────────────────
+
+/// Run a fixture on both backends, assert each succeeds, that their stdout
+/// agrees (the cross-backend invariant of `docs/validation.md`), and that it
+/// equals `expected`.
+fn assert_both_backends(fixture: &str, expected: &[u8]) {
+    ensure_runtime_built();
+    let mut outs = Vec::new();
+    for backend in ["llvm", "cranelift"] {
+        // `CODDL_LEAK_CHECK=1` makes the runtime's `coddl_runtime_shutdown`
+        // report a non-zero refcount balance to stderr (debug builds). It
+        // propagates through `coddl run` to the compiled binary it spawns, so a
+        // leaking program prints `coddl: leaked N` — which we assert against.
+        let out = coddl()
+            .args(["run", &format!("--backend={backend}")])
+            .arg(fixture_path(fixture))
+            .env("CODDL_LEAK_CHECK", "1")
+            .output()
+            .unwrap_or_else(|e| panic!("spawn coddl run --backend={backend}: {e}"));
+        assert!(
+            out.status.success(),
+            "{fixture} {backend} run failed: stderr=\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("coddl: leaked"),
+            "{fixture} {backend} leaked memory: {stderr}"
+        );
+        outs.push(out.stdout);
+    }
+    assert_eq!(
+        outs[0],
+        outs[1],
+        "backends disagree on {fixture}:\n  LLVM:      {:?}\n  Cranelift: {:?}",
+        String::from_utf8_lossy(&outs[0]),
+        String::from_utf8_lossy(&outs[1]),
+    );
+    assert_eq!(
+        outs[0],
+        expected,
+        "{fixture} produced unexpected stdout: {:?}",
+        String::from_utf8_lossy(&outs[0]),
+    );
+}
+
+#[test]
+fn tuple_and_relation_params_and_relation_result() {
+    assert_both_backends("tuple-relation-params", b"hello tuple\n{a: 1}\n{a: 2}\n");
+}
+
+#[test]
+fn tuple_value_merges_through_if() {
+    assert_both_backends("tuple-through-if", b"yes\nno\n");
+}
+
+#[test]
+fn handler_shape_tuple_param_relation_result() {
+    assert_both_backends("handler-shape", b"{line: \"/users\"}\n");
+}
+
+// ── Size-threshold boxing for large tuples + returning a tuple ─────────
+
+#[test]
+fn wide_tuple_is_boxed_as_a_parameter() {
+    assert_both_backends("wide-tuple-param", b"three\n");
+}
+
+#[test]
+fn small_tuple_return_boxes_and_unboxes() {
+    assert_both_backends("small-tuple-return", b"hi\n");
+}
+
+#[test]
+fn large_tuple_return_stays_boxed() {
+    assert_both_backends("large-tuple-return", b"3\n");
+}
+
+#[test]
+fn relation_bearing_tuple_returns_and_both_fields_used() {
+    assert_both_backends("relation-in-tuple-return", b"response\n{a: 1}\n{a: 2}\n");
+}
+
+#[test]
+fn boxed_tuple_merges_through_if() {
+    assert_both_backends("boxed-tuple-through-if", b"yes\nno\n");
+}
+
+#[test]
+fn boxed_tuple_transient_heap_fields_are_leak_free() {
+    // `assert_both_backends` runs with `CODDL_LEAK_CHECK=1` and fails on any
+    // leaked allocation — this fixture's transient relation/Text field reads
+    // must balance.
+    assert_both_backends("boxed-tuple-transient-fields", b"aa\n{a: 1}\n");
+}
+
+#[test]
+fn fresh_relation_temp_to_write_relation_is_leak_free() {
+    assert_both_backends("fresh-relation-write", b"{a: 1}\n{a: 2}\n");
 }
 
 // ── Transaction example ───────────────────────────────────────────────

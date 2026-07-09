@@ -73,7 +73,11 @@ pub enum CoddlAttrKind {
     /// `sub` descriptor describes the tuple's components (0-based offsets);
     /// the printer / comparator recurse through it.
     Tuple = 10,
-    // Reserved: Relation = 11. Not yet emitted.
+    /// Relation-valued attribute cell: a single RC payload pointer stored
+    /// inline (8 bytes). The record co-owns it (retain-on-store); the drop
+    /// walker releases it. Not a sub-region — the relation's own header drives
+    /// its own drop, so `sub` is null.
+    Relation = 11,
 }
 
 /// One attribute in a heading descriptor.
@@ -1075,12 +1079,29 @@ unsafe fn walk_text_cells(
         if attr.kind == CoddlAttrKind::Text as u32 {
             let (ptr, _len) = read_text_cell(rec, off);
             f(ptr as *mut u8);
+        } else if attr.kind == CoddlAttrKind::Relation as u32 {
+            // A relation-valued cell is a single RC payload pointer; hand it to
+            // `f` (retain-on-copy or release-on-drop) exactly like a `Text`
+            // pointer. No sub-region to recurse — the relation drops itself.
+            let ptr = read_ptr_cell(rec, off);
+            f(ptr);
         } else if attr.kind == CoddlAttrKind::Tuple as u32 && !attr.sub.is_null() {
             let sub = &*attr.sub;
             let sub_attrs = std::slice::from_raw_parts(sub.attrs, sub.attr_count as usize);
             walk_text_cells(rec, sub_attrs, off, f);
         }
     }
+}
+
+/// Read a single pointer-sized cell (a relation-valued attribute) at `off`.
+///
+/// # Safety
+/// `rec + off` must hold 8 bytes of a valid RC payload pointer (or null).
+unsafe fn read_ptr_cell(rec: *const u8, off: usize) -> *mut u8 {
+    let bytes: [u8; 8] = std::slice::from_raw_parts(rec.add(off), 8)
+        .try_into()
+        .unwrap();
+    usize::from_ne_bytes(bytes) as *mut u8
 }
 
 /// Retain every `Text` cell across `count` records of `payload` (heading

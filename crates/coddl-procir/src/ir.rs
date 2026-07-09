@@ -207,6 +207,28 @@ pub enum Inst {
         field_name: String,
         field_type: ProcType,
     },
+    /// Materialize a flattened tuple `src` into a heap record — the boxed
+    /// representation of a large tuple (`layout::tuple_is_boxed`). Lowering
+    /// allocates a `length = 1` RC payload (`CoddlKind::Relation`), stores each
+    /// attribute's flattened cells (retain-on-store for Text/relation cells),
+    /// and does **not** seal (a tuple is one record, not a set). `dst` carries
+    /// `ProcType::Tuple(heading)` but its ABI value is a single pointer. Emitted
+    /// for a large-tuple literal and to box a small tuple at a return site.
+    TupleBox {
+        dst: ValueId,
+        src: ValueId,
+        heading_id: HeadingId,
+    },
+    /// Read a boxed tuple `src` (one RC record) back into a flattened tuple
+    /// value — the inverse of [`Inst::TupleBox`]. Reuses the per-attribute
+    /// record read (no cardinality check; a box is always one record). `dst`
+    /// carries `ProcType::Tuple(heading)`, flattened. Emitted at a call whose
+    /// result is a *small* tuple (the return ABI hands back a boxed pointer).
+    TupleUnbox {
+        dst: ValueId,
+        src: ValueId,
+        heading_id: HeadingId,
+    },
     /// Build a relation value from its tuple operands. Each `tuples[i]`
     /// is a `ValueId` typed `ProcType::Tuple(h)` where `h` matches the
     /// heading at `heading_id`. Lowering allocates an RC payload,
@@ -770,6 +792,16 @@ impl fmt::Display for Inst {
                 field_name,
                 ..
             } => write!(f, "{dst} = field {src}.{field_name}"),
+            Inst::TupleBox {
+                dst,
+                src,
+                heading_id,
+            } => write!(f, "{dst} = tuple_box heading_{} {src}", heading_id.0),
+            Inst::TupleUnbox {
+                dst,
+                src,
+                heading_id,
+            } => write!(f, "{dst} = tuple_unbox heading_{} {src}", heading_id.0),
             Inst::RelationLit {
                 dst,
                 tuples,

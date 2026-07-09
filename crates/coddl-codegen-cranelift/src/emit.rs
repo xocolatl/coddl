@@ -1021,6 +1021,11 @@ fn push_param_types(
             out.push(AbiParam::new(types::I64));
         }
         ProcType::Unit => {} // no value at the ABI level
+        // A boxed (large) tuple crosses the ABI as one pointer; a flattened
+        // (small) tuple expands per attribute.
+        ProcType::Tuple(heading) if coddl_procir::tuple_is_boxed(heading) => {
+            out.push(AbiParam::new(ptr_ty));
+        }
         ProcType::Tuple(heading) => {
             for (_, attr_ty) in heading.attrs() {
                 push_param_types(out, &proc_type_from_attr(attr_ty), ptr_ty);
@@ -1038,6 +1043,91 @@ fn returns_fat_pointer(ty: &ProcType) -> bool {
     matches!(ty, ProcType::Text | ProcType::Binary)
 }
 
+/// Consume the flattened entry-block ABI slots for one parameter — mirroring
+/// [`push_param_types`] — and build its `ValueRepr`, advancing `idx` past the
+/// slots used. A `Text`/`Binary`/`Rational` param takes two slots; a `Tuple`
+/// recurses per attribute in canonical heading order (an empty `Tuple`/`Unit`
+/// takes none); every other leaf takes one.
+fn bind_param_repr(bps: &[CrValue], idx: &mut usize, ty: &ProcType) -> ValueRepr {
+    match ty {
+        ProcType::Text | ProcType::Binary => {
+            let ptr = bps[*idx];
+            let len = bps[*idx + 1];
+            *idx += 2;
+            ValueRepr::Text { ptr, len }
+        }
+        ProcType::Rational => {
+            let num = bps[*idx];
+            let den = bps[*idx + 1];
+            *idx += 2;
+            ValueRepr::Rational { num, den }
+        }
+        ProcType::Unit => ValueRepr::Tuple { fields: Vec::new() },
+        // A boxed tuple is one pointer slot.
+        ProcType::Tuple(heading) if coddl_procir::tuple_is_boxed(heading) => {
+            let v = bps[*idx];
+            *idx += 1;
+            ValueRepr::Scalar(v)
+        }
+        ProcType::Tuple(heading) => {
+            let mut fields = Vec::new();
+            for (attr_name, attr_ty) in heading.attrs() {
+                let sub = bind_param_repr(bps, idx, &proc_type_from_attr(attr_ty));
+                fields.push((attr_name.clone(), sub));
+            }
+            ValueRepr::Tuple { fields }
+        }
+        _ => {
+            let v = bps[*idx];
+            *idx += 1;
+            ValueRepr::Scalar(v)
+        }
+    }
+}
+
+/// Append the merge-block parameters for one join value (the `if`/loop phi
+/// equivalent) and build its `ValueRepr`. Same recursion as [`bind_param_repr`],
+/// but each leaf is a fresh `append_block_param` rather than a consumed entry
+/// slot; the predecessor `Br`s supply matching flattened args via
+/// `push_call_operands`, so append order must match that flatten order.
+fn append_block_param_repr(
+    builder: &mut FunctionBuilder<'_>,
+    cl_block: cranelift_codegen::ir::Block,
+    ty: &ProcType,
+    ptr_ty: cranelift_codegen::ir::Type,
+) -> ValueRepr {
+    match ty {
+        ProcType::Text | ProcType::Binary => {
+            let ptr = builder.append_block_param(cl_block, ptr_ty);
+            let len = builder.append_block_param(cl_block, types::I64);
+            ValueRepr::Text { ptr, len }
+        }
+        ProcType::Rational => {
+            let num = builder.append_block_param(cl_block, types::I64);
+            let den = builder.append_block_param(cl_block, types::I64);
+            ValueRepr::Rational { num, den }
+        }
+        ProcType::Unit => ValueRepr::Tuple { fields: Vec::new() },
+        // A boxed tuple is one pointer block-param.
+        ProcType::Tuple(heading) if coddl_procir::tuple_is_boxed(heading) => {
+            ValueRepr::Scalar(builder.append_block_param(cl_block, ptr_ty))
+        }
+        ProcType::Tuple(heading) => {
+            let mut fields = Vec::new();
+            for (attr_name, attr_ty) in heading.attrs() {
+                let sub =
+                    append_block_param_repr(builder, cl_block, &proc_type_from_attr(attr_ty), ptr_ty);
+                fields.push((attr_name.clone(), sub));
+            }
+            ValueRepr::Tuple { fields }
+        }
+        other => {
+            let v = builder.append_block_param(cl_block, cranelift_value_type(other, ptr_ty));
+            ValueRepr::Scalar(v)
+        }
+    }
+}
+
 fn push_return_types(
     out: &mut Vec<AbiParam>,
     ty: &ProcType,
@@ -1046,6 +1136,9 @@ fn push_return_types(
     match ty {
         ProcType::Unit => {}
         ProcType::Tuple(heading) if heading.is_empty() => {}
+        // Any non-empty tuple return crosses the ABI as one pointer (a boxed
+        // record; the lowerer boxes a small tuple at the return site).
+        ProcType::Tuple(_) => out.push(AbiParam::new(ptr_ty)),
         other => out.push(AbiParam::new(cranelift_value_type(other, ptr_ty))),
     }
 }
@@ -1193,23 +1286,8 @@ fn emit_function(
         let mut idx = 0usize;
         for (i, (_pname, pty)) in func.params.iter().enumerate() {
             let vid = ValueId(i as u32);
-            match pty {
-                ProcType::Text | ProcType::Binary => {
-                    let ptr = bps[idx];
-                    let len = bps[idx + 1];
-                    values.insert(vid, ValueRepr::Text { ptr, len });
-                    idx += 2;
-                }
-                ProcType::Tuple(_) => {
-                    return Err(CraneliftEmitError::UnsupportedInst(
-                        "Tuple-typed parameters not yet supported in defined functions".into(),
-                    ));
-                }
-                _ => {
-                    values.insert(vid, ValueRepr::Scalar(bps[idx]));
-                    idx += 1;
-                }
-            }
+            let repr = bind_param_repr(&bps, &mut idx, pty);
+            values.insert(vid, repr);
         }
         if returns_fat_pointer(&func.return_type) {
             ret_len_out = Some(bps[idx]);
@@ -1225,22 +1303,8 @@ fn emit_function(
     for procir_block in &func.blocks {
         let cl_block = block_map[&procir_block.id];
         for (pvid, pty) in &procir_block.params {
-            match pty {
-                ProcType::Text | ProcType::Binary => {
-                    let ptr = builder.append_block_param(cl_block, ptr_ty);
-                    let len = builder.append_block_param(cl_block, types::I64);
-                    values.insert(*pvid, ValueRepr::Text { ptr, len });
-                }
-                ProcType::Tuple(_) => {
-                    return Err(CraneliftEmitError::UnsupportedInst(
-                        "merging a Tuple value through `if` not yet supported".into(),
-                    ));
-                }
-                other => {
-                    let v = builder.append_block_param(cl_block, cranelift_value_type(other, ptr_ty));
-                    values.insert(*pvid, ValueRepr::Scalar(v));
-                }
-            }
+            let repr = append_block_param_repr(&mut builder, cl_block, pty, ptr_ty);
+            values.insert(*pvid, repr);
         }
     }
 
@@ -1527,6 +1591,67 @@ fn emit_inst(
             values.insert(*dst, field_repr);
             Ok(())
         }
+        Inst::TupleBox {
+            dst,
+            src,
+            heading_id,
+        } => {
+            // Box a flattened tuple into a `length = 1` heap record — like a
+            // one-tuple `RelationLit`, minus the seal.
+            let layout = heading_layouts.get(heading_id.0 as usize).ok_or_else(|| {
+                CraneliftEmitError::UnsupportedInst(format!("unknown heading_id {} in TupleBox", heading_id.0))
+            })?;
+            let desc_id = heading_desc_ids[heading_id.0 as usize];
+            let desc_gv = obj.declare_data_in_func(desc_id, builder.func);
+            let ptr_ty = obj.target_config().pointer_type();
+            let desc_val = builder.ins().symbol_value(ptr_ty, desc_gv);
+            let alloc_local = obj.declare_func_in_func(funcs["coddl_rc_alloc"], builder.func);
+            let size_val = builder.ins().iconst(types::I64, layout.record_size as i64);
+            let count_val = builder.ins().iconst(types::I32, 1);
+            let kind_val = builder.ins().iconst(types::I32, 0); // CoddlKind::Relation
+            let call = builder
+                .ins()
+                .call(alloc_local, &[size_val, count_val, kind_val, desc_val]);
+            let payload = builder.inst_results(call)[0];
+            let tuple_repr = values.get(src).cloned().ok_or_else(|| {
+                CraneliftEmitError::UnsupportedInst(format!("undefined tuple value {src:?} in TupleBox"))
+            })?;
+            let ValueRepr::Tuple { fields } = &tuple_repr else {
+                return Err(CraneliftEmitError::UnsupportedInst(format!(
+                    "TupleBox operand is not a flattened Tuple: {tuple_repr:?}"
+                )));
+            };
+            for attr in &layout.attrs {
+                let field_repr = fields
+                    .iter()
+                    .find(|(n, _)| n == &attr.name)
+                    .map(|(_, r)| r.clone())
+                    .ok_or_else(|| {
+                        CraneliftEmitError::UnsupportedInst(format!(
+                            "tuple missing attribute `{}` for box layout",
+                            attr.name
+                        ))
+                    })?;
+                let retain_ref = obj.declare_func_in_func(funcs["coddl_rc_retain"], builder.func);
+                store_attr(builder, payload, attr.offset as i32, &field_repr, attr.sub.as_ref(), attr.kind, retain_ref)?;
+            }
+            values.insert(*dst, ValueRepr::Scalar(payload));
+            Ok(())
+        }
+        Inst::TupleUnbox {
+            dst,
+            src,
+            heading_id,
+        } => {
+            let record_ptr = scalar_value(values, src)?;
+            let layout = heading_layouts.get(heading_id.0 as usize).ok_or_else(|| {
+                CraneliftEmitError::UnsupportedInst(format!("unknown heading_id {} in TupleUnbox", heading_id.0))
+            })?;
+            let ptr_ty = obj.target_config().pointer_type();
+            let repr = read_boxed_tuple(builder, record_ptr, layout, 0, ptr_ty)?;
+            values.insert(*dst, repr);
+            Ok(())
+        }
         Inst::RelationLit {
             dst,
             tuples,
@@ -1588,7 +1713,7 @@ fn emit_inst(
                         record_idx as i32 * layout.record_size as i32 + attr.offset as i32;
                     let retain_ref =
                         obj.declare_func_in_func(funcs["coddl_rc_retain"], builder.func);
-                    store_attr(builder, payload, byte_offset, &field_repr, attr.sub.as_ref(), retain_ref)?;
+                    store_attr(builder, payload, byte_offset, &field_repr, attr.sub.as_ref(), attr.kind, retain_ref)?;
                 }
             }
 
@@ -1654,6 +1779,7 @@ fn emit_inst(
                     byte_offset,
                     &field_repr,
                     attr.sub.as_ref(),
+                    attr.kind,
                     retain_ref,
                 )?;
             }
@@ -1973,9 +2099,14 @@ fn emit_inst(
                     values.insert(*dst, ValueRepr::Text { ptr, len });
                     Ok(())
                 }
-                other => Err(CraneliftEmitError::UnsupportedInst(format!(
-                    "AttrLoad of type {other:?} not yet supported"
-                ))),
+                // Relation cell (boxed-tuple field) and nested-tuple cell: reuse
+                // the shared recursive reader.
+                other => {
+                    let ptr_ty = obj.target_config().pointer_type();
+                    let repr = read_cell(builder, src_v, *offset as i32, other, ptr_ty)?;
+                    values.insert(*dst, repr);
+                    Ok(())
+                }
             }
         }
         Inst::Where {
@@ -2010,15 +2141,20 @@ fn emit_inst(
             record,
             offset,
             value,
-            attr_type: _,
+            attr_type,
         } => {
             let payload = scalar_value(values, record)?;
             let repr = values.get(value).cloned().ok_or_else(|| {
                 CraneliftEmitError::UnsupportedInst(format!("undefined value {value:?} in AttrStore"))
             })?;
-            // The extend/where store path is scalar/Text only (no sub-layout).
+            // The extend/where store path is scalar/Text only (no sub-layout);
+            // a relation-valued store retains via the `RELATION` kind.
+            let kind = match attr_type {
+                ProcType::Relation(_) | ProcType::Pointer => coddl_procir::kind_tag::RELATION,
+                _ => coddl_procir::kind_tag::INTEGER,
+            };
             let retain_ref = obj.declare_func_in_func(funcs["coddl_rc_retain"], builder.func);
-            store_attr(builder, payload, *offset as i32, &repr, None, retain_ref)
+            store_attr(builder, payload, *offset as i32, &repr, None, kind, retain_ref)
         }
         Inst::Extend {
             dst,
@@ -2276,52 +2412,10 @@ fn emit_inst(
             let record_ptr = builder.inst_results(call)[0];
             // Read each attribute from the record pointer; bundle
             // into a ValueRepr::Tuple.
-            let flags = MemFlags::trusted();
             let mut fields: Vec<(String, ValueRepr)> = Vec::with_capacity(layout.attrs.len());
             for attr in &layout.attrs {
                 let attr_type = proc_type_from_kind_cl(attr.kind);
-                let offset = attr.offset as i32;
-                let repr = match attr_type {
-                    ProcType::Integer => {
-                        let v = builder.ins().load(types::I64, flags, record_ptr, offset);
-                        ValueRepr::Scalar(v)
-                    }
-                    ProcType::Boolean => {
-                        let raw =
-                            builder.ins().load(types::I64, flags, record_ptr, offset);
-                        let v = builder.ins().ireduce(types::I8, raw);
-                        ValueRepr::Scalar(v)
-                    }
-                    ProcType::Character => {
-                        let raw =
-                            builder.ins().load(types::I64, flags, record_ptr, offset);
-                        let v = builder.ins().ireduce(types::I32, raw);
-                        ValueRepr::Scalar(v)
-                    }
-                    ProcType::Approximate => {
-                        let v = builder.ins().load(types::F64, flags, record_ptr, offset);
-                        ValueRepr::Scalar(v)
-                    }
-                    ProcType::Rational => {
-                        let num = builder.ins().load(types::I64, flags, record_ptr, offset);
-                        let den = builder
-                            .ins()
-                            .load(types::I64, flags, record_ptr, offset + 8);
-                        ValueRepr::Rational { num, den }
-                    }
-                    ProcType::Text => {
-                        let ptr = builder.ins().load(ptr_ty, flags, record_ptr, offset);
-                        let len = builder
-                            .ins()
-                            .load(types::I64, flags, record_ptr, offset + 8);
-                        ValueRepr::Text { ptr, len }
-                    }
-                    other => {
-                        return Err(CraneliftEmitError::UnsupportedInst(format!(
-                            "Extract attribute of type {other:?} not yet supported"
-                        )));
-                    }
-                };
+                let repr = read_cell(builder, record_ptr, attr.offset as i32, &attr_type, ptr_ty)?;
                 fields.push((attr.name.clone(), repr));
             }
             values.insert(*dst, ValueRepr::Tuple { fields });
@@ -2680,8 +2774,90 @@ fn proc_type_from_kind_cl(kind: u32) -> ProcType {
         k if k == kind_tag::APPROXIMATE => ProcType::Approximate,
         k if k == kind_tag::RATIONAL => ProcType::Rational,
         k if k == kind_tag::TEXT => ProcType::Text,
+        k if k == kind_tag::RELATION => ProcType::Pointer,
         other => unreachable!("unsupported attr kind {other} in Extract"),
     }
+}
+
+/// Read one attribute cell at `record_ptr + byte_offset` into a `ValueRepr`,
+/// mirroring LLVM's `read_attr_repr`. Leaf scalars/Text/Rational load directly;
+/// a relation-valued cell loads its RC pointer as a `ptr` scalar (borrowed —
+/// the record still owns it); an inline nested-tuple cell recurses over its
+/// sub-region (offsets 0-based, so add this cell's `byte_offset`; sub-attr types
+/// come from the heading's surface `Type`s). Shared by `Extract`, `TupleUnbox`,
+/// and boxed-tuple `AttrLoad`.
+fn read_cell(
+    builder: &mut FunctionBuilder<'_>,
+    record_ptr: CrValue,
+    byte_offset: i32,
+    attr_type: &ProcType,
+    ptr_ty: cranelift_codegen::ir::Type,
+) -> Result<ValueRepr, CraneliftEmitError> {
+    let flags = MemFlags::trusted();
+    let repr = match attr_type {
+        ProcType::Integer => ValueRepr::Scalar(builder.ins().load(types::I64, flags, record_ptr, byte_offset)),
+        ProcType::Boolean => {
+            let raw = builder.ins().load(types::I64, flags, record_ptr, byte_offset);
+            ValueRepr::Scalar(builder.ins().ireduce(types::I8, raw))
+        }
+        ProcType::Character => {
+            let raw = builder.ins().load(types::I64, flags, record_ptr, byte_offset);
+            ValueRepr::Scalar(builder.ins().ireduce(types::I32, raw))
+        }
+        ProcType::Approximate => ValueRepr::Scalar(builder.ins().load(types::F64, flags, record_ptr, byte_offset)),
+        ProcType::Rational => {
+            let num = builder.ins().load(types::I64, flags, record_ptr, byte_offset);
+            let den = builder.ins().load(types::I64, flags, record_ptr, byte_offset + 8);
+            ValueRepr::Rational { num, den }
+        }
+        ProcType::Text | ProcType::Binary => {
+            let ptr = builder.ins().load(ptr_ty, flags, record_ptr, byte_offset);
+            let len = builder.ins().load(types::I64, flags, record_ptr, byte_offset + 8);
+            ValueRepr::Text { ptr, len }
+        }
+        ProcType::Relation(_) | ProcType::Pointer => {
+            ValueRepr::Scalar(builder.ins().load(ptr_ty, flags, record_ptr, byte_offset))
+        }
+        ProcType::Tuple(heading) => {
+            let sub = coddl_procir::record_layout(heading);
+            let mut fields = Vec::with_capacity(sub.attrs.len());
+            for (layout, (_, aty)) in sub.attrs.iter().zip(heading.attrs()) {
+                let sub_type = proc_type_from_attr(aty);
+                let repr = read_cell(builder, record_ptr, byte_offset + layout.offset as i32, &sub_type, ptr_ty)?;
+                fields.push((layout.name.clone(), repr));
+            }
+            ValueRepr::Tuple { fields }
+        }
+        other => {
+            return Err(CraneliftEmitError::UnsupportedInst(format!(
+                "reading a cell of type {other:?} not yet supported"
+            )));
+        }
+    };
+    Ok(repr)
+}
+
+/// Read a whole boxed-tuple record into a flattened `ValueRepr::Tuple`,
+/// layout-driven: a nested-tuple cell (`attr.sub`) recurses; every other cell
+/// reads its leaf via [`read_cell`]. `base` is the record-absolute offset of
+/// this (sub-)region. No cardinality check — a box is one record.
+fn read_boxed_tuple(
+    builder: &mut FunctionBuilder<'_>,
+    record_ptr: CrValue,
+    layout: &RecordLayout,
+    base: i32,
+    ptr_ty: cranelift_codegen::ir::Type,
+) -> Result<ValueRepr, CraneliftEmitError> {
+    let mut fields = Vec::with_capacity(layout.attrs.len());
+    for attr in &layout.attrs {
+        let off = base + attr.offset as i32;
+        let repr = match &attr.sub {
+            Some(sub) => read_boxed_tuple(builder, record_ptr, sub, off, ptr_ty)?,
+            None => read_cell(builder, record_ptr, off, &proc_type_from_kind_cl(attr.kind), ptr_ty)?,
+        };
+        fields.push((attr.name.clone(), repr));
+    }
+    Ok(ValueRepr::Tuple { fields })
 }
 
 /// Extract a `Scalar(v)` from the values map for an RC-managed
@@ -2763,9 +2939,24 @@ fn store_attr(
     byte_offset: i32,
     repr: &ValueRepr,
     sub: Option<&RecordLayout>,
+    kind: u32,
     retain_ref: cranelift_codegen::ir::FuncRef,
 ) -> Result<(), CraneliftEmitError> {
     let flags = MemFlags::trusted();
+    // A relation-valued cell is a single RC payload pointer — indistinguishable
+    // from an `Integer` cell by Cranelift value type (both `I64` on 64-bit), so
+    // the layout `kind` disambiguates: store the pointer and retain it (the
+    // record co-owns the relation, balanced by the drop walker's release).
+    if kind == coddl_procir::kind_tag::RELATION {
+        let ValueRepr::Scalar(v) = repr else {
+            return Err(CraneliftEmitError::UnsupportedInst(
+                "relation cell store expected a pointer scalar".into(),
+            ));
+        };
+        builder.ins().store(flags, *v, payload, byte_offset);
+        builder.ins().call(retain_ref, &[*v]);
+        return Ok(());
+    }
     match repr {
         ValueRepr::Scalar(v) => {
             // Integer cells are 8-byte i64. A `Character` value is an inline
@@ -2819,6 +3010,7 @@ fn store_attr(
                     byte_offset + sub_attr.offset as i32,
                     &field,
                     sub_attr.sub.as_ref(),
+                    sub_attr.kind,
                     retain_ref,
                 )?;
             }

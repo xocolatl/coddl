@@ -423,10 +423,13 @@ each `parse_<x>` has a corresponding `check_<x>`.
   `Sequence T`, `Tuple { H }`, and `Relation { H }` (headings via
   `resolve_heading`, recursively). The static `resolve_type_ref_quiet`
   is its no-diagnostic twin, exposed for the ProcIR lowerer (which
-  resolves a `let`/`var` annotation's heading to build a headed empty
-  relation). A generator heading type in operator parameter/return
-  position is rejected (`T0018`) — the ProcIR signature path can't yet
-  build a heading-generator `ProcType`; local bindings are unaffected.
+  resolves a `let`/`var` annotation's heading — and an operator's
+  `Tuple`/`Relation` parameter/return heading — into a `ProcType`). Every
+  signature shape is now supported: `Tuple`/`Relation` parameters and
+  `Tuple`/`Relation` returns. A relation (and a **large** tuple) crosses
+  the ABI as one pointer; a **small** tuple flattens per-attribute for
+  passing and is boxed at the return boundary (see [procir.md](procir.md)
+  "boxed tuples" and [codegen.md](codegen.md)). `T0018` is retired.
 - **`write_relation` polymorphism** — the built-in's `rel`
   parameter has `ParamKind::AnyRelation` rather than a concrete
   type. `check_named_arg` special-cases this kind: any
@@ -668,7 +671,7 @@ check script enforces that.
 | T0015 | Duplicate field name in tuple literal                    |
 | T0016 | Field access on a value whose type isn't a tuple         |
 | T0017 | Unknown field name in tuple field access                 |
-| T0018 | a `Relation { H }` / `Tuple { H }` heading type in operator parameter/return position is not yet lowerable (local `let`/`var` annotations are supported) |
+| T0018 | *retired* (available for reuse). Formerly gated a `Tuple`/`Relation` heading in an operator signature; every such shape now lowers — small tuples flatten, large tuples and returns box (a boxed tuple is a `length = 1` relation payload). |
 | T0019 | Tuple heading mismatch in relation literal                |
 | T0020 | `where` predicate must be Boolean                         |
 | T0021 | Scalar operator operand type mismatch                     |

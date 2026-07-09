@@ -121,6 +121,11 @@ struct Emitter {
     /// `emit_module` so `Inst::RelationLit` can look up the
     /// heading's layout by id without recomputing.
     heading_layouts: Vec<coddl_procir::RecordLayout>,
+    /// The per-module headings themselves (same index as `heading_layouts`),
+    /// so `Inst::TupleUnbox` can read a boxed tuple's cells with their surface
+    /// attribute types (the layout keeps only kind tags, which are lossy for
+    /// nested tuples).
+    headings: Vec<coddl_procir::Heading>,
     /// Per-module public-relvar lookup: surface name → column count.
     /// The three new Inst arms (RelvarSlotInit / RelvarSlotRelease /
     /// RelvarRead) reference this to size the column-pointer / column-
@@ -182,6 +187,7 @@ impl Emitter {
             .iter()
             .map(|h| record_layout(h))
             .collect();
+        self.headings = module.headings.clone();
         for (i, heading) in module.headings.iter().enumerate() {
             self.emit_heading_descriptor(HeadingId(i as u32), heading)?;
         }
@@ -641,32 +647,7 @@ impl Emitter {
         // `push_param_decl` writes into the signature.
         for (i, (pname, pty)) in func.params.iter().enumerate() {
             let vid = ValueId(i as u32);
-            match pty {
-                ProcType::Text | ProcType::Binary => {
-                    self.values.insert(
-                        vid,
-                        ValueRepr::Text {
-                            ptr_op: format!("%{pname}.ptr"),
-                            len_op: format!("%{pname}.len"),
-                        },
-                    );
-                }
-                ProcType::Tuple(_) => {
-                    return Err(LlvmEmitError::UnsupportedInst(
-                        "Tuple-typed parameters not yet supported in defined functions".into(),
-                    ));
-                }
-                other => {
-                    let ty = llvm_value_type(other).to_string();
-                    self.values.insert(
-                        vid,
-                        ValueRepr::Scalar {
-                            ty,
-                            op: format!("%{pname}"),
-                        },
-                    );
-                }
-            }
+            self.values.insert(vid, param_value_repr(pname, pty));
         }
 
         writeln!(
@@ -759,13 +740,30 @@ impl Emitter {
             reprs.push((*src, repr));
         }
 
-        match pty {
+        let repr = self.emit_phi_value(&format!("%v{}", pvid.0), pty, &reprs)?;
+        self.values.insert(pvid, repr);
+        Ok(())
+    }
+
+    /// Emit the `phi` node(s) for one join value and return its `ValueRepr`.
+    /// A scalar is one `phi`; a `Text`/`Binary` is two (`.ptr` + `.len`); a
+    /// `Tuple` recurses per-attribute (nested tuples nest), threading each
+    /// leaf's incoming operands from the corresponding field of every
+    /// predecessor's `ValueRepr::Tuple`. `base` is the SSA name prefix
+    /// (`%v<N>`), so leaf names match what downstream `TupleField` reads.
+    fn emit_phi_value(
+        &mut self,
+        base: &str,
+        ty: &ProcType,
+        reprs: &[(BlockId, ValueRepr)],
+    ) -> Result<ValueRepr, LlvmEmitError> {
+        match ty {
             ProcType::Text | ProcType::Binary => {
-                let ptr_name = format!("%v{}.ptr", pvid.0);
-                let len_name = format!("%v{}.len", pvid.0);
+                let ptr_name = format!("{base}.ptr");
+                let len_name = format!("{base}.len");
                 let mut ptr_entries = Vec::new();
                 let mut len_entries = Vec::new();
-                for (src, repr) in &reprs {
+                for (src, repr) in reprs {
                     let ValueRepr::Text { ptr_op, len_op } = repr else {
                         return Err(LlvmEmitError::UnsupportedInst(
                             "phi expected a Text operand".into(),
@@ -776,24 +774,60 @@ impl Emitter {
                 }
                 writeln!(self.body, "    {ptr_name} = phi ptr {}", ptr_entries.join(", ")).unwrap();
                 writeln!(self.body, "    {len_name} = phi i64 {}", len_entries.join(", ")).unwrap();
-                self.values.insert(
-                    pvid,
-                    ValueRepr::Text {
-                        ptr_op: ptr_name,
-                        len_op: len_name,
-                    },
-                );
+                Ok(ValueRepr::Text {
+                    ptr_op: ptr_name,
+                    len_op: len_name,
+                })
             }
-            ProcType::Tuple(_) => {
-                return Err(LlvmEmitError::UnsupportedInst(
-                    "merging a Tuple value through `if` not yet supported".into(),
-                ));
+            // A boxed tuple is one pointer — phi it like a scalar.
+            ProcType::Tuple(heading) if coddl_procir::tuple_is_boxed(heading) => {
+                let mut entries = Vec::new();
+                for (src, repr) in reprs {
+                    let ValueRepr::Scalar { op, .. } = repr else {
+                        return Err(LlvmEmitError::UnsupportedInst(
+                            "phi expected a boxed-tuple pointer operand".into(),
+                        ));
+                    };
+                    entries.push(format!("[ {op}, %{src} ]"));
+                }
+                writeln!(self.body, "    {base} = phi ptr {}", entries.join(", ")).unwrap();
+                Ok(ValueRepr::Scalar {
+                    ty: "ptr".to_string(),
+                    op: base.to_string(),
+                })
+            }
+            ProcType::Tuple(heading) => {
+                let mut fields = Vec::new();
+                for (attr_name, attr_ty) in heading.attrs() {
+                    // Pull this attribute's operand out of every predecessor's tuple.
+                    let mut sub_reprs = Vec::with_capacity(reprs.len());
+                    for (src, repr) in reprs {
+                        let ValueRepr::Tuple { fields } = repr else {
+                            return Err(LlvmEmitError::UnsupportedInst(
+                                "phi expected a Tuple operand".into(),
+                            ));
+                        };
+                        let sub = fields
+                            .iter()
+                            .find(|(n, _)| n == attr_name)
+                            .ok_or_else(|| {
+                                LlvmEmitError::UnsupportedInst(format!(
+                                    "phi tuple operand missing field `{attr_name}`"
+                                ))
+                            })?;
+                        sub_reprs.push((*src, sub.1.clone()));
+                    }
+                    let sub_base = format!("{base}.{attr_name}");
+                    let sub_repr =
+                        self.emit_phi_value(&sub_base, &proc_type_from_attr(attr_ty), &sub_reprs)?;
+                    fields.push((attr_name.clone(), sub_repr));
+                }
+                Ok(ValueRepr::Tuple { fields })
             }
             other => {
-                let name = format!("%v{}", pvid.0);
                 let lty = llvm_value_type(other);
                 let mut entries = Vec::new();
-                for (src, repr) in &reprs {
+                for (src, repr) in reprs {
                     let ValueRepr::Scalar { op, .. } = repr else {
                         return Err(LlvmEmitError::UnsupportedInst(
                             "phi expected a scalar operand".into(),
@@ -801,17 +835,13 @@ impl Emitter {
                     };
                     entries.push(format!("[ {op}, %{src} ]"));
                 }
-                writeln!(self.body, "    {name} = phi {lty} {}", entries.join(", ")).unwrap();
-                self.values.insert(
-                    pvid,
-                    ValueRepr::Scalar {
-                        ty: lty.to_string(),
-                        op: name,
-                    },
-                );
+                writeln!(self.body, "    {base} = phi {lty} {}", entries.join(", ")).unwrap();
+                Ok(ValueRepr::Scalar {
+                    ty: lty.to_string(),
+                    op: base.to_string(),
+                })
             }
         }
-        Ok(())
     }
 
     fn emit_inst(&mut self, inst: &Inst) -> Result<(), LlvmEmitError> {
@@ -961,6 +991,16 @@ impl Emitter {
                 self.values.insert(*dst, field_repr);
                 Ok(())
             }
+            Inst::TupleBox {
+                dst,
+                src,
+                heading_id,
+            } => self.lower_tuple_box(*dst, src, *heading_id),
+            Inst::TupleUnbox {
+                dst,
+                src,
+                heading_id,
+            } => self.lower_tuple_unbox(*dst, src, *heading_id),
             Inst::RelationLit {
                 dst,
                 tuples,
@@ -1925,9 +1965,18 @@ impl Emitter {
                 );
                 Ok(())
             }
-            other => Err(LlvmEmitError::UnsupportedInst(format!(
-                "AttrLoad of type {other:?} not yet supported"
-            ))),
+            // Relation cell (boxed-tuple field) and nested-tuple cell: reuse the
+            // shared recursive reader.
+            other => {
+                let repr = self.read_attr_repr(
+                    &src_op,
+                    offset as usize,
+                    other,
+                    &format!("v{}", dst.0),
+                )?;
+                self.values.insert(dst, repr);
+                Ok(())
+            }
         }
     }
 
@@ -2402,6 +2451,38 @@ impl Emitter {
                     len_op: len_name,
                 })
             }
+            // A relation-valued cell is one inline RC payload pointer. Read it
+            // as a `ptr` scalar (borrowed — the record still owns it).
+            ProcType::Relation(_) | ProcType::Pointer => {
+                let slot = self.gep_byte(base, byte_offset);
+                let name = format!("%{name_hint}");
+                writeln!(self.body, "    {name} = load ptr, ptr {slot}").unwrap();
+                Ok(ValueRepr::Scalar {
+                    ty: "ptr".to_string(),
+                    op: name,
+                })
+            }
+            // An inline nested-tuple cell: recurse over its sub-region and
+            // bundle the components into a `ValueRepr::Tuple` (offsets 0-based
+            // within the sub-region, so add this cell's `byte_offset`). Sub-attr
+            // types come from the heading's surface `Type`s (via
+            // `proc_type_from_attr`, which handles nested Tuple/Relation) —
+            // `record_layout` and `heading.attrs()` share canonical order.
+            ProcType::Tuple(heading) => {
+                let sub = coddl_procir::record_layout(heading);
+                let mut fields = Vec::with_capacity(sub.attrs.len());
+                for (i, (layout, (_, aty))) in sub.attrs.iter().zip(heading.attrs()).enumerate() {
+                    let attr_type = proc_type_from_attr(aty);
+                    let repr = self.read_attr_repr(
+                        base,
+                        byte_offset + layout.offset as usize,
+                        &attr_type,
+                        &format!("{name_hint}.f{i}"),
+                    )?;
+                    fields.push((layout.name.clone(), repr));
+                }
+                Ok(ValueRepr::Tuple { fields })
+            }
             other => Err(LlvmEmitError::UnsupportedInst(format!(
                 "Extract attribute of type {other:?} not yet supported"
             ))),
@@ -2452,6 +2533,95 @@ impl Emitter {
     ///
     /// The destination `ValueRepr` is the relation pointer as a
     /// `Scalar { ty: "ptr", op: "%vN" }`.
+    /// Box a flattened tuple `src` into a `length = 1` heap record (the same
+    /// shape as a one-tuple `RelationLit`, minus the seal). `dst` becomes the
+    /// record pointer.
+    fn lower_tuple_box(
+        &mut self,
+        dst: ValueId,
+        src: &ValueId,
+        heading_id: HeadingId,
+    ) -> Result<(), LlvmEmitError> {
+        let layout = self
+            .heading_layouts
+            .get(heading_id.0 as usize)
+            .ok_or_else(|| {
+                LlvmEmitError::UnsupportedInst(format!("unknown heading_id {} in TupleBox", heading_id.0))
+            })?
+            .clone();
+        let record_size = layout.record_size as usize;
+        let tuple_repr = self.values.get(src).cloned().ok_or_else(|| {
+            LlvmEmitError::UnsupportedInst(format!("undefined tuple value {src:?} in TupleBox"))
+        })?;
+        let ValueRepr::Tuple { fields } = &tuple_repr else {
+            return Err(LlvmEmitError::UnsupportedInst(format!(
+                "TupleBox operand is not a flattened Tuple: {tuple_repr:?}"
+            )));
+        };
+        let dst_name = format!("%v{}", dst.0);
+        writeln!(
+            self.body,
+            "    {dst_name} = call ptr @coddl_rc_alloc(i64 {record_size}, i32 1, i32 0, ptr @.heading.{})",
+            heading_id.0,
+        )
+        .unwrap();
+        for attr in &layout.attrs {
+            let field_repr = fields
+                .iter()
+                .find(|(n, _)| n == &attr.name)
+                .map(|(_, r)| r)
+                .ok_or_else(|| {
+                    LlvmEmitError::UnsupportedInst(format!(
+                        "tuple missing attribute `{}` for box layout",
+                        attr.name
+                    ))
+                })?;
+            self.emit_attr_store(&dst_name, attr.offset as usize, field_repr, attr.sub.as_ref())?;
+        }
+        self.values.insert(
+            dst,
+            ValueRepr::Scalar {
+                ty: "ptr".to_string(),
+                op: dst_name,
+            },
+        );
+        Ok(())
+    }
+
+    /// Unbox a boxed tuple `src` (one RC record) into a flattened
+    /// `ValueRepr::Tuple`, reading each attribute with its surface type (so
+    /// nested tuples / relation cells read correctly). No cardinality check —
+    /// a box is always one record.
+    fn lower_tuple_unbox(
+        &mut self,
+        dst: ValueId,
+        src: &ValueId,
+        heading_id: HeadingId,
+    ) -> Result<(), LlvmEmitError> {
+        let record_ptr = self.scalar_op(src)?;
+        let heading = self
+            .headings
+            .get(heading_id.0 as usize)
+            .cloned()
+            .ok_or_else(|| {
+                LlvmEmitError::UnsupportedInst(format!("unknown heading_id {} in TupleUnbox", heading_id.0))
+            })?;
+        let layout = record_layout(&heading);
+        let mut fields = Vec::with_capacity(layout.attrs.len());
+        for (i, (attr, (_, aty))) in layout.attrs.iter().zip(heading.attrs()).enumerate() {
+            let attr_type = proc_type_from_attr(aty);
+            let repr = self.read_attr_repr(
+                &record_ptr,
+                attr.offset as usize,
+                &attr_type,
+                &format!("v{}.f{i}", dst.0),
+            )?;
+            fields.push((attr.name.clone(), repr));
+        }
+        self.values.insert(dst, ValueRepr::Tuple { fields });
+        Ok(())
+    }
+
     fn lower_relation_lit(
         &mut self,
         dst: ValueId,
@@ -2615,6 +2785,15 @@ impl Emitter {
                 // `Approximate`: store the double's 8 (canonical) bytes.
                 let slot = self.gep_byte(base, byte_offset);
                 writeln!(self.body, "    store double {op}, ptr {slot}").unwrap();
+                Ok(())
+            }
+            ValueRepr::Scalar { ty, op } if ty == "ptr" => {
+                // A relation-valued attribute: store the RC payload pointer and
+                // retain it — the record co-owns the relation, balanced by the
+                // drop walker's per-cell release (same discipline as `Text`).
+                let slot = self.gep_byte(base, byte_offset);
+                writeln!(self.body, "    store ptr {op}, ptr {slot}").unwrap();
+                writeln!(self.body, "    call void @coddl_rc_retain(ptr {op})").unwrap();
                 Ok(())
             }
             ValueRepr::Scalar { ty, .. } => Err(LlvmEmitError::UnsupportedInst(format!(
@@ -2844,9 +3023,17 @@ impl Emitter {
                             "returning Rational by value not yet supported".into(),
                         ));
                     }
+                    // Only an *empty* tuple (unit) reaches here: it returns
+                    // `void`. A non-empty tuple return was boxed by the lowerer
+                    // into a `Scalar` pointer (see `box_return_value_if_needed`).
+                    ValueRepr::Tuple { fields } if fields.is_empty() => {
+                        writeln!(self.body, "    ret void").unwrap();
+                    }
                     ValueRepr::Tuple { .. } => {
                         return Err(LlvmEmitError::UnsupportedInst(
-                            "returning Tuple by value not yet supported".into(),
+                            "non-empty tuple reached the return terminator unboxed \
+                             (lowerer should have boxed it)"
+                                .into(),
                         ));
                     }
                 }
@@ -2926,6 +3113,7 @@ fn proc_type_from_kind_llvm(kind: u32) -> ProcType {
         k if k == kind_tag::APPROXIMATE => ProcType::Approximate,
         k if k == kind_tag::RATIONAL => ProcType::Rational,
         k if k == kind_tag::TEXT => ProcType::Text,
+        k if k == kind_tag::RELATION => ProcType::Pointer,
         other => unreachable!("unsupported attr kind {other} in Extract"),
     }
 }
@@ -2957,6 +3145,11 @@ fn llvm_return_type(ty: &ProcType) -> String {
     match ty {
         ProcType::Unit => "void".to_string(),
         ProcType::Tuple(h) if h.is_empty() => "void".to_string(),
+        // Any non-empty tuple return crosses the ABI as one pointer — a boxed
+        // record. The lowerer boxes a small (flattened) tuple at the return
+        // site, so the value handed back is always a pointer (see the return
+        // terminator and `lower_user_call`).
+        ProcType::Tuple(_) => "ptr".to_string(),
         // Booleans cross the C ABI as `i8` (matches Rust's `bool`
         // repr); inside an LLVM function the SSA is `i1` and gets
         // zext'd at the return site.
@@ -3002,6 +3195,11 @@ fn push_param_types(out: &mut Vec<String>, ty: &ProcType) {
             out.push("ptr".to_string());
             out.push("i64".to_string());
         }
+        // A boxed (large) tuple crosses the ABI as one pointer; a flattened
+        // (small) tuple expands per attribute.
+        ProcType::Tuple(heading) if coddl_procir::tuple_is_boxed(heading) => {
+            out.push("ptr".to_string());
+        }
         ProcType::Tuple(heading) => {
             for (_, attr_ty) in heading.attrs() {
                 push_param_types(out, &proc_type_from_attr(attr_ty));
@@ -3021,6 +3219,9 @@ fn push_param_decl(out: &mut Vec<String>, name: &str, ty: &ProcType) {
             out.push(format!("ptr %{name}.ptr"));
             out.push(format!("i64 %{name}.len"));
         }
+        ProcType::Tuple(heading) if coddl_procir::tuple_is_boxed(heading) => {
+            out.push(format!("ptr %{name}"));
+        }
         ProcType::Tuple(heading) => {
             for (attr_name, attr_ty) in heading.attrs() {
                 let sub_name = format!("{name}.{attr_name}");
@@ -3028,6 +3229,42 @@ fn push_param_decl(out: &mut Vec<String>, name: &str, ty: &ProcType) {
             }
         }
         other => out.push(format!("{ty} %{name}", ty = llvm_value_type(other))),
+    }
+}
+
+/// Build the `ValueRepr` binding a function parameter to its ABI SSA names,
+/// mirroring [`push_param_decl`] exactly so the names line up with the `define`
+/// line. A `Text`/`Binary` param is a `(ptr, len)` pair; a `Tuple` recurses
+/// per-attribute into a `ValueRepr::Tuple` (nested tuples nest); every other
+/// leaf is a single scalar operand. A relation param is one `ptr` scalar.
+fn param_value_repr(name: &str, ty: &ProcType) -> ValueRepr {
+    match ty {
+        ProcType::Text | ProcType::Binary => ValueRepr::Text {
+            ptr_op: format!("%{name}.ptr"),
+            len_op: format!("%{name}.len"),
+        },
+        ProcType::Tuple(heading) if coddl_procir::tuple_is_boxed(heading) => ValueRepr::Scalar {
+            ty: "ptr".to_string(),
+            op: format!("%{name}"),
+        },
+        ProcType::Tuple(heading) => {
+            let fields = heading
+                .attrs()
+                .iter()
+                .map(|(attr_name, attr_ty)| {
+                    let sub_name = format!("{name}.{attr_name}");
+                    (
+                        attr_name.clone(),
+                        param_value_repr(&sub_name, &proc_type_from_attr(attr_ty)),
+                    )
+                })
+                .collect();
+            ValueRepr::Tuple { fields }
+        }
+        other => ValueRepr::Scalar {
+            ty: llvm_value_type(other).to_string(),
+            op: format!("%{name}"),
+        },
     }
 }
 

@@ -837,28 +837,6 @@ impl TypeChecker {
         Heading::new(fields)
     }
 
-    /// Reject a `Relation { H }` / `Tuple { H }` heading-generator type in
-    /// operator parameter or return position. The parser and resolver accept it,
-    /// but the ProcIR signature path (`proc_type_from_type_ref`) can't yet build
-    /// a heading-generator `ProcType`, so lowering it would be unsound — T0018
-    /// (revived from the retired empty-relation-literal code). Local `let`/`var`
-    /// annotations are fully supported and never reach here.
-    fn reject_generator_signature_type(&mut self, tr: &TypeRef, role: &str) {
-        let Some(name_tok) = tr.name() else {
-            return;
-        };
-        if (name_tok.text() == "Relation" || name_tok.text() == "Tuple") && tr.heading().is_some() {
-            self.error(
-                self.node_span(tr.syntax()),
-                "T0018",
-                format!(
-                    "a `Relation`/`Tuple` heading type in {role} position is not yet \
-                     supported (only local `let`/`var` bindings for now)"
-                ),
-            );
-        }
-    }
-
     /// Verify every attribute named in `key { ... }` actually appears
     /// in `heading`. Emits T0013 against each offender. Returns the
     /// list of attribute names in source order — even ones that
@@ -1172,10 +1150,7 @@ impl TypeChecker {
                 }
 
                 let ty = match param.type_ref() {
-                    Some(tr) => {
-                        self.reject_generator_signature_type(&tr, "an operator parameter");
-                        self.resolve_type_ref(&tr)
-                    }
+                    Some(tr) => self.resolve_type_ref(&tr),
                     None => Type::Unknown,
                 };
                 scope.insert(name, ty, self.token_span(&name_tok), BindingOrigin::Param);
@@ -1188,10 +1163,7 @@ impl TypeChecker {
         // hint right after the heading — that's where the user would
         // have typed `-> Type`.
         let return_type = match decl.return_type() {
-            Some(tr) => {
-                self.reject_generator_signature_type(&tr, "an operator return");
-                self.resolve_type_ref(&tr)
-            }
+            Some(tr) => self.resolve_type_ref(&tr),
             None => {
                 if let Some(heading) = decl.heading() {
                     let r = heading.syntax().text_range();
@@ -6282,17 +6254,33 @@ mod tests {
     }
 
     #[test]
-    fn generator_typed_oper_param_diagnoses_t0018() {
-        // A `Relation { H }` operator parameter parses and typechecks as a type
-        // but is not yet lowerable — revived T0018.
+    fn relation_typed_oper_param_is_accepted() {
+        // A `Relation { H }` operator parameter is now supported (a relation
+        // crosses the ABI as a single pointer) — no T0018.
         let src = "oper f { r: Relation { a: Integer } } [ let _x = 1; ];";
-        assert!(codes(src).contains(&"T0018"), "{:?}", diagnostics(src));
+        assert!(!codes(src).contains(&"T0018"), "{:?}", diagnostics(src));
     }
 
     #[test]
-    fn generator_typed_oper_return_diagnoses_t0018() {
+    fn tuple_typed_oper_param_is_accepted() {
+        // A `Tuple { H }` operator parameter is supported (flattens per-attribute).
+        let src = "oper f { t: Tuple { a: Integer } } [ let _x = t.a; ];";
+        assert!(!codes(src).contains(&"T0018"), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn relation_typed_oper_return_is_accepted() {
+        // A `Relation { H }` return is supported (payload pointer + escape retain).
         let src = "oper f {} -> Relation { a: Integer } [ Relation { {a: 1} } ];";
-        assert!(codes(src).contains(&"T0018"), "{:?}", diagnostics(src));
+        assert!(!codes(src).contains(&"T0018"), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn whole_tuple_return_is_accepted() {
+        // A whole-`Tuple` return now type-checks (lowering boxes it) — T0018
+        // retired. Both a small and a wide tuple return are fine here.
+        let src = "oper f {} -> Tuple { a: Integer } [ {a: 1} ];";
+        assert!(!codes(src).contains(&"T0018"), "{:?}", diagnostics(src));
     }
 
     #[test]

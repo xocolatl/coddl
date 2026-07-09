@@ -49,7 +49,11 @@ pub mod kind_tag {
     /// Inline nested-tuple cell: a contiguous sub-region; the descriptor
     /// attribute carries a pointer to the tuple's own heading descriptor.
     pub const TUPLE: u32 = 10;
-    // Reserved (not yet emitted): RELATION = 11.
+    /// Relation-valued attribute cell: a single RC payload pointer (8 bytes),
+    /// stored inline. The record co-owns it (retain-on-store); the drop walker
+    /// releases it. Unlike `TUPLE`, it is *not* an inline sub-region — the
+    /// relation's own header/descriptor drives its own drop, so no `sub`.
+    pub const RELATION: u32 = 11;
 }
 
 /// One attribute's slot inside a record.
@@ -89,6 +93,8 @@ pub fn cell_width(ty: &Type) -> Option<u32> {
         // Rational is a reduced (numer, denom) pair of i64s — 16 bytes.
         Type::Rational => Some(16),
         Type::Text => Some(16),
+        // Relation-valued attribute: one inline RC payload pointer.
+        Type::Relation(_) => Some(8),
         // Inline nested-tuple cell: the sum of its components' widths,
         // recursively (`Tuple {}` → 0). `None` propagates if any component
         // is an as-yet-unsupported cell type.
@@ -103,6 +109,23 @@ pub fn cell_width(ty: &Type) -> Option<u32> {
     }
 }
 
+/// A tuple whose flattened record is at least this many bytes is **boxed** —
+/// passed and returned as a single RC pointer to a heap record — instead of
+/// flattened into per-attribute ABI slots. Below it, tuples stay flattened
+/// (zero heap, free field access). ~8 machine words, so typical 2–4-field
+/// tuples flatten and only genuinely wide ones box. Purely a representation
+/// knob — no observable semantic effect.
+pub const TUPLE_BOX_THRESHOLD: u32 = 64;
+
+/// Whether a tuple with `heading` is boxed (see [`TUPLE_BOX_THRESHOLD`]). A pure
+/// function of the interned heading, so the lowerer and both backends agree by
+/// construction. A heading whose width isn't layout-computable (an unsupported
+/// cell type) is never boxed — it stays flattened, where its cells pass as
+/// individual leaf operands.
+pub fn tuple_is_boxed(heading: &Heading) -> bool {
+    cell_width(&Type::Tuple(heading.clone())).is_some_and(|w| w >= TUPLE_BOX_THRESHOLD)
+}
+
 /// Map a surface `Type` to its [`kind_tag`] integer. Returns `None`
 /// for types not yet supported in relation cells.
 pub fn cell_kind(ty: &Type) -> Option<u32> {
@@ -114,6 +137,7 @@ pub fn cell_kind(ty: &Type) -> Option<u32> {
         Type::Rational => Some(kind_tag::RATIONAL),
         Type::Text => Some(kind_tag::TEXT),
         Type::Tuple(_) => Some(kind_tag::TUPLE),
+        Type::Relation(_) => Some(kind_tag::RELATION),
         _ => None,
     }
 }

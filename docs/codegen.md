@@ -39,7 +39,7 @@ and a length — even though ProcIR sees them as one logical `ValueId`.
 | `Boolean`     | `_Bool`               | `i1` (LLVM) / `I8` (Cranelift) | `I8`                        |
 | `Unit`        | _(no operand)_        | `void` (return only) | _(omitted from params and returns)_   |
 | `Pointer`     | `void*`               | `ptr`                | pointer type from target_config       |
-| `Tuple(H)`    | _(flatten per attribute in canonical heading order)_ | _(flatten recursively into leaf scalars)_ | _(flatten recursively into leaf scalars)_ |
+| `Tuple(H)`    | _small: flatten per attribute; large: `void*` (boxed record)_ | _small: flatten; large: `ptr`_ | _small: flatten; large: `ptr`_ |
 | `Relation(id)`| `void*` (RC payload pointer) | `ptr`                | pointer type from target_config       |
 
 `Rational` and `Approximate` aren't exercised by hello-world; the
@@ -53,19 +53,30 @@ Two ABI types decompose at C-call boundaries:
 - **`Text` / `Binary`** — one `ValueId` becomes two operands at the
   call site: a pointer and an `i64` length. Externs declare two
   consecutive parameters in the corresponding positions.
-- **`Tuple(H)`** — one `ValueId` becomes the recursive concatenation
-  of its attributes' ABI operands, in canonical heading order
-  (`Heading::attrs()`). A `Tuple { a: Integer, b: Text }` lowers to
-  three operands at the call site: `i64`, `ptr`, `i64`. Nested
-  tuples nest. Empty `Tuple {}` contributes zero operands —
-  effectively a no-op argument.
+- **`Tuple(H)`** — the representation is a **size threshold**
+  (`coddl_procir::tuple_is_boxed`, record width ≥ `TUPLE_BOX_THRESHOLD`).
+  A **small** tuple's `ValueId` becomes the recursive concatenation of
+  its attributes' ABI operands, in canonical heading order
+  (`Heading::attrs()`). A `Tuple { a: Integer, b: Text }` lowers to three
+  operands at the call site: `i64`, `ptr`, `i64`. Nested tuples nest;
+  empty `Tuple {}` contributes zero operands. A **large** tuple is a
+  single `ptr` — a boxed record. The ABI helpers (`push_param_types`,
+  `push_param_decl` / `param_value_repr`, `bind_param_repr`,
+  `append_block_param_repr`, `push_call_operands`, `emit_phi_value`)
+  branch on `tuple_is_boxed`. Independently, **every non-empty tuple
+  return is one `ptr`** (`llvm_return_type` / `push_return_types`): the
+  lowerer boxes a small tuple at the return site and unboxes at the call.
 
-Tuples are pure compile-time grouping in both backends: each
+A **small** tuple is pure compile-time grouping in both backends: each
 `Inst::TupleLit` and `Inst::TupleField` updates the per-`ValueId`
-`ValueRepr` map without emitting any LLVM op / Cranelift `builder.ins`
-op. The work happens at ABI boundaries, where the recursive
-`push_param_types` / `push_call_operands` helpers walk the
-`ValueRepr::Tuple` tree and emit one leaf operand per attribute.
+`ValueRepr` map without emitting any op. A **large** (boxed) tuple is a
+heap record: `Inst::TupleBox` allocates a `length = 1` payload and stores
+its cells (`store_attr` / `emit_attr_store`, retain-on-store for
+Text/**relation** cells — `kind_tag::RELATION`); a field reads via
+`Inst::AttrLoad`; `Inst::TupleUnbox` reads the whole record back. The drop
+walker frees it as a length-1 relation payload. The work still happens at
+ABI boundaries, where the flatten helpers walk the `ValueRepr::Tuple` tree
+for small tuples and emit one `ptr` for boxed ones.
 
 ### Per-module heading descriptors (Phase 19)
 
@@ -78,10 +89,10 @@ layouts (matched by both backends and by `coddl-runtime`):
 struct CoddlAttrDesc {
     const uint8_t* name;       // pointer to name bytes (not null-terminated)
     uint32_t       name_len;
-    uint32_t       kind;       // 0 = Integer, 1 = Boolean, 2 = Text, 10 = Tuple
+    uint32_t       kind;       // 0=Integer 1=Boolean 2=Text 3=Char 4=Approx 5=Rational 10=Tuple 11=Relation
     uint32_t       offset;     // byte offset within a record
     // 4 bytes of natural trailing padding on 64-bit hosts
-    const CoddlHeadingDesc* sub; // Tuple cell: nested descriptor; else NULL
+    const CoddlHeadingDesc* sub; // Tuple cell: nested descriptor; else NULL (a Relation cell is one payload pointer, no sub)
 };
 struct CoddlHeadingDesc {
     uint32_t                attr_count;
@@ -150,7 +161,14 @@ N declared params (in source order). LLVM inserts directly into
 Cranelift calls `builder.append_block_params_for_function_params` on
 the entry block and binds each block param to the corresponding
 ValueId. For Text/Binary params, two consecutive ABI slots combine
-into one `ValueRepr::Text { ptr, len }`.
+into one `ValueRepr::Text { ptr, len }`; a `Tuple` param recursively
+consumes its leaves' slots (name-sorted, mirroring `push_param_decl` /
+`push_param_types`) into a `ValueRepr::Tuple`, and a `Relation` param is
+one pointer slot. The same recursion binds an `if`-merge block's `Tuple`
+join value (per-leaf phi / block param). A **whole-`Tuple`-by-value
+return** is *not* emitted — it would need `sret` return-ABI machinery;
+the typechecker gates it with `T0018`, so a handler returns a single-tuple
+`Relation` instead (a `Relation` return is just a payload pointer).
 
 The `Boolean` ABI:
 

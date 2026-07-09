@@ -348,7 +348,18 @@ implementations.
 allocated RC blocks. In `cfg(debug_assertions)` builds it tracks
 every `coddl_rc_alloc` / `coddl_rc_release`; release builds return
 0. The runtime unit tests assert this counter returns to zero after
-allocate-retain-release cycles. The driver e2e tests run release
-builds (where the counter is a no-op), so live-allocation leaks
-need a debug-build runtime test to catch — that's the role of
-`coddl-runtime::rc::tests::alloc_retain_release_balances`.
+allocate-retain-release cycles.
+
+**End-to-end leak gate.** In a balanced program the counter is 0 by
+program end — every `coddl_rc_alloc` is matched by a release before
+`main` finishes (relvar slots and heap locals are released in the
+epilogue). So, under `cfg(debug_assertions)` and gated by the
+`CODDL_LEAK_CHECK` env var, `coddl_runtime_shutdown` reads
+`live_allocations()` and, when non-zero, prints
+`coddl: leaked <N> allocation(s)` to stderr. The driver e2e tests
+compile the program against the **debug** runtime staticlib and run it
+via `coddl run` (which inherits the env down to the binary), so
+`assert_both_backends` sets `CODDL_LEAK_CHECK=1` and fails on any leak
+line — turning a refcount imbalance into a red test instead of silent
+memory growth. The gate is opt-in (env-gated) and compiles out of
+release builds entirely.

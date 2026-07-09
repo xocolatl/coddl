@@ -22,5 +22,8 @@ pub use ir::{
     BasicBlock, BlockId, Const, Function, Heading, HeadingId, Inst, Module, PlanEntry, ProcType,
     PublicRelvarBinding, ScalarOp, Terminator, Type, ValueId,
 };
-pub use layout::{cell_kind, cell_width, kind_tag, record_layout, AttrLayout, RecordLayout};
+pub use layout::{
+    cell_kind, cell_width, kind_tag, record_layout, tuple_is_boxed, AttrLayout, RecordLayout,
+    TUPLE_BOX_THRESHOLD,
+};
 pub use lower::{explain_with_plan, lower, lower_with_plan, ExplainEntry, LowerOutput};

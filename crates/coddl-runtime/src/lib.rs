@@ -103,6 +103,22 @@ pub unsafe extern "C" fn coddl_runtime_shutdown() -> CoddlStatus {
     // connection. Connections are dropped here, closing every open
     // handle.
     sqlite::shutdown_storage();
+    // Opt-in refcount-balance check: in a correct program every
+    // `coddl_rc_alloc` is matched by a release before we get here (relvar
+    // slots and heap locals are released earlier in `main`), so
+    // `live_allocations()` is 0. A non-zero count is a leak — report it to
+    // stderr so an e2e run with `CODDL_LEAK_CHECK=1` can assert on it. Debug
+    // builds only (the counter compiles out in release); env-gated so ordinary
+    // runs stay silent.
+    #[cfg(debug_assertions)]
+    {
+        if std::env::var_os("CODDL_LEAK_CHECK").is_some() {
+            let live = live_allocations();
+            if live != 0 {
+                eprintln!("coddl: leaked {live} allocation(s)");
+            }
+        }
+    }
     INITIALIZED.store(0, Ordering::SeqCst);
     CoddlStatus::Ok
 }

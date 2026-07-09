@@ -447,11 +447,10 @@ function that implements it.
                     -- {}`) whose attribute types are themselves type-refs
                     -- (so headings nest). Only when a `{` follows — a bare
                     -- `Tuple`/`Relation` stays a leaf name (resolving to
-                    -- the unknown-type T0005). A generator heading type in
-                    -- an operator parameter/return position is not yet
-                    -- lowerable (T0018); local `let`/`var` annotations are
-                    -- fully supported. `parse_heading` emits P0008 on a
-                    -- missing `}`.
+                    -- the unknown-type T0005). `Tuple`/`Relation` parameters
+                    -- and returns are fully supported (the lowerer boxes large
+                    -- tuples and tuple returns). `parse_heading` emits P0008 on
+                    -- a missing `}`.
 
 <key-clause>    ::= 'key' <ident-brace-list> ;                 -- parse_key_clause
 <ident-brace-list> ::= '{' [ <identifier> commalist ] '}' ;    -- parse_ident_brace_list

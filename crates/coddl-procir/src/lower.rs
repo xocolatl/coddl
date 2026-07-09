@@ -25,7 +25,7 @@ use coddl_syntax::ast::{
     TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WhileStmt, WrapExpr,
 };
 use coddl_syntax::{parse_format_template, SyntaxKind, TemplateChunk};
-use coddl_types::{check, Heading, RelvarKind, RelvarTable, Type};
+use coddl_types::{check, resolve_type_ref_quiet, Heading, RelvarKind, RelvarTable, Type};
 
 use coddl_relir::{
     CmpOp, Literal as RelLiteral, Predicate, RelExpr, ScalarBinOp, ScalarExpr, StorageOrigin,
@@ -388,14 +388,14 @@ struct Lowerer {
     /// owns the argument — so they are bound as body locals (resolving a body
     /// reference like `self`) but excluded from the scope-exit release.
     param_value_ids: Vec<ValueId>,
-    /// For each `TupleLit` (by dst `ValueId`): the `Text` cell values consumed
-    /// directly into it — direct `Text` field values plus, recursively, the
-    /// temps of *fresh nested `TupleLit`* fields (not `NameRef`-aliased tuples).
-    /// `lower_relation_lit` drains the top-level tuples' entries and runs
-    /// `release_text_temp` on each, balancing the relation's retain-on-store of
-    /// an owned `Text` temp consumed into a cell. A standalone tuple's entry is
-    /// never drained (its temps flow out via `.field` and are released there).
-    tuple_cell_text_temps: HashMap<ValueId, Vec<ValueId>>,
+    /// For each `TupleLit` (by dst `ValueId`): the fresh **heap** cell values
+    /// consumed directly into it — owned `Text` and relation/sequence field
+    /// temps, plus, recursively, the temps of *fresh nested `TupleLit`* fields
+    /// (not `NameRef`-aliased). `lower_relation_lit` and the `TupleBox` paths
+    /// drain the entry and run `release_call_arg_temp` on each, balancing the
+    /// record's retain-on-store of a temp consumed into a cell. A standalone
+    /// tuple's entry is never drained (its temps flow out via `.field`).
+    tuple_cell_heap_temps: HashMap<ValueId, Vec<ValueId>>,
     /// Relation temporaries whose release is deferred to **function** scope
     /// exit. `extract` copies a record's cells into a tuple as *borrowed*
     /// `(ptr,len)` values, then the source relation would normally be released
@@ -454,7 +454,7 @@ impl Lowerer {
             builtin_relvars: HashMap::new(),
             owned_texts: HashSet::new(),
             param_value_ids: Vec::new(),
-            tuple_cell_text_temps: HashMap::new(),
+            tuple_cell_heap_temps: HashMap::new(),
             deferred_relation_releases: Vec::new(),
             user_opers: HashMap::new(),
         }
@@ -540,6 +540,34 @@ impl Lowerer {
         self.headings.push(h.clone());
         self.heading_ids.insert(h.clone(), id);
         id
+    }
+
+    /// Convert a resolved surface `Type` to a `ProcType`, interning any
+    /// `Relation` heading into the per-module table — which the free
+    /// `proc_type_from_type` can't do (it needs `&mut self`). Used for operator
+    /// parameter/return types: unlike hello-world's scalars, those may be
+    /// `Tuple`/`Relation` heading types now that T0018 permits every signature
+    /// shape but a whole-tuple-by-value return. A `Tuple` keeps its surface
+    /// `Heading` (flattened per-attribute at ABI boundaries); a `Relation` — and
+    /// a `Sequence` element — needs interning to carry a `HeadingId`.
+    fn proc_type_from_resolved(&mut self, ty: &Type) -> ProcType {
+        match ty {
+            Type::Relation(h) => ProcType::Relation(self.intern_heading(h)),
+            Type::Sequence(elem) => ProcType::Sequence(Box::new(self.proc_type_from_resolved(elem))),
+            other => proc_type_from_type(other),
+        }
+    }
+
+    /// Recover a surface `Type` from a `ProcType`, resolving a `Relation`'s
+    /// `HeadingId` back to its interned `Heading` (which the free
+    /// `type_from_proc` can't). Used when building a tuple heading from its
+    /// fields' `ProcType`s — a relation-valued attribute needs its heading.
+    fn type_from_proc_m(&self, pt: &ProcType) -> Type {
+        match pt {
+            ProcType::Relation(id) => Type::Relation(self.headings[id.0 as usize].clone()),
+            ProcType::Sequence(elem) => Type::Sequence(Box::new(self.type_from_proc_m(elem))),
+            other => type_from_proc(other),
+        }
     }
 
     fn push_local_scope(&mut self) {
@@ -756,7 +784,7 @@ impl Lowerer {
         self.value_types.clear();
         self.owned_texts.clear();
         self.param_value_ids.clear();
-        self.tuple_cell_text_temps.clear();
+        self.tuple_cell_heap_temps.clear();
         self.deferred_relation_releases.clear();
     }
 
@@ -778,11 +806,17 @@ impl Lowerer {
     }
 
     /// True iff `ty` describes an always-heap-managed value that needs RC
-    /// retain/release regardless of provenance. Relations always allocate;
-    /// `Text` is provenance-dependent (owned vs borrowed) and handled
-    /// separately via `owned_texts` — see [`Self::needs_scope_release`].
+    /// retain/release regardless of provenance. Relations and sequences always
+    /// allocate; a **boxed** tuple is an RC record pointer too (a flattened
+    /// tuple is not — its heap cells follow their own producers). `Text` is
+    /// provenance-dependent (owned vs borrowed) and handled separately via
+    /// `owned_texts` — see [`Self::needs_scope_release`].
     fn is_heap_managed(ty: &ProcType) -> bool {
-        matches!(ty, ProcType::Relation(_) | ProcType::Sequence(_))
+        match ty {
+            ProcType::Relation(_) | ProcType::Sequence(_) => true,
+            ProcType::Tuple(h) => crate::layout::tuple_is_boxed(h),
+            _ => false,
+        }
     }
 
     /// Whether a *scope-bound local* `v` of type `ty` must be released at
@@ -827,6 +861,61 @@ impl Lowerer {
         }
     }
 
+    /// Release an owned heap **temporary** passed as an argument to a user
+    /// operator. Arguments are *borrowed* by the callee (it excludes them from
+    /// its own scope-exit release via `param_value_ids`), so the caller owns
+    /// them: a fresh temp (a relation/sequence literal or `where` result, an
+    /// owned `||`/call `Text`) that no local binds must be released once the
+    /// call returns, since it doesn't escape. A value bound to a local is freed
+    /// at that local's scope exit; a parameter of *this* function is the
+    /// caller's-caller's to free; a non-heap value (a scalar, or a `Tuple`
+    /// grouping — whose heap cells, if any, follow their own producers) needs
+    /// nothing. If the callee returns the same pointer, its escape-retain
+    /// (`retain_if_escaping_local`) balances this release, leaving `rc` intact.
+    fn release_call_arg_temp(&mut self, v: ValueId) {
+        let ty = self.value_type(v);
+        let heap = Self::is_heap_managed(&ty)
+            || (matches!(ty, ProcType::Text) && self.owned_texts.contains(&v));
+        if !heap || self.param_value_ids.contains(&v) {
+            return;
+        }
+        let owned_by_local = self
+            .locals
+            .iter()
+            .any(|layer| layer.values().any(|(vid, _)| *vid == v));
+        if !owned_by_local {
+            self.insts.push(Inst::Release { src: v });
+        }
+    }
+
+    /// Box a small (flattened) tuple return value into a heap record so the
+    /// return ABI is a single pointer for *every* non-empty tuple. A large
+    /// tuple is already boxed (returned as-is); an empty tuple / non-tuple is
+    /// untouched. The flattened tuple's owned `Text` cell temps are released —
+    /// the box co-owns them now (mirrors `lower_relation_lit` / `lower_tuple_lit`).
+    fn box_return_value_if_needed(&mut self, v: ValueId, declared_return: &ProcType) -> ValueId {
+        let ProcType::Tuple(heading) = declared_return else {
+            return v;
+        };
+        if heading.is_empty() || crate::layout::tuple_is_boxed(heading) {
+            return v;
+        }
+        let heading_id = self.intern_heading(heading);
+        let boxed = self.fresh_value();
+        self.record_type(boxed, ProcType::Tuple(heading.clone()));
+        self.insts.push(Inst::TupleBox {
+            dst: boxed,
+            src: v,
+            heading_id,
+        });
+        if let Some(temps) = self.tuple_cell_heap_temps.remove(&v) {
+            for t in temps {
+                self.release_call_arg_temp(t);
+            }
+        }
+        boxed
+    }
+
     /// Emit `Inst::Release` for every heap-managed binding in the
     /// topmost local scope, in unspecified (HashMap) order. Called
     /// before popping a scope (transaction exit) and at function
@@ -861,12 +950,21 @@ impl Lowerer {
     /// epilogue, `if`-arm exit, and transaction exit.
     fn retain_if_escaping_local(&mut self, value: ValueId) {
         let ty = self.value_type(value);
-        let in_scope = self
-            .locals
-            .last()
-            .map(|s| s.values().any(|(v, _)| *v == value))
-            .unwrap_or(false);
-        if in_scope && self.needs_scope_release(value, &ty) {
+        // Retain a heap value that escapes its enclosing scope and is bound
+        // somewhere — a local in *any* active scope, or a parameter. The escaped
+        // value becomes the join/return value and is (re)owned downstream (an
+        // `if`-merge local, the caller of a return), so it needs its own count.
+        // A fresh temporary bound nowhere already holds `rc = 1` and needs none.
+        // (Checking every scope — not just the top — matters for an `if`-arm or
+        // transaction body that yields a *parameter* or an outer local: those
+        // aren't in the arm/tx scope, so the top-scope-only check missed them
+        // and the merge local later over-released the borrowed box.)
+        let bound = self.param_value_ids.contains(&value)
+            || self
+                .locals
+                .iter()
+                .any(|s| s.values().any(|(v, _)| *v == value));
+        if bound && self.needs_scope_release(value, &ty) {
             self.insts.push(Inst::Retain { src: value });
         }
     }
@@ -930,7 +1028,7 @@ impl Lowerer {
         // name (T0060), so the by-name `user_opers` map stays unambiguous.
         for item in root.items() {
             if let Item::OperDecl(o) = item {
-                let (name, params, return_type) = Self::oper_signature(&o);
+                let (name, params, return_type) = self.oper_signature(&o);
                 self.user_opers.insert(
                     name,
                     UserOpSig {
@@ -1110,7 +1208,7 @@ impl Lowerer {
     /// of an operator never drifts from the emitted function. An absent param
     /// type or return clause maps to `Unit`, mirroring the typechecker's
     /// defaults for a clean program (the only input lowering sees).
-    fn oper_signature(decl: &OperDecl) -> (String, Vec<(String, ProcType)>, ProcType) {
+    fn oper_signature(&mut self, decl: &OperDecl) -> (String, Vec<(String, ProcType)>, ProcType) {
         let name = decl
             .name()
             .map(|t| t.text().to_string())
@@ -1124,14 +1222,14 @@ impl Lowerer {
                     .unwrap_or_default();
                 let pty = param
                     .type_ref()
-                    .map(|tr| proc_type_from_type_ref(&tr))
+                    .map(|tr| self.proc_type_from_resolved(&resolve_type_ref_quiet(&tr)))
                     .unwrap_or(ProcType::Unit);
                 params.push((pname, pty));
             }
         }
         let return_type = decl
             .return_type()
-            .map(|tr| proc_type_from_type_ref(&tr))
+            .map(|tr| self.proc_type_from_resolved(&resolve_type_ref_quiet(&tr)))
             .unwrap_or(ProcType::Unit);
         (name, params, return_type)
     }
@@ -1145,7 +1243,7 @@ impl Lowerer {
         // to Unit; main is treated as Unit at the IR level (the backends
         // special-case `ret i32 0`), and the typechecker rejects a declared
         // non-Unit return on `main` with T0011, so that is safe.
-        let (name, params, declared_return) = Self::oper_signature(decl);
+        let (name, params, declared_return) = self.oper_signature(decl);
         let linkage_name = name.clone();
         let is_main = name == "main";
 
@@ -1188,7 +1286,7 @@ impl Lowerer {
             // (materialized via `coddl_sqlite_relvar_init`).
         }
 
-        let body_value = decl.body().map(|body| self.lower_block(&body));
+        let mut body_value = decl.body().map(|body| self.lower_block(&body));
 
         // When the body's tail value is actually returned (a non-`main`,
         // non-Unit oper — the same condition that builds `Return(Some(v))`
@@ -1200,6 +1298,11 @@ impl Lowerer {
         let returns_value = !is_main && !matches!(declared_return, ProcType::Unit);
         if returns_value {
             if let Some(v) = body_value {
+                // The return ABI for any non-empty tuple is one boxed pointer.
+                // A large tuple is already boxed; box a small (flattened) one
+                // here so the value handed back is always a pointer.
+                let v = self.box_return_value_if_needed(v, &declared_return);
+                body_value = Some(v);
                 self.retain_if_escaping_local(v);
             }
         }
@@ -4735,7 +4838,7 @@ impl Lowerer {
         // nested `TupleLit` field contributes its own collected temps. A
         // `NameRef`-aliased field (tuple or text) is skipped — its value may be
         // referenced elsewhere, so releasing it here would double-free.
-        let mut cell_text_temps: Vec<ValueId> = Vec::new();
+        let mut cell_heap_temps: Vec<ValueId> = Vec::new();
         for field in tup.fields() {
             let name_tok = match field.name() {
                 Some(t) => t,
@@ -4748,12 +4851,19 @@ impl Lowerer {
             let id = self.lower_expr(&value_expr);
             let ty = self.value_type(id);
             match &ty {
-                ProcType::Text if !matches!(value_expr, Expr::NameRef(_)) => {
-                    cell_text_temps.push(id);
+                // A fresh (non-binding) heap cell — an owned `Text`, or a
+                // relation/sequence temp — is retain-on-stored by the record
+                // build (`TupleBox` / `RelationLit`), so its producer reference
+                // must be released after. A `NameRef` is a binding owned
+                // elsewhere; a nested tuple contributes its own collected temps.
+                ProcType::Text | ProcType::Relation(_) | ProcType::Sequence(_)
+                    if !matches!(value_expr, Expr::NameRef(_)) =>
+                {
+                    cell_heap_temps.push(id);
                 }
                 ProcType::Tuple(_) if matches!(value_expr, Expr::TupleLit(_)) => {
-                    if let Some(sub) = self.tuple_cell_text_temps.get(&id) {
-                        cell_text_temps.extend(sub.iter().copied());
+                    if let Some(sub) = self.tuple_cell_heap_temps.get(&id) {
+                        cell_heap_temps.extend(sub.iter().copied());
                     }
                 }
                 _ => {}
@@ -4768,7 +4878,7 @@ impl Lowerer {
         let heading = Heading::new(
             field_pairs
                 .iter()
-                .map(|(n, _, ty)| (n.clone(), type_from_proc(ty)))
+                .map(|(n, _, ty)| (n.clone(), self.type_from_proc_m(ty)))
                 .collect(),
         );
         let fields: Vec<(String, ValueId)> = field_pairs
@@ -4780,10 +4890,29 @@ impl Lowerer {
         self.insts.push(Inst::TupleLit {
             dst,
             fields,
-            heading,
+            heading: heading.clone(),
         });
-        if !cell_text_temps.is_empty() {
-            self.tuple_cell_text_temps.insert(dst, cell_text_temps);
+        // A large tuple is boxed: materialize the flattened grouping into a heap
+        // record and hand back the pointer. The box retain-on-stores each
+        // Text/relation cell, so release any owned `Text` temp consumed directly
+        // into a cell (mirrors `lower_relation_lit`). The boxed value is heap-
+        // managed (`is_heap_managed`), so scope-exit / escape RC handles it.
+        if crate::layout::tuple_is_boxed(&heading) {
+            let heading_id = self.intern_heading(&heading);
+            let boxed = self.fresh_value();
+            self.record_type(boxed, ProcType::Tuple(heading));
+            self.insts.push(Inst::TupleBox {
+                dst: boxed,
+                src: dst,
+                heading_id,
+            });
+            for t in cell_heap_temps {
+                self.release_call_arg_temp(t);
+            }
+            return boxed;
+        }
+        if !cell_heap_temps.is_empty() {
+            self.tuple_cell_heap_temps.insert(dst, cell_heap_temps);
         }
         dst
     }
@@ -4804,20 +4933,62 @@ impl Lowerer {
             .expect("typechecked field-access has a field token")
             .text()
             .to_string();
-        let field_type = heading
-            .lookup(&field_name)
-            .map(proc_type_from_type)
-            .unwrap_or_else(|| {
-                unreachable!("unknown field `{field_name}` survived typecheck")
-            });
+        let field_ty = heading.lookup(&field_name).unwrap_or_else(|| {
+            unreachable!("unknown field `{field_name}` survived typecheck")
+        });
+        // Use the interning conversion so a relation-valued field resolves its
+        // `HeadingId` (the free `proc_type_from_type` rejects `Type::Relation`).
+        let field_type = self.proc_type_from_resolved(&field_ty);
         let dst = self.fresh_value();
         self.record_type(dst, field_type.clone());
-        self.insts.push(Inst::TupleField {
-            dst,
-            src,
-            field_name,
-            field_type,
-        });
+        // On a *boxed* tuple the fields live in a heap record, so read the one
+        // named field with an `AttrLoad` at its layout offset. A *flattened*
+        // tuple keeps the compile-time `TupleField` projection.
+        if crate::layout::tuple_is_boxed(&heading) {
+            let offset = crate::layout::record_layout(&heading)
+                .attrs
+                .iter()
+                .find(|a| a.name == field_name)
+                .map(|a| a.offset)
+                .unwrap_or_else(|| unreachable!("field `{field_name}` absent from boxed layout"));
+            self.insts.push(Inst::AttrLoad {
+                dst,
+                src,
+                offset,
+                attr_type: field_type.clone(),
+            });
+        } else {
+            self.insts.push(Inst::TupleField {
+                dst,
+                src,
+                field_name,
+                field_type: field_type.clone(),
+            });
+        }
+        // A tuple heap-field read is a *borrow*. Retain it to an independent
+        // owned copy in the cases the boxing work introduced, where a bare
+        // borrow breaks:
+        //   * a **boxed** tuple's `Text` field — the box can be freed before the
+        //     field is consumed (returned from the oper, or an owned-temp box
+        //     argument freed right after the call); the copy joins `owned_texts`.
+        //   * any **relation/sequence** field (boxed *or* a flattened tuple with
+        //     a relation-valued attribute) — relations carry no owned/borrowed
+        //     mark, so a borrowing consumer (`write_relation`) would over-release
+        //     a bare borrow; owning the copy balances that release.
+        // A *flattened* `Text` field stays a zero-cost borrow (its consumer
+        // — `write_line` — leaves borrowed Text alone; see
+        // `borrowed_text_field_is_not_released`). Scalars own no heap.
+        let boxed = crate::layout::tuple_is_boxed(&heading);
+        match &field_type {
+            ProcType::Text if boxed => {
+                self.insts.push(Inst::Retain { src: dst });
+                self.mark_text_owned(dst);
+            }
+            t if Self::is_heap_managed(t) => {
+                self.insts.push(Inst::Retain { src: dst });
+            }
+            _ => {}
+        }
         dst
     }
 
@@ -5032,7 +5203,7 @@ impl Lowerer {
         // and literals; the collected temps are single-use fresh expressions.
         let cell_temps: Vec<ValueId> = tuple_values
             .iter()
-            .filter_map(|tv| self.tuple_cell_text_temps.remove(tv))
+            .filter_map(|tv| self.tuple_cell_heap_temps.remove(tv))
             .flatten()
             .collect();
         self.insts.push(Inst::RelationLit {
@@ -5041,7 +5212,7 @@ impl Lowerer {
             heading_id,
         });
         for t in cell_temps {
-            self.release_text_temp(t);
+            self.release_call_arg_temp(t);
         }
         dst
     }
@@ -5286,6 +5457,16 @@ impl Lowerer {
         }
 
         let returns_text = matches!(return_type, ProcType::Text);
+        // A *small* tuple return crosses the ABI as a boxed pointer (the return
+        // convention boxes it); capture the heading so we can unbox the result
+        // back to the flattened representation the rest of lowering expects. A
+        // large tuple stays boxed (its canonical rep).
+        let unbox_heading = match &return_type {
+            ProcType::Tuple(h) if !h.is_empty() && !crate::layout::tuple_is_boxed(h) => {
+                Some(h.clone())
+            }
+            _ => None,
+        };
         let dst = if matches!(return_type, ProcType::Unit) {
             None
         } else {
@@ -5296,13 +5477,35 @@ impl Lowerer {
         self.insts.push(Inst::Call {
             dst,
             callee: surface.to_string(),
-            args: arg_values,
+            args: arg_values.clone(),
             return_type,
         });
+        // Arguments are borrowed by the callee; release any owned heap temporary
+        // now that the call has consumed it (a bound local or parameter is left
+        // to its own owner). Done after the call so the value is live for it.
+        for arg in &arg_values {
+            self.release_call_arg_temp(*arg);
+        }
         if returns_text {
             if let Some(v) = dst {
                 self.mark_text_owned(v);
             }
+        }
+        if let Some(heading) = unbox_heading {
+            // The call returned a boxed pointer; unbox into the flattened value.
+            // Its cells are *borrowed* into the flattened result, so defer the
+            // box's release to scope exit (mirrors the `extract`-source rule).
+            let box_v = dst.expect("non-unit tuple return binds a dst");
+            let heading_id = self.intern_heading(&heading);
+            let flat = self.fresh_value();
+            self.record_type(flat, ProcType::Tuple(heading));
+            self.insts.push(Inst::TupleUnbox {
+                dst: flat,
+                src: box_v,
+                heading_id,
+            });
+            self.deferred_relation_releases.push(box_v);
+            return flat;
         }
         dst.unwrap_or_else(|| {
             let v = self.fresh_value();
@@ -5332,6 +5535,12 @@ impl Lowerer {
             ),
         };
         self.insts.push(Inst::WriteRelation { rel, heading_id });
+        // `write_relation` borrows its argument; release an owned relation
+        // *temporary* now that it's been written (a `where`/`extract`/call
+        // result, or a retain-on-read boxed-tuple relation field). A bound local
+        // or parameter is left to its own owner. Mirrors how the builtin path
+        // releases owned `Text` argument temps.
+        self.release_call_arg_temp(rel);
         let v = self.fresh_value();
         self.record_type(v, ProcType::Unit);
         v
@@ -5553,9 +5762,9 @@ impl Lowerer {
         // holds (mirrors `lower_relation_lit`). A `NameRef`-aliased args
         // tuple contributes none, so this is a no-op there.
         if let Some(tv) = args_tv {
-            if let Some(temps) = self.tuple_cell_text_temps.remove(&tv) {
+            if let Some(temps) = self.tuple_cell_heap_temps.remove(&tv) {
                 for t in temps {
-                    self.release_text_temp(t);
+                    self.release_call_arg_temp(t);
                 }
             }
         }
@@ -5735,39 +5944,6 @@ fn type_from_proc(pt: &ProcType) -> Type {
             )
         }
         ProcType::Sequence(elem) => Type::Sequence(Box::new(type_from_proc(elem))),
-    }
-}
-
-/// Resolve a (possibly generator-applied) type-ref to a `ProcType`,
-/// mirroring the typechecker's `resolve_type_ref`. `Sequence T` recurses
-/// into the element type-ref; any other head is a built-in scalar name.
-fn proc_type_from_type_ref(tr: &TypeRef) -> ProcType {
-    match tr.name() {
-        Some(tok) if tok.text() == "Sequence" => {
-            let elem = tr
-                .element()
-                .map(|e| proc_type_from_type_ref(&e))
-                .unwrap_or(ProcType::Unit);
-            ProcType::Sequence(Box::new(elem))
-        }
-        Some(tok) => proc_type_from_builtin_name(tok.text()),
-        None => ProcType::Unit,
-    }
-}
-
-fn proc_type_from_builtin_name(name: &str) -> ProcType {
-    match name {
-        "Integer" => ProcType::Integer,
-        "Rational" => ProcType::Rational,
-        "Approximate" => ProcType::Approximate,
-        "Text" => ProcType::Text,
-        "Character" => ProcType::Character,
-        "Binary" => ProcType::Binary,
-        "Byte" => ProcType::Byte,
-        "Boolean" => ProcType::Boolean,
-        // Typechecker already rejected anything else via T0005; the
-        // diagnostic-free invariant means we never get here.
-        other => unreachable!("unknown type `{other}` survived typecheck"),
     }
 }
 

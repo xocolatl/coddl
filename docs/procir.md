@@ -71,8 +71,15 @@ Key invariants the lowering pass and the backends both rely on:
   whose `return_type` is `Unit` has `dst == None`.
 - **`ProcType` is the machine-level type, not the surface type.**
   `ProcType::Tuple(Heading)` carries the typechecker's `Heading`
-  directly; at ABI boundaries it flattens per-attribute in canonical
-  heading order (nested tuples recursively). `ProcType::Relation`
+  directly. A tuple's representation is a **size threshold** on the
+  heading (`layout::tuple_is_boxed`, record width ≥ `TUPLE_BOX_THRESHOLD`):
+  a **small** tuple flattens per-attribute in canonical heading order at
+  ABI boundaries (nested tuples recursively — zero heap, free field
+  access); a **large** tuple is **boxed** — one pointer to a
+  `length = 1` RC record (built by `TupleBox`, read by `AttrLoad` /
+  `TupleUnbox`), just like a relation. Independently, *every* non-empty
+  tuple **return** crosses the ABI as one pointer: a small tuple is boxed
+  at the return site and unboxed at the call. `ProcType::Relation`
   is a single pointer at the ABI level (the RC-managed payload),
   with the heading living in static data and reached via the
   per-module descriptor table. `Sequence` becomes a runtime handle
@@ -95,7 +102,9 @@ Key invariants the lowering pass and the backends both rely on:
 | `Const`              | `value: Const`, `ty: ProcType`                                            | `dst: ValueId`        | Materialize a compile-time constant of type `ty`.                         |
 | `Call`               | `callee: String` (linkage name), `args: Vec<ValueId>`, `return_type`      | `dst: Option<ValueId>` | Call the named function. `dst` is `None` iff `return_type == Unit`.       |
 | `TupleLit`           | `fields: Vec<(String, ValueId)>` (canonical-order), `heading: Heading`    | `dst: ValueId`        | Bundle the fields into a tuple value typed `Tuple(heading)`. No runtime op — the value is a compile-time grouping over the field SSA values; backends carry it as a `ValueRepr::Tuple` and flatten at ABI boundaries. |
-| `TupleField`         | `src: ValueId` (tuple), `field_name: String`, `field_type: ProcType`      | `dst: ValueId`        | Project one attribute out of `src`. Pure compile-time projection in backends — `dst` binds the field's existing `ValueRepr`. |
+| `TupleField`         | `src: ValueId` (tuple), `field_name: String`, `field_type: ProcType`      | `dst: ValueId`        | Project one attribute out of a **flattened** (small) tuple `src`. Pure compile-time projection in backends — `dst` binds the field's existing `ValueRepr`. (A field of a **boxed** tuple reads via `AttrLoad` instead, with a retain on a heap field.) |
+| `TupleBox`           | `src: ValueId` (flattened tuple), `heading_id: HeadingId`                 | `dst: ValueId`        | Materialize a flattened tuple into a heap record — like a one-tuple `RelationLit` minus the seal: `coddl_rc_alloc(record_size, 1, kind=Relation, desc)` + per-attribute stores (retain-on-store for Text/relation cells). `dst` is the record pointer typed `Tuple(heading)`. Emitted for a large-tuple literal and to box a small tuple at a return site. |
+| `TupleUnbox`         | `src: ValueId` (boxed tuple), `heading_id: HeadingId`                     | `dst: ValueId`        | Read a boxed tuple's record back into a flattened `ValueRepr::Tuple` (per-attribute reads; no cardinality check — a box is one record). The inverse of `TupleBox`. Emitted at a small-tuple call result; the box is deferred-released after (its cells are borrowed into `dst`). |
 | `RelationLit`        | `tuples: Vec<ValueId>` (each typed `Tuple(h)`), `heading_id: HeadingId`   | `dst: ValueId`        | Allocate a fresh RC-managed payload (rc=1), copy each tuple's flattened bytes into the canonical-layout record buffer at the right offsets, then call `coddl_relation_seal` (sort + adjacent-dedup). `dst` carries `ProcType::Relation(heading_id)`. |
 | `Retain`             | `src: ValueId` (relation pointer)                                         | —                     | Increment the refcount of `src`. Backend lowers to `call coddl_rc_retain`. Emitted by the lowerer when a `let` RHS is a `NameRef` to an already-bound heap value. |
 | `Release`            | `src: ValueId` (relation pointer)                                         | —                     | Decrement the refcount of `src`; the drop walker runs on the runtime side when the count reaches zero. Backend lowers to `call coddl_rc_release`. Emitted at scope-exit for every heap-typed local. |
