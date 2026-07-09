@@ -41,6 +41,48 @@ The project already anticipates this shape: the runtime is a `staticlib` today, 
 loading lands" ([runtime.md](runtime.md), [workspace.md](workspace.md)). A web host is that same
 embed-compiled-Coddl-as-a-library move, driven by a concrete application.
 
+## Why a C ABI between host and handler — and what "staying in Coddl" would mean
+
+The host calls the handler across a C ABI. It is worth being precise about what that *is*, because it sounds
+heavier than it is and it raises the natural question: if both `coddl-web` and the handler are ours, why not
+stay "in Coddl" and skip the ABI?
+
+**The seam is a direct native call, not a boundary crossing.** There is no marshalling, serialization, or IPC
+between host and handler — they link into one binary and the call is a single `call` instruction over an
+agreed register/stack layout, plus the fat-pointer return convention ([codegen.md](codegen.md)) and a
+`coddl_rc_release`. It is already in-process and zero-copy; the "C ABI" is the *calling convention*, not a
+wire format.
+
+**The convention exists because two different compilers meet here.** `rustc` builds `coddl-web`; Coddl's own
+codegen (Cranelift / LLVM) builds the handler. They must agree on how arguments and returns are laid out, and
+the only convention both toolchains implement is the C ABI. Coddl's codegen already emits C-linkage symbols
+with no name mangling — this is the compiler↔runtime boundary [workspace.md](workspace.md) defines, not
+something invented for the web host. `rustc` speaks it via `extern "C"`.
+
+**You cannot make the host Coddl today, so *some* foreign boundary is unavoidable.** Sockets, `read`/`write`,
+byte buffers, and (later) HTTP/JSON parsing need the raw pointers and mutable memory the surface language
+forbids by design (the self-hosting fault line in [principles.md](principles.md)). That is why the transport
+half being absent from Coddl is *correct, not a gap*. The only open question is *where* the foreign boundary
+sits, not whether there is one.
+
+**"Staying in Coddl" is a real long-term direction — but it moves the seam, it does not delete it.** The
+self-hosting goal is to pull the socket *loop* itself into Coddl, leaving only an irreducible syscall shim as
+FFI — `socket`/`accept`/`read`/`write` as builtin opers bottoming out in the runtime, exactly the pattern
+`coddl::env` already uses (a builtin whose leaves are C-ABI calls — see [prelude.md](prelude.md)). Once the
+loop is Coddl, the host→handler call becomes an *ordinary `oper` call*: same codegen, native value
+representations, and **no hand-written `extern` declarations and no manual `coddl_rc_release`**, because the
+compiler manages ownership on both sides. What that removes is the hand-written *marshalling ceremony* — not a
+calling convention. Coddl-to-Coddl calls are themselves C-ABI-shaped today (unmangled C-linkage symbols; it is
+why handler overloading is blocked on name mangling, see What's deferred). "In Coddl" means
+*compiler-managed* marshalling rather than *hand-written*, not "no ABI."
+
+**Where the ceremony actually bites is P2, not the spine.** The spine's call is already free — a bare `Text`
+return, nothing to marshal. The three sharp edges below (retain-on-store, real RC headers, copy-before-release)
+exist precisely *because* a Rust host has to hand-construct Coddl's RC-headed values across the seam. An
+all-Coddl host would hand the handler a native value directly and none of that hand-marshalling would exist.
+That is the concrete payoff of eventually moving the loop into Coddl — and the concrete reason it is deferred:
+it needs Coddl to grow a `Binary` type and socket builtins first.
+
 ## Responsibilities
 
 **The host (`coddl-web`, Rust) owns:** the TCP listener; HTTP/1.1 parsing; the route table
