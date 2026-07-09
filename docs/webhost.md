@@ -5,14 +5,15 @@ HTTP parsing, routing, and JSON; Coddl provides the **models** (relvars) and the
 compiled as a host-callable library. The host builds a request value, calls a handler, and serializes the
 response it gets back.
 
-> **Status.** *Spine built.* The vocabulary this doc marshals — `Request` / `Response` — is real: it
-> lives in the opt-in [`coddl::web`](prelude.md) standard-library module, brought into scope with
-> `use module coddl::web;`. **P1a and the Spine (below) have landed:** `coddl emit-obj` already produces a
-> mainless object, and the `coddl-web` crate is a single-threaded `TcpListener` that calls a handler across
-> the C ABI and serves a fixed `200 OK`. What remains is the richer request/response and routing (P2/P3),
-> lifecycle synthesis (P1b), and the relvar-backed payoff (P4). It extends the first milestone: everything it
-> relies on — the frontend, RelIR → SQL, ProcIR → native codegen, the `staticlib` runtime, user `oper`s with
-> the C-ABI return convention — is assumed already end-to-end per [milestone.md](milestone.md).
+> **Status.** *Request/response built.* The vocabulary this doc marshals — `Request` / `Response` — is real:
+> it lives in the opt-in [`coddl::web`](prelude.md) standard-library module, brought into scope with
+> `use module coddl::web;`. **P1a, the Spine, and P2 (below) have landed:** `coddl emit-obj` produces a
+> mainless object, and the `coddl-web` crate is a single-threaded `TcpListener` that parses each request,
+> marshals a `Request` `Tuple` in, calls a handler across the C ABI, reads a `Response` `Tuple` back
+> (box-on-return), and writes the reply. What remains is routing (P3), lifecycle synthesis (P1b), and the
+> relvar-backed payoff (P4). It extends the first milestone: everything it relies on — the frontend, RelIR →
+> SQL, ProcIR → native codegen, the `staticlib` runtime, user `oper`s with the C-ABI return convention — is
+> assumed already end-to-end per [milestone.md](milestone.md).
 
 **Last sync:** validated against `8ac70d9`; the `Request` / `Response` vocabulary has since landed as the
 `coddl::web` module. Revalidate the file:line and ABI claims below when the entry model, the calling
@@ -115,54 +116,62 @@ The canonical `Request` / `Response` declarations live in the [`coddl::web`](pre
 A `Tuple` parameter is **flattened per-attribute** into leaf ABI slots in canonical (name-sorted) heading
 order — `Text` as a `(ptr, i64)` pair, scalars by value — so the host passes a request by pushing its fields
 as C arguments; no new convention is required. A relation-valued attribute (`headers`) passes as an opaque
-`void*` RC payload pointer.
+`void*` RC payload pointer. The `Request` above flattens to 7 args — `body (ptr, len)`, `headers (ptr)`,
+`method (ptr, len)`, `path (ptr, len)` — which `coddl-web` builds and pushes per request.
 
-*First cut:* model `headers` and `body` as `Text` and skip the relation-valued attribute — building a
-`Relation` value host-side (see [memory.md](memory.md), "One-reference-per-cell") is deferred until the
-spine works.
+The host builds the `headers` relation value directly (see [memory.md](memory.md), "One-reference-per-cell")
+via `coddl_rc_alloc` against a hand-written `{ name, value }` descriptor — an **empty** relation for now,
+so the plumbing is exercised without host-side header parsing (populated headers are the follow-up).
 
 ### Return (handler → host)
 
-There is **no whole-`Tuple`-by-value return** today — `Tuple` is required to be flattened at ABI boundaries,
-and a bare `Tuple` in scalar return position is `unreachable!` in codegen (it would need `sret` / return-pair
-machinery). So the return uses one of two existing paths, in order of increasing capability:
+**A handler returns a `Response` `Tuple` by value.** Whole-`Tuple`-by-value return now exists via
+**box-on-return**: a `Tuple` in return position is *always* returned as one `ptr` to a length-1
+`CoddlKind::Relation` record (`box_return_value_if_needed` in [procir.md](procir.md); the boxing is
+data- and cardinality-preserving, so `TupleBox`/`TupleUnbox` round-trips are transparent). So
 
-1. **Spine — `oper handle { … } -> Text`.** Return the response body directly and reuse the fully-built
-   fat-pointer return convention: the function gains a trailing `*mut usize` length-out parameter and returns
-   the payload pointer (`define ptr @handle(…, ptr %.ret_len_out)`; see [codegen.md](codegen.md)). Status and
-   headers are hardcoded host-side (200, `text/plain`). This is enough for the entire first milestone.
-2. **`Response` as a single-tuple `Relation`.** When status/headers must ride along, declare the handler to
-   return a `Relation` of exactly one tuple and reuse the relation return path (an `oper` with a non-unit
-   result already returns its payload pointer, kept alive past scope by escape retention). The host reads
-   record 0 through the heading descriptor. This reuses `coddl_query`-style `*mut u8` returns and pulls in
-   **zero** plan/relvar machinery — reading a returned relation touches only the RC header.
+```
+oper handle { req: Request } -> Response
+```
 
-Whole-`Tuple`-by-value (`sret`) and a `-> Text` body plus a bespoke `status_out` param are both possible but
-rejected for now: the first needs new return-ABI codegen; the second needs bespoke out-param synthesis and is
-strictly less principled than the relation return once headers arrive.
+lowers to `define ptr @handle(<flattened Request args>)` returning one pointer to a 32-byte record with the
+name-sorted layout `body@0 (ptr@0, len@8), headers@16 (Relation ptr), status@24 (Integer i64)`. The host
+reads the record's cells directly through that layout — `status` and the `body` `(ptr, len)` — exactly as it
+reads any returned record. This reuses `coddl_query`-style `*mut u8` returns and pulls in **zero**
+plan/relvar machinery: reading a returned record touches only the RC header, and the record's baked-in
+descriptor drives the drop walker on release (freeing the inner `body` `Text` *and* the `headers` relation).
+
+> **Superseded design.** Earlier drafts specced two lower-capability paths — a `-> Text` spine (body only,
+> status/headers hardcoded host-side) and `Response` as a *single-tuple `Relation`* — because
+> whole-`Tuple`-by-value return did not yet exist. Both are obsolete: the handler returns a `Response`
+> `Tuple` directly (one boxed-record pointer), not a relation of one tuple. There is no `-> Text` body plus a
+> bespoke `status_out` param, and no `sret`.
 
 ### Three sharp edges (where "just reuse the marshalling" is subtly wrong)
 
-1. **Copy the body out before releasing the relation.** With the relation return, the response body is a
-   `Text` cell *inside* the record; the drop walker (`drop_relation_payload`, [memory.md](memory.md)) frees
-   that inner cell when the host releases the outer relation. The host must copy the bytes to its own buffer
-   first, or the body pointer dangles.
+1. **Copy the body out before releasing the record.** The response body is a `Text` cell *inside* the boxed
+   `Response` record; the drop walker (`drop_relation_payload`, [memory.md](memory.md)) frees that inner cell
+   when the host releases the outer record. The host must copy the bytes to its own buffer first, or the body
+   pointer dangles. (`read_response` in `coddl-web` copies before the single `coddl_rc_release`.)
 2. **Release every returned payload, exactly once per request.** The host owns the handler's result and must
    `coddl_rc_release` it after serializing — otherwise it leaks one relation/`Text` per request. Release
    no-ops on immortal string literals (`IMMORTAL_RC`), so a uniform release is always correct.
 3. **A stored `Text` param needs a real RC header.** Handler parameters are *borrowed*, so a handler that only
    reads its request is safe with a raw `(ptr, len)`. But if a handler *stores* a request `Text` into a
    relation, retain-on-store reads a `CoddlRcHeader` 32 bytes ahead of the pointer — UB if the host passed
-   bytes with no header. A host that builds request values a handler may store must replicate the
-   RC-headed-cell discipline that `marshal_rows` uses. Harmless for the read-only spine; latent for P2.
+   bytes with no header. So `coddl-web`'s `rc_text` builds every request `method`/`path`/`body` through
+   `coddl_rc_alloc` (a real header), not a raw `(ptr, len)`, replicating the RC-headed-cell discipline that
+   `marshal_rows` uses — even though the current handler only reads.
 
 ### Layout single source of truth
 
 The host is a **new consumer** of the record layout defined once in `crates/coddl-procir/src/layout.rs`
 (`cell_width` / `cell_kind` / `record_layout`) and mirrored by the runtime's `#[repr(C)]` types and both
-codegen backends. There is no automated drift check ([risks.md](risks.md), "FFI struct-layout single source
-of truth") — a host mirroring these `#[repr(C)]` types by hand is one more place that silently rots if the
-layout description doesn't become generated. Note it there.
+codegen backends. `coddl-web` now hand-writes two `CoddlHeadingDesc`s against this layout — the
+`{ name, value }` `headers` heading and (for the built-in default handler) the `{ body, headers, status }`
+`Response` record — mirroring the `coddl::env` descriptor precedent in `crates/coddl-runtime/src/env.rs`.
+There is no automated drift check ([risks.md](risks.md), "FFI struct-layout single source of truth"): these
+hand-written descriptors silently rot if the layout description ever diverges and doesn't become generated.
 
 ## Lifecycle: `coddl_app_init` / `coddl_app_shutdown`
 
@@ -297,8 +306,14 @@ dependency of the database payoff (P4), **not** of the request/response plumbing
    automated as the driver e2e test `web_spine_mainless_handler_links_into_c_host`, which links a mainless
    object into a C host exactly as the spike prescribes.
 
-4. **P2 — richer request/response.** Add the `Request` `Tuple` parameter (existing flatten) and promote the
-   result to a single-tuple `Relation` (`Response`, return option 2). Land the three sharp-edge mitigations.
+4. **P2 — richer request/response. DONE.** The handler takes a `Request` `Tuple` parameter (flattened to 7
+   ABI args) and returns a `Response` `Tuple` by value (box-on-return; the host reads status + body from the
+   record). The host builds RC-headed request `method`/`path`/`body` `Text`s + an empty `headers` relation,
+   calls across the ABI, copies the body out, and releases every payload exactly once — all three sharp-edge
+   mitigations landed. The default handler hand-builds a `Response` record; a compiled
+   `oper handle { req: Request } -> Response` (`examples/web-hello/handle.cd`) links in via `CODDL_APP_OBJ`.
+   `headers` on both sides is an **empty** relation for now — populated request/response headers are the
+   follow-up.
 
 5. **P3 — host harness proper.** A real host-side routing table and HTTP request parsing. Parallels P2 — it
    only ever needs one handler symbol at a time.
@@ -326,7 +341,9 @@ dependency of the database payoff (P4), **not** of the request/response plumbing
 - **Handler overloading** — needs name mangling; the surface name is the linkage name today.
 - **`cdylib` hot-reload / plugin loading** — the `staticlib`-into-foreign-host cut ships first;
   [workspace.md](workspace.md)'s `cdylib` path is the later evolution.
-- **Host-built relation-valued request attributes** (e.g. `headers` as a relation).
+- **Populated `headers`** — request and response `headers` cross the ABI as an *empty* `{ name, value }`
+  relation today. Filling them host-side (parsing request headers into records; emitting response header
+  records) is the immediate follow-up; the relation-valued-attribute plumbing it rides on already works.
 - **Routes as a relvar + reverse URL resolution** — the two-queries-over-one-relvar model above.
 
 ## Verification

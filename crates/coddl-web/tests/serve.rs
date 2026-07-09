@@ -5,11 +5,13 @@
 //! the port from the `listening on …` line it prints, makes one HTTP request,
 //! and asserts the response is a `200 OK` carrying the handler's body.
 //!
-//! This exercises the whole host loop end-to-end — accept, call the handler
-//! across the C ABI, allocate/release the payload through the runtime, write the
-//! response — against the built-in `hello\n` handler, so it needs no compiled
-//! app object. The cross-object FFI boundary (a separately-compiled Coddl handler
-//! linked into a foreign host) is proved hermetically by the driver e2e test
+//! This exercises the whole host loop end-to-end — accept, parse the request,
+//! marshal a `Request` value, call the handler across the C ABI, read the
+//! boxed `Response` record back, allocate/release every payload through the
+//! runtime, write the response — against the built-in `hello` handler, so it
+//! needs no compiled app object. The cross-object FFI boundary (a
+//! separately-compiled Coddl handler linked into a foreign host) is proved
+//! hermetically by the driver e2e test
 //! `web_spine_mainless_handler_links_into_c_host`.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -51,18 +53,21 @@ fn coddl_web_serves_handler_body_over_http() {
 
     let mut stream = TcpStream::connect(&addr).expect("connect to coddl-web");
     stream
-        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .write_all(b"GET /users HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .expect("send request");
     // The server sets `Connection: close`, so it closes after one response and
     // `read_to_end` terminates.
     let mut resp = Vec::new();
     stream.read_to_end(&mut resp).expect("read response");
 
+    // The built-in handler hand-builds a `Response` record (status 200, empty
+    // headers, body `hello`) that the host reads back over the C ABI. The body
+    // has no trailing newline — it is the record's `body` Text verbatim.
     let text = String::from_utf8_lossy(&resp);
     assert!(text.starts_with("HTTP/1.1 200 OK"), "response head: {text:?}");
     assert!(
-        text.ends_with("\r\n\r\nhello\n"),
-        "expected body `hello\\n`, got: {text:?}"
+        text.ends_with("\r\n\r\nhello"),
+        "expected body `hello`, got: {text:?}"
     );
 
     drop(server); // explicit: stop the server before the test returns

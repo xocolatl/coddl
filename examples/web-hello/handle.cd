@@ -1,16 +1,27 @@
 program web_hello;
 
 // A web handler is an ordinary `oper` — nothing about it is web-specific except
-// the shape of its result. This is the web-host spine's handler (docs/webhost.md):
-// no request parameter yet, and a bare `Text` body (status/headers are hardcoded
-// host-side). `Request`/`Response` marshalling arrives with P2.
+// the shape of its parameter and result. This is the web-host P2 handler
+// (docs/webhost.md): it takes a `Request` tuple and returns a `Response` tuple,
+// using the `coddl::web` vocabulary. The Rust host (coddl-web) parses the HTTP
+// request into the `Request`, calls this across the C ABI, and reads the
+// `Response` back — status/headers/body all cross the boundary.
 //
-// There is no `main`: a handler module is compiled *mainless* and linked into a
-// foreign host that owns the socket loop. Build the demo server with:
+// `headers` is an empty relation for now (populated headers are a follow-up);
+// the body echoes the request path to prove data crosses both ways.
+//
+// There is no `main`: a handler module is compiled *mainless* and linked into
+// the foreign host that owns the socket loop. Build the demo server with:
 //
 //   coddl emit-obj examples/web-hello/handle.cd -o /tmp/handle.o
 //   CODDL_APP_OBJ=/tmp/handle.o cargo run -p coddl-web
-//   curl -s localhost:8000        # => hello
-oper handle{} -> Text [
-    "hello\n"
+//   curl -s localhost:8000/widgets      # => you asked for /widgets
+use module coddl::web;
+
+oper handle{ req: Request } -> Response [
+    {
+        status: 200,
+        headers: Relation {},
+        body: format{ template: f"you asked for {path}", args: { path: req.path } }
+    }
 ];
