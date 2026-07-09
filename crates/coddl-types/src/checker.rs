@@ -321,6 +321,13 @@ pub struct CheckOutput {
     /// which T0014 flags). For `.cddb`: base + virtual (similarly).
     /// Empty for `.cdmap` / `.cdstore` — those don't declare relvars.
     pub relvars: RelvarTable,
+    /// Every resolved type alias in scope — user `type Name = …;` declarations
+    /// and the type aliases of active (`use module`) stdlib modules (e.g.
+    /// `coddl::web`'s `Request`/`Response`). Each maps to its fully-resolved
+    /// `Type`. The ProcIR lowerer absorbs this so operator signatures naming an
+    /// alias resolve (the static `resolve_type_ref_quiet` knows only inline
+    /// types and builtins).
+    pub type_aliases: HashMap<String, Type>,
 }
 
 /// Tokenize, parse, and type-check `source` in the supplied dialect.
@@ -371,6 +378,7 @@ pub fn check(source: &str, file: FileId, file_kind: FileKind) -> CheckOutput {
         hints: tc.hints,
         mutable_spans: tc.mutable_spans,
         relvars: tc.relvars,
+        type_aliases: tc.type_aliases,
     }
 }
 
@@ -1205,9 +1213,11 @@ impl TypeChecker {
             }
         }
 
-        // The body's result type must match the declared return.
+        // The body's result type must match the declared return. The tail is
+        // checked *against* the return type (bidirectional), so an empty
+        // relation / nested tuple in the returned value infers from it.
         if let Some(body) = decl.body() {
-            let body_ty = self.check_block(&body, &mut scope);
+            let body_ty = self.check_block_expected(&body, &mut scope, &return_type);
             if !body_ty.assignable_to(&return_type) {
                 let span = body
                     .tail_expr()
@@ -1287,22 +1297,26 @@ impl TypeChecker {
     }
 
 
+    fn check_stmt(&mut self, stmt: &Stmt, scope: &mut Scope) {
+        match stmt {
+            Stmt::Let(l) => self.check_let_stmt(l, scope),
+            Stmt::Var(v) => self.check_var_stmt(v, scope),
+            Stmt::Assign(a) => self.check_assignment_stmt(a, scope),
+            Stmt::Truncate(t) => self.check_truncate_stmt(t, scope),
+            Stmt::Delete(d) => self.check_delete_stmt(d, scope),
+            Stmt::Insert(i) => self.check_insert_stmt(i, scope),
+            Stmt::Update(u) => self.check_update_stmt(u, scope),
+            Stmt::ExprStmt(e) => self.check_expr_stmt(e, scope),
+            Stmt::For(f) => self.check_for_stmt(f, scope),
+            Stmt::While(w) => self.check_while_stmt(w, scope),
+            Stmt::DoWhile(d) => self.check_do_while_stmt(d, scope),
+            Stmt::Load(l) => self.check_load_stmt(l, scope),
+        }
+    }
+
     fn check_block(&mut self, block: &Block, scope: &mut Scope) -> Type {
         for stmt in block.statements() {
-            match stmt {
-                Stmt::Let(l) => self.check_let_stmt(&l, scope),
-                Stmt::Var(v) => self.check_var_stmt(&v, scope),
-                Stmt::Assign(a) => self.check_assignment_stmt(&a, scope),
-                Stmt::Truncate(t) => self.check_truncate_stmt(&t, scope),
-                Stmt::Delete(d) => self.check_delete_stmt(&d, scope),
-                Stmt::Insert(i) => self.check_insert_stmt(&i, scope),
-                Stmt::Update(u) => self.check_update_stmt(&u, scope),
-                Stmt::ExprStmt(e) => self.check_expr_stmt(&e, scope),
-                Stmt::For(f) => self.check_for_stmt(&f, scope),
-                Stmt::While(w) => self.check_while_stmt(&w, scope),
-                Stmt::DoWhile(d) => self.check_do_while_stmt(&d, scope),
-                Stmt::Load(l) => self.check_load_stmt(&l, scope),
-            }
+            self.check_stmt(&stmt, scope);
         }
         match block.tail_expr() {
             Some(expr) => self.check_expr(&expr, scope),
@@ -2233,6 +2247,14 @@ impl TypeChecker {
                     _ => None,
                 };
                 self.check_relation_lit(r, scope, expected_heading)
+            }
+            // A tuple literal bound with a `Tuple` annotation propagates the
+            // annotation's field types (so an empty relation field infers).
+            Some(Expr::TupleLit(t)) if matches!(&declared, Some(Type::Tuple(_))) => {
+                let Some(Type::Tuple(h)) = &declared else {
+                    unreachable!("guarded by the match arm")
+                };
+                self.check_tuple_lit_expected(t, scope, &h.clone())
             }
             Some(v) => self.check_expr(v, scope),
             None => Type::Unknown,
@@ -3262,6 +3284,78 @@ impl TypeChecker {
             fields.push((name, ty));
         }
         Type::Tuple(Heading::new(fields))
+    }
+
+    /// Check `expr` against an `expected` type, propagating the expected type
+    /// into the positions where inference needs it (bidirectional checking): an
+    /// empty `Relation {}` / `Sequence []` literal takes its heading/element
+    /// from the expectation, and a tuple literal propagates per-field. Every
+    /// other shape falls back to bottom-up [`Self::check_expr`]. Used at the
+    /// return position and annotated bindings so e.g. a `Response` tuple can
+    /// write `{ …, headers: Relation {} }` and the empty relation infers its
+    /// `{name, value}` heading.
+    fn check_expr_expected(&mut self, expr: &Expr, scope: &mut Scope, expected: &Type) -> Type {
+        match (expr, expected) {
+            (Expr::RelationLit(r), Type::Relation(h)) => {
+                self.check_relation_lit(r, scope, Some(h.clone()))
+            }
+            (Expr::SequenceLit(s), Type::Sequence(elem)) => {
+                self.check_sequence_lit(s, scope, Some((**elem).clone()))
+            }
+            (Expr::TupleLit(t), Type::Tuple(h)) => self.check_tuple_lit_expected(t, scope, h),
+            _ => self.check_expr(expr, scope),
+        }
+    }
+
+    /// Like [`Self::check_tuple_lit`] but checks each field value against the
+    /// expected field type (looked up by name in `expected`), so nested empty
+    /// relations / tuples infer from the expectation. A field absent from
+    /// `expected` (an extra field) is checked bottom-up; the surplus surfaces as
+    /// a heading mismatch (`assignable_to`) at the call/return site.
+    fn check_tuple_lit_expected(
+        &mut self,
+        tup: &TupleLit,
+        scope: &mut Scope,
+        expected: &Heading,
+    ) -> Type {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut fields: Vec<(String, Type)> = Vec::new();
+        for field in tup.fields() {
+            let name_tok = match field.name() {
+                Some(t) => t,
+                None => continue,
+            };
+            let name = name_tok.text().to_string();
+            let ty = match field.value() {
+                Some(v) => match expected.lookup(&name) {
+                    Some(exp) => self.check_expr_expected(&v, scope, &exp.clone()),
+                    None => self.check_expr(&v, scope),
+                },
+                None => Type::Unknown,
+            };
+            if !seen.insert(name.clone()) {
+                self.error(
+                    self.token_span(&name_tok),
+                    "T0015",
+                    format!("duplicate field `{name}` in tuple literal"),
+                );
+                continue;
+            }
+            fields.push((name, ty));
+        }
+        Type::Tuple(Heading::new(fields))
+    }
+
+    /// Like [`Self::check_block`] but the tail expression is checked against
+    /// `expected` (bidirectional). Statements are unaffected.
+    fn check_block_expected(&mut self, block: &Block, scope: &mut Scope, expected: &Type) -> Type {
+        for stmt in block.statements() {
+            self.check_stmt(&stmt, scope);
+        }
+        match block.tail_expr() {
+            Some(expr) => self.check_expr_expected(&expr, scope, expected),
+            None => Type::unit(),
+        }
     }
 
     /// Walk a `Relation { <tuple-lit>, <tuple-lit>, … }` literal. The

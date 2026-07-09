@@ -219,6 +219,7 @@ fn lower_impl(
     }
     lowerer.absorb_private_relvars(&check_out.relvars);
     lowerer.absorb_builtin_relvars(&check_out.relvars);
+    lowerer.absorb_type_aliases(&check_out.type_aliases);
     let module = lowerer.lower_root(&root);
     let relir = std::mem::take(&mut lowerer.relir);
     // Merge in any diagnostics the lowerer itself emitted (e.g.
@@ -360,6 +361,11 @@ struct Lowerer {
     /// fully-pushed (or unreferenced) relvars get no startup materialization.
     legacy_used_relvars: HashSet<String>,
     /// In-memory `private` relvars: surface name → interned heading id.
+    /// Resolved type aliases (user `type Name = …;` + active-module aliases like
+    /// `coddl::web`'s `Request`/`Response`), absorbed from the typechecker. A
+    /// signature or annotation naming an alias resolves through this before the
+    /// static `resolve_type_ref_quiet` (which knows only inline types/builtins).
+    type_aliases: HashMap<String, Type>,
     /// Absorbed from the typechecker's relvar table; they have no SQL source,
     /// so their slots start empty and are filled by assignment.
     private_relvars: HashMap<String, HeadingId>,
@@ -420,6 +426,7 @@ impl Lowerer {
             seen_externs: HashSet::new(),
             headings: Vec::new(),
             heading_ids: HashMap::new(),
+            type_aliases: HashMap::new(),
             file,
             diagnostics: Vec::new(),
             collect_relir: false,
@@ -504,6 +511,26 @@ impl Lowerer {
             self.private_relvar_order.push(name.to_string());
             self.private_relvars.insert(name.to_string(), heading_id);
         }
+    }
+
+    /// Absorb the typechecker's resolved type aliases so signatures/annotations
+    /// naming an alias lower correctly.
+    fn absorb_type_aliases(&mut self, aliases: &HashMap<String, Type>) {
+        self.type_aliases = aliases.clone();
+    }
+
+    /// Resolve a `TypeRef` to a `Type`, consulting the absorbed alias table
+    /// first (a leaf name that is an alias resolves to its fully-resolved type),
+    /// then falling back to the static `resolve_type_ref_quiet` for inline
+    /// `Tuple`/`Relation`/`Sequence`/builtin forms. Used everywhere the lowerer
+    /// resolves a signature or binding annotation.
+    fn resolve_type_ref_aliased(&self, tr: &TypeRef) -> Type {
+        if let Some(name) = tr.name() {
+            if let Some(ty) = self.type_aliases.get(name.text()) {
+                return ty.clone();
+            }
+        }
+        resolve_type_ref_quiet(tr)
     }
 
     /// Absorb `builtin` relvars from the typechecker's relvar table: intern each
@@ -1222,14 +1249,20 @@ impl Lowerer {
                     .unwrap_or_default();
                 let pty = param
                     .type_ref()
-                    .map(|tr| self.proc_type_from_resolved(&resolve_type_ref_quiet(&tr)))
+                    .map(|tr| {
+                        let ty = self.resolve_type_ref_aliased(&tr);
+                        self.proc_type_from_resolved(&ty)
+                    })
                     .unwrap_or(ProcType::Unit);
                 params.push((pname, pty));
             }
         }
         let return_type = decl
             .return_type()
-            .map(|tr| self.proc_type_from_resolved(&resolve_type_ref_quiet(&tr)))
+            .map(|tr| {
+                let ty = self.resolve_type_ref_aliased(&tr);
+                self.proc_type_from_resolved(&ty)
+            })
             .unwrap_or(ProcType::Unit);
         (name, params, return_type)
     }
@@ -5140,7 +5173,7 @@ impl Lowerer {
             if r.tuples().next().is_none() {
                 let heading = type_ref
                     .as_ref()
-                    .and_then(|tr| match coddl_types::resolve_type_ref_quiet(tr) {
+                    .and_then(|tr| match self.resolve_type_ref_aliased(tr) {
                         Type::Relation(h) => Some(h),
                         _ => None,
                     })
@@ -5158,7 +5191,7 @@ impl Lowerer {
             if s.elements().next().is_none() {
                 if let Some(Type::Sequence(elem)) = type_ref
                     .as_ref()
-                    .map(|tr| coddl_types::resolve_type_ref_quiet(tr))
+                    .map(|tr| self.resolve_type_ref_aliased(tr))
                 {
                     if !matches!(elem.as_ref(), Type::Relation(_) | Type::Unknown) {
                         return self.lower_empty_sequence_lit(proc_type_from_type(&elem));
