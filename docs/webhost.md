@@ -5,13 +5,15 @@ HTTP parsing, routing, and JSON; Coddl provides the **models** (relvars) and the
 compiled as a host-callable library. The host builds a request value, calls a handler, and serializes the
 response it gets back.
 
-> **Status.** *Request/response built.* The vocabulary this doc marshals — `Request` / `Response` — is real:
-> it lives in the opt-in [`coddl::web`](prelude.md) standard-library module, brought into scope with
-> `use module coddl::web;`. **P1a, the Spine, and P2 (below) have landed:** `coddl emit-obj` produces a
-> mainless object, and the `coddl-web` crate is a single-threaded `TcpListener` that parses each request,
-> marshals a `Request` `Tuple` in, calls a handler across the C ABI, reads a `Response` `Tuple` back
-> (box-on-return), and writes the reply. What remains is routing (P3), lifecycle synthesis (P1b), and the
-> relvar-backed payoff (P4). It extends the first milestone: everything it relies on — the frontend, RelIR →
+> **Status.** *Request/response built, headers both ways.* The vocabulary this doc marshals — `Request` /
+> `Response` — is real: it lives in the opt-in [`coddl::web`](prelude.md) standard-library module, brought
+> into scope with `use module coddl::web;`. **P1a, the Spine, P2, and P3a (below) have landed:** `coddl
+> emit-obj` produces a mainless object, and the `coddl-web` crate is a single-threaded `TcpListener` that
+> parses real HTTP requests (headers + `Content-Length` body), marshals a `Request` `Tuple` in — including a
+> populated `{name, value}` headers relation — calls a handler across the C ABI, reads a `Response` `Tuple`
+> back (box-on-return), and writes the reply with the handler's response headers. What remains is routing
+> (a **userspace Coddl framework**, not host work — see the design note below), lifecycle synthesis (P1b),
+> and the relvar-backed payoff (P4). It extends the first milestone: everything it relies on — the frontend, RelIR →
 > SQL, ProcIR → native codegen, the `staticlib` runtime, user `oper`s with the C-ABI return convention — is
 > assumed already end-to-end per [milestone.md](milestone.md).
 
@@ -29,7 +31,8 @@ gunicorn (WSGI/ASGI) does. What they write is three things, and two of them are 
 | Pydantic / Django model | relvar + `Tuple` heading | relational middle |
 | ORM query (`User.objects.filter(…)`) | a relational query, **pushed to SQL** ([sqlemit.md](sqlemit.md)) | relational middle |
 | `@app.get("/users")` handler | `oper handle { req: Request } -> Response` | relational middle |
-| uvicorn accept loop + HTTP parse + routing + JSON | the **Rust host** (`coddl-web`) | FFI bottom |
+| URL routing / dispatch (`urls.py`) | a userspace Coddl framework — `handle` delegates (see design note) | relational middle |
+| uvicorn accept loop + HTTP parse + JSON | the **Rust host** (`coddl-web`) | FFI bottom |
 
 The transport half being absent from Coddl is *correct*, not a gap — it isn't the app developer's job in
 these frameworks either. It's **FFI-bottom "will stay Rust" work** by the self-hosting fault line in
@@ -86,16 +89,38 @@ it needs Coddl to grow a `Binary` type and socket builtins first.
 
 ## Responsibilities
 
-**The host (`coddl-web`, Rust) owns:** the TCP listener; HTTP/1.1 parsing; the route table
-(method + path → handler symbol); calling `coddl_app_init` once at startup and `coddl_app_shutdown` once at
-teardown; per-request marshalling of a `Request` value in and a `Response` value out; JSON (de)serialization;
-releasing every payload a handler returns. It knows no relational algebra — it calls handlers as opaque C
-functions across the `extern "C"` ABI, exactly the compiler/runtime boundary [workspace.md](workspace.md)
-defines.
+**The host (`coddl-web`, Rust) owns:** the TCP listener; HTTP/1.1 parsing; calling `coddl_app_init` once at
+startup and `coddl_app_shutdown` once at teardown; per-request marshalling of a `Request` value in and a
+`Response` value out; JSON (de)serialization; releasing every payload a handler returns. It calls **one**
+handler entry per app — `handle` — as an opaque C function across the `extern "C"` ABI, exactly the
+compiler/runtime boundary [workspace.md](workspace.md) defines. It knows no relational algebra, **and no
+routing** — see the design note below.
 
 **Coddl provides:** relvars (the models) and handler `oper`s (the views). A handler is an ordinary `oper`;
 nothing about it is web-specific except the shape of its parameter and result. The relational query inside a
-handler pushes to SQL like any other.
+handler pushes to SQL like any other. **Routing lives here too** — the app's single `handle` inspects the
+`Request` and delegates, in Coddl.
+
+### Design note: `coddl::web` is vocabulary, not a framework
+
+Routing is *application logic*, not *transport*, so by the self-hosting fault line it sits **above** the FFI
+bottom — in Coddl, not in the host. The host therefore stays at **one `handle` symbol** forever and never
+grows a router; the whole "how does a generic host bind app-specific handler symbols" question dissolves. An
+app's `handle` is itself the router: it reads `req.method` / `req.path` and delegates to sub-`oper`s. A "web
+framework" is then a **userspace Coddl library** of those idioms, not something the host or stdlib imposes.
+
+Correspondingly, the [`coddl::web`](prelude.md) module holds **no opinion on routing** (or middleware). It is
+two tiers: (1) the **contract types** `Request` / `Response`, which are mandatory because they are the literal
+ABI the host marshals; and (2) **assumption-free primitives**, added only demand-driven. Because
+`Request` / `Response` are an ordinary tuple + relation, **core algebra already expresses most of what a
+framework wants** (`req.headers where name = "host"`, `resp replace { status: 404 }`), so the module stays
+thin by default — and a thin module can't leak policy. Add an oper only when core algebra genuinely can't
+express it *and* a real framework has shown the pattern repeats (promote proven idioms **down**; don't
+speculate a grab-bag API **up**). Even a "neutral" helper can smuggle policy — a `header { req, name }` oper
+must pick absent-header behavior — so prefer the form that hands back the value/relation and lets the caller
+decide. Fuller pattern/param routing waits on Coddl `Text` primitives (push to each backend's native string
+functions), and relvar-driven dispatch-by-data on first-class `oper` references — both **language** features,
+deliberately not host workarounds.
 
 ## The boundary: the request/response ABI
 
@@ -120,8 +145,10 @@ as C arguments; no new convention is required. A relation-valued attribute (`hea
 `method (ptr, len)`, `path (ptr, len)` — which `coddl-web` builds and pushes per request.
 
 The host builds the `headers` relation value directly (see [memory.md](memory.md), "One-reference-per-cell")
-via `coddl_rc_alloc` against a hand-written `{ name, value }` descriptor — an **empty** relation for now,
-so the plumbing is exercised without host-side header parsing (populated headers are the follow-up).
+via `coddl_rc_alloc` against a hand-written `{ name, value }` descriptor, one record per parsed request
+header — mirroring `coddl_env_snapshot` (`crates/coddl-runtime/src/env.rs`): each cell is a real `rc_text`
+(rc = 1, moved in), and the host's single release of the relation after the call frees every cell through the
+drop walker. Identical `(name, value)` pairs are deduped so the relation keeps set semantics (RM Pro 1).
 
 ### Return (handler → host)
 
@@ -136,10 +163,13 @@ oper handle { req: Request } -> Response
 
 lowers to `define ptr @handle(<flattened Request args>)` returning one pointer to a 32-byte record with the
 name-sorted layout `body@0 (ptr@0, len@8), headers@16 (Relation ptr), status@24 (Integer i64)`. The host
-reads the record's cells directly through that layout — `status` and the `body` `(ptr, len)` — exactly as it
-reads any returned record. This reuses `coddl_query`-style `*mut u8` returns and pulls in **zero**
-plan/relvar machinery: reading a returned record touches only the RC header, and the record's baked-in
-descriptor drives the drop walker on release (freeing the inner `body` `Text` *and* the `headers` relation).
+reads the record's cells directly through that layout — `status`, the `body` `(ptr, len)`, and the `headers`
+relation pointer (walked into `(name, value)` pairs and emitted as HTTP header lines) — exactly as it reads
+any returned record. This reuses `coddl_query`-style `*mut u8` returns and pulls in **zero** plan/relvar
+machinery: reading a returned record touches only the RC header, and the record's baked-in descriptor drives
+the drop walker on release (freeing the inner `body` `Text` *and* the `headers` relation and its cells).
+Transport framing headers (`Content-Length`, `Connection`) are the host's — a handler-supplied copy is
+dropped so it can't fight the host's connection management.
 
 > **Superseded design.** Earlier drafts specced two lower-capability paths — a `-> Text` spine (body only,
 > status/headers hardcoded host-side) and `Response` as a *single-tuple `Relation`* — because
@@ -195,25 +225,27 @@ nothing — `coddl_runtime_init` / `_shutdown` are no-op stubs and the host may 
 ## The `coddl-web` crate
 
 A new crate at the host boundary, a sibling of [`coddl-driver`](driver.md): it owns transport and knows no
-relational algebra, exactly as the driver calls the frontend without knowing SQL. First cut: a
-single-threaded HTTP/1.1 `TcpListener`; `coddl_app_init` once; per-request dispatch through a host-side route
-table to the handler symbol; read the response, serialize, write, release; loop.
+relational algebra — and no routing — exactly as the driver calls the frontend without knowing SQL. Per
+request: a single-threaded HTTP/1.1 `TcpListener` parses the request, calls the app's single `handle`,
+reads the response, serializes, writes, releases; loop. (`coddl_app_init`/`_shutdown` enter once a handler
+touches a relvar — P1b.)
 
 **Single-threaded first is forced, not chosen.** The runtime assumes one linear program run: global
 Mutex-guarded registries (connections, databases, plans, relvar slots), a global atomic transaction-depth
 counter, and one connection per database path. A concurrent per-request model collides with all three; it is
 deferred (see below), and the spine proves the boundary without touching it.
 
-**Routes are data (a future note).** A route table is a relvar —
+**Routes are data (a future note) — in *userspace* Coddl, not the host.** A route table is a relvar —
 `Routes { name: Text, method: Text, pattern: Text, handler: Text }` — and the two directions are two queries
 over it: *forward* dispatch (`method` + `path` → `handler`) is a restriction, and *reverse* URL resolution
 (`name` + args → URL) is a lookup plus substitution. Django keeps a resolver and a separate reverse map;
-relationally they are one relvar queried two ways. The pattern-matching and substitution themselves stay
-host-side string work (not relational algebra), but the table becomes Coddl data. There is now a concrete
-precedent for a stdlib module exporting a *relvar* rather than only types: `coddl::env`'s `Environment` is a
-`builtin relvar` (read *and* written through ordinary relational DML — see [prelude.md](prelude.md)). A
-`Routes` relvar owned by `coddl::web` is the same shape, queried two ways. Deferred; the first cut is a plain
-host-side table.
+relationally they are one relvar queried two ways. This lives **above** the FFI line — a userspace Coddl web
+framework owns it; the host never routes (it stays at one `handle`). There is precedent for a stdlib module
+exporting a *relvar* rather than only types: `coddl::env`'s `Environment` is a `builtin relvar` (read *and*
+written through ordinary relational DML — see [prelude.md](prelude.md)), so a framework's `Routes` relvar is
+the same shape. Two language capabilities gate the ergonomic form: `Text` primitives for pattern/param
+matching (pushable to backends' native string functions), and first-class `oper` references to *call* the
+handler a matched row names. `coddl::web` itself stays neutral — it ships neither `Routes` nor a router.
 
 ## Deployment
 
@@ -308,20 +340,28 @@ dependency of the database payoff (P4), **not** of the request/response plumbing
 
 4. **P2 — richer request/response. DONE.** The handler takes a `Request` `Tuple` parameter (flattened to 7
    ABI args) and returns a `Response` `Tuple` by value (box-on-return; the host reads status + body from the
-   record). The host builds RC-headed request `method`/`path`/`body` `Text`s + an empty `headers` relation,
-   calls across the ABI, copies the body out, and releases every payload exactly once — all three sharp-edge
-   mitigations landed. The default handler hand-builds a `Response` record; a compiled
+   record). The host builds RC-headed request `method`/`path`/`body` `Text`s + a (then-empty) `headers`
+   relation, calls across the ABI, copies the body out, and releases every payload exactly once — all three
+   sharp-edge mitigations landed. The default handler hand-builds a `Response` record; a compiled
    `oper handle { req: Request } -> Response` (`examples/web-hello/handle.cd`) links in via `CODDL_APP_OBJ`.
-   `headers` on both sides is an **empty** relation for now — populated request/response headers are the
-   follow-up.
+   (`headers` crossed **empty** at P2; P3a fills them — see below.)
 
-5. **P3 — host harness proper.** A real host-side routing table and HTTP request parsing. Parallels P2 — it
-   only ever needs one handler symbol at a time.
+5. **P3a — real HTTP parsing + populated headers. DONE.** The host parses real HTTP requests (headers +
+   `Content-Length` body framing, accumulated across `read`s) and carries headers **both ways**: request
+   headers become a populated `{ name, value }` relation on the `Request` (mirroring `coddl_env_snapshot`),
+   and the `Response`'s headers relation is walked back into the reply (framing headers stay host-owned).
+   Pure host-side Rust — no relvars, no lifecycle, no routing.
 
-6. **P1b — lifecycle synthesis.** `coddl_app_init` / `coddl_app_shutdown` emitted from the plan. Needed only
+6. **Routing — a userspace Coddl framework (not host work).** The host stays at **one `handle` symbol**; an
+   app's `handle` inspects the `Request` and delegates, in Coddl (see the design note under Responsibilities).
+   Exact-path dispatch works today; ergonomic pattern/param routes wait on Coddl `Text` primitives, and
+   relvar-driven dispatch-by-data on first-class `oper` references — both language features, not host
+   workarounds.
+
+7. **P1b — lifecycle synthesis.** `coddl_app_init` / `coddl_app_shutdown` emitted from the plan. Needed only
    once a handler touches a relvar or a pushed plan — i.e. a dependency of P4, deferred until here.
 
-7. **P4 — payoff.** A handler whose body is a relational query against a relvar, pushed to SQL, returned as
+8. **P4 — payoff.** A handler whose body is a relational query against a relvar, pushed to SQL, returned as
    the response body — the "Django view + ORM query" in a single expression, null-free and backend-pushed:
 
    ```
@@ -341,10 +381,11 @@ dependency of the database payoff (P4), **not** of the request/response plumbing
 - **Handler overloading** — needs name mangling; the surface name is the linkage name today.
 - **`cdylib` hot-reload / plugin loading** — the `staticlib`-into-foreign-host cut ships first;
   [workspace.md](workspace.md)'s `cdylib` path is the later evolution.
-- **Populated `headers`** — request and response `headers` cross the ABI as an *empty* `{ name, value }`
-  relation today. Filling them host-side (parsing request headers into records; emitting response header
-  records) is the immediate follow-up; the relation-valued-attribute plumbing it rides on already works.
-- **Routes as a relvar + reverse URL resolution** — the two-queries-over-one-relvar model above.
+- **Chunked transfer + request pipelining** — the host frames the body by `Content-Length` only; a chunked
+  body is treated as empty, and bytes past `Content-Length` are dropped (`Connection: close`, no pipelining).
+- **Routing as a userspace Coddl framework** — the host stays at one `handle`; routing (incl. a `Routes`
+  relvar queried two ways for forward dispatch + reverse URL resolution) is userspace, gated on Coddl `Text`
+  primitives and first-class `oper` references (see the Responsibilities design note).
 
 ## Verification
 

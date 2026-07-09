@@ -1,27 +1,38 @@
 program web_hello;
 
 // A web handler is an ordinary `oper` — nothing about it is web-specific except
-// the shape of its parameter and result. This is the web-host P2 handler
+// the shape of its parameter and result. This is the web-host P3a handler
 // (docs/webhost.md): it takes a `Request` tuple and returns a `Response` tuple,
 // using the `coddl::web` vocabulary. The Rust host (coddl-web) parses the HTTP
 // request into the `Request`, calls this across the C ABI, and reads the
-// `Response` back — status/headers/body all cross the boundary.
+// `Response` back — status, headers, and body all cross the boundary.
 //
-// `headers` is an empty relation for now (populated headers are a follow-up);
-// the body echoes the request path to prove data crosses both ways.
+// Headers now flow BOTH ways (P3a):
+//   - Response direction: this handler returns a populated `headers` relation
+//     (one `Content-Type` tuple below); the host emits each as an HTTP header
+//     line in the reply.
+//   - Request direction: `req.headers` is the *parsed* incoming request headers
+//     as an ordinary `Relation { name: Text, value: Text }` — query it like any
+//     relation, e.g. `req.headers where name = "host"`. (This demo doesn't read
+//     them; a handler that does should use `load`+`for` rather than `extract`,
+//     which errors when a header is absent.)
+//
+// Routing lives in Coddl, not the host: an app's single `handle` inspects the
+// request and delegates. Here we just echo the path to prove data crosses.
 //
 // There is no `main`: a handler module is compiled *mainless* and linked into
 // the foreign host that owns the socket loop. Build the demo server with:
 //
 //   coddl emit-obj examples/web-hello/handle.cd -o /tmp/handle.o
 //   CODDL_APP_OBJ=/tmp/handle.o cargo run -p coddl-web
-//   curl -s localhost:8000/widgets      # => you asked for /widgets
+//   curl -is localhost:8000/widgets     # => Content-Type: text/plain
+//                                        #    you asked for /widgets
 use module coddl::web;
 
 oper handle{ req: Request } -> Response [
     {
         status: 200,
-        headers: Relation {},
+        headers: Relation { { name: "Content-Type", value: "text/plain" } },
         body: format{ template: f"you asked for {path}", args: { path: req.path } }
     }
 ];

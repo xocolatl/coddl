@@ -52,19 +52,30 @@ fn coddl_web_serves_handler_body_over_http() {
         .to_string();
 
     let mut stream = TcpStream::connect(&addr).expect("connect to coddl-web");
+    // The request carries headers (`Host`, `X-Test`) so the host's request-header
+    // build path runs — parse them into a populated `{name, value}` relation,
+    // marshal it across the ABI, and release it. The default handler ignores them.
     stream
-        .write_all(b"GET /users HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .write_all(
+            b"GET /users HTTP/1.1\r\nHost: localhost\r\nX-Test: v\r\nConnection: close\r\n\r\n",
+        )
         .expect("send request");
     // The server sets `Connection: close`, so it closes after one response and
     // `read_to_end` terminates.
     let mut resp = Vec::new();
     stream.read_to_end(&mut resp).expect("read response");
 
-    // The built-in handler hand-builds a `Response` record (status 200, empty
-    // headers, body `hello`) that the host reads back over the C ABI. The body
+    // The built-in handler hand-builds a `Response` record (status 200, one
+    // `Content-Type` header, body `hello`) that the host reads back over the C
+    // ABI. The `Content-Type` line proves the response-header **read** path (the
+    // host walked the returned `{name, value}` relation into the reply). The body
     // has no trailing newline — it is the record's `body` Text verbatim.
     let text = String::from_utf8_lossy(&resp);
     assert!(text.starts_with("HTTP/1.1 200 OK"), "response head: {text:?}");
+    assert!(
+        text.contains("Content-Type: text/plain\r\n"),
+        "expected the handler's Content-Type header, got: {text:?}"
+    );
     assert!(
         text.ends_with("\r\n\r\nhello"),
         "expected body `hello`, got: {text:?}"
