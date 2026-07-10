@@ -1,0 +1,54 @@
+#!/bin/sh
+# Pre-commit formatting gate.
+#
+# Rust: rustfmt's fixed defaults over the whole workspace (`cargo fmt --all
+# --check`) — the baseline is kept clean, so any drift fails fast.
+#
+# Coddl: `coddl fmt --check` on the *staged* `.cd` files only. Gating staged
+# files (not the whole tree) is deliberate: the Coddl formatter is still
+# maturing, so pre-existing `.cd` files are left as-is until a deliberate
+# `coddl fmt --write` sweep — you only reformat what you touch. When the
+# formatter's rules change, that sweep is the "expected churn".
+#
+# Installed by tools/git-hooks/install.sh as a shim in .git/hooks/pre-commit,
+# so local hooks (e.g. ctags) keep working. Bypass with `git commit --no-verify`.
+set -e
+
+repo="$(git rev-parse --show-toplevel)"
+cd "$repo"
+
+fail=0
+
+# ── Rust ─────────────────────────────────────────────────────────────────
+if ! cargo fmt --all --check >/dev/null 2>&1; then
+    echo "✗ Rust: not formatted — run 'cargo fmt --all' to fix." >&2
+    fail=1
+fi
+
+# ── Coddl (staged .cd files) ─────────────────────────────────────────────
+staged_cd="$(git diff --cached --name-only --diff-filter=ACM -- '*.cd')"
+if [ -n "$staged_cd" ]; then
+    if ! cargo build -q -p coddl-driver 2>/dev/null; then
+        echo "✗ cannot build coddl to check .cd formatting." >&2
+        exit 1
+    fi
+    coddl="$repo/target/debug/coddl"
+    cd_fail=0
+    for f in $staged_cd; do
+        [ -f "$f" ] || continue
+        if ! "$coddl" fmt --check "$f"; then
+            cd_fail=1
+        fi
+    done
+    if [ "$cd_fail" -ne 0 ]; then
+        echo "✗ Coddl: not formatted — run 'coddl fmt --write <file>' to fix." >&2
+        fail=1
+    fi
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "" >&2
+    echo "pre-commit: formatting check failed; commit aborted." >&2
+    echo "bypass with 'git commit --no-verify' if intentional." >&2
+    exit 1
+fi
