@@ -42,4 +42,6 @@ Format-on-save needs to be fast: milliseconds, not tens of milliseconds. The CST
 
 ## Out of scope for v1
 
-Auto-import sorting, comment reflow at line-width limits, configurable rules beyond `indent_width` and `format.edition`, format-only-the-diff (`coddl fmt --check` is in scope; rustfmt-style range-only formatting in the LSP can land later). Add these once the rules above stabilize and the idempotency tests stick.
+Auto-import sorting, comment reflow at line-width limits, configurable rules beyond `indent_width` and `format.edition`, format-only-the-diff (rustfmt-style range-only formatting in the LSP can land later). Add these once the rules above stabilize and the idempotency tests stick.
+
+`coddl fmt --check` (verify formatting; exit 1 if not) and `coddl fmt --write` (reformat in place) are implemented — see [driver.md](driver.md). The git pre-commit hook in `tools/git-hooks/` uses `--check` to gate staged `.cd` files; the formatter's rules are still maturing, so it gates only staged files, and a rules change is applied with a deliberate `--write` sweep.

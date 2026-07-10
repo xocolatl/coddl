@@ -51,6 +51,8 @@ fn main() -> ExitCode {
             eprintln!("  run <file>           compile + run <file>, propagating exit code");
             eprintln!("                       [--backend=llvm|cranelift] (default cranelift)");
             eprintln!("  fmt <file>           run the formatter on <file> (or stdin if -)");
+            eprintln!("                       [--check] verify formatting (exit 1 if not),");
+            eprintln!("                       [--write] reformat the file in place");
             eprintln!("  --version            print version");
             ExitCode::from(2)
         }
@@ -872,7 +874,26 @@ fn cmd_run(args: &[String]) -> ExitCode {
 }
 
 fn cmd_fmt(args: &[String]) -> ExitCode {
-    let Some((source, kind)) = read_input(args, "fmt") else {
+    // Modes: default writes the formatted text to stdout; `--check` verifies the
+    // input is already formatted (exit 1 if not, no output); `--write` rewrites
+    // the file in place. `--check`/`--write` back the git pre-commit hook and a
+    // future formatter-improvement sweep respectively.
+    let mut check = false;
+    let mut write = false;
+    let mut positional: Vec<String> = Vec::new();
+    for a in args {
+        match a.as_str() {
+            "--check" => check = true,
+            "--write" => write = true,
+            _ => positional.push(a.clone()),
+        }
+    }
+    if check && write {
+        eprintln!("coddl fmt: --check and --write are mutually exclusive");
+        return ExitCode::from(2);
+    }
+
+    let Some((source, kind)) = read_input(&positional, "fmt") else {
         return ExitCode::from(1);
     };
     if let Err(code) = require_cd(kind, "fmt") {
@@ -881,6 +902,47 @@ fn cmd_fmt(args: &[String]) -> ExitCode {
 
     let opts = coddl_fmt::FormatOptions::default();
     let out = coddl_fmt::format(&source, &opts, kind);
+
+    // The path label (`None` for stdin) — used in messages and as the `--write`
+    // target.
+    let path = positional.first().map(String::as_str).filter(|s| *s != "-");
+
+    // `--check` / `--write` refuse to act on input the formatter couldn't parse
+    // cleanly: reformatting around a parse error could drop or mangle bytes.
+    if (check || write) && !out.diagnostics.is_empty() {
+        for d in &out.diagnostics {
+            eprintln!("{}: {} [{}]", d.severity, d.message, d.code);
+        }
+        return ExitCode::from(1);
+    }
+
+    if check {
+        if out.text == source {
+            return ExitCode::SUCCESS;
+        }
+        match path {
+            Some(p) => eprintln!("coddl fmt: {p} is not formatted (run `coddl fmt --write {p}`)"),
+            None => eprintln!("coddl fmt: input is not formatted"),
+        }
+        return ExitCode::from(1);
+    }
+
+    if write {
+        let Some(p) = path else {
+            eprintln!("coddl fmt: --write needs a file path (cannot rewrite stdin)");
+            return ExitCode::from(2);
+        };
+        if out.text != source {
+            if let Err(err) = std::fs::write(p, out.text.as_bytes()) {
+                eprintln!("coddl fmt: write {p}: {err}");
+                return ExitCode::from(1);
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    // Default: emit the formatted text to stdout. Parse-error diagnostics still
+    // surface and fail, but the (best-effort) formatted text is written first.
     if io::stdout().write_all(out.text.as_bytes()).is_err() {
         return ExitCode::from(1);
     }

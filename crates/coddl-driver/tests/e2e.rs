@@ -5400,6 +5400,73 @@ fn fmt_reformats_to_canonical_and_is_idempotent() {
 }
 
 #[test]
+fn fmt_check_reports_unformatted_and_accepts_formatted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let messy = tmp.path().join("messy.cd");
+    std::fs::write(
+        &messy,
+        "program p;\noper   main {}[ write_line{message:\"hi\"} ; ];\n",
+    )
+    .expect("write messy.cd");
+    // `--check` on unformatted input: non-zero exit, no stdout.
+    let out = coddl()
+        .args(["fmt", "--check"])
+        .arg(&messy)
+        .output()
+        .expect("spawn coddl");
+    assert!(!out.status.success(), "--check must fail on messy input");
+    assert!(
+        out.stdout.is_empty(),
+        "--check must not emit formatted text"
+    );
+
+    // `--check` on already-canonical input: success.
+    let clean = tmp.path().join("clean.cd");
+    std::fs::write(
+        &clean,
+        "program p;\noper main{} [\n    write_line{ message: \"hi\" };\n];\n",
+    )
+    .expect("write clean.cd");
+    let out2 = coddl()
+        .args(["fmt", "--check"])
+        .arg(&clean)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out2.status.success(),
+        "--check must pass on formatted input: {:?}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+}
+
+#[test]
+fn fmt_write_reformats_in_place_and_is_idempotent() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let f = tmp.path().join("f.cd");
+    std::fs::write(
+        &f,
+        "program p;\noper   main {}[ write_line{message:\"hi\"} ; ];\n",
+    )
+    .expect("write f.cd");
+    let out = coddl()
+        .args(["fmt", "--write"])
+        .arg(&f)
+        .output()
+        .expect("spawn coddl");
+    assert!(out.status.success(), "--write failed: {:?}", out.status);
+    let canonical = "program p;\noper main{} [\n    write_line{ message: \"hi\" };\n];\n";
+    assert_eq!(std::fs::read_to_string(&f).expect("read f.cd"), canonical);
+
+    // A now-canonical file passes `--check`.
+    let chk = coddl()
+        .args(["fmt", "--check"])
+        .arg(&f)
+        .output()
+        .expect("spawn coddl");
+    assert!(chk.status.success(), "--check must pass after --write");
+}
+
+#[test]
 fn public_relvar_outside_transaction_diagnoses_t0025() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cd_path = tmp.path().join("bad.cd");

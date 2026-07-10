@@ -20,11 +20,18 @@ The driver is the user's first contact with Coddl. It calls into the frontend cr
 | `emit-obj <file>`   | file or `-`   | Cranelift object bytes → stdout (or `-o`)  | `-o <path>` optional           |
 | `compile <file>`    | file (or `-` with `-o`) | native binary at `<output>`     | `--backend=llvm`, `-o <basename>` |
 | `run <file>`        | file or `-`   | compiled binary's stdout/stderr            | `--backend=cranelift`          |
-| `fmt <file>`        | file or `-`   | formatted source → stdout                  | —                              |
+| `fmt <file>`        | file or `-`   | formatted source → stdout                  | `--check`, `--write`           |
 
 Every subcommand exits `0` on success, `1` on I/O / compile failure,
 `2` on usage error (unknown flag, missing required argument), and
 forwards the compiled binary's exit code for `run`.
+
+`fmt` has three modes: with no flag it writes the formatted source to
+stdout; `--check` writes nothing and exits `1` if the input isn't already
+formatted (the git pre-commit hook uses this — see `tools/git-hooks/`);
+`--write` rewrites the file in place (and needs a file, not stdin).
+`--check` and `--write` refuse to act on input the formatter can't parse
+cleanly, and are mutually exclusive.
 
 
 ## `explain`
