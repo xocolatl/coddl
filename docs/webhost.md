@@ -5,18 +5,19 @@ HTTP parsing, routing, and JSON; Coddl provides the **models** (relvars) and the
 compiled as a host-callable library. The host builds a request value, calls a handler, and serializes the
 response it gets back.
 
-> **Status.** *RawRequest/RawResponse running over the boxed ABI.* The vocabulary this doc marshals —
-> `RawRequest` / `RawResponse` — is real: it lives in the opt-in [`coddl::web`](prelude.md) standard-library
-> module, brought into scope with `use module coddl::web;`. **P1a, the Spine, P2, P3a, and the RawRequest
-> reshape (below) have landed:** `coddl emit-obj` produces a mainless object, and the `coddl-web` crate is a
-> single-threaded `TcpListener` that parses real HTTP requests (headers + `Content-Length` body), builds a
-> **boxed `RawRequest`** value — raw RFC-faithful components (`path`/`query` as possrep scalars, ordinality
-> headers), passed as one pointer — calls the handler across the C ABI, reads a **boxed `RawResponse`** back,
-> and writes the reply. What remains is routing (a **userspace Coddl framework**, not host work — see the
-> design note below), lifecycle synthesis (P1b), and the relvar-backed payoff (P4). It extends the first
-> milestone: everything it relies on — the frontend, RelIR →
-> SQL, ProcIR → native codegen, the `staticlib` runtime, user `oper`s with the C-ABI return convention — is
-> assumed already end-to-end per [milestone.md](milestone.md).
+> **Status.** *End-to-end: a relvar-backed handler serves SQL query results over HTTP.* The vocabulary this
+> doc marshals — `RawRequest` / `RawResponse` — is real: it lives in the opt-in [`coddl::web`](prelude.md)
+> standard-library module, brought into scope with `use module coddl::web;`. **P1a, the Spine, P2, P3a, the
+> RawRequest reshape, P1b, and P4 (the payoff) have landed:** `coddl emit-obj` produces a mainless object,
+> and the `coddl-web` crate is a single-threaded `TcpListener` that parses real HTTP requests (headers +
+> `Content-Length` body), builds a **boxed `RawRequest`** value — raw RFC-faithful components (`path`/`query`
+> as possrep scalars, ordinality headers), passed as one pointer — calls the handler across the C ABI, reads
+> a **boxed `RawResponse`** back, and writes the reply. A handler whose body queries a `public relvar` pushed
+> to SQL, through the synthesized `coddl_app_init`/`coddl_app_shutdown` lifecycle, works end-to-end
+> (`examples/web-users/`). What remains is routing (a **userspace Coddl framework**, not host work — see the
+> design note below) and the deferred items at the end. It extends the first milestone: everything it relies
+> on — the frontend, RelIR → SQL, ProcIR → native codegen, the `staticlib` runtime, user `oper`s with the
+> C-ABI return convention — is assumed already end-to-end per [milestone.md](milestone.md).
 
 **Last sync:** validated against `8ac70d9`; the `Request` / `Response` vocabulary has since landed as the
 `coddl::web` module. Revalidate the file:line and ABI claims below when the entry model, the calling
@@ -390,13 +391,35 @@ dependency of the database payoff (P4), **not** of the request/response plumbing
    them once around the accept loop. Proven with a private-relvar handler + C host under the leak gate; the
    public-relvar SQL path rides the same code, exercised by P4.
 
-9. **P4 — payoff.** A handler whose body is a relational query against a relvar, pushed to SQL, returned as
-   the response body — the "Django view + ORM query" in a single expression, null-free and backend-pushed:
+9. **P4 — payoff. DONE.** A handler whose body is a relational query against a SQLite-backed `public relvar`,
+   pushed to SQL, serialized into the response body — the "Django view + ORM query," null-free and
+   backend-pushed. `examples/web-users/` is the worked example (companions + `seed-db.sh`); `curl`ing it
+   returns the active users, one line per row.
+
+   The handler **builds its own response body** — it queries, `load`s the result, and loops to concatenate a
+   `Text`. There is no relation-serialization primitive and no host-side JSON: serialization is ordinary
+   handler code (the `coddl::web` vocabulary stays neutral). A `dump_relation { self: Relation H } -> Text`
+   builtin (the value-returning twin of `write_relation`) was considered and deferred — the handler doesn't
+   need it.
 
    ```
-   oper handle_users { req: RawRequest } -> RawResponse
-     [ Users where active = true project { name, email } ]
+   oper handle { _req: RawRequest } -> RawResponse [
+       let active = transaction [ Users where active project { name, email } ];
+       var rows;  load rows from active order [ asc name ];
+       var body := "";
+       for r in rows do [ body := body || r.name || " <" || r.email || ">\n"; ];
+       { status: 200,
+         headers: Relation { { name: "Content-Type", value: "text/plain", ordinality: 0 } },
+         body }
+   ];
    ```
+
+   Two capabilities landed under P4 to make the handler expressible: **loop-carried owned `Text`** (the
+   `body := body || …` accumulator across a loop — the deferred T0076 case, now RC-correct on both backends),
+   and **bare-Boolean predicate pushdown** (`where active` ≡ `where active = true`, pushed as `WHERE
+   "active" = ?`; the formatter canonicalizes to the bare form, so both must push). Proven by the hermetic
+   e2e `app_init_drives_a_mainless_public_relvar_sql_query` (query pushed to SQL through the synthesized
+   `coddl_app_init`, under the leak gate) and the manual `coddl-web` + `curl` flow above.
 
 ## What's deferred
 

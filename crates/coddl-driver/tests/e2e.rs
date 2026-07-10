@@ -44,6 +44,7 @@ fn fixtures_dir() -> &'static Path {
             ("nullary-relations", NULLARY_RELATIONS_SRC),
             ("headed-empty-relation", HEADED_EMPTY_RELATION_SRC),
             ("var-accum", VAR_ACCUM_SRC),
+            ("text-accum", TEXT_ACCUM_SRC),
             ("uninit-var", UNINIT_VAR_SRC),
             ("for-in-demo", FOR_IN_DEMO_SRC),
             ("relvar-if", RELVAR_IF_SRC),
@@ -308,6 +309,34 @@ int main(void) {
 }
 ";
 
+// The P4 query host: identical in shape to `LIFECYCLE_HOST_C`, but the mainless
+// oper it calls (`query_active`) runs a relvar query *pushed to SQL* through the
+// synthesized `coddl_app_init` (RegisterDatabase + RegisterPlan) and returns the
+// serialized body. Proves the public-relvar + SQL + database path P1b synthesized
+// but never exercised.
+const QUERY_HOST_C: &str = "\
+#include <stddef.h>
+#include <unistd.h>
+extern void coddl_app_init(void);
+extern void coddl_app_shutdown(void);
+extern char *query_active(size_t *ret_len_out);
+extern void coddl_rc_release(char *ptr);
+int main(void) {
+    coddl_app_init();
+    size_t len = 0;
+    char *body = query_active(&len);
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(1, body + off, len - off);
+        if (n <= 0) break;
+        off += (size_t)n;
+    }
+    coddl_rc_release(body);
+    coddl_app_shutdown();
+    return 0;
+}
+";
+
 // `coddl::env`'s `Environment` builtin relvar: the process environment read as
 // a relation. Restricted to a harness-set variable so stdout is deterministic
 // (the raw environment is machine-dependent). `name` is the key, so the
@@ -533,6 +562,39 @@ oper main {} [
         total := 0;
     ];
     write_line { message: to_text { self: total } };
+];
+";
+
+// Loop-carried `Text` accumulation — the web-handler body-building idiom
+// (docs/webhost.md P4). Exercises all three loop forms reassigning an owned
+// `Text` var across the back-edge: a counted `for`, a `for-in` over a sequence,
+// and a `while` (mixing a Text carry with an Integer counter carry). Each
+// concat frees the previous accumulator, so the whole run is leak-clean under
+// the default gate — the proof that lifting T0076 for loop-carried Text is
+// refcount-correct on both backends.
+const TEXT_ACCUM_SRC: &str = "\
+program text_accum;
+oper main {} [
+    var a := \"\";
+    for i := 1 to 3 do [
+        a := a || \"x\";
+    ];
+    write_line { message: a };
+
+    let names = Sequence [\"Alice\", \"Bob\"];
+    var b := \"\";
+    for n in names do [
+        b := b || n || \";\";
+    ];
+    write_line { message: b };
+
+    var c := \"\";
+    var j := 0;
+    while j < 2 do [
+        c := c || \"y\";
+        j := j + 1;
+    ];
+    write_line { message: c };
 ];
 ";
 
@@ -1192,6 +1254,39 @@ fn coddl_run_cranelift_var_accumulator() {
 }
 
 #[test]
+fn coddl_run_llvm_text_accumulator() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("text-accum"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=llvm failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // for: "" ++ x×3; for-in: Alice; Bob;; while: "" ++ y×2. Leak-gated.
+    assert_eq!(out.stdout, b"xxx\nAlice;Bob;\nyy\n");
+}
+
+#[test]
+fn coddl_run_cranelift_text_accumulator() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("text-accum"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend=cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"xxx\nAlice;Bob;\nyy\n");
+}
+
+#[test]
 fn coddl_run_llvm_for_in() {
     ensure_runtime_built();
     let out = coddl()
@@ -1580,6 +1675,122 @@ fn app_init_shutdown_drive_a_mainless_relvar_handler() {
         String::from_utf8_lossy(&run.stderr)
     );
     assert_eq!(run.stdout, b"hi");
+}
+
+/// P4 — the payoff. A *mainless* module whose oper runs a relational query
+/// against a SQLite-backed `public relvar`, **pushed to SQL**, and serializes the
+/// result into a `Text` (the `load` + loop body-building idiom the web handler
+/// uses). This is the public-relvar + SQL + database path `coddl_app_init`
+/// synthesizes (RegisterDatabase + RegisterPlan) but that P1b's private-relvar
+/// test never exercised. A C host stands in for `coddl-web`: `coddl_app_init` →
+/// `query_active` (query pushed to SQL against the seeded db) → `coddl_app_shutdown`.
+/// Run under the leak gate so the whole cycle is proven RC-balanced — including
+/// the loop-carried `Text` accumulator.
+#[test]
+fn app_init_drives_a_mainless_public_relvar_sql_query() {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    // 1. The mainless module: a public relvar + a handler-shaped oper whose body
+    //    is a relvar query pushed to SQL, serialized one line per row. Owns its
+    //    source (a compiler-property test must not couple to a hand-editable
+    //    example). `where active` is the bare-Boolean predicate (pushes as
+    //    `active = 1`); `order [asc name]` makes the output deterministic.
+    let cd = tmp.path().join("query.cd");
+    std::fs::write(
+        &cd,
+        "program web_users_q;\n\
+         database users;\n\
+         public relvar Users { id: Integer, name: Text, email: Text, active: Boolean } key { id };\n\
+         oper query_active {} -> Text [\n\
+             let active = transaction [ Users where active project { name, email } ];\n\
+             var rows;\n\
+             load rows from active order [asc name];\n\
+             var body := \"\";\n\
+             for r in rows do [\n\
+                 body := body || r.name || \" <\" || r.email || \">\\n\";\n\
+             ];\n\
+             body\n\
+         ];\n",
+    )
+    .expect("write query.cd");
+
+    // 2. Companions + seed: two active users (Alice, Carol) and one inactive
+    //    (Bob), so the pushed `WHERE active` genuinely filters. Boolean maps to
+    //    an INTEGER column (0/1).
+    std::fs::write(
+        tmp.path().join("users.cddb"),
+        "database users;\n\
+         base relvar Users { id: Integer, name: Text, email: Text, active: Boolean } key { id };\n",
+    )
+    .expect("write users.cddb");
+    std::fs::write(
+        tmp.path().join("users.cdstore"),
+        "store for users;\n\
+         backend sqlite { file: \"users.sqlite\" };\n\
+         relvar Users: table \"users\" { columns: { id, name, email, active } };\n",
+    )
+    .expect("write users.cdstore");
+    let db = tmp.path().join("users.sqlite");
+    let seed = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "sqlite3 '{}' \"CREATE TABLE users (id INTEGER NOT NULL, name TEXT NOT NULL, email TEXT NOT NULL, active INTEGER NOT NULL, PRIMARY KEY (id)); INSERT INTO users (id, name, email, active) VALUES (1,'Alice','alice@example.com',1),(2,'Bob','bob@example.com',0),(3,'Carol','carol@example.com',1);\"",
+            db.display()
+        ))
+        .status()
+        .expect("invoke sqlite3");
+    assert!(seed.success(), "users fixture seed failed");
+
+    // 3. Emit the mainless object, link it with the runtime staticlib + the C host.
+    let obj = tmp.path().join("query.o");
+    let emit = coddl()
+        .args(["emit-obj"])
+        .arg(&cd)
+        .arg("-o")
+        .arg(&obj)
+        .output()
+        .expect("spawn coddl emit-obj");
+    assert!(
+        emit.status.success(),
+        "emit-obj failed: stderr=\n{}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    let host_c = tmp.path().join("query_host.c");
+    std::fs::write(&host_c, QUERY_HOST_C).expect("write query_host.c");
+    let bin = tmp.path().join("query_host");
+    let runtime = workspace_root().join("target/debug/libcoddl_runtime.a");
+    let link = Command::new("cc")
+        .arg(&obj)
+        .arg(&runtime)
+        .arg(&host_c)
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .expect("spawn cc");
+    assert!(
+        link.status.success(),
+        "cc link failed: stderr=\n{}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    // 4. Run under the leak gate. `CODDL_USERS_FILE` points at the temp db so the
+    //    run is CWD-independent. Ordered by name → deterministic bytes.
+    let run = Command::new(&bin)
+        .env("CODDL_LEAK_CHECK", "1")
+        .env("CODDL_USERS_FILE", &db)
+        .output()
+        .expect("run query host");
+    assert!(
+        run.status.success(),
+        "query host exit {}: stderr=\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        run.stdout,
+        b"Alice <alice@example.com>\nCarol <carol@example.com>\n"
+    );
 }
 
 /// The cross-backend equivalence invariant: for any source program,

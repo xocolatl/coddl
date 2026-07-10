@@ -1,0 +1,14 @@
+// users.cddb
+//
+// Conceptual schema for the `users` database — the SQL-backed catalog the P4 web
+// handler queries. The heading mirrors the `public relvar Users` in handle.cd.
+
+database users;
+
+base relvar Users {
+    id: Integer,
+    name: Text,
+    email: Text,
+    active: Boolean,
+}
+key { id };

@@ -1,0 +1,67 @@
+// handle.cd
+//
+// The P4 web-host payoff (docs/webhost.md §9): a mainless handler whose body is
+// a relational query against a SQLite-backed `public relvar`, pushed to SQL, and
+// serialized into the HTTP response body — the "Django view + ORM query in one
+// expression," null-free and backend-pushed.
+//
+// The handler builds its own response: it queries the active users, `load`s the
+// result and loops to concatenate a `text/plain` body. No host-side JSON, no
+// relation-serialization primitive — the handler owns the response, as ordinary
+// Coddl. (The loop-carried `Text` accumulator relies on the T0076 lift that
+// shipped with this milestone.)
+//
+// Public-relvar reads sit inside a `transaction [...]` (OO Pre 4 / T0025).
+//
+// The .cd-family (storage stays out of D — RM Pro 6):
+//   handle.cd       — this program: the external schema + the handler
+//   users.cddb      — database catalog (conceptual schema)
+//   users.cdstore   — conceptual -> physical (SQLite) binding
+//   seed-db.sh      — recreates users.sqlite with the demo data
+//
+// There is no `main`: a handler module is compiled *mainless* and linked into
+// the `coddl-web` host that owns the socket loop. Run it end-to-end:
+//
+//   sh examples/web-users/seed-db.sh
+//   coddl emit-obj examples/web-users/handle.cd -o /tmp/handle.o
+//   CODDL_APP_OBJ=/tmp/handle.o \
+//     CODDL_USERS_FILE=$PWD/examples/web-users/users.sqlite \
+//     cargo run -p coddl-web
+//   curl -s localhost:8000/        # => Alice <alice@example.com>
+//                                   #    Carol <carol@example.com>
+use module coddl::web;
+
+program web_users;
+database users;
+
+public relvar Users {
+    id: Integer,
+    name: Text,
+    email: Text,
+    active: Boolean,
+} key { id };
+
+// This handler lists every active user regardless of the request path, so it
+// ignores `req` (a real app's single `handle` would inspect it and route).
+oper handle{ _req: RawRequest } -> RawResponse [
+    let active_users = transaction [
+        var rows;
+        let active = Users where active project { name, email };
+        load rows from active order [asc name];
+        rows
+    ];
+
+    var body := "";
+    for user in active_users do [
+        body := body || format{
+            template: f"{name} <{email}>\n",
+            args: { name: user.name, email: user.email }
+        };
+    ];
+
+    {
+        status: 200,
+        headers: Relation { { name: "Content-Type", value: "text/plain", ordinality: 0 } },
+        body
+    }
+];

@@ -20,7 +20,12 @@ This doc describes the **target** RelIR. The code implements a thin slice of it;
 - Restriction predicates are an `attr <cmp> literal` comparison
   (`Predicate::AttrCmp { attr, op: CmpOp, value }`), where `<cmp>` is `=`/`<>`
   (Integer/Text/Boolean) or `<`/`<=`/`>`/`>=` (Integer). Only `=` pins a value,
-  so only it bounds cardinality for `DISTINCT`-elision.
+  so only it bounds cardinality for `DISTINCT`-elision. A **bare Boolean
+  attribute** predicate `R where flag` is the equality `flag = true` (a
+  Boolean-valued attribute is itself a proposition) and pushes as
+  `Predicate::AttrCmp { attr, Eq, Boolean(true) }` → `WHERE "flag" = ?` — the
+  formatter canonicalizes `flag = true` to the bare form, so both surface
+  spellings must push identically.
 - A **conjunctive `where`** (`R where p and q and …`) of pushable comparisons
   pushes: the lowerer (`collect_conjuncts`) splits it into one `Restrict` per
   conjunct — the identical tree the stacked spelling `R where p where q` builds —

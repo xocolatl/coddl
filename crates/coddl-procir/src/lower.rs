@@ -727,15 +727,20 @@ impl Lowerer {
     /// The outer `var`s reassigned within `body`, captured as
     /// `(name, pre-join value, type)` for block-parameter threading across a
     /// control-flow join (a loop back-edge or an `if` merge). Value-typed vars
-    /// thread with no refcount work and are unconditionally correct. A carried
-    /// var of a heap-managed / `Text` type is **not yet lowered** — refcount-
-    /// correct heap mutation across a join is future work — so each emits T0076
-    /// at `span` and is excluded (the error makes the IR unsafe to run, so the
-    /// body's own straight-line rebind never executes).
+    /// thread with no refcount work. When `allow_text` is set (the loop forms),
+    /// an owned `Text` carry is threaded too — the caller marks its header param
+    /// owned so the per-iteration old-value release fires and the final value is
+    /// released once at scope exit. A carried var of a heap-managed type
+    /// (relation/sequence/boxed tuple), or a `Text` when `allow_text` is unset
+    /// (the `if` merge), is **not yet lowered** — refcount-correct heap mutation
+    /// across that join is future work — so each emits T0076 at `span` and is
+    /// excluded (the error makes the IR unsafe to run, so the body's own
+    /// straight-line rebind never executes).
     fn carried_value_vars(
         &mut self,
         bodies: &[Option<&Block>],
         span: Span,
+        allow_text: bool,
     ) -> Vec<(String, ValueId, ProcType)> {
         let mut names = Vec::new();
         for body in bodies {
@@ -752,7 +757,7 @@ impl Lowerer {
             let Some((v, ty)) = self.lookup_local(&name) else {
                 continue; // a relvar or inner-scope name — not an outer var
             };
-            if Self::is_heap_managed(&ty) || matches!(ty, ProcType::Text) {
+            if Self::is_heap_managed(&ty) || (matches!(ty, ProcType::Text) && !allow_text) {
                 self.diagnostics.push(Diagnostic::error(
                     span,
                     "T0076",
@@ -2465,7 +2470,7 @@ impl Lowerer {
         // block parameters — the SSA join of the entry edge (pre-loop values)
         // and the back-edge (end-of-iteration values). Captured before any
         // block is sealed, while `locals` still holds their pre-loop values.
-        let carried = self.carried_value_vars(&[user_body.as_ref()], loop_span);
+        let carried = self.carried_value_vars(&[user_body.as_ref()], loop_span, true);
 
         let header = self.fresh_block();
         let body = self.fresh_block();
@@ -2491,6 +2496,12 @@ impl Lowerer {
         for (name, _, ty) in &carried {
             let p = self.fresh_value();
             self.record_type(p, ty.clone());
+            // An owned `Text` carry: mark the header param owned so the
+            // reassignment inside the body releases the previous value and the
+            // final value is released once at scope exit.
+            if matches!(ty, ProcType::Text) {
+                self.mark_text_owned(p);
+            }
             header_params.push((p, ty.clone()));
             carried_params.push((name.clone(), p, ty.clone()));
         }
@@ -2578,7 +2589,7 @@ impl Lowerer {
     fn lower_while_stmt(&mut self, stmt: &WhileStmt) {
         let span = self.node_span(stmt.syntax());
         let body = stmt.body();
-        let carried = self.carried_value_vars(&[body.as_ref()], span);
+        let carried = self.carried_value_vars(&[body.as_ref()], span, true);
 
         let header = self.fresh_block();
         let body_block = self.fresh_block();
@@ -2599,6 +2610,9 @@ impl Lowerer {
         for (name, _, ty) in &carried {
             let p = self.fresh_value();
             self.record_type(p, ty.clone());
+            if matches!(ty, ProcType::Text) {
+                self.mark_text_owned(p);
+            }
             header_params.push((p, ty.clone()));
             carried_params.push((name.clone(), p, ty.clone()));
         }
@@ -2661,7 +2675,7 @@ impl Lowerer {
     fn lower_do_while_stmt(&mut self, stmt: &DoWhileStmt) {
         let span = self.node_span(stmt.syntax());
         let body = stmt.body();
-        let carried = self.carried_value_vars(&[body.as_ref()], span);
+        let carried = self.carried_value_vars(&[body.as_ref()], span, true);
 
         let body_block = self.fresh_block();
         let latch = self.fresh_block();
@@ -2681,6 +2695,9 @@ impl Lowerer {
         for (name, _, ty) in &carried {
             let p = self.fresh_value();
             self.record_type(p, ty.clone());
+            if matches!(ty, ProcType::Text) {
+                self.mark_text_owned(p);
+            }
             body_params.push((p, ty.clone()));
             carried_params.push((name.clone(), p, ty.clone()));
         }
@@ -2745,7 +2762,7 @@ impl Lowerer {
         // not-taken edge forwards the pre-`if` value (a missing `else` gets an
         // explicit skip block for that, since `CondBr` carries no args).
         // Captured before the arms rebind `locals`.
-        let carried = self.carried_value_vars(&[then_body.as_ref(), else_body.as_ref()], span);
+        let carried = self.carried_value_vars(&[then_body.as_ref(), else_body.as_ref()], span, false);
 
         let cond = self.lower_expr(&cond_expr);
 
@@ -4105,6 +4122,21 @@ impl Lowerer {
     /// non-literal operands, comparisons other than `=`) returns `None` so
     /// the restriction falls back to the in-process `where` path.
     fn build_predicate(&self, expr: &Expr, heading: &Heading) -> Option<Predicate> {
+        // A bare Boolean attribute reference `attr` is the predicate `attr = true`
+        // — a Boolean-valued attribute is itself a proposition. Push it as an
+        // equality so `R where flag` filters in SQL exactly like `R where flag =
+        // true` (the formatter canonicalizes the latter to the former, so both
+        // surface forms must push to the same `WHERE flag = 1`).
+        if let Some(attr) = attr_ref_name(expr) {
+            return match heading.lookup(&attr) {
+                Some(Type::Boolean) => Some(Predicate::AttrCmp {
+                    attr,
+                    op: CmpOp::Eq,
+                    value: RelLiteral::Boolean(true),
+                }),
+                _ => None,
+            };
+        }
         let b = match expr {
             Expr::Binary(b) => b,
             _ => return None,
@@ -6578,12 +6610,44 @@ mod tests {
     }
 
     #[test]
-    fn heap_var_carried_across_loop_diagnoses_t0076() {
-        // Refcount-correct heap mutation across a join is future work — a
-        // `Text` var reassigned inside a loop is a lowering error, not a
-        // miscompile.
+    fn text_var_carried_across_loop_threads_as_owned_block_param() {
+        // An owned `Text` accumulator reassigned in a counted loop rides a
+        // header block parameter (like the Integer case) and is RC-managed: the
+        // reassignment releases the previous value each iteration, so lowering
+        // succeeds with no T0076.
         let src = "program p;\n\
-                   oper main {} [ var s := \"a\"; for i := 1 to 2 do [ s := s; ]; ];";
+                   oper main {} [ var s := \"a\"; for i := 1 to 2 do [ s := s || \"b\"; ]; ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").expect("main");
+        // The loop header (sealed with a `CondBr`) carries the counter plus the
+        // Text accumulator.
+        let header = main
+            .blocks
+            .iter()
+            .find(|b| matches!(b.terminator, Terminator::CondBr { .. }))
+            .expect("loop header block");
+        assert!(
+            header.params.iter().any(|(_, t)| matches!(t, ProcType::Text)),
+            "loop header carries the Text accumulator as a block param, got {:?}",
+            header.params
+        );
+        // The reassignment releases the previous owned Text each iteration.
+        assert!(
+            main.blocks
+                .iter()
+                .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Release { .. }))),
+            "reassignment releases the previous owned Text each iteration"
+        );
+    }
+
+    #[test]
+    fn text_var_carried_across_if_diagnoses_t0076() {
+        // Text-carried across a *loop* now lowers, but across an `if` merge it
+        // is still deferred (refcount-correct heap mutation across that join is
+        // future work) — it remains a lowering error, not a miscompile.
+        let src = "program p;\n\
+                   oper main {} [ var s := \"a\"; \
+                   if true then [ s := s || \"b\"; ] else [ s := s || \"c\"; ]; let _z = s; ];";
         let out = lower(src, FileId(0));
         assert!(
             out.diagnostics.iter().any(|d| d.code == "T0076"),
@@ -6651,6 +6715,36 @@ oper main {}\n\
         plan
     }
 
+    /// A public relvar with a `Boolean` attribute — the shape a bare-Boolean
+    /// predicate (`Flags where active`) pushes against.
+    fn flags_plan() -> Plan {
+        use coddl_plan::{BackendKind, ResolvedPublicRelvar, WritePolicy};
+        use coddl_types::RelvarTable;
+        Plan {
+            program_name: "flags".to_string(),
+            database_name: Some("flags".to_string()),
+            cd_relvars: RelvarTable::default(),
+            cddb_relvars: RelvarTable::default(),
+            backend_kind: BackendKind::Sqlite,
+            resolved: vec![ResolvedPublicRelvar {
+                app_name: "Flags".to_string(),
+                catalog_name: "Flags".to_string(),
+                heading: Heading::new(vec![
+                    ("id".to_string(), Type::Integer),
+                    ("active".to_string(), Type::Boolean),
+                ]),
+                table_name: "flags".to_string(),
+                columns: vec![
+                    ("id".to_string(), "id".to_string()),
+                    ("active".to_string(), "active".to_string()),
+                ],
+                keys: vec![vec!["id".to_string()]],
+                write_policy: WritePolicy::ReadOnly,
+            }],
+            db_file_default: Some("/tmp/flags.sqlite".to_string()),
+        }
+    }
+
     fn lower_ok_with_plan(src: &str, plan: &Plan) -> Module {
         let out = lower_with_plan(src, FileId(0), Some(plan));
         // Only errors block lowering; T0032 unused-binding warnings don't.
@@ -6683,6 +6777,43 @@ oper main {}\n\
         // The compile path never clones a RelExpr — `relir` stays empty.
         let out = lower_with_plan(HELLO_WORLD_DB, FileId(0), Some(&greetings_plan()));
         assert!(out.relir.is_empty());
+    }
+
+    const FLAGS_BARE_BOOL: &str = "\
+program flags;\n\
+database flags;\n\
+\n\
+public relvar Flags {\n\
+    id: Integer,\n\
+    active: Boolean,\n\
+}\n\
+key { id };\n\
+\n\
+oper main {}\n\
+[\n\
+    let f = transaction [\n\
+        Flags where active\n\
+    ];\n\
+];\n";
+
+    #[test]
+    fn bare_boolean_predicate_pushes_as_equality() {
+        // `R where flag` (a bare Boolean attribute) is `R where flag = true` and
+        // must push to SQL as an equality — the two surface forms are equivalent
+        // (the formatter canonicalizes `= true` to the bare form), so both reach
+        // the backend as `WHERE "active" = ?`.
+        let out = explain_with_plan(FLAGS_BARE_BOOL, FileId(0), Some(&flags_plan()));
+        assert_eq!(out.relir.len(), 1, "one pushed query expected");
+        let entry = &out.relir[0];
+        assert!(
+            entry.sql.contains(r#"WHERE "active" = ?"#),
+            "bare Boolean predicate should push as an equality, got: {}",
+            entry.sql
+        );
+        assert_eq!(
+            entry.expr.render(),
+            "Restrict { active = true }\n  RelvarRef Flags { db: flags, table: flags }"
+        );
     }
 
     const HELLO_WORLD_DB_CONJUNCT: &str = "\
