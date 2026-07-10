@@ -304,8 +304,8 @@ impl<'a> Parser<'a> {
     /// dialect) on the resulting tree rather than producing a generic
     /// P0001 parse error.
     fn parse_item(&mut self) {
-        if self.at_keyword("program") {
-            self.parse_program_decl();
+        if self.at_keyword("program") || self.at_keyword("library") || self.at_keyword("module") {
+            self.parse_file_header();
         } else if self.at_keyword("database") {
             self.parse_database_binding();
         } else if self.at_keyword("public") {
@@ -355,18 +355,30 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
-    /// `program <name>;`. The trailing semicolon is required; missing
-    /// pieces produce a diagnostic but the node still closes cleanly.
-    fn parse_program_decl(&mut self) {
-        debug_assert!(self.at_keyword("program"));
+    /// `( program | library | module ) <name>;` — the file-kind header that
+    /// every `.cd` compilation unit opens with. The leading keyword records
+    /// the kind (`program` → executable, `library` → C-ABI artifact, `module`
+    /// → an intermediate unit linked into a consumer); the name is the bare
+    /// leaf identity. All three share the `PROGRAM_DECL` node — the kind is
+    /// read back from the leading keyword token via `ProgramDecl::kind()`. The
+    /// trailing semicolon is required; missing pieces produce a diagnostic but
+    /// the node still closes cleanly. Whether a header is present, unique, and
+    /// first is a compilation-unit rule enforced in the plan layer, not here.
+    fn parse_file_header(&mut self) {
+        debug_assert!(
+            self.at_keyword("program") || self.at_keyword("library") || self.at_keyword("module")
+        );
         self.start_node(SyntaxKind::PROGRAM_DECL);
-        self.bump(); // "program"
+        self.bump(); // "program" | "library" | "module"
 
         if !self.eat(SyntaxKind::IDENT) {
-            self.error("P0002", "expected program name");
+            self.error(
+                "P0002",
+                "expected file name after `program`/`library`/`module`",
+            );
         }
         if !self.eat(SyntaxKind::SEMICOLON) {
-            self.error("P0003", "expected `;` after program declaration");
+            self.error("P0003", "expected `;` after file header");
         }
 
         self.finish_node();
@@ -2145,6 +2157,17 @@ mod tests {
         assert_eq!(out.tree.text(), "program foo");
         assert!(out.diagnostics.iter().any(|d| d.code == "P0003"));
     }
+
+    #[test]
+    fn library_and_module_headers_parse() {
+        for src in ["library foo;", "module foo;"] {
+            let out = parse_str(src);
+            assert!(out.diagnostics.is_empty(), "{src}: {:?}", out.diagnostics);
+            assert_eq!(out.tree.text(), src);
+            assert_eq!(kinds(&out), vec![SyntaxKind::PROGRAM_DECL], "{src}");
+        }
+    }
+
 
     #[test]
     fn database_binding_parses_clean() {

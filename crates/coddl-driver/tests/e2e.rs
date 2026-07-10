@@ -99,7 +99,7 @@ oper main {} [
 // This is the shape `docs/webhost.md` builds toward; the test below links it
 // into a C host exactly as that doc's verification spike prescribes.
 const HANDLE_MAINLESS_SRC: &str = "\
-program p;
+library p;
 oper handle {} -> Text [ \"hello\\n\" ];
 ";
 
@@ -111,7 +111,7 @@ oper handle {} -> Text [ \"hello\\n\" ];
 // back — the write's slot-store and the read both require the slot that
 // `coddl_app_init` materialized.
 const APP_LIFECYCLE_SRC: &str = "\
-program app_lifecycle;
+library app_lifecycle;
 private relvar Config { greeting: Text } key { greeting };
 oper greet {} -> Text [
     Config := Relation { { greeting: \"hi\" } };
@@ -837,6 +837,46 @@ fn coddl_run_default_backend_prints_hello_world() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.stdout, b"Hello, world!\n");
+}
+
+#[test]
+fn check_flags_headerless_cd_with_pl0012() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cd = tmp.path().join("headerless.cd");
+    std::fs::write(&cd, "oper main {} [ ]\n").expect("write");
+    let out = coddl().args(["check"]).arg(&cd).output().expect("spawn coddl");
+    assert!(!out.status.success(), "expected non-zero exit for a headerless file");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("PL0012"), "stderr=\n{stderr}");
+}
+
+#[test]
+fn check_flags_program_without_main_with_pl0014() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cd = tmp.path().join("nomain.cd");
+    std::fs::write(&cd, "program p;\noper helper {} [ ]\n").expect("write");
+    let out = coddl().args(["check"]).arg(&cd).output().expect("spawn coddl");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("PL0014"), "stderr=\n{stderr}");
+}
+
+#[test]
+fn run_rejects_a_library_with_usage_error_2() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cd = tmp.path().join("lib.cd");
+    std::fs::write(&cd, "library l;\noper handle {} -> Text [ \"hi\\n\" ];\n").expect("write");
+    let out = coddl().args(["run"]).arg(&cd).output().expect("spawn coddl");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected usage error 2; stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("library") && stderr.contains("not executable"),
+        "stderr=\n{stderr}"
+    );
 }
 
 #[test]
@@ -1699,7 +1739,7 @@ fn app_init_drives_a_mainless_public_relvar_sql_query() {
     let cd = tmp.path().join("query.cd");
     std::fs::write(
         &cd,
-        "program web_users_q;\n\
+        "library web_users_q;\n\
          database users;\n\
          public relvar Users { id: Integer, name: Text, email: Text, active: Boolean } key { id };\n\
          oper query_active {} -> Text [\n\

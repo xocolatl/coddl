@@ -12,11 +12,30 @@ pub struct PlanOutput {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+/// The kind declared by a `.cd` file's mandatory header — `program`,
+/// `library`, or `module`. Read from the leading keyword of the file
+/// header (`ProgramDecl::kind()`); classifies the compilation unit for
+/// the driver (only a `program` is runnable) and the lowerer (only a
+/// `program` splices lifecycle into `main`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileHeaderKind {
+    /// `program p;` — an executable; requires an `oper main`.
+    Program,
+    /// `library l;` — a stable-C-ABI artifact a foreign host links; no `main`.
+    Library,
+    /// `module m;` — an intermediate unit linked into a consumer; no `main`.
+    Module,
+}
+
 /// A program's resolved project plan — what the compiler knows about
 /// the four-file `.cd` family for one entry point. Downstream phases
 /// (Phase 21 SQLite materialization, code generation) consume this.
 #[derive(Debug)]
 pub struct Plan {
+    /// The kind declared by the `.cd`'s file header. `None` only when the
+    /// file has no header at all (a PL0012 error already fired); downstream
+    /// callers bail on the diagnostic before relying on the kind.
+    pub header_kind: Option<FileHeaderKind>,
     pub program_name: String,
     /// The database the program binds to via `database <name>;` in
     /// `.cd`. `None` when the program has no public relvars; that's

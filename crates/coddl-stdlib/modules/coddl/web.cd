@@ -1,3 +1,5 @@
+module web;
+
 // coddl::web — the web-host vocabulary (opt-in).
 //
 // A *vocabulary* module, not a framework: it ships the contract types the Rust

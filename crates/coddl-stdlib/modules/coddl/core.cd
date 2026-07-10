@@ -1,3 +1,5 @@
+module core;
+
 // coddl::core — the built-in surface, in Coddl source.
 //
 // The always-in-scope core module (no `use module` needed). Resolved from the

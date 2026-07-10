@@ -1,3 +1,5 @@
+library web_users;
+
 // handle.cd
 //
 // The P4 web-host payoff (docs/webhost.md §9): a mainless handler whose body is
@@ -31,7 +33,6 @@
 //                                   #    Carol <carol@example.com>
 use module coddl::web;
 
-program web_users;
 database users;
 
 public relvar Users {

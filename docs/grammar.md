@@ -341,8 +341,12 @@ normalize per `format.edition`.
 
 ## Syntactic productions
 
-The current grammar accepts a top-level sequence of `program` and
-`oper` declarations. Inside an operator body, the statement layer
+A `.cd` file opens with a mandatory file-kind header — `program`,
+`library`, or `module` (see `<file-header>`) — followed by a top-level
+sequence of declarations (`oper`, relvars, `type`, `use module`, …).
+The header's presence, uniqueness, first-position, and the `program ⟺
+oper main` rule are compilation-unit checks the plan layer enforces
+(PL0012–PL0015), not the parser. Inside an operator body, the statement layer
 recognizes expression statements only; the expression layer supports
 identifier references, single-token literals, and brace-delimited call
 expressions. Every rule below carries a comment naming the parser
@@ -350,7 +354,7 @@ function that implements it.
 
 ```
 <root>          ::= { <item> } ;                              -- parse_root
-<item>          ::= <program-decl>
+<item>          ::= <file-header>
                   | <database-binding>
                   | <public-relvar-decl>
                   | <private-relvar-decl>
@@ -360,7 +364,16 @@ function that implements it.
                   | <use-decl>
                   | <unknown-item> ;                          -- parse_item
 
-<program-decl>  ::= 'program' <identifier> ';' ;              -- parse_program_decl
+<file-header>   ::= ( 'program' | 'library' | 'module' )
+                      <identifier> ';' ;                        -- parse_file_header
+                  -- The mandatory file-kind header. `program` → executable
+                  -- (requires an `oper main`); `library` → a stable-C-ABI
+                  -- artifact a foreign host links (no `main`); `module` → an
+                  -- intermediate unit linked into a consumer (no `main`). The
+                  -- name is the bare leaf identity. Presence, uniqueness,
+                  -- first-position, and the kind⟺main rule are compilation-unit
+                  -- checks enforced in the plan layer (PL0012–PL0015), not the
+                  -- parser.
 
 <database-binding> ::= 'database' <identifier> ';' ;          -- parse_database_binding
                        -- Binds this program to a catalog. The compiler

@@ -67,6 +67,12 @@ dir and executes it immediately, propagating the binary's exit code.
 Both share the same pipeline: lower → emit → link with the runtime
 staticlib via `clang` (LLVM) or `cc` (Cranelift).
 
+**File-kind requirement.** `compile` and `run` produce an executable, so the
+input must be a `program` (it has an `oper main`). A `library` or `module`
+input is a usage error (exit `2`) — a `library` has no entry point and is meant
+to be linked by a foreign host, so use `emit-obj` to produce its object.
+`emit-obj` accepts `program`, `library`, and `module`.
+
 **Flags:**
 
 | Flag                        | Subcommands       | Default                                 |

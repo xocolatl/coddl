@@ -24,7 +24,7 @@ use coddl_syntax::FileKind;
 use coddl_types::{check, Heading, RelvarKind, RelvarTable};
 
 mod plan;
-pub use plan::{BackendKind, Plan, PlanOutput, ResolvedPublicRelvar, WritePolicy};
+pub use plan::{BackendKind, FileHeaderKind, Plan, PlanOutput, ResolvedPublicRelvar, WritePolicy};
 
 /// Discover the `.cd`'s companions and cross-validate the chain.
 ///
@@ -72,6 +72,10 @@ pub fn discover_and_validate_with_overrides(
     let cd_check = check(&cd_source, FileId(0), FileKind::Cd);
     diags.extend(cd_check.diagnostics.iter().cloned());
 
+    // Compilation-unit header rules (PL0012–PL0015). Run unconditionally, before
+    // the public-relvar branches, so every `.cd` entry point is validated.
+    let header_kind = validate_file_header(&cd_check.tree, &mut diags);
+
     let program_name = extract_program_name(&cd_check.tree);
     let database_binding = find_database_binding(&cd_check.tree);
     let database_name = database_binding
@@ -89,6 +93,7 @@ pub fn discover_and_validate_with_overrides(
     if !has_public {
         return PlanOutput {
             plan: Some(Plan {
+                header_kind,
                 program_name,
                 database_name,
                 cd_relvars: cd_check.relvars,
@@ -111,6 +116,7 @@ pub fn discover_and_validate_with_overrides(
         ));
         return PlanOutput {
             plan: Some(Plan {
+                header_kind,
                 program_name,
                 database_name: None,
                 cd_relvars: cd_check.relvars,
@@ -293,6 +299,7 @@ pub fn discover_and_validate_with_overrides(
 
     PlanOutput {
         plan: Some(Plan {
+            header_kind,
             program_name,
             database_name: Some(database_name),
             cd_relvars: cd_check.relvars,
@@ -431,6 +438,112 @@ fn collect_columns(
     out
 }
 
+/// Validate the `.cd`'s mandatory file header and return its kind.
+///
+/// Compilation-unit rules — enforced here, not in `check()`, so the reusable
+/// frontend stays lenient for the LSP's partial buffers and the unit-test
+/// fragments that call `check()` directly:
+///   * exactly one header, and it is the first item — else **PL0012** (missing
+///     or not first) / **PL0013** (more than one);
+///   * `program` declares an `oper main` — else **PL0014**;
+///   * `library` / `module` declares no `oper main` — else **PL0015**.
+///
+/// Returns `None` only when no header is present at all.
+fn validate_file_header(
+    tree: &coddl_syntax::cst::SyntaxNode,
+    diags: &mut Vec<Diagnostic>,
+) -> Option<FileHeaderKind> {
+    use coddl_syntax::ast::Item;
+
+    let root = Root::cast(tree.clone())?;
+    let items: Vec<Item> = root.items().collect();
+
+    // Collect every header (all three kinds share the ProgramDecl node).
+    let headers: Vec<_> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, it)| match it {
+            Item::ProgramDecl(d) => Some((i, d.clone())),
+            _ => None,
+        })
+        .collect();
+
+    let Some((first_idx, header)) = headers.first().cloned() else {
+        diags.push(plain_error(
+            "PL0012",
+            "file has no `program`/`library`/`module` header — every `.cd` file must \
+             open with one"
+                .to_string(),
+        ));
+        return None;
+    };
+
+    // Header present but not the first item.
+    if first_idx != 0 {
+        diags.push(Diagnostic::error(
+            header_span(&header),
+            "PL0012",
+            "the `program`/`library`/`module` header must be the first item in the file"
+                .to_string(),
+        ));
+    }
+
+    // More than one header.
+    for (_, extra) in headers.iter().skip(1) {
+        diags.push(Diagnostic::error(
+            header_span(extra),
+            "PL0013",
+            "a `.cd` file declares exactly one `program`/`library`/`module` header".to_string(),
+        ));
+    }
+
+    let kind = match header.kind().map(|t| t.text().to_string()).as_deref() {
+        Some("program") => FileHeaderKind::Program,
+        Some("library") => FileHeaderKind::Library,
+        Some("module") => FileHeaderKind::Module,
+        // Malformed header (parser already reported the missing keyword/name);
+        // treat as a program so a stray `main` isn't double-diagnosed.
+        _ => FileHeaderKind::Program,
+    };
+
+    let main_oper = items.iter().find_map(|it| match it {
+        Item::OperDecl(o) if o.name().map(|t| t.text() == "main").unwrap_or(false) => Some(o),
+        _ => None,
+    });
+
+    match kind {
+        FileHeaderKind::Program if main_oper.is_none() => {
+            diags.push(Diagnostic::error(
+                header_span(&header),
+                "PL0014",
+                "a `program` must declare an `oper main` entry point".to_string(),
+            ));
+        }
+        FileHeaderKind::Library | FileHeaderKind::Module if main_oper.is_some() => {
+            let span = main_oper
+                .and_then(|o| o.name())
+                .map(|t| token_span(FileId(0), &t))
+                .unwrap_or_else(|| header_span(&header));
+            diags.push(Diagnostic::error(
+                span,
+                "PL0015",
+                "a `library`/`module` must not declare an `oper main` — only a `program` \
+                 has an entry point"
+                    .to_string(),
+            ));
+        }
+        _ => {}
+    }
+
+    Some(kind)
+}
+
+/// Span of a file header node (`program`/`library`/`module` …), in the `.cd`.
+fn header_span(header: &coddl_syntax::ast::ProgramDecl) -> Span {
+    let r = header.syntax().text_range();
+    Span::new(FileId(0), r.start().into(), r.end().into())
+}
+
 fn extract_program_name(tree: &coddl_syntax::cst::SyntaxNode) -> String {
     let Some(root) = Root::cast(tree.clone()) else {
         return String::new();
@@ -525,6 +638,7 @@ mod tests {
 program hello;
 database greetings;
 public relvar Greetings { id: Integer, message: Text } key { id };
+oper main {} [ ]
 ";
 
     const CDDB_GREETINGS: &str = "\
@@ -834,5 +948,66 @@ base relvar Greetings { id: Integer, message: Boolean } key { id };
         assert_eq!(plan.backend_kind, BackendKind::Sqlite);
         assert_eq!(plan.resolved.len(), 1);
         assert_eq!(plan.resolved[0].app_name, "Greetings");
+    }
+
+    // ── File-kind header rules (PL0012–PL0015) ───────────────────────────
+
+    /// PL-codes only, from a standalone `.cd` (no companions needed).
+    fn pl_codes(cd: &str) -> Vec<&'static str> {
+        let (_dir, cd_path) = write_project(cd, None, None);
+        discover_and_validate(&cd_path)
+            .diagnostics
+            .into_iter()
+            .map(|d| d.code)
+            .filter(|c| c.starts_with("PL"))
+            .collect()
+    }
+
+    #[test]
+    fn clean_program_library_module_have_no_pl_and_right_kind() {
+        for (cd, kind) in [
+            ("program p;\noper main {} [ ]\n", FileHeaderKind::Program),
+            ("library l;\noper handle {} [ ]\n", FileHeaderKind::Library),
+            ("module m;\noper helper {} [ ]\n", FileHeaderKind::Module),
+        ] {
+            let (_dir, cd_path) = write_project(cd, None, None);
+            let out = discover_and_validate(&cd_path);
+            let pl: Vec<_> = out
+                .diagnostics
+                .iter()
+                .filter(|d| d.code.starts_with("PL"))
+                .map(|d| d.code)
+                .collect();
+            assert!(pl.is_empty(), "{cd:?}: unexpected {pl:?}");
+            assert_eq!(out.plan.unwrap().header_kind, Some(kind), "{cd:?}");
+        }
+    }
+
+    #[test]
+    fn headerless_file_is_pl0012() {
+        assert!(pl_codes("oper main {} [ ]\n").contains(&"PL0012"));
+    }
+
+    #[test]
+    fn header_not_first_is_pl0012() {
+        let codes = pl_codes("oper helper {} [ ]\nmodule m;\n");
+        assert!(codes.contains(&"PL0012"), "{codes:?}");
+    }
+
+    #[test]
+    fn two_headers_is_pl0013() {
+        assert!(pl_codes("program p;\nlibrary l;\noper main {} [ ]\n").contains(&"PL0013"));
+    }
+
+    #[test]
+    fn program_without_main_is_pl0014() {
+        let codes = pl_codes("program p;\noper helper {} [ ]\n");
+        assert!(codes.contains(&"PL0014"), "{codes:?}");
+    }
+
+    #[test]
+    fn library_or_module_with_main_is_pl0015() {
+        assert!(pl_codes("library l;\noper main {} [ ]\n").contains(&"PL0015"));
+        assert!(pl_codes("module m;\noper main {} [ ]\n").contains(&"PL0015"));
     }
 }

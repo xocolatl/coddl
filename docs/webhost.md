@@ -211,11 +211,16 @@ hand-written descriptors silently rot if the layout description ever diverges an
 
 ## Lifecycle: `coddl_app_init` / `coddl_app_shutdown` — **DONE (P1b)**
 
-For a `main` program the runtime lifecycle rides `main`: the lowerer wraps `oper main {}` with
+A web handler is a **`library`** (`library web_hello;`) — its file-kind header declares it a
+stable-C-ABI artifact a foreign host links, not "a `program` that happens to have no `main`."
+The lowerer keys lifecycle emission off that declared kind (`header_is_program`), so the two
+paths below are chosen by the header, not inferred from the absence of an `oper main`.
+
+For a `program` the runtime lifecycle rides `main`: the lowerer wraps `oper main {}` with
 `coddl_runtime_init` / `coddl_runtime_shutdown` and splices in `RegisterDatabase` / `RegisterPlan` (one per
 pushed SQL plan) and per-relvar `RelvarSlotInit` / `RelvarSlotRelease`. A web host owns `main`, so that
-sequence can't ride one — a mainless module used to hit the early-return in `finalize_main_prologue`
-(`crates/coddl-procir/src/lower.rs`) and register nothing.
+sequence can't ride one — a `library` / `module` takes the mainless branch in `finalize_main_prologue`
+(`crates/coddl-procir/src/lower.rs`) instead.
 
 The registration sequence is compiler-synthesized from the plan and **independent of any user `main` body**,
 so a **mainless module now synthesizes two fresh exported functions** — `coddl_app_init` (a

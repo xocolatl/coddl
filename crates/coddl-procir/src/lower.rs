@@ -239,6 +239,13 @@ fn lower_impl(
 
 struct Lowerer {
     program_name: String,
+    /// Whether this compilation unit's header is `program` (vs `library` /
+    /// `module`). A `program` splices lifecycle into `main`; a `library` /
+    /// `module` synthesizes `coddl_app_init` / `coddl_app_shutdown` instead.
+    /// Defaults to `true` so a headerless fragment behaves as before (mainless
+    /// iff it has no `oper main`). The plan layer's `program ⟺ main` rule keeps
+    /// this consistent with the presence of a `main` function.
+    header_is_program: bool,
     functions: Vec<Function>,
     seen_externs: HashSet<&'static str>,
     /// Per-module interner: maps each unique `Heading` to a
@@ -428,6 +435,7 @@ impl Lowerer {
     fn new(file: FileId) -> Self {
         Self {
             program_name: String::new(),
+            header_is_program: true,
             functions: Vec::new(),
             seen_externs: HashSet::new(),
             headings: Vec::new(),
@@ -1237,11 +1245,14 @@ impl Lowerer {
                 releases.push(Inst::RelvarSlotRelease { name: name.clone() });
             }
         }
-        // A mainless module (a web handler the foreign host links) can't ride
-        // `main` for lifecycle. Synthesize `coddl_app_init` / `coddl_app_shutdown`
-        // instead — always (even with nothing to register), so a generic host can
-        // call them unconditionally; the host invokes each once around its loop.
-        if !self.functions.iter().any(|f| f.name == "main") {
+        // A `library` / `module` (e.g. a web handler the foreign host links)
+        // can't ride `main` for lifecycle. Synthesize `coddl_app_init` /
+        // `coddl_app_shutdown` instead — always (even with nothing to register),
+        // so a generic host can call them unconditionally; the host invokes each
+        // once around its loop. The header kind is authoritative; the `main`
+        // guard also covers a headerless fragment and never splices into a
+        // missing `main`.
+        if !self.header_is_program || !self.functions.iter().any(|f| f.name == "main") {
             self.synthesize_app_lifecycle(prologue, releases);
             return;
         }
@@ -1350,6 +1361,10 @@ impl Lowerer {
         if let Some(name_tok) = decl.name() {
             self.program_name = name_tok.text().to_string();
         }
+        // The leading keyword records the file kind. Only `program` rides
+        // `main`; `library` / `module` get synthesized lifecycle. A malformed
+        // header (no keyword) defaults to `program`.
+        self.header_is_program = decl.kind().map_or(true, |t| t.text() == "program");
     }
 
     /// Extract a user `oper`'s lowered signature — `(name, params, return
@@ -6680,6 +6695,7 @@ oper main {}\n\
         use coddl_plan::{BackendKind, ResolvedPublicRelvar, WritePolicy};
         use coddl_types::RelvarTable;
         Plan {
+            header_kind: Some(coddl_plan::FileHeaderKind::Program),
             program_name: "hello_world_db".to_string(),
             database_name: Some("greetings".to_string()),
             cd_relvars: RelvarTable::default(),
@@ -6721,6 +6737,7 @@ oper main {}\n\
         use coddl_plan::{BackendKind, ResolvedPublicRelvar, WritePolicy};
         use coddl_types::RelvarTable;
         Plan {
+            header_kind: Some(coddl_plan::FileHeaderKind::Program),
             program_name: "flags".to_string(),
             database_name: Some("flags".to_string()),
             cd_relvars: RelvarTable::default(),
@@ -7849,6 +7866,7 @@ oper main {} [
         use coddl_plan::BackendKind;
         use coddl_types::RelvarTable;
         let plan = Plan {
+            header_kind: Some(coddl_plan::FileHeaderKind::Program),
             program_name: "rel_lit".to_string(),
             database_name: None,
             cd_relvars: RelvarTable::default(),

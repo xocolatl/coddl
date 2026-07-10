@@ -102,6 +102,32 @@ fn require_cd(kind: FileKind, cmd: &str) -> Result<(), ExitCode> {
     }
 }
 
+/// `run` / `compile` produce an executable, so the input must be a `program`.
+/// A `library` / `module` is a valid compilation unit but has no entry point,
+/// so reject it with a usage error (exit 2) that points at `emit-obj`. A
+/// missing/malformed header falls through — it surfaces as a PL0012 error in
+/// the plan pass, which bails with exit 1.
+fn require_program(source: &str, cmd: &str) -> Result<(), ExitCode> {
+    use coddl_syntax::ast::{AstNode, Item, Root};
+    let parsed = coddl_syntax::parse(source, FileId(0), FileKind::Cd);
+    let header_kind = Root::cast(parsed.tree).and_then(|r| {
+        r.items().find_map(|it| match it {
+            Item::ProgramDecl(d) => d.kind().map(|t| t.text().to_string()),
+            _ => None,
+        })
+    });
+    if let Some(k) = header_kind.as_deref() {
+        if k == "library" || k == "module" {
+            eprintln!(
+                "coddl {cmd}: a `{k}` is not executable; only a `program` can be run or \
+                 compiled. Use `coddl emit-obj` to produce an object for a foreign host.",
+            );
+            return Err(ExitCode::from(2));
+        }
+    }
+    Ok(())
+}
+
 fn cmd_lex(args: &[String]) -> ExitCode {
     let Some((source, _kind)) = read_input(args, "lex") else {
         return ExitCode::from(1);
@@ -231,15 +257,12 @@ fn cmd_check(args: &[String]) -> ExitCode {
 
     let mut diagnostics = out.diagnostics.clone();
 
-    // When the input is a `.cd` file path (not stdin) and declares
-    // public relvars, run the plan pass to cross-validate companions.
-    // Stdin-fed `.cd` skips the plan pass — there's no path to anchor
-    // companion-file discovery against.
-    let has_public_relvars = out
-        .relvars
-        .iter()
-        .any(|(_, info)| info.kind == coddl_types::RelvarKind::Public);
-    if kind == FileKind::Cd && has_public_relvars {
+    // When the input is a `.cd` file path (not stdin), run the plan pass so
+    // the compilation-unit rules surface: the mandatory file header
+    // (PL0012–PL0015) always, plus companion cross-validation when public
+    // relvars are declared. Stdin-fed `.cd` skips it — there's no path to
+    // anchor header/companion discovery against.
+    if kind == FileKind::Cd {
         if let Some(path) = args.first().filter(|s| s.as_str() != "-") {
             let plan_out = coddl_plan::discover_and_validate(Path::new(path));
             for d in &plan_out.diagnostics {
@@ -727,6 +750,9 @@ fn cmd_compile(args: &[String]) -> ExitCode {
     if let Err(code) = require_cd(kind, "compile") {
         return code;
     }
+    if let Err(code) = require_program(&source, "compile") {
+        return code;
+    }
     let cd_path = parsed
         .positional
         .first()
@@ -797,6 +823,9 @@ fn cmd_run(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     };
     if let Err(code) = require_cd(kind, "run") {
+        return code;
+    }
+    if let Err(code) = require_program(&source, "run") {
         return code;
     }
     let cd_path = parsed

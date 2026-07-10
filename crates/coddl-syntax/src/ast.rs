@@ -152,9 +152,16 @@ impl Item {
 ast_node!(pub ProgramDecl, PROGRAM_DECL);
 
 impl ProgramDecl {
-    /// The declared program name. `program` itself is also an IDENT in
-    /// the tree (contextual keyword), so the name is the *second* IDENT
-    /// child.
+    /// The file-kind keyword — `program`, `library`, or `module`. It is the
+    /// *first* IDENT child (a contextual keyword). Callers compare its text to
+    /// classify the compilation unit; the plan layer enforces which kind is
+    /// legal where.
+    pub fn kind(&self) -> Option<SyntaxToken> {
+        nth_token(&self.syntax, SyntaxKind::IDENT, 0)
+    }
+
+    /// The declared file name. The kind keyword occupies the first IDENT
+    /// slot, so the name is the *second* IDENT child.
     pub fn name(&self) -> Option<SyntaxToken> {
         nth_token(&self.syntax, SyntaxKind::IDENT, 1)
     }
@@ -1597,6 +1604,22 @@ mod tests {
             root.items().next().unwrap(),
             Item::BaseRelvarDecl(_)
         ));
+    }
+
+    #[test]
+    fn file_header_kind_and_name_resolve() {
+        for (src, kind, name) in [
+            ("program p;", "program", "p"),
+            ("library l;", "library", "l"),
+            ("module m;", "module", "m"),
+        ] {
+            let root = ast(src);
+            let Item::ProgramDecl(d) = root.items().next().unwrap() else {
+                panic!("{src}: expected a ProgramDecl item");
+            };
+            assert_eq!(d.kind().unwrap().text(), kind, "{src}");
+            assert_eq!(d.name().unwrap().text(), name, "{src}");
+        }
     }
 
     #[test]

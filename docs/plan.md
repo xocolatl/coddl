@@ -40,7 +40,7 @@ A `.cd` source with **no** public relvars doesn't need a `database` binding — 
 
 The rest of this doc pins what `coddl-plan` enforces today.
 
-**Last sync:** Phase 16. Every commit that adds, removes, or changes a PL-code or validation invariant in `crates/coddl-plan/` updates this file in the same commit; `tools/check-grammar.sh` enforces the diagnostic table from the hygiene gate.
+**Last sync:** file-kind headers (PL0012–PL0015). Every commit that adds, removes, or changes a PL-code or validation invariant in `crates/coddl-plan/` updates this file in the same commit; `tools/check-grammar.sh` enforces the diagnostic table from the hygiene gate.
 
 
 ## Discovery
@@ -55,6 +55,16 @@ public entry point. It:
    today; reserved for multi-program projects) and the
    `database <name>;` binding via
    `coddl_syntax::ast::DatabaseBinding::name()`.
+2a. **Validates the mandatory file header** (`validate_file_header`),
+   unconditionally, before any public-relvar branching: exactly one
+   `program`/`library`/`module` header as the first item (PL0012 /
+   PL0013), and the kind⟺`main` rule (`program` requires an `oper main`
+   → PL0014; `library`/`module` forbid one → PL0015). The resolved
+   `FileHeaderKind` is threaded into the `Plan` so the driver can gate
+   commands (only a `program` is runnable) and the lowerer can choose
+   lifecycle emission. These are *compilation-unit* rules, kept out of
+   `coddl_types::check` so that reusable frontend stays lenient for the
+   LSP's partial buffers and unit-test fragments.
 3. **No public relvars in `.cd`** → returns an empty `Plan` with no
    PL diagnostics. The program builds standalone (Phase 8 path).
 4. **Public relvars present, no binding** → PL0001 at the first
@@ -102,6 +112,7 @@ about the root cause.
 
 ```rust
 pub struct Plan {
+    pub header_kind: Option<FileHeaderKind>,  // None only when no header at all
     pub program_name: String,
     pub database_name: Option<String>,    // None when no public relvars
     pub cd_relvars: RelvarTable,
@@ -109,6 +120,8 @@ pub struct Plan {
     pub backend_kind: BackendKind,
     pub resolved: Vec<ResolvedPublicRelvar>,
 }
+
+pub enum FileHeaderKind { Program, Library, Module }
 
 pub struct ResolvedPublicRelvar {
     pub app_name: String,                 // declared in .cd
@@ -168,4 +181,8 @@ hygiene-check script enforces that.
 | PL0009 | `.cdstore` binding doesn't cover a heading attribute                                 |
 | PL0010 | `.cdstore` column entry names an attribute not in the catalog heading                |
 | PL0011 | Backend kind isn't supported (v1 supports `sqlite` only)                             |
+| PL0012 | `.cd` file has no `program`/`library`/`module` header, or it is not the first item    |
+| PL0013 | `.cd` file declares more than one file header                                        |
+| PL0014 | A `program` declares no `oper main` entry point                                      |
+| PL0015 | A `library`/`module` declares an `oper main` (only a `program` has an entry point)   |
 | PL0100 | I/O error reading the `.cd` entry point                                              |
