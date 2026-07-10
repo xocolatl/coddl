@@ -88,6 +88,13 @@ results over HTTP"); tree tip is now `33e68b9` (mandatory file-kind headers land
   body, and serves it via `coddl-web` + curl. *Re-verify:* `examples/web-users/handle.cd`
   exists; `sh examples/web-users/seed-db.sh && coddl emit-obj … && CODDL_APP_OBJ=… cargo run
   -p coddl-web` then `curl localhost:8000/`.
+- **A0 wiki scaffold exists (this roadmap's first APP item).** `examples/wiki/` mirrors
+  `examples/web-users/`: `wiki.cd` (a `library`; `public relvar Pages { slug, title, body }
+  key { slug }`), `wiki.cddb`, `wiki.cdstore`, `seed-db.sh`, `.gitignore`. The `handle`
+  ignores the path and serves the hardcoded `home` page as `text/html` (raw, unescaped —
+  escaping waits on F4/L1). *Re-verify:* the 5 files exist; `sh examples/wiki/seed-db.sh &&
+  cargo run -p coddl-driver -- emit-obj examples/wiki/wiki.cd -o /tmp/wiki.o && CODDL_APP_OBJ=/tmp/wiki.o
+  CODDL_WIKI_FILE=$PWD/examples/wiki/wiki.sqlite cargo run -p coddl-web`, then `curl -si localhost:8000/`.
 - **Text primitives are ABSENT.** The builtin registry has only `to_text` (plus
   `to_rational`/`to_approximate`). No `split`/`substring`/`index_of`/`contains`/
   `starts_with`/`replace`/`length`. String tools today: `||` concat, `s[i]` indexing,
@@ -181,7 +188,11 @@ Legend: `[status] ID (LAYER) — title` · `Depends on:` · `Unblocks:` · `Acce
 
 ### Phase P0 — Scaffold (prove the app skeleton on the P4 foundation)
 
-- `[ ] A0 (APP) — Wiki scaffold + models.`
+- `[x] A0 (APP) — Wiki scaffold + models.` DONE (commit `0272695`) — `examples/wiki/`
+  now mirrors `examples/web-users/` (`wiki.cd` + `wiki.cddb` + `wiki.cdstore` + `seed-db.sh`
+  + `.gitignore`); a mainless `handle` serves the hardcoded `home` page as `text/html`
+  (verified: `curl -si localhost:8000/` → `200`, `Content-Type: text/html`, `<h1>Home</h1>`).
+  Env override is `CODDL_WIKI_FILE`. Original spec:
   Create `examples/wiki/` as a copy of the `examples/web-users/` shape: `wiki.cd`
   (opens with a mandatory `library wiki;` file-kind header (`33e68b9`); `use module coddl::web;`, `database wiki;`, `oper handle { _req: RawRequest }
   -> RawResponse`), `wiki.cddb`, `wiki.cdstore`, `seed-db.sh`, `.gitignore`. Model

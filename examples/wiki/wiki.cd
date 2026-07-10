@@ -1,0 +1,66 @@
+library wiki;
+
+// wiki.cd
+//
+// Wiki roadmap step A0 (examples/wiki/ROADMAP.md): the app skeleton on the P4
+// web-host foundation. A mainless handler queries a SQLite-backed `public relvar`
+// (`Pages`), pushes the query to SQL, `load`s the result and loops to build an
+// HTML body — the same shape as examples/web-users, serving `text/html`.
+//
+// This first handler ignores the request path and serves ONE hardcoded page
+// (`Pages where slug = "home"`). Routing (H1/F1/F2) and HTML escaping (L1/F4)
+// arrive in later roadmap items; A0 is pure scaffolding on a proven read path.
+//
+// Public-relvar reads sit inside a `transaction [...]` (OO Pre 4 / T0025).
+//
+// The .cd-family (storage stays out of D — RM Pro 6):
+//   wiki.cd       — this library: the external schema + the handler
+//   wiki.cddb     — database catalog (conceptual schema)
+//   wiki.cdstore  — conceptual -> physical (SQLite) binding
+//   seed-db.sh    — recreates wiki.sqlite with the demo pages
+//
+// There is no `main`: a handler library is compiled *mainless* and linked into
+// the `coddl-web` host that owns the socket loop. Run it end-to-end:
+//
+//   sh examples/wiki/seed-db.sh
+//   coddl emit-obj examples/wiki/wiki.cd -o /tmp/wiki.o
+//   CODDL_APP_OBJ=/tmp/wiki.o \
+//     CODDL_WIKI_FILE=$PWD/examples/wiki/wiki.sqlite \
+//     cargo run -p coddl-web
+//   curl -si localhost:8000/        # => 200, text/html, the Home page
+use module coddl::web;
+
+database wiki;
+
+public relvar Pages {
+    slug: Text,
+    title: Text,
+    body: Text,
+} key { slug };
+
+// A0: serve the single "home" page regardless of the request path, so `req` is
+// ignored (a real app's single `handle` inspects it and routes — F1/F2). The
+// title/body are interpolated raw: escaping (F4's `escape_html`) lands with L1
+// Text primitives; the seed data here is trusted.
+oper handle{ _req: RawRequest } -> RawResponse [
+    let home = transaction [
+        var rows;
+        let page = Pages where slug = "home" project { title, body };
+        load rows from page order [asc title];
+        rows
+    ];
+
+    var body := "";
+    for page in home do [
+        body := body || format{
+            template: f"<!doctype html>\n<html>\n<head><title>{title}</title></head>\n<body>\n<h1>{title}</h1>\n<div>{body}</div>\n</body>\n</html>\n",
+            args: { title: page.title, body: page.body }
+        };
+    ];
+
+    {
+        status: 200,
+        headers: Relation { { name: "Content-Type", value: "text/html", ordinality: 0 } },
+        body
+    }
+];

@@ -1,0 +1,13 @@
+// wiki.cddb
+//
+// Conceptual schema for the `wiki` database — the SQL-backed catalog the web
+// handler queries. The heading mirrors the `public relvar Pages` in wiki.cd.
+
+database wiki;
+
+base relvar Pages {
+    slug: Text,
+    title: Text,
+    body: Text,
+}
+key { slug };
