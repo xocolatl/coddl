@@ -188,7 +188,12 @@ pub unsafe extern "C" fn coddl_read_line(
     let bytes = strip_line_ending(line.as_bytes());
     let n = bytes.len();
 
-    let out = crate::rc::coddl_rc_alloc(n, n as u32, crate::rc::CoddlKind::Text as u32, std::ptr::null());
+    let out = crate::rc::coddl_rc_alloc(
+        n,
+        n as u32,
+        crate::rc::CoddlKind::Text as u32,
+        std::ptr::null(),
+    );
     if n > 0 {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, n);
     }

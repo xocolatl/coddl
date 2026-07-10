@@ -207,7 +207,10 @@ mod tests {
         // Cells in SELECT-list order: id, message.
         assert_eq!(
             rows,
-            vec![vec![Value::Integer(1), Value::Text("hello world".to_string())]]
+            vec![vec![
+                Value::Integer(1),
+                Value::Text("hello world".to_string())
+            ]]
         );
     }
 

@@ -230,11 +230,11 @@ fn emit_tclose(input: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
     }
     let a = quote_ident(&attrs[0].0); // source column (canonical order)
     let b = quote_ident(&attrs[1].0); // target column
-    // Operand SELECT — its two columns are aliased to the attribute names a, b.
-    // Emitted via `emit_select_offset` (not `emit_select`): the operand is never
-    // itself a root `TClose` (a nested `(R tclose) tclose` declines through
-    // `resolve` and decomposes in-process), and its placeholders start at the
-    // statement's `$1`.
+                                      // Operand SELECT — its two columns are aliased to the attribute names a, b.
+                                      // Emitted via `emit_select_offset` (not `emit_select`): the operand is never
+                                      // itself a root `TClose` (a nested `(R tclose) tclose` declines through
+                                      // `resolve` and decomposes in-process), and its placeholders start at the
+                                      // statement's `$1`.
     let op = emit_select_offset(input, dialect, 0, &[])?;
     let src = &op.sql.text;
     let result = TCLOSE_RESULT_CTE;
@@ -326,9 +326,13 @@ pub fn emit_assignment(target: &RelExpr, rhs: &RelExpr, dialect: Dialect) -> Res
             "assignment target does not resolve to a base relvar".to_string(),
         ));
     };
-    let is_target = |e: &RelExpr| matches!(e, RelExpr::RelvarRef { table_name, .. } if table_name == t);
+    let is_target =
+        |e: &RelExpr| matches!(e, RelExpr::RelvarRef { table_name, .. } if table_name == t);
     match rhs {
-        RelExpr::Minus { lhs, rhs: subtrahend } if is_target(lhs) => {
+        RelExpr::Minus {
+            lhs,
+            rhs: subtrahend,
+        } if is_target(lhs) => {
             if delete_base_table(subtrahend) == Some(t.as_str()) {
                 // Subtrahend is the target relvar, optionally `where`-restricted:
                 // delete exactly its rows (or every row, for `t minus t`).
@@ -360,12 +364,8 @@ pub fn emit_assignment(target: &RelExpr, rhs: &RelExpr, dialect: Dialect) -> Res
         }
         // `t := t union e` — union is commutative, so the target may be the left
         // or right operand; `e` is the other one.
-        RelExpr::Or { lhs, rhs } if is_target(lhs) => {
-            emit_idempotent_insert(target, rhs, dialect)
-        }
-        RelExpr::Or { lhs, rhs } if is_target(rhs) => {
-            emit_idempotent_insert(target, lhs, dialect)
-        }
+        RelExpr::Or { lhs, rhs } if is_target(lhs) => emit_idempotent_insert(target, rhs, dialect),
+        RelExpr::Or { lhs, rhs } if is_target(rhs) => emit_idempotent_insert(target, lhs, dialect),
         // Otherwise try the UPDATE shape: a `union` of the unchanged rows and the
         // substituted matching rows (`t := (t where ¬p) union ((t where p)
         // «substitute»)`), or a bare substitute over `t` (update-all). Anything
@@ -514,11 +514,7 @@ fn emit_update(target: &RelExpr, rhs: &RelExpr, dialect: Dialect) -> Result<SqlQ
                     "update: changed-rows operand is not a restriction".to_string(),
                 ));
             };
-            let RelExpr::Restrict {
-                input: ci,
-                pred: q,
-            } = complement
-            else {
+            let RelExpr::Restrict { input: ci, pred: q } = complement else {
                 return Err(BackendError::Other(
                     "update: unchanged-rows operand is not a restriction".to_string(),
                 ));
@@ -624,7 +620,9 @@ pub fn emit_insert_template(target: &RelExpr, dialect: Dialect) -> Result<SqlQue
         ));
     };
     let insert_cols: Vec<String> = columns.iter().map(|(_, phys)| quote_ident(phys)).collect();
-    let select_cols: Vec<String> = (1..=columns.len()).map(|i| format!("v.column{i}")).collect();
+    let select_cols: Vec<String> = (1..=columns.len())
+        .map(|i| format!("v.column{i}"))
+        .collect();
     let conjuncts: Vec<String> = columns
         .iter()
         .enumerate()
@@ -940,14 +938,23 @@ fn emit_select_offset(
     // `DISTINCT` only when the result isn't provably already a set — a
     // surviving candidate key or a cardinality-≤-1 restriction makes it
     // redundant (RM Pro 3 is still upheld; we only drop a proven no-op).
-    let distinct = if expr.needs_distinct() { "DISTINCT " } else { "" };
+    let distinct = if expr.needs_distinct() {
+        "DISTINCT "
+    } else {
+        ""
+    };
     let mut text = format!("SELECT {distinct}{select_list} FROM {from_clause}");
 
     // WHERE = the conjunction of the collected (column, literal) tests. Each
     // predicate was resolved to its physical column at its own level in the
     // tree (so a `where` above a `rename` resolves through the rename).
     let mut params: Vec<Value> = Vec::new();
-    text.push_str(&render_where_clause(&wheres, dialect, param_offset, &mut params)?);
+    text.push_str(&render_where_clause(
+        &wheres,
+        dialect,
+        param_offset,
+        &mut params,
+    )?);
 
     // Trailing `ORDER BY` for the `load … order [ … ]` boundary: order by the
     // output columns (named by attribute), `DESC` where requested, `ASC` (SQL's
@@ -1258,7 +1265,11 @@ fn fnv1a(dialect: Dialect, text: &str) -> u64 {
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = OFFSET;
     let label = dialect.to_string();
-    for b in label.bytes().chain(std::iter::once(0u8)).chain(text.bytes()) {
+    for b in label
+        .bytes()
+        .chain(std::iter::once(0u8))
+        .chain(text.bytes())
+    {
         hash ^= b as u64;
         hash = hash.wrapping_mul(PRIME);
     }
@@ -1374,8 +1385,11 @@ mod tests {
             (CmpOp::Gt, ">"),
             (CmpOp::GtEq, ">="),
         ] {
-            let q = emit_select(&restrict_cmp("id", op, Literal::Integer(3)), Dialect::SQLite)
-                .unwrap();
+            let q = emit_select(
+                &restrict_cmp("id", op, Literal::Integer(3)),
+                Dialect::SQLite,
+            )
+            .unwrap();
             assert_eq!(
                 q.sql.text,
                 format!(r#"SELECT "id", "message" FROM "greetings" WHERE "id" {sym} ?"#),
@@ -1387,8 +1401,11 @@ mod tests {
 
     #[test]
     fn restrict_ne_uses_postgres_placeholder() {
-        let q = emit_select(&restrict_cmp("id", CmpOp::Ne, Literal::Integer(1)), Dialect::Postgres)
-            .unwrap();
+        let q = emit_select(
+            &restrict_cmp("id", CmpOp::Ne, Literal::Integer(1)),
+            Dialect::Postgres,
+        )
+        .unwrap();
         assert_eq!(
             q.sql.text,
             r#"SELECT "id", "message" FROM "greetings" WHERE "id" <> $1"#
@@ -1398,8 +1415,11 @@ mod tests {
     #[test]
     fn delete_with_ne_predicate_renders() {
         // The WHERE renderer is shared, so surgical DELETE gets `<>` for free.
-        let q = emit_delete(&restrict_cmp("id", CmpOp::Ne, Literal::Integer(1)), Dialect::SQLite)
-            .unwrap();
+        let q = emit_delete(
+            &restrict_cmp("id", CmpOp::Ne, Literal::Integer(1)),
+            Dialect::SQLite,
+        )
+        .unwrap();
         assert_eq!(q.sql.text, r#"DELETE FROM "greetings" WHERE "id" <> ?"#);
     }
 
@@ -1545,7 +1565,8 @@ mod tests {
         // no `DISTINCT`.
         let expr = RelExpr::Restrict {
             input: Box::new(greetings()),
-            pred: Predicate::AttrCmp { op: CmpOp::Eq,
+            pred: Predicate::AttrCmp {
+                op: CmpOp::Eq,
                 attr: "message".to_string(),
                 value: Literal::Text("hello world".to_string()),
             },
@@ -1780,7 +1801,8 @@ mod tests {
         // restricted one threads its bind param through the derived table.
         let x = RelExpr::Restrict {
             input: Box::new(stale()),
-            pred: Predicate::AttrCmp { op: CmpOp::Eq,
+            pred: Predicate::AttrCmp {
+                op: CmpOp::Eq,
                 attr: "id".to_string(),
                 value: Literal::Integer(2),
             },
@@ -1862,7 +1884,9 @@ mod tests {
         let rhs = union(new_arrivals(), greetings());
         let q = emit_assignment(&greetings(), &rhs, Dialect::SQLite).unwrap();
         assert!(
-            q.sql.text.starts_with(r#"INSERT INTO "greetings" ("id", "message")"#),
+            q.sql
+                .text
+                .starts_with(r#"INSERT INTO "greetings" ("id", "message")"#),
             "got: {}",
             q.sql.text
         );
@@ -1872,14 +1896,19 @@ mod tests {
     fn assignment_union_restricted_relvar_binds_param() {
         let x = RelExpr::Restrict {
             input: Box::new(new_arrivals()),
-            pred: Predicate::AttrCmp { op: CmpOp::Eq,
+            pred: Predicate::AttrCmp {
+                op: CmpOp::Eq,
                 attr: "id".to_string(),
                 value: Literal::Integer(5),
             },
         };
         let rhs = union(greetings(), x);
         let q = emit_assignment(&greetings(), &rhs, Dialect::SQLite).unwrap();
-        assert!(q.sql.text.contains(r#"WHERE "id" = ?) AS coddl_src"#), "got: {}", q.sql.text);
+        assert!(
+            q.sql.text.contains(r#"WHERE "id" = ?) AS coddl_src"#),
+            "got: {}",
+            q.sql.text
+        );
         assert_eq!(q.sql.param_count, 1);
         assert_eq!(q.params, vec![Value::Integer(5)]);
     }
@@ -1968,8 +1997,12 @@ mod tests {
     fn assignment_update_all_has_no_where() {
         // A bare substitute over the relvar (no complement/union) updates every
         // row — `Greetings := Greetings replace { message: message || "!" }`.
-        let q = emit_assignment(&greetings(), &substitute_message_bang(greetings()), Dialect::SQLite)
-            .unwrap();
+        let q = emit_assignment(
+            &greetings(),
+            &substitute_message_bang(greetings()),
+            Dialect::SQLite,
+        )
+        .unwrap();
         assert_eq!(
             q.sql.text,
             r#"UPDATE "greetings" SET "message" = ("message" || '!')"#
@@ -2403,7 +2436,8 @@ mod tests {
         // both as SQLite `?` and Postgres `$1`.
         let restricted = RelExpr::Restrict {
             input: Box::new(edges()),
-            pred: Predicate::AttrCmp { op: CmpOp::Eq,
+            pred: Predicate::AttrCmp {
+                op: CmpOp::Eq,
                 attr: "from".to_string(),
                 value: Literal::Integer(1),
             },
@@ -2502,7 +2536,8 @@ mod tests {
                     lhs: Box::new(employees()),
                     rhs: Box::new(departments()),
                 }),
-                pred: Predicate::AttrCmp { op: CmpOp::Eq,
+                pred: Predicate::AttrCmp {
+                    op: CmpOp::Eq,
                     attr: "dept_name".to_string(),
                     value: Literal::Text("Engineering".to_string()),
                 },
@@ -2553,10 +2588,7 @@ mod tests {
             keep: vec!["message".to_string()],
         };
         let q = emit_select(&expr, Dialect::SQLite).unwrap();
-        assert_eq!(
-            q.sql.text,
-            r#"SELECT DISTINCT "message" FROM "greetings""#
-        );
+        assert_eq!(q.sql.text, r#"SELECT DISTINCT "message" FROM "greetings""#);
     }
 
     #[test]
@@ -2767,7 +2799,8 @@ mod tests {
         };
         let expr = RelExpr::Restrict {
             input: Box::new(renamed),
-            pred: Predicate::AttrCmp { op: CmpOp::Eq,
+            pred: Predicate::AttrCmp {
+                op: CmpOp::Eq,
                 attr: "identifier".to_string(),
                 value: Literal::Integer(1),
             },

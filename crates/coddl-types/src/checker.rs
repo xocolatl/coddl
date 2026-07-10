@@ -12,18 +12,15 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use coddl_diagnostics::{Diagnostic, FileId, Span};
+use coddl_stdlib::ModulePath;
 use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, DeleteStmt, DoWhileStmt, Expr,
-    ExprStmt,
-    InsertStmt,
-    ExtendExpr, FieldAccess, ForStmt, Heading as AstHeading, IfExpr, IndexExpr, Item, KeyClause,
-    LetStmt, LoadStmt,
-    NamedArg, OperDecl,
-    PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr,
-    ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
-    TypeDecl, TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WhileStmt, WrapExpr,
+    ExprStmt, ExtendExpr, FieldAccess, ForStmt, Heading as AstHeading, IfExpr, IndexExpr,
+    InsertStmt, Item, KeyClause, LetStmt, LoadStmt, NamedArg, OperDecl, PrivateRelvarDecl,
+    ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr, ReplaceExpr, Root,
+    SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit, TypeDecl, TypeRef,
+    UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WhileStmt, WrapExpr,
 };
-use coddl_stdlib::ModulePath;
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
 use coddl_syntax::{parse, parse_format_template, FileKind, SyntaxKind, TemplateChunk};
@@ -628,7 +625,10 @@ impl TypeChecker {
                 self.warn(
                     b.span,
                     "T0077",
-                    format!("`{}` is declared `var` but never reassigned; use `let`", b.name),
+                    format!(
+                        "`{}` is declared `var` but never reassigned; use `let`",
+                        b.name
+                    ),
                 );
             }
         }
@@ -1009,7 +1009,9 @@ impl TypeChecker {
                 self.builtins.load_module(module.source());
             }
             let out = parse(module.source(), FileId(0), FileKind::Cd);
-            let Some(mroot) = Root::cast(out.tree) else { continue };
+            let Some(mroot) = Root::cast(out.tree) else {
+                continue;
+            };
             for item in mroot.items() {
                 match item {
                     Item::OperDecl(o) if o.is_builtin() => {
@@ -1207,7 +1209,9 @@ impl TypeChecker {
         let mut params: Vec<(Cow<'static, str>, ParamKind)> = Vec::new();
         if let Some(heading) = decl.heading() {
             for param in heading.params() {
-                let Some(pname_tok) = param.name() else { continue };
+                let Some(pname_tok) = param.name() else {
+                    continue;
+                };
                 let pty = param
                     .type_ref()
                     .map(|tr| resolve_type_ref_quiet(&tr))
@@ -1487,7 +1491,6 @@ impl TypeChecker {
         self.resolve_type_name(&name_tok)
     }
 
-
     fn check_stmt(&mut self, stmt: &Stmt, scope: &mut Scope) {
         match stmt {
             Stmt::Let(l) => self.check_let_stmt(l, scope),
@@ -1702,7 +1705,9 @@ impl TypeChecker {
                         Some(Type::Relation(_) | Type::Tuple(_)) => self.error(
                             self.token_span(&tok),
                             "T0082",
-                            format!("cannot order by `{key}`: only scalar attributes have an order"),
+                            format!(
+                                "cannot order by `{key}`: only scalar attributes have an order"
+                            ),
                         ),
                         Some(_) => {}
                     }
@@ -1986,8 +1991,7 @@ impl TypeChecker {
 
         // … bound to an assignable relvar (public or private).
         let lookup = self.relvars.get(name).and_then(|i| {
-            matches!(i.kind, RelvarKind::Public | RelvarKind::Private)
-                .then(|| i.heading.clone())
+            matches!(i.kind, RelvarKind::Public | RelvarKind::Private).then(|| i.heading.clone())
         });
         let Some(heading) = lookup else {
             self.error(
@@ -2081,7 +2085,9 @@ impl TypeChecker {
     /// (T0025) enforced by checking the `where`-operand once the structure is
     /// known good.
     fn check_delete_stmt(&mut self, stmt: &DeleteStmt, scope: &mut Scope) {
-        let Some(operand) = stmt.operand() else { return };
+        let Some(operand) = stmt.operand() else {
+            return;
+        };
 
         // The operand must be a `where`-restriction `R where p`.
         let where_bin = match &operand {
@@ -2117,15 +2123,12 @@ impl TypeChecker {
         let name = ident.text();
 
         // … bound to an assignable relvar (public or private).
-        let assignable = self
-            .relvars
-            .get(name)
-            .is_some_and(|i| {
-                matches!(
-                    i.kind,
-                    RelvarKind::Public | RelvarKind::Private | RelvarKind::Builtin
-                )
-            });
+        let assignable = self.relvars.get(name).is_some_and(|i| {
+            matches!(
+                i.kind,
+                RelvarKind::Public | RelvarKind::Private | RelvarKind::Builtin
+            )
+        });
         if !assignable {
             self.error(
                 self.token_span(&ident),
@@ -2222,7 +2225,9 @@ impl TypeChecker {
     /// (T0031). A public relvar requires a transaction (T0025), the predicate
     /// must be Boolean (T0020) — both via the operand's own `check_expr`.
     fn check_update_stmt(&mut self, stmt: &UpdateStmt, scope: &mut Scope) {
-        let Some(operand) = stmt.operand() else { return };
+        let Some(operand) = stmt.operand() else {
+            return;
+        };
 
         // The operand must be relvar-rooted: a bare relvar `R` (update-all) or
         // a restriction `R where p`. Extract the root relvar name.
@@ -2271,7 +2276,12 @@ impl TypeChecker {
         // resolves against the heading first (the same scope rule as `replace`).
         scope.push();
         for (n, ty) in heading.attrs() {
-            scope.insert(n.clone(), ty.clone(), Span::default(), BindingOrigin::WhereAttr);
+            scope.insert(
+                n.clone(),
+                ty.clone(),
+                Span::default(),
+                BindingOrigin::WhereAttr,
+            );
         }
         let mut seen: HashSet<String> = HashSet::new();
         for (name_tok, value) in stmt.pairs() {
@@ -2986,7 +2996,9 @@ impl TypeChecker {
                 other => self.error(
                     self.token_span(&tok),
                     "T0048",
-                    format!("`unwrap` target `{name}` is not a tuple-valued attribute (got {other})"),
+                    format!(
+                        "`unwrap` target `{name}` is not a tuple-valued attribute (got {other})"
+                    ),
                 ),
             }
         }
@@ -3056,7 +3068,12 @@ impl TypeChecker {
         // resolves against the heading first (the same scope rule as `where`).
         scope.push();
         for (name, ty) in heading.attrs() {
-            scope.insert(name.clone(), ty.clone(), Span::default(), BindingOrigin::WhereAttr);
+            scope.insert(
+                name.clone(),
+                ty.clone(),
+                Span::default(),
+                BindingOrigin::WhereAttr,
+            );
         }
         // Classify each pair into a removed-attribute set and an added
         // `(name, type)`. Every value computes: it adds `new` and removes the
@@ -3115,7 +3132,9 @@ impl TypeChecker {
                         self.error(
                             value_span,
                             "T0046",
-                            format!("`replace` value for `{new}` must be Integer or Text, got {vty}"),
+                            format!(
+                                "`replace` value for `{new}` must be Integer or Text, got {vty}"
+                            ),
                         );
                         continue;
                     }
@@ -3282,7 +3301,12 @@ impl TypeChecker {
         // against the heading first (the same scope rule as `where`).
         scope.push();
         for (name, ty) in heading.attrs() {
-            scope.insert(name.clone(), ty.clone(), Span::default(), BindingOrigin::WhereAttr);
+            scope.insert(
+                name.clone(),
+                ty.clone(),
+                Span::default(),
+                BindingOrigin::WhereAttr,
+            );
         }
         // Result heading: existing attributes plus each computed one. `seen` is
         // seeded with `H`'s names so a new name colliding with an existing
@@ -3637,9 +3661,7 @@ impl TypeChecker {
                 self.error(
                     self.node_span(e.syntax()),
                     "T0062",
-                    format!(
-                        "sequence element type {t} differs from the first element's {elem_ty}"
-                    ),
+                    format!("sequence element type {t} differs from the first element's {elem_ty}"),
                 );
             }
         }
@@ -3761,7 +3783,12 @@ impl TypeChecker {
         // attributes shadow any outer locals with the same name.
         scope.push();
         for (name, ty) in heading.attrs() {
-            scope.insert(name.clone(), ty.clone(), Span::default(), BindingOrigin::WhereAttr);
+            scope.insert(
+                name.clone(),
+                ty.clone(),
+                Span::default(),
+                BindingOrigin::WhereAttr,
+            );
         }
         let rhs_ty = match bin.rhs() {
             Some(e) => self.check_expr(&e, scope),
@@ -3868,8 +3895,7 @@ impl TypeChecker {
             }
         }
         for (name, ty) in rhs_h.attrs() {
-            if !lhs_h.attrs().iter().any(|(n, t)| n == name && t == ty)
-                && !differing.contains(name)
+            if !lhs_h.attrs().iter().any(|(n, t)| n == name && t == ty) && !differing.contains(name)
             {
                 differing.push(name.clone());
             }
@@ -4292,7 +4318,8 @@ impl TypeChecker {
         // never through `check_expr`, so the `FormatText` firewall is untouched.
         // Discriminated by a `template` argument; the `message: Text` overload
         // never carries one, so the two forms are disjoint.
-        if callee_name == "write_line" && self_ty.is_none() && call_has_named_arg(call, "template") {
+        if callee_name == "write_line" && self_ty.is_none() && call_has_named_arg(call, "template")
+        {
             // Preserve the side-effecting/transaction rule (T0026) the plain
             // overload gets from the registry.
             if let Some(sig) = self.builtins.candidates("write_line").first().cloned() {
@@ -4539,7 +4566,9 @@ impl TypeChecker {
                 self.error(
                     span,
                     "T0054",
-                    format!("no matching overload of `{callee_name}` for argument types {{ {got} }}"),
+                    format!(
+                        "no matching overload of `{callee_name}` for argument types {{ {got} }}"
+                    ),
                 );
                 Type::Unknown
             }
@@ -5678,7 +5707,11 @@ mod tests {
         let src = "program p; oper handle { req: RawRequest } [];";
         let cs = codes(src);
         assert!(cs.contains(&"T0088"), "{:?}", cs);
-        assert!(!cs.contains(&"T0005"), "should be T0088, not T0005: {:?}", cs);
+        assert!(
+            !cs.contains(&"T0005"),
+            "should be T0088, not T0005: {:?}",
+            cs
+        );
     }
 
     #[test]
@@ -5715,7 +5748,11 @@ mod tests {
         let src = "program p; oper main {} [ write_relation { rel: Environment }; ];";
         let cs = codes(src);
         assert!(cs.contains(&"T0090"), "{:?}", cs);
-        assert!(!cs.contains(&"T0001"), "should be T0090, not T0001: {:?}", cs);
+        assert!(
+            !cs.contains(&"T0001"),
+            "should be T0090, not T0001: {:?}",
+            cs
+        );
     }
 
     #[test]
@@ -6193,7 +6230,8 @@ mod tests {
     #[test]
     fn ufcs_cardinality_on_sequence_resolves() {
         // `xs.cardinality {}` picks the `AnySequence` overload → Integer.
-        let src = "oper main {} [ let xs = Sequence [ \"a\", \"b\" ]; let _n = xs.cardinality {}; ];";
+        let src =
+            "oper main {} [ let xs = Sequence [ \"a\", \"b\" ]; let _n = xs.cardinality {}; ];";
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "expected clean, got {diags:?}");
     }
@@ -7425,7 +7463,10 @@ mod tests {
     fn unused_binding_is_a_warning_not_an_error() {
         let src = "oper main {} [ let x = 1; ];";
         let d = diagnostics(src);
-        let t0032 = d.iter().find(|d| d.code == "T0032").expect("expected T0032");
+        let t0032 = d
+            .iter()
+            .find(|d| d.code == "T0032")
+            .expect("expected T0032");
         assert_eq!(t0032.severity, coddl_diagnostics::Severity::Warning);
     }
 
@@ -7453,7 +7494,12 @@ mod tests {
         // is used → no warning. Exactly one T0032.
         let src = "oper main {} [ let x = \"a\"; let x = \"b\"; write_line { message: x }; ];";
         let n = codes(src).iter().filter(|c| **c == "T0032").count();
-        assert_eq!(n, 1, "only the shadowed `x` should warn: {:?}", diagnostics(src));
+        assert_eq!(
+            n,
+            1,
+            "only the shadowed `x` should warn: {:?}",
+            diagnostics(src)
+        );
     }
 
     #[test]
@@ -7461,8 +7507,7 @@ mod tests {
         // The heading attr `a` injected into the predicate scope must not be
         // flagged unused (WhereAttr origin); only user `let`s warn. `_s` is
         // exempt, `r` is used, so the program is diagnostic-free.
-        let src =
-            "oper main {} [ let r = Relation { {a: 1}, {a: 2} }; let _s = r where a = 2; ];";
+        let src = "oper main {} [ let r = Relation { {a: 1}, {a: 2} }; let _s = r where a = 2; ];";
         assert!(!codes(src).contains(&"T0032"));
     }
 
@@ -7475,7 +7520,8 @@ mod tests {
         let src = "oper main {} [ for i := 0 to 2 do [ let _x = i + 1; ]; ];";
         let d = diagnostics(src);
         assert!(
-            d.iter().all(|x| x.severity != coddl_diagnostics::Severity::Error),
+            d.iter()
+                .all(|x| x.severity != coddl_diagnostics::Severity::Error),
             "expected no errors, got {d:?}"
         );
     }
@@ -7563,23 +7609,43 @@ mod tests {
     fn var_reassignment_is_allowed() {
         let src = "oper main {} [ var x := 1; x := 2; let _y = x; ];";
         let c = codes(src);
-        assert!(!c.contains(&"T0074"), "reassigning a `var` is legal: {:?}", diagnostics(src));
-        assert!(!c.contains(&"T0075"), "same-type value is fine: {:?}", diagnostics(src));
+        assert!(
+            !c.contains(&"T0074"),
+            "reassigning a `var` is legal: {:?}",
+            diagnostics(src)
+        );
+        assert!(
+            !c.contains(&"T0075"),
+            "same-type value is fine: {:?}",
+            diagnostics(src)
+        );
     }
 
     #[test]
     fn reassigning_let_binding_is_t0074() {
         let src = "oper main {} [ let x = 1; x := 2; ];";
         let c = codes(src);
-        assert!(c.contains(&"T0074"), "expected T0074, got {:?}", diagnostics(src));
+        assert!(
+            c.contains(&"T0074"),
+            "expected T0074, got {:?}",
+            diagnostics(src)
+        );
         // The dedicated code fires — not the generic non-relvar assignment T0033.
-        assert!(!c.contains(&"T0033"), "should not fall through to T0033: {:?}", diagnostics(src));
+        assert!(
+            !c.contains(&"T0033"),
+            "should not fall through to T0033: {:?}",
+            diagnostics(src)
+        );
     }
 
     #[test]
     fn var_reassignment_type_mismatch_is_t0075() {
         let src = "oper main {} [ var x := 1; x := \"s\"; ];";
-        assert!(codes(src).contains(&"T0075"), "expected T0075, got {:?}", diagnostics(src));
+        assert!(
+            codes(src).contains(&"T0075"),
+            "expected T0075, got {:?}",
+            diagnostics(src)
+        );
     }
 
     #[test]
@@ -7600,14 +7666,23 @@ mod tests {
         // decl (`var x`) + one read (RHS `x`) + one write (target `x`) = 3.
         let src = "oper main {} [ var x := 1; x := x; ];";
         let out = check(src, FileId(0), FileKind::Cd);
-        assert_eq!(out.mutable_spans.len(), 3, "decl + read + write; got {:?}", out.mutable_spans);
+        assert_eq!(
+            out.mutable_spans.len(),
+            3,
+            "decl + read + write; got {:?}",
+            out.mutable_spans
+        );
     }
 
     #[test]
     fn let_binding_has_no_mutable_spans() {
         let src = "oper main {} [ let x = 1; let _y = x; ];";
         let out = check(src, FileId(0), FileKind::Cd);
-        assert!(out.mutable_spans.is_empty(), "an immutable `let` is not mutable: {:?}", out.mutable_spans);
+        assert!(
+            out.mutable_spans.is_empty(),
+            "an immutable `let` is not mutable: {:?}",
+            out.mutable_spans
+        );
     }
 
     #[test]
@@ -7615,14 +7690,21 @@ mod tests {
         // The analog of Rust's `unused_mut`: read, never written → use `let`.
         let src = "oper main {} [ var x := 1; let _y = x; ];";
         let d = diagnostics(src);
-        let t = d.iter().find(|d| d.code == "T0077").expect("expected T0077");
+        let t = d
+            .iter()
+            .find(|d| d.code == "T0077")
+            .expect("expected T0077");
         assert_eq!(t.severity, coddl_diagnostics::Severity::Warning);
     }
 
     #[test]
     fn reassigned_var_does_not_suggest_let() {
         let src = "oper main {} [ var x := 1; x := 2; let _y = x; ];";
-        assert!(!codes(src).contains(&"T0077"), "a genuinely mutable var: {:?}", diagnostics(src));
+        assert!(
+            !codes(src).contains(&"T0077"),
+            "a genuinely mutable var: {:?}",
+            diagnostics(src)
+        );
     }
 
     #[test]
@@ -7636,7 +7718,11 @@ mod tests {
     #[test]
     fn uninitialized_let_is_t0078() {
         let src = "oper main {} [ let x: Integer; ];";
-        assert!(codes(src).contains(&"T0078"), "expected T0078, got {:?}", diagnostics(src));
+        assert!(
+            codes(src).contains(&"T0078"),
+            "expected T0078, got {:?}",
+            diagnostics(src)
+        );
     }
 
     #[test]
@@ -7646,7 +7732,8 @@ mod tests {
         let src = "oper main {} [ var x; x := 1; let _y = x; ];";
         let d = diagnostics(src);
         assert!(
-            d.iter().all(|x| x.severity != coddl_diagnostics::Severity::Error),
+            d.iter()
+                .all(|x| x.severity != coddl_diagnostics::Severity::Error),
             "expected no errors, got {d:?}"
         );
     }
@@ -7654,7 +7741,11 @@ mod tests {
     #[test]
     fn read_before_assignment_is_t0079() {
         let src = "oper main {} [ var x; let _y = x; ];";
-        assert!(codes(src).contains(&"T0079"), "expected T0079, got {:?}", diagnostics(src));
+        assert!(
+            codes(src).contains(&"T0079"),
+            "expected T0079, got {:?}",
+            diagnostics(src)
+        );
     }
 
     #[test]
@@ -7663,7 +7754,8 @@ mod tests {
         let src = "oper main {} [ var x; if true then [ x := 1; ] else [ x := 2; ]; let _y = x; ];";
         let d = diagnostics(src);
         assert!(
-            d.iter().all(|x| x.severity != coddl_diagnostics::Severity::Error),
+            d.iter()
+                .all(|x| x.severity != coddl_diagnostics::Severity::Error),
             "expected no errors, got {d:?}"
         );
     }
@@ -7672,21 +7764,33 @@ mod tests {
     fn assign_in_only_one_arm_then_read_is_t0079() {
         // No `else` ⇒ the then-arm may not run ⇒ not definitely assigned after.
         let src = "oper main {} [ var x; if true then [ x := 1; ]; let _y = x; ];";
-        assert!(codes(src).contains(&"T0079"), "expected T0079, got {:?}", diagnostics(src));
+        assert!(
+            codes(src).contains(&"T0079"),
+            "expected T0079, got {:?}",
+            diagnostics(src)
+        );
     }
 
     #[test]
     fn assign_in_loop_body_then_read_after_is_t0079() {
         // A loop may run zero times ⇒ its body's assignments aren't definite.
         let src = "oper main {} [ var x; for i := 1 to 3 do [ x := i; ]; let _y = x; ];";
-        assert!(codes(src).contains(&"T0079"), "expected T0079, got {:?}", diagnostics(src));
+        assert!(
+            codes(src).contains(&"T0079"),
+            "expected T0079, got {:?}",
+            diagnostics(src)
+        );
     }
 
     #[test]
     fn inferred_type_fixed_by_first_assignment_is_t0075() {
         // `x`'s type is inferred `Integer` from `x := 1`; the `Text` write fails.
         let src = "oper main {} [ var x; x := 1; x := \"s\"; ];";
-        assert!(codes(src).contains(&"T0075"), "expected T0075, got {:?}", diagnostics(src));
+        assert!(
+            codes(src).contains(&"T0075"),
+            "expected T0075, got {:?}",
+            diagnostics(src)
+        );
     }
 
     #[test]
@@ -7702,7 +7806,11 @@ mod tests {
             .iter()
             .find(|h| h.kind == HintKind::LetBinding && h.span.start == decl_x_end)
             .expect("expected an inferred-type hint anchored at `var x`");
-        assert!(matches!(hint.ty, Type::Integer), "hint type was {:?}", hint.ty);
+        assert!(
+            matches!(hint.ty, Type::Integer),
+            "hint type was {:?}",
+            hint.ty
+        );
     }
 
     #[test]
@@ -7768,7 +7876,8 @@ mod tests {
                    load names from rnames order [asc name]; ];";
         let d = diagnostics(src);
         assert!(
-            d.iter().all(|x| x.severity != coddl_diagnostics::Severity::Error),
+            d.iter()
+                .all(|x| x.severity != coddl_diagnostics::Severity::Error),
             "expected no errors, got {d:?}"
         );
     }
@@ -7809,7 +7918,8 @@ mod tests {
                    load Names from names; ];";
         let d = diagnostics(src);
         assert!(
-            d.iter().all(|x| x.severity != coddl_diagnostics::Severity::Error),
+            d.iter()
+                .all(|x| x.severity != coddl_diagnostics::Severity::Error),
             "expected no errors, got {d:?}"
         );
     }
@@ -7893,7 +8003,8 @@ mod tests {
                    for name in names do [ write_line { message: name }; ]; ];";
         let d = diagnostics(src);
         assert!(
-            d.iter().all(|x| x.severity != coddl_diagnostics::Severity::Error),
+            d.iter()
+                .all(|x| x.severity != coddl_diagnostics::Severity::Error),
             "expected no errors, got {d:?}"
         );
     }
@@ -7921,8 +8032,7 @@ mod tests {
         // `r` is referenced only inside `r where a = 2` (an expression the
         // lowerer may fold/push away) — usage is a source-level fact, so `r`
         // is not flagged. `_s` is exempt.
-        let src =
-            "oper main {} [ let r = Relation { {a: 1}, {a: 2} }; let _s = r where a = 2; ];";
+        let src = "oper main {} [ let r = Relation { {a: 1}, {a: 2} }; let _s = r where a = 2; ];";
         assert!(!codes(src).contains(&"T0032"));
     }
 
@@ -8068,7 +8178,11 @@ mod tests {
     fn format_returns_text() {
         // `message` flows into write_line's Text `message` param with no
         // T0004 — proving format's result type is Text.
-        assert!(!codes(FORMAT_HELLO).contains(&"T0004"), "{:?}", codes(FORMAT_HELLO));
+        assert!(
+            !codes(FORMAT_HELLO).contains(&"T0004"),
+            "{:?}",
+            codes(FORMAT_HELLO)
+        );
     }
 
     #[test]

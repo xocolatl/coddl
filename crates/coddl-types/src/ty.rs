@@ -322,14 +322,8 @@ mod tests {
     fn heading_canonicalizes_field_order() {
         // The constructor sorts by name, so source-order variations
         // produce equal headings.
-        let h1 = Heading::new(vec![
-            ("b".into(), Type::Text),
-            ("a".into(), Type::Integer),
-        ]);
-        let h2 = Heading::new(vec![
-            ("a".into(), Type::Integer),
-            ("b".into(), Type::Text),
-        ]);
+        let h1 = Heading::new(vec![("b".into(), Type::Text), ("a".into(), Type::Integer)]);
+        let h2 = Heading::new(vec![("a".into(), Type::Integer), ("b".into(), Type::Text)]);
         assert_eq!(h1, h2);
         assert_eq!(h1.attrs()[0].0, "a");
         assert_eq!(h1.attrs()[1].0, "b");
@@ -337,10 +331,7 @@ mod tests {
 
     #[test]
     fn heading_lookup_finds_attribute() {
-        let h = Heading::new(vec![
-            ("x".into(), Type::Integer),
-            ("y".into(), Type::Text),
-        ]);
+        let h = Heading::new(vec![("x".into(), Type::Integer), ("y".into(), Type::Text)]);
         assert!(matches!(h.lookup("x"), Some(Type::Integer)));
         assert!(matches!(h.lookup("y"), Some(Type::Text)));
         assert!(h.lookup("z").is_none());

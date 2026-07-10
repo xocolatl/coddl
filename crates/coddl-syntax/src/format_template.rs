@@ -290,7 +290,10 @@ mod tests {
 
     #[test]
     fn escaped_braces_are_literal() {
-        assert_eq!(ok(r#"f"{{not a placeholder}}""#), vec![lit("{not a placeholder}")]);
+        assert_eq!(
+            ok(r#"f"{{not a placeholder}}""#),
+            vec![lit("{not a placeholder}")]
+        );
     }
 
     #[test]
@@ -300,7 +303,16 @@ mod tests {
 
     #[test]
     fn unicode_escape_decodes() {
-        assert_eq!(ok(r#"f"\u{41}{x}""#), vec![lit("A"), TemplateChunk::Placeholder { name: "x".into(), range: 9..10 }]);
+        assert_eq!(
+            ok(r#"f"\u{41}{x}""#),
+            vec![
+                lit("A"),
+                TemplateChunk::Placeholder {
+                    name: "x".into(),
+                    range: 9..10
+                }
+            ]
+        );
     }
 
     #[test]

@@ -268,10 +268,7 @@ pub enum Inst {
     /// `write_relation` builtin's surface call lowers to this instead
     /// of a generic `Inst::Call` so the backend doesn't have to
     /// special-case the descriptor lookup in its `Inst::Call` path.
-    WriteRelation {
-        rel: ValueId,
-        heading_id: HeadingId,
-    },
+    WriteRelation { rel: ValueId, heading_id: HeadingId },
     /// Scalar binary operator. The result type depends on `op`: comparison /
     /// Boolean ops yield `ProcType::Boolean`, arithmetic ops yield
     /// `ProcType::Integer`, and `Concat` yields `ProcType::Text`.
@@ -474,10 +471,7 @@ pub enum Inst {
     /// fields live on the corresponding `Module::public_relvars`
     /// entry; backends look up by `name`. Lowers to a single call to
     /// `coddl_sqlite_relvar_init`.
-    RelvarSlotInit {
-        name: String,
-        heading_id: HeadingId,
-    },
+    RelvarSlotInit { name: String, heading_id: HeadingId },
     /// Release the RC pointer in the named relvar's slot. Emitted once
     /// per public relvar in `main`'s epilogue, before
     /// `coddl_runtime_shutdown`. Backends load the slot's pointer +
@@ -499,19 +493,13 @@ pub enum Inst {
     /// Unlike `RelvarSlotInit` there is no SQL source — the slot starts
     /// empty and is filled by `RelvarSlotStore`. Lowers to a single call to
     /// `coddl_relvar_slot_init_empty`.
-    PrivateRelvarSlotInit {
-        name: String,
-        heading_id: HeadingId,
-    },
+    PrivateRelvarSlotInit { name: String, heading_id: HeadingId },
     /// Store a relation value into a relvar's slot — relational assignment
     /// `R := <expr>`. Move semantics: the runtime releases the slot's
     /// previous value (if any) and takes ownership of `value`, so the
     /// lowerer emits no release for the RHS. Lowers to a single call to
     /// `coddl_relvar_slot_store`.
-    RelvarSlotStore {
-        name: String,
-        value: ValueId,
-    },
+    RelvarSlotStore { name: String, value: ValueId },
     /// Register the logical database so the runtime can resolve its
     /// connection path. Emitted once in `main`'s prologue when the program
     /// has at least one pushed plan, after `coddl_runtime_init`. Backends
@@ -966,7 +954,11 @@ impl fmt::Display for Inst {
                 heading_id,
             } => write!(f, "{dst} = relvar_read {name} heading_{}", heading_id.0),
             Inst::PrivateRelvarSlotInit { name, heading_id } => {
-                write!(f, "private_relvar_slot_init {name} heading_{}", heading_id.0)
+                write!(
+                    f,
+                    "private_relvar_slot_init {name} heading_{}",
+                    heading_id.0
+                )
             }
             Inst::RelvarSlotStore { name, value } => {
                 write!(f, "relvar_slot_store {name} {value}")

@@ -49,7 +49,11 @@ impl CoddlLsp {
         let plan_diags = match self.analyzer.project_for(uri).await {
             Some(project) => match self.analyzer.project_snapshot(&project.cd_path).await {
                 Some(psnap) => match self.analyzer.file_id_for(&project, uri).await {
-                    Some(fid) => psnap.diagnostics_by_file.get(&fid).cloned().unwrap_or_default(),
+                    Some(fid) => psnap
+                        .diagnostics_by_file
+                        .get(&fid)
+                        .cloned()
+                        .unwrap_or_default(),
                     None => Vec::new(),
                 },
                 None => Vec::new(),
@@ -57,11 +61,10 @@ impl CoddlLsp {
             None => Vec::new(),
         };
 
-        let diagnostics: Vec<_> =
-            analyzer::published_diagnostics(&snap.diagnostics, &plan_diags)
-                .iter()
-                .map(|d| lsp_convert::diagnostic(d, &snap.line_index))
-                .collect();
+        let diagnostics: Vec<_> = analyzer::published_diagnostics(&snap.diagnostics, &plan_diags)
+            .iter()
+            .map(|d| lsp_convert::diagnostic(d, &snap.line_index))
+            .collect();
 
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, Some(snap.version))

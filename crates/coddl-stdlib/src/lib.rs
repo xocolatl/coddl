@@ -175,8 +175,8 @@ mod tests {
 
     #[test]
     fn core_resolves_to_nonempty_source() {
-        let src = resolve(&ModulePath::parse("coddl::core"))
-            .expect("coddl::core is always embedded");
+        let src =
+            resolve(&ModulePath::parse("coddl::core")).expect("coddl::core is always embedded");
         assert!(src.source().contains("builtin oper"));
     }
 

@@ -115,7 +115,8 @@ impl Codegen for CraneliftBackend {
         let ptr_bytes = obj.target_config().pointer_bytes() as usize;
         for (i, heading) in module.headings.iter().enumerate() {
             let layout = record_layout(heading);
-            let desc_id = emit_heading_descriptor(&mut obj, HeadingId(i as u32), &layout, ptr_bytes)?;
+            let desc_id =
+                emit_heading_descriptor(&mut obj, HeadingId(i as u32), &layout, ptr_bytes)?;
             layouts.push(layout);
             heading_desc_ids.push(desc_id);
         }
@@ -668,8 +669,11 @@ fn emit_plan_data(
     p: &PlanEntry,
 ) -> Result<PlanDataIds, CraneliftEmitError> {
     let sql = declare_byte_constant(obj, &format!(".plan.{}.sql", p.plan_id), p.sql.as_bytes())?;
-    let dbn =
-        declare_byte_constant(obj, &format!(".plan.{}.db_name", p.plan_id), p.db_name.as_bytes())?;
+    let dbn = declare_byte_constant(
+        obj,
+        &format!(".plan.{}.db_name", p.plan_id),
+        p.db_name.as_bytes(),
+    )?;
     Ok(PlanDataIds {
         db_name: dbn,
         db_name_len: p.db_name.len() as i64,
@@ -730,7 +734,8 @@ fn emit_public_relvar_data(
         .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
 
     let relvar_name_bytes = name.as_bytes();
-    let relvar_name = declare_byte_constant(obj, &format!("{name}.relvar_name"), relvar_name_bytes)?;
+    let relvar_name =
+        declare_byte_constant(obj, &format!("{name}.relvar_name"), relvar_name_bytes)?;
     let env_name_bytes = env_name.as_bytes();
     let env_id = declare_byte_constant(obj, &format!("{name}.env_name"), env_name_bytes)?;
     let default_bytes = db_default.as_bytes();
@@ -925,8 +930,16 @@ fn emit_layout_descriptor(
         let kind = layout.attrs[i].kind;
         let off = layout.attrs[i].offset;
         // Offsets relative to attr base: ptr_bytes, ptr_bytes+4, ptr_bytes+8.
-        attrs_write_u32(&mut attrs_dd, offset_in_attrs as usize + ptr_bytes, name_bytes_len);
-        attrs_write_u32(&mut attrs_dd, offset_in_attrs as usize + ptr_bytes + 4, kind);
+        attrs_write_u32(
+            &mut attrs_dd,
+            offset_in_attrs as usize + ptr_bytes,
+            name_bytes_len,
+        );
+        attrs_write_u32(
+            &mut attrs_dd,
+            offset_in_attrs as usize + ptr_bytes + 4,
+            kind,
+        );
         attrs_write_u32(&mut attrs_dd, offset_in_attrs as usize + ptr_bytes + 8, off);
         // `sub` pointer for a Tuple cell; scalars leave it null (zeroed).
         if let Some(sid) = sub_ids[i] {
@@ -1005,11 +1018,7 @@ fn cranelift_signature(
 /// Text/Binary expand to `(ptr, i64)`; Tuple expands per attribute in
 /// canonical heading order, nested tuples recursively; empty Tuple
 /// contributes zero entries.
-fn push_param_types(
-    out: &mut Vec<AbiParam>,
-    ty: &ProcType,
-    ptr_ty: cranelift_codegen::ir::Type,
-) {
+fn push_param_types(out: &mut Vec<AbiParam>, ty: &ProcType, ptr_ty: cranelift_codegen::ir::Type) {
     match ty {
         ProcType::Text | ProcType::Binary => {
             out.push(AbiParam::new(ptr_ty));
@@ -1115,8 +1124,12 @@ fn append_block_param_repr(
         ProcType::Tuple(heading) => {
             let mut fields = Vec::new();
             for (attr_name, attr_ty) in heading.attrs() {
-                let sub =
-                    append_block_param_repr(builder, cl_block, &proc_type_from_attr(attr_ty), ptr_ty);
+                let sub = append_block_param_repr(
+                    builder,
+                    cl_block,
+                    &proc_type_from_attr(attr_ty),
+                    ptr_ty,
+                );
                 fields.push((attr_name.clone(), sub));
             }
             ValueRepr::Tuple { fields }
@@ -1128,11 +1141,7 @@ fn append_block_param_repr(
     }
 }
 
-fn push_return_types(
-    out: &mut Vec<AbiParam>,
-    ty: &ProcType,
-    ptr_ty: cranelift_codegen::ir::Type,
-) {
+fn push_return_types(out: &mut Vec<AbiParam>, ty: &ProcType, ptr_ty: cranelift_codegen::ir::Type) {
     match ty {
         ProcType::Unit => {}
         ProcType::Tuple(heading) if heading.is_empty() => {}
@@ -1381,7 +1390,14 @@ fn emit_block(
             next_data,
         )?;
     }
-    emit_terminator(builder, &block.terminator, values, is_main, ret_len_out, block_map)?;
+    emit_terminator(
+        builder,
+        &block.terminator,
+        values,
+        is_main,
+        ret_len_out,
+        block_map,
+    )?;
     Ok(())
 }
 
@@ -1522,18 +1538,19 @@ fn emit_inst(
             // the `coddl_resolve_op_field` out-param convention.)
             if returns_fat_pointer(return_type) {
                 let ptr_ty = obj.target_config().pointer_type();
-                let slot = builder.create_sized_stack_slot(
-                    cranelift_codegen::ir::StackSlotData::new(
+                let slot =
+                    builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                         cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                         8,
                         3,
-                    ),
-                );
+                    ));
                 let len_addr = builder.ins().stack_addr(ptr_ty, slot, 0);
                 call_args.push(len_addr);
                 let call = builder.ins().call(local_callee, &call_args);
                 let ptr = builder.inst_results(call)[0];
-                let len = builder.ins().load(types::I64, MemFlags::trusted(), len_addr, 0);
+                let len = builder
+                    .ins()
+                    .load(types::I64, MemFlags::trusted(), len_addr, 0);
                 if let Some(dst) = dst {
                     values.insert(*dst, ValueRepr::Text { ptr, len });
                 }
@@ -1562,7 +1579,12 @@ fn emit_inst(
                 })?;
                 repr_fields.push((name.clone(), repr));
             }
-            values.insert(*dst, ValueRepr::Tuple { fields: repr_fields });
+            values.insert(
+                *dst,
+                ValueRepr::Tuple {
+                    fields: repr_fields,
+                },
+            );
             Ok(())
         }
         Inst::TupleField {
@@ -1602,7 +1624,10 @@ fn emit_inst(
             // Box a flattened tuple into a `length = 1` heap record — like a
             // one-tuple `RelationLit`, minus the seal.
             let layout = heading_layouts.get(heading_id.0 as usize).ok_or_else(|| {
-                CraneliftEmitError::UnsupportedInst(format!("unknown heading_id {} in TupleBox", heading_id.0))
+                CraneliftEmitError::UnsupportedInst(format!(
+                    "unknown heading_id {} in TupleBox",
+                    heading_id.0
+                ))
             })?;
             let desc_id = heading_desc_ids[heading_id.0 as usize];
             let desc_gv = obj.declare_data_in_func(desc_id, builder.func);
@@ -1617,7 +1642,9 @@ fn emit_inst(
                 .call(alloc_local, &[size_val, count_val, kind_val, desc_val]);
             let payload = builder.inst_results(call)[0];
             let tuple_repr = values.get(src).cloned().ok_or_else(|| {
-                CraneliftEmitError::UnsupportedInst(format!("undefined tuple value {src:?} in TupleBox"))
+                CraneliftEmitError::UnsupportedInst(format!(
+                    "undefined tuple value {src:?} in TupleBox"
+                ))
             })?;
             let ValueRepr::Tuple { fields } = &tuple_repr else {
                 return Err(CraneliftEmitError::UnsupportedInst(format!(
@@ -1636,7 +1663,15 @@ fn emit_inst(
                         ))
                     })?;
                 let retain_ref = obj.declare_func_in_func(funcs["coddl_rc_retain"], builder.func);
-                store_attr(builder, payload, attr.offset as i32, &field_repr, attr.sub.as_ref(), attr.kind, retain_ref)?;
+                store_attr(
+                    builder,
+                    payload,
+                    attr.offset as i32,
+                    &field_repr,
+                    attr.sub.as_ref(),
+                    attr.kind,
+                    retain_ref,
+                )?;
             }
             values.insert(*dst, ValueRepr::Scalar(payload));
             Ok(())
@@ -1648,7 +1683,10 @@ fn emit_inst(
         } => {
             let record_ptr = scalar_value(values, src)?;
             let layout = heading_layouts.get(heading_id.0 as usize).ok_or_else(|| {
-                CraneliftEmitError::UnsupportedInst(format!("unknown heading_id {} in TupleUnbox", heading_id.0))
+                CraneliftEmitError::UnsupportedInst(format!(
+                    "unknown heading_id {} in TupleUnbox",
+                    heading_id.0
+                ))
             })?;
             let ptr_ty = obj.target_config().pointer_type();
             let repr = read_boxed_tuple(builder, record_ptr, layout, 0, ptr_ty)?;
@@ -1680,10 +1718,9 @@ fn emit_inst(
             let size_val = builder.ins().iconst(types::I64, payload_size);
             let count_val = builder.ins().iconst(types::I32, count);
             let kind_val = builder.ins().iconst(types::I32, 0); // CoddlKind::Relation
-            let call = builder.ins().call(
-                alloc_local,
-                &[size_val, count_val, kind_val, desc_val],
-            );
+            let call = builder
+                .ins()
+                .call(alloc_local, &[size_val, count_val, kind_val, desc_val]);
             let payload = builder.inst_results(call)[0];
 
             // Store each tuple into its record slot.
@@ -1716,7 +1753,15 @@ fn emit_inst(
                         record_idx as i32 * layout.record_size as i32 + attr.offset as i32;
                     let retain_ref =
                         obj.declare_func_in_func(funcs["coddl_rc_retain"], builder.func);
-                    store_attr(builder, payload, byte_offset, &field_repr, attr.sub.as_ref(), attr.kind, retain_ref)?;
+                    store_attr(
+                        builder,
+                        payload,
+                        byte_offset,
+                        &field_repr,
+                        attr.sub.as_ref(),
+                        attr.kind,
+                        retain_ref,
+                    )?;
                 }
             }
 
@@ -2054,16 +2099,14 @@ fn emit_inst(
             let flags = MemFlags::trusted();
             match attr_type {
                 ProcType::Integer => {
-                    let v =
-                        builder.ins().load(types::I64, flags, src_v, *offset as i32);
+                    let v = builder.ins().load(types::I64, flags, src_v, *offset as i32);
                     values.insert(*dst, ValueRepr::Scalar(v));
                     Ok(())
                 }
                 ProcType::Boolean => {
                     // Record cell stores Boolean as 8 bytes; reduce to
                     // the I8 boolean SSA repr.
-                    let raw =
-                        builder.ins().load(types::I64, flags, src_v, *offset as i32);
+                    let raw = builder.ins().load(types::I64, flags, src_v, *offset as i32);
                     let v = builder.ins().ireduce(types::I8, raw);
                     values.insert(*dst, ValueRepr::Scalar(v));
                     Ok(())
@@ -2071,8 +2114,7 @@ fn emit_inst(
                 ProcType::Character => {
                     // Record cell stores the codepoint zero-extended to 8
                     // bytes; reduce to the I32 `Character` SSA repr.
-                    let raw =
-                        builder.ins().load(types::I64, flags, src_v, *offset as i32);
+                    let raw = builder.ins().load(types::I64, flags, src_v, *offset as i32);
                     let v = builder.ins().ireduce(types::I32, raw);
                     values.insert(*dst, ValueRepr::Scalar(v));
                     Ok(())
@@ -2132,10 +2174,9 @@ fn emit_inst(
             let pred_addr = builder.ins().func_addr(ptr_ty, pred_ref);
             let where_id = funcs["coddl_relation_where"];
             let where_local = obj.declare_func_in_func(where_id, builder.func);
-            let call =
-                builder
-                    .ins()
-                    .call(where_local, &[src_v, desc_val, pred_addr]);
+            let call = builder
+                .ins()
+                .call(where_local, &[src_v, desc_val, pred_addr]);
             let result = builder.inst_results(call)[0];
             values.insert(*dst, ValueRepr::Scalar(result));
             Ok(())
@@ -2148,7 +2189,9 @@ fn emit_inst(
         } => {
             let payload = scalar_value(values, record)?;
             let repr = values.get(value).cloned().ok_or_else(|| {
-                CraneliftEmitError::UnsupportedInst(format!("undefined value {value:?} in AttrStore"))
+                CraneliftEmitError::UnsupportedInst(format!(
+                    "undefined value {value:?} in AttrStore"
+                ))
             })?;
             // The extend/where store path is scalar/Text only (no sub-layout);
             // a relation-valued store retains via the `RELATION` kind.
@@ -2157,7 +2200,15 @@ fn emit_inst(
                 _ => coddl_procir::kind_tag::INTEGER,
             };
             let retain_ref = obj.declare_func_in_func(funcs["coddl_rc_retain"], builder.func);
-            store_attr(builder, payload, *offset as i32, &repr, None, kind, retain_ref)
+            store_attr(
+                builder,
+                payload,
+                *offset as i32,
+                &repr,
+                None,
+                kind,
+                retain_ref,
+            )
         }
         Inst::Extend {
             dst,
@@ -2207,10 +2258,9 @@ fn emit_inst(
             let res_desc_val = builder.ins().symbol_value(ptr_ty, res_desc_gv);
             let project_id = funcs["coddl_relation_project"];
             let project_local = obj.declare_func_in_func(project_id, builder.func);
-            let call =
-                builder
-                    .ins()
-                    .call(project_local, &[src_v, src_desc_val, res_desc_val]);
+            let call = builder
+                .ins()
+                .call(project_local, &[src_v, src_desc_val, res_desc_val]);
             let result = builder.inst_results(call)[0];
             values.insert(*dst, ValueRepr::Scalar(result));
             Ok(())
@@ -2231,10 +2281,9 @@ fn emit_inst(
             let res_desc_val = builder.ins().symbol_value(ptr_ty, res_desc_gv);
             let restructure_id = funcs["coddl_relation_restructure"];
             let restructure_local = obj.declare_func_in_func(restructure_id, builder.func);
-            let call =
-                builder
-                    .ins()
-                    .call(restructure_local, &[src_v, src_desc_val, res_desc_val]);
+            let call = builder
+                .ins()
+                .call(restructure_local, &[src_v, src_desc_val, res_desc_val]);
             let result = builder.inst_results(call)[0];
             values.insert(*dst, ValueRepr::Scalar(result));
             Ok(())
@@ -2250,16 +2299,14 @@ fn emit_inst(
             let lhs_v = scalar_value(values, lhs)?;
             let rhs_v = scalar_value(values, rhs)?;
             let ptr_ty = obj.target_config().pointer_type();
-            let lhs_desc_gv = obj
-                .declare_data_in_func(heading_desc_ids[lhs_heading_id.0 as usize], builder.func);
+            let lhs_desc_gv =
+                obj.declare_data_in_func(heading_desc_ids[lhs_heading_id.0 as usize], builder.func);
             let lhs_desc_val = builder.ins().symbol_value(ptr_ty, lhs_desc_gv);
-            let rhs_desc_gv = obj
-                .declare_data_in_func(heading_desc_ids[rhs_heading_id.0 as usize], builder.func);
+            let rhs_desc_gv =
+                obj.declare_data_in_func(heading_desc_ids[rhs_heading_id.0 as usize], builder.func);
             let rhs_desc_val = builder.ins().symbol_value(ptr_ty, rhs_desc_gv);
-            let res_desc_gv = obj.declare_data_in_func(
-                heading_desc_ids[result_heading_id.0 as usize],
-                builder.func,
-            );
+            let res_desc_gv = obj
+                .declare_data_in_func(heading_desc_ids[result_heading_id.0 as usize], builder.func);
             let res_desc_val = builder.ins().symbol_value(ptr_ty, res_desc_gv);
             let join_id = funcs["coddl_relation_join"];
             let join_local = obj.declare_func_in_func(join_id, builder.func);
@@ -2434,13 +2481,12 @@ fn emit_inst(
             // 1. Resolve the env-var override → path (ptr, len).
             //    `coddl_resolve_op_field` writes len into an alloca'd
             //    i64 slot we set up first.
-            let slot_len = builder.create_sized_stack_slot(
-                cranelift_codegen::ir::StackSlotData::new(
+            let slot_len =
+                builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                     cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                     8,
                     3,
-                ),
-            );
+                ));
             let len_addr = builder.ins().stack_addr(ptr_ty, slot_len, 0);
             let resolve_id = funcs["coddl_resolve_op_field"];
             let resolve_local = obj.declare_func_in_func(resolve_id, builder.func);
@@ -2455,8 +2501,9 @@ fn emit_inst(
                 &[env_addr, env_len, default_addr, default_len, len_addr],
             );
             let resolved_ptr = builder.inst_results(call)[0];
-            let resolved_len =
-                builder.ins().load(types::I64, MemFlags::trusted(), len_addr, 0);
+            let resolved_len = builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), len_addr, 0);
 
             // 2. Call coddl_sqlite_relvar_init.
             let relvar_name_gv = obj.declare_data_in_func(ids.relvar_name, builder.func);
@@ -2580,19 +2627,16 @@ fn emit_inst(
         }
         Inst::RegisterDatabase => {
             let db = db_data.ok_or_else(|| {
-                CraneliftEmitError::UnsupportedInst(
-                    "RegisterDatabase with no database data".into(),
-                )
+                CraneliftEmitError::UnsupportedInst("RegisterDatabase with no database data".into())
             })?;
             let ptr_ty = obj.target_config().pointer_type();
             // Resolve the env override → path; len is written into a stack slot.
-            let len_slot = builder.create_sized_stack_slot(
-                cranelift_codegen::ir::StackSlotData::new(
+            let len_slot =
+                builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                     cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                     8,
                     3,
-                ),
-            );
+                ));
             let len_addr = builder.ins().stack_addr(ptr_ty, len_slot, 0);
             let resolve_local =
                 obj.declare_func_in_func(funcs["coddl_resolve_op_field"], builder.func);
@@ -2607,16 +2651,19 @@ fn emit_inst(
                 &[env_addr, env_len, default_addr, default_len, len_addr],
             );
             let resolved_ptr = builder.inst_results(call)[0];
-            let resolved_len = builder.ins().load(types::I64, MemFlags::trusted(), len_addr, 0);
+            let resolved_len = builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), len_addr, 0);
             // Register the database.
             let name_gv = obj.declare_data_in_func(db.name, builder.func);
             let name_addr = builder.ins().symbol_value(ptr_ty, name_gv);
             let name_len = builder.ins().iconst(types::I64, db.name_len);
             let reg_local =
                 obj.declare_func_in_func(funcs["coddl_register_database"], builder.func);
-            builder
-                .ins()
-                .call(reg_local, &[name_addr, name_len, resolved_ptr, resolved_len]);
+            builder.ins().call(
+                reg_local,
+                &[name_addr, name_len, resolved_ptr, resolved_len],
+            );
             Ok(())
         }
         Inst::RegisterPlan { plan_id } => {
@@ -2637,8 +2684,7 @@ fn emit_inst(
             let desc_id = heading_desc_ids[p.result_heading_id];
             let desc_gv = obj.declare_data_in_func(desc_id, builder.func);
             let desc_addr = builder.ins().symbol_value(ptr_ty, desc_gv);
-            let reg_local =
-                obj.declare_func_in_func(funcs["coddl_register_plan"], builder.func);
+            let reg_local = obj.declare_func_in_func(funcs["coddl_register_plan"], builder.func);
             builder.ins().call(
                 reg_local,
                 &[
@@ -2678,7 +2724,9 @@ fn emit_inst(
             let plan_id_v = builder.ins().iconst(types::I32, *plan_id as i64);
             let n_v = builder.ins().iconst(types::I64, params.len() as i64);
             let exec_local = obj.declare_func_in_func(funcs["coddl_exec"], builder.func);
-            builder.ins().call(exec_local, &[plan_id_v, params_arg, n_v]);
+            builder
+                .ins()
+                .call(exec_local, &[plan_id_v, params_arg, n_v]);
             Ok(())
         }
         Inst::InsertFrom {
@@ -2798,24 +2846,44 @@ fn read_cell(
 ) -> Result<ValueRepr, CraneliftEmitError> {
     let flags = MemFlags::trusted();
     let repr = match attr_type {
-        ProcType::Integer => ValueRepr::Scalar(builder.ins().load(types::I64, flags, record_ptr, byte_offset)),
+        ProcType::Integer => ValueRepr::Scalar(builder.ins().load(
+            types::I64,
+            flags,
+            record_ptr,
+            byte_offset,
+        )),
         ProcType::Boolean => {
-            let raw = builder.ins().load(types::I64, flags, record_ptr, byte_offset);
+            let raw = builder
+                .ins()
+                .load(types::I64, flags, record_ptr, byte_offset);
             ValueRepr::Scalar(builder.ins().ireduce(types::I8, raw))
         }
         ProcType::Character => {
-            let raw = builder.ins().load(types::I64, flags, record_ptr, byte_offset);
+            let raw = builder
+                .ins()
+                .load(types::I64, flags, record_ptr, byte_offset);
             ValueRepr::Scalar(builder.ins().ireduce(types::I32, raw))
         }
-        ProcType::Approximate => ValueRepr::Scalar(builder.ins().load(types::F64, flags, record_ptr, byte_offset)),
+        ProcType::Approximate => ValueRepr::Scalar(builder.ins().load(
+            types::F64,
+            flags,
+            record_ptr,
+            byte_offset,
+        )),
         ProcType::Rational => {
-            let num = builder.ins().load(types::I64, flags, record_ptr, byte_offset);
-            let den = builder.ins().load(types::I64, flags, record_ptr, byte_offset + 8);
+            let num = builder
+                .ins()
+                .load(types::I64, flags, record_ptr, byte_offset);
+            let den = builder
+                .ins()
+                .load(types::I64, flags, record_ptr, byte_offset + 8);
             ValueRepr::Rational { num, den }
         }
         ProcType::Text | ProcType::Binary => {
             let ptr = builder.ins().load(ptr_ty, flags, record_ptr, byte_offset);
-            let len = builder.ins().load(types::I64, flags, record_ptr, byte_offset + 8);
+            let len = builder
+                .ins()
+                .load(types::I64, flags, record_ptr, byte_offset + 8);
             ValueRepr::Text { ptr, len }
         }
         ProcType::Relation(_) | ProcType::Pointer => {
@@ -2826,7 +2894,13 @@ fn read_cell(
             let mut fields = Vec::with_capacity(sub.attrs.len());
             for (layout, (_, aty)) in sub.attrs.iter().zip(heading.attrs()) {
                 let sub_type = proc_type_from_attr(aty);
-                let repr = read_cell(builder, record_ptr, byte_offset + layout.offset as i32, &sub_type, ptr_ty)?;
+                let repr = read_cell(
+                    builder,
+                    record_ptr,
+                    byte_offset + layout.offset as i32,
+                    &sub_type,
+                    ptr_ty,
+                )?;
                 fields.push((layout.name.clone(), repr));
             }
             ValueRepr::Tuple { fields }
@@ -2856,7 +2930,13 @@ fn read_boxed_tuple(
         let off = base + attr.offset as i32;
         let repr = match &attr.sub {
             Some(sub) => read_boxed_tuple(builder, record_ptr, sub, off, ptr_ty)?,
-            None => read_cell(builder, record_ptr, off, &proc_type_from_kind_cl(attr.kind), ptr_ty)?,
+            None => read_cell(
+                builder,
+                record_ptr,
+                off,
+                &proc_type_from_kind_cl(attr.kind),
+                ptr_ty,
+            )?,
         };
         fields.push((attr.name.clone(), repr));
     }
@@ -3056,9 +3136,7 @@ fn emit_terminator(
                         "Text return without a len-out parameter in the signature".into(),
                     )
                 })?;
-                builder
-                    .ins()
-                    .store(MemFlags::trusted(), *len, len_out, 0);
+                builder.ins().store(MemFlags::trusted(), *len, len_out, 0);
                 builder.ins().return_(&[*ptr]);
             }
             Some(ValueRepr::Rational { .. }) => {
@@ -3213,7 +3291,10 @@ mod tests {
             .windows(needle.len())
             .position(|w| w == needle)
             .expect("string bytes present");
-        assert!(at >= RC_HEADER_SIZE, "no room for a header before the payload");
+        assert!(
+            at >= RC_HEADER_SIZE,
+            "no room for a header before the payload"
+        );
         let header = &bytes[at - RC_HEADER_SIZE..at];
         let mut want = Vec::new();
         want.extend_from_slice(&RC_IMMORTAL.to_ne_bytes());

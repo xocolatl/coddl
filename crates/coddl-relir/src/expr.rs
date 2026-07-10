@@ -129,9 +129,7 @@ pub enum RelExpr {
     /// SQL emission (a `WITH RECURSIVE` push is a deferred follow-up), so a
     /// relvar-rooted `tclose` fetches its operand via SQL then closes
     /// in-process.
-    TClose {
-        input: Box<RelExpr>,
-    },
+    TClose { input: Box<RelExpr> },
     /// Wrap (surface `wrap`) — group attributes into tuple-valued attributes.
     /// **Unary.** Each `(new, components)` removes the component attributes from
     /// the top level and adds `new : Tuple(components)`. Cardinality- and
@@ -154,10 +152,7 @@ pub enum RelExpr {
     /// An in-memory (`private`) relvar read — the materialized counterpart of
     /// the relvar-rooted `RelvarRef` leaf. No SQL source, so any subtree
     /// containing it is `Materialized` and lowers in-process.
-    MaterializedRelvar {
-        name: String,
-        heading: Heading,
-    },
+    MaterializedRelvar { name: String, heading: Heading },
 }
 
 /// Combine the storage origins of a binary node's two operands (`And` / `Or`):
@@ -395,7 +390,11 @@ impl RelExpr {
             // re-canonicalizes (re-sorts) with the new attributes mixed in.
             RelExpr::Extend { input, extends } => {
                 let mut attrs: Vec<(String, Type)> = input.heading().attrs().to_vec();
-                attrs.extend(extends.iter().map(|(name, ty, _)| (name.clone(), ty.clone())));
+                attrs.extend(
+                    extends
+                        .iter()
+                        .map(|(name, ty, _)| (name.clone(), ty.clone())),
+                );
                 Heading::new(attrs)
             }
             // Survivors (attributes not consumed by any wrap) plus each new
@@ -497,7 +496,10 @@ impl RelExpr {
                 table_name,
                 ..
             } => {
-                let _ = writeln!(out, "{pad}RelvarRef {name} {{ db: {database}, table: {table_name} }}");
+                let _ = writeln!(
+                    out,
+                    "{pad}RelvarRef {name} {{ db: {database}, table: {table_name} }}"
+                );
             }
             RelExpr::MaterializedRelvar { name, .. } => {
                 let _ = writeln!(out, "{pad}MaterializedRelvar {name}");

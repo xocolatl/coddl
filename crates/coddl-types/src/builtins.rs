@@ -124,7 +124,9 @@ impl Builtins {
             if !decl.is_builtin() {
                 continue;
             }
-            let Some(name_tok) = decl.name() else { continue };
+            let Some(name_tok) = decl.name() else {
+                continue;
+            };
             let name = name_tok.text().to_string();
 
             let mut params: Vec<(Cow<'static, str>, ParamKind)> = Vec::new();
@@ -147,7 +149,14 @@ impl Builtins {
                 .unwrap_or_else(Type::unit);
 
             let purity = prelude_purity(&name);
-            self.register(name, OperSig { params, return_type, purity });
+            self.register(
+                name,
+                OperSig {
+                    params,
+                    return_type,
+                    purity,
+                },
+            );
         }
     }
 
@@ -255,7 +264,9 @@ mod tests {
     #[test]
     fn write_relation_is_polymorphic() {
         let b = Builtins::new();
-        let sig = b.oper("write_relation").expect("write_relation should exist");
+        let sig = b
+            .oper("write_relation")
+            .expect("write_relation should exist");
         assert_eq!(sig.params.len(), 1);
         assert_eq!(sig.params[0].0.as_ref(), "rel");
         assert!(matches!(sig.params[0].1, ParamKind::AnyRelation));
@@ -335,10 +346,15 @@ mod tests {
     #[test]
     fn to_approximate_loaded_from_prelude() {
         let b = Builtins::new();
-        let sig = b.oper("to_approximate").expect("to_approximate should exist");
+        let sig = b
+            .oper("to_approximate")
+            .expect("to_approximate should exist");
         assert_eq!(sig.params.len(), 1);
         assert_eq!(sig.params[0].0.as_ref(), "self");
-        assert!(matches!(sig.params[0].1, ParamKind::Concrete(Type::Rational)));
+        assert!(matches!(
+            sig.params[0].1,
+            ParamKind::Concrete(Type::Rational)
+        ));
         assert!(matches!(sig.return_type, Type::Approximate));
         assert_eq!(sig.purity, Purity::Pure);
     }
@@ -347,7 +363,10 @@ mod tests {
     fn to_rational_loaded_from_prelude() {
         let b = Builtins::new();
         let sig = b.oper("to_rational").expect("to_rational should exist");
-        assert!(matches!(sig.params[0].1, ParamKind::Concrete(Type::Integer)));
+        assert!(matches!(
+            sig.params[0].1,
+            ParamKind::Concrete(Type::Integer)
+        ));
         assert!(matches!(sig.return_type, Type::Rational));
         assert_eq!(sig.purity, Purity::Pure);
     }

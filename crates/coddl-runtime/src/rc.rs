@@ -125,7 +125,9 @@ pub unsafe extern "C" fn coddl_rc_alloc(
     kind: u32,
     desc: *const CoddlHeadingDesc,
 ) -> *mut u8 {
-    let total = HEADER_SIZE.checked_add(payload_size).expect("alloc overflow");
+    let total = HEADER_SIZE
+        .checked_add(payload_size)
+        .expect("alloc overflow");
     let layout = Layout::from_size_align(total, PAYLOAD_ALIGN).expect("bad layout");
     let block = alloc(layout);
     if block.is_null() {

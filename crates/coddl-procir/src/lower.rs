@@ -16,13 +16,10 @@ use coddl_diagnostics::{Diagnostic, FileId, Severity, Span};
 use coddl_plan::{Plan, WritePolicy};
 use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, DeleteStmt, DoWhileStmt,
-    Expr, ExprStmt,
-    InsertStmt,
-    ExtendExpr, FieldAccess, ForStmt, IfExpr, IndexExpr, Item,
-    LetStmt, Literal, LoadStmt, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit,
-    RenameExpr,
-    ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit,
-    TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WhileStmt, WrapExpr,
+    Expr, ExprStmt, ExtendExpr, FieldAccess, ForStmt, IfExpr, IndexExpr, InsertStmt, Item, LetStmt,
+    Literal, LoadStmt, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit,
+    RenameExpr, ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt,
+    TupleLit, TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WhileStmt, WrapExpr,
 };
 use coddl_syntax::{parse_format_template, SyntaxKind, TemplateChunk};
 use coddl_types::{check, resolve_type_ref_quiet, Heading, RelvarKind, RelvarTable, Type};
@@ -193,12 +190,7 @@ pub fn explain_with_plan(source: &str, file: FileId, plan: Option<&Plan>) -> Low
     lower_impl(source, file, plan, true)
 }
 
-fn lower_impl(
-    source: &str,
-    file: FileId,
-    plan: Option<&Plan>,
-    collect_relir: bool,
-) -> LowerOutput {
+fn lower_impl(source: &str, file: FileId, plan: Option<&Plan>, collect_relir: bool) -> LowerOutput {
     let check_out = check(source, file, coddl_syntax::FileKind::Cd);
     let has_errors = check_out
         .diagnostics
@@ -536,10 +528,7 @@ impl Lowerer {
 
     /// Absorb the typechecker's possrep scalars so a `Type::Scalar` erases to
     /// its component and its selector/accessor lower correctly.
-    fn absorb_nominal_scalars(
-        &mut self,
-        scalars: &HashMap<String, coddl_types::PossrepScalar>,
-    ) {
+    fn absorb_nominal_scalars(&mut self, scalars: &HashMap<String, coddl_types::PossrepScalar>) {
         self.nominal_scalars = scalars.clone();
     }
 
@@ -608,7 +597,9 @@ impl Lowerer {
         let ty = self.erase_scalars(ty);
         match &ty {
             Type::Relation(h) => ProcType::Relation(self.intern_heading(h)),
-            Type::Sequence(elem) => ProcType::Sequence(Box::new(self.proc_type_from_resolved(elem))),
+            Type::Sequence(elem) => {
+                ProcType::Sequence(Box::new(self.proc_type_from_resolved(elem)))
+            }
             other => proc_type_from_type(other),
         }
     }
@@ -782,10 +773,7 @@ impl Lowerer {
     }
 
     fn lookup_local(&self, name: &str) -> Option<(ValueId, ProcType)> {
-        self.locals
-            .iter()
-            .rev()
-            .find_map(|l| l.get(name).cloned())
+        self.locals.iter().rev().find_map(|l| l.get(name).cloned())
     }
 
     /// Record a relation `let`-binding as a deferred `RelExpr` alias (see
@@ -919,8 +907,7 @@ impl Lowerer {
     /// `Text` loaded from a cell is excluded — releasing it would be a
     /// premature free).
     fn needs_scope_release(&self, v: ValueId, ty: &ProcType) -> bool {
-        Self::is_heap_managed(ty)
-            || (matches!(ty, ProcType::Text) && self.owned_texts.contains(&v))
+        Self::is_heap_managed(ty) || (matches!(ty, ProcType::Text) && self.owned_texts.contains(&v))
     }
 
     /// Mark `v` as an owned heap `Text` (a `||` result, `read_line` result,
@@ -1563,13 +1550,19 @@ impl Lowerer {
     /// target is a write to the SQL-backed relvar: the RHS is recognized as an
     /// assignment shape and emitted as surgical DML, never hydrated.
     fn lower_assign_stmt(&mut self, stmt: &AssignStmt) {
-        let Some(target_expr) = stmt.target() else { return };
+        let Some(target_expr) = stmt.target() else {
+            return;
+        };
         let Expr::NameRef(target) = &target_expr else {
             return; // typechecker rejected a non-name target (T0033)
         };
-        let Some(name_tok) = target.ident() else { return };
+        let Some(name_tok) = target.ident() else {
+            return;
+        };
         let name = name_tok.text().to_string();
-        let Some(value_expr) = stmt.value() else { return };
+        let Some(value_expr) = stmt.value() else {
+            return;
+        };
 
         // `R := R` does nothing — elide it entirely (the typechecker already
         // warned, T0051). This holds for both a public and a private target.
@@ -1642,11 +1635,15 @@ impl Lowerer {
     /// (a whole-table `DELETE FROM t`, never hydrated); a **private** relvar
     /// stores the empty `R minus R` value back into its in-memory slot.
     fn lower_truncate_stmt(&mut self, stmt: &TruncateStmt) {
-        let Some(operand) = stmt.operand() else { return };
+        let Some(operand) = stmt.operand() else {
+            return;
+        };
         let Expr::NameRef(target) = &operand else {
             return; // typechecker rejected a non-name operand (T0033)
         };
-        let Some(name_tok) = target.ident() else { return };
+        let Some(name_tok) = target.ident() else {
+            return;
+        };
         let name = name_tok.text().to_string();
 
         // Public target → surgical whole-table delete via the `R := R minus R`
@@ -1682,13 +1679,19 @@ impl Lowerer {
     /// `emit_assignment` (`DELETE FROM t WHERE p`, never hydrated); a **private**
     /// relvar stores the kept rows `R minus (R where p)` back into its slot.
     fn lower_delete_stmt(&mut self, stmt: &DeleteStmt) {
-        let Some(operand) = stmt.operand() else { return };
+        let Some(operand) = stmt.operand() else {
+            return;
+        };
         // The operand is the `where`-restriction `R where p` (typecheck guarantees
         // the shape); the relvar is the `where` lhs.
         let Expr::Binary(bin) = &operand else { return };
         let Some(lhs_expr) = bin.lhs() else { return };
-        let Expr::NameRef(target) = &lhs_expr else { return };
-        let Some(name_tok) = target.ident() else { return };
+        let Expr::NameRef(target) = &lhs_expr else {
+            return;
+        };
+        let Some(name_tok) = target.ident() else {
+            return;
+        };
         let name = name_tok.text().to_string();
 
         // Builtin (FFI-backed) target → unset each matched variable. The rows to
@@ -1750,11 +1753,19 @@ impl Lowerer {
     /// source is SQL-backed, else ships its rows (`ship_union_insert`); a
     /// **private** relvar stores the in-process union back into its slot.
     fn lower_insert_stmt(&mut self, stmt: &InsertStmt) {
-        let Some(target_expr) = stmt.target() else { return };
-        let Expr::NameRef(target) = &target_expr else { return };
-        let Some(name_tok) = target.ident() else { return };
+        let Some(target_expr) = stmt.target() else {
+            return;
+        };
+        let Expr::NameRef(target) = &target_expr else {
+            return;
+        };
+        let Some(name_tok) = target.ident() else {
+            return;
+        };
         let name = name_tok.text().to_string();
-        let Some(source_expr) = stmt.source() else { return };
+        let Some(source_expr) = stmt.source() else {
+            return;
+        };
 
         // Builtin (FFI-backed) target → set each source tuple's variable. The
         // runtime walks the source relation and calls `setenv`.
@@ -1873,7 +1884,9 @@ impl Lowerer {
     /// arm; a **private** relvar computes the union (or the bare substitute) in
     /// process and stores it back into its slot.
     fn lower_update_stmt(&mut self, stmt: &UpdateStmt) {
-        let Some(operand) = stmt.operand() else { return };
+        let Some(operand) = stmt.operand() else {
+            return;
+        };
         // Root relvar + the `where`-restriction, if any. The operand is `R` or
         // `R where p` (typecheck guaranteed the shape).
         let (root_expr, has_where) = match &operand {
@@ -1884,8 +1897,12 @@ impl Lowerer {
             }
             _ => return,
         };
-        let Expr::NameRef(target) = &root_expr else { return };
-        let Some(name_tok) = target.ident() else { return };
+        let Expr::NameRef(target) = &root_expr else {
+            return;
+        };
+        let Some(name_tok) = target.ident() else {
+            return;
+        };
         let name = name_tok.text().to_string();
 
         // Collect the `{ target: value }` pairs (typecheck guaranteed each side).
@@ -1937,7 +1954,10 @@ impl Lowerer {
             changed
         };
         self.used_private_relvars.insert(name.clone());
-        self.insts.push(Inst::RelvarSlotStore { name, value: result });
+        self.insts.push(Inst::RelvarSlotStore {
+            name,
+            value: result,
+        });
     }
 
     /// Lower the public (SQL-backed) `update`: build `Or{ Restrict(t, ¬p),
@@ -2179,9 +2199,8 @@ impl Lowerer {
             return None;
         }
         let (lhs, rhs) = (b.lhs()?, b.rhs()?);
-        let is_target = |e: &Expr| {
-            matches!(e, Expr::NameRef(n) if n.ident().is_some_and(|t| t.text() == name))
-        };
+        let is_target =
+            |e: &Expr| matches!(e, Expr::NameRef(n) if n.ident().is_some_and(|t| t.text() == name));
         if is_target(&lhs) {
             Some(rhs)
         } else if is_target(&rhs) {
@@ -2209,10 +2228,7 @@ impl Lowerer {
         if let Expr::Literal(lit) = &value_expr {
             if lit.token().map(|t| t.kind()) == Some(SyntaxKind::FORMAT_STRING_LIT) {
                 if let (Some(tok), Some(name_tok)) = (lit.token(), stmt.name()) {
-                    self.bind_format_template(
-                        name_tok.text().to_string(),
-                        tok.text().to_string(),
-                    );
+                    self.bind_format_template(name_tok.text().to_string(), tok.text().to_string());
                 }
                 return;
             }
@@ -2777,7 +2793,8 @@ impl Lowerer {
         // not-taken edge forwards the pre-`if` value (a missing `else` gets an
         // explicit skip block for that, since `CondBr` carries no args).
         // Captured before the arms rebind `locals`.
-        let carried = self.carried_value_vars(&[then_body.as_ref(), else_body.as_ref()], span, false);
+        let carried =
+            self.carried_value_vars(&[then_body.as_ref(), else_body.as_ref()], span, false);
 
         let cond = self.lower_expr(&cond_expr);
 
@@ -2891,7 +2908,8 @@ impl Lowerer {
             }
             params.push((result, ty));
         }
-        let mut carried_params: Vec<(String, ValueId, ProcType)> = Vec::with_capacity(carried.len());
+        let mut carried_params: Vec<(String, ValueId, ProcType)> =
+            Vec::with_capacity(carried.len());
         for (name, _, cty) in &carried {
             let p = self.fresh_value();
             self.record_type(p, cty.clone());
@@ -2917,11 +2935,7 @@ impl Lowerer {
     /// (`var x;` unbound) — the vars an `if` *introduces* (definitely assigned
     /// on both paths). Only when both arms exist; a missing `else` can't make a
     /// var definitely assigned.
-    fn introduced_var_names(
-        &self,
-        then_b: Option<&Block>,
-        else_b: Option<&Block>,
-    ) -> Vec<String> {
+    fn introduced_var_names(&self, then_b: Option<&Block>, else_b: Option<&Block>) -> Vec<String> {
         let (Some(t), Some(e)) = (then_b, else_b) else {
             return Vec::new();
         };
@@ -2940,7 +2954,10 @@ impl Lowerer {
 
     /// The current SSA value of each introduced var (read from `locals` after
     /// an arm rebinds it) — the arguments that arm passes to the merge.
-    fn introduced_current_values(&self, introduced: &[(String, ProcType, ValueId)]) -> Vec<ValueId> {
+    fn introduced_current_values(
+        &self,
+        introduced: &[(String, ProcType, ValueId)],
+    ) -> Vec<ValueId> {
         introduced
             .iter()
             .map(|(name, _, _)| {
@@ -3194,7 +3211,9 @@ impl Lowerer {
             ProcType::Sequence(inner) => match *inner {
                 ProcType::Tuple(h) => h,
                 other => {
-                    unreachable!("reverse load of `Sequence {other}` (non-tuple) survived typecheck")
+                    unreachable!(
+                        "reverse load of `Sequence {other}` (non-tuple) survived typecheck"
+                    )
                 }
             },
             other => unreachable!("reverse load source `{other}` is not a Sequence"),
@@ -3318,7 +3337,10 @@ impl Lowerer {
         let mut pairs: Vec<(String, Expr)> = Vec::new();
         let mut removed: HashSet<String> = HashSet::new();
         for (name_tok, value) in re.pairs() {
-            let new = name_tok.expect("typechecked replace pair has a name").text().to_string();
+            let new = name_tok
+                .expect("typechecked replace pair has a name")
+                .text()
+                .to_string();
             let value = value.expect("typechecked replace pair has a value");
             let mut refs: HashSet<String> = HashSet::new();
             ast_attr_refs(&value, &mut refs);
@@ -3549,7 +3571,10 @@ impl Lowerer {
             .into_iter()
             .map(|(name_tok, value)| {
                 (
-                    name_tok.expect("typechecked extend pair has a name").text().to_string(),
+                    name_tok
+                        .expect("typechecked extend pair has a name")
+                        .text()
+                        .to_string(),
                     value.expect("typechecked extend pair has a value"),
                 )
             })
@@ -4072,9 +4097,9 @@ impl Lowerer {
                     SyntaxKind::INTEGER_LIT => {
                         Some(ScalarExpr::Int(parse_integer_literal(tok.text())))
                     }
-                    SyntaxKind::STRING_LIT => {
-                        Some(ScalarExpr::Str(String::from_utf8(decode_string_literal(tok.text())).ok()?))
-                    }
+                    SyntaxKind::STRING_LIT => Some(ScalarExpr::Str(
+                        String::from_utf8(decode_string_literal(tok.text())).ok()?,
+                    )),
                     SyntaxKind::CHAR_LIT => Some(ScalarExpr::Char(decode_char_literal(tok.text()))),
                     _ => None,
                 }
@@ -4201,9 +4226,9 @@ impl Lowerer {
                     SyntaxKind::CHAR_LIT => {
                         Some(RelLiteral::Character(decode_char_literal(token.text())))
                     }
-                    SyntaxKind::APPROXIMATE_LIT => {
-                        Some(RelLiteral::Approximate(decode_approximate_literal(token.text())))
-                    }
+                    SyntaxKind::APPROXIMATE_LIT => Some(RelLiteral::Approximate(
+                        decode_approximate_literal(token.text()),
+                    )),
                     SyntaxKind::RATIONAL_LIT => {
                         let (n, d) = decode_rational_literal(token.text());
                         Some(RelLiteral::Rational(n, d))
@@ -4272,10 +4297,9 @@ impl Lowerer {
                 // A `Rational` bind param serializes to its canonical `"n/d"`
                 // string and rides the existing Text param path (SQLite has no
                 // exact-rational type; canonical text ⇒ text-`=` is value-`=`).
-                Value::Rational(n, d) => (
-                    Const::Text(format!("{n}/{d}").into_bytes()),
-                    ProcType::Text,
-                ),
+                Value::Rational(n, d) => {
+                    (Const::Text(format!("{n}/{d}").into_bytes()), ProcType::Text)
+                }
                 Value::Boolean(b) => (Const::Boolean(*b), ProcType::Boolean),
             };
             let dst = self.fresh_value();
@@ -4325,15 +4349,11 @@ impl Lowerer {
         let op = ue.op_kind().expect("typechecked unary expr has an op");
         match op {
             UnaryOp::Extract => {
-                let operand_expr = ue
-                    .operand()
-                    .expect("typechecked extract has an operand");
+                let operand_expr = ue.operand().expect("typechecked extract has an operand");
                 let src = self.lower_expr(&operand_expr);
                 let heading_id = match self.value_type(src) {
                     ProcType::Relation(id) => id,
-                    other => unreachable!(
-                        "extract on non-relation `{other}` survived typecheck"
-                    ),
+                    other => unreachable!("extract on non-relation `{other}` survived typecheck"),
                 };
                 let heading = self.headings[heading_id.0 as usize].clone();
                 let dst = self.fresh_value();
@@ -4513,15 +4533,35 @@ impl Lowerer {
             BinaryOp::GtEq => (ScalarOp::GtEq, self.value_type(lhs), ProcType::Boolean),
             BinaryOp::And => (ScalarOp::And, ProcType::Boolean, ProcType::Boolean),
             BinaryOp::Or => (ScalarOp::Or, ProcType::Boolean, ProcType::Boolean),
-            BinaryOp::Add if rat => (ScalarOp::RationalAdd, ProcType::Rational, ProcType::Rational),
+            BinaryOp::Add if rat => (
+                ScalarOp::RationalAdd,
+                ProcType::Rational,
+                ProcType::Rational,
+            ),
             BinaryOp::Add => (ScalarOp::Add, ProcType::Integer, ProcType::Integer),
-            BinaryOp::Sub if rat => (ScalarOp::RationalSub, ProcType::Rational, ProcType::Rational),
+            BinaryOp::Sub if rat => (
+                ScalarOp::RationalSub,
+                ProcType::Rational,
+                ProcType::Rational,
+            ),
             BinaryOp::Sub => (ScalarOp::Sub, ProcType::Integer, ProcType::Integer),
-            BinaryOp::Mul if rat => (ScalarOp::RationalMul, ProcType::Rational, ProcType::Rational),
+            BinaryOp::Mul if rat => (
+                ScalarOp::RationalMul,
+                ProcType::Rational,
+                ProcType::Rational,
+            ),
             BinaryOp::Mul => (ScalarOp::Mul, ProcType::Integer, ProcType::Integer),
-            BinaryOp::Div if rat => (ScalarOp::RationalDiv, ProcType::Rational, ProcType::Rational),
+            BinaryOp::Div if rat => (
+                ScalarOp::RationalDiv,
+                ProcType::Rational,
+                ProcType::Rational,
+            ),
             // Integer `/` is exact: two Integer operands, a Rational result.
-            BinaryOp::Div => (ScalarOp::RatioFromInts, ProcType::Integer, ProcType::Rational),
+            BinaryOp::Div => (
+                ScalarOp::RatioFromInts,
+                ProcType::Integer,
+                ProcType::Rational,
+            ),
             BinaryOp::IntDiv => (ScalarOp::Div, ProcType::Integer, ProcType::Integer),
             BinaryOp::Concat => {
                 lhs = self.coerce_to_text(lhs);
@@ -5139,10 +5179,8 @@ impl Lowerer {
                 .map(|(n, _, ty)| (n.clone(), self.type_from_proc_m(ty)))
                 .collect(),
         );
-        let fields: Vec<(String, ValueId)> = field_pairs
-            .into_iter()
-            .map(|(n, v, _)| (n, v))
-            .collect();
+        let fields: Vec<(String, ValueId)> =
+            field_pairs.into_iter().map(|(n, v, _)| (n, v)).collect();
         let dst = self.fresh_value();
         self.record_type(dst, ProcType::Tuple(heading.clone()));
         self.insts.push(Inst::TupleLit {
@@ -5191,9 +5229,9 @@ impl Lowerer {
             .expect("typechecked field-access has a field token")
             .text()
             .to_string();
-        let field_ty = heading.lookup(&field_name).unwrap_or_else(|| {
-            unreachable!("unknown field `{field_name}` survived typecheck")
-        });
+        let field_ty = heading
+            .lookup(&field_name)
+            .unwrap_or_else(|| unreachable!("unknown field `{field_name}` survived typecheck"));
         // Use the interning conversion so a relation-valued field resolves its
         // `HeadingId` (the free `proc_type_from_type` rejects `Type::Relation`).
         let field_type = self.proc_type_from_resolved(&field_ty);
@@ -5797,9 +5835,9 @@ impl Lowerer {
         let rel = self.lower_expr(&rel_expr);
         let heading_id = match self.value_type(rel) {
             ProcType::Relation(id) => id,
-            other => unreachable!(
-                "write_relation got non-relation arg type `{other}` past typecheck"
-            ),
+            other => {
+                unreachable!("write_relation got non-relation arg type `{other}` past typecheck")
+            }
         };
         self.insts.push(Inst::WriteRelation { rel, heading_id });
         // `write_relation` borrows its argument; release an owned relation
@@ -5952,8 +5990,9 @@ impl Lowerer {
                     // recorded at the binding site.
                     Some(Expr::NameRef(n)) => {
                         if let Some(ident) = n.ident() {
-                            template_text =
-                                self.lookup_format_template(ident.text()).map(str::to_string);
+                            template_text = self
+                                .lookup_format_template(ident.text())
+                                .map(str::to_string);
                         }
                     }
                     _ => {}
@@ -5995,7 +6034,9 @@ impl Lowerer {
                         .lookup(name)
                         .map(proc_type_from_type)
                         .unwrap_or_else(|| {
-                            unreachable!("placeholder `{name}` missing from args heading past typecheck")
+                            unreachable!(
+                                "placeholder `{name}` missing from args heading past typecheck"
+                            )
                         });
                     let field = self.fresh_value();
                     self.record_type(field, field_type.clone());
@@ -6433,7 +6474,9 @@ fn canonical_approx_bits(x: f64) -> u64 {
 /// the lexer already validated the mantissa/exponent shape.
 fn decode_approximate_literal(text: &str) -> u64 {
     let cleaned: String = text.chars().filter(|c| *c != '_').collect();
-    let value: f64 = cleaned.parse().expect("lexer validated the approximate literal");
+    let value: f64 = cleaned
+        .parse()
+        .expect("lexer validated the approximate literal");
     canonical_approx_bits(value)
 }
 
@@ -6560,9 +6603,10 @@ mod tests {
             .find(|f| f.name == "greet")
             .expect("greet function emitted");
         assert!(matches!(greet.return_type, ProcType::Text));
-        assert!(greet.blocks.iter().any(
-            |b| matches!(b.terminator, Terminator::Return(Some(_)))
-        ));
+        assert!(greet
+            .blocks
+            .iter()
+            .any(|b| matches!(b.terminator, Terminator::Return(Some(_)))));
 
         // `main` calls `greet` by its surface linkage name (no extern symbol),
         // binds a Text dst, and releases the owned result at scope exit.
@@ -6642,7 +6686,10 @@ mod tests {
             .find(|b| matches!(b.terminator, Terminator::CondBr { .. }))
             .expect("loop header block");
         assert!(
-            header.params.iter().any(|(_, t)| matches!(t, ProcType::Text)),
+            header
+                .params
+                .iter()
+                .any(|(_, t)| matches!(t, ProcType::Text)),
             "loop header carries the Text accumulator as a block param, got {:?}",
             header.params
         );
@@ -6771,7 +6818,8 @@ oper main {}\n\
             .filter(|d| d.severity == coddl_diagnostics::Severity::Error)
             .collect();
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
-        out.module.expect("module should be produced on clean check")
+        out.module
+            .expect("module should be produced on clean check")
     }
 
     #[test]
@@ -6951,7 +6999,9 @@ oper main {}\n\
 
         // The pushed subtree replaces the legacy materialize + filter path.
         assert!(
-            !insts.iter().any(|i| matches!(i, Inst::RelvarSlotInit { .. })),
+            !insts
+                .iter()
+                .any(|i| matches!(i, Inst::RelvarSlotInit { .. })),
             "startup slot init should be suppressed in:\n{m}"
         );
         assert!(
@@ -7037,7 +7087,10 @@ public relvar Greetings { id: Integer, message: Text } key { id };\n\
         );
         let (m, insts) = bt_main_insts(&src);
         assert_eq!(
-            insts.iter().filter(|i| matches!(i, Inst::Query { .. })).count(),
+            insts
+                .iter()
+                .filter(|i| matches!(i, Inst::Query { .. }))
+                .count(),
             1,
             "should fold to one pushed query in:\n{m}"
         );
@@ -7070,7 +7123,10 @@ public relvar Greetings { id: Integer, message: Text } key { id };\n\
         );
         let (m, insts) = bt_main_insts(&src);
         assert_eq!(
-            insts.iter().filter(|i| matches!(i, Inst::Query { .. })).count(),
+            insts
+                .iter()
+                .filter(|i| matches!(i, Inst::Query { .. }))
+                .count(),
             1,
             "the unused `gg` alias should add no query in:\n{m}"
         );
@@ -7100,8 +7156,7 @@ public relvar Greetings { id: Integer, message: Text } key { id };\n\
         );
         assert_eq!(m.plans.len(), 1);
         assert_eq!(
-            m.plans[0].sql,
-            r#"SELECT "id", "message" FROM "greetings""#,
+            m.plans[0].sql, r#"SELECT "id", "message" FROM "greetings""#,
             "the relvar materializes (SELECT *) inside the transaction:\n{m}"
         );
     }
@@ -7120,8 +7175,7 @@ public relvar Greetings { id: Integer, message: Text } key { id };\n\
         let (m, insts) = bt_main_insts(&src);
         assert_eq!(m.plans.len(), 1);
         assert_eq!(
-            m.plans[0].sql,
-            r#"SELECT "id", "message" FROM "greetings" ORDER BY "message""#,
+            m.plans[0].sql, r#"SELECT "id", "message" FROM "greetings" ORDER BY "message""#,
             "the order rides the source SELECT:\n{m}"
         );
         let keys = insts
@@ -7156,8 +7210,7 @@ public relvar Greetings { id: Integer, message: Text } key { id };\n\
         let (m, insts) = bt_main_insts(&src);
         assert_eq!(m.plans.len(), 1);
         assert_eq!(
-            m.plans[0].sql,
-            r#"SELECT "id", "message" FROM "greetings""#,
+            m.plans[0].sql, r#"SELECT "id", "message" FROM "greetings""#,
             "the snapshot materialized with no ORDER BY:\n{m}"
         );
         let keys = insts
@@ -7213,7 +7266,10 @@ public relvar Greetings { id: Integer, message: Text } key { id };\n\
         );
         let (m, insts) = bt_main_insts(&src);
         assert_eq!(
-            insts.iter().filter(|i| matches!(i, Inst::Query { .. })).count(),
+            insts
+                .iter()
+                .filter(|i| matches!(i, Inst::Query { .. }))
+                .count(),
             1,
             "project should fold to one pushed query in:\n{m}"
         );
@@ -7267,7 +7323,9 @@ oper main {}\n\
             "relvar read should be served by the query"
         );
         assert!(
-            !insts.iter().any(|i| matches!(i, Inst::RelvarSlotInit { .. })),
+            !insts
+                .iter()
+                .any(|i| matches!(i, Inst::RelvarSlotInit { .. })),
             "startup slot init should be suppressed in:\n{m}"
         );
 
@@ -7412,9 +7470,13 @@ oper main {}\n\
             "char operand normalized via CharToText"
         );
         assert!(
-            insts
-                .iter()
-                .any(|i| matches!(i, Inst::ScalarOp { op: ScalarOp::Concat, .. })),
+            insts.iter().any(|i| matches!(
+                i,
+                Inst::ScalarOp {
+                    op: ScalarOp::Concat,
+                    ..
+                }
+            )),
             "concatenation lowers to ScalarOp::Concat"
         );
     }
@@ -7432,11 +7494,15 @@ oper main {}\n\
             .iter()
             .find(|f| f.name.starts_with("__coddl_where_"))
             .expect("predicate helper function");
-        let has_add = pred
-            .blocks
-            .iter()
-            .flat_map(|b| &b.insts)
-            .any(|i| matches!(i, Inst::ScalarOp { op: ScalarOp::Add, .. }));
+        let has_add = pred.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+            matches!(
+                i,
+                Inst::ScalarOp {
+                    op: ScalarOp::Add,
+                    ..
+                }
+            )
+        });
         assert!(has_add, "predicate body computes a + b via ScalarOp::Add");
     }
 
@@ -7717,10 +7783,18 @@ oper main {} [
         let m = lower_ok(src);
         let main = m.functions.iter().find(|f| f.name == "main").unwrap();
         let insts: Vec<_> = main.blocks.iter().flat_map(|b| &b.insts).collect();
-        assert!(insts.iter().any(|i| matches!(i, Inst::Minus { .. })), "unchanged = R minus matching");
-        assert!(insts.iter().any(|i| matches!(i, Inst::Union { .. })), "result = unchanged union changed");
         assert!(
-            insts.iter().any(|i| matches!(i, Inst::RelvarSlotStore { .. })),
+            insts.iter().any(|i| matches!(i, Inst::Minus { .. })),
+            "unchanged = R minus matching"
+        );
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::Union { .. })),
+            "result = unchanged union changed"
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|i| matches!(i, Inst::RelvarSlotStore { .. })),
             "update stores the result into the slot"
         );
     }
@@ -7734,13 +7808,20 @@ oper main {} [
         let m = lower_ok(src);
         let main = m.functions.iter().find(|f| f.name == "main").unwrap();
         let insts: Vec<_> = main.blocks.iter().flat_map(|b| &b.insts).collect();
-        assert!(insts.iter().any(|i| matches!(i, Inst::Extend { .. })), "substitute extends the new value");
         assert!(
-            insts.iter().any(|i| matches!(i, Inst::RelvarSlotStore { .. })),
+            insts.iter().any(|i| matches!(i, Inst::Extend { .. })),
+            "substitute extends the new value"
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|i| matches!(i, Inst::RelvarSlotStore { .. })),
             "update-all stores the substituted relation"
         );
         assert!(
-            !insts.iter().any(|i| matches!(i, Inst::Union { .. } | Inst::Minus { .. })),
+            !insts
+                .iter()
+                .any(|i| matches!(i, Inst::Union { .. } | Inst::Minus { .. })),
             "update-all has no unchanged-rows union"
         );
     }
@@ -7766,14 +7847,22 @@ oper main {} [
             .iter()
             .find(|f| f.name.starts_with("__coddl_extend_"))
             .expect("synthesized extend helper");
-        assert_eq!(helper.params.len(), 2, "helper has src + dst pointer params");
+        assert_eq!(
+            helper.params.len(),
+            2,
+            "helper has src + dst pointer params"
+        );
         assert_eq!(helper.return_type, ProcType::Unit);
         // The helper computes `a + b` (a ScalarOp::Add) and stores cells.
         let insts = &helper.blocks[0].insts;
         assert!(
-            insts
-                .iter()
-                .any(|i| matches!(i, Inst::ScalarOp { op: ScalarOp::Add, .. })),
+            insts.iter().any(|i| matches!(
+                i,
+                Inst::ScalarOp {
+                    op: ScalarOp::Add,
+                    ..
+                }
+            )),
             "helper computes a + b"
         );
         assert!(
@@ -7855,7 +7944,10 @@ oper main {} [
             .expect("expected an Inst::RelationLit");
         assert_eq!(tuples_len, 0, "still an empty relation (zero tuples)");
         let h = &m.headings[heading_id.0 as usize];
-        assert!(h.lookup("name").is_some(), "carries the annotation's `name`");
+        assert!(
+            h.lookup("name").is_some(),
+            "carries the annotation's `name`"
+        );
         assert_eq!(h.attrs().len(), 1, "exactly the annotation heading");
     }
 
@@ -8136,7 +8228,11 @@ oper main {} [
             1,
             "owned concat local released exactly once; releases={releases:?}"
         );
-        assert_eq!(releases.len(), 1, "only the concat local; releases={releases:?}");
+        assert_eq!(
+            releases.len(),
+            1,
+            "only the concat local; releases={releases:?}"
+        );
     }
 
     #[test]
@@ -8152,7 +8248,11 @@ oper main {} [
             releases.contains(&inner),
             "inner concat temporary released; releases={releases:?}"
         );
-        assert_eq!(releases.len(), 2, "inner temp + outer local; releases={releases:?}");
+        assert_eq!(
+            releases.len(),
+            2,
+            "inner temp + outer local; releases={releases:?}"
+        );
     }
 
     #[test]
@@ -8163,12 +8263,15 @@ oper main {} [
         let src = "oper greet { name: Text } [ write_line { message: \"a\" || name }; ];";
         let module = lower_ok(src);
         let greet = module.functions.iter().find(|f| f.name == "greet").unwrap();
-        let concat = greet
-            .blocks[0]
+        let concat = greet.blocks[0]
             .insts
             .iter()
             .find_map(|i| match i {
-                Inst::ScalarOp { dst, op: ScalarOp::Concat, .. } => Some(*dst),
+                Inst::ScalarOp {
+                    dst,
+                    op: ScalarOp::Concat,
+                    ..
+                } => Some(*dst),
                 _ => None,
             })
             .expect("a Concat present");
@@ -8180,7 +8283,11 @@ oper main {} [
                 _ => None,
             })
             .collect();
-        assert_eq!(releases, vec![concat], "only the inline concat temp; got {releases:?}");
+        assert_eq!(
+            releases,
+            vec![concat],
+            "only the inline concat temp; got {releases:?}"
+        );
     }
 
     #[test]
@@ -8188,7 +8295,8 @@ oper main {} [
         // `t.message` is a `TupleField` — a borrowed `(ptr,len)` into the
         // tuple, NOT an owned heap Text. It must never be released (that would
         // be a premature free). The literal is borrowed too. Zero releases.
-        let src = "oper main {} [ let t = { message: \"hi\" }; write_line { message: t.message }; ];";
+        let src =
+            "oper main {} [ let t = { message: \"hi\" }; write_line { message: t.message }; ];";
         let module = lower_ok(src);
         assert!(
             main_releases(&module).is_empty(),
@@ -8290,7 +8398,11 @@ oper main {} [
                    oper main {} [ let g = echo { self: \"x\" }; \
                    write_line { message: g }; ];";
         let m = lower_ok(src);
-        let echo = m.functions.iter().find(|f| f.name == "echo").expect("echo fn");
+        let echo = m
+            .functions
+            .iter()
+            .find(|f| f.name == "echo")
+            .expect("echo fn");
         let term = &echo.blocks.last().expect("a block").terminator;
         assert!(
             matches!(term, Terminator::Return(Some(v)) if *v == ValueId(0)),
@@ -8443,7 +8555,10 @@ oper main {} [
         let m = lower_ok(src);
         let act = m.functions.iter().find(|f| f.name == "act").unwrap();
         assert_eq!(act.blocks.len(), 3, "entry + then + merge");
-        assert!(matches!(act.blocks[0].terminator, Terminator::CondBr { .. }));
+        assert!(matches!(
+            act.blocks[0].terminator,
+            Terminator::CondBr { .. }
+        ));
         let brs = act
             .blocks
             .iter()
@@ -8493,7 +8608,11 @@ oper main {} [
         match &f.blocks[0].terminator {
             Terminator::Br { target, args } => {
                 assert_eq!(*target, header_id, "entry branches to the header");
-                assert_eq!(args.len(), 1, "entry seeds the counter with the lower bound");
+                assert_eq!(
+                    args.len(),
+                    1,
+                    "entry seeds the counter with the lower bound"
+                );
             }
             other => panic!("entry should end in Br, got {other:?}"),
         }
@@ -8610,8 +8729,10 @@ oper main {} [
             .blocks
             .iter()
             .enumerate()
-            .find(|(idx, b)| *idx > body_idx
-                && matches!(&b.terminator, Terminator::Br { target, .. } if *target == body.id))
+            .find(|(idx, b)| {
+                *idx > body_idx
+                    && matches!(&b.terminator, Terminator::Br { target, .. } if *target == body.id)
+            })
             .map(|(_, b)| b)
             .expect("a later block branches back to the body (the latch)");
         assert!(
@@ -8718,9 +8839,9 @@ oper main {} [
         );
         // … and `{name}` is read out of it via TupleField.
         assert!(
-            insts.iter().any(
-                |i| matches!(i, Inst::TupleField { field_name, .. } if field_name == "name")
-            ),
+            insts
+                .iter()
+                .any(|i| matches!(i, Inst::TupleField { field_name, .. } if field_name == "name")),
             "expected a TupleField for `name`"
         );
         // The two literal chunks become Text consts.
@@ -8734,12 +8855,23 @@ oper main {} [
                 _ => None,
             })
             .collect();
-        assert!(text_consts.iter().any(|s| s == "Hello, "), "{text_consts:?}");
+        assert!(
+            text_consts.iter().any(|s| s == "Hello, "),
+            "{text_consts:?}"
+        );
         assert!(text_consts.iter().any(|s| s == "!"), "{text_consts:?}");
         // Three pieces fold via at least two Concats.
         let concats = insts
             .iter()
-            .filter(|i| matches!(i, Inst::ScalarOp { op: ScalarOp::Concat, .. }))
+            .filter(|i| {
+                matches!(
+                    i,
+                    Inst::ScalarOp {
+                        op: ScalarOp::Concat,
+                        ..
+                    }
+                )
+            })
             .count();
         assert!(concats >= 2, "expected ≥2 concats, got {concats}");
     }
@@ -8753,9 +8885,10 @@ oper main {} [
         let m = lower_ok(src);
         let main = m.functions.iter().find(|f| f.name == "main").unwrap();
         assert!(
-            main.blocks[0].insts.iter().any(
-                |i| matches!(i, Inst::Call { callee, .. } if callee == "coddl_int_to_text")
-            ),
+            main.blocks[0]
+                .insts
+                .iter()
+                .any(|i| matches!(i, Inst::Call { callee, .. } if callee == "coddl_int_to_text")),
             "expected a coddl_int_to_text call for the Integer placeholder"
         );
     }
@@ -8777,9 +8910,9 @@ oper main {} [
             "expected args TupleLit"
         );
         assert!(
-            insts.iter().any(
-                |i| matches!(i, Inst::TupleField { field_name, .. } if field_name == "name")
-            ),
+            insts
+                .iter()
+                .any(|i| matches!(i, Inst::TupleField { field_name, .. } if field_name == "name")),
             "expected a TupleField for `name`"
         );
         let write = insts
@@ -8860,7 +8993,10 @@ oper main {} [
             .iter()
             .filter(|i| matches!(i, Inst::Call { callee, .. } if callee == "coddl_rc_length"))
             .count();
-        assert_eq!(calls, 1, "the method call lowers to one coddl_rc_length call");
+        assert_eq!(
+            calls, 1,
+            "the method call lowers to one coddl_rc_length call"
+        );
     }
 
     #[test]
@@ -8989,7 +9125,9 @@ oper main {} [
             .insts
             .iter()
             .find_map(|i| match i {
-                Inst::TupleLit { fields, heading, .. } => Some((fields.clone(), heading.clone())),
+                Inst::TupleLit {
+                    fields, heading, ..
+                } => Some((fields.clone(), heading.clone())),
                 _ => None,
             })
             .expect("TupleLit emitted");
@@ -9008,7 +9146,9 @@ oper main {} [
             .insts
             .iter()
             .find_map(|i| match i {
-                Inst::TupleLit { fields, heading, .. } => Some((fields.clone(), heading.clone())),
+                Inst::TupleLit {
+                    fields, heading, ..
+                } => Some((fields.clone(), heading.clone())),
                 _ => None,
             })
             .expect("TupleLit emitted");
@@ -9038,11 +9178,15 @@ oper main {} [
         // Predicate body contains an AttrLoad + ScalarOp.
         let pred_insts = &pred.blocks[0].insts;
         assert!(
-            pred_insts.iter().any(|i| matches!(i, Inst::AttrLoad { .. })),
+            pred_insts
+                .iter()
+                .any(|i| matches!(i, Inst::AttrLoad { .. })),
             "predicate should AttrLoad heading attrs"
         );
         assert!(
-            pred_insts.iter().any(|i| matches!(i, Inst::ScalarOp { .. })),
+            pred_insts
+                .iter()
+                .any(|i| matches!(i, Inst::ScalarOp { .. })),
             "predicate body should ScalarOp"
         );
         // Main contains an Inst::Where.
@@ -9140,6 +9284,9 @@ oper main {} [
             .iter()
             .filter(|i| matches!(i, Inst::Release { src } if *src == extract_src))
             .count();
-        assert_eq!(count, 1, "let-bound source should see exactly one Release (at scope exit)");
+        assert_eq!(
+            count, 1,
+            "let-bound source should see exactly one Release (at scope exit)"
+        );
     }
 }

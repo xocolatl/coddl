@@ -153,9 +153,8 @@ pub fn record_layout(heading: &Heading) -> RecordLayout {
     let mut offset: u32 = 0;
     let mut attrs: Vec<AttrLayout> = Vec::with_capacity(heading.len());
     for (name, ty) in heading.attrs() {
-        let kind = cell_kind(ty).unwrap_or_else(|| {
-            unreachable!("cell kind for {ty} not yet supported")
-        });
+        let kind =
+            cell_kind(ty).unwrap_or_else(|| unreachable!("cell kind for {ty} not yet supported"));
         // A `Tuple` attribute is an inline nested cell: lay its components out
         // in a self-contained sub-region (0-based) and keep that sub-layout so
         // codegen can emit a nested descriptor and the runtime can recurse.

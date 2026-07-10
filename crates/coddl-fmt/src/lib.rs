@@ -126,7 +126,10 @@ mod tests {
     fn spacing_around_operators_colon_and_dot() {
         let src = "program p;\noper main {} [ let x=g.message where id=1; ];\n";
         let got = fmt(src);
-        assert!(got.contains("let x = g.message where id = 1;"), "got:\n{got}");
+        assert!(
+            got.contains("let x = g.message where id = 1;"),
+            "got:\n{got}"
+        );
         assert_eq!(fmt(&got), got);
     }
 
@@ -150,15 +153,25 @@ mod tests {
             got.contains("template: f\"Hi {x}!\""),
             "f\"…\" must stay glued, got:\n{got}"
         );
-        assert_eq!(fmt(&got), got, "format-string formatting must be idempotent");
+        assert_eq!(
+            fmt(&got),
+            got,
+            "format-string formatting must be idempotent"
+        );
     }
 
     #[test]
     fn preserves_leading_and_trailing_comments() {
         let src = "// header\nprogram p; // trailing\noper main {} [\n    write_line { message: \"hi\" }; // note\n];\n";
         let got = fmt(src);
-        assert!(got.starts_with("// header\nprogram p; // trailing\n"), "got:\n{got}");
-        assert!(got.contains("write_line{ message: \"hi\" }; // note"), "got:\n{got}");
+        assert!(
+            got.starts_with("// header\nprogram p; // trailing\n"),
+            "got:\n{got}"
+        );
+        assert!(
+            got.contains("write_line{ message: \"hi\" }; // note"),
+            "got:\n{got}"
+        );
         assert_eq!(fmt(&got), got, "comments must survive idempotently");
     }
 
@@ -166,7 +179,10 @@ mod tests {
     fn multiline_heading_and_block_are_preserved_and_idempotent() {
         let src = "program p;\npublic relvar G {\n    id: Integer,\n    name: Text,\n} key { id };\noper main{} [\n    let t = transaction [\n        G where id = 1\n    ];\n];\n";
         let got = fmt(src);
-        assert_eq!(got, src, "already-canonical multi-line input is a fixpoint:\n{got}");
+        assert_eq!(
+            got, src,
+            "already-canonical multi-line input is a fixpoint:\n{got}"
+        );
     }
 
     #[test]
@@ -182,9 +198,15 @@ mod tests {
         // glue their opener to the preceding name; the change is idempotent.
         let src = "program p;\noper to_text { self: Sequence Text } [\n    let x = self [0];\n    write_line { message: x };\n];\n";
         let got = fmt(src);
-        assert!(got.contains("oper to_text{ self: Sequence Text }"), "heading glue, got:\n{got}");
+        assert!(
+            got.contains("oper to_text{ self: Sequence Text }"),
+            "heading glue, got:\n{got}"
+        );
         assert!(got.contains("self[0]"), "index glue, got:\n{got}");
-        assert!(got.contains("write_line{ message: x }"), "call glue, got:\n{got}");
+        assert!(
+            got.contains("write_line{ message: x }"),
+            "call glue, got:\n{got}"
+        );
         assert_eq!(fmt(&got), got, "gluing must be idempotent");
     }
 
@@ -195,9 +217,18 @@ mod tests {
         // (shared `HEADING`) heading all keep their leading space.
         let src = "program p;\npublic relvar G { id: Integer } key { id };\noper main {} [\n    let xs = Sequence [\"a\", \"b\"];\n    let m = f { params: { xs } };\n];\n";
         let got = fmt(src);
-        assert!(got.contains("public relvar G { id: Integer }"), "relvar heading spaced, got:\n{got}");
-        assert!(got.contains("Sequence [\"a\", \"b\"]"), "sequence literal spaced, got:\n{got}");
-        assert!(got.contains("params: { xs }"), "tuple literal spaced, got:\n{got}");
+        assert!(
+            got.contains("public relvar G { id: Integer }"),
+            "relvar heading spaced, got:\n{got}"
+        );
+        assert!(
+            got.contains("Sequence [\"a\", \"b\"]"),
+            "sequence literal spaced, got:\n{got}"
+        );
+        assert!(
+            got.contains("params: { xs }"),
+            "tuple literal spaced, got:\n{got}"
+        );
         assert!(got.contains("f{ params:"), "call still glues, got:\n{got}");
         assert_eq!(fmt(&got), got);
     }
@@ -214,16 +245,23 @@ mod tests {
             got.contains("load names from rnames order [asc name, desc age];"),
             "order list spacing, got:\n{got}"
         );
-        assert!(got.contains("load R from names;"), "reverse form, got:\n{got}");
+        assert!(
+            got.contains("load R from names;"),
+            "reverse form, got:\n{got}"
+        );
         assert_eq!(fmt(&got), got, "load formatting must be idempotent");
     }
 
     #[test]
     fn formats_other_dialects_too() {
         // A `.cddb` catalog: spacing normalizes via the same printer.
-        let src = "database greetings;\nbase relvar Greetings {id: Integer,message: Text} key {id};\n";
+        let src =
+            "database greetings;\nbase relvar Greetings {id: Integer,message: Text} key {id};\n";
         let got = format(src, &FormatOptions::default(), FileKind::Cddb).text;
-        assert!(got.contains("{ id: Integer, message: Text }"), "got:\n{got}");
+        assert!(
+            got.contains("{ id: Integer, message: Text }"),
+            "got:\n{got}"
+        );
         assert_eq!(
             format(&got, &FormatOptions::default(), FileKind::Cddb).text,
             got

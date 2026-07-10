@@ -1079,8 +1079,16 @@ impl BinaryExpr {
                     SyntaxKind::IDENT
                         if matches!(
                             tok.text(),
-                            "and" | "or" | "where" | "join" | "times" | "compose" | "intersect"
-                                | "union" | "minus" | "div"
+                            "and"
+                                | "or"
+                                | "where"
+                                | "join"
+                                | "times"
+                                | "compose"
+                                | "intersect"
+                                | "union"
+                                | "minus"
+                                | "div"
                         ) =>
                     {
                         return Some(tok);
@@ -1827,7 +1835,10 @@ mod tests {
         let tuples: Vec<TupleLit> = rel.tuples().collect();
         assert_eq!(tuples.len(), 2);
         assert_eq!(tuples[0].fields().count(), 1);
-        assert_eq!(tuples[0].fields().next().unwrap().name().unwrap().text(), "a");
+        assert_eq!(
+            tuples[0].fields().next().unwrap().name().unwrap().text(),
+            "a"
+        );
     }
 
     #[test]

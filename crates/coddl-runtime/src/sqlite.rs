@@ -51,8 +51,7 @@ fn db_connections() -> &'static Mutex<HashMap<String, Connection>> {
 /// down the connection pool — defense in depth against codegen paths
 /// that forget the per-relvar release.
 fn relvar_slots() -> &'static Mutex<HashMap<String, usize>> {
-    static SLOTS: std::sync::OnceLock<Mutex<HashMap<String, usize>>> =
-        std::sync::OnceLock::new();
+    static SLOTS: std::sync::OnceLock<Mutex<HashMap<String, usize>>> = std::sync::OnceLock::new();
     SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -251,18 +250,14 @@ pub unsafe extern "C" fn coddl_sqlite_relvar_init(
         let mut stmt = match conn.prepare(&sql) {
             Ok(s) => s,
             Err(err) => {
-                eprintln!(
-                    "coddl: sqlite_relvar_init: prepare failed for relvar `{relvar}`: {err}"
-                );
+                eprintln!("coddl: sqlite_relvar_init: prepare failed for relvar `{relvar}`: {err}");
                 std::process::abort();
             }
         };
         let mut rows = match stmt.query([]) {
             Ok(r) => r,
             Err(err) => {
-                eprintln!(
-                    "coddl: sqlite_relvar_init: query failed for relvar `{relvar}`: {err}"
-                );
+                eprintln!("coddl: sqlite_relvar_init: query failed for relvar `{relvar}`: {err}");
                 std::process::abort();
             }
         };
@@ -1029,7 +1024,10 @@ pub unsafe extern "C" fn coddl_exec(
     match stmt.execute(params_from_iter(bindings.iter())) {
         Ok(_) => CoddlStatus::Ok,
         Err(err) => {
-            eprintln!("coddl: exec: execution failed for plan {}: {err}", plan_id.0);
+            eprintln!(
+                "coddl: exec: execution failed for plan {}: {err}",
+                plan_id.0
+            );
             std::process::abort();
         }
     }
@@ -1585,10 +1583,14 @@ mod tests {
             let id = ptr::read(rel as *const i64);
             assert_eq!(id, 1);
             let msg_ptr = usize::from_ne_bytes(
-                std::slice::from_raw_parts(rel.add(8), 8).try_into().unwrap(),
+                std::slice::from_raw_parts(rel.add(8), 8)
+                    .try_into()
+                    .unwrap(),
             ) as *const u8;
             let msg_len = usize::from_ne_bytes(
-                std::slice::from_raw_parts(rel.add(16), 8).try_into().unwrap(),
+                std::slice::from_raw_parts(rel.add(16), 8)
+                    .try_into()
+                    .unwrap(),
             );
             let msg = std::str::from_utf8(std::slice::from_raw_parts(msg_ptr, msg_len)).unwrap();
             assert_eq!(msg, "hello world");
@@ -1678,7 +1680,10 @@ mod tests {
                 kind: CoddlAttrKind::Integer as u32,
             };
             let r1 = coddl_query(PlanId(0), &p1, 1);
-            assert_eq!((*(r1.sub(crate::rc::HEADER_SIZE) as *const CoddlRcHeader)).length, 1);
+            assert_eq!(
+                (*(r1.sub(crate::rc::HEADER_SIZE) as *const CoddlRcHeader)).length,
+                1
+            );
             assert_eq!(ptr::read(r1 as *const i64), 1);
             coddl_rc_release(r1);
 
@@ -1689,7 +1694,10 @@ mod tests {
                 kind: CoddlAttrKind::Integer as u32,
             };
             let r2 = coddl_query(PlanId(0), &p2, 1);
-            assert_eq!((*(r2.sub(crate::rc::HEADER_SIZE) as *const CoddlRcHeader)).length, 1);
+            assert_eq!(
+                (*(r2.sub(crate::rc::HEADER_SIZE) as *const CoddlRcHeader)).length,
+                1
+            );
             assert_eq!(ptr::read(r2 as *const i64), 2);
             coddl_rc_release(r2);
 

@@ -166,7 +166,10 @@ fn separator(
     }
 
     // No space before these.
-    if matches!(ck, COMMA | SEMICOLON | COLON | DOT | COLON_COLON | R_PAREN | R_BRACKET) {
+    if matches!(
+        ck,
+        COMMA | SEMICOLON | COLON | DOT | COLON_COLON | R_PAREN | R_BRACKET
+    ) {
         return Sep::None;
     }
     // No space after these. `::` is tight on both sides: `coddl::core`.
@@ -227,8 +230,7 @@ fn compute_multiline(toks: &[SyntaxToken]) -> Vec<bool> {
             }
         }
         if is_open(k) {
-            let is_block = k == L_BRACKET
-                && tok.parent().map(|n| n.kind()) == Some(BLOCK);
+            let is_block = k == L_BRACKET && tok.parent().map(|n| n.kind()) == Some(BLOCK);
             stack.push(Group {
                 open: i,
                 saw_newline: false,

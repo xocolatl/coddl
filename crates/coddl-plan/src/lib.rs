@@ -223,7 +223,10 @@ pub fn discover_and_validate_with_overrides(
         }
     }
 
-    let cddb_relvars = cddb_check.as_ref().map(|c| c.relvars.clone()).unwrap_or_default();
+    let cddb_relvars = cddb_check
+        .as_ref()
+        .map(|c| c.relvars.clone())
+        .unwrap_or_default();
     let backend_kind = cdstore_root
         .as_ref()
         .and_then(|r| r.backend())
@@ -330,7 +333,10 @@ pub fn discover_and_validate_with_overrides(
 /// `.cdstore`'s parent directory.
 fn extract_file_directive(decl: &BackendDecl) -> Option<String> {
     for field in decl.fields() {
-        let name = field.name().map(|t| t.text().to_string()).unwrap_or_default();
+        let name = field
+            .name()
+            .map(|t| t.text().to_string())
+            .unwrap_or_default();
         if name != "file" {
             continue;
         }
@@ -442,9 +448,7 @@ fn collect_columns(
             diags.push(Diagnostic::error(
                 span,
                 "PL0009",
-                format!(
-                    "binding for `{binding_name}` doesn't cover heading attribute `{attr}`",
-                ),
+                format!("binding for `{binding_name}` doesn't cover heading attribute `{attr}`",),
             ));
         }
     }
@@ -673,8 +677,7 @@ relvar Greetings: table \"greetings\" {
 
     #[test]
     fn hello_world_db_resolves_cleanly() {
-        let (_dir, cd) =
-            write_project(CD_HELLO, Some(CDDB_GREETINGS), Some(CDSTORE_GREETINGS));
+        let (_dir, cd) = write_project(CD_HELLO, Some(CDDB_GREETINGS), Some(CDSTORE_GREETINGS));
         let out = discover_and_validate(&cd);
         let pl: Vec<_> = out
             .diagnostics
@@ -712,8 +715,7 @@ relvar Greetings: table \"greetings\" {
     columns: { id, message }
 };
 ";
-        let (_dir, cd) =
-            write_project(CD_HELLO, Some(CDDB_GREETINGS), Some(CDSTORE_SHORTHAND));
+        let (_dir, cd) = write_project(CD_HELLO, Some(CDDB_GREETINGS), Some(CDSTORE_SHORTHAND));
         let out = discover_and_validate(&cd);
         let pl: Vec<_> = out
             .diagnostics
@@ -816,8 +818,7 @@ relvar Greetings: table \"greetings\" {
 database greetings;
 base relvar Greetings { id: Integer, message: Boolean } key { id };
 ";
-        let (_dir, cd) =
-            write_project(CD_HELLO, Some(mismatched_cddb), Some(CDSTORE_GREETINGS));
+        let (_dir, cd) = write_project(CD_HELLO, Some(mismatched_cddb), Some(CDSTORE_GREETINGS));
         let out = discover_and_validate(&cd);
         assert!(codes(&out.diagnostics).contains(&"PL0007"));
     }
@@ -874,15 +875,17 @@ relvar Greetings: table \"greetings\" {
         let out = discover_and_validate(&cd);
         assert!(codes(&out.diagnostics).contains(&"PL0011"));
         let plan = out.plan.unwrap();
-        assert_eq!(plan.backend_kind, BackendKind::Other("postgres".to_string()));
+        assert_eq!(
+            plan.backend_kind,
+            BackendKind::Other("postgres".to_string())
+        );
     }
 
     #[test]
     fn overrides_with_empty_map_matches_disk_only_behavior() {
         let (dir, cd) = write_project(CD_HELLO, Some(CDDB_GREETINGS), Some(CDSTORE_GREETINGS));
         let baseline = discover_and_validate(&cd);
-        let with_empty =
-            discover_and_validate_with_overrides(&cd, &HashMap::new());
+        let with_empty = discover_and_validate_with_overrides(&cd, &HashMap::new());
         // Same PL-code set (the per-file T-code diagnostics carry
         // identical spans / messages too, but we don't assert on
         // those here — codes are the contract).
@@ -899,7 +902,9 @@ relvar Greetings: table \"greetings\" {
         // First confirm the disk version validates clean.
         let clean = discover_and_validate(&cd);
         assert!(
-            !codes(&clean.diagnostics).iter().any(|c| c.starts_with("PL")),
+            !codes(&clean.diagnostics)
+                .iter()
+                .any(|c| c.starts_with("PL")),
             "baseline should be clean"
         );
 

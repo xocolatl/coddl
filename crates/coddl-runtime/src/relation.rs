@@ -293,10 +293,8 @@ pub unsafe extern "C" fn coddl_relation_join(
     let rhs_rec = (*rhs_desc).record_size as usize;
     let res_rec = (*result_desc).record_size as usize;
 
-    let lhs_attrs =
-        std::slice::from_raw_parts((*lhs_desc).attrs, (*lhs_desc).attr_count as usize);
-    let rhs_attrs =
-        std::slice::from_raw_parts((*rhs_desc).attrs, (*rhs_desc).attr_count as usize);
+    let lhs_attrs = std::slice::from_raw_parts((*lhs_desc).attrs, (*lhs_desc).attr_count as usize);
+    let rhs_attrs = std::slice::from_raw_parts((*rhs_desc).attrs, (*rhs_desc).attr_count as usize);
     let res_attrs =
         std::slice::from_raw_parts((*result_desc).attrs, (*result_desc).attr_count as usize);
 
@@ -326,7 +324,12 @@ pub unsafe extern "C" fn coddl_relation_join(
         for la in lhs_attrs {
             let lname = std::slice::from_raw_parts(la.name, la.name_len as usize);
             if lname == dname {
-                moves.push((d.offset as usize, true, la.offset as usize, cell_width_desc(d)));
+                moves.push((
+                    d.offset as usize,
+                    true,
+                    la.offset as usize,
+                    cell_width_desc(d),
+                ));
                 placed = true;
                 break;
             }
@@ -337,7 +340,12 @@ pub unsafe extern "C" fn coddl_relation_join(
         for ra in rhs_attrs {
             let rname = std::slice::from_raw_parts(ra.name, ra.name_len as usize);
             if rname == dname {
-                moves.push((d.offset as usize, false, ra.offset as usize, cell_width_desc(d)));
+                moves.push((
+                    d.offset as usize,
+                    false,
+                    ra.offset as usize,
+                    cell_width_desc(d),
+                ));
                 break;
             }
         }
@@ -544,8 +552,8 @@ pub unsafe extern "C" fn coddl_relation_tclose(
     }
     let off_a = attrs[0].offset as usize; // source cell
     let off_b = attrs[1].offset as usize; // target cell
-    // Both key attributes have identical type (typechecked); `attrs[0]` supplies
-    // the kind + sub-descriptor for both the width and the content-aware match.
+                                          // Both key attributes have identical type (typechecked); `attrs[0]` supplies
+                                          // the kind + sub-descriptor for both the width and the content-aware match.
     let w = cell_width_desc(&attrs[0]);
 
     // The accumulating edge set, seeded with a copy of the input records.
@@ -1380,7 +1388,11 @@ pub unsafe extern "C" fn coddl_load_ordered(
             let attr = &attrs[(packed & 0x7fff_ffff) as usize];
             let off = attr.offset as usize;
             let ord = cmp_cell(ra, off, rb, off, attr);
-            let ord = if packed >> 31 == 1 { ord.reverse() } else { ord };
+            let ord = if packed >> 31 == 1 {
+                ord.reverse()
+            } else {
+                ord
+            };
             if ord != std::cmp::Ordering::Equal {
                 return ord;
             }
@@ -1793,11 +1805,20 @@ mod tests {
 
     #[test]
     fn int_to_text_formats_decimal() {
-        for (n, expect) in [(0i64, "0"), (42, "42"), (-7, "-7"), (i64::MIN, "-9223372036854775808")] {
+        for (n, expect) in [
+            (0i64, "0"),
+            (42, "42"),
+            (-7, "-7"),
+            (i64::MIN, "-9223372036854775808"),
+        ] {
             unsafe {
                 let mut len = 0usize;
                 let out = coddl_int_to_text(n, &mut len);
-                assert_eq!(std::slice::from_raw_parts(out, len), expect.as_bytes(), "int {n}");
+                assert_eq!(
+                    std::slice::from_raw_parts(out, len),
+                    expect.as_bytes(),
+                    "int {n}"
+                );
                 coddl_rc_release(out);
             }
         }
@@ -2141,7 +2162,10 @@ mod tests {
             let out = coddl_relation_tclose(edges, &desc);
             assert!(!out.is_null());
             let len = (*(out.sub(HEADER_SIZE) as *const CoddlRcHeader)).length as usize;
-            assert_eq!(len, 3, "closure adds \"a\"→\"c\" across distinct \"b\" pointers");
+            assert_eq!(
+                len, 3,
+                "closure adds \"a\"→\"c\" across distinct \"b\" pointers"
+            );
             let mut got: Vec<(Vec<u8>, Vec<u8>)> = (0..len)
                 .map(|i| {
                     let rec = out.add(i * 32);
@@ -2543,7 +2567,8 @@ mod tests {
             assert!(!out.is_null());
             let header = out.sub(HEADER_SIZE) as *const CoddlRcHeader;
             assert_eq!((*header).length, 2);
-            let read = |row: usize, off: usize| std::ptr::read(out.add(row * 16 + off) as *const i64);
+            let read =
+                |row: usize, off: usize| std::ptr::read(out.add(row * 16 + off) as *const i64);
             // re-sorted by (b, z): {b:3, z:2}, {b:5, z:1}
             assert_eq!(read(0, 0), 3, "b");
             assert_eq!(read(0, 8), 2, "z == a of the {{a:2}} row");
@@ -2573,17 +2598,55 @@ mod tests {
         // {a, b} extend {c: a + b} → {a, b, c}. The helper fills each widened
         // record; the runtime allocates, loops, and re-seals.
         let src_attrs = [
-            CoddlAttrDesc { name: b"a".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 0, sub: std::ptr::null() },
-            CoddlAttrDesc { name: b"b".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 8, sub: std::ptr::null() },
+            CoddlAttrDesc {
+                name: b"a".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 0,
+                sub: std::ptr::null(),
+            },
+            CoddlAttrDesc {
+                name: b"b".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 8,
+                sub: std::ptr::null(),
+            },
         ];
-        let src_desc = CoddlHeadingDesc { attr_count: 2, record_size: 16, attrs: src_attrs.as_ptr() };
+        let src_desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 16,
+            attrs: src_attrs.as_ptr(),
+        };
         // result {a, b, c}: a@0, b@8, c@16.
         let res_attrs = [
-            CoddlAttrDesc { name: b"a".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 0, sub: std::ptr::null() },
-            CoddlAttrDesc { name: b"b".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 8, sub: std::ptr::null() },
-            CoddlAttrDesc { name: b"c".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 16, sub: std::ptr::null() },
+            CoddlAttrDesc {
+                name: b"a".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 0,
+                sub: std::ptr::null(),
+            },
+            CoddlAttrDesc {
+                name: b"b".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 8,
+                sub: std::ptr::null(),
+            },
+            CoddlAttrDesc {
+                name: b"c".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 16,
+                sub: std::ptr::null(),
+            },
         ];
-        let res_desc = CoddlHeadingDesc { attr_count: 3, record_size: 24, attrs: res_attrs.as_ptr() };
+        let res_desc = CoddlHeadingDesc {
+            attr_count: 3,
+            record_size: 24,
+            attrs: res_attrs.as_ptr(),
+        };
         unsafe {
             let s = coddl_rc_alloc(2 * 16, 2, CoddlKind::Relation as u32, &src_desc);
             // sealed input: {a:1,b:2}, {a:3,b:1}
@@ -2596,7 +2659,8 @@ mod tests {
             assert!(!out.is_null());
             let header = out.sub(HEADER_SIZE) as *const CoddlRcHeader;
             assert_eq!((*header).length, 2, "two distinct widened rows");
-            let read = |row: usize, off: usize| std::ptr::read(out.add(row * 24 + off) as *const i64);
+            let read =
+                |row: usize, off: usize| std::ptr::read(out.add(row * 24 + off) as *const i64);
             // sorted by (a, b, c): {1, 2, 3} then {3, 1, 4}
             assert_eq!((read(0, 0), read(0, 8), read(0, 16)), (1, 2, 3));
             assert_eq!((read(1, 0), read(1, 8), read(1, 16)), (3, 1, 4));
@@ -2708,14 +2772,42 @@ mod tests {
         // NOTE: sub_desc.attrs points at sub_attrs; the caller must keep the
         // returned tuple alive for as long as the descriptor is used.
         let sub_attrs = [
-            CoddlAttrDesc { name: b"x".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 0, sub: std::ptr::null() },
-            CoddlAttrDesc { name: b"y".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 8, sub: std::ptr::null() },
+            CoddlAttrDesc {
+                name: b"x".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 0,
+                sub: std::ptr::null(),
+            },
+            CoddlAttrDesc {
+                name: b"y".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 8,
+                sub: std::ptr::null(),
+            },
         ];
         // sub_desc.attrs is filled in by the caller after the array settles.
-        let sub_desc = CoddlHeadingDesc { attr_count: 2, record_size: 16, attrs: std::ptr::null() };
+        let sub_desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 16,
+            attrs: std::ptr::null(),
+        };
         let top_attrs = [
-            CoddlAttrDesc { name: b"id".as_ptr(), name_len: 2, kind: CoddlAttrKind::Integer as u32, offset: 0, sub: std::ptr::null() },
-            CoddlAttrDesc { name: b"pt".as_ptr(), name_len: 2, kind: CoddlAttrKind::Tuple as u32, offset: 8, sub: std::ptr::null() },
+            CoddlAttrDesc {
+                name: b"id".as_ptr(),
+                name_len: 2,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 0,
+                sub: std::ptr::null(),
+            },
+            CoddlAttrDesc {
+                name: b"pt".as_ptr(),
+                name_len: 2,
+                kind: CoddlAttrKind::Tuple as u32,
+                offset: 8,
+                sub: std::ptr::null(),
+            },
         ];
         (sub_attrs, sub_desc, top_attrs)
     }
@@ -2821,7 +2913,11 @@ mod tests {
         let (sub_attrs, mut sub_desc, mut top_attrs) = nested_attrs();
         sub_desc.attrs = sub_attrs.as_ptr();
         top_attrs[1].sub = &sub_desc as *const CoddlHeadingDesc;
-        let desc = CoddlHeadingDesc { attr_count: 2, record_size: 24, attrs: top_attrs.as_ptr() };
+        let desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 24,
+            attrs: top_attrs.as_ptr(),
+        };
         unsafe {
             let payload = coddl_rc_alloc(2 * 24, 2, CoddlKind::Relation as u32, &desc);
             let write = |rec: usize, id: i64, x: i64, y: i64| {
@@ -2833,7 +2929,11 @@ mod tests {
             write(1, 1, 1, 9);
             coddl_relation_seal(payload, &desc);
             let header = payload.sub(HEADER_SIZE) as *const CoddlRcHeader;
-            assert_eq!((*header).length, 2, "records differing inside the tuple must not dedup");
+            assert_eq!(
+                (*header).length,
+                2,
+                "records differing inside the tuple must not dedup"
+            );
             coddl_rc_release(payload);
 
             // Identical tuple cells → dedup to one.
@@ -2855,22 +2955,76 @@ mod tests {
     fn restructure_wrap_then_unwrap_round_trips() {
         // flat {a@0, b@8, c@16} (size 24).
         let flat_attrs = [
-            CoddlAttrDesc { name: b"a".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 0, sub: std::ptr::null() },
-            CoddlAttrDesc { name: b"b".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 8, sub: std::ptr::null() },
-            CoddlAttrDesc { name: b"c".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 16, sub: std::ptr::null() },
+            CoddlAttrDesc {
+                name: b"a".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 0,
+                sub: std::ptr::null(),
+            },
+            CoddlAttrDesc {
+                name: b"b".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 8,
+                sub: std::ptr::null(),
+            },
+            CoddlAttrDesc {
+                name: b"c".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 16,
+                sub: std::ptr::null(),
+            },
         ];
-        let flat_desc = CoddlHeadingDesc { attr_count: 3, record_size: 24, attrs: flat_attrs.as_ptr() };
+        let flat_desc = CoddlHeadingDesc {
+            attr_count: 3,
+            record_size: 24,
+            attrs: flat_attrs.as_ptr(),
+        };
         // wrapped {c@0, t: Tuple{a@0, b@8}@8} (size 24) — name-sorted: c, t.
         let t_sub_attrs = [
-            CoddlAttrDesc { name: b"a".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 0, sub: std::ptr::null() },
-            CoddlAttrDesc { name: b"b".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 8, sub: std::ptr::null() },
+            CoddlAttrDesc {
+                name: b"a".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 0,
+                sub: std::ptr::null(),
+            },
+            CoddlAttrDesc {
+                name: b"b".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 8,
+                sub: std::ptr::null(),
+            },
         ];
-        let t_sub_desc = CoddlHeadingDesc { attr_count: 2, record_size: 16, attrs: t_sub_attrs.as_ptr() };
+        let t_sub_desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 16,
+            attrs: t_sub_attrs.as_ptr(),
+        };
         let wrapped_attrs = [
-            CoddlAttrDesc { name: b"c".as_ptr(), name_len: 1, kind: CoddlAttrKind::Integer as u32, offset: 0, sub: std::ptr::null() },
-            CoddlAttrDesc { name: b"t".as_ptr(), name_len: 1, kind: CoddlAttrKind::Tuple as u32, offset: 8, sub: &t_sub_desc as *const CoddlHeadingDesc },
+            CoddlAttrDesc {
+                name: b"c".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 0,
+                sub: std::ptr::null(),
+            },
+            CoddlAttrDesc {
+                name: b"t".as_ptr(),
+                name_len: 1,
+                kind: CoddlAttrKind::Tuple as u32,
+                offset: 8,
+                sub: &t_sub_desc as *const CoddlHeadingDesc,
+            },
         ];
-        let wrapped_desc = CoddlHeadingDesc { attr_count: 2, record_size: 24, attrs: wrapped_attrs.as_ptr() };
+        let wrapped_desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 24,
+            attrs: wrapped_attrs.as_ptr(),
+        };
         unsafe {
             let flat = coddl_rc_alloc(24, 1, CoddlKind::Relation as u32, &flat_desc);
             std::ptr::write(flat.add(0) as *mut i64, 1); // a
@@ -2879,7 +3033,11 @@ mod tests {
 
             // wrap: leaves a→t.a (off 8), b→t.b (off 16), c→c (off 0).
             let wrapped = coddl_relation_restructure(flat, &flat_desc, &wrapped_desc);
-            assert_eq!(std::ptr::read(wrapped.add(0) as *const i64), 3, "c at front");
+            assert_eq!(
+                std::ptr::read(wrapped.add(0) as *const i64),
+                3,
+                "c at front"
+            );
             assert_eq!(std::ptr::read(wrapped.add(8) as *const i64), 1, "t.a");
             assert_eq!(std::ptr::read(wrapped.add(16) as *const i64), 2, "t.b");
 
@@ -2900,7 +3058,12 @@ mod tests {
     // valid for the whole test. No seal: the test controls input row order, so a
     // stable sort's tie-breaking is observable.
     unsafe fn ab_src(rows: &[(i64, i64)], desc: &CoddlHeadingDesc) -> *mut u8 {
-        let src = coddl_rc_alloc(16 * rows.len(), rows.len() as u32, CoddlKind::Relation as u32, desc);
+        let src = coddl_rc_alloc(
+            16 * rows.len(),
+            rows.len() as u32,
+            CoddlKind::Relation as u32,
+            desc,
+        );
         for (i, &(a, b)) in rows.iter().enumerate() {
             std::ptr::write(src.add(i * 16) as *mut i64, a);
             std::ptr::write(src.add(i * 16 + 8) as *mut i64, b);
@@ -2927,10 +3090,19 @@ mod tests {
 
             let asc = coddl_load_ordered(src, &desc, [0u32].as_ptr(), 1);
             let header = asc.sub(HEADER_SIZE) as *const CoddlRcHeader;
-            assert_eq!((*header).kind, CoddlKind::Sequence as u32, "result is a Sequence");
+            assert_eq!(
+                (*header).kind,
+                CoddlKind::Sequence as u32,
+                "result is a Sequence"
+            );
             assert_eq!((*header).length, 4, "no dedup — every row kept");
             assert_eq!(
-                [ab_row(asc, 0), ab_row(asc, 1), ab_row(asc, 2), ab_row(asc, 3)],
+                [
+                    ab_row(asc, 0),
+                    ab_row(asc, 1),
+                    ab_row(asc, 2),
+                    ab_row(asc, 3)
+                ],
                 [(1, 2), (1, 5), (2, 1), (2, 0)],
                 "asc by a; ties keep input order",
             );
@@ -2938,7 +3110,12 @@ mod tests {
             // Descending flips the key groups but keeps each group's input order.
             let desc_seq = coddl_load_ordered(src, &desc, [0x8000_0000u32].as_ptr(), 1);
             assert_eq!(
-                [ab_row(desc_seq, 0), ab_row(desc_seq, 1), ab_row(desc_seq, 2), ab_row(desc_seq, 3)],
+                [
+                    ab_row(desc_seq, 0),
+                    ab_row(desc_seq, 1),
+                    ab_row(desc_seq, 2),
+                    ab_row(desc_seq, 3)
+                ],
                 [(2, 1), (2, 0), (1, 2), (1, 5)],
             );
 
@@ -2958,7 +3135,12 @@ mod tests {
             let keys = [0u32, 1u32 | 0x8000_0000];
             let out = coddl_load_ordered(src, &desc, keys.as_ptr(), keys.len());
             assert_eq!(
-                [ab_row(out, 0), ab_row(out, 1), ab_row(out, 2), ab_row(out, 3)],
+                [
+                    ab_row(out, 0),
+                    ab_row(out, 1),
+                    ab_row(out, 2),
+                    ab_row(out, 3)
+                ],
                 [(1, 5), (1, 2), (2, 1), (2, 0)],
             );
             coddl_rc_release(out);
@@ -3052,7 +3234,11 @@ mod tests {
 
             let rel = coddl_relation_from_sequence(seq, &desc);
             let header = rel.sub(HEADER_SIZE) as *const CoddlRcHeader;
-            assert_eq!((*header).kind, CoddlKind::Relation as u32, "result is a Relation");
+            assert_eq!(
+                (*header).kind,
+                CoddlKind::Relation as u32,
+                "result is a Relation"
+            );
             assert_eq!((*header).length, 2, "duplicates dropped");
             assert_eq!(
                 [ab_row(rel, 0), ab_row(rel, 1)],

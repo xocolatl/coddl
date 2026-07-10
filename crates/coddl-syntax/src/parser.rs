@@ -993,7 +993,10 @@ impl<'a> Parser<'a> {
             let before = self.pos;
             self.parse_expr();
             if self.pos == before {
-                self.error("P0014", "expected a relation or `{ … }` tuple-set to insert");
+                self.error(
+                    "P0014",
+                    "expected a relation or `{ … }` tuple-set to insert",
+                );
             }
         }
 
@@ -1308,8 +1311,8 @@ impl<'a> Parser<'a> {
             self.start_node_at(cp, SyntaxKind::BINARY_EXPR);
             self.bump_trivia();
             self.bump(); // operator token or keyword IDENT
-            // Missing-rhs (e.g. `1 = ;`) surfaces as P0014 from the
-            // inner `parse_primary_expr` — no dedicated code needed.
+                         // Missing-rhs (e.g. `1 = ;`) surfaces as P0014 from the
+                         // inner `parse_primary_expr` — no dedicated code needed.
             self.parse_expr_prec(prec + 1, allow_brace_call);
             self.finish_node();
         }
@@ -1492,10 +1495,7 @@ impl<'a> Parser<'a> {
             if self.at(SyntaxKind::L_BRACE) {
                 self.parse_tuple_lit();
             } else {
-                self.error(
-                    "P0032",
-                    "expected `{` to start tuple in relation literal",
-                );
+                self.error("P0032", "expected `{` to start tuple in relation literal");
                 break;
             }
             if !self.eat(SyntaxKind::COMMA) {
@@ -1573,9 +1573,9 @@ impl<'a> Parser<'a> {
         self.bump_trivia();
         self.start_node(SyntaxKind::UNARY_EXPR);
         self.bump(); // `extract`
-        // Operand parses at the lowest precedence so `where`, `and`,
-        // `or`, comparisons all bind inside. Missing operand surfaces
-        // as P0014 from the inner `parse_primary_expr`.
+                     // Operand parses at the lowest precedence so `where`, `and`,
+                     // `or`, comparisons all bind inside. Missing operand surfaces
+                     // as P0014 from the inner `parse_primary_expr`.
         self.parse_expr_prec(0, true);
         self.finish_node();
     }
@@ -1810,10 +1810,10 @@ impl<'a> Parser<'a> {
         debug_assert!(self.at_keyword("project"));
         self.bump_trivia();
         self.bump(); // `project`
-        // Optional `all but` prefix — project *away* the named attributes
-        // (keep the complement). `all`/`but` are contextual keywords: in this
-        // position before the `{` they're the operator; inside the braces, or
-        // anywhere else, they remain ordinary identifiers.
+                     // Optional `all but` prefix — project *away* the named attributes
+                     // (keep the complement). `all`/`but` are contextual keywords: in this
+                     // position before the `{` they're the operator; inside the braces, or
+                     // anywhere else, they remain ordinary identifiers.
         if self.at_keyword("all") {
             self.bump(); // `all`
             if self.at_keyword("but") {
@@ -1976,7 +1976,7 @@ impl<'a> Parser<'a> {
         debug_assert!(self.at_keyword("tclose"));
         self.bump_trivia();
         self.bump(); // `tclose`
-        // Optional `{ a, b }` brace-list. Absent → bare form, no error.
+                     // Optional `{ a, b }` brace-list. Absent → bare form, no error.
         if !self.at(SyntaxKind::L_BRACE) {
             return;
         }
@@ -2168,7 +2168,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn database_binding_parses_clean() {
         let out = parse_str("program p;\ndatabase greetings;\n");
@@ -2215,7 +2214,10 @@ mod tests {
         let Some(Item::UseDecl(u)) = root.items().next() else {
             panic!("expected a use decl");
         };
-        assert_eq!(u.category().map(|t| t.text().to_string()).as_deref(), Some("module"));
+        assert_eq!(
+            u.category().map(|t| t.text().to_string()).as_deref(),
+            Some("module")
+        );
         let segs: Vec<String> = u.segments().map(|t| t.text().to_string()).collect();
         assert_eq!(segs, vec!["a", "b", "c"]);
     }
@@ -2910,7 +2912,10 @@ mod tests {
     fn insert_stmt_tuple_set_parses() {
         let out = parse_str("oper main {} [ insert R { {a: 1}, {a: 2} }; ];");
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
-        assert_eq!(out.tree.text(), "oper main {} [ insert R { {a: 1}, {a: 2} }; ];");
+        assert_eq!(
+            out.tree.text(),
+            "oper main {} [ insert R { {a: 1}, {a: 2} }; ];"
+        );
         let insert = out
             .tree
             .descendants()
@@ -2918,7 +2923,10 @@ mod tests {
             .expect("INSERT_STMT in tree");
         // Target NAME_REF + the tuple-set as a (keyword-less) RELATION_LIT.
         let kinds: Vec<_> = insert.children().map(|n| n.kind()).collect();
-        assert!(kinds.contains(&SyntaxKind::NAME_REF), "target NAME_REF in {kinds:?}");
+        assert!(
+            kinds.contains(&SyntaxKind::NAME_REF),
+            "target NAME_REF in {kinds:?}"
+        );
         assert!(
             kinds.contains(&SyntaxKind::RELATION_LIT),
             "tuple-set RELATION_LIT in {kinds:?}"
@@ -2929,7 +2937,9 @@ mod tests {
             .find(|n| n.kind() == SyntaxKind::RELATION_LIT)
             .unwrap();
         assert_eq!(
-            rel.children().filter(|n| n.kind() == SyntaxKind::TUPLE_LIT).count(),
+            rel.children()
+                .filter(|n| n.kind() == SyntaxKind::TUPLE_LIT)
+                .count(),
             2
         );
         assert!(!rel.text().to_string().contains("Relation"));
@@ -2990,7 +3000,10 @@ mod tests {
     fn update_stmt_with_where_parses() {
         let out = parse_str("oper main {} [ update R where a = 1 { b: 2 }; ];");
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
-        assert_eq!(out.tree.text(), "oper main {} [ update R where a = 1 { b: 2 }; ];");
+        assert_eq!(
+            out.tree.text(),
+            "oper main {} [ update R where a = 1 { b: 2 }; ];"
+        );
         let update = out
             .tree
             .descendants()
@@ -2999,8 +3012,14 @@ mod tests {
         // Operand is the `where` BINARY_EXPR; clause is a separate ARG_LIST — the
         // brace was NOT swallowed into the predicate.
         let kinds: Vec<_> = update.children().map(|n| n.kind()).collect();
-        assert!(kinds.contains(&SyntaxKind::BINARY_EXPR), "operand BINARY_EXPR in {kinds:?}");
-        assert!(kinds.contains(&SyntaxKind::ARG_LIST), "clause ARG_LIST in {kinds:?}");
+        assert!(
+            kinds.contains(&SyntaxKind::BINARY_EXPR),
+            "operand BINARY_EXPR in {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&SyntaxKind::ARG_LIST),
+            "clause ARG_LIST in {kinds:?}"
+        );
     }
 
     #[test]
@@ -3016,8 +3035,14 @@ mod tests {
             .find(|n| n.kind() == SyntaxKind::UPDATE_STMT)
             .expect("UPDATE_STMT in tree");
         let kinds: Vec<_> = update.children().map(|n| n.kind()).collect();
-        assert!(kinds.contains(&SyntaxKind::NAME_REF), "operand NAME_REF in {kinds:?}");
-        assert!(kinds.contains(&SyntaxKind::ARG_LIST), "clause ARG_LIST in {kinds:?}");
+        assert!(
+            kinds.contains(&SyntaxKind::NAME_REF),
+            "operand NAME_REF in {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&SyntaxKind::ARG_LIST),
+            "clause ARG_LIST in {kinds:?}"
+        );
         assert!(
             !kinds.contains(&SyntaxKind::CALL_EXPR),
             "operand must not be a brace-call: {kinds:?}"
@@ -3042,7 +3067,9 @@ mod tests {
             "clause ARG_LIST present"
         );
         assert!(
-            out.tree.descendants().any(|n| n.kind() == SyntaxKind::CALL_EXPR),
+            out.tree
+                .descendants()
+                .any(|n| n.kind() == SyntaxKind::CALL_EXPR),
             "parenthesized brace-call parses as CALL_EXPR"
         );
     }
@@ -3087,7 +3114,9 @@ mod tests {
         let out = parse_str("oper main {} [ write_relation { rel: R }; ];");
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
         assert!(
-            out.tree.descendants().any(|n| n.kind() == SyntaxKind::CALL_EXPR),
+            out.tree
+                .descendants()
+                .any(|n| n.kind() == SyntaxKind::CALL_EXPR),
             "brace-call still parses as CALL_EXPR"
         );
     }
@@ -3392,7 +3421,9 @@ mod tests {
         assert_eq!(fields[0].kind(), SyntaxKind::NAMED_ARG);
         assert_eq!(fields[0].text(), "a");
         assert!(
-            fields[0].children().any(|n| n.kind() == SyntaxKind::NAME_REF),
+            fields[0]
+                .children()
+                .any(|n| n.kind() == SyntaxKind::NAME_REF),
             "shorthand value should be a NAME_REF"
         );
     }
@@ -3953,7 +3984,9 @@ mod tests {
         // The condition is a BINARY_EXPR; the body is one BLOCK.
         assert!(ws.children().any(|n| n.kind() == SyntaxKind::BINARY_EXPR));
         assert_eq!(
-            ws.children().filter(|n| n.kind() == SyntaxKind::BLOCK).count(),
+            ws.children()
+                .filter(|n| n.kind() == SyntaxKind::BLOCK)
+                .count(),
             1
         );
     }
@@ -4016,7 +4049,9 @@ mod tests {
             .collect();
         assert_eq!(idents, vec!["do", "while"]);
         assert_eq!(
-            dw.children().filter(|n| n.kind() == SyntaxKind::BLOCK).count(),
+            dw.children()
+                .filter(|n| n.kind() == SyntaxKind::BLOCK)
+                .count(),
             1
         );
         assert!(dw.children().any(|n| n.kind() == SyntaxKind::BINARY_EXPR));
@@ -4084,7 +4119,9 @@ mod tests {
         assert_eq!(source.text(), "rnames");
         // One order key.
         assert_eq!(
-            ls.children().filter(|n| n.kind() == SyntaxKind::SORT_ITEM).count(),
+            ls.children()
+                .filter(|n| n.kind() == SyntaxKind::SORT_ITEM)
+                .count(),
             1
         );
     }
@@ -4102,7 +4139,9 @@ mod tests {
             .find(|n| n.kind() == SyntaxKind::LOAD_STMT)
             .expect("LOAD_STMT in tree");
         assert_eq!(
-            ls.children().filter(|n| n.kind() == SyntaxKind::SORT_ITEM).count(),
+            ls.children()
+                .filter(|n| n.kind() == SyntaxKind::SORT_ITEM)
+                .count(),
             0
         );
     }
@@ -4183,7 +4222,10 @@ mod tests {
         let out = parse_str(src);
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
         assert_eq!(
-            out.tree.descendants().filter(|n| n.kind() == SyntaxKind::SORT_ITEM).count(),
+            out.tree
+                .descendants()
+                .filter(|n| n.kind() == SyntaxKind::SORT_ITEM)
+                .count(),
             2
         );
     }
@@ -4517,7 +4559,10 @@ mod tests {
             .expect("LET_STMT's value is a BINARY_EXPR");
         // Outer op is `or` — the rhs is the lone `3 = 3`.
         let outer_text = outer_bin.text().to_string();
-        assert!(outer_text.contains(" or "), "expected `or` at top: {outer_text}");
+        assert!(
+            outer_text.contains(" or "),
+            "expected `or` at top: {outer_text}"
+        );
         // Inner-most lhs of `or` should be the `and` chain.
         let inner_bin = outer_bin
             .children()
@@ -4962,9 +5007,7 @@ mod tests {
             .descendants()
             .find(|n| n.kind() == SyntaxKind::RENAME_EXPR)
             .expect("RENAME_EXPR at the top");
-        assert!(re
-            .children()
-            .any(|n| n.kind() == SyntaxKind::EXTEND_EXPR));
+        assert!(re.children().any(|n| n.kind() == SyntaxKind::EXTEND_EXPR));
     }
 
     #[test]
@@ -5076,7 +5119,9 @@ mod tests {
 
     #[test]
     fn wrap_unwrap_are_contextual_not_reserved() {
-        let out = parse_str("oper f {} [ let wrap = 1; let unwrap = 2; let s = R where wrap = unwrap; ];");
+        let out = parse_str(
+            "oper f {} [ let wrap = 1; let unwrap = 2; let s = R where wrap = unwrap; ];",
+        );
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }
 
@@ -5123,9 +5168,7 @@ mod tests {
             .descendants()
             .find(|n| n.kind() == SyntaxKind::REPLACE_EXPR)
             .expect("REPLACE_EXPR at the top");
-        assert!(re
-            .children()
-            .any(|n| n.kind() == SyntaxKind::EXTEND_EXPR));
+        assert!(re.children().any(|n| n.kind() == SyntaxKind::EXTEND_EXPR));
     }
 
     #[test]
@@ -5327,7 +5370,10 @@ mod tests {
     fn builtin_oper_decl_parses() {
         let out = parse_str("builtin oper to_text { self: Integer } -> Text;");
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
-        assert_eq!(out.tree.text(), "builtin oper to_text { self: Integer } -> Text;");
+        assert_eq!(
+            out.tree.text(),
+            "builtin oper to_text { self: Integer } -> Text;"
+        );
 
         let decl = out.tree.first_child().unwrap();
         assert_eq!(decl.kind(), SyntaxKind::OPER_DECL);

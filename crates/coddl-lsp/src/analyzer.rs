@@ -291,9 +291,7 @@ impl Analyzer {
                 // The project id is this .cd's path. Parse the
                 // buffer source to extract the database binding.
                 let source = self.get_source(uri).await;
-                let database_name = source
-                    .as_deref()
-                    .and_then(extract_database_binding_name);
+                let database_name = source.as_deref().and_then(extract_database_binding_name);
 
                 let project = self
                     .get_or_create_project(uri_path.clone(), database_name.clone())
@@ -326,10 +324,7 @@ impl Analyzer {
                 let Some(db_name) = file_stem(&uri_path) else {
                     return;
                 };
-                let Some(cd_path) = self
-                    .find_cd_for_database(&uri_path, &db_name)
-                    .await
-                else {
+                let Some(cd_path) = self.find_cd_for_database(&uri_path, &db_name).await else {
                     return;
                 };
 
@@ -477,7 +472,9 @@ impl Analyzer {
                 if doc.kind != FileKind::Cd {
                     continue;
                 }
-                let Some(path) = uri_to_path(uri) else { continue };
+                let Some(path) = uri_to_path(uri) else {
+                    continue;
+                };
                 if path.parent() != Some(dir) {
                     continue;
                 }
@@ -520,7 +517,9 @@ impl Analyzer {
         };
         let files = self.files.read().await;
         for uri in members.values() {
-            let Some(path) = uri_to_path(uri) else { continue };
+            let Some(path) = uri_to_path(uri) else {
+                continue;
+            };
             let Some(doc) = files.get(uri) else { continue };
             let source = {
                 let inner = doc.inner.lock().await;
@@ -1149,10 +1148,7 @@ relvar Greetings: table \"greetings\" {
             .expect("project snapshot");
 
         // PL0007 (heading mismatch) is routed to .cd's FileId(0).
-        let cd_diags = psnap
-            .diagnostics_by_file
-            .get(&FileId(0))
-            .expect("CD diags");
+        let cd_diags = psnap.diagnostics_by_file.get(&FileId(0)).expect("CD diags");
         assert!(cd_diags.iter().any(|d| d.code == "PL0007"));
     }
 
@@ -1203,10 +1199,7 @@ relvar Greetings: table \"greetings\" {
         let project = analyzer.project_for(&uri).await.unwrap();
         let psnap = analyzer.project_snapshot(&project.cd_path).await.unwrap();
         assert!(
-            psnap
-                .diagnostics_by_file
-                .values()
-                .all(|v| v.is_empty()),
+            psnap.diagnostics_by_file.values().all(|v| v.is_empty()),
             "standalone .cd should have no plan diagnostics: {:?}",
             psnap.diagnostics_by_file
         );
@@ -1229,7 +1222,10 @@ relvar Greetings: table \"greetings\" {
         // After close, the project map should no longer hold this
         // project's cd_path.
         let projects = analyzer.projects.read().await;
-        assert!(projects.is_empty(), "expected project torn down on last close");
+        assert!(
+            projects.is_empty(),
+            "expected project torn down on last close"
+        );
     }
 
     #[tokio::test]

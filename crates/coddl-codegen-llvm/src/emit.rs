@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use coddl_procir::{
-    record_layout, BasicBlock, BlockId, Codegen, Const, Function, HeadingId, Inst, Module, ProcType,
-    RecordLayout, ScalarOp, Terminator, Type, ValueId,
+    record_layout, BasicBlock, BlockId, Codegen, Const, Function, HeadingId, Inst, Module,
+    ProcType, RecordLayout, ScalarOp, Terminator, Type, ValueId,
 };
 
 use crate::error::LlvmEmitError;
@@ -182,11 +182,7 @@ impl Emitter {
         // globals: per-attr name strings, the attribute array, and
         // the descriptor struct itself. Cache the layouts so
         // `Inst::RelationLit` can look them up by id later.
-        self.heading_layouts = module
-            .headings
-            .iter()
-            .map(|h| record_layout(h))
-            .collect();
+        self.heading_layouts = module.headings.iter().map(|h| record_layout(h)).collect();
         self.headings = module.headings.clone();
         for (i, heading) in module.headings.iter().enumerate() {
             self.emit_heading_descriptor(HeadingId(i as u32), heading)?;
@@ -265,7 +261,11 @@ impl Emitter {
             writeln!(self.body, "declare void @{f}(i64, i64, i64, i64, ptr, ptr)").unwrap();
         }
         // Rational three-way compare: (n1, d1, n2, d2) -> i32 (-1/0/+1).
-        writeln!(self.body, "declare i32 @coddl_rational_cmp(i64, i64, i64, i64)").unwrap();
+        writeln!(
+            self.body,
+            "declare i32 @coddl_rational_cmp(i64, i64, i64, i64)"
+        )
+        .unwrap();
         // `coddl_rational_to_approx` (Rational → double) is declared by the
         // generic builtin-call path (`to_approximate` ∈ BUILTIN_EXTERNS).
         // RC retain/release — emitted for any heap `Text` (immortal literals
@@ -281,11 +281,7 @@ impl Emitter {
     /// machinery (alloc/seal) is always needed once a `RELATION_LIT`
     /// is present.
     fn emit_runtime_rc_externs(&mut self) {
-        writeln!(
-            self.body,
-            "declare ptr @coddl_rc_alloc(i64, i32, i32, ptr)"
-        )
-        .unwrap();
+        writeln!(self.body, "declare ptr @coddl_rc_alloc(i64, i32, i32, ptr)").unwrap();
         // `coddl_rc_retain`/`coddl_rc_release` are declared unconditionally in
         // `emit_scalar_text_externs` (scalar `Text` RC needs them without any
         // relations), so they are intentionally not repeated here.
@@ -301,7 +297,11 @@ impl Emitter {
         writeln!(self.body, "declare void @coddl_relvar_slot_store(ptr, ptr)").unwrap();
         // Phase 20 `where`: takes (src, desc, pred_fn) and returns
         // a fresh relation pointer (rc=1).
-        writeln!(self.body, "declare ptr @coddl_relation_where(ptr, ptr, ptr)").unwrap();
+        writeln!(
+            self.body,
+            "declare ptr @coddl_relation_where(ptr, ptr, ptr)"
+        )
+        .unwrap();
         // `extend`: (src, src_desc, result_desc, helper_fn) -> rc=1 ptr.
         writeln!(
             self.body,
@@ -310,8 +310,16 @@ impl Emitter {
         .unwrap();
         // `project`: takes (src, src_desc, result_desc) and returns a
         // fresh narrowed + sealed relation pointer (rc=1).
-        writeln!(self.body, "declare ptr @coddl_relation_project(ptr, ptr, ptr)").unwrap();
-        writeln!(self.body, "declare ptr @coddl_relation_restructure(ptr, ptr, ptr)").unwrap();
+        writeln!(
+            self.body,
+            "declare ptr @coddl_relation_project(ptr, ptr, ptr)"
+        )
+        .unwrap();
+        writeln!(
+            self.body,
+            "declare ptr @coddl_relation_restructure(ptr, ptr, ptr)"
+        )
+        .unwrap();
         // `join`: (lhs, lhs_desc, rhs, rhs_desc, result_desc) -> rc=1 ptr.
         writeln!(
             self.body,
@@ -319,9 +327,17 @@ impl Emitter {
         )
         .unwrap();
         // `union`: (lhs, rhs, desc) -> rc=1 ptr. Identical headings ⇒ one desc.
-        writeln!(self.body, "declare ptr @coddl_relation_union(ptr, ptr, ptr)").unwrap();
+        writeln!(
+            self.body,
+            "declare ptr @coddl_relation_union(ptr, ptr, ptr)"
+        )
+        .unwrap();
         // `minus`: (lhs, rhs, desc) -> rc=1 ptr. Identical headings ⇒ one desc.
-        writeln!(self.body, "declare ptr @coddl_relation_minus(ptr, ptr, ptr)").unwrap();
+        writeln!(
+            self.body,
+            "declare ptr @coddl_relation_minus(ptr, ptr, ptr)"
+        )
+        .unwrap();
         // `tclose`: (src, desc) -> rc=1 ptr. Result heading == operand heading
         // ⇒ one desc for both.
         writeln!(self.body, "declare ptr @coddl_relation_tclose(ptr, ptr)").unwrap();
@@ -345,11 +361,7 @@ impl Emitter {
         )
         .unwrap();
         // Text byte-equality: (a_ptr, a_len, b_ptr, b_len) -> i8 (1 = equal).
-        writeln!(
-            self.body,
-            "declare i8 @coddl_text_eq(ptr, i64, ptr, i64)"
-        )
-        .unwrap();
+        writeln!(self.body, "declare i8 @coddl_text_eq(ptr, i64, ptr, i64)").unwrap();
         // Phase 21 `extract`: takes (src, desc) and returns a record
         // pointer (the relation's payload, which IS the first record
         // when length==1). Aborts on length != 1.
@@ -416,7 +428,10 @@ impl Emitter {
         self.emit_byte_constant("@.db.default_path", default_path.as_bytes());
         for p in &module.plans {
             self.emit_byte_constant(&format!("@.plan.{}.sql", p.plan_id), p.sql.as_bytes());
-            self.emit_byte_constant(&format!("@.plan.{}.db_name", p.plan_id), p.db_name.as_bytes());
+            self.emit_byte_constant(
+                &format!("@.plan.{}.db_name", p.plan_id),
+                p.db_name.as_bytes(),
+            );
             self.plan_meta
                 .insert(p.plan_id, (p.param_count, p.result_heading_id.0));
         }
@@ -776,8 +791,18 @@ impl Emitter {
                     ptr_entries.push(format!("[ {ptr_op}, %{src} ]"));
                     len_entries.push(format!("[ {len_op}, %{src} ]"));
                 }
-                writeln!(self.body, "    {ptr_name} = phi ptr {}", ptr_entries.join(", ")).unwrap();
-                writeln!(self.body, "    {len_name} = phi i64 {}", len_entries.join(", ")).unwrap();
+                writeln!(
+                    self.body,
+                    "    {ptr_name} = phi ptr {}",
+                    ptr_entries.join(", ")
+                )
+                .unwrap();
+                writeln!(
+                    self.body,
+                    "    {len_name} = phi i64 {}",
+                    len_entries.join(", ")
+                )
+                .unwrap();
                 Ok(ValueRepr::Text {
                     ptr_op: ptr_name,
                     len_op: len_name,
@@ -811,14 +836,11 @@ impl Emitter {
                                 "phi expected a Tuple operand".into(),
                             ));
                         };
-                        let sub = fields
-                            .iter()
-                            .find(|(n, _)| n == attr_name)
-                            .ok_or_else(|| {
-                                LlvmEmitError::UnsupportedInst(format!(
-                                    "phi tuple operand missing field `{attr_name}`"
-                                ))
-                            })?;
+                        let sub = fields.iter().find(|(n, _)| n == attr_name).ok_or_else(|| {
+                            LlvmEmitError::UnsupportedInst(format!(
+                                "phi tuple operand missing field `{attr_name}`"
+                            ))
+                        })?;
                         sub_reprs.push((*src, sub.1.clone()));
                     }
                     let sub_base = format!("{base}.{attr_name}");
@@ -947,8 +969,7 @@ impl Emitter {
             } => self.lower_call(*dst, callee, args, return_type),
             Inst::TupleLit { dst, fields, .. } => {
                 // Pure compile-time grouping — no LLVM op emitted.
-                let mut repr_fields: Vec<(String, ValueRepr)> =
-                    Vec::with_capacity(fields.len());
+                let mut repr_fields: Vec<(String, ValueRepr)> = Vec::with_capacity(fields.len());
                 for (name, v) in fields {
                     let repr = self
                         .values
@@ -961,8 +982,12 @@ impl Emitter {
                         .clone();
                     repr_fields.push((name.clone(), repr));
                 }
-                self.values
-                    .insert(*dst, ValueRepr::Tuple { fields: repr_fields });
+                self.values.insert(
+                    *dst,
+                    ValueRepr::Tuple {
+                        fields: repr_fields,
+                    },
+                );
                 Ok(())
             }
             Inst::TupleField {
@@ -1060,7 +1085,9 @@ impl Emitter {
                     .values
                     .get(value)
                     .ok_or_else(|| {
-                        LlvmEmitError::UnsupportedInst(format!("undefined value {value:?} in AttrStore"))
+                        LlvmEmitError::UnsupportedInst(format!(
+                            "undefined value {value:?} in AttrStore"
+                        ))
                     })?
                     .clone();
                 // The extend/where store path is scalar/Text only (no sub-layout).
@@ -1225,7 +1252,9 @@ impl Emitter {
     /// result heading descriptor, keyed by the dense plan id.
     fn lower_register_plan(&mut self, plan_id: u32) -> Result<(), LlvmEmitError> {
         let (param_count, result_heading_id) = *self.plan_meta.get(&plan_id).ok_or_else(|| {
-            LlvmEmitError::UnsupportedInst(format!("RegisterPlan references unknown plan {plan_id}"))
+            LlvmEmitError::UnsupportedInst(format!(
+                "RegisterPlan references unknown plan {plan_id}"
+            ))
         })?;
         writeln!(
             self.body,
@@ -1389,25 +1418,18 @@ impl Emitter {
         name: &str,
         heading_id: HeadingId,
     ) -> Result<(), LlvmEmitError> {
-        let col_count = *self
-            .public_relvar_columns
-            .get(name)
-            .ok_or_else(|| {
-                LlvmEmitError::UnsupportedInst(format!(
-                    "RelvarSlotInit references unknown relvar `{name}`"
-                ))
-            })?;
+        let col_count = *self.public_relvar_columns.get(name).ok_or_else(|| {
+            LlvmEmitError::UnsupportedInst(format!(
+                "RelvarSlotInit references unknown relvar `{name}`"
+            ))
+        })?;
         let env_name_len = format!("CODDL_{}_FILE", name.to_ascii_uppercase());
         let _ = env_name_len; // length lookup unused — env_name was already stored as a global byte
-        // Resolve the env-var override first; the runtime returns
-        // (ptr, len_out) — len_out is written into a stack slot we
-        // alloca right here.
+                              // Resolve the env-var override first; the runtime returns
+                              // (ptr, len_out) — len_out is written into a stack slot we
+                              // alloca right here.
         let resolved_len_slot = format!("%v_{name}_resolve_len");
-        writeln!(
-            self.body,
-            "    {resolved_len_slot} = alloca i64, align 8"
-        )
-        .unwrap();
+        writeln!(self.body, "    {resolved_len_slot} = alloca i64, align 8").unwrap();
         let resolved_ptr = format!("%v_{name}_resolved");
         writeln!(
             self.body,
@@ -1759,7 +1781,11 @@ impl Emitter {
         let operand_ty = llvm_value_type(operand_type);
         match op {
             ScalarOp::And | ScalarOp::Or => {
-                let instr = if matches!(op, ScalarOp::And) { "and" } else { "or" };
+                let instr = if matches!(op, ScalarOp::And) {
+                    "and"
+                } else {
+                    "or"
+                };
                 writeln!(self.body, "    {dst_name} = {instr} i1 {lhs_op}, {rhs_op}").unwrap();
                 self.values.insert(
                     dst,
@@ -1972,12 +1998,8 @@ impl Emitter {
             // Relation cell (boxed-tuple field) and nested-tuple cell: reuse the
             // shared recursive reader.
             other => {
-                let repr = self.read_attr_repr(
-                    &src_op,
-                    offset as usize,
-                    other,
-                    &format!("v{}", dst.0),
-                )?;
+                let repr =
+                    self.read_attr_repr(&src_op, offset as usize, other, &format!("v{}", dst.0))?;
                 self.values.insert(dst, repr);
                 Ok(())
             }
@@ -2550,7 +2572,10 @@ impl Emitter {
             .heading_layouts
             .get(heading_id.0 as usize)
             .ok_or_else(|| {
-                LlvmEmitError::UnsupportedInst(format!("unknown heading_id {} in TupleBox", heading_id.0))
+                LlvmEmitError::UnsupportedInst(format!(
+                    "unknown heading_id {} in TupleBox",
+                    heading_id.0
+                ))
             })?
             .clone();
         let record_size = layout.record_size as usize;
@@ -2580,7 +2605,12 @@ impl Emitter {
                         attr.name
                     ))
                 })?;
-            self.emit_attr_store(&dst_name, attr.offset as usize, field_repr, attr.sub.as_ref())?;
+            self.emit_attr_store(
+                &dst_name,
+                attr.offset as usize,
+                field_repr,
+                attr.sub.as_ref(),
+            )?;
         }
         self.values.insert(
             dst,
@@ -2608,7 +2638,10 @@ impl Emitter {
             .get(heading_id.0 as usize)
             .cloned()
             .ok_or_else(|| {
-                LlvmEmitError::UnsupportedInst(format!("unknown heading_id {} in TupleUnbox", heading_id.0))
+                LlvmEmitError::UnsupportedInst(format!(
+                    "unknown heading_id {} in TupleUnbox",
+                    heading_id.0
+                ))
             })?;
         let layout = record_layout(&heading);
         let mut fields = Vec::with_capacity(layout.attrs.len());
@@ -2829,9 +2862,7 @@ impl Emitter {
             // offsets; the `ValueRepr::Tuple` gives values, both name-canonical).
             ValueRepr::Tuple { fields } => {
                 let sub = sub.ok_or_else(|| {
-                    LlvmEmitError::UnsupportedInst(
-                        "tuple cell store without a sub-layout".into(),
-                    )
+                    LlvmEmitError::UnsupportedInst("tuple cell store without a sub-layout".into())
                 })?;
                 for sub_attr in &sub.attrs {
                     let field = fields
@@ -2943,8 +2974,7 @@ impl Emitter {
             .unwrap();
             let len_op = format!("%v{}.len", v.0);
             writeln!(self.body, "    {len_op} = load i64, ptr {len_slot}").unwrap();
-            self.values
-                .insert(v, ValueRepr::Text { ptr_op, len_op });
+            self.values.insert(v, ValueRepr::Text { ptr_op, len_op });
             return Ok(());
         }
 
@@ -3002,11 +3032,7 @@ impl Emitter {
                         // type-checks.
                         if matches!(return_type, ProcType::Boolean) && ty == "i1" {
                             let widened = format!("{op}.b");
-                            writeln!(
-                                self.body,
-                                "    {widened} = zext i1 {op} to i8"
-                            )
-                            .unwrap();
+                            writeln!(self.body, "    {widened} = zext i1 {op} to i8").unwrap();
                             writeln!(self.body, "    ret i8 {widened}").unwrap();
                         } else {
                             writeln!(self.body, "    ret {ty} {op}").unwrap();
@@ -3291,8 +3317,12 @@ fn proc_type_from_attr(ty: &Type) -> ProcType {
         Type::Scalar(_) => unreachable!(
             "Type::Scalar is erased to its possrep component before a heading reaches codegen"
         ),
-        Type::FormatText => unreachable!("Type::FormatText is compile-time-only; never reaches codegen"),
-        Type::Sequence(_) => unreachable!("Type::Sequence is not yet lowered; never reaches codegen"),
+        Type::FormatText => {
+            unreachable!("Type::FormatText is compile-time-only; never reaches codegen")
+        }
+        Type::Sequence(_) => {
+            unreachable!("Type::Sequence is not yet lowered; never reaches codegen")
+        }
         Type::Unknown => unreachable!("Type::Unknown reached codegen"),
     }
 }

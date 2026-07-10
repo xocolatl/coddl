@@ -71,7 +71,10 @@ fn coddl_web_serves_handler_body_over_http() {
     // host walked the returned `{name, ordinality, value}` relation into the
     // reply). The body has no trailing newline — it is the record's `body` Text.
     let text = String::from_utf8_lossy(&resp);
-    assert!(text.starts_with("HTTP/1.1 200 OK"), "response head: {text:?}");
+    assert!(
+        text.starts_with("HTTP/1.1 200 OK"),
+        "response head: {text:?}"
+    );
     assert!(
         text.contains("Content-Type: text/plain\r\n"),
         "expected the handler's Content-Type header, got: {text:?}"

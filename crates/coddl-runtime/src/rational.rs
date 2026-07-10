@@ -221,8 +221,8 @@ mod tests {
         assert_eq!(coddl_rational_cmp(1, 2, 1, 2), 0);
         assert_eq!(coddl_rational_cmp(2, 3, 1, 2), 1); // 2/3 > 1/2
         assert_eq!(coddl_rational_cmp(-1, 2, 1, 2), -1); // sign on numerator
-        // Cross-product `4e9 * 4e9 = 1.6e19` overflows i64 but fits i128:
-        // `4e9/1` is far greater than `1/4e9`.
+                                                         // Cross-product `4e9 * 4e9 = 1.6e19` overflows i64 but fits i128:
+                                                         // `4e9/1` is far greater than `1/4e9`.
         assert_eq!(coddl_rational_cmp(4_000_000_000, 1, 1, 4_000_000_000), 1);
     }
 }

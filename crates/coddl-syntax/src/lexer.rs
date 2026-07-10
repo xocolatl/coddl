@@ -865,10 +865,7 @@ mod tests {
     #[test]
     fn double_pipe_lexes_as_concat() {
         use TokenKind::*;
-        assert_eq!(
-            lex_kinds("a || b"),
-            vec![Ident, PipePipe, Ident, Eof]
-        );
+        assert_eq!(lex_kinds("a || b"), vec![Ident, PipePipe, Ident, Eof]);
         let out = lex_all("||");
         assert!(out.diagnostics.is_empty(), "`||` is a clean token");
     }

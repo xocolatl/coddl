@@ -66,7 +66,10 @@ fn fixtures_dir() -> &'static Path {
             ("large-tuple-return", LARGE_TUPLE_RETURN_SRC),
             ("relation-in-tuple-return", RELATION_IN_TUPLE_RETURN_SRC),
             ("boxed-tuple-through-if", BOXED_TUPLE_THROUGH_IF_SRC),
-            ("boxed-tuple-transient-fields", BOXED_TUPLE_TRANSIENT_FIELDS_SRC),
+            (
+                "boxed-tuple-transient-fields",
+                BOXED_TUPLE_TRANSIENT_FIELDS_SRC,
+            ),
             ("fresh-relation-write", FRESH_RELATION_WRITE_SRC),
         ] {
             std::fs::write(tmp.path().join(format!("{name}.cd")), src)
@@ -844,8 +847,15 @@ fn check_flags_headerless_cd_with_pl0012() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cd = tmp.path().join("headerless.cd");
     std::fs::write(&cd, "oper main {} [ ]\n").expect("write");
-    let out = coddl().args(["check"]).arg(&cd).output().expect("spawn coddl");
-    assert!(!out.status.success(), "expected non-zero exit for a headerless file");
+    let out = coddl()
+        .args(["check"])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit for a headerless file"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("PL0012"), "stderr=\n{stderr}");
 }
@@ -855,7 +865,11 @@ fn check_flags_program_without_main_with_pl0014() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cd = tmp.path().join("nomain.cd");
     std::fs::write(&cd, "program p;\noper helper {} [ ]\n").expect("write");
-    let out = coddl().args(["check"]).arg(&cd).output().expect("spawn coddl");
+    let out = coddl()
+        .args(["check"])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("PL0014"), "stderr=\n{stderr}");
 }
@@ -865,7 +879,11 @@ fn run_rejects_a_library_with_usage_error_2() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cd = tmp.path().join("lib.cd");
     std::fs::write(&cd, "library l;\noper handle {} -> Text [ \"hi\\n\" ];\n").expect("write");
-    let out = coddl().args(["run"]).arg(&cd).output().expect("spawn coddl");
+    let out = coddl()
+        .args(["run"])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
     assert_eq!(
         out.status.code(),
         Some(2),
@@ -1569,7 +1587,10 @@ fn coddl_compile_llvm_produces_runnable_binary() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let run = Command::new(&bin).env("CODDL_LEAK_CHECK", "1").output().expect("run binary");
+    let run = Command::new(&bin)
+        .env("CODDL_LEAK_CHECK", "1")
+        .output()
+        .expect("run binary");
     assert!(run.status.success(), "binary exit {}", run.status);
     assert_eq!(run.stdout, b"Hello, world!\n");
 }
@@ -1592,7 +1613,10 @@ fn coddl_compile_cranelift_produces_runnable_binary() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let run = Command::new(&bin).env("CODDL_LEAK_CHECK", "1").output().expect("run binary");
+    let run = Command::new(&bin)
+        .env("CODDL_LEAK_CHECK", "1")
+        .output()
+        .expect("run binary");
     assert!(run.status.success(), "binary exit {}", run.status);
     assert_eq!(run.stdout, b"Hello, world!\n");
 }
@@ -3040,7 +3064,8 @@ fn assert_pushdown_audit(backend: &str) {
         String::from_utf8_lossy(&out.stderr),
     );
     assert_eq!(
-        out.stdout, b"hello world\n",
+        out.stdout,
+        b"hello world\n",
         "unexpected stdout on {backend}: {:?}",
         String::from_utf8_lossy(&out.stdout)
     );
@@ -3053,9 +3078,7 @@ fn assert_pushdown_audit(backend: &str) {
     let sqls: Vec<&str> = contents
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| {
-            audit_sql(l).unwrap_or_else(|| panic!("malformed audit line ({backend}): {l:?}"))
-        })
+        .map(|l| audit_sql(l).unwrap_or_else(|| panic!("malformed audit line ({backend}): {l:?}")))
         .collect();
     assert!(
         !sqls.is_empty(),
@@ -3204,7 +3227,10 @@ fn assert_self_truncate_empties(backend: &str) {
              transaction [ Greetings := Greetings minus Greetings; ];\n\
          ];\n",
     );
-    assert!(rows.is_empty(), "expected empty table on {backend}, got {rows:?}");
+    assert!(
+        rows.is_empty(),
+        "expected empty table on {backend}, got {rows:?}"
+    );
 }
 
 #[test]
@@ -3229,7 +3255,10 @@ fn assert_truncate_stmt_empties(backend: &str) {
              transaction [ truncate Greetings; ];\n\
          ];\n",
     );
-    assert!(rows.is_empty(), "expected empty table on {backend}, got {rows:?}");
+    assert!(
+        rows.is_empty(),
+        "expected empty table on {backend}, got {rows:?}"
+    );
 }
 
 #[test]
@@ -3666,7 +3695,9 @@ fn assert_comparison_pushes(backend: &str, pred: &str, expect_msg: &str, expect_
         .collect();
     // No unfiltered scan of greetings.
     assert!(
-        !sqls.iter().any(|s| s.contains("greetings") && !s.contains("WHERE")),
+        !sqls
+            .iter()
+            .any(|s| s.contains("greetings") && !s.contains("WHERE")),
         "unexpected full scan (pred {pred}, {backend}): {sqls:?}"
     );
     // Exactly one pushed query, carrying the comparison operator.
@@ -4087,8 +4118,8 @@ fn run_in_process_general_replace(backend: &str) -> Vec<u8> {
 #[test]
 fn general_replace_in_process_computes_and_consumes() {
     let expected = sorted_tuples(&[
-        "{c: 2}",  // a*b for {1,2}; a,b consumed
-        "{c: 3}",  // a*b for {3,1}
+        "{c: 2}",       // a*b for {1,2}; a,b consumed
+        "{c: 3}",       // a*b for {3,1}
         "{a: 2, b: 2}", // a+1 in place
         "{a: 4, b: 1}",
         r#"{z: "widget"}"#, // x||y; x,y consumed
@@ -4182,9 +4213,15 @@ fn audit_sql_strips_prefix_and_validates_format() {
     );
     // Malformed timestamp prefixes are rejected (None), so the integration
     // test panics rather than silently skipping a non-conforming line.
-    assert_eq!(audit_sql("2026-6-19 07:12:36.948 - sqlite - SELECT 1"), None);
+    assert_eq!(
+        audit_sql("2026-6-19 07:12:36.948 - sqlite - SELECT 1"),
+        None
+    );
     assert_eq!(audit_sql("not a log line at all"), None);
-    assert_eq!(audit_sql("2026-06-19 07:12:36.948 - postgres - SELECT 1"), None);
+    assert_eq!(
+        audit_sql("2026-06-19 07:12:36.948 - postgres - SELECT 1"),
+        None
+    );
 }
 
 #[test]
@@ -4396,9 +4433,17 @@ fn run_pushed_nullary(backend: &str, where_id: i64) -> Vec<u8> {
 fn pushed_nullary_projection_is_reltrue_or_relfalse() {
     for backend in ["llvm", "cranelift"] {
         // id = 1 is present → reltrue (one empty tuple).
-        assert_eq!(run_pushed_nullary(backend, 1), b"{}\n", "reltrue on {backend}");
+        assert_eq!(
+            run_pushed_nullary(backend, 1),
+            b"{}\n",
+            "reltrue on {backend}"
+        );
         // id = 999 is absent → relfalse (zero tuples, no output).
-        assert_eq!(run_pushed_nullary(backend, 999), b"", "relfalse on {backend}");
+        assert_eq!(
+            run_pushed_nullary(backend, 999),
+            b"",
+            "relfalse on {backend}"
+        );
     }
 }
 
@@ -4482,7 +4527,10 @@ fn run_rename_inprocess(backend: &str) -> Vec<u8> {
 
 #[test]
 fn rename_inprocess_llvm_permutes_into_new_layout() {
-    assert_eq!(run_rename_inprocess("llvm"), b"{b: 10, z: 1}\n{b: 20, z: 2}\n");
+    assert_eq!(
+        run_rename_inprocess("llvm"),
+        b"{b: 10, z: 1}\n{b: 20, z: 2}\n"
+    );
 }
 
 #[test]
@@ -4778,7 +4826,10 @@ fn approximate_null_reads_back_as_nan_and_is_reflexive() {
             "approx NaN round-trip on {backend} failed: stderr=\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert_eq!(out.stdout, b"true\n", "nan = nan should be true on {backend}");
+        assert_eq!(
+            out.stdout, b"true\n",
+            "nan = nan should be true on {backend}"
+        );
     }
 }
 
@@ -4983,14 +5034,20 @@ fn run_text_where_inprocess(src: &str, backend: &str) -> Vec<u8> {
 fn text_where_inprocess_eq_byte_identical() {
     let llvm = run_text_where_inprocess(TEXT_WHERE_EQ_SRC, "llvm");
     assert_eq!(llvm, b"{n: 2, name: \"bob\"}\n");
-    assert_eq!(llvm, run_text_where_inprocess(TEXT_WHERE_EQ_SRC, "cranelift"));
+    assert_eq!(
+        llvm,
+        run_text_where_inprocess(TEXT_WHERE_EQ_SRC, "cranelift")
+    );
 }
 
 #[test]
 fn text_where_inprocess_neq_byte_identical() {
     let llvm = run_text_where_inprocess(TEXT_WHERE_NEQ_SRC, "llvm");
     assert_eq!(llvm, b"{n: 1, name: \"alice\"}\n");
-    assert_eq!(llvm, run_text_where_inprocess(TEXT_WHERE_NEQ_SRC, "cranelift"));
+    assert_eq!(
+        llvm,
+        run_text_where_inprocess(TEXT_WHERE_NEQ_SRC, "cranelift")
+    );
 }
 
 const CHAR_WHERE_EQ_SRC: &str = "\
@@ -5036,14 +5093,20 @@ fn char_where_inprocess_eq_byte_identical() {
     // + `icmp` on the codepoint), and printing (`'b'`, single-quoted).
     let llvm = run_char_where_inprocess(CHAR_WHERE_EQ_SRC, "llvm");
     assert_eq!(llvm, b"{c: 'b', n: 2}\n");
-    assert_eq!(llvm, run_char_where_inprocess(CHAR_WHERE_EQ_SRC, "cranelift"));
+    assert_eq!(
+        llvm,
+        run_char_where_inprocess(CHAR_WHERE_EQ_SRC, "cranelift")
+    );
 }
 
 #[test]
 fn char_where_inprocess_neq_byte_identical() {
     let llvm = run_char_where_inprocess(CHAR_WHERE_NEQ_SRC, "llvm");
     assert_eq!(llvm, b"{c: 'a', n: 1}\n");
-    assert_eq!(llvm, run_char_where_inprocess(CHAR_WHERE_NEQ_SRC, "cranelift"));
+    assert_eq!(
+        llvm,
+        run_char_where_inprocess(CHAR_WHERE_NEQ_SRC, "cranelift")
+    );
 }
 
 const APPROX_WHERE_EQ_SRC: &str = "\
@@ -5089,14 +5152,20 @@ fn approx_where_inprocess_eq_byte_identical() {
     // `icmp` on the bits), and printing (`1.5e0`, exponent form).
     let llvm = run_approx_where_inprocess(APPROX_WHERE_EQ_SRC, "llvm");
     assert_eq!(llvm, b"{n: 1, x: 1.5e0}\n");
-    assert_eq!(llvm, run_approx_where_inprocess(APPROX_WHERE_EQ_SRC, "cranelift"));
+    assert_eq!(
+        llvm,
+        run_approx_where_inprocess(APPROX_WHERE_EQ_SRC, "cranelift")
+    );
 }
 
 #[test]
 fn approx_where_inprocess_neq_byte_identical() {
     let llvm = run_approx_where_inprocess(APPROX_WHERE_NEQ_SRC, "llvm");
     assert_eq!(llvm, b"{n: 2, x: 2.5e0}\n");
-    assert_eq!(llvm, run_approx_where_inprocess(APPROX_WHERE_NEQ_SRC, "cranelift"));
+    assert_eq!(
+        llvm,
+        run_approx_where_inprocess(APPROX_WHERE_NEQ_SRC, "cranelift")
+    );
 }
 
 const RAT_WHERE_EQ_SRC: &str = "\
@@ -5149,7 +5218,10 @@ fn rat_where_inprocess_eq_byte_identical() {
 fn rat_where_inprocess_neq_byte_identical() {
     let llvm = run_rat_where_inprocess(RAT_WHERE_NEQ_SRC, "llvm");
     assert_eq!(llvm, b"{n: 2, q: 3/2}\n");
-    assert_eq!(llvm, run_rat_where_inprocess(RAT_WHERE_NEQ_SRC, "cranelift"));
+    assert_eq!(
+        llvm,
+        run_rat_where_inprocess(RAT_WHERE_NEQ_SRC, "cranelift")
+    );
 }
 
 // ── field-init shorthand (`{ name }` ≡ `{ name: name }`) ─────────────
@@ -5251,10 +5323,7 @@ fn binding_transparency_folds_to_single_pushed_query() {
         assert_eq!(out.stdout, b"hello world\n", "on {backend}");
 
         let log_txt = std::fs::read_to_string(&log).expect("read audit log");
-        let selects: Vec<&str> = log_txt
-            .lines()
-            .filter(|l| l.contains("SELECT"))
-            .collect();
+        let selects: Vec<&str> = log_txt.lines().filter(|l| l.contains("SELECT")).collect();
         assert_eq!(
             selects.len(),
             1,
@@ -5279,7 +5348,11 @@ fn diagnostics_are_not_double_reported() {
         "program dup;\noper main {} [ let greeting = 1; write_line { message: \"hi\" }; ];\n",
     )
     .expect("write dup.cd");
-    let out = coddl().args(["run"]).arg(&cd).output().expect("spawn coddl");
+    let out = coddl()
+        .args(["run"])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
     assert!(
         out.status.success(),
         "run failed: stderr=\n{}",
@@ -5303,7 +5376,11 @@ fn fmt_reformats_to_canonical_and_is_idempotent() {
         "program p;\noper   main {}[ write_line{message:\"hi\"} ; ];\n",
     )
     .expect("write messy.cd");
-    let out = coddl().args(["fmt"]).arg(&messy).output().expect("spawn coddl");
+    let out = coddl()
+        .args(["fmt"])
+        .arg(&messy)
+        .output()
+        .expect("spawn coddl");
     assert!(out.status.success(), "fmt failed: {:?}", out.status);
     let formatted = String::from_utf8(out.stdout).expect("utf8");
     assert_eq!(
@@ -5314,7 +5391,11 @@ fn fmt_reformats_to_canonical_and_is_idempotent() {
     // Formatting the formatted output is byte-identical (idempotent).
     let clean = tmp.path().join("clean.cd");
     std::fs::write(&clean, &formatted).expect("write clean.cd");
-    let out2 = coddl().args(["fmt"]).arg(&clean).output().expect("spawn coddl");
+    let out2 = coddl()
+        .args(["fmt"])
+        .arg(&clean)
+        .output()
+        .expect("spawn coddl");
     assert_eq!(String::from_utf8(out2.stdout).expect("utf8"), formatted);
 }
 

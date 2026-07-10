@@ -104,7 +104,10 @@ mod tests {
             "tclose pushes as a recursive CTE: {}",
             q.sql.text
         );
-        assert!(q.sql.text.contains(r#"JOIN coddl_tc_op ON coddl_tc."b" = coddl_tc_op."a""#));
+        assert!(q
+            .sql
+            .text
+            .contains(r#"JOIN coddl_tc_op ON coddl_tc."b" = coddl_tc_op."a""#));
     }
 
     #[test]
@@ -135,9 +138,7 @@ mod tests {
             lhs: Box::new(greetings()),
             rhs: Box::new(greetings()),
         };
-        assert!(
-            try_push_ordered(&union, Dialect::SQLite, &[("id".to_string(), false)]).is_none()
-        );
+        assert!(try_push_ordered(&union, Dialect::SQLite, &[("id".to_string(), false)]).is_none());
         assert!(try_push(&union, Dialect::SQLite).is_some());
     }
 }
