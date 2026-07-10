@@ -251,39 +251,30 @@ fn cmd_check(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     };
 
-    // `coddl check` accepts every dialect the typechecker understands.
-    // `.cd` and `.cddb` walk their relvar tables and report
-    // diagnostics; `.cdmap` and `.cdstore` are parse-only today (the
-    // plan layer is Phase 16) so check() just surfaces parse errors.
-    let out = coddl_types::check(&source, FileId(0), kind);
-
-    let mut diagnostics = out.diagnostics.clone();
-
-    // When the input is a `.cd` file path (not stdin), run the plan pass so
-    // the compilation-unit rules surface: the mandatory file header
-    // (PL0012–PL0015) always, plus companion cross-validation when public
-    // relvars are declared. Stdin-fed `.cd` skips it — there's no path to
-    // anchor header/companion discovery against.
-    if kind == FileKind::Cd {
-        if let Some(path) = args.first().filter(|s| s.as_str() != "-") {
-            let plan_out = coddl_plan::discover_and_validate(Path::new(path));
-            for d in &plan_out.diagnostics {
-                if d.code.starts_with("PL") {
-                    diagnostics.push(d.clone());
-                }
+    // For a `.cd` **file path**, the plan pass is authoritative: it runs the
+    // full multi-unit check (the entry plus every imported module, so
+    // cross-module calls resolve), the compilation-unit header rules
+    // (PL0012–PL0015), the module-resolution rules (PL0016–PL0019), and
+    // companion cross-validation. Use its diagnostics wholesale. Stdin and
+    // non-`.cd` inputs have no path to anchor discovery, so they fall back to a
+    // single-file check (which can't see `use module` imports).
+    let (diagnostics, source_map): (Vec<Diagnostic>, Vec<PathBuf>) =
+        match (kind, args.first().filter(|s| s.as_str() != "-")) {
+            (FileKind::Cd, Some(path)) => {
+                let out = coddl_plan::discover_and_validate(Path::new(path));
+                let map = build_source_map(Path::new(path), &out.module_graph);
+                (out.diagnostics, map)
             }
-        }
-    }
+            _ => (
+                coddl_types::check(&source, FileId(0), kind).diagnostics,
+                Vec::new(),
+            ),
+        };
 
     if diagnostics.is_empty() {
         ExitCode::SUCCESS
     } else {
-        for d in &diagnostics {
-            eprintln!(
-                "{}: {} [{}] at {}..{}",
-                d.severity, d.message, d.code, d.span.start, d.span.end
-            );
-        }
+        print_diagnostics(&diagnostics, &source_map);
         ExitCode::from(1)
     }
 }
@@ -614,13 +605,42 @@ fn parse_compile_args(args: &[String], cmd: &str) -> Result<CompileArgs, ExitCod
     })
 }
 
-fn print_diagnostics(diagnostics: &[Diagnostic]) {
+fn print_diagnostics(diagnostics: &[Diagnostic], source_map: &[PathBuf]) {
     for d in diagnostics {
-        eprintln!(
-            "{}: {} [{}] at {}..{}",
-            d.severity, d.message, d.code, d.span.start, d.span.end
-        );
+        // A multi-unit program tags each diagnostic with its unit's `FileId`;
+        // the source map turns that back into a file name so an error inside an
+        // imported module reports against the module, not the entry file.
+        match source_map
+            .get(d.span.file.0 as usize)
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            Some(path) => eprintln!(
+                "{}: {} [{}] at {}:{}..{}",
+                d.severity,
+                d.message,
+                d.code,
+                path.display(),
+                d.span.start,
+                d.span.end
+            ),
+            _ => eprintln!(
+                "{}: {} [{}] at {}..{}",
+                d.severity, d.message, d.code, d.span.start, d.span.end
+            ),
+        }
     }
+}
+
+/// FileId → path, matching the plan layer's allocation: `0` = the entry `.cd`,
+/// `1`/`2` reserved for the `.cddb`/`.cdstore` companions (left blank here —
+/// their diagnostics still print without a name), `3..` = the imported modules
+/// in graph order. An out-of-range or blank entry falls back to bare offsets.
+fn build_source_map(cd_path: &Path, graph: &coddl_plan::ModuleGraph) -> Vec<PathBuf> {
+    let mut map = vec![cd_path.to_path_buf(), PathBuf::new(), PathBuf::new()];
+    for m in &graph.modules {
+        map.push(m.file.clone());
+    }
+    map
 }
 
 /// Discover the Phase 16 plan for a `.cd` file input, if the first
@@ -633,12 +653,8 @@ fn discover_plan_for_input(positional: &[String]) -> Option<coddl_plan::Plan> {
         .filter(|s| s.as_str() != "-")
         .map(PathBuf::from)?;
     let out = coddl_plan::discover_and_validate(&cd_path);
-    for d in &out.diagnostics {
-        eprintln!(
-            "{}: {} [{}] at {}..{}",
-            d.severity, d.message, d.code, d.span.start, d.span.end
-        );
-    }
+    let source_map = build_source_map(&cd_path, &out.module_graph);
+    print_diagnostics(&out.diagnostics, &source_map);
     if out
         .diagnostics
         .iter()
@@ -666,9 +682,11 @@ fn lower_or_bail(source: &str, cd_path: Option<&Path>) -> Option<coddl_procir::M
     // diagnostics it didn't already show — otherwise every `.cd` diagnostic
     // (error or warning) would report twice.
     let mut plan_diags: Vec<Diagnostic> = Vec::new();
+    let mut source_map: Vec<PathBuf> = Vec::new();
     let plan = if let Some(path) = cd_path {
         let plan_out = coddl_plan::discover_and_validate(path);
-        print_diagnostics(&plan_out.diagnostics);
+        source_map = build_source_map(path, &plan_out.module_graph);
+        print_diagnostics(&plan_out.diagnostics, &source_map);
         if plan_out
             .diagnostics
             .iter()
@@ -688,7 +706,7 @@ fn lower_or_bail(source: &str, cd_path: Option<&Path>) -> Option<coddl_procir::M
         .filter(|&d| !plan_diags.contains(d))
         .cloned()
         .collect();
-    print_diagnostics(&fresh);
+    print_diagnostics(&fresh, &source_map);
     if out
         .diagnostics
         .iter()

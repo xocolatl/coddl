@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use coddl_diagnostics::{Diagnostic, FileId, Severity, Span};
-use coddl_plan::{Plan, WritePolicy};
+use coddl_plan::{Plan, ResolvedModule, WritePolicy};
 use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, DeleteStmt, DoWhileStmt,
     Expr, ExprStmt, ExtendExpr, FieldAccess, ForStmt, IfExpr, IndexExpr, InsertStmt, Item, LetStmt,
@@ -21,8 +21,10 @@ use coddl_syntax::ast::{
     RenameExpr, ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt,
     TupleLit, TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WhileStmt, WrapExpr,
 };
-use coddl_syntax::{parse_format_template, SyntaxKind, TemplateChunk};
-use coddl_types::{check, resolve_type_ref_quiet, Heading, RelvarKind, RelvarTable, Type};
+use coddl_syntax::{parse, parse_format_template, SyntaxKind, TemplateChunk};
+use coddl_types::{
+    check_program, resolve_type_ref_quiet, CheckUnit, Heading, RelvarKind, RelvarTable, Type,
+};
 
 use coddl_relir::{
     CmpOp, Literal as RelLiteral, Predicate, RelExpr, ScalarBinOp, ScalarExpr, StorageOrigin,
@@ -115,8 +117,10 @@ fn builtin_relvar_read_symbol(name: &str) -> Option<&'static str> {
 /// the program's `oper` declarations so a call site (`lower_call`) can resolve
 /// a non-builtin callee regardless of declaration order. Unlike a
 /// `BuiltinExtern`, a user op lowers to an in-module `Function` whose linkage
-/// name is its surface name, so there's no separate `linkage` field and no
-/// `ensure_extern` — the backend finds it among `Module::functions`.
+/// name is its (possibly module-mangled) surface name, so there's no separate
+/// `linkage` field and no `ensure_extern` — the backend finds it among
+/// `Module::functions`.
+#[derive(Clone)]
 struct UserOpSig {
     params: Vec<(String, ProcType)>,
     return_type: ProcType,
@@ -191,19 +195,47 @@ pub fn explain_with_plan(source: &str, file: FileId, plan: Option<&Plan>) -> Low
 }
 
 fn lower_impl(source: &str, file: FileId, plan: Option<&Plan>, collect_relir: bool) -> LowerOutput {
-    let check_out = check(source, file, coddl_syntax::FileKind::Cd);
-    let has_errors = check_out
+    // The userspace modules this program imports (from the plan's graph),
+    // dependency-first. Empty for a standalone program or a plan-less (stdin)
+    // lowering — then the whole pipeline is single-unit, exactly as before.
+    let modules: Vec<ResolvedModule> = plan
+        .map(|p| p.module_graph.modules.clone())
+        .unwrap_or_default();
+
+    // Multi-unit check so imported calls resolve (a module's `oper` bodies are
+    // genuine code that must type-check). FileIds mirror the plan layer:
+    // entry = 0, `.cddb`/`.cdstore` reserve 1/2, modules take 3..
+    let mut units: Vec<CheckUnit> = modules
+        .iter()
+        .enumerate()
+        .map(|(i, m)| CheckUnit {
+            module: Some(m.path.clone()),
+            source: &m.source,
+            file: FileId((i + 3) as u32),
+        })
+        .collect();
+    units.push(CheckUnit {
+        module: None,
+        source,
+        file,
+    });
+    let prog = check_program(&units);
+    if prog
         .diagnostics
         .iter()
-        .any(|d| d.severity == Severity::Error);
-    if has_errors {
+        .any(|d| d.severity == Severity::Error)
+    {
         return LowerOutput {
             module: None,
-            diagnostics: check_out.diagnostics,
+            diagnostics: prog.diagnostics,
             relir: Vec::new(),
         };
     }
+    let check_out = prog
+        .entry
+        .expect("check_program always returns the entry unit's output");
     let root = Root::cast(check_out.tree).expect("parser always returns a Root");
+
     let mut lowerer = Lowerer::new(file);
     lowerer.collect_relir = collect_relir;
     if let Some(plan) = plan {
@@ -213,13 +245,33 @@ fn lower_impl(source: &str, file: FileId, plan: Option<&Plan>, collect_relir: bo
     lowerer.absorb_builtin_relvars(&check_out.relvars);
     lowerer.absorb_type_aliases(&check_out.type_aliases);
     lowerer.absorb_nominal_scalars(&check_out.nominal_scalars);
+
+    // Lower each imported module's operator bodies (dependency-first) into the
+    // shared function list, mangled by the module's `$`-prefix, building a
+    // catalog of each module's exports so a later unit's imports resolve to the
+    // correct mangled symbol.
+    let mut catalog: HashMap<String, HashMap<String, UserOpSig>> = HashMap::new();
+    for m in &modules {
+        let prefix = m.path.segments().join("$");
+        let Some(mroot) = Root::cast(parse(&m.source, file, coddl_syntax::FileKind::Cd).tree)
+        else {
+            continue;
+        };
+        let imported = build_imported(&mroot, &catalog);
+        let exports = lowerer.lower_module_unit(&mroot, prefix.clone(), imported);
+        catalog.insert(prefix, exports);
+    }
+
+    // Lower the entry unit (full: main prologue, relvars), with its imports set.
+    lowerer.current_module = None;
+    lowerer.imported_opers = build_imported(&root, &catalog);
     let module = lowerer.lower_root(&root);
     let relir = std::mem::take(&mut lowerer.relir);
     // Merge in any diagnostics the lowerer itself emitted (e.g.
     // T0022 for captures in `where` predicates). If the lowerer
     // emitted error-severity diagnostics, the IR is unsafe to
     // codegen — return no module.
-    let mut diagnostics = check_out.diagnostics;
+    let mut diagnostics = prog.diagnostics;
     diagnostics.extend(lowerer.diagnostics);
     let lower_errored = diagnostics.iter().any(|d| d.severity == Severity::Error);
     LowerOutput {
@@ -227,6 +279,32 @@ fn lower_impl(source: &str, file: FileId, plan: Option<&Plan>, collect_relir: bo
         diagnostics,
         relir,
     }
+}
+
+/// Build the current unit's imported-operator table: for each `use module`
+/// import whose module is in `catalog`, map every exported operator name to its
+/// `(exporting-module prefix, signature)`. Stdlib (`coddl::*`) imports aren't in
+/// the catalog and are skipped. The typechecker already rejected ambiguity
+/// (T0092), so on a clean program each name maps to a single module.
+fn build_imported(
+    root: &Root,
+    catalog: &HashMap<String, HashMap<String, UserOpSig>>,
+) -> HashMap<String, (String, UserOpSig)> {
+    let mut imported: HashMap<String, (String, UserOpSig)> = HashMap::new();
+    for item in root.items() {
+        let Item::UseDecl(u) = item else { continue };
+        let segs: Vec<String> = u.segments().map(|t| t.text().to_string()).collect();
+        if segs.is_empty() {
+            continue;
+        }
+        let prefix = segs.join("$");
+        if let Some(exports) = catalog.get(&prefix) {
+            for (name, sig) in exports {
+                imported.insert(name.clone(), (prefix.clone(), sig.clone()));
+            }
+        }
+    }
+    imported
 }
 
 struct Lowerer {
@@ -421,6 +499,29 @@ struct Lowerer {
     /// defined later in the file still resolves. `lower_call` consults this
     /// after the builtin special-cases; a hit emits an in-module `Inst::Call`.
     user_opers: HashMap<String, UserOpSig>,
+    /// The module currently being lowered, as its `$`-joined linkage prefix
+    /// (`greet`, `a$b`); `None` when lowering the entry `program`/`library`. A
+    /// module's own operators are mangled with this prefix so two modules can
+    /// define a same-named private helper without their symbols colliding; the
+    /// entry unit's operators (including `main`) stay verbatim.
+    current_module: Option<String>,
+    /// Operators the current unit imports (`use module <leaf>;`): name → the
+    /// `($-joined prefix of the exporting module, signature)`. Consulted by
+    /// `lower_call` only when the name is not a local `user_oper`, so a call to
+    /// an imported operator emits the exporting module's mangled symbol. The
+    /// typechecker already rejected ambiguity (T0092), so each name maps to one.
+    imported_opers: HashMap<String, (String, UserOpSig)>,
+}
+
+/// The linkage symbol for operator `name` owned by the module whose `$`-joined
+/// prefix is `module` (`None` = the entry unit — verbatim). A module operator is
+/// `<prefix>$<name>` (`greet$hello`); `$` is invalid in a UAX-#31 identifier, so
+/// a mangled name can never collide with a user-written symbol.
+fn mangle_linkage(module: Option<&str>, name: &str) -> String {
+    match module {
+        None => name.to_string(),
+        Some(prefix) => format!("{prefix}${name}"),
+    }
 }
 
 impl Lowerer {
@@ -471,6 +572,8 @@ impl Lowerer {
             tuple_cell_heap_temps: HashMap::new(),
             deferred_relation_releases: Vec::new(),
             user_opers: HashMap::new(),
+            current_module: None,
+            imported_opers: HashMap::new(),
         }
     }
 
@@ -1101,6 +1204,46 @@ impl Lowerer {
 
     // ── Walks ────────────────────────────────────────────────────────
 
+    /// Lower one imported module's operator bodies into the shared function
+    /// list, mangled with `prefix`, and return the module's exported operator
+    /// signatures (for the import catalog). Modules contribute operators only;
+    /// module-level relvars / type declarations are a later extension (they are
+    /// type-checked, just not yet lowered from an imported unit). Runs before
+    /// the entry unit's `lower_root`, so the entry's calls resolve to the
+    /// symbols emitted here.
+    fn lower_module_unit(
+        &mut self,
+        root: &Root,
+        prefix: String,
+        imported: HashMap<String, (String, UserOpSig)>,
+    ) -> HashMap<String, UserOpSig> {
+        // Pre-pass: this module's own operator signatures (self-calls + forward
+        // references). Collected fresh so they don't mix with a prior unit's.
+        let mut own: HashMap<String, UserOpSig> = HashMap::new();
+        for item in root.items() {
+            if let Item::OperDecl(o) = item {
+                let (name, params, return_type) = self.oper_signature(&o);
+                own.insert(
+                    name,
+                    UserOpSig {
+                        params,
+                        return_type,
+                    },
+                );
+            }
+        }
+        self.current_module = Some(prefix);
+        self.user_opers = own.clone();
+        self.imported_opers = imported;
+        for item in root.items() {
+            if let Item::OperDecl(o) = item {
+                let func = self.lower_oper_decl(&o);
+                self.functions.push(func);
+            }
+        }
+        own
+    }
+
     fn lower_root(&mut self, root: &Root) -> Module {
         // Pre-pass: record every user-defined operator's signature so a call
         // to an operator declared later in the file resolves during body
@@ -1108,6 +1251,9 @@ impl Lowerer {
         // overloading), but built-ins live in a separate table, so this insert
         // never clobbers one; the typechecker caps it at one user overload per
         // name (T0060), so the by-name `user_opers` map stays unambiguous.
+        // Clear first so a preceding module unit's operators (from
+        // `lower_module_unit`) don't leak into the entry's own-operator scope.
+        self.user_opers.clear();
         for item in root.items() {
             if let Item::OperDecl(o) = item {
                 let (name, params, return_type) = self.oper_signature(&o);
@@ -1396,14 +1542,15 @@ impl Lowerer {
     fn lower_oper_decl(&mut self, decl: &OperDecl) -> Function {
         self.reset_function_state();
 
-        // Surface name doubles as the linkage name for now. Adding name
-        // mangling — for overloading or module-scoped symbols — slots into
-        // `oper_signature` once it arrives. The declared return type defaults
-        // to Unit; main is treated as Unit at the IR level (the backends
-        // special-case `ret i32 0`), and the typechecker rejects a declared
-        // non-Unit return on `main` with T0011, so that is safe.
+        // The linkage name is the surface name for an entry-unit operator, and
+        // module-scoped (`<prefix>$<name>`) when lowering an imported module —
+        // so two modules' same-named private helpers get distinct symbols. The
+        // declared return type defaults to Unit; main is treated as Unit at the
+        // IR level (the backends special-case `ret i32 0`), and the typechecker
+        // rejects a declared non-Unit return on `main` with T0011, so that is
+        // safe. `main` only ever occurs in the entry unit (verbatim).
         let (name, params, declared_return) = self.oper_signature(decl);
-        let linkage_name = name.clone();
+        let linkage_name = mangle_linkage(self.current_module.as_deref(), &name);
         let is_main = name == "main";
 
         // Bind parameters as body locals so a body reference (e.g. `self`)
@@ -5630,10 +5777,12 @@ impl Lowerer {
         if surface == "write_line" && call_has_named_arg(call, "template") {
             return self.lower_write_line_format_call(call);
         }
-        // A non-builtin callee is a user-defined operator — an in-module
-        // function. (Names are unique across builtins ∪ user ops, so this
-        // never shadows a builtin.)
-        if self.user_opers.contains_key(&surface) {
+        // A non-builtin callee is a user-defined operator — either the current
+        // unit's own operator or one imported from a module (both emitted as an
+        // in-module `Inst::Call`; `lower_user_call` picks the mangled symbol).
+        // Names are unique across builtins ∪ user ops, so this never shadows a
+        // builtin.
+        if self.user_opers.contains_key(&surface) || self.imported_opers.contains_key(&surface) {
             return self.lower_user_call(&surface, call, self_val);
         }
 
@@ -5732,12 +5881,24 @@ impl Lowerer {
         call: &CallExpr,
         self_val: Option<ValueId>,
     ) -> ValueId {
-        let (params, return_type) = {
-            let sig = self
-                .user_opers
-                .get(surface)
-                .expect("lower_user_call invoked only for a known user op");
-            (sig.params.clone(), sig.return_type.clone())
+        // Resolve the callee's owning module + signature: the current unit's own
+        // operator (owned by `current_module`) shadows an import; otherwise the
+        // importing table gives the exporting module's prefix. The callee's
+        // linkage symbol is mangled by whichever module owns it.
+        let (callee, params, return_type) = if let Some(sig) = self.user_opers.get(surface) {
+            (
+                mangle_linkage(self.current_module.as_deref(), surface),
+                sig.params.clone(),
+                sig.return_type.clone(),
+            )
+        } else if let Some((prefix, sig)) = self.imported_opers.get(surface) {
+            (
+                mangle_linkage(Some(prefix), surface),
+                sig.params.clone(),
+                sig.return_type.clone(),
+            )
+        } else {
+            unreachable!("lower_user_call invoked only for a known user op `{surface}`")
         };
 
         let arg_list = call.args().expect("typechecked call has an arg list");
@@ -5781,7 +5942,7 @@ impl Lowerer {
         };
         self.insts.push(Inst::Call {
             dst,
-            callee: surface.to_string(),
+            callee,
             args: arg_values.clone(),
             return_type,
         });
@@ -6764,6 +6925,7 @@ oper main {}\n\
                 write_policy: WritePolicy::ReadOnly,
             }],
             db_file_default: Some("/tmp/greetings.sqlite".to_string()),
+            module_graph: coddl_plan::ModuleGraph::default(),
         }
     }
 
@@ -6806,6 +6968,7 @@ oper main {}\n\
                 write_policy: WritePolicy::ReadOnly,
             }],
             db_file_default: Some("/tmp/flags.sqlite".to_string()),
+            module_graph: coddl_plan::ModuleGraph::default(),
         }
     }
 
@@ -7966,6 +8129,7 @@ oper main {} [
             backend_kind: BackendKind::Sqlite,
             resolved: vec![],
             db_file_default: None,
+            module_graph: coddl_plan::ModuleGraph::default(),
         };
         let src = "program rel_lit;\n\
                    oper main {}\n\

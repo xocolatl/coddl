@@ -1,0 +1,7 @@
+program app;
+
+use module greet;
+
+oper main{} [
+    hello{};
+];

@@ -240,6 +240,35 @@ conservatively barred from a `transaction [...]`, never the reverse).
 User-operator *overloading* (a second user overload of one name) is later
 work.
 
+### Imported operators (userspace modules)
+
+A program is checked as a set of **units** — the entry `program`/`library`
+plus every userspace `module` it transitively imports (`use module <leaf>;`),
+resolved by the plan layer into a dependency-first graph (see
+[plan.md](plan.md)). `check_program` checks each unit separately: a module's
+body is genuine code (unlike a signature-only stdlib module), so it is
+type-checked with its own imports in scope, and every diagnostic carries that
+unit's `FileId` (so an error in `greet.cd` reports against `greet.cd`).
+
+Scoping is **opt-in and per-unit**. A unit sees its own operators plus the
+exported operators (all top-level `oper`s — there is no `pub` keyword yet) of
+the modules it *directly* imports. Imports live in a table **separate** from the
+unit's own operators, which gives two properties:
+
+- **A local definition shadows an import.** Resolution consults builtins and the
+  unit's own `oper`s first; the imported table is checked only when nothing local
+  matches. So a unit may define its own `helper` even while importing a module
+  that also exports `helper` — no `T0060`, and the call binds locally.
+- **Same-named exports from two modules coexist until used.** Importing two
+  modules that both export `greeting` is fine; only a *call* to the ambiguous
+  name is an error (`T0092`), resolvable by defining a local `oper` of that name.
+
+An un-imported module's operators are never in scope — the name stays a free
+identifier the unit may define itself (the same discipline as the opt-in stdlib
+modules). The single-file `check` entry point is `check_program` with one entry
+unit and no imports, so unit-test fragments and the LSP's single-buffer path are
+unchanged.
+
 ### UFCS method calls
 
 Any operator with a parameter literally named `self` — built-in or
@@ -753,3 +782,4 @@ check script enforces that.
 | T0089 | a `use module <path>;` names a module that does not exist under the reserved `coddl::` root |
 | T0090 | a `builtin relvar` from an opt-in stdlib module is referenced without importing it — add `use module <path>;` (e.g. `Environment` needs `use module coddl::env;`) |
 | T0091 | a possrep-scalar declaration `type Name { … }` has other than exactly one component — multi-component possreps are not yet supported (single-component tier) |
+| T0092 | a call names an operator exported by **more than one** imported userspace module (ambiguous import) — define a local `oper` of that name to disambiguate |

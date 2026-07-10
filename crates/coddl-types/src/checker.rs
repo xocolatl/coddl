@@ -349,6 +349,18 @@ pub struct PossrepScalar {
 /// function is parse-only — the result carries the tree and parser
 /// diagnostics; the relvar table is empty.
 pub fn check(source: &str, file: FileId, file_kind: FileKind) -> CheckOutput {
+    check_inner(source, file, file_kind, HashMap::new()).0
+}
+
+/// Type-check one unit with `imported_opers` seeded from its module imports.
+/// Returns the [`CheckOutput`] and the unit's own exported operator signatures
+/// (its top-level `oper`s), which feed [`check_program`]'s export catalog.
+fn check_inner(
+    source: &str,
+    file: FileId,
+    file_kind: FileKind,
+    imported_opers: HashMap<String, Vec<(ModulePath, crate::builtins::OperSig)>>,
+) -> (CheckOutput, HashMap<String, crate::builtins::OperSig>) {
     let parse_out = parse(source, file, file_kind);
     let tree = parse_out.tree.clone();
     let mut tc = TypeChecker {
@@ -362,6 +374,7 @@ pub fn check(source: &str, file: FileId, file_kind: FileKind) -> CheckOutput {
         transaction_depth: 0,
         public_relvars: HashSet::new(),
         user_opers: HashMap::new(),
+        imported_opers,
         type_aliases: HashMap::new(),
         nominal_scalars: HashMap::new(),
         active_modules: HashSet::new(),
@@ -385,15 +398,101 @@ pub fn check(source: &str, file: FileId, file_kind: FileKind) -> CheckOutput {
             // (the plan layer) and Phase 21 (storage materialization).
         }
     }
-    CheckOutput {
-        tree,
-        diagnostics: tc.diagnostics,
-        hints: tc.hints,
-        mutable_spans: tc.mutable_spans,
-        relvars: tc.relvars,
-        type_aliases: tc.type_aliases,
-        nominal_scalars: tc.nominal_scalars,
+    let exports = tc.user_opers.clone();
+    (
+        CheckOutput {
+            tree,
+            diagnostics: tc.diagnostics,
+            hints: tc.hints,
+            mutable_spans: tc.mutable_spans,
+            relvars: tc.relvars,
+            type_aliases: tc.type_aliases,
+            nominal_scalars: tc.nominal_scalars,
+        },
+        exports,
+    )
+}
+
+/// One compilation unit for [`check_program`].
+pub struct CheckUnit<'a> {
+    /// The unit's module path; `None` for the entry `program`/`library`.
+    pub module: Option<ModulePath>,
+    /// The unit's `.cd` source.
+    pub source: &'a str,
+    /// The unit's file id — every diagnostic from this unit carries it, so the
+    /// driver's source map can render errors against the right file.
+    pub file: FileId,
+}
+
+/// The result of [`check_program`].
+pub struct ProgramCheckOutput {
+    /// The entry unit's [`CheckOutput`] (types, relvars, tree). `None` only when
+    /// no entry unit (`module: None`) was supplied.
+    pub entry: Option<CheckOutput>,
+    /// Every diagnostic across all units, each tagged with its unit's `FileId`.
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Type-check a program as a set of units — the entry `program`/`library` plus
+/// the userspace `module`s it transitively imports, **dependency-first** (every
+/// module precedes each unit that imports it). Each unit is checked with its
+/// direct imports' exported operators in scope (opt-in; a unit's own definitions
+/// and builtins shadow imports). Diagnostics from all units are merged.
+///
+/// `coddl_types` never sees `coddl_plan` (reverse arrow), so the caller (the plan
+/// layer) supplies the resolved units; the export catalog is built here from each
+/// module's own top-level operators.
+pub fn check_program(units: &[CheckUnit]) -> ProgramCheckOutput {
+    let mut catalog: HashMap<ModulePath, HashMap<String, crate::builtins::OperSig>> =
+        HashMap::new();
+    let mut diagnostics: Vec<Diagnostic> = Vec::new();
+    let mut entry: Option<CheckOutput> = None;
+
+    for unit in units {
+        // Seed the imported-operator scope from the catalog for this unit's
+        // direct `use module` imports. Stdlib (`coddl::*`) paths aren't in the
+        // catalog — they're handled by `resolve_modules` inside the unit check.
+        let mut imported: HashMap<String, Vec<(ModulePath, crate::builtins::OperSig)>> =
+            HashMap::new();
+        for path in use_module_paths(unit.source) {
+            if let Some(exports) = catalog.get(&path) {
+                for (name, sig) in exports {
+                    imported
+                        .entry(name.clone())
+                        .or_default()
+                        .push((path.clone(), sig.clone()));
+                }
+            }
+        }
+        let (out, exports) = check_inner(unit.source, unit.file, FileKind::Cd, imported);
+        diagnostics.extend(out.diagnostics.iter().cloned());
+        match &unit.module {
+            Some(m) => {
+                catalog.insert(m.clone(), exports);
+            }
+            None => entry = Some(out),
+        }
     }
+
+    ProgramCheckOutput { entry, diagnostics }
+}
+
+/// The `use module <path>;` paths declared in a `.cd` source, in order. Malformed
+/// (empty) paths are skipped — the parser already reported them.
+fn use_module_paths(source: &str) -> Vec<ModulePath> {
+    let out = parse(source, FileId(0), FileKind::Cd);
+    let Some(root) = Root::cast(out.tree) else {
+        return Vec::new();
+    };
+    root.items()
+        .filter_map(|item| {
+            let Item::UseDecl(u) = item else {
+                return None;
+            };
+            let segs: Vec<String> = u.segments().map(|t| t.text().to_string()).collect();
+            (!segs.is_empty()).then(|| ModulePath::new(segs))
+        })
+        .collect()
 }
 
 /// Quiet (no-diagnostic) resolution of a `TypeRef` to a `Type`. The static
@@ -536,6 +635,15 @@ struct TypeChecker {
     /// path as a single-signature builtin. Names are unique across builtins ∪
     /// user ops — a collision is rejected at registration with T0060.
     user_opers: HashMap<String, crate::builtins::OperSig>,
+    /// Operators imported from userspace modules via `use module <leaf>;`, keyed
+    /// by name → the `(owning module, signature)` pairs that export it. Held
+    /// **separately** from `user_opers` so a unit's own definition (and builtins)
+    /// *shadow* a same-named import — this table is consulted only when nothing
+    /// local matches — and so two imported modules exporting the same name
+    /// coexist until that name is actually called (then **T0092**). Empty for a
+    /// single-unit [`check`]; seeded by [`check_program`] from the export catalog
+    /// for a unit's direct imports.
+    imported_opers: HashMap<String, Vec<(ModulePath, crate::builtins::OperSig)>>,
     /// User-defined type aliases (`type Name = <type-ref>;`), collected in a
     /// pre-pass so a later type reference resolves regardless of declaration
     /// order. Consulted by `resolve_type_name` after the built-in type names.
@@ -4353,6 +4461,38 @@ impl TypeChecker {
                 return_type: Type::Scalar(callee_name.clone()),
                 purity: crate::builtins::Purity::Pure,
             });
+        }
+        // Nothing local (builtin / own `oper` / possrep selector) claims this
+        // name — consult the userspace imports. A unit's own definitions shadow
+        // imports, so this runs only when `candidates` is empty. Exactly one
+        // exporting module resolves; two or more is ambiguous (T0092).
+        if candidates.is_empty() {
+            let imports = self
+                .imported_opers
+                .get(&callee_name)
+                .cloned()
+                .unwrap_or_default();
+            match imports.len() {
+                0 => {}
+                1 => candidates.push(imports.into_iter().next().expect("len == 1").1),
+                _ => {
+                    let mods = imports
+                        .iter()
+                        .map(|(m, _)| format!("`{m}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.error(
+                        self.token_span(&callee_name_tok),
+                        "T0092",
+                        format!(
+                            "call to `{callee_name}` is ambiguous — it is exported by more than \
+                             one imported module ({mods}); define a local `oper {callee_name}` to \
+                             disambiguate"
+                        ),
+                    );
+                    return Type::Unknown;
+                }
+            }
         }
 
         // A method call `x.m { … }` requires `m` to declare a `self` parameter
@@ -8374,5 +8514,166 @@ mod tests {
         assert!(!c.contains(&"T0001"), "{:?}", c);
         assert!(!c.contains(&"T0002"), "{:?}", c);
         assert!(!c.contains(&"T0003"), "{:?}", c);
+    }
+
+    // ── Multi-unit checking (userspace module imports) ───────────────────
+
+    fn program_codes(units: &[CheckUnit]) -> Vec<&'static str> {
+        check_program(units)
+            .diagnostics
+            .into_iter()
+            .map(|d| d.code)
+            .collect()
+    }
+
+    #[test]
+    fn imported_oper_resolves_when_imported() {
+        let greet = "module greet;\noper hello {} [ write_line { message: \"hi\" }; ];\n";
+        let app = "program app;\nuse module greet;\noper main {} [ hello {}; ];\n";
+        let units = [
+            CheckUnit {
+                module: Some(ModulePath::parse("greet")),
+                source: greet,
+                file: FileId(1),
+            },
+            CheckUnit {
+                module: None,
+                source: app,
+                file: FileId(0),
+            },
+        ];
+        let c = program_codes(&units);
+        assert!(
+            !c.contains(&"T0001"),
+            "hello must resolve via import: {c:?}"
+        );
+        assert!(!c.contains(&"T0092"), "{c:?}");
+    }
+
+    #[test]
+    fn unimported_module_oper_is_unresolved_t0001() {
+        // `greet` is in the program, but `app` never imports it, so its `hello`
+        // is out of scope — opt-in, like the stdlib module precedent.
+        let greet = "module greet;\noper hello {} [ ];\n";
+        let app = "program app;\noper main {} [ hello {}; ];\n";
+        let units = [
+            CheckUnit {
+                module: Some(ModulePath::parse("greet")),
+                source: greet,
+                file: FileId(1),
+            },
+            CheckUnit {
+                module: None,
+                source: app,
+                file: FileId(0),
+            },
+        ];
+        assert!(program_codes(&units).contains(&"T0001"));
+    }
+
+    #[test]
+    fn own_oper_shadows_same_named_import() {
+        // A local `hello` alongside an imported `greet::hello` is not a
+        // redefinition (they live in separate tables) and the call binds locally.
+        let greet = "module greet;\noper hello {} [ ];\n";
+        let app =
+            "program app;\nuse module greet;\noper hello {} [ ];\noper main {} [ hello {}; ];\n";
+        let units = [
+            CheckUnit {
+                module: Some(ModulePath::parse("greet")),
+                source: greet,
+                file: FileId(1),
+            },
+            CheckUnit {
+                module: None,
+                source: app,
+                file: FileId(0),
+            },
+        ];
+        let c = program_codes(&units);
+        assert!(
+            !c.contains(&"T0060"),
+            "own+imported same name is not a redef: {c:?}"
+        );
+        assert!(!c.contains(&"T0092"), "{c:?}");
+        assert!(!c.contains(&"T0001"), "{c:?}");
+    }
+
+    #[test]
+    fn unused_ambiguous_import_is_clean() {
+        // Two modules exporting the same name coexist until it is actually used.
+        let foo = "module foo;\noper hello {} [ ];\n";
+        let bar = "module bar;\noper hello {} [ ];\n";
+        let app = "program app;\nuse module foo;\nuse module bar;\noper main {} [ ];\n";
+        let units = [
+            CheckUnit {
+                module: Some(ModulePath::parse("foo")),
+                source: foo,
+                file: FileId(1),
+            },
+            CheckUnit {
+                module: Some(ModulePath::parse("bar")),
+                source: bar,
+                file: FileId(2),
+            },
+            CheckUnit {
+                module: None,
+                source: app,
+                file: FileId(0),
+            },
+        ];
+        assert!(!program_codes(&units).contains(&"T0092"));
+    }
+
+    #[test]
+    fn ambiguous_import_on_use_diagnoses_t0092() {
+        let foo = "module foo;\noper hello {} [ ];\n";
+        let bar = "module bar;\noper hello {} [ ];\n";
+        let app = "program app;\nuse module foo;\nuse module bar;\noper main {} [ hello {}; ];\n";
+        let units = [
+            CheckUnit {
+                module: Some(ModulePath::parse("foo")),
+                source: foo,
+                file: FileId(1),
+            },
+            CheckUnit {
+                module: Some(ModulePath::parse("bar")),
+                source: bar,
+                file: FileId(2),
+            },
+            CheckUnit {
+                module: None,
+                source: app,
+                file: FileId(0),
+            },
+        ];
+        assert!(program_codes(&units).contains(&"T0092"));
+    }
+
+    #[test]
+    fn module_body_error_surfaces_against_its_file() {
+        // Each module body is type-checked; an unresolved call inside `greet`
+        // reports against `greet`'s FileId, not the entry's.
+        let greet = "module greet;\noper hello {} [ nonexistent {}; ];\n";
+        let app = "program app;\nuse module greet;\noper main {} [ hello {}; ];\n";
+        let units = [
+            CheckUnit {
+                module: Some(ModulePath::parse("greet")),
+                source: greet,
+                file: FileId(7),
+            },
+            CheckUnit {
+                module: None,
+                source: app,
+                file: FileId(0),
+            },
+        ];
+        let diags = check_program(&units).diagnostics;
+        let unresolved: Vec<_> = diags.iter().filter(|d| d.code == "T0001").collect();
+        assert!(!unresolved.is_empty(), "module body must be checked");
+        assert!(
+            unresolved.iter().all(|d| d.span.file == FileId(7)),
+            "error must carry greet's FileId: {unresolved:?}"
+        );
     }
 }

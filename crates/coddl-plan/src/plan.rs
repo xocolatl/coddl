@@ -65,6 +65,11 @@ pub struct Plan {
     /// resolver applies `CODDL_<DBNAME>_FILE` env override before falling
     /// back to this default.
     pub db_file_default: Option<String>,
+    /// The userspace modules this program imports (`use module <leaf>;`),
+    /// dependency-first. The lowerer lowers each module's operator bodies into
+    /// the program's ProcIR module with module-scoped linkage names. Empty when
+    /// the program imports no userspace modules.
+    pub module_graph: ModuleGraph,
 }
 
 /// One public relvar's full resolution: from the application-side

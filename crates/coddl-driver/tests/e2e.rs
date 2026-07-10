@@ -6298,3 +6298,61 @@ fn load_from_db_relvar_pushes_order_by_both_directions() {
         );
     }
 }
+
+/// Userspace module import, end-to-end on both backends. A `program` imports a
+/// `module` and calls one of its operators; the module operator in turn calls
+/// its *own* `helper`, which shares a name with the program's own `helper`. The
+/// two same-named helpers must stay distinct symbols (module-scoped mangling),
+/// so the output is the program's helper then the module's helper. Run under the
+/// leak gate (`coddl()` sets `CODDL_LEAK_CHECK`), so a non-zero exit also flags a
+/// refcount imbalance.
+#[test]
+fn userspace_module_import_and_name_collision_run_on_both_backends() {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        tmp.path().join("greet.cd"),
+        "module greet;\n\
+         oper helper {} [ write_line { message: \"greet helper\" }; ];\n\
+         oper hello {} [ helper {}; ];\n",
+    )
+    .expect("write greet.cd");
+    std::fs::write(
+        tmp.path().join("app.cd"),
+        "program app;\n\
+         use module greet;\n\
+         oper helper {} [ write_line { message: \"app helper\" }; ];\n\
+         oper main {} [ helper {}; hello {}; ];\n",
+    )
+    .expect("write app.cd");
+    let app = tmp.path().join("app.cd");
+
+    let mut outs = Vec::new();
+    for backend in ["llvm", "cranelift"] {
+        let out = coddl()
+            .args(["run", &format!("--backend={backend}")])
+            .arg(&app)
+            .output()
+            .unwrap_or_else(|e| panic!("spawn coddl run --backend={backend}: {e}"));
+        assert!(
+            out.status.success(),
+            "{backend} run failed: stderr=\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        outs.push(out.stdout);
+    }
+    assert_eq!(
+        outs[0],
+        outs[1],
+        "backends disagree:\n  LLVM:      {:?}\n  Cranelift: {:?}",
+        String::from_utf8_lossy(&outs[0]),
+        String::from_utf8_lossy(&outs[1]),
+    );
+    // main → app's own `helper`, then greet.hello → greet's own `helper`.
+    assert_eq!(
+        outs[0],
+        b"app helper\ngreet helper\n",
+        "unexpected output: {:?}",
+        String::from_utf8_lossy(&outs[0]),
+    );
+}

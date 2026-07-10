@@ -253,6 +253,15 @@ A user writing `oper main { x: Integer } []` is rejected by the
 typechecker (`T0006`), so the backends never need to handle a
 parameterized `main`.
 
+`main` only ever occurs in the entry unit (a `library`/`module` with a
+`main` is rejected in the plan layer, PL0015), and the entry unit's
+symbols are never mangled — so `main` stays verbatim. An operator lowered
+from an **imported module** carries a module-scoped `linkage_name`
+(`<prefix>$<name>`, e.g. `greet$hello`; see [procir.md](procir.md)); both
+backends emit it verbatim like any other `linkage_name`. `$` is a legal
+symbol character in LLVM IR (unquoted) and opaque to Cranelift, so no
+escaping is needed.
+
 
 ## LLVM backend
 

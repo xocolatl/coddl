@@ -63,10 +63,15 @@ Key invariants the lowering pass and the backends both rely on:
 - **Externs carry no blocks.** `Function::blocks.is_empty()` ⇔ the
   function is an extern declaration. Hello-world produces one such
   Function for `write_line` and one with blocks for `main`.
-- **`linkage_name` is the source of truth for the symbol.** For
-  defined functions today, `linkage_name == name`. For externs,
-  `linkage_name` is the `coddl_*` name the runtime exposes. Backends
-  emit `linkage_name` verbatim and never derive it.
+- **`linkage_name` is the source of truth for the symbol.** For a
+  defined function in the entry unit (`program`/`library`), `linkage_name
+  == name`. For an operator lowered from an **imported module**, it is
+  **module-scoped**: `<prefix>$<name>`, where `<prefix>` is the module
+  path joined with `$` (`greet$hello`, `a$b$helper`) — `$` is invalid in
+  a UAX-#31 identifier, so a mangled symbol can never collide with a
+  user-written one, letting two modules define a same-named private
+  helper. For externs, `linkage_name` is the `coddl_*` name the runtime
+  exposes. Backends emit `linkage_name` verbatim and never derive it.
 - **SSA: every `Inst` defines at most one `ValueId`.** `Inst::Call`
   whose `return_type` is `Unit` has `dst == None`.
 - **`ProcType` is the machine-level type, not the surface type.**
@@ -156,7 +161,7 @@ walk shape. Each `check_<x>` in `coddl-types::checker` has a sibling
 | `Stmt::Let`    | Lowers the RHS expression and binds its `ValueId` in the current local scope. No `Inst` emitted — `let` is a binding, not a computation. |
 | `Stmt::ExprStmt` | `lower_expr` is called and its result discarded.                                           |
 | `Expr::Literal` | `Inst::Const` of the matching `ProcType`.                                                   |
-| `Expr::Call`   | A builtin callee lowers each declared parameter's argument expression in source-declaration order, emits the synthetic extern `Function` on first reference, then `Inst::Call` to its `linkage_name`. A **user-defined** callee (any non-builtin name; resolved against the user-op signature table a `lower_root` pre-pass fills from every `oper` declaration, so forward references work) lowers args the same name-driven way and emits an in-module `Inst::Call` whose `callee` is the operator's surface name — no extern, since the callee is a `Module::functions` entry. A `Text`-returning user call marks its result owned (released at the caller's scope exit), the same as `read_line`. |
+| `Expr::Call`   | A builtin callee lowers each declared parameter's argument expression in source-declaration order, emits the synthetic extern `Function` on first reference, then `Inst::Call` to its `linkage_name`. A **user-defined** callee (any non-builtin name; resolved against the current unit's own-operator table a pre-pass fills from every `oper` declaration, then its imported-operator table for a `use module` import) lowers args the same name-driven way and emits an in-module `Inst::Call` whose `callee` is the resolved operator's **linkage name** — verbatim for an own operator of the entry unit, or the exporting module's `<prefix>$<name>` for an imported call — no extern, since the callee is a `Module::functions` entry. A unit's own operator shadows a same-named import. A `Text`-returning user call marks its result owned (released at the caller's scope exit), the same as `read_line`. |
 | `Expr::NameRef` | Looks up the name in the local scope stack (innermost-first). Returns the bound `ValueId` so downstream consumers thread it through. |
 | `Expr::Transaction` | Pushes a local scope, emits `Inst::Call("coddl_begin_tx")`, walks the body via `Block`, emits `Inst::Call("coddl_commit_tx")`, releases heap-typed locals, pops the scope. The body's `ValueId` becomes the expression's value (so a `let g = transaction [...]` binds the tail). Tx-externs are no-ops in v1: nothing inside the body touches SQLite (reads are served from the pre-materialized slot), so begin/commit have no work to do — the shape exists so the conformance rule (T0025 / T0026) has somewhere to land. Real BEGIN/COMMIT discipline ships with write-through. |
 | SQL pushdown cut | Before legacy lowering, `lower_expr` tries `try_lower_pushed`: it builds a `coddl-relir` `RelExpr` from a relvar-rooted relational subtree (a public-relvar leaf, optionally `where attr = literal`), runs the cut (`cut::try_push`), and on a hit bakes the SQL via `coddl-sqlemit`, records a `PlanEntry` on `Module::plans` (deduped by the text-stable `coddl_sqlemit::PlanId`), emits one `Inst::Const` per bind value, and emits `Inst::Query { dst, plan_id, params, heading_id }` at the force point — replacing the legacy `RelvarRead`/`Where`. Only enabled for a pushable backend (SQLite today); a non-pushable shape or backend falls through to the legacy path below. |

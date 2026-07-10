@@ -48,10 +48,15 @@ The rest of this doc pins what `coddl-plan` enforces today.
 `coddl_plan::discover_and_validate(cd_path) -> PlanOutput` is the
 public entry point. It:
 
-1. Reads the `.cd` source from `cd_path` and runs
-   `coddl_types::check(_, _, FileKind::Cd)`. The per-file
-   diagnostics flow into the output unchanged.
-2. Reads the AST: extracts the `program <name>;` label (a no-op
+1. Parses the `.cd`, resolves its userspace module graph (see
+   "Userspace module resolution" below), then runs the **multi-unit**
+   `coddl_types::check_program` over the entry plus every resolved
+   module (dependency-first), so cross-module calls resolve and each
+   module body is checked. The merged, per-`FileId`-tagged diagnostics
+   flow into the output; the entry unit's `CheckOutput` drives the rest
+   of discovery. FileIds: entry = `0`, `.cddb`/`.cdstore` companions
+   reserve `1`/`2`, modules take `3..`.
+2. Reads the entry AST: extracts the `program <name>;` label (a no-op
    today; reserved for multi-program projects) and the
    `database <name>;` binding via
    `coddl_syntax::ast::DatabaseBinding::name()`.

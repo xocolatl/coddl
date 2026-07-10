@@ -20,8 +20,8 @@ use coddl_syntax::ast_cddb::CddbRoot;
 use coddl_syntax::ast_cdstore::{
     BackendDecl, CdstoreRoot, CdstoreValue, ColumnsBlock, RelvarBinding,
 };
-use coddl_syntax::FileKind;
-use coddl_types::{check, Heading, RelvarKind, RelvarTable};
+use coddl_syntax::{parse, FileKind};
+use coddl_types::{check, check_program, CheckUnit, Heading, RelvarKind, RelvarTable};
 
 mod modules;
 mod plan;
@@ -72,20 +72,51 @@ pub fn discover_and_validate_with_overrides(
         }
     };
 
-    let cd_check = check(&cd_source, FileId(0), FileKind::Cd);
-    diags.extend(cd_check.diagnostics.iter().cloned());
-
-    // Compilation-unit header rules (PL0012–PL0015). Run unconditionally, before
-    // the public-relvar branches, so every `.cd` entry point is validated.
-    let header_kind = validate_file_header(&cd_check.tree, &mut diags);
+    // Parse the entry once to walk its `use module` edges; the full multi-unit
+    // check (below) re-checks the entry with its imports in scope.
+    let entry_parse = parse(&cd_source, FileId(0), FileKind::Cd);
 
     // Resolve the userspace module graph (`use module <leaf>;` imports → sibling
     // `.cd` files), validating the file/header contract and detecting cycles
     // (PL0016–PL0019). Runs for every entry file, independent of public relvars.
     let base = cd_path.parent().unwrap_or_else(|| Path::new("."));
     let entry_display = cd_path.display().to_string();
-    let module_graph =
-        modules::resolve_module_graph(&cd_check.tree, &entry_display, base, overrides, &mut diags);
+    let module_graph = modules::resolve_module_graph(
+        &entry_parse.tree,
+        &entry_display,
+        base,
+        overrides,
+        &mut diags,
+    );
+
+    // Type-check the whole program — the entry plus every resolved userspace
+    // module, dependency-first — so cross-module calls resolve and each module
+    // body is checked. FileIds: entry = 0; the `.cddb`/`.cdstore` companions
+    // reserve 1/2; modules take 3.. so every unit's diagnostics are distinct.
+    let mut units: Vec<CheckUnit> = module_graph
+        .modules
+        .iter()
+        .enumerate()
+        .map(|(i, m)| CheckUnit {
+            module: Some(m.path.clone()),
+            source: &m.source,
+            file: FileId((i + 3) as u32),
+        })
+        .collect();
+    units.push(CheckUnit {
+        module: None,
+        source: &cd_source,
+        file: FileId(0),
+    });
+    let program_out = check_program(&units);
+    diags.extend(program_out.diagnostics.iter().cloned());
+    let cd_check = program_out
+        .entry
+        .expect("check_program always returns the entry unit's output");
+
+    // Compilation-unit header rules (PL0012–PL0015). Run unconditionally, before
+    // the public-relvar branches, so every `.cd` entry point is validated.
+    let header_kind = validate_file_header(&cd_check.tree, &mut diags);
 
     let program_name = extract_program_name(&cd_check.tree);
     let database_binding = find_database_binding(&cd_check.tree);
@@ -112,6 +143,7 @@ pub fn discover_and_validate_with_overrides(
                 backend_kind: BackendKind::Unknown,
                 resolved: Vec::new(),
                 db_file_default: None,
+                module_graph: module_graph.clone(),
             }),
             diagnostics: diags,
             module_graph,
@@ -136,6 +168,7 @@ pub fn discover_and_validate_with_overrides(
                 backend_kind: BackendKind::Unknown,
                 resolved: Vec::new(),
                 db_file_default: None,
+                module_graph: module_graph.clone(),
             }),
             diagnostics: diags,
             module_graph,
@@ -322,6 +355,7 @@ pub fn discover_and_validate_with_overrides(
             backend_kind,
             resolved,
             db_file_default,
+            module_graph: module_graph.clone(),
         }),
         diagnostics: diags,
         module_graph,
@@ -1190,5 +1224,40 @@ base relvar Greetings { id: Integer, message: Boolean } key { id };
             .collect();
         assert!(pl.is_empty(), "unexpected {pl:?}");
         assert!(out.module_graph.modules.is_empty());
+    }
+
+    /// All diagnostic codes from resolving `cd_path` (T-codes and PL-codes).
+    fn all_codes(cd_path: &Path) -> Vec<&'static str> {
+        discover_and_validate(cd_path)
+            .diagnostics
+            .into_iter()
+            .map(|d| d.code)
+            .collect()
+    }
+
+    #[test]
+    fn entry_call_to_imported_oper_resolves_through_discover() {
+        // The full-program payoff at the plan layer: the entry's call to a
+        // module's exported oper resolves (no T0001) because `discover_and_validate`
+        // runs the multi-unit `check_program` over the entry + module.
+        let (_d, cd) = write_unit(
+            "program app;\nuse module greet;\noper main {} [ hello {}; ];\n",
+            &[("greet.cd", "module greet;\noper hello {} [ ];\n")],
+        );
+        assert!(
+            !all_codes(&cd).contains(&"T0001"),
+            "imported `hello` must resolve: {:?}",
+            all_codes(&cd)
+        );
+    }
+
+    #[test]
+    fn entry_call_without_import_is_t0001_through_discover() {
+        // Same module on disk, but not imported → out of scope → unresolved.
+        let (_d, cd) = write_unit(
+            "program app;\noper main {} [ hello {}; ];\n",
+            &[("greet.cd", "module greet;\noper hello {} [ ];\n")],
+        );
+        assert!(all_codes(&cd).contains(&"T0001"));
     }
 }

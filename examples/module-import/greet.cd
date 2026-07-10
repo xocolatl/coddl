@@ -1,0 +1,5 @@
+module greet;
+
+oper hello{} [
+    write_line{ message: "Hello from the greet module!" };
+];
