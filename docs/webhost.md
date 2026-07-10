@@ -208,24 +208,36 @@ codegen backends. `coddl-web` now hand-writes two `CoddlHeadingDesc`s against th
 There is no automated drift check ([risks.md](risks.md), "FFI struct-layout single source of truth"): these
 hand-written descriptors silently rot if the layout description ever diverges and doesn't become generated.
 
-## Lifecycle: `coddl_app_init` / `coddl_app_shutdown`
+## Lifecycle: `coddl_app_init` / `coddl_app_shutdown` — **DONE (P1b)**
 
-Today the runtime lifecycle is bolted onto `main`: the lowerer wraps a user `oper main {}` with
+For a `main` program the runtime lifecycle rides `main`: the lowerer wraps `oper main {}` with
 `coddl_runtime_init` / `coddl_runtime_shutdown` and splices in `RegisterDatabase` / `RegisterPlan` (one per
-pushed SQL plan) and per-relvar `RelvarSlotInit` / `RelvarSlotRelease`. A host owns `main`, so that lifecycle
-must move.
+pushed SQL plan) and per-relvar `RelvarSlotInit` / `RelvarSlotRelease`. A web host owns `main`, so that
+sequence can't ride one — a mainless module used to hit the early-return in `finalize_main_prologue`
+(`crates/coddl-procir/src/lower.rs`) and register nothing.
 
-The registration instruction sequence is compiler-synthesized from the plan and is **independent of any user
-`main` body**. Library mode therefore synthesizes two fresh functions — `coddl_app_init` and
-`coddl_app_shutdown` — carrying that identical instruction sequence, rather than trying to relocate anything
-*out of* a `main` that a web app never had. This is cleaner than today's approach of hunting for the block
-that contains the `coddl_runtime_init` call.
+The registration sequence is compiler-synthesized from the plan and **independent of any user `main` body**,
+so a **mainless module now synthesizes two fresh exported functions** — `coddl_app_init` (a
+`coddl_runtime_init` call + the same `RegisterDatabase` / `RegisterPlan` / `RelvarSlotInit` /
+`PrivateRelvarSlotInit` prologue) and `coddl_app_shutdown` (the `RelvarSlotRelease`s + `coddl_runtime_shutdown`)
+— carrying the identical sequence, rather than relocating anything out of a `main` a web app never had. Both
+codegen backends emit them unchanged (they already lower those instructions and every `Function`).
 
-The host calls each **exactly once**, RAII-guarded in `coddl-web`. The contract is process-lifetime: the
-runtime's registries are global `Mutex<HashMap>`s built for init-once / use-many / release-once. Calling
-`app_init` per request would double-register plans and re-init relvar slots; never calling `app_shutdown`
-leaks the connection pool at exit (benign). A DB-less spine has no plans or relvars, so it synthesizes
-nothing — `coddl_runtime_init` / `_shutdown` are no-op stubs and the host may skip them entirely.
+**Both are always emitted for a mainless module** — even a DB-less one (then they're just
+`runtime_init`/`shutdown`) — so a *generic* host can call them unconditionally and the symbols always resolve
+(the earlier "a DB-less spine may skip them" note is superseded — always-emit no-op stubs is simpler than a
+weak-symbol dance). `coddl-web` declares them under `#[cfg(coddl_app_obj)]` and calls `coddl_app_init` once
+before the accept loop, with an RAII guard that runs `coddl_app_shutdown` on exit (best-effort — the loop
+runs until the process is killed; a skipped shutdown just leaks the pool at exit, benign). The contract is
+process-lifetime: the runtime's registries are global `Mutex<HashMap>`s built for init-once / use-many /
+release-once, so calling `app_init` per request would double-register plans (`coddl_register_plan` aborts on
+a duplicate `plan_id`).
+
+The mechanism is proven by the hermetic e2e `app_init_shutdown_drive_a_mainless_relvar_handler`: a mainless
+module with a **private relvar** that an oper writes then reads, a C host that calls
+`coddl_app_init` → the oper → `coddl_app_shutdown`, run under the leak gate. (The **public-relvar + SQL +
+database** path in `app_init` is carried by the same synthesized code but is exercised by P4 — a handler
+whose body is a relvar query pushed to SQL, which needs a seeded database.)
 
 ## The `coddl-web` crate
 
@@ -372,8 +384,11 @@ dependency of the database payoff (P4), **not** of the request/response plumbing
    relvar-driven dispatch-by-data on first-class `oper` references — both language features, not host
    workarounds.
 
-8. **P1b — lifecycle synthesis.** `coddl_app_init` / `coddl_app_shutdown` emitted from the plan. Needed only
-   once a handler touches a relvar or a pushed plan — i.e. a dependency of P4, deferred until here.
+8. **P1b — lifecycle synthesis. DONE.** A mainless module synthesizes `coddl_app_init` / `coddl_app_shutdown`
+   (the `main` prologue/epilogue — runtime init + `RegisterDatabase`/`RegisterPlan`/relvar-slot init, and the
+   releases + runtime shutdown), always emitted so the host calls them unconditionally; `coddl-web` calls
+   them once around the accept loop. Proven with a private-relvar handler + C host under the leak gate; the
+   public-relvar SQL path rides the same code, exercised by P4.
 
 9. **P4 — payoff.** A handler whose body is a relational query against a relvar, pushed to SQL, returned as
    the response body — the "Django view + ORM query" in a single expression, null-free and backend-pushed:

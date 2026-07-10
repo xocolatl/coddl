@@ -56,6 +56,7 @@ fn fixtures_dir() -> &'static Path {
             ("union-intersect-minus", UNION_INTERSECT_MINUS_SRC),
             ("transitive-closure", TCLOSE_SRC),
             ("handle-mainless", HANDLE_MAINLESS_SRC),
+            ("app-lifecycle", APP_LIFECYCLE_SRC),
             ("tuple-relation-params", TUPLE_RELATION_PARAMS_SRC),
             ("tuple-through-if", TUPLE_THROUGH_IF_SRC),
             ("handler-shape", HANDLER_SHAPE_SRC),
@@ -99,6 +100,23 @@ oper main {} [
 const HANDLE_MAINLESS_SRC: &str = "\
 program p;
 oper handle {} -> Text [ \"hello\\n\" ];
+";
+
+// P1b lifecycle synthesis: a *mainless* module that touches a **private relvar**.
+// Because there is no `main` to carry the runtime prologue, the compiler
+// synthesizes `coddl_app_init` (runtime init + the private-relvar slot init) and
+// `coddl_app_shutdown` (slot release + runtime shutdown), which a foreign host
+// calls once around its request loop. `greet` writes the relvar then reads it
+// back — the write's slot-store and the read both require the slot that
+// `coddl_app_init` materialized.
+const APP_LIFECYCLE_SRC: &str = "\
+program app_lifecycle;
+private relvar Config { greeting: Text } key { greeting };
+oper greet {} -> Text [
+    Config := Relation { { greeting: \"hi\" } };
+    let t = extract Config;
+    t.greeting
+];
 ";
 
 // A minimal C host that stands in for `coddl-web`: it owns `main`, calls the
@@ -258,6 +276,34 @@ int main(void) {
         off += (size_t)n;
     }
     coddl_rc_release(body);
+    return 0;
+}
+";
+
+// A C host for the P1b lifecycle e2e: it calls `coddl_app_init` once (which
+// materializes the handler's private-relvar slot), then the mainless `greet`
+// oper across the C ABI, writes the returned bytes, releases the payload, and
+// calls `coddl_app_shutdown` once (which releases the slot + shuts the runtime
+// down). Without `coddl_app_init` the relvar slot is never materialized.
+const LIFECYCLE_HOST_C: &str = "\
+#include <stddef.h>
+#include <unistd.h>
+extern void coddl_app_init(void);
+extern void coddl_app_shutdown(void);
+extern char *greet(size_t *ret_len_out);
+extern void coddl_rc_release(char *ptr);
+int main(void) {
+    coddl_app_init();
+    size_t len = 0;
+    char *body = greet(&len);
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(1, body + off, len - off);
+        if (n <= 0) break;
+        off += (size_t)n;
+    }
+    coddl_rc_release(body);
+    coddl_app_shutdown();
     return 0;
 }
 ";
@@ -1473,6 +1519,67 @@ fn web_spine_mainless_handler_links_into_c_host() {
         String::from_utf8_lossy(&run.stderr)
     );
     assert_eq!(run.stdout, b"hello\n");
+}
+
+/// P1b — lifecycle synthesis. A *mainless* module that touches a private relvar
+/// exports `coddl_app_init` / `coddl_app_shutdown` (the runtime prologue/epilogue
+/// that can't ride a nonexistent `main`). A C host calls `coddl_app_init` →
+/// `greet` (which writes then reads the private relvar) → `coddl_app_shutdown`;
+/// the relvar slot is materialized by `coddl_app_init`, so a clean `hi` proves
+/// the whole init → use → shutdown cycle works. Run under the leak gate
+/// (`CODDL_LEAK_CHECK`) so the cycle is proven RC-balanced.
+#[test]
+fn app_init_shutdown_drive_a_mainless_relvar_handler() {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let obj = tmp.path().join("greet.o");
+    let host_c = tmp.path().join("lifecycle_host.c");
+    let bin = tmp.path().join("lifecycle_host");
+
+    // 1. Emit the mainless private-relvar handler to an object file.
+    let emit = coddl()
+        .args(["emit-obj"])
+        .arg(fixture_path("app-lifecycle"))
+        .arg("-o")
+        .arg(&obj)
+        .output()
+        .expect("spawn coddl emit-obj");
+    assert!(
+        emit.status.success(),
+        "emit-obj failed: stderr=\n{}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+
+    // 2. Link the object + runtime staticlib + the C host into a binary.
+    std::fs::write(&host_c, LIFECYCLE_HOST_C).expect("write lifecycle_host.c");
+    let runtime = workspace_root().join("target/debug/libcoddl_runtime.a");
+    let link = Command::new("cc")
+        .arg(&obj)
+        .arg(&runtime)
+        .arg(&host_c)
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .expect("spawn cc");
+    assert!(
+        link.status.success(),
+        "cc link failed: stderr=\n{}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    // 3. Run under the leak gate: `app_init` → `greet` → `app_shutdown` must be
+    //    RC-balanced and produce the relvar's greeting.
+    let run = Command::new(&bin)
+        .env("CODDL_LEAK_CHECK", "1")
+        .output()
+        .expect("run lifecycle host");
+    assert!(
+        run.status.success(),
+        "lifecycle host exit {}: stderr=\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"hi");
 }
 
 /// The cross-backend equivalence invariant: for any source program,

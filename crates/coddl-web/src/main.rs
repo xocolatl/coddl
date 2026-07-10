@@ -220,10 +220,30 @@ unsafe fn build_raw_request(
 // ── The handler ───────────────────────────────────────────────────────────
 
 // The compiled Coddl handler (`CODDL_APP_OBJ`): one boxed `RawRequest` pointer
-// in, one boxed `RawResponse` pointer out.
+// in, one boxed `RawResponse` pointer out. A compiled module also exports the
+// P1b lifecycle functions — `coddl_app_init` (runtime init + database/plan/relvar
+// registration) and `coddl_app_shutdown` (releases + runtime shutdown) — which
+// the host calls once around the accept loop.
 #[cfg(coddl_app_obj)]
 extern "C" {
     fn handle(req_ptr: *mut u8) -> *mut u8;
+    fn coddl_app_init();
+    fn coddl_app_shutdown();
+}
+
+/// Runs `coddl_app_init` on construction and `coddl_app_shutdown` on drop, so a
+/// graceful exit tears the runtime down once. The accept loop below runs until
+/// the process is killed, so in practice shutdown is best-effort — per the
+/// lifecycle contract, a skipped shutdown just leaks the connection pool at exit
+/// (benign). Only present when a compiled handler is linked.
+#[cfg(coddl_app_obj)]
+struct AppLifecycle;
+
+#[cfg(coddl_app_obj)]
+impl Drop for AppLifecycle {
+    fn drop(&mut self) {
+        unsafe { coddl_app_shutdown() };
+    }
 }
 
 /// Built-in default handler when no `CODDL_APP_OBJ` is linked: hand-build a
@@ -487,6 +507,17 @@ fn main() -> std::io::Result<()> {
     // free one (used by the integration test to avoid port collisions).
     let addr = std::env::var("CODDL_WEB_ADDR").unwrap_or_else(|_| "127.0.0.1:8000".to_string());
     let listener = TcpListener::bind(&addr)?;
+
+    // Run the compiled handler's app lifecycle once: `coddl_app_init` registers
+    // its database / plans / relvar slots so a `handle` call can touch a relvar;
+    // the guard runs `coddl_app_shutdown` on exit. The built-in default handler
+    // links no compiled module and touches no relvar, so it needs neither.
+    #[cfg(coddl_app_obj)]
+    let _lifecycle = unsafe {
+        coddl_app_init();
+        AppLifecycle
+    };
+
     // Announce the resolved address (port `:0` becomes concrete here) so a
     // supervising process can learn where to connect, then flush immediately.
     println!("coddl-web listening on http://{}", listener.local_addr()?);

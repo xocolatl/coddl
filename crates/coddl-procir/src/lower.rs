@@ -1232,14 +1232,23 @@ impl Lowerer {
                 releases.push(Inst::RelvarSlotRelease { name: name.clone() });
             }
         }
+        // A mainless module (a web handler the foreign host links) can't ride
+        // `main` for lifecycle. Synthesize `coddl_app_init` / `coddl_app_shutdown`
+        // instead — always (even with nothing to register), so a generic host can
+        // call them unconditionally; the host invokes each once around its loop.
+        if !self.functions.iter().any(|f| f.name == "main") {
+            self.synthesize_app_lifecycle(prologue, releases);
+            return;
+        }
+        // With a `main`, there is nothing to splice if nothing was registered.
         if prologue.is_empty() && releases.is_empty() {
             return;
         }
-
-        let main = match self.functions.iter_mut().find(|f| f.name == "main") {
-            Some(f) => f,
-            None => return,
-        };
+        let main = self
+            .functions
+            .iter_mut()
+            .find(|f| f.name == "main")
+            .expect("main present (checked just above)");
         // The prologue goes right after `coddl_runtime_init` and the releases
         // right before `coddl_runtime_shutdown`. Both calls sit in a *single*
         // block each, but not necessarily the same one: `init` is always in the
@@ -1275,6 +1284,61 @@ impl Lowerer {
                 }
             }
         }
+    }
+
+    /// Synthesize the mainless module's lifecycle functions (P1b): two exported
+    /// `Function`s a foreign host (e.g. `coddl-web`) calls once around its
+    /// request loop. `coddl_app_init` carries `coddl_runtime_init` + the same
+    /// database/plan/relvar registrations `main`'s prologue would; `coddl_app_shutdown`
+    /// carries the relvar-slot releases + `coddl_runtime_shutdown`. Emitted for
+    /// *every* mainless module (a DB-less one is just init/shutdown), so the host
+    /// can call them unconditionally.
+    fn synthesize_app_lifecycle(&mut self, prologue: Vec<Inst>, releases: Vec<Inst>) {
+        // `coddl_app_init`: runtime init, then the registration prologue.
+        self.reset_function_state();
+        self.begin_function_body();
+        self.ensure_runtime_extern("coddl_runtime_init", Vec::new(), ProcType::Integer);
+        let d = self.fresh_value();
+        self.record_type(d, ProcType::Integer);
+        self.insts.push(Inst::Call {
+            dst: Some(d),
+            callee: "coddl_runtime_init".to_string(),
+            args: Vec::new(),
+            return_type: ProcType::Integer,
+        });
+        self.insts.extend(prologue);
+        self.finish_block(Terminator::Return(None));
+        let blocks = std::mem::take(&mut self.blocks);
+        self.functions.push(Function {
+            name: "__coddl_app_init".to_string(),
+            linkage_name: "coddl_app_init".to_string(),
+            params: Vec::new(),
+            return_type: ProcType::Unit,
+            blocks,
+        });
+
+        // `coddl_app_shutdown`: the slot releases, then runtime shutdown.
+        self.reset_function_state();
+        self.begin_function_body();
+        self.insts.extend(releases);
+        self.ensure_runtime_extern("coddl_runtime_shutdown", Vec::new(), ProcType::Integer);
+        let d = self.fresh_value();
+        self.record_type(d, ProcType::Integer);
+        self.insts.push(Inst::Call {
+            dst: Some(d),
+            callee: "coddl_runtime_shutdown".to_string(),
+            args: Vec::new(),
+            return_type: ProcType::Integer,
+        });
+        self.finish_block(Terminator::Return(None));
+        let blocks = std::mem::take(&mut self.blocks);
+        self.functions.push(Function {
+            name: "__coddl_app_shutdown".to_string(),
+            linkage_name: "coddl_app_shutdown".to_string(),
+            params: Vec::new(),
+            return_type: ProcType::Unit,
+            blocks,
+        });
     }
 
     fn lower_program_decl(&mut self, decl: &ProgramDecl) {
@@ -8016,13 +8080,47 @@ oper main {} [
     fn multiple_opers_lower_independently() {
         let src = "oper foo {} []; oper bar {} [];";
         let m = lower_ok(src);
+        // A mainless module also synthesizes the P1b lifecycle functions
+        // (`__coddl_app_init` / `__coddl_app_shutdown`); this test is about the
+        // user opers, so exclude the compiler-internal `__`-prefixed ones.
         let defined: Vec<&str> = m
             .functions
             .iter()
             .filter(|f| !f.is_extern())
             .map(|f| f.name.as_str())
+            .filter(|n| !n.starts_with("__"))
             .collect();
         assert_eq!(defined, vec!["foo", "bar"]);
+    }
+
+    #[test]
+    fn mainless_module_synthesizes_app_lifecycle() {
+        // No `main` → the runtime lifecycle can't ride it, so P1b synthesizes two
+        // exported functions the host calls around its loop.
+        let src = "oper handle {} -> Text [ \"x\" ];";
+        let m = lower_ok(src);
+        let linkage: Vec<&str> = m
+            .functions
+            .iter()
+            .map(|f| f.linkage_name.as_str())
+            .collect();
+        assert!(linkage.contains(&"coddl_app_init"), "{linkage:?}");
+        assert!(linkage.contains(&"coddl_app_shutdown"), "{linkage:?}");
+    }
+
+    #[test]
+    fn main_module_has_no_app_lifecycle() {
+        // A `main` program carries the lifecycle inside `main` itself — no
+        // separate app_init/shutdown are synthesized.
+        let src = "oper main {} [];";
+        let m = lower_ok(src);
+        let linkage: Vec<&str> = m
+            .functions
+            .iter()
+            .map(|f| f.linkage_name.as_str())
+            .collect();
+        assert!(!linkage.contains(&"coddl_app_init"), "{linkage:?}");
+        assert!(!linkage.contains(&"coddl_app_shutdown"), "{linkage:?}");
     }
 
     #[test]
