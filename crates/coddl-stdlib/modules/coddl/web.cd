@@ -1,26 +1,63 @@
 // coddl::web — the web-host vocabulary (opt-in).
 //
-// A type/vocabulary module: the Request/Response shapes a Rust host marshals
-// across the C ABI to compiled Coddl handlers (see docs/webhost.md). Opt-in via
-// `use module coddl::web;` — a CLI program must not have `Request` in scope.
+// A *vocabulary* module, not a framework: it ships the contract types the Rust
+// host (coddl-web) marshals across the C ABI to compiled Coddl handlers, plus
+// assumption-free primitives — and deliberately no opinion on routing, decoding,
+// or form conventions. Opt-in via `use module coddl::web;`. See docs/webhost.md,
+// "coddl::web is vocabulary, not a framework".
 //
-// There is no callable operator here: the "server" is host-side (the app
-// developer writes handlers, not a socket loop). Coddl provides the models
-// (relvars) and the handler `oper`s; this module provides their vocabulary.
-//
-// Eventually a `Routes` relvar joins these — forward dispatch is a restriction,
-// reverse URL resolution a lookup — so routing is relational (docs/webhost.md,
-// "Routes as data").
+// Routing lives in *userspace* Coddl — an app's single `handle` inspects the
+// request and delegates; this module ships neither a `Routes` relvar nor a
+// router. Decomposing the raw components (path -> segments, query -> pairs) is
+// likewise userspace and demand-driven: it encodes policy that frameworks decide
+// differently (percent-decoding, form-urlencoding, trailing slashes), so the base
+// types stay RAW and let userspace add the operators (UFCS dispatches on the
+// receiver's type, so a framework can hang `to_sequence` off `RawRequestPath`
+// from anywhere).
 
-type Request = Tuple {
+// --- RFC 3986 raw components as distinct single-possrep types --------------------
+//
+// A URI component is its own domain, so it gets its own type rather than bare
+// `Text`: distinct scalar types are disjoint (RM Pre 1), so a path can't be
+// confused with a query or an arbitrary `Text`, and the type is the stable home
+// for the decomposition operators userspace will add. The possrep wraps the raw,
+// still-percent-encoded octets (RM Pre 4) — that is the *representation*; any
+// structure is exposed only through operators defined on the type (TTM Ch. 3, the
+// "supplier numbers aren't character strings" point). These ship with no
+// operators on purpose. The lone possrep is anonymous, so its selector is the
+// type name (`RawRequestPath { value: "/x" }`) and its accessor is `.value`.
+
+type RawRequestPath { value: Text }; // e.g. "/uri/full/path/"   (raw, percent-encoded)
+type RawRequestQuery { value: Text }; // e.g. "param=arg&three=5" (raw; RFC gives it no structure)
+
+// --- The request/response contract ----------------------------------------------
+//
+// Raw and lossless. `path` and `query` are the two request-target parts (split at
+// the first `?` — the one split RFC 3986 actually defines) and each is its own
+// type; `method` and `body` stay `Text` (atoms with no domain operators). Headers
+// keep wire order and exact-duplicate lines via an explicit `ordinality` attribute
+// (`OrderedNameValues` below), so they lose nothing — yet stay a relation, fully
+// queryable with the algebra (`req.headers where name = "host"`).
+
+// An ordered, duplicate-tolerant name/value relation. HTTP header (and query-pair)
+// order is defined and lines can repeat, so `ordinality` records wire position — an
+// ordinal *attribute* is data, not RM Pro 1 positional-tuple semantics. It stays a
+// relation (queryable) rather than a `Sequence`: sort by `ordinality` to recover
+// order, `project { name, value }` to drop it when order doesn't matter. No `key`
+// clause — a key is a relvar constraint (cf. `builtin relvar … key { … }`), not part
+// of a relation *type*; a relation value is duplicate-free by definition already.
+type OrderedNameValues = Relation { name: Text, value: Text, ordinality: Integer };
+
+type RawRequest = Tuple {
     method: Text,
-    path: Text,
-    headers: Relation { name: Text, value: Text },
-    body: Text
+    path: RawRequestPath,
+    query: RawRequestQuery,
+    headers: OrderedNameValues,
+    body: Text,
 };
 
-type Response = Tuple {
+type RawResponse = Tuple {
     status: Integer,
-    headers: Relation { name: Text, value: Text },
-    body: Text
+    headers: OrderedNameValues,
+    body: Text,
 };

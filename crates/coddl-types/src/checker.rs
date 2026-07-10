@@ -328,6 +328,21 @@ pub struct CheckOutput {
     /// alias resolve (the static `resolve_type_ref_quiet` knows only inline
     /// types and builtins).
     pub type_aliases: HashMap<String, Type>,
+    /// Every user-defined single-possrep scalar type in scope (`type Name {
+    /// component: T };`) → its possrep component. The ProcIR lowerer absorbs
+    /// this to erase a `Type::Scalar(name)` to its component's representation
+    /// and to lower the selector / accessor as identity. See `docs/typecheck.md`.
+    pub nominal_scalars: HashMap<String, PossrepScalar>,
+}
+
+/// A user-defined single-possrep scalar's possrep: its one component's name and
+/// type. `RawRequestPath { value: Text }` → `{ component: "value", ty: Text }`.
+/// Single-component only for now (a multi-component possrep is rejected with
+/// T0091; multi-*possrep* is a later tier).
+#[derive(Debug, Clone)]
+pub struct PossrepScalar {
+    pub component: String,
+    pub ty: Type,
 }
 
 /// Tokenize, parse, and type-check `source` in the supplied dialect.
@@ -351,6 +366,7 @@ pub fn check(source: &str, file: FileId, file_kind: FileKind) -> CheckOutput {
         public_relvars: HashSet::new(),
         user_opers: HashMap::new(),
         type_aliases: HashMap::new(),
+        nominal_scalars: HashMap::new(),
         active_modules: HashSet::new(),
         stdlib_oper_owner: HashMap::new(),
         stdlib_type_owner: HashMap::new(),
@@ -379,6 +395,7 @@ pub fn check(source: &str, file: FileId, file_kind: FileKind) -> CheckOutput {
         mutable_spans: tc.mutable_spans,
         relvars: tc.relvars,
         type_aliases: tc.type_aliases,
+        nominal_scalars: tc.nominal_scalars,
     }
 }
 
@@ -465,6 +482,12 @@ struct TypeChecker {
     /// `Unknown` until that path is threaded through. Once a file `use`s an
     /// opt-in stdlib module, that module's aliases are inserted here too.
     type_aliases: HashMap<String, Type>,
+    /// User-defined single-possrep scalar types (`type Name { c: T };`) → their
+    /// possrep component. Registered in the type-decl pre-pass; consulted by
+    /// `resolve_type_name` (→ `Type::Scalar`), the possrep accessor
+    /// (`check_field_access`), and the synthesized selector (`check_call`).
+    /// Mirrored into `CheckOutput` for the ProcIR lowerer.
+    nominal_scalars: HashMap<String, PossrepScalar>,
     /// The opt-in stdlib modules this file has brought into scope with
     /// `use module <path>;`. `coddl::core` is always in scope and is not
     /// required here. Populated by [`Self::resolve_modules`] before any body is
@@ -578,13 +601,14 @@ impl TypeChecker {
                 _ => {}
             }
         }
-        // Pre-pass: register user-defined type aliases (`type Name = …;`) so
-        // a later type reference resolves regardless of declaration order.
-        // Runs before the operator pre-pass so operator param/return types can
-        // name an alias.
+        // Pre-pass: register user-defined type declarations — aliases
+        // (`type Name = …;`) and possrep scalars (`type Name { c: T };`) — so a
+        // later type reference resolves regardless of declaration order. Runs
+        // before the operator pre-pass so operator param/return types can name
+        // one, and so a scalar's synthesized selector is visible to it.
         for item in root.items() {
             if let Item::TypeDecl(d) = item {
-                self.register_type_alias(&d);
+                self.register_type_decl(&d);
             }
         }
         // Pre-pass: collect every user-defined operator's signature so a
@@ -924,11 +948,34 @@ impl TypeChecker {
                             self.stdlib_type_owner
                                 .insert(name.clone(), module.path.clone());
                             if active {
-                                let ty = d
-                                    .aliased_type()
-                                    .map(|tr| resolve_type_ref_quiet(&tr))
-                                    .unwrap_or(Type::Unknown);
-                                self.type_aliases.insert(name, ty);
+                                if let Some(heading) = d.possrep_heading() {
+                                    // Possrep scalar (single-component tier):
+                                    // register the nominal type so an imported
+                                    // `RawRequestPath` resolves to `Type::Scalar`,
+                                    // not an `Unknown` alias.
+                                    let comps: Vec<_> = heading.params().collect();
+                                    if comps.len() == 1 {
+                                        if let Some(cn) = comps[0].name() {
+                                            let cty = comps[0]
+                                                .type_ref()
+                                                .map(|tr| resolve_type_ref_quiet(&tr))
+                                                .unwrap_or(Type::Unknown);
+                                            self.nominal_scalars.insert(
+                                                name,
+                                                PossrepScalar {
+                                                    component: cn.text().to_string(),
+                                                    ty: cty,
+                                                },
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    let ty = d
+                                        .aliased_type()
+                                        .map(|tr| resolve_type_ref_quiet(&tr))
+                                        .unwrap_or(Type::Unknown);
+                                    self.type_aliases.insert(name, ty);
+                                }
                             }
                         }
                     }
@@ -979,7 +1026,13 @@ impl TypeChecker {
     /// component of the aliased type surfaces T0005 once, here. The aliased
     /// type resolves loudly, so it may name an alias registered earlier in
     /// source order.
-    fn register_type_alias(&mut self, decl: &TypeDecl) {
+    /// Register a `type` declaration in its pre-pass. Two forms (chosen by the
+    /// parser, surfaced as `possrep_heading()` vs `aliased_type()`):
+    /// - `type Name { component: T };` — a distinct nominal **possrep scalar**
+    ///   (single-component tier), recorded in `nominal_scalars`.
+    /// - `type Name = <type-ref>;` — a transparent **alias**, recorded in
+    ///   `type_aliases`.
+    fn register_type_decl(&mut self, decl: &TypeDecl) {
         let Some(name_tok) = decl.name() else { return };
         let name = name_tok.text().to_string();
 
@@ -991,7 +1044,7 @@ impl TypeChecker {
             );
             return;
         }
-        if self.type_aliases.contains_key(&name) {
+        if self.type_aliases.contains_key(&name) || self.nominal_scalars.contains_key(&name) {
             self.error(
                 self.token_span(&name_tok),
                 "T0086",
@@ -1000,6 +1053,39 @@ impl TypeChecker {
             return;
         }
 
+        // Possrep-scalar form: a distinct nominal type. Single-component only for
+        // now (a multi-component possrep would erase to a tuple — deferred).
+        if let Some(heading) = decl.possrep_heading() {
+            let comps: Vec<_> = heading.params().collect();
+            if comps.len() != 1 {
+                self.error(
+                    self.token_span(&name_tok),
+                    "T0091",
+                    format!(
+                        "possrep of `{name}` must have exactly one component \
+                         (multi-component possreps are not yet supported)"
+                    ),
+                );
+                return;
+            }
+            let Some(cname_tok) = comps[0].name() else {
+                return;
+            };
+            let cty = comps[0]
+                .type_ref()
+                .map(|tr| self.resolve_type_ref(&tr))
+                .unwrap_or(Type::Unknown);
+            self.nominal_scalars.insert(
+                name,
+                PossrepScalar {
+                    component: cname_tok.text().to_string(),
+                    ty: cty,
+                },
+            );
+            return;
+        }
+
+        // Alias form.
         let ty = match decl.aliased_type() {
             Some(tr) => self.resolve_type_ref(&tr),
             None => Type::Unknown,
@@ -1016,6 +1102,18 @@ impl TypeChecker {
         }
         let Some(name_tok) = decl.name() else { return };
         let name = name_tok.text().to_string();
+
+        // A user `oper` can't reuse a possrep scalar's name — that name is the
+        // scalar's synthesized selector (registered in the earlier type-decl
+        // pre-pass).
+        if self.nominal_scalars.contains_key(&name) {
+            self.error(
+                self.token_span(&name_tok),
+                "T0060",
+                format!("`{name}` is already defined as a possrep-scalar type"),
+            );
+            return;
+        }
 
         // Build the heading first: operators are identified by name *and*
         // heading, so the collision check below needs the parameter shape.
@@ -1244,6 +1342,12 @@ impl TypeChecker {
         // alias (both registered in the pre-pass).
         if let Some(t) = self.type_aliases.get(name) {
             return t.clone();
+        }
+        // A user-defined possrep scalar (`type Name { c: T };`) — a distinct
+        // nominal type. Its component lives in `nominal_scalars`; here we only
+        // need the name to form the nominal `Type::Scalar`.
+        if self.nominal_scalars.contains_key(name) {
+            return Type::Scalar(name.to_string());
         }
         // Not in scope. If it's an opt-in stdlib type, point at the import
         // rather than reporting a plain unknown-type.
@@ -3482,6 +3586,20 @@ impl TypeChecker {
                     Type::Unknown
                 }
             },
+            // A possrep accessor `x.component` on a nominal scalar reads its
+            // possrep component (RM Pre 5). Single-possrep, so the one component
+            // must match by name.
+            Type::Scalar(ref sname) => match self.nominal_scalars.get(sname).cloned() {
+                Some(ps) if ps.component == field_name => ps.ty,
+                _ => {
+                    self.error(
+                        self.token_span(&field_tok),
+                        "T0017",
+                        format!("unknown possrep component `{field_name}` of type `{sname}`"),
+                    );
+                    Type::Unknown
+                }
+            },
             other => {
                 let span = fa
                     .base()
@@ -4107,6 +4225,20 @@ impl TypeChecker {
         let mut candidates = self.builtins.candidates(&callee_name).to_vec();
         if let Some(user_sig) = self.user_opers.get(&callee_name).cloned() {
             candidates.push(user_sig);
+        }
+        // A possrep scalar's synthesized selector: `Name { component: e } -> Name`
+        // (RM Pre 4 — a selector per possrep). Derived from the possrep; a user
+        // oper can't reuse a scalar's name (rejected at registration, T0060), so
+        // at most one of these applies.
+        if let Some(ps) = self.nominal_scalars.get(&callee_name).cloned() {
+            candidates.push(crate::builtins::OperSig {
+                params: vec![(
+                    std::borrow::Cow::Owned(ps.component),
+                    crate::builtins::ParamKind::Concrete(ps.ty),
+                )],
+                return_type: Type::Scalar(callee_name.clone()),
+                purity: crate::builtins::Purity::Pure,
+            });
         }
 
         // A method call `x.m { … }` requires `m` to declare a `self` parameter
@@ -5454,9 +5586,9 @@ mod tests {
 
     #[test]
     fn web_type_without_import_diagnoses_t0088() {
-        // `Request` belongs to opt-in `coddl::web`; unimported → T0088, not the
+        // `RawRequest` belongs to opt-in `coddl::web`; unimported → T0088, not the
         // generic unknown-type T0005.
-        let src = "program p; oper handle { req: Request } [];";
+        let src = "program p; oper handle { req: RawRequest } [];";
         let cs = codes(src);
         assert!(cs.contains(&"T0088"), "{:?}", cs);
         assert!(!cs.contains(&"T0005"), "should be T0088, not T0005: {:?}", cs);
@@ -5464,9 +5596,9 @@ mod tests {
 
     #[test]
     fn web_type_with_import_resolves_clean() {
-        // Importing `coddl::web` brings `Request` into scope; its fields resolve.
+        // Importing `coddl::web` brings `RawRequest` into scope; its fields resolve.
         let src = "program p; use module coddl::web; \
-                   oper handle { req: Request } -> Text [ req.body ];";
+                   oper handle { req: RawRequest } -> Text [ req.body ];";
         assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
     }
 
@@ -5483,9 +5615,9 @@ mod tests {
 
     #[test]
     fn importing_web_makes_request_collide_with_user_type_t0086() {
-        // Once `coddl::web` is imported, `Request` is defined — a same-named
+        // Once `coddl::web` is imported, `RawRequest` is defined — a same-named
         // user `type` is a genuine duplicate (T0086).
-        let src = "program p; use module coddl::web; type Request = Integer;";
+        let src = "program p; use module coddl::web; type RawRequest = Integer;";
         assert!(codes(src).contains(&"T0086"), "{:?}", codes(src));
     }
 
@@ -5593,6 +5725,45 @@ mod tests {
     fn duplicate_type_alias_errors() {
         let src = "program p; type Foo = Integer; type Foo = Text;";
         assert!(codes(src).contains(&"T0086"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn possrep_scalar_selector_and_accessor_check_clean() {
+        // A single-possrep scalar: construct via the synthesized selector
+        // `Meters { value: e }`, read the component back via the possrep
+        // accessor `m.value`. Both typecheck with no diagnostics.
+        let src = "program p; \
+                   type Meters { value: Integer }; \
+                   oper f { m: Meters } -> Integer [ m.value ]; \
+                   oper g {} -> Meters [ Meters { value: 42 } ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn possrep_scalar_is_disjoint_from_component_t0009() {
+        // A `Meters` value is not a `Text` (RM Pre 1 — distinct scalar types are
+        // disjoint), so a body producing a `Meters` can't satisfy a declared
+        // `Text` return. (Checked via the loud body-vs-return path; user-oper
+        // *parameter* types still resolve quietly, a pre-existing alias gap.)
+        let src = "program p; \
+                   type Meters { value: Integer }; \
+                   oper g {} -> Text [ Meters { value: 42 } ];";
+        assert!(codes(src).contains(&"T0009"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn multi_component_possrep_is_unsupported_t0091() {
+        // Single-component only for now; a two-component possrep is rejected.
+        let src = "program p; type Point { x: Integer, y: Integer };";
+        assert!(codes(src).contains(&"T0091"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn oper_cannot_shadow_possrep_scalar_selector_t0060() {
+        // The scalar's name is its selector; a user `oper` can't reuse it.
+        let src = "program p; type Meters { value: Integer }; oper Meters { x: Integer } [];";
+        assert!(codes(src).contains(&"T0060"), "{:?}", codes(src));
     }
 
     #[test]

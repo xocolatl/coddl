@@ -152,6 +152,15 @@ pub enum Type {
     /// literal is `Sequence [ … ]`. The element type may be any type,
     /// including a nested `Sequence`.
     Sequence(Box<Type>),
+    /// A user-defined **nominal** scalar type, identified by name (RM Pre 1:
+    /// distinct scalar types are disjoint). Declared `type Name { comp: T };`
+    /// with a possrep whose components live in the checker's nominal-scalar
+    /// table; a single-possrep scalar erases to its component's representation
+    /// at ProcIR (`RawRequestPath` is physically a `Text`). Two `Scalar`s are
+    /// the same type iff they have the same name — a `Scalar("RawRequestPath")`
+    /// is never assignable to `Text` (or to another scalar), even when its
+    /// component is `Text`. See `docs/typecheck.md`.
+    Scalar(String),
     /// Used wherever a type couldn't be resolved (unknown type name,
     /// unresolved callee, etc.). Compares equal to anything so the
     /// checker can keep walking without piling errors on top of
@@ -207,6 +216,10 @@ impl Type {
             (Type::Tuple(a), Type::Tuple(b)) => a.assignable_to(b),
             (Type::Relation(a), Type::Relation(b)) => a.assignable_to(b),
             (Type::Sequence(a), Type::Sequence(b)) => a.assignable_to(b),
+            // Nominal: same name = same type. Never bridges to the component
+            // type (RM Pre 1 disjointness) — the `_ => false` below covers
+            // `Scalar` vs `Text`/other scalars.
+            (Type::Scalar(a), Type::Scalar(b)) => a == b,
             _ => false,
         }
     }
@@ -227,6 +240,7 @@ impl fmt::Display for Type {
             Type::Tuple(h) => write!(f, "Tuple {h}"),
             Type::Relation(h) => write!(f, "Relation {h}"),
             Type::Sequence(t) => write!(f, "Sequence {t}"),
+            Type::Scalar(name) => f.write_str(name),
             Type::Unknown => f.write_str("<unknown>"),
         }
     }

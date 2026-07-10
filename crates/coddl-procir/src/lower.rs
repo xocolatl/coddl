@@ -220,6 +220,7 @@ fn lower_impl(
     lowerer.absorb_private_relvars(&check_out.relvars);
     lowerer.absorb_builtin_relvars(&check_out.relvars);
     lowerer.absorb_type_aliases(&check_out.type_aliases);
+    lowerer.absorb_nominal_scalars(&check_out.nominal_scalars);
     let module = lowerer.lower_root(&root);
     let relir = std::mem::take(&mut lowerer.relir);
     // Merge in any diagnostics the lowerer itself emitted (e.g.
@@ -366,6 +367,11 @@ struct Lowerer {
     /// signature or annotation naming an alias resolves through this before the
     /// static `resolve_type_ref_quiet` (which knows only inline types/builtins).
     type_aliases: HashMap<String, Type>,
+    /// Absorbed possrep scalars (`type Name { c: T };`) → their component. A
+    /// `Type::Scalar(name)` erases to the 1-field tuple `{c: T}` (physically the
+    /// component): the selector lowers to that tuple literal, the accessor to a
+    /// `TupleField`. From `CheckOutput::nominal_scalars`.
+    nominal_scalars: HashMap<String, coddl_types::PossrepScalar>,
     /// Absorbed from the typechecker's relvar table; they have no SQL source,
     /// so their slots start empty and are filled by assignment.
     private_relvars: HashMap<String, HeadingId>,
@@ -427,6 +433,7 @@ impl Lowerer {
             headings: Vec::new(),
             heading_ids: HashMap::new(),
             type_aliases: HashMap::new(),
+            nominal_scalars: HashMap::new(),
             file,
             diagnostics: Vec::new(),
             collect_relir: false,
@@ -519,6 +526,15 @@ impl Lowerer {
         self.type_aliases = aliases.clone();
     }
 
+    /// Absorb the typechecker's possrep scalars so a `Type::Scalar` erases to
+    /// its component and its selector/accessor lower correctly.
+    fn absorb_nominal_scalars(
+        &mut self,
+        scalars: &HashMap<String, coddl_types::PossrepScalar>,
+    ) {
+        self.nominal_scalars = scalars.clone();
+    }
+
     /// Resolve a `TypeRef` to a `Type`, consulting the absorbed alias table
     /// first (a leaf name that is an alias resolves to its fully-resolved type),
     /// then falling back to the static `resolve_type_ref_quiet` for inline
@@ -581,6 +597,18 @@ impl Lowerer {
         match ty {
             Type::Relation(h) => ProcType::Relation(self.intern_heading(h)),
             Type::Sequence(elem) => ProcType::Sequence(Box::new(self.proc_type_from_resolved(elem))),
+            // A single-possrep scalar *is* its component: erase to the 1-field
+            // tuple `{component: T}`. Physically that flattens to the component
+            // (`RawRequestPath` → a `Text`), and the selector/accessor reuse the
+            // tuple machinery (`TupleLit` / `TupleField`).
+            Type::Scalar(name) => {
+                let ps = self
+                    .nominal_scalars
+                    .get(name)
+                    .unwrap_or_else(|| unreachable!("unknown scalar `{name}` survived typecheck"));
+                let heading = Heading::new(vec![(ps.component.clone(), ps.ty.clone())]);
+                self.proc_type_from_resolved(&Type::Tuple(heading))
+            }
             other => proc_type_from_type(other),
         }
     }
@@ -4895,6 +4923,33 @@ impl Lowerer {
     /// heading order in the emitted `Inst::TupleLit`. The heading
     /// itself is built from the per-field static types — which the
     /// typechecker already enforces match the surface declaration.
+    /// Lower a possrep scalar's selector `Name { component: e }` to the 1-field
+    /// tuple `{component: e}` it erases to (single-component tier). Physically a
+    /// 1-field tuple flattens to the component, so the accessor `x.component`
+    /// reads it back with a `TupleField`.
+    fn lower_scalar_selector(&mut self, call: &CallExpr) -> ValueId {
+        let arg = call
+            .args()
+            .and_then(|args| args.args().next())
+            .expect("typechecked scalar selector has its one component argument");
+        let fname = arg
+            .name()
+            .expect("typechecked selector arg has a name")
+            .text()
+            .to_string();
+        let fval = self.lower_expr(&arg.value().expect("typechecked selector arg has a value"));
+        let fty = self.value_type(fval);
+        let heading = Heading::new(vec![(fname.clone(), self.type_from_proc_m(&fty))]);
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Tuple(heading.clone()));
+        self.insts.push(Inst::TupleLit {
+            dst,
+            fields: vec![(fname, fval)],
+            heading,
+        });
+        dst
+    }
+
     fn lower_tuple_lit(&mut self, tup: &TupleLit) -> ValueId {
         let mut field_pairs: Vec<(String, ValueId, ProcType)> = Vec::new();
         // `Text` cell values consumed directly into this tuple — collected so
@@ -5337,6 +5392,15 @@ impl Lowerer {
             }
             _ => unreachable!("typechecked call has a NameRef or FieldAccess callee"),
         };
+
+        // A possrep scalar's selector `Name { component: e }` — a distinct
+        // nominal type that erases to a 1-field tuple `{component: e}`. Lower it
+        // like that tuple literal (identity on the representation). A UFCS form
+        // (`self_val` set) can't be a selector, so a scalar name there falls
+        // through to the ordinary path.
+        if self_val.is_none() && self.nominal_scalars.contains_key(&surface) {
+            return self.lower_scalar_selector(call);
+        }
 
         // Polymorphic-Relation builtins are lowered to specialized
         // ProcIR ops carrying their argument's `HeadingId`. The
@@ -5977,6 +6041,10 @@ fn proc_type_from_type(ty: &Type) -> ProcType {
             unreachable!("Type::FormatText is compile-time-only and never lowered")
         }
         Type::Sequence(elem) => ProcType::Sequence(Box::new(proc_type_from_type(elem))),
+        Type::Scalar(_) => unreachable!(
+            "Type::Scalar must be erased via Lowerer::proc_type_from_resolved (it needs the \
+             nominal-scalar table to reach the possrep component)"
+        ),
         Type::Unknown => unreachable!("Type::Unknown survived typecheck"),
     }
 }

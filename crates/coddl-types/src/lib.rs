@@ -15,6 +15,6 @@ pub mod checker;
 pub mod relvars;
 pub mod ty;
 
-pub use checker::{check, resolve_type_ref_quiet, CheckOutput, HintKind, TypeHint};
+pub use checker::{check, resolve_type_ref_quiet, CheckOutput, HintKind, PossrepScalar, TypeHint};
 pub use relvars::{RelvarInfo, RelvarKind, RelvarTable};
 pub use ty::{Heading, Type};

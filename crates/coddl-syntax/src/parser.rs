@@ -372,10 +372,16 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
-    /// `type <identifier> = <type-ref> ;` — a type alias (currently the only
-    /// `TYPE_DECL` form). Names a structural type, e.g. the prelude's
-    /// `Request` / `Response` (docs/prelude.md). Dispatched on the leading
-    /// contextual `type` keyword, like the other item forms.
+    /// `type <identifier> ( = <type-ref> | <heading> ) ;` — a type declaration
+    /// in one of two forms, chosen by the token after the name:
+    /// - `= <type-ref>` is a transparent **alias**, naming a structural type
+    ///   (e.g. the prelude's `Request` / `Response`, docs/prelude.md).
+    /// - `{ … }` is a **possrep-scalar** type — a distinct user-defined scalar
+    ///   whose possrep components are the heading (single-possrep tier; the
+    ///   component list reuses `parse_heading`). See docs/typecheck.md.
+    ///
+    /// Dispatched on the leading contextual `type` keyword, like the other item
+    /// forms.
     fn parse_type_decl(&mut self) {
         debug_assert!(self.at_keyword("type"));
         self.start_node(SyntaxKind::TYPE_DECL);
@@ -384,10 +390,16 @@ impl<'a> Parser<'a> {
         if !self.eat(SyntaxKind::IDENT) {
             self.error("P0080", "expected type name after `type`");
         }
-        if !self.eat(SyntaxKind::EQ) {
-            self.error("P0081", "expected `=` in type declaration");
+        if self.at(SyntaxKind::L_BRACE) {
+            // Possrep-scalar form: the `{ … }` is the possrep component heading.
+            self.parse_heading();
+        } else if self.eat(SyntaxKind::EQ) {
+            // Alias form.
+            self.parse_type_ref();
+        } else {
+            self.error("P0081", "expected `{` or `=` after type name");
+            self.parse_type_ref(); // recover: consume a trailing type-ref if any
         }
-        self.parse_type_ref();
         if !self.eat(SyntaxKind::SEMICOLON) {
             self.error("P0082", "expected `;` after type declaration");
         }
@@ -5338,6 +5350,18 @@ mod tests {
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
         let decl = out.tree.first_child().unwrap();
         assert_eq!(decl.kind(), SyntaxKind::TYPE_DECL);
+    }
+
+    #[test]
+    fn type_decl_possrep_form_parses() {
+        // The possrep-scalar form `type Name { component: Type }` parses clean,
+        // with the component list as a *direct* HEADING child (not a TYPE_REF).
+        let out = parse_str("type RawRequestPath { value: Text };");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let decl = out.tree.first_child().unwrap();
+        assert_eq!(decl.kind(), SyntaxKind::TYPE_DECL);
+        assert!(decl.children().any(|c| c.kind() == SyntaxKind::HEADING));
+        assert!(!decl.children().any(|c| c.kind() == SyntaxKind::TYPE_REF));
     }
 
     #[test]

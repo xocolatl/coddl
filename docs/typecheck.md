@@ -136,9 +136,17 @@ The following are deferred until the relevant productions arrive:
   type from the binding annotation (like an empty `Relation {}`); the former
   empty-construction gap (T0064) survives only as a defensive lowering
   fallback.
-- **User-defined scalar types** via `possrep` — the typechecker has
-  no notion of user types yet; every type-name lookup either resolves
-  to a built-in or yields `T0005`.
+- **User-defined scalar types** via `possrep` — the **single-possrep,
+  single-component** tier is implemented: `type Name { component: T };`
+  declares a distinct nominal scalar (`Type::Scalar`, disjoint from `T` per
+  RM Pre 1), with a synthesized selector `Name { component: e }` and possrep
+  accessor `x.component`. It erases to its component in ProcIR (a
+  single-possrep scalar *is* its component). Deferred: multi-component
+  possreps (T0091), multiple possreps + author-supplied conversions
+  (the `Point` cartesian/polar case), possrep `CONSTRAINT` predicates, and
+  `THE_`-as-assignment-target. User-oper *parameter* types naming a scalar
+  still resolve quietly to `Unknown` (the same pre-existing gap as aliases —
+  the loud body path resolves them).
 - **Function types** — `oper` signatures are stored in the built-in
   registry as `OperSig`, not as a first-class `Type` value.
 
@@ -739,8 +747,9 @@ check script enforces that.
 | T0083 | an `order` clause on the reverse `load <relvar> from <sequence>` form — a relation is unordered (RM Pro 1), so ordering a seal-into-relvar is meaningless |
 | T0084 | the reverse `load` target is a **public** (SQL-backed) relvar — sealing a sequence into a public relvar (a DML replace) is not yet wired; use a private relvar |
 | T0085 | a `type Name = …;` declaration shadows a built-in type name (`Integer`, `Text`, …) |
-| T0086 | a `type Name = …;` declaration re-declares a name already given a type alias |
+| T0086 | a `type Name …;` declaration (alias or possrep scalar) re-declares a name already given a type |
 | T0087 | an operator that belongs to an opt-in stdlib module is called without importing it — add `use module <path>;` (e.g. `environment` needs `use module coddl::env;`) |
-| T0088 | a type that belongs to an opt-in stdlib module is named without importing it — add `use module <path>;` (e.g. `Request` needs `use module coddl::web;`) |
+| T0088 | a type that belongs to an opt-in stdlib module is named without importing it — add `use module <path>;` (e.g. `RawRequest` needs `use module coddl::web;`) |
 | T0089 | a `use module <path>;` names a module that does not exist under the reserved `coddl::` root |
 | T0090 | a `builtin relvar` from an opt-in stdlib module is referenced without importing it — add `use module <path>;` (e.g. `Environment` needs `use module coddl::env;`) |
+| T0091 | a possrep-scalar declaration `type Name { … }` has other than exactly one component — multi-component possreps are not yet supported (single-component tier) |

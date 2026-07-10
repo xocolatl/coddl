@@ -291,8 +291,18 @@ impl TypeDecl {
         nth_token(&self.syntax, SyntaxKind::IDENT, 1)
     }
 
-    /// The aliased type — the `<type-ref>` on the right of `=`.
+    /// The aliased type — the `<type-ref>` on the right of `=`. `None` for the
+    /// possrep-scalar form (which has a direct `HEADING` child instead).
     pub fn aliased_type(&self) -> Option<TypeRef> {
+        child(&self.syntax)
+    }
+
+    /// The possrep component heading — the `{ … }` in the possrep-scalar form
+    /// (`type Name { component: Type, … }`). A *direct* `HEADING` child, which
+    /// only the possrep form has; the alias form's heading (if any) is nested
+    /// inside its `TYPE_REF`, so this returns `None` there. Presence of this
+    /// (vs. `aliased_type`) is how the checker tells the two forms apart.
+    pub fn possrep_heading(&self) -> Option<Heading> {
         child(&self.syntax)
     }
 }

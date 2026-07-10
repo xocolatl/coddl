@@ -3284,6 +3284,9 @@ fn proc_type_from_attr(ty: &Type) -> ProcType {
         Type::Boolean => ProcType::Boolean,
         Type::Tuple(h) => ProcType::Tuple(h.clone()),
         Type::Relation(_) => ProcType::Pointer,
+        Type::Scalar(_) => unreachable!(
+            "Type::Scalar is erased to its possrep component before a heading reaches codegen"
+        ),
         Type::FormatText => unreachable!("Type::FormatText is compile-time-only; never reaches codegen"),
         Type::Sequence(_) => unreachable!("Type::Sequence is not yet lowered; never reaches codegen"),
         Type::Unknown => unreachable!("Type::Unknown reached codegen"),

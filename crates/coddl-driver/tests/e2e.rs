@@ -50,6 +50,7 @@ fn fixtures_dir() -> &'static Path {
             ("hello-everyone-2", HELLO_EVERYONE_2_SRC),
             ("ufcs-method", UFCS_METHOD_SRC),
             ("return-local", RETURN_LOCAL_SRC),
+            ("possrep-scalar", POSSREP_SCALAR_SRC),
             ("transaction", TRANSACTION_SRC),
             ("join-times-compose", JOIN_TIMES_COMPOSE_SRC),
             ("union-intersect-minus", UNION_INTERSECT_MINUS_SRC),
@@ -528,6 +529,24 @@ const RETURN_LOCAL_SRC: &str = "\
 program return_local;
 oper make {} -> Text [ let s = \"x\" || \"y\"; s ];
 oper main {} [ write_line { message: make {} }; ];
+";
+
+// Single-possrep user-defined scalar types: declare `Meters { value: Integer }`
+// and `Slug { value: Text }` (the `RawRequestPath`-shaped case), construct each
+// via its synthesized selector, and read the component back via the possrep
+// accessor `.value`. A single-possrep scalar erases to its component, so this
+// is pure construct-and-read with no heap of its own (Integer) / a borrowed
+// `Text` (Slug) — leak-clean under the default gate.
+const POSSREP_SCALAR_SRC: &str = "\
+program possrep_scalar;
+oper main {} [
+    let m = Meters { value: 42 };
+    let p = Slug { value: \"/users\" };
+    write_line { message: to_text { self: m.value } };
+    write_line { message: p.value };
+];
+type Meters { value: Integer };
+type Slug { value: Text };
 ";
 
 // UFCS on a *user* operator: `\"hi\".shout {}` ≡ `shout { self: \"hi\" }` — the
@@ -1544,6 +1563,14 @@ fn assert_both_backends(fixture: &str, expected: &[u8]) {
 #[test]
 fn tuple_and_relation_params_and_relation_result() {
     assert_both_backends("tuple-relation-params", b"hello tuple\n{a: 1}\n{a: 2}\n");
+}
+
+#[test]
+fn possrep_scalar_select_and_access() {
+    // An `Integer`-backed and a `Text`-backed single-possrep scalar, each
+    // constructed via its selector and read back via `.value`. Both backends
+    // agree and the run is leak-clean (default gate).
+    assert_both_backends("possrep-scalar", b"42\n/users\n");
 }
 
 #[test]

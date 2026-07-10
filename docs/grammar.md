@@ -410,13 +410,19 @@ function that implements it.
                     -- `private` relvar qualifiers.
 <return-clause> ::= '->' <type-ref> ;                          -- parse_return_clause
 
-<type-decl>     ::= 'type' <identifier> '=' <type-ref> ';' ;   -- parse_type_decl
-                    -- A type alias — names a structural type (see
-                    -- docs/prelude.md). Dispatched on the leading contextual
-                    -- `type` keyword.
-                    -- Missing name is P0080, missing `=` is P0081, missing
-                    -- `;` is P0082. The checker rejects shadowing a built-in
-                    -- type name (T0085) and a duplicate declaration (T0086).
+<type-decl>     ::= 'type' <identifier> ( '=' <type-ref> | <heading> ) ';' ; -- parse_type_decl
+                    -- Two forms, chosen by the token after the name:
+                    --   `= <type-ref>`  a transparent alias, naming a structural
+                    --                   type (see docs/prelude.md).
+                    --   `{ … }`         a possrep-scalar type — a distinct
+                    --                   user-defined scalar whose possrep
+                    --                   components are the <heading> (single-
+                    --                   possrep tier; see docs/typecheck.md).
+                    -- Dispatched on the leading contextual `type` keyword.
+                    -- Missing name is P0080; a name followed by neither `{` nor
+                    -- `=` is P0081; missing `;` is P0082. The checker rejects
+                    -- shadowing a built-in type name (T0085) and a duplicate
+                    -- declaration (T0086).
 
 <use-decl>      ::= 'use' 'module' <module-path> ';' ;         -- parse_use_decl
                     -- A module import. `module` is the only category today;
