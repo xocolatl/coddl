@@ -594,23 +594,50 @@ impl Lowerer {
     /// `Heading` (flattened per-attribute at ABI boundaries); a `Relation` — and
     /// a `Sequence` element — needs interning to carry a `HeadingId`.
     fn proc_type_from_resolved(&mut self, ty: &Type) -> ProcType {
-        match ty {
+        // Erase every `Type::Scalar` first — top-level *and* nested in a heading —
+        // so no `Heading` reaching layout / codegen ever carries a `Scalar`, and
+        // the selector/accessor reuse the tuple machinery.
+        let ty = self.erase_scalars(ty);
+        match &ty {
             Type::Relation(h) => ProcType::Relation(self.intern_heading(h)),
             Type::Sequence(elem) => ProcType::Sequence(Box::new(self.proc_type_from_resolved(elem))),
-            // A single-possrep scalar *is* its component: erase to the 1-field
-            // tuple `{component: T}`. Physically that flattens to the component
-            // (`RawRequestPath` → a `Text`), and the selector/accessor reuse the
-            // tuple machinery (`TupleLit` / `TupleField`).
+            other => proc_type_from_type(other),
+        }
+    }
+
+    /// Rewrite a `Type`, replacing every `Type::Scalar(name)` — top-level or
+    /// nested inside a `Tuple`/`Relation`/`Sequence` — with the 1-field tuple
+    /// `Tuple { component: T }` it physically is (a single-possrep scalar erases
+    /// to its component). After this, no `Scalar` remains, so a boxed
+    /// `RawRequest`'s `path` field lowers as a 1-field tuple cell — `req.path`
+    /// reads back through `AttrLoad` and `req.path.value` through `TupleField` —
+    /// and layout / both codegen backends only ever see the component.
+    fn erase_scalars(&self, ty: &Type) -> Type {
+        match ty {
             Type::Scalar(name) => {
                 let ps = self
                     .nominal_scalars
                     .get(name)
                     .unwrap_or_else(|| unreachable!("unknown scalar `{name}` survived typecheck"));
-                let heading = Heading::new(vec![(ps.component.clone(), ps.ty.clone())]);
-                self.proc_type_from_resolved(&Type::Tuple(heading))
+                Type::Tuple(Heading::new(vec![(
+                    ps.component.clone(),
+                    self.erase_scalars(&ps.ty),
+                )]))
             }
-            other => proc_type_from_type(other),
+            Type::Tuple(h) => Type::Tuple(self.erase_scalars_heading(h)),
+            Type::Relation(h) => Type::Relation(self.erase_scalars_heading(h)),
+            Type::Sequence(elem) => Type::Sequence(Box::new(self.erase_scalars(elem))),
+            other => other.clone(),
         }
+    }
+
+    fn erase_scalars_heading(&self, h: &Heading) -> Heading {
+        Heading::new(
+            h.attrs()
+                .iter()
+                .map(|(n, t)| (n.clone(), self.erase_scalars(t)))
+                .collect(),
+        )
     }
 
     /// Recover a surface `Type` from a `ProcType`, resolving a `Relation`'s

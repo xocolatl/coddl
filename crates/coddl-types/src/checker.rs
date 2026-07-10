@@ -447,6 +447,72 @@ fn heading_quiet(heading: &AstHeading) -> Heading {
     Heading::new(fields)
 }
 
+/// Context-aware [`resolve_type_ref_quiet`] for resolving a module's alias RHS:
+/// an otherwise-unknown leaf that names one of the module's own **type aliases**
+/// (e.g. `RawRequest`'s `headers: OrderedNameValues`) or **possrep scalars**
+/// (e.g. `path: RawRequestPath`) resolves to the alias's type / `Type::Scalar`
+/// rather than `Unknown` — a plain quiet resolve would leave the field
+/// `Unknown`, which then survives into lowering. The caller resolves the
+/// module's declarations in source order, so referenced aliases/scalars are
+/// already registered.
+fn resolve_type_ref_quiet_with_scalars(
+    tr: &TypeRef,
+    scalars: &HashMap<String, PossrepScalar>,
+    aliases: &HashMap<String, Type>,
+) -> Type {
+    let Some(name_tok) = tr.name() else {
+        return Type::Unknown;
+    };
+    if name_tok.text() == "Sequence" {
+        let elem = tr
+            .element()
+            .map(|e| resolve_type_ref_quiet_with_scalars(&e, scalars, aliases))
+            .unwrap_or(Type::Unknown);
+        return Type::Sequence(Box::new(elem));
+    }
+    if name_tok.text() == "Relation" {
+        if let Some(h) = tr.heading() {
+            return Type::Relation(heading_quiet_with_scalars(&h, scalars, aliases));
+        }
+    }
+    if name_tok.text() == "Tuple" {
+        if let Some(h) = tr.heading() {
+            return Type::Tuple(heading_quiet_with_scalars(&h, scalars, aliases));
+        }
+    }
+    if let Some(t) = Type::from_builtin_name(name_tok.text()) {
+        return t;
+    }
+    if let Some(t) = aliases.get(name_tok.text()) {
+        return t.clone();
+    }
+    if scalars.contains_key(name_tok.text()) {
+        return Type::Scalar(name_tok.text().to_string());
+    }
+    Type::Unknown
+}
+
+/// Context-aware [`heading_quiet`] — resolves each attribute type through
+/// [`resolve_type_ref_quiet_with_scalars`].
+fn heading_quiet_with_scalars(
+    heading: &AstHeading,
+    scalars: &HashMap<String, PossrepScalar>,
+    aliases: &HashMap<String, Type>,
+) -> Heading {
+    let mut fields: Vec<(String, Type)> = Vec::new();
+    for param in heading.params() {
+        let Some(name_tok) = param.name() else {
+            continue;
+        };
+        let ty = param
+            .type_ref()
+            .map(|tr| resolve_type_ref_quiet_with_scalars(&tr, scalars, aliases))
+            .unwrap_or(Type::Unknown);
+        fields.push((name_tok.text().to_string(), ty));
+    }
+    Heading::new(fields)
+}
+
 struct TypeChecker {
     file: FileId,
     file_kind: FileKind,
@@ -970,9 +1036,20 @@ impl TypeChecker {
                                         }
                                     }
                                 } else {
+                                    // Context-aware: a field naming one of this
+                                    // module's own aliases or possrep scalars
+                                    // (registered above, in source order) resolves
+                                    // to that type / `Type::Scalar` rather than
+                                    // `Unknown`.
                                     let ty = d
                                         .aliased_type()
-                                        .map(|tr| resolve_type_ref_quiet(&tr))
+                                        .map(|tr| {
+                                            resolve_type_ref_quiet_with_scalars(
+                                                &tr,
+                                                &self.nominal_scalars,
+                                                &self.type_aliases,
+                                            )
+                                        })
                                         .unwrap_or(Type::Unknown);
                                     self.type_aliases.insert(name, ty);
                                 }

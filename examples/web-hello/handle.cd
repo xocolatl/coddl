@@ -32,7 +32,10 @@ use module coddl::web;
 oper handle{ req: RawRequest } -> RawResponse [
     {
         status: 200,
-        headers: Relation { { name: "Content-Type", value: "text/html", ordinality: 0 } },
-        body: format{ template: f"you asked for <b style=\"font-size: 2rem;\">{path}</b>", args: { path: req.path.value } }
+        headers: Relation { { name: "Content-Type", value: "text/text", ordinality: 0 } },
+        body: format{
+            template: f"you asked for {path} with query {query}",
+            args: { path: req.path.value, query: req.query.value }
+        }
     }
 ];

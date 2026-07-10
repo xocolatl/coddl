@@ -5,15 +5,16 @@ HTTP parsing, routing, and JSON; Coddl provides the **models** (relvars) and the
 compiled as a host-callable library. The host builds a request value, calls a handler, and serializes the
 response it gets back.
 
-> **Status.** *Request/response built, headers both ways.* The vocabulary this doc marshals — `Request` /
-> `Response` — is real: it lives in the opt-in [`coddl::web`](prelude.md) standard-library module, brought
-> into scope with `use module coddl::web;`. **P1a, the Spine, P2, and P3a (below) have landed:** `coddl
-> emit-obj` produces a mainless object, and the `coddl-web` crate is a single-threaded `TcpListener` that
-> parses real HTTP requests (headers + `Content-Length` body), marshals a `Request` `Tuple` in — including a
-> populated `{name, value}` headers relation — calls a handler across the C ABI, reads a `Response` `Tuple`
-> back (box-on-return), and writes the reply with the handler's response headers. What remains is routing
-> (a **userspace Coddl framework**, not host work — see the design note below), lifecycle synthesis (P1b),
-> and the relvar-backed payoff (P4). It extends the first milestone: everything it relies on — the frontend, RelIR →
+> **Status.** *RawRequest/RawResponse running over the boxed ABI.* The vocabulary this doc marshals —
+> `RawRequest` / `RawResponse` — is real: it lives in the opt-in [`coddl::web`](prelude.md) standard-library
+> module, brought into scope with `use module coddl::web;`. **P1a, the Spine, P2, P3a, and the RawRequest
+> reshape (below) have landed:** `coddl emit-obj` produces a mainless object, and the `coddl-web` crate is a
+> single-threaded `TcpListener` that parses real HTTP requests (headers + `Content-Length` body), builds a
+> **boxed `RawRequest`** value — raw RFC-faithful components (`path`/`query` as possrep scalars, ordinality
+> headers), passed as one pointer — calls the handler across the C ABI, reads a **boxed `RawResponse`** back,
+> and writes the reply. What remains is routing (a **userspace Coddl framework**, not host work — see the
+> design note below), lifecycle synthesis (P1b), and the relvar-backed payoff (P4). It extends the first
+> milestone: everything it relies on — the frontend, RelIR →
 > SQL, ProcIR → native codegen, the `staticlib` runtime, user `oper`s with the C-ABI return convention — is
 > assumed already end-to-end per [milestone.md](milestone.md).
 
@@ -30,7 +31,7 @@ gunicorn (WSGI/ASGI) does. What they write is three things, and two of them are 
 |---|---|---|
 | Pydantic / Django model | relvar + `Tuple` heading | relational middle |
 | ORM query (`User.objects.filter(…)`) | a relational query, **pushed to SQL** ([sqlemit.md](sqlemit.md)) | relational middle |
-| `@app.get("/users")` handler | `oper handle { req: Request } -> Response` | relational middle |
+| `@app.get("/users")` handler | `oper handle { req: RawRequest } -> RawResponse` | relational middle |
 | URL routing / dispatch (`urls.py`) | a userspace Coddl framework — `handle` delegates (see design note) | relational middle |
 | uvicorn accept loop + HTTP parse + JSON | the **Rust host** (`coddl-web`) | FFI bottom |
 
@@ -129,40 +130,44 @@ A request crosses the C ABI as ordinary Coddl values. The calling convention tha
 
 ### Argument (host → handler)
 
-Model a request as a Coddl `Tuple`:
+A request is the raw, RFC-faithful `RawRequest` (`crates/coddl-stdlib/modules/coddl/web.cd`, opt-in via
+`use module coddl::web;`):
 
 ```
-Request : Tuple { method: Text, path: Text, headers: Relation { name: Text, value: Text }, body: Text }
+RawRequest : Tuple { method: Text, path: RawRequestPath, query: RawRequestQuery,
+                     headers: OrderedNameValues, body: Text }
 ```
 
-The canonical `Request` / `Response` declarations live in the [`coddl::web`](prelude.md) module
-(`crates/coddl-stdlib/modules/coddl/web.cd`, opt-in via `use module coddl::web;`); this sketch mirrors them.
+`path` / `query` are **single-possrep scalar types** wrapping the raw (percent-encoded) octets — distinct
+domains, physically just their `Text`; `OrderedNameValues` is `Relation { name, value, ordinality: Integer }`
+(ordinality carries wire order). At **72 B**, `RawRequest` is **≥ the 64 B boxing threshold**, so it crosses
+the ABI **boxed**: one pointer to a name-sorted record `body@0 (Text), headers@16 (Relation ptr),
+method@24 (Text), path@40 (Text), query@56 (Text)`. So `oper handle { req: RawRequest }` lowers to
+`define ptr @handle(ptr %req)` and reads each field with an `AttrLoad` at its offset (`req.path.value` →
+`AttrLoad` at 40 then the possrep accessor). (This is the first ≥64 B *parameter*; both backends already
+implemented the boxed-param ABI for it — P2's boxing machinery just hadn't been exercised on the param side.)
 
-A `Tuple` parameter is **flattened per-attribute** into leaf ABI slots in canonical (name-sorted) heading
-order — `Text` as a `(ptr, i64)` pair, scalars by value — so the host passes a request by pushing its fields
-as C arguments; no new convention is required. A relation-valued attribute (`headers`) passes as an opaque
-`void*` RC payload pointer. The `Request` above flattens to 7 args — `body (ptr, len)`, `headers (ptr)`,
-`method (ptr, len)`, `path (ptr, len)` — which `coddl-web` builds and pushes per request.
-
-The host builds the `headers` relation value directly (see [memory.md](memory.md), "One-reference-per-cell")
-via `coddl_rc_alloc` against a hand-written `{ name, value }` descriptor, one record per parsed request
-header — mirroring `coddl_env_snapshot` (`crates/coddl-runtime/src/env.rs`): each cell is a real `rc_text`
-(rc = 1, moved in), and the host's single release of the relation after the call frees every cell through the
-drop walker. Identical `(name, value)` pairs are deduped so the relation keeps set semantics (RM Pro 1).
+The host builds the boxed `RawRequest` record by hand (`build_raw_request` in `coddl-web/src/main.rs`):
+`rc_text` cells for `method`/`path`/`query`/`body` and a hand-built `headers` relation (`build_headers`
+against the `OrderedNameValues` descriptor, one record per parsed header with its ordinality) — all *moved
+in* (rc = 1). A single-possrep scalar is physically its `Text`, so the host writes `path`/`query` as plain
+`Text` cells (byte-compatible with the compiler's internal 1-field-tuple view). The request-target is split
+at the first `?` into raw `path` / `query`. Because the record owns every cell, **one** `coddl_rc_release`
+of the record cascades through the drop walker and frees them all.
 
 ### Return (handler → host)
 
-**A handler returns a `Response` `Tuple` by value.** Whole-`Tuple`-by-value return now exists via
+**A handler returns a `RawResponse` `Tuple` by value.** Whole-`Tuple`-by-value return exists via
 **box-on-return**: a `Tuple` in return position is *always* returned as one `ptr` to a length-1
 `CoddlKind::Relation` record (`box_return_value_if_needed` in [procir.md](procir.md); the boxing is
 data- and cardinality-preserving, so `TupleBox`/`TupleUnbox` round-trips are transparent). So
 
 ```
-oper handle { req: Request } -> Response
+oper handle { req: RawRequest } -> RawResponse
 ```
 
-lowers to `define ptr @handle(<flattened Request args>)` returning one pointer to a 32-byte record with the
-name-sorted layout `body@0 (ptr@0, len@8), headers@16 (Relation ptr), status@24 (Integer i64)`. The host
+lowers to `define ptr @handle(ptr %req)` returning one pointer to a 32-byte record with the name-sorted
+layout `body@0 (ptr@0, len@8), headers@16 (Relation ptr), status@24 (Integer i64)`. The host
 reads the record's cells directly through that layout — `status`, the `body` `(ptr, len)`, and the `headers`
 relation pointer (walked into `(name, value)` pairs and emitted as HTTP header lines) — exactly as it reads
 any returned record. This reuses `coddl_query`-style `*mut u8` returns and pulls in **zero** plan/relvar
@@ -352,20 +357,29 @@ dependency of the database payoff (P4), **not** of the request/response plumbing
    and the `Response`'s headers relation is walked back into the reply (framing headers stay host-owned).
    Pure host-side Rust — no relvars, no lifecycle, no routing.
 
-6. **Routing — a userspace Coddl framework (not host work).** The host stays at **one `handle` symbol**; an
-   app's `handle` inspects the `Request` and delegates, in Coddl (see the design note under Responsibilities).
+6. **RawRequest reshape — possrep-scalar contract, boxed handler. DONE.** The contract became the raw,
+   RFC-faithful `RawRequest`/`RawResponse` — `path`/`query` as single-possrep scalar types, `ordinality`
+   headers. At 72 B, `RawRequest` crosses the boxing threshold, so the handler takes a **boxed parameter**
+   (`define ptr @handle(ptr %req)` — the first ≥64 B param; both backends already had the boxed-param ABI).
+   The host builds the boxed request record, splits the target at `?`, and `examples/web-hello/handle.cd`
+   echoes `req.path.value` end-to-end over `curl`. Needed two small compiler fixes: a module alias's fields
+   resolve to their scalar type (not `Unknown`), and a `Scalar` heading attribute erases to its
+   1-field-tuple form so `req.path.value` lowers (`AttrLoad` → `TupleField`).
+
+7. **Routing — a userspace Coddl framework (not host work).** The host stays at **one `handle` symbol**; an
+   app's `handle` inspects the `RawRequest` and delegates, in Coddl (see the design note under Responsibilities).
    Exact-path dispatch works today; ergonomic pattern/param routes wait on Coddl `Text` primitives, and
    relvar-driven dispatch-by-data on first-class `oper` references — both language features, not host
    workarounds.
 
-7. **P1b — lifecycle synthesis.** `coddl_app_init` / `coddl_app_shutdown` emitted from the plan. Needed only
+8. **P1b — lifecycle synthesis.** `coddl_app_init` / `coddl_app_shutdown` emitted from the plan. Needed only
    once a handler touches a relvar or a pushed plan — i.e. a dependency of P4, deferred until here.
 
-8. **P4 — payoff.** A handler whose body is a relational query against a relvar, pushed to SQL, returned as
+9. **P4 — payoff.** A handler whose body is a relational query against a relvar, pushed to SQL, returned as
    the response body — the "Django view + ORM query" in a single expression, null-free and backend-pushed:
 
    ```
-   oper handle_users { req: Request } -> Response
+   oper handle_users { req: RawRequest } -> RawResponse
      [ Users where active = true project { name, email } ]
    ```
 

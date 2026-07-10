@@ -6,8 +6,8 @@
 //! and asserts the response is a `200 OK` carrying the handler's body.
 //!
 //! This exercises the whole host loop end-to-end — accept, parse the request,
-//! marshal a `Request` value, call the handler across the C ABI, read the
-//! boxed `Response` record back, allocate/release every payload through the
+//! build a boxed `RawRequest` value, call the handler across the C ABI, read the
+//! boxed `RawResponse` record back, allocate/release every payload through the
 //! runtime, write the response — against the built-in `hello` handler, so it
 //! needs no compiled app object. The cross-object FFI boundary (a
 //! separately-compiled Coddl handler linked into a foreign host) is proved
@@ -65,11 +65,11 @@ fn coddl_web_serves_handler_body_over_http() {
     let mut resp = Vec::new();
     stream.read_to_end(&mut resp).expect("read response");
 
-    // The built-in handler hand-builds a `Response` record (status 200, one
+    // The built-in handler hand-builds a `RawResponse` record (status 200, one
     // `Content-Type` header, body `hello`) that the host reads back over the C
     // ABI. The `Content-Type` line proves the response-header **read** path (the
-    // host walked the returned `{name, value}` relation into the reply). The body
-    // has no trailing newline — it is the record's `body` Text verbatim.
+    // host walked the returned `{name, ordinality, value}` relation into the
+    // reply). The body has no trailing newline — it is the record's `body` Text.
     let text = String::from_utf8_lossy(&resp);
     assert!(text.starts_with("HTTP/1.1 200 OK"), "response head: {text:?}");
     assert!(
