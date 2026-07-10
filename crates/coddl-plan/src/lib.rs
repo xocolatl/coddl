@@ -23,7 +23,9 @@ use coddl_syntax::ast_cdstore::{
 use coddl_syntax::FileKind;
 use coddl_types::{check, Heading, RelvarKind, RelvarTable};
 
+mod modules;
 mod plan;
+pub use modules::{ModuleGraph, ResolvedModule};
 pub use plan::{BackendKind, FileHeaderKind, Plan, PlanOutput, ResolvedPublicRelvar, WritePolicy};
 
 /// Discover the `.cd`'s companions and cross-validate the chain.
@@ -65,6 +67,7 @@ pub fn discover_and_validate_with_overrides(
             return PlanOutput {
                 plan: None,
                 diagnostics: diags,
+                module_graph: ModuleGraph::default(),
             };
         }
     };
@@ -75,6 +78,14 @@ pub fn discover_and_validate_with_overrides(
     // Compilation-unit header rules (PL0012–PL0015). Run unconditionally, before
     // the public-relvar branches, so every `.cd` entry point is validated.
     let header_kind = validate_file_header(&cd_check.tree, &mut diags);
+
+    // Resolve the userspace module graph (`use module <leaf>;` imports → sibling
+    // `.cd` files), validating the file/header contract and detecting cycles
+    // (PL0016–PL0019). Runs for every entry file, independent of public relvars.
+    let base = cd_path.parent().unwrap_or_else(|| Path::new("."));
+    let entry_display = cd_path.display().to_string();
+    let module_graph =
+        modules::resolve_module_graph(&cd_check.tree, &entry_display, base, overrides, &mut diags);
 
     let program_name = extract_program_name(&cd_check.tree);
     let database_binding = find_database_binding(&cd_check.tree);
@@ -103,6 +114,7 @@ pub fn discover_and_validate_with_overrides(
                 db_file_default: None,
             }),
             diagnostics: diags,
+            module_graph,
         };
     }
 
@@ -126,12 +138,12 @@ pub fn discover_and_validate_with_overrides(
                 db_file_default: None,
             }),
             diagnostics: diags,
+            module_graph,
         };
     };
 
-    let parent = cd_path.parent().unwrap_or_else(|| Path::new("."));
-    let cddb_path = parent.join(format!("{database_name}.cddb"));
-    let cdstore_path = parent.join(format!("{database_name}.cdstore"));
+    let cddb_path = base.join(format!("{database_name}.cddb"));
+    let cdstore_path = base.join(format!("{database_name}.cdstore"));
 
     let cddb_source = match read_source_or_override(&cddb_path, overrides) {
         Ok(s) => Some(s),
@@ -309,6 +321,7 @@ pub fn discover_and_validate_with_overrides(
             db_file_default,
         }),
         diagnostics: diags,
+        module_graph,
     }
 }
 
@@ -594,7 +607,7 @@ fn unquote(s: &str) -> String {
     trimmed.to_string()
 }
 
-fn plain_error(code: &'static str, message: String) -> Diagnostic {
+pub(crate) fn plain_error(code: &'static str, message: String) -> Diagnostic {
     Diagnostic::error(Span::new(FileId(0), 0, 0), code, message)
 }
 
@@ -1009,5 +1022,168 @@ base relvar Greetings { id: Integer, message: Boolean } key { id };
     fn library_or_module_with_main_is_pl0015() {
         assert!(pl_codes("library l;\noper main {} [ ]\n").contains(&"PL0015"));
         assert!(pl_codes("module m;\noper main {} [ ]\n").contains(&"PL0015"));
+    }
+
+    // ── Userspace module resolution (PL0016–PL0019) ──────────────────────
+
+    /// Write an entry `app.cd` plus sibling files (name → contents) into a
+    /// fresh tempdir; return the dir (kept alive) and the entry path.
+    fn write_unit(entry: &str, siblings: &[(&str, &str)]) -> (TempDir, PathBuf) {
+        let dir = TempDir::new().expect("tempdir");
+        let entry_path = dir.path().join("app.cd");
+        fs::write(&entry_path, entry).unwrap();
+        for (name, body) in siblings {
+            fs::write(dir.path().join(name), body).unwrap();
+        }
+        (dir, entry_path)
+    }
+
+    /// PL-codes from resolving `cd_path`.
+    fn pl_of(cd_path: &Path) -> Vec<&'static str> {
+        discover_and_validate(cd_path)
+            .diagnostics
+            .into_iter()
+            .map(|d| d.code)
+            .filter(|c| c.starts_with("PL"))
+            .collect()
+    }
+
+    #[test]
+    fn userspace_import_resolves_cleanly() {
+        let (_d, cd) = write_unit(
+            "program app;\nuse module foo;\noper main {} [ ]\n",
+            &[("foo.cd", "module foo;\noper helper {} [ ]\n")],
+        );
+        let out = discover_and_validate(&cd);
+        let pl: Vec<_> = out
+            .diagnostics
+            .iter()
+            .map(|d| d.code)
+            .filter(|c| c.starts_with("PL"))
+            .collect();
+        assert!(pl.is_empty(), "unexpected {pl:?}");
+        assert_eq!(out.module_graph.modules.len(), 1);
+        assert_eq!(out.module_graph.modules[0].path.to_string(), "foo");
+    }
+
+    #[test]
+    fn missing_module_file_is_pl0016() {
+        let (_d, cd) = write_unit("program app;\nuse module gone;\noper main {} [ ]\n", &[]);
+        assert!(pl_of(&cd).contains(&"PL0016"));
+    }
+
+    #[test]
+    fn nested_userspace_path_is_pl0016() {
+        // Multi-segment userspace paths (nested modules) are not yet supported.
+        let (_d, cd) = write_unit("program app;\nuse module a::b;\noper main {} [ ]\n", &[]);
+        assert!(pl_of(&cd).contains(&"PL0016"));
+    }
+
+    #[test]
+    fn header_name_not_matching_file_is_pl0017() {
+        let (_d, cd) = write_unit(
+            "program app;\nuse module foo;\noper main {} [ ]\n",
+            &[("foo.cd", "module bar;\noper helper {} [ ]\n")],
+        );
+        assert!(pl_of(&cd).contains(&"PL0017"));
+    }
+
+    #[test]
+    fn case_mismatched_header_is_pl0017() {
+        // The case-fold guard: on a case-insensitive filesystem `foo.cd` and
+        // `Foo.cd` are the same file, so the header's case must match exactly.
+        let (_d, cd) = write_unit(
+            "program app;\nuse module foo;\noper main {} [ ]\n",
+            &[("foo.cd", "module Foo;\noper helper {} [ ]\n")],
+        );
+        assert!(pl_of(&cd).contains(&"PL0017"));
+    }
+
+    #[test]
+    fn importing_a_non_module_is_pl0018() {
+        for target in [
+            ("lib.cd", "library lib;\noper handle {} [ ]\n"),
+            ("prog.cd", "program prog;\noper main {} [ ]\n"),
+        ] {
+            let leaf = target.0.strip_suffix(".cd").unwrap();
+            let (_d, cd) = write_unit(
+                &format!("program app;\nuse module {leaf};\noper main {{}} [ ]\n"),
+                &[target],
+            );
+            assert!(pl_of(&cd).contains(&"PL0018"), "{}", target.0);
+        }
+    }
+
+    #[test]
+    fn import_cycle_is_pl0019() {
+        let (_d, cd) = write_unit(
+            "program app;\nuse module a;\noper main {} [ ]\n",
+            &[
+                ("a.cd", "module a;\nuse module b;\noper ha {} [ ]\n"),
+                ("b.cd", "module b;\nuse module a;\noper hb {} [ ]\n"),
+            ],
+        );
+        assert!(pl_of(&cd).contains(&"PL0019"));
+    }
+
+    #[test]
+    fn transitive_graph_is_dependency_first() {
+        // entry → a → b: `b` (a dependency) precedes `a` (its dependent).
+        let (_d, cd) = write_unit(
+            "program app;\nuse module a;\noper main {} [ ]\n",
+            &[
+                ("a.cd", "module a;\nuse module b;\noper ha {} [ ]\n"),
+                ("b.cd", "module b;\noper hb {} [ ]\n"),
+            ],
+        );
+        let out = discover_and_validate(&cd);
+        assert!(pl_of(&cd).is_empty(), "{:?}", pl_of(&cd));
+        let names: Vec<String> = out
+            .module_graph
+            .modules
+            .iter()
+            .map(|m| m.path.to_string())
+            .collect();
+        assert_eq!(names, vec!["b".to_string(), "a".to_string()]);
+    }
+
+    #[test]
+    fn diamond_imports_resolve_each_module_once() {
+        let (_d, cd) = write_unit(
+            "program app;\nuse module a;\nuse module b;\noper main {} [ ]\n",
+            &[
+                ("a.cd", "module a;\nuse module c;\noper ha {} [ ]\n"),
+                ("b.cd", "module b;\nuse module c;\noper hb {} [ ]\n"),
+                ("c.cd", "module c;\noper hc {} [ ]\n"),
+            ],
+        );
+        let out = discover_and_validate(&cd);
+        assert_eq!(out.module_graph.modules.len(), 3, "c must appear once");
+        let cs = out
+            .module_graph
+            .modules
+            .iter()
+            .filter(|m| m.path.to_string() == "c")
+            .count();
+        assert_eq!(cs, 1);
+    }
+
+    #[test]
+    fn coddl_import_is_not_a_userspace_module() {
+        // A stdlib import is the checker's concern; the filesystem walk skips
+        // it, so there is no PL0016 even with no `web.cd` sibling on disk.
+        let (_d, cd) = write_unit(
+            "program app;\nuse module coddl::web;\noper main {} [ ]\n",
+            &[],
+        );
+        let out = discover_and_validate(&cd);
+        let pl: Vec<_> = out
+            .diagnostics
+            .iter()
+            .map(|d| d.code)
+            .filter(|c| c.starts_with("PL"))
+            .collect();
+        assert!(pl.is_empty(), "unexpected {pl:?}");
+        assert!(out.module_graph.modules.is_empty());
     }
 }

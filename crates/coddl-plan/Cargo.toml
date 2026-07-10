@@ -9,6 +9,7 @@ description = "Project plan: discover `.cd` companions, cross-validate, produce 
 
 [dependencies]
 coddl-diagnostics.workspace = true
+coddl-stdlib.workspace = true
 coddl-syntax.workspace = true
 coddl-types.workspace = true
 

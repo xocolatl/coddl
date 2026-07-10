@@ -3,13 +3,20 @@
 use coddl_diagnostics::Diagnostic;
 use coddl_types::{Heading, RelvarTable};
 
+use crate::modules::ModuleGraph;
+
 /// The output of one plan run: the synthesized [`Plan`] (when
-/// discovery succeeded enough to shape it) and every diagnostic from
-/// per-file typechecking and cross-file validation.
+/// discovery succeeded enough to shape it), the userspace module graph
+/// reachable from the entry file, and every diagnostic from per-file
+/// typechecking, cross-file validation, and module resolution.
 #[derive(Debug)]
 pub struct PlanOutput {
     pub plan: Option<Plan>,
     pub diagnostics: Vec<Diagnostic>,
+    /// The transitive userspace-module graph (`use module <leaf>;` imports
+    /// resolved to sibling `.cd` files). Empty when the entry file imports no
+    /// userspace modules. A later phase type-checks and lowers these units.
+    pub module_graph: ModuleGraph,
 }
 
 /// The kind declared by a `.cd` file's mandatory header — `program`,

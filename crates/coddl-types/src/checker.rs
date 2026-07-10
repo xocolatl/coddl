@@ -977,6 +977,16 @@ impl TypeChecker {
                 continue; // malformed path — the parser already reported it
             }
             let path = ModulePath::new(segs);
+            // The reserved `coddl` root is the embedded stdlib; anything else is
+            // a userspace module the plan layer resolves (it has the file path
+            // and does I/O). The checker defers userspace imports to it —
+            // neither erroring nor bringing names into scope here — so a valid
+            // `use module foo;` does not trip T0089. Registering an imported
+            // module's signatures is a later step.
+            let is_coddl_root = path.segments().first().map(String::as_str) == Some("coddl");
+            if !is_coddl_root {
+                continue;
+            }
             if coddl_stdlib::resolve(&path).is_none() {
                 self.error(
                     self.node_span(u.syntax()),
@@ -996,9 +1006,9 @@ impl TypeChecker {
             let active = self.active_modules.contains(&module.path);
             if active {
                 // Register this module's `builtin oper` signatures.
-                self.builtins.load_module(module.source);
+                self.builtins.load_module(module.source());
             }
-            let out = parse(module.source, FileId(0), FileKind::Cd);
+            let out = parse(module.source(), FileId(0), FileKind::Cd);
             let Some(mroot) = Root::cast(out.tree) else { continue };
             for item in mroot.items() {
                 match item {
@@ -5636,7 +5646,7 @@ mod tests {
         // diagnostics.
         let core = coddl_stdlib::resolve(&coddl_stdlib::ModulePath::parse("coddl::core"))
             .expect("coddl::core is always embedded");
-        let diags = diagnostics(core.source);
+        let diags = diagnostics(core.source());
         assert!(diags.is_empty(), "coddl::core has diagnostics: {diags:?}");
     }
 
@@ -5725,9 +5735,9 @@ mod tests {
         let env = coddl_stdlib::resolve(&coddl_stdlib::ModulePath::parse("coddl::env"))
             .expect("coddl::env is embedded");
         assert!(
-            diagnostics(env.source).is_empty(),
+            diagnostics(env.source()).is_empty(),
             "coddl::env source should check clean: {:?}",
-            diagnostics(env.source)
+            diagnostics(env.source())
         );
         // A stray user `builtin relvar` is likewise not a decl-site error; it is
         // inert (unregistered), so a *reference* to it is what fails to resolve.

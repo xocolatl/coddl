@@ -40,7 +40,7 @@ A `.cd` source with **no** public relvars doesn't need a `database` binding — 
 
 The rest of this doc pins what `coddl-plan` enforces today.
 
-**Last sync:** file-kind headers (PL0012–PL0015). Every commit that adds, removes, or changes a PL-code or validation invariant in `crates/coddl-plan/` updates this file in the same commit; `tools/check-grammar.sh` enforces the diagnostic table from the hygiene gate.
+**Last sync:** userspace module resolution (PL0016–PL0019, `ModuleGraph` on `PlanOutput`). Every commit that adds, removes, or changes a PL-code or validation invariant in `crates/coddl-plan/` updates this file in the same commit; `tools/check-grammar.sh` enforces the diagnostic table from the hygiene gate.
 
 
 ## Discovery
@@ -79,6 +79,45 @@ public entry point. It:
 `.cdmap` discovery is **out of scope for Phase 16** — any `.cdmap`
 file in the directory is left alone. Non-identity adapters (project /
 rename / virtual sources) land in a later phase.
+
+
+## Userspace module resolution
+
+After validating the header, `discover_and_validate` resolves the
+entry file's `use module <path>;` imports (`crates/coddl-plan/src/modules.rs`).
+It walks the imports transitively, building a `ModuleGraph` — the set of
+userspace modules reachable from the entry point, in **dependency-first**
+order (a module appears after every module it imports) — attached to
+`PlanOutput.module_graph`. A later phase type-checks and lowers these units.
+
+Resolution runs for **every** entry file, independent of public relvars, so a
+standalone `program` that imports a module is validated too.
+
+- **Roots and providers.** A module path is resolved by a
+  `coddl_stdlib::ModuleProvider`. The reserved `coddl` first segment is the
+  embedded stdlib (`coddl_stdlib::EmbeddedProvider`), handled by the
+  typechecker; the plan layer skips it. Any other path is a **userspace**
+  module resolved by the project-local `modules::FsProvider`, which maps a
+  single-segment leaf `foo` to a sibling `foo.cd` under the importing file's
+  directory — the same by-convention resolution as `database greetings;` →
+  `greetings.cddb` (a module path is a *logical name*, never a filesystem path
+  in source). The provider consults the plan layer's `overrides` map (unsaved
+  LSP buffers) before touching disk.
+
+- **Validation** (each a zero-span diagnostic whose message names the importing
+  file, the module, and the expected path — precise per-file spans arrive with
+  the multi-file source map):
+  - **PL0016** — the sibling `<leaf>.cd` is unreadable, or the path is nested
+    (multi-segment userspace paths are not yet supported).
+  - **PL0017** — the target's header declares a name that isn't the file's leaf,
+    *case-exactly*. This is the guard against case-folding filesystems
+    (macOS/Windows), where `foo.cd` and `Foo.cd` are the same file: the
+    self-declared header is source-of-truth, so a mismatch is a compile error
+    rather than a silent mis-resolution.
+  - **PL0018** — the target is a `program`/`library` (or headerless), not a
+    `module`. `use module` links `module` units only.
+  - **PL0019** — an import cycle among modules (detected as a back-edge in the
+    DFS walk).
 
 
 ## Validation invariants (identity-only)
@@ -185,4 +224,8 @@ hygiene-check script enforces that.
 | PL0013 | `.cd` file declares more than one file header                                        |
 | PL0014 | A `program` declares no `oper main` entry point                                      |
 | PL0015 | A `library`/`module` declares an `oper main` (only a `program` has an entry point)   |
+| PL0016 | A `use module <leaf>;` import resolves to no readable module file (or a nested userspace path) |
+| PL0017 | An imported module's header name doesn't match its file name exactly (case-fold guard) |
+| PL0018 | A `use module` import targets a `program`/`library` (or a headerless file), not a `module` |
+| PL0019 | Import cycle among userspace modules                                                 |
 | PL0100 | I/O error reading the `.cd` entry point                                              |

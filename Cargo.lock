@@ -257,6 +257,7 @@ name = "coddl-plan"
 version = "0.0.0"
 dependencies = [
  "coddl-diagnostics",
+ "coddl-stdlib",
  "coddl-syntax",
  "coddl-types",
  "tempfile",

@@ -103,7 +103,7 @@ impl Builtins {
     fn load_prelude(&mut self) {
         let core = coddl_stdlib::resolve(&coddl_stdlib::ModulePath::parse("coddl::core"))
             .expect("coddl::core is always embedded in coddl-stdlib");
-        self.load_module(core.source);
+        self.load_module(core.source());
     }
 
     /// Parse one stdlib module's source and register its `builtin oper`
