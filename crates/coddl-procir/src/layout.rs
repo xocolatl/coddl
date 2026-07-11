@@ -291,4 +291,74 @@ mod tests {
         assert_eq!(l.attrs[0].width, 0);
         assert_eq!(l.attrs[0].sub.as_ref().unwrap().record_size, 0);
     }
+
+    #[test]
+    fn cooked_request_layout_matches_web_host_descriptor() {
+        // Pins the COMPILER side of the coddl-web cooked-`Request` ABI. The host
+        // hand-writes a heading descriptor with these exact offsets
+        // (crates/coddl-web/src/main.rs `request_desc`), and a compiled
+        // `oper handle { req: Request } -> RawResponse` boxed param must lay out
+        // identically or the handler reads garbage — a silent, no-compile-error
+        // failure. The host round-trip test in coddl-web pins the same numbers on
+        // the other side; together they guard the descriptor byte-match.
+        //
+        // The single-possrep scalars `RawRequestPath` / `RawRequestQuery` erase to
+        // `Text` before codegen (Type::Scalar never reaches layout), so `raw_path`
+        // / `raw_query` are `Text` here — matching how the host frees them.
+        let path_segments = Type::Relation(heading(&[
+            ("ordinality", Type::Integer),
+            ("segment", Type::Text),
+        ]));
+        let name_values = Type::Relation(heading(&[
+            ("name", Type::Text),
+            ("value", Type::Text),
+            ("ordinality", Type::Integer),
+        ]));
+        let request = heading(&[
+            ("method", Type::Text),
+            ("path", path_segments),
+            ("query", name_values.clone()),
+            ("headers", name_values),
+            ("raw_path", Type::Text),
+            ("raw_query", Type::Text),
+            ("body", Type::Text),
+        ]);
+        let l = record_layout(&request);
+
+        // 88 B ≥ TUPLE_BOX_THRESHOLD → crosses the ABI as one boxed pointer.
+        assert_eq!(l.record_size, 88);
+        assert!(tuple_is_boxed(&request));
+
+        // Name-sorted order, offsets, widths, kinds the host hardcodes.
+        let got: Vec<(&str, u32, u32, u32)> = l
+            .attrs
+            .iter()
+            .map(|a| (a.name.as_str(), a.offset, a.width, a.kind))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("body", 0, 16, kind_tag::TEXT),
+                ("headers", 16, 8, kind_tag::RELATION),
+                ("method", 24, 16, kind_tag::TEXT),
+                ("path", 40, 8, kind_tag::RELATION),
+                ("query", 48, 8, kind_tag::RELATION),
+                ("raw_path", 56, 16, kind_tag::TEXT),
+                ("raw_query", 72, 16, kind_tag::TEXT),
+            ]
+        );
+
+        // PathSegments per-record layout the host's `path_segments_desc` encodes.
+        let seg = record_layout(&heading(&[
+            ("ordinality", Type::Integer),
+            ("segment", Type::Text),
+        ]));
+        assert_eq!(seg.record_size, 24);
+        let seg_got: Vec<(&str, u32)> = seg
+            .attrs
+            .iter()
+            .map(|a| (a.name.as_str(), a.offset))
+            .collect();
+        assert_eq!(seg_got, vec![("ordinality", 0), ("segment", 8)]);
+    }
 }

@@ -42,7 +42,7 @@ public relvar Pages {
 // ignored (a real app's single `handle` inspects it and routes — F1/F2). The
 // title/body are interpolated raw: escaping (F4's `escape_html`) lands with L1
 // Text primitives; the seed data here is trusted.
-oper handle{ _req: RawRequest } -> RawResponse [
+oper handle{ _req: Request } -> RawResponse [
     let home = transaction [
         var rows;
         let page = Pages where slug = "home" project { title, body };

@@ -1,7 +1,7 @@
-//! `coddl-web` — the web host (see docs/webhost.md), Stage B (`RawRequest`).
+//! `coddl-web` — the web host (see docs/webhost.md), cooked `Request`.
 //!
 //! A single-threaded HTTP/1.1 listener that owns `main`, parses each request
-//! into a Coddl `RawRequest` value, calls a handler across the C ABI, reads the
+//! into a cooked Coddl `Request` value, calls a handler across the C ABI, reads the
 //! `RawResponse` value back, and writes the HTTP reply. It knows no relational
 //! algebra and **no routing** — it calls one handler entry (`handle`) per app
 //! as an opaque C symbol and lets the app route in Coddl (docs/webhost.md
@@ -9,14 +9,18 @@
 //! web-specific — sockets, HTTP parsing, and the *hand-written marshalling* of
 //! Coddl's RC-headed values — is FFI-bottom "stays Rust" work.
 //!
-//! The handler is `use module coddl::web; oper handle { req: RawRequest } ->
-//! RawResponse`. Its ABI (confirmed via `coddl emit-llvm`):
-//!   - `RawRequest` (72 B ≥ the 64 B boxing threshold) is a **boxed** tuple
+//! The handler is `use module coddl::web; oper handle { req: Request } ->
+//! RawResponse`. Its ABI (confirmed via `coddl emit-llvm`; the layout is pinned
+//! by the `record_layout` assertion in coddl-procir):
+//!   - `Request` (88 B ≥ the 64 B boxing threshold) is a **boxed** tuple
 //!     parameter — one pointer to a record, name-sorted layout
-//!     `body@0 (Text), headers@16 (Relation), method@24 (Text), path@40 (Text),
-//!     query@56 (Text)`. A `Text` cell is a `(ptr, len)` pair; `path`/`query`
-//!     are single-possrep scalars (`RawRequestPath`/`RawRequestQuery`) that are
-//!     *physically* just their `Text` component.
+//!     `body@0 (Text), headers@16 (Relation), method@24 (Text), path@40
+//!     (Relation), query@48 (Relation), raw_path@56 (Text), raw_query@72 (Text)`.
+//!     A `Text` cell is a `(ptr, len)` pair; a `Relation` cell is one pointer.
+//!     `path` is a cooked `PathSegments = { ordinality, segment }` relation
+//!     (percent-decoded), `query` a cooked `OrderedNameValues` relation of
+//!     decoded pairs; `raw_path`/`raw_query` keep the raw percent-encoded target
+//!     parts (single-possrep scalars, physically `Text`) as an escape hatch.
 //!   - `RawResponse` (32 B) is returned **boxed** — one pointer to a record,
 //!     `body@0 (Text), headers@16 (Relation), status@24 (i64)`.
 //! So the whole call is `handle(req_ptr) -> resp_ptr`. Headers are
@@ -78,12 +82,50 @@ fn headers_desc() -> *const CoddlHeadingDesc {
     }) as *const CoddlHeadingDesc
 }
 
-/// The boxed `RawRequest` record heading — name-sorted `body@0 (Text),
-/// headers@16 (Relation), method@24 (Text), path@40 (Text), query@56 (Text)`;
-/// record_size 72. `path`/`query` are single-possrep scalars that are physically
-/// `Text`, so the drop walker frees them as `Text` — byte-compatible with the
-/// compiler's internal 1-field-tuple view of them.
-fn raw_request_desc() -> *const CoddlHeadingDesc {
+/// `PathSegments = Relation { ordinality: Integer, segment: Text }` — the cooked
+/// request path. Name-sorted, so `ordinality@0 (8 B)`, `segment@8 (16 B)`;
+/// record_size 24. `ordinality` carries wire order (the URL path is a sequence).
+fn path_segments_desc() -> *const CoddlHeadingDesc {
+    use std::sync::OnceLock;
+    static DESC: OnceLock<usize> = OnceLock::new();
+    *DESC.get_or_init(|| {
+        let attrs: &'static [CoddlAttrDesc; 2] = Box::leak(Box::new([
+            CoddlAttrDesc {
+                name: b"ordinality".as_ptr(),
+                name_len: 10,
+                kind: CoddlAttrKind::Integer as u32,
+                offset: 0,
+                sub: std::ptr::null(),
+            },
+            CoddlAttrDesc {
+                name: b"segment".as_ptr(),
+                name_len: 7,
+                kind: CoddlAttrKind::Text as u32,
+                offset: 8,
+                sub: std::ptr::null(),
+            },
+        ]));
+        let desc: &'static CoddlHeadingDesc = Box::leak(Box::new(CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 24,
+            attrs: attrs.as_ptr(),
+        }));
+        desc as *const CoddlHeadingDesc as usize
+    }) as *const CoddlHeadingDesc
+}
+
+/// The boxed cooked `Request` record heading — name-sorted `body@0 (Text),
+/// headers@16 (Relation), method@24 (Text), path@40 (Relation), query@48
+/// (Relation), raw_path@56 (Text), raw_query@72 (Text)`; record_size 88
+/// (≥ the 64 B boxing threshold, so the param crosses the ABI as one boxed
+/// pointer). `path` is a `PathSegments` relation, `query`/`headers` are
+/// `OrderedNameValues`; the three Relation cells carry a **null** `sub` — a
+/// nested relation is self-describing via its own RC-header desc, and codegen
+/// emits `ptr null` for a Relation attr's sub, so a non-null sub here would be a
+/// silent descriptor mismatch. `raw_path`/`raw_query` are the single-possrep raw
+/// scalars, physically `Text`. These offsets are pinned to `record_layout`
+/// (crates/coddl-procir/src/layout.rs) by the layout-assertion test there.
+fn request_desc() -> *const CoddlHeadingDesc {
     use std::sync::OnceLock;
     static DESC: OnceLock<usize> = OnceLock::new();
     *DESC.get_or_init(|| {
@@ -94,22 +136,25 @@ fn raw_request_desc() -> *const CoddlHeadingDesc {
             offset,
             sub: std::ptr::null(),
         };
-        let attrs: &'static [CoddlAttrDesc; 5] = Box::leak(Box::new([
+        let relation = |name: &'static [u8], offset: u32| CoddlAttrDesc {
+            name: name.as_ptr(),
+            name_len: name.len() as u32,
+            kind: CoddlAttrKind::Relation as u32,
+            offset,
+            sub: std::ptr::null(),
+        };
+        let attrs: &'static [CoddlAttrDesc; 7] = Box::leak(Box::new([
             text(b"body", 0),
-            CoddlAttrDesc {
-                name: b"headers".as_ptr(),
-                name_len: 7,
-                kind: CoddlAttrKind::Relation as u32,
-                offset: 16,
-                sub: std::ptr::null(),
-            },
+            relation(b"headers", 16),
             text(b"method", 24),
-            text(b"path", 40),
-            text(b"query", 56),
+            relation(b"path", 40),
+            relation(b"query", 48),
+            text(b"raw_path", 56),
+            text(b"raw_query", 72),
         ]));
         let desc: &'static CoddlHeadingDesc = Box::leak(Box::new(CoddlHeadingDesc {
-            attr_count: 5,
-            record_size: 72,
+            attr_count: 7,
+            record_size: 88,
             attrs: attrs.as_ptr(),
         }));
         desc as *const CoddlHeadingDesc as usize
@@ -198,28 +243,55 @@ unsafe fn build_headers(pairs: &[(Vec<u8>, Vec<u8>)]) -> *mut u8 {
     rel
 }
 
-/// Build the boxed `RawRequest` record (72 B). The cells are *moved in* (rc = 1,
-/// the record owns them), so the host's single `coddl_rc_release` of the record
-/// frees all four Texts and the headers relation via the drop walker.
-unsafe fn build_raw_request(
+/// Build an owned `PathSegments` relation from decoded segments, in order — one
+/// 24 B record per segment (`ordinality@0` = the index, `segment@8` a fresh
+/// `rc_text`, rc=1, moved in). `build_path_segments(&[])` is the empty relation
+/// (the root path `/`).
+unsafe fn build_path_segments(segs: &[Vec<u8>]) -> *mut u8 {
+    let n = segs.len();
+    let rel = coddl_rc_alloc(
+        n * 24,
+        n as u32,
+        CoddlKind::Relation as u32,
+        path_segments_desc(),
+    );
+    for (i, seg) in segs.iter().enumerate() {
+        let rec = rel.add(i * 24);
+        (rec as *mut i64).write(i as i64); // ordinality @0
+        write_text_cell(rec.add(8), seg); // segment @8
+    }
+    rel
+}
+
+/// Build the boxed cooked `Request` record (88 B). The cells are *moved in*
+/// (rc = 1, the record owns them), so the host's single `coddl_rc_release` of the
+/// record frees the three Text cells (body/method + raw_path/raw_query) and the
+/// three nested relations (headers/path/query) via the drop walker. `query`
+/// reuses `build_headers`/`headers_desc` — it is the same `OrderedNameValues`
+/// type as `headers`, with `ordinality` = wire position.
+unsafe fn build_request(
     method: &[u8],
-    path: &[u8],
-    query: &[u8],
+    raw_path: &[u8],
+    raw_query: &[u8],
+    path_segs: &[Vec<u8>],
+    query_pairs: &[(Vec<u8>, Vec<u8>)],
     headers: &[(Vec<u8>, Vec<u8>)],
     body: &[u8],
 ) -> *mut u8 {
-    let rec = coddl_rc_alloc(72, 1, CoddlKind::Relation as u32, raw_request_desc());
+    let rec = coddl_rc_alloc(88, 1, CoddlKind::Relation as u32, request_desc());
     write_text_cell(rec, body); // body @0
     (rec.add(16) as *mut *mut u8).write(build_headers(headers)); // headers @16
     write_text_cell(rec.add(24), method); // method @24
-    write_text_cell(rec.add(40), path); // path @40
-    write_text_cell(rec.add(56), query); // query @56
+    (rec.add(40) as *mut *mut u8).write(build_path_segments(path_segs)); // path @40
+    (rec.add(48) as *mut *mut u8).write(build_headers(query_pairs)); // query @48
+    write_text_cell(rec.add(56), raw_path); // raw_path @56
+    write_text_cell(rec.add(72), raw_query); // raw_query @72
     rec
 }
 
 // ── The handler ───────────────────────────────────────────────────────────
 
-// The compiled Coddl handler (`CODDL_APP_OBJ`): one boxed `RawRequest` pointer
+// The compiled Coddl handler (`CODDL_APP_OBJ`): one boxed `Request` pointer
 // in, one boxed `RawResponse` pointer out. A compiled module also exports the
 // P1b lifecycle functions — `coddl_app_init` (runtime init + database/plan/relvar
 // registration) and `coddl_app_shutdown` (releases + runtime shutdown) — which
@@ -401,9 +473,10 @@ fn parse_head(head: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>) {
     let method = parts.next().unwrap_or(b"GET").to_vec();
     let target = parts.next().unwrap_or(b"/").to_vec();
 
-    // Header lines: split once on `:`, trim OWS, preserve names as received,
-    // and dedup identical `(name, value)` pairs so the relation keeps set
-    // semantics (RM Pro 1 — no duplicate tuples).
+    // Header lines: split once on `:`, trim OWS, lowercase the name (HTTP header
+    // names are case-insensitive, so a cooked handler can match `name = "host"`
+    // reliably), and dedup identical `(name, value)` pairs so the relation keeps
+    // set semantics (RM Pro 1 — no duplicate tuples).
     let mut headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     for line in lines {
         if line.is_empty() {
@@ -412,7 +485,7 @@ fn parse_head(head: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>) {
         let Some(colon) = line.iter().position(|&b| b == b':') else {
             continue;
         };
-        let name = trim(&line[..colon]).to_vec();
+        let name = trim(&line[..colon]).to_ascii_lowercase();
         let value = trim(&line[colon + 1..]).to_vec();
         if !headers.iter().any(|(n, v)| n == &name && v == &value) {
             headers.push((name, value));
@@ -428,6 +501,89 @@ fn split_target(target: &[u8]) -> (&[u8], &[u8]) {
         Some(q) => (&target[..q], &target[q + 1..]),
         None => (target, &[]),
     }
+}
+
+// ── Percent-decoding (host cooks the raw request; ROADMAP D1) ───────────────
+//
+// The one place decode *policy* lives in the host, provisionally (reversible to
+// userspace when L1/Text primitives land). Pure, byte-oriented, and never
+// panics: the output of a `Text` cell is bytes, so an invalid-UTF-8 decode is
+// stored and compared as bytes at this layer.
+
+/// Value of a single ASCII hex digit, or `None` if it isn't one.
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Percent-decode `%XX` (case-insensitive hex) escapes. A `%` not followed by two
+/// hex digits passes through **literally** — lossless, never panics. Does NOT map
+/// `+` to space (that is query-component policy, not path policy).
+fn percent_decode(src: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len());
+    let mut i = 0;
+    while i < src.len() {
+        if src[i] == b'%' && i + 2 < src.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(src[i + 1]), hex_val(src[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(src[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Decode a query-string component: `+` → space, **then** `%XX`. Two passes so a
+/// literal `%2B` survives as `+` (mapped before percent-decoding runs), not space.
+fn query_component_decode(src: &[u8]) -> Vec<u8> {
+    let spaced: Vec<u8> = src
+        .iter()
+        .map(|&b| if b == b'+' { b' ' } else { b })
+        .collect();
+    percent_decode(&spaced)
+}
+
+/// Split a raw path into percent-decoded segments. Strip **one** leading `/`,
+/// split the remainder on literal `/`, then decode each piece — decoding *after*
+/// the split, so `/a%2Fb` is one segment `a/b`, not two. `"/"` and `""` yield no
+/// segments (the root path); `"/wiki/"` yields `["wiki", ""]`.
+fn split_path_segments(raw_path: &[u8]) -> Vec<Vec<u8>> {
+    let rest = if raw_path.first() == Some(&b'/') {
+        &raw_path[1..]
+    } else {
+        raw_path
+    };
+    if rest.is_empty() {
+        return Vec::new();
+    }
+    rest.split(|&b| b == b'/').map(percent_decode).collect()
+}
+
+/// Parse a raw query string into decoded `(name, value)` pairs in wire order:
+/// split on `&`, split each part on the **first** `=` (missing `=` ⇒ empty
+/// value), then `+`→space and `%XX`-decode both sides. Empty parts are kept
+/// (lossless — a distinct `ordinality` keeps them apart). Empty query ⇒ no pairs.
+fn parse_query_pairs(raw_query: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    if raw_query.is_empty() {
+        return Vec::new();
+    }
+    raw_query
+        .split(|&b| b == b'&')
+        .map(|part| match part.iter().position(|&b| b == b'=') {
+            Some(eq) => (
+                query_component_decode(&part[..eq]),
+                query_component_decode(&part[eq + 1..]),
+            ),
+            None => (query_component_decode(part), Vec::new()),
+        })
+        .collect()
 }
 
 /// Strip a single trailing `\r` (the CR of a CRLF line ending).
@@ -461,9 +617,19 @@ fn is_framing_header(name: &[u8]) -> bool {
 /// record owns its cells, so releasing it once cascades through the drop walker;
 /// the response body/headers are copied out before its single release.
 fn invoke_handler(req: &ParsedRequest) -> (i64, Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>) {
-    let (path, query) = split_target(&req.target);
+    let (raw_path, raw_query) = split_target(&req.target);
+    let path_segs = split_path_segments(raw_path);
+    let query_pairs = parse_query_pairs(raw_query);
     unsafe {
-        let req_rec = build_raw_request(&req.method, path, query, &req.headers, &req.body);
+        let req_rec = build_request(
+            &req.method,
+            raw_path,
+            raw_query,
+            &path_segs,
+            &query_pairs,
+            &req.headers,
+            &req.body,
+        );
         let resp_rec = handle(req_rec);
         let out = read_response(resp_rec); // copies body + response headers out
 
@@ -534,4 +700,180 @@ fn main() -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Decode helpers (ROADMAP D1 edge cases) ──────────────────────────────
+
+    #[test]
+    fn percent_decode_basic() {
+        assert_eq!(percent_decode(b"%2F"), b"/");
+        assert_eq!(percent_decode(b"%20"), b" ");
+        assert_eq!(percent_decode(b"a%2fb"), b"a/b"); // lowercase hex
+        assert_eq!(percent_decode(b"plain"), b"plain");
+        assert_eq!(percent_decode(b""), b"");
+    }
+
+    #[test]
+    fn percent_decode_malformed_is_literal() {
+        assert_eq!(percent_decode(b"%2"), b"%2"); // truncated at end
+        assert_eq!(percent_decode(b"%"), b"%"); // lone percent
+        assert_eq!(percent_decode(b"%GG"), b"%GG"); // non-hex digits
+        assert_eq!(percent_decode(b"a%2"), b"a%2");
+        assert_eq!(percent_decode(b"%2Gx"), b"%2Gx"); // second digit bad
+    }
+
+    #[test]
+    fn query_component_decode_plus_then_percent() {
+        assert_eq!(query_component_decode(b"a+b"), b"a b");
+        assert_eq!(query_component_decode(b"c%20d"), b"c d");
+        assert_eq!(query_component_decode(b"%2B"), b"+"); // literal + survives
+        assert_eq!(query_component_decode(b"a+b%2Bc"), b"a b+c");
+    }
+
+    #[test]
+    fn split_path_segments_cases() {
+        let empty: Vec<Vec<u8>> = Vec::new();
+        assert_eq!(split_path_segments(b"/"), empty);
+        assert_eq!(split_path_segments(b""), empty);
+        assert_eq!(split_path_segments(b"/wiki"), vec![b"wiki".to_vec()]);
+        assert_eq!(
+            split_path_segments(b"/wiki/"),
+            vec![b"wiki".to_vec(), b"".to_vec()]
+        );
+        assert_eq!(
+            split_path_segments(b"/a/b/c"),
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+        );
+        // Split BEFORE decode: `%2F` stays inside one segment.
+        assert_eq!(split_path_segments(b"/a%2Fb"), vec![b"a/b".to_vec()]);
+        assert_eq!(
+            split_path_segments(b"/wiki/Home%20Page"),
+            vec![b"wiki".to_vec(), b"Home Page".to_vec()]
+        );
+        // No leading slash: strip only if present.
+        assert_eq!(split_path_segments(b"wiki"), vec![b"wiki".to_vec()]);
+        // Double leading slash → empty first segment.
+        assert_eq!(
+            split_path_segments(b"//a"),
+            vec![b"".to_vec(), b"a".to_vec()]
+        );
+    }
+
+    #[test]
+    fn parse_query_pairs_cases() {
+        let empty: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        assert_eq!(parse_query_pairs(b""), empty);
+        assert_eq!(
+            parse_query_pairs(b"a=1&b=2"),
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec())
+            ]
+        );
+        assert_eq!(parse_query_pairs(b"a"), vec![(b"a".to_vec(), b"".to_vec())]);
+        assert_eq!(
+            parse_query_pairs(b"a="),
+            vec![(b"a".to_vec(), b"".to_vec())]
+        );
+        assert_eq!(
+            parse_query_pairs(b"=v"),
+            vec![(b"".to_vec(), b"v".to_vec())]
+        );
+        assert_eq!(
+            parse_query_pairs(b"a=1=2"),
+            vec![(b"a".to_vec(), b"1=2".to_vec())] // split on FIRST `=`
+        );
+        assert_eq!(
+            parse_query_pairs(b"a+b=c%20d"),
+            vec![(b"a b".to_vec(), b"c d".to_vec())]
+        );
+        assert_eq!(
+            parse_query_pairs(b"a&&b"),
+            vec![
+                (b"a".to_vec(), b"".to_vec()),
+                (b"".to_vec(), b"".to_vec()),
+                (b"b".to_vec(), b"".to_vec()),
+            ]
+        );
+    }
+
+    // ── Round-trip: build_request → read back at offsets → release ───────────
+    //
+    // Pins the HOST side of the ABI to the documented offsets (0/16/24/40/48/56/
+    // 72, record_size 88). The COMPILER side is pinned to the same numbers by the
+    // `record_layout` assertion in coddl-procir; together they guard the silent
+    // host↔compiler descriptor-mismatch risk.
+
+    /// Read a `PathSegments` relation into `(ordinality, segment)` pairs: count
+    /// from the RC-header length; 24 B records, `ordinality@0`, `segment@8`.
+    unsafe fn read_path_segments(rel: *const u8) -> Vec<(i64, Vec<u8>)> {
+        if rel.is_null() {
+            return Vec::new();
+        }
+        let count = (*(rel.sub(HEADER_SIZE) as *const CoddlRcHeader)).length as usize;
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let rec = rel.add(i * 24);
+            let ord = (rec as *const i64).read();
+            out.push((ord, read_text_cell(rec.add(8))));
+        }
+        out
+    }
+
+    #[test]
+    fn build_request_round_trips_at_documented_offsets() {
+        let raw_path = b"/wiki/Home%20Page";
+        let raw_query = b"a=1&b=hi";
+        let path_segs = split_path_segments(raw_path);
+        let query_pairs = parse_query_pairs(raw_query);
+        let headers = vec![(b"host".to_vec(), b"x".to_vec())];
+
+        unsafe {
+            let rec = build_request(
+                b"GET",
+                raw_path,
+                raw_query,
+                &path_segs,
+                &query_pairs,
+                &headers,
+                b"abc",
+            );
+
+            // Text cells: body@0, method@24, raw_path@56, raw_query@72.
+            assert_eq!(read_text_cell(rec), b"abc");
+            assert_eq!(read_text_cell(rec.add(24)), b"GET");
+            assert_eq!(read_text_cell(rec.add(56)), raw_path);
+            assert_eq!(read_text_cell(rec.add(72)), raw_query);
+
+            // OrderedNameValues relations: headers@16, query@48.
+            let headers_ptr = (rec.add(16) as *const *const u8).read();
+            assert_eq!(
+                read_headers_relation(headers_ptr),
+                vec![(b"host".to_vec(), b"x".to_vec())]
+            );
+            let query_ptr = (rec.add(48) as *const *const u8).read();
+            assert_eq!(
+                read_headers_relation(query_ptr),
+                vec![
+                    (b"a".to_vec(), b"1".to_vec()),
+                    (b"b".to_vec(), b"hi".to_vec())
+                ]
+            );
+
+            // PathSegments relation @40, with ordinality preserved.
+            let path_ptr = (rec.add(40) as *const *const u8).read();
+            assert_eq!(
+                read_path_segments(path_ptr),
+                vec![(0, b"wiki".to_vec()), (1, b"Home Page".to_vec())]
+            );
+
+            // A single release drop-walks every nested cell/relation (no crash,
+            // no double-free); RC balances because each cell was moved in rc=1.
+            coddl_rc_release(rec);
+        }
+    }
 }

@@ -6,13 +6,14 @@ compiled as a host-callable library. The host builds a request value, calls a ha
 response it gets back.
 
 > **Status.** *End-to-end: a relvar-backed handler serves SQL query results over HTTP.* The vocabulary this
-> doc marshals — `RawRequest` / `RawResponse` — is real: it lives in the opt-in [`coddl::web`](prelude.md)
+> doc marshals — `Request` / `RawResponse` — is real: it lives in the opt-in [`coddl::web`](prelude.md)
 > standard-library module, brought into scope with `use module coddl::web;`. **P1a, the Spine, P2, P3a, the
-> RawRequest reshape, P1b, and P4 (the payoff) have landed:** `coddl emit-obj` produces a mainless object,
-> and the `coddl-web` crate is a single-threaded `TcpListener` that parses real HTTP requests (headers +
-> `Content-Length` body), builds a **boxed `RawRequest`** value — raw RFC-faithful components (`path`/`query`
-> as possrep scalars, ordinality headers), passed as one pointer — calls the handler across the C ABI, reads
-> a **boxed `RawResponse`** back, and writes the reply. A handler whose body queries a `public relvar` pushed
+> RawRequest reshape, P1b, P4 (the payoff), and the cooked-`Request` transform (H1) have landed:** `coddl
+> emit-obj` produces a mainless object, and the `coddl-web` crate is a single-threaded `TcpListener` that
+> parses real HTTP requests (headers + `Content-Length` body), decodes the request-target and builds a
+> **boxed cooked `Request`** value — `path`/`query` as percent-decoded relations with the raw parts kept
+> alongside, passed as one pointer — calls the handler across the C ABI, reads a **boxed `RawResponse`** back,
+> and writes the reply. A handler whose body queries a `public relvar` pushed
 > to SQL, through the synthesized `coddl_app_init`/`coddl_app_shutdown` lifecycle, works end-to-end
 > (`examples/web-users/`). What remains is routing (a **userspace Coddl framework**, not host work — see the
 > design note below) and the deferred items at the end. It extends the first milestone: everything it relies
@@ -32,7 +33,7 @@ gunicorn (WSGI/ASGI) does. What they write is three things, and two of them are 
 |---|---|---|
 | Pydantic / Django model | relvar + `Tuple` heading | relational middle |
 | ORM query (`User.objects.filter(…)`) | a relational query, **pushed to SQL** ([sqlemit.md](sqlemit.md)) | relational middle |
-| `@app.get("/users")` handler | `oper handle { req: RawRequest } -> RawResponse` | relational middle |
+| `@app.get("/users")` handler | `oper handle { req: Request } -> RawResponse` | relational middle |
 | URL routing / dispatch (`urls.py`) | a userspace Coddl framework — `handle` delegates (see design note) | relational middle |
 | uvicorn accept loop + HTTP parse + JSON | the **Rust host** (`coddl-web`) | FFI bottom |
 
@@ -131,30 +132,43 @@ A request crosses the C ABI as ordinary Coddl values. The calling convention tha
 
 ### Argument (host → handler)
 
-A request is the raw, RFC-faithful `RawRequest` (`crates/coddl-stdlib/modules/coddl/web.cd`, opt-in via
-`use module coddl::web;`):
+A handler receives the **cooked `Request`** (`crates/coddl-stdlib/modules/coddl/web.cd`, opt-in via
+`use module coddl::web;`): the host decodes the raw request-target into queryable relations, so routing and
+path-param extraction are plain relational algebra with **no** dependency on Text primitives (ROADMAP D1 —
+decode *policy* sits in the host provisionally, reversible to userspace once those primitives land):
 
 ```
-RawRequest : Tuple { method: Text, path: RawRequestPath, query: RawRequestQuery,
-                     headers: OrderedNameValues, body: Text }
+Request : Tuple { method: Text, path: PathSegments, query: OrderedNameValues,
+                  headers: OrderedNameValues, raw_path: RawRequestPath,
+                  raw_query: RawRequestQuery, body: Text }
 ```
 
-`path` / `query` are **single-possrep scalar types** wrapping the raw (percent-encoded) octets — distinct
-domains, physically just their `Text`; `OrderedNameValues` is `Relation { name, value, ordinality: Integer }`
-(ordinality carries wire order). At **72 B**, `RawRequest` is **≥ the 64 B boxing threshold**, so it crosses
-the ABI **boxed**: one pointer to a name-sorted record `body@0 (Text), headers@16 (Relation ptr),
-method@24 (Text), path@40 (Text), query@56 (Text)`. So `oper handle { req: RawRequest }` lowers to
-`define ptr @handle(ptr %req)` and reads each field with an `AttrLoad` at its offset (`req.path.value` →
-`AttrLoad` at 40 then the possrep accessor). (This is the first ≥64 B *parameter*; both backends already
-implemented the boxed-param ABI for it — P2's boxing machinery just hadn't been exercised on the param side.)
+`path` is `PathSegments = Relation { ordinality: Integer, segment: Text }` — the URL path split on `/` and
+percent-decoded, one tuple per segment (a **relation, not a `Sequence`**: `ordinality` is a mandatory
+attribute, so `/a/a` stays two tuples; RM Pro 1). `query` is `OrderedNameValues = Relation { name, value,
+ordinality: Integer }` — the `&`-separated pairs, `+`→space and `%XX` decoded; `headers` is the same relation
+with names lowercased (ordinality carries wire order). `raw_path` / `raw_query` keep the original
+still-encoded target parts (single-possrep scalars wrapping the raw octets, physically `Text`) as an escape
+hatch — and make the record wide enough to stay boxed. The raw `RawRequest` type is retained in `web.cd` for
+a future raw-bytes need but is no longer what the host builds.
 
-The host builds the boxed `RawRequest` record by hand (`build_raw_request` in `coddl-web/src/main.rs`):
-`rc_text` cells for `method`/`path`/`query`/`body` and a hand-built `headers` relation (`build_headers`
-against the `OrderedNameValues` descriptor, one record per parsed header with its ordinality) — all *moved
-in* (rc = 1). A single-possrep scalar is physically its `Text`, so the host writes `path`/`query` as plain
-`Text` cells (byte-compatible with the compiler's internal 1-field-tuple view). The request-target is split
-at the first `?` into raw `path` / `query`. Because the record owns every cell, **one** `coddl_rc_release`
-of the record cascades through the drop walker and frees them all.
+At **88 B**, `Request` is **≥ the 64 B boxing threshold**, so it crosses the ABI **boxed**: one pointer to a
+name-sorted record `body@0 (Text), headers@16 (Relation ptr), method@24 (Text), path@40 (Relation ptr),
+query@48 (Relation ptr), raw_path@56 (Text), raw_query@72 (Text)`. So `oper handle { req: Request }` lowers
+to `define ptr @handle(ptr %req)` and reads a field with an `AttrLoad` at its offset — routing on the path is
+`req.path where ordinality = 0 and segment = "wiki"`, a plain relational query on the relation cell at
+offset 40. (These offsets are pinned to the compiler's `record_layout` by a test in `coddl-procir` and to the
+host's hand-written descriptor by a round-trip test in `coddl-web`, guarding the silent descriptor-mismatch.)
+
+The host builds the boxed `Request` record by hand (`build_request` in `coddl-web/src/main.rs`): `rc_text`
+cells for `method`/`body`/`raw_path`/`raw_query`, a `build_path_segments` relation for `path`, and
+`build_headers` relations for `query` and `headers` (against the `PathSegments` / `OrderedNameValues`
+descriptors, one record per element with its ordinality) — all *moved in* (rc = 1). The request-target is
+split at the first `?`; the path is then split on `/` and each segment percent-decoded **after** the split
+(so `/a%2Fb` is one segment `a/b`), and the query pairs are `+`→space + `%XX` decoded (pure helpers,
+unit-tested for the edge cases). Because the record owns every cell, **one** `coddl_rc_release` of the record
+cascades through the drop walker and frees them all — the three nested relations self-describe via their own
+RC-header descriptors, so the parent's Relation cells carry a null sub-descriptor.
 
 ### Return (handler → host)
 
@@ -164,7 +178,7 @@ of the record cascades through the drop walker and frees them all.
 data- and cardinality-preserving, so `TupleBox`/`TupleUnbox` round-trips are transparent). So
 
 ```
-oper handle { req: RawRequest } -> RawResponse
+oper handle { req: Request } -> RawResponse
 ```
 
 lowers to `define ptr @handle(ptr %req)` returning one pointer to a 32-byte record with the name-sorted
@@ -385,7 +399,7 @@ dependency of the database payoff (P4), **not** of the request/response plumbing
    1-field-tuple form so `req.path.value` lowers (`AttrLoad` → `TupleField`).
 
 7. **Routing — a userspace Coddl framework (not host work).** The host stays at **one `handle` symbol**; an
-   app's `handle` inspects the `RawRequest` and delegates, in Coddl (see the design note under Responsibilities).
+   app's `handle` inspects the cooked `Request` and delegates, in Coddl (see the design note under Responsibilities).
    Exact-path dispatch works today; ergonomic pattern/param routes wait on Coddl `Text` primitives, and
    relvar-driven dispatch-by-data on first-class `oper` references — both language features, not host
    workarounds.
@@ -408,7 +422,7 @@ dependency of the database payoff (P4), **not** of the request/response plumbing
    need it.
 
    ```
-   oper handle { _req: RawRequest } -> RawResponse [
+   oper handle { _req: Request } -> RawResponse [
        let active = transaction [ Users where active project { name, email } ];
        var rows;  load rows from active order [ asc name ];
        var body := "";
@@ -425,6 +439,18 @@ dependency of the database payoff (P4), **not** of the request/response plumbing
    "active" = ?`; the formatter canonicalizes to the bare form, so both must push). Proven by the hermetic
    e2e `app_init_drives_a_mainless_public_relvar_sql_query` (query pushed to SQL through the synthesized
    `coddl_app_init`, under the leak gate) and the manual `coddl-web` + `curl` flow above.
+
+10. **H1 — cooked `Request` transform. DONE.** The host now decodes the request-target and hands the handler
+    the cooked `Request` (above) instead of the raw `RawRequest`: `path` a percent-decoded
+    `PathSegments = { ordinality, segment }` relation, `query`/`headers` decoded `OrderedNameValues`, with
+    `raw_path`/`raw_query` kept alongside. So routing and path-param extraction are plain relational queries
+    (`req.path where ordinality = 0 and segment = "wiki"`) with **no** dependency on Text primitives (ROADMAP
+    D1). Carrying the raw parts keeps the record at 88 B — boxed, so the ABI stays `handle(ptr) -> ptr`
+    unchanged; only the host's descriptor + a decoding `build_request` changed. The offsets are pinned both
+    ways (a `record_layout` assertion in `coddl-procir`, a `build_request` round-trip in `coddl-web`);
+    percent/`+`/split-before-decode edge cases are unit-tested; and a probe handler reading `req.path` over the
+    real host echoes decoded segments (`/wiki/Home%20Page` → `Home Page`, `/a%2Fb/x` → one segment `a/b`).
+    Unblocks userspace routing (ROADMAP F1/F2).
 
 ## What's deferred
 

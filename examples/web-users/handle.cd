@@ -44,7 +44,7 @@ public relvar Users {
 
 // This handler lists every active user regardless of the request path, so it
 // ignores `req` (a real app's single `handle` would inspect it and route).
-oper handle{ _req: RawRequest } -> RawResponse [
+oper handle{ _req: Request } -> RawResponse [
     let active_users = transaction [
         var rows;
         let active = Users where active project { name, email };

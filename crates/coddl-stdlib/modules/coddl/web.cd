@@ -9,13 +9,19 @@ module web;
 // "coddl::web is vocabulary, not a framework".
 //
 // Routing lives in *userspace* Coddl — an app's single `handle` inspects the
-// request and delegates; this module ships neither a `Routes` relvar nor a
-// router. Decomposing the raw components (path -> segments, query -> pairs) is
-// likewise userspace and demand-driven: it encodes policy that frameworks decide
-// differently (percent-decoding, form-urlencoding, trailing slashes), so the base
-// types stay RAW and let userspace add the operators (UFCS dispatches on the
-// receiver's type, so a framework can hang `to_sequence` off `RawRequestPath`
-// from anywhere).
+// cooked request and delegates; this module ships neither a `Routes` relvar nor a
+// router.
+//
+// Design note: cooking is host-side, provisional (ROADMAP D1). Decomposing the
+// request-target (path -> segments, query -> pairs) is decode *policy* that
+// frameworks decide differently (percent-decoding, `+`->space, trailing slashes),
+// so ideally it lives in userspace. But userspace decomposition needs Text
+// primitives, which aren't built yet — so for now the host (coddl-web) does it and
+// hands the handler a cooked `Request` (below), keeping the raw `RawRequestPath` /
+// `RawRequestQuery` parts alongside as an escape hatch. This is reversible: once
+// Text primitives land, `Request` can be derived from `RawRequest` in this module
+// and the host reverts to raw-only. The raw scalar types below stay the stable
+// home for any userspace operators (UFCS dispatches on the receiver's type).
 
 // --- RFC 3986 raw components as distinct single-possrep types --------------------
 //
@@ -50,11 +56,48 @@ type RawRequestQuery { value: Text }; // e.g. "param=arg&three=5" (raw; RFC give
 // of a relation *type*; a relation value is duplicate-free by definition already.
 type OrderedNameValues = Relation { name: Text, value: Text, ordinality: Integer };
 
+// The raw, lossless request as the host first parses it — `path`/`query` are the
+// two request-target parts, still percent-encoded, each its own scalar type. Kept
+// as a named type for a future raw-bytes need; the handler receives the cooked
+// `Request` below, not this. (Host `coddl-web` no longer builds a `RawRequest`
+// value — see the "Design note: cooking is host-side, provisional" above.)
 type RawRequest = Tuple {
     method: Text,
     path: RawRequestPath,
     query: RawRequestQuery,
     headers: OrderedNameValues,
+    body: Text,
+};
+
+// --- The cooked request: what a handler actually receives -------------------
+//
+// The host (coddl-web) decodes the raw request-target into queryable relations so
+// routing and path-param extraction are plain relational algebra — with no
+// dependency on Text primitives (not yet built). This puts decode *policy* in the
+// host provisionally (ROADMAP D1): it is reversible to userspace Coddl once Text
+// primitives land, at which point `Request` can be derived from `RawRequest` in
+// this module and the host reverts to raw-only. Until then the host builds it.
+//
+// `path` is the URL path split on `/` and percent-decoded, one tuple per segment.
+// It is a relation, NOT a `Sequence`: `ordinality` is a mandatory *attribute* (an
+// ordinal attribute is data, RM Pro 1 — a bare `Sequence Text` would collapse
+// `/a/a` to one element), so `/a/a` stays `{(0,"a"),(1,"a")}`. Root `/` is the
+// empty relation. `load` it into a sequence at point of use for ordered iteration.
+type PathSegments = Relation { ordinality: Integer, segment: Text };
+
+// `query` reuses `OrderedNameValues`: `&`-separated pairs, `+`->space and `%XX`
+// decoded, `ordinality` = wire position. `raw_path`/`raw_query` carry the original
+// still-encoded target parts (the raw escape hatch) — so nothing is lost, and the
+// record is wide enough (88 B) to cross the C ABI as one boxed pointer, matching
+// the always-boxed `RawResponse` return. `headers` names are lowercased by the
+// host (HTTP header names are case-insensitive); `method`/`body` pass through raw.
+type Request = Tuple {
+    method: Text,
+    path: PathSegments,
+    query: OrderedNameValues,
+    headers: OrderedNameValues,
+    raw_path: RawRequestPath,
+    raw_query: RawRequestQuery,
     body: Text,
 };
 

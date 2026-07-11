@@ -79,9 +79,13 @@ direction, out of scope here.
 
 ## 2. Ground truth (RE-VERIFY — the tree moves)
 
-Snapshot as of the P4 commit (`55b7500`, "P4: relvar-backed web handler serving SQL query
-results over HTTP"); tree tip is now `33e68b9` (mandatory file-kind headers landed since).
-**Before trusting any line, re-check it** — instructions inline.
+Snapshot re-verified against `d689515` (A0); **H1 (cooked `Request`) landed on top of it (this
+commit).** The prose below
+was first snapshotted when `33e68b9` (file-kind headers) was the tip; since then L2 (`13345e6`)
+and A0 (`d689515`) landed, so re-verify each line. The commit hashes cited below are valid
+historical commits (P4 `55b7500`, headers `33e68b9`, …) — only §5's old A0 hash `0272695` was
+superseded by the current A0 commit `d689515`. **Before trusting any line, re-check it** —
+instructions inline.
 
 - **P4 works end-to-end.** A mainless `oper handle { _req: RawRequest } -> RawResponse`
   queries a public relvar pushed to SQL, `load`s the result, loops to build a `text/plain`
@@ -100,11 +104,12 @@ results over HTTP"); tree tip is now `33e68b9` (mandatory file-kind headers land
   `starts_with`/`replace`/`length`. String tools today: `||` concat, `s[i]` indexing,
   `cardinality`, `format`/`f"…"` interpolation. *Re-verify:* grep string-op names in
   `crates/coddl-types/src/builtins.rs` and `crates/coddl-stdlib/modules/coddl/core.cd`.
-- **Module resolution is STDLIB-ONLY.** `use module` resolves against the embedded
-  `coddl-stdlib` crate (`coddl_stdlib::resolve(ModulePath::parse("coddl::web"))`,
-  `crates/coddl-types/src/builtins.rs:~104`). No userspace/local `.cd`-imports-`.cd` path.
-  *Re-verify:* grep `resolve`/`ModulePath`/`use module` in `crates/coddl-types/src/` and
-  `crates/coddl-stdlib/src/`.
+- **Userspace module imports WORK (L2 DONE, `13345e6`).** `use module` resolves stdlib **and**
+  local sibling `.cd` files; imported opers lower into the importing unit's object with
+  module-scoped mangled symbols (`greet$hello`), so same-named private helpers don't collide;
+  ambiguous imports are T0092. Worked example: `examples/module-import/` (`greet.cd` + `app.cd`).
+  *Re-verify:* `imported_opers`/`resolve_modules`/`T0092` in `crates/coddl-types/src/checker.rs`;
+  run `coddl run examples/module-import/app.cd`.
 - **File-kind headers are now mandatory (`33e68b9`).** Every `.cd` opens with a
   `program` / `library` / `module` header (diagnostics PL0012–PL0015); a web-handler file is
   a `library` (or `module`), and lifecycle emission keys off that declared kind — see
@@ -126,11 +131,14 @@ results over HTTP"); tree tip is now `33e68b9` (mandatory file-kind headers land
   works is **not yet tested** — same "synthesized-but-unexercised" risk class P4's read
   path was. *Re-verify:* `examples/insert-update-delete/`, and search e2e for a
   mainless/web write test (likely none yet).
-- **Host: one `handle` symbol, `RawRequest`/`RawResponse` over the boxed C ABI.** `path`/
-  `query` are **raw, percent-encoded** possrep scalars (`.value` is `Text`); `headers` is
-  an `OrderedNameValues` relation; `body` is `Text`. Response headers flow back; framing
-  headers host-owned. Handler linked via `CODDL_APP_OBJ` (build.rs). *Re-verify:*
-  `crates/coddl-web/src/main.rs`, `crates/coddl-stdlib/modules/coddl/web.cd`.
+- **Host: one `handle` symbol, cooked `Request`/`RawResponse` over the boxed C ABI (H1 done,
+  working tree).** `path` is a percent-decoded `PathSegments = {ordinality, segment}` relation;
+  `query`/`headers` are decoded `OrderedNameValues` relations (header names lowercased);
+  `raw_path`/`raw_query` keep the raw percent-encoded target parts; `method`/`body` are `Text`.
+  `Request` is 88 B → boxed, ABI `handle(ptr) -> ptr` unchanged. `RawRequest` stays defined but
+  the host no longer builds it. Response headers flow back; framing headers host-owned. Handler
+  linked via `CODDL_APP_OBJ` (build.rs). *Re-verify:* `crates/coddl-web/src/main.rs`,
+  `crates/coddl-stdlib/modules/coddl/web.cd`.
 - **Runtime is single-threaded** (global Mutex registries, one connection per db, atomic
   tx-depth). Concurrency is deferred. *Re-verify:* `docs/webhost.md` "What's deferred".
 
@@ -188,7 +196,7 @@ Legend: `[status] ID (LAYER) — title` · `Depends on:` · `Unblocks:` · `Acce
 
 ### Phase P0 — Scaffold (prove the app skeleton on the P4 foundation)
 
-- `[x] A0 (APP) — Wiki scaffold + models.` DONE (commit `0272695`) — `examples/wiki/`
+- `[x] A0 (APP) — Wiki scaffold + models.` DONE (commit `d689515`) — `examples/wiki/`
   now mirrors `examples/web-users/` (`wiki.cd` + `wiki.cddb` + `wiki.cdstore` + `seed-db.sh`
   + `.gitignore`); a mainless `handle` serves the hardcoded `home` page as `text/html`
   (verified: `curl -si localhost:8000/` → `200`, `Content-Type: text/html`, `<h1>Home</h1>`).
@@ -226,7 +234,20 @@ The keystone phase. Routing rides **H1** (a host transform — no L1); safe rend
   path and rebuilds a string in-process, leak-gated; a golden-SQL test showing one op
   pushing to SQLite. **This is the highest-leverage item in the whole roadmap.**
 
-- `[ ] H1 (HOST) — raw→cooked Request transform.`
+- `[x] H1 (HOST) — raw→cooked Request transform.` DONE (this commit) —
+  `coddl-web` decodes the request-target and builds the cooked `Request`: `path` a
+  percent-decoded `PathSegments = {ordinality, segment}` relation, `query`/`headers` decoded
+  `OrderedNameValues` (header names lowercased), `raw_path`/`raw_query` kept alongside. Handler
+  param `RawRequest` -> `Request` in `web.cd` + both example handlers. **Design 1** chosen (carry
+  cooked + raw so `Request` is 88 B → boxed → host ABI `handle(ptr)->ptr` unchanged; only the
+  descriptor + `build_request` changed) over cooked-only (56 B → the compiler flattens it into
+  ~7 scalar args). Decode is pure Rust helpers (`percent_decode`, `query_component_decode`,
+  `split_path_segments`, `parse_query_pairs`). Dot-segment normalization NOT done (non-goal:
+  DB-backed slugs, no filesystem traversal). Verified: decode unit tests + `build_request`
+  round-trip (coddl-web) + a `record_layout` layout assertion (coddl-procir) pin the 88 B/offsets
+  on both ABI sides; 205 driver e2e green; a probe handler reading `req.path` over real
+  `coddl-web` echoes decoded segments (`/wiki/Home%20Page` -> `Home Page`; split-before-decode
+  `/a%2Fb/x` -> one segment `a/b`; `?query` stripped). Unblocks F1, F2. Original spec:
   One Rust function in `coddl-web` that turns the parsed wire request into a **cooked
   `Request`** value (D1), hand-marshalled like `RawRequest` (reuse `build_headers` + a
   `{ordinality, segment}` descriptor; `split_target` already exists). It builds:
@@ -303,15 +324,19 @@ The keystone phase. Routing rides **H1** (a host transform — no L1); safe rend
 
 ### Phase P2 — Make the framework real (physical seam)
 
-- `[~] L2 (LANG) — Userspace module imports.`
-  The file-kind-header foundation (`program`/`library`/`module`, PL0012–PL0015) landed
-  (`33e68b9`); L2 proper — local module resolution + import + name mangling — remains.
-  Let one userspace `.cd` import another (app `use`s a framework `.cd`) — today `use module`
-  resolves only stdlib (§2). Design: local module path resolution in the driver + checker
-  (`crates/coddl-types` module machinery, `crates/coddl-driver`), without privileging the
-  framework as stdlib. Interacts with the `emit-obj`/single-compilation-unit model — decide
-  whether it's multi-file-one-program or true separate modules.
-  Depends on: — (independent LANG work; can proceed anytime). Unblocks: F-extract, D4.
+- `[x] L2 (LANG) — Userspace module imports.` DONE (commit `13345e6`) — local `.cd`-imports-
+  `.cd` resolution + separate-unit lowering with module-scoped mangled symbols (`greet$hello`).
+  The file-kind-header foundation (`program`/`library`/`module`, PL0012–PL0015) was the
+  precursor; L2 proper (local module path resolution in the checker/driver + import + name
+  mangling) then landed. `use module greet;` resolves a sibling `greet.cd`; imported opers lower
+  into the importing unit's object; same-named private helpers don't collide; ambiguous imports
+  are T0092. Worked example: `examples/module-import/` (`greet.cd` + `app.cd`, runs on both
+  backends). Unblocks: F-extract, D4. Original spec:
+  Let one userspace `.cd` import another (app `use`s a framework `.cd`). Design: local module
+  path resolution in the driver + checker (`crates/coddl-types` module machinery,
+  `crates/coddl-driver`), without privileging the framework as stdlib. Interacts with the
+  `emit-obj`/single-compilation-unit model — decide whether it's multi-file-one-program or true
+  separate modules.
   Acceptance: a two-file example where `app.cd` calls an oper defined in `lib.cd` via an
   import, compiles and runs; docs updated.
 
