@@ -309,6 +309,34 @@ fn build_imported(
     imported
 }
 
+/// A deferred heap release (see [`Lowerer::deferred_relation_releases`]). Two
+/// producers register these, differing only in where the release lands:
+///
+/// - **`extract` source** (`Kind::ExtractSource`): the extracted relation, whose
+///   cells are copied out as borrowed `(ptr,len)` and normally *consumed* within
+///   the same `if`-arm (`format`/`||`/scalar read). Released at that arm's exit.
+/// - **Unbox box** (`Kind::UnboxBox { flat }`): the boxed pointer a small-tuple
+///   `oper` call returns, unboxed into the flattened value `flat` (whose cells
+///   borrow the box). Released at the enclosing arm's exit too — **unless**
+///   `flat` is the arm's escaping tail value (the raw call result flows through
+///   the merge), in which case it must outlive the arm and stays deferred to the
+///   function epilogue (still ROADMAP L8: merging a raw boxed call result
+///   through an `if`). A `flat` consumed within the arm — bound and field-read,
+///   or embedded with a retaining copy — does *not* escape, so its box releases
+///   at arm exit, dominated by its def.
+#[derive(Clone, Copy)]
+struct DeferredRelease {
+    /// The relation / box payload to `Release`.
+    src: ValueId,
+    kind: DeferredKind,
+}
+
+#[derive(Clone, Copy)]
+enum DeferredKind {
+    ExtractSource,
+    UnboxBox { flat: ValueId },
+}
+
 struct Lowerer {
     program_name: String,
     /// Whether this compilation unit's header is `program` (vs `library` /
@@ -514,26 +542,20 @@ struct Lowerer {
     /// consumption drain *removes* on release, so an aliased or duplicated
     /// binding (`let x = y`, two names for one flattened owner) releases once.
     flattened_heading_owners: HashSet<ValueId>,
-    /// Heap temporaries whose release is deferred past their producer because a
+    /// Heap payloads whose release is deferred past their producer because a
     /// later value *borrows* their cells: `extract` copies a record's cells into
     /// a tuple as borrowed `(ptr,len)` values, and a boxed-tuple call return is
     /// unboxed into a flattened borrowed value. Releasing the source at once
     /// would dangle those cells, so the release waits until every borrowing use
-    /// is past.
+    /// is past. See [`DeferredRelease`] for where each kind releases — the
+    /// governing rule is that the `Release` must stay **dominated by the
+    /// producer**, so an entry created inside an `if`-arm releases at that arm's
+    /// exit (which the arm dominates), never at the `if`-merge / function
+    /// epilogue (which it does not).
     ///
-    /// The `bool` is `true` when the source may be released at the end of an
-    /// enclosing `if`-arm — the `extract` case, whose borrowed cells are normally
-    /// *consumed* within the arm (copied into a fresh `Text` by `format`/`||`, or
-    /// read as a scalar). Draining it there keeps the release dominated by its
-    /// def; draining at the true epilogue — the `if`-merge block, which the arm
-    /// does not dominate — would be an SSA violation. It is `false` for an
-    /// unbox'd call return, whose borrowed cells *escape* the arm (they are the
-    /// arm's result), so its release must stay at the function epilogue; an
-    /// unbox inside an arm therefore still fails to lower (ROADMAP L8's other
-    /// half — merging an `oper` call's boxed result through an `if`).
-    ///
-    /// Drained (every entry) in `lower_oper_decl` and the helper epilogues.
-    deferred_relation_releases: Vec<(ValueId, bool)>,
+    /// Drained (every remaining entry) in `lower_oper_decl` and the helper
+    /// epilogues.
+    deferred_relation_releases: Vec<DeferredRelease>,
     /// Signatures of every user-defined `oper`, collected in a pre-pass over
     /// `lower_root` before any body is lowered, so a call to an operator
     /// defined later in the file still resolves. `lower_call` consults this
@@ -1083,8 +1105,8 @@ impl Lowerer {
     /// current instruction stream (the function/helper epilogue). The list is
     /// drained, so it's safe to call once per function or helper body.
     fn drain_deferred_relation_releases(&mut self) {
-        for (src, _) in std::mem::take(&mut self.deferred_relation_releases) {
-            self.insts.push(Inst::Release { src });
+        for d in std::mem::take(&mut self.deferred_relation_releases) {
+            self.insts.push(Inst::Release { src: d.src });
         }
     }
 
@@ -1990,11 +2012,14 @@ impl Lowerer {
 
         // Unwind every active scope's heap locals (not just the top one).
         self.release_all_scopes_heap_locals();
-        // Release every pending deferred `extract`-source relation on this
-        // path. The list is cloned, not drained: sibling fall-through paths
-        // still release the same sources at their own arm-end / epilogue.
-        for (src, _) in self.deferred_relation_releases.clone() {
-            self.insts.push(Inst::Release { src });
+        // Release every pending deferred source/box on this path. The list is
+        // cloned, not drained: sibling fall-through paths still release the same
+        // entries at their own arm-end / epilogue. Every remaining entry is
+        // dominated by this return — an arm-scoped entry releases at its own
+        // arm's exit (so a *sibling* arm's entry is already gone), leaving only
+        // this arm's own and enclosing-scope entries, all defined before here.
+        for d in self.deferred_relation_releases.clone() {
+            self.insts.push(Inst::Release { src: d.src });
         }
 
         self.finish_block(Terminator::Return(value));
@@ -3570,28 +3595,32 @@ impl Lowerer {
                 self.retain_if_escaping_local(val);
                 self.release_top_scope_heap_locals();
                 self.pop_local_scope();
-                // Release this arm's *arm-local* deferred sources (the `extract`
-                // sources, tagged `true`) here in the arm block: their def is in
-                // this block, so releasing them at the true epilogue — the
-                // if-merge block, which the arm does not dominate — would be an
-                // SSA violation. This is correct when the extracted cells are
-                // consumed within the arm (the common case: `format`/`||` copy
-                // them into a fresh owned `Text`, or a scalar field is read); a
-                // bound-local escape is retained by `retain_if_escaping_local`
-                // above. Non-arm-local deferrals (tagged `false` — an unbox'd
-                // call return, whose cells escape the arm) are left in place for
-                // the true epilogue, so an unbox inside an arm still fails to
-                // lower (ROADMAP L8's other half).
+                // Release this arm's deferred sources/boxes *here in the arm
+                // block*, where their def dominates the release — the true
+                // epilogue is the if-merge block, which the arm does not
+                // dominate, so a release there is an SSA violation. An `extract`
+                // source releases here (its borrowed cells are consumed within
+                // the arm: `format`/`||`/scalar read). An unbox'd call return's
+                // box releases here too, *unless* its flattened value `flat` is
+                // the arm's escaping tail (`val`) — then the raw result flows
+                // through the merge and the box must outlive the arm, so it stays
+                // deferred to the epilogue (still ROADMAP L8: merging a raw boxed
+                // call result through an `if`). A `flat` bound-and-field-read or
+                // embedded-with-copy does *not* escape, so its box releases here.
                 let tail = self.deferred_relation_releases.split_off(deferred_mark);
-                let mut arm_sources = Vec::new();
-                for (src, arm_local) in tail {
-                    if arm_local {
-                        arm_sources.push(src);
+                let mut arm_releases = Vec::new();
+                for d in tail {
+                    let releases_here = match d.kind {
+                        DeferredKind::ExtractSource => true,
+                        DeferredKind::UnboxBox { flat } => flat != val,
+                    };
+                    if releases_here {
+                        arm_releases.push(d.src);
                     } else {
-                        self.deferred_relation_releases.push((src, arm_local));
+                        self.deferred_relation_releases.push(d);
                     }
                 }
-                for src in arm_sources {
+                for src in arm_releases {
                     self.insts.push(Inst::Release { src });
                 }
                 (val, false, owns_cells)
@@ -5021,10 +5050,12 @@ impl Lowerer {
                     .iter()
                     .any(|layer| layer.values().any(|(vid, _)| *vid == src));
                 if !is_owned {
-                    // `true`: an `extract` source may be released at an enclosing
-                    // if-arm's end (its borrowed cells are normally consumed
-                    // within the arm).
-                    self.deferred_relation_releases.push((src, true));
+                    // An `extract` source releases at an enclosing if-arm's end
+                    // (its borrowed cells are normally consumed within the arm).
+                    self.deferred_relation_releases.push(DeferredRelease {
+                        src,
+                        kind: DeferredKind::ExtractSource,
+                    });
                 }
                 dst
             }
@@ -6501,12 +6532,16 @@ impl Lowerer {
                 src: box_v,
                 heading_id,
             });
-            // `false`: the unbox'd cells escape as the surrounding value, so the
-            // box must live to the true epilogue — it cannot be released at an
-            // if-arm's end (its result flows through the merge). Merging an `oper`
-            // call's boxed result through an `if` therefore still fails to lower
-            // (ROADMAP L8).
-            self.deferred_relation_releases.push((box_v, false));
+            // Defer the box's release, carrying `flat` so an enclosing if-arm
+            // exit can release the box *there* (dominated by this call) once
+            // `flat`'s borrowed cells are consumed within the arm — unless `flat`
+            // is the arm's escaping tail, in which case the box stays deferred to
+            // the epilogue (merging a raw boxed call result through an `if` is
+            // still ROADMAP L8). Straight-line code drains it at the epilogue.
+            self.deferred_relation_releases.push(DeferredRelease {
+                src: box_v,
+                kind: DeferredKind::UnboxBox { flat },
+            });
             return flat;
         }
         dst.unwrap_or_else(|| {

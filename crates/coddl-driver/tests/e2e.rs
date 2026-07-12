@@ -75,6 +75,7 @@ fn fixtures_dir() -> &'static Path {
             ("if-carried-text", IF_CARRIED_TEXT_SRC),
             ("return-early", RETURN_EARLY_SRC),
             ("nameref-tuple-cell", NAMEREF_TUPLE_CELL_SRC),
+            ("unbox-in-arm", UNBOX_IN_ARM_SRC),
         ] {
             std::fs::write(tmp.path().join(format!("{name}.cd")), src)
                 .unwrap_or_else(|e| panic!("write {name}.cd fixture: {e}"));
@@ -428,6 +429,39 @@ oper main {} [
     write_relation { rel: rel_cell {} };
     write_line { message: alias {} };
     write_line { message: nested {} };
+];
+";
+
+// Binding a small-tuple `oper` call result inside an `if` arm and reading its
+// fields (the wiki `/wiki/{slug}` shape). The call returns a boxed pointer that
+// the caller unboxes into a flattened value borrowing the box's cells; the box
+// release is deferred. When this happens inside an arm, the box must release at
+// that *arm's* exit (dominated by the call), NOT the function epilogue / merge
+// block (which the arm doesn't dominate) — and a *sibling* arm's early `return`
+// must not drain it either. `pick` mirrors the wiki: `let r = mk{}` in the then
+// arm seeds `code`/`body` defaults, a nested `if` overrides them, and the else
+// arm early-returns. Non-immortal (`||`) cells + the leak gate catch an over- or
+// under-release; without the arm-exit release the run fails to lower at all
+// (`mk()` release doesn't dominate its uses).
+const UNBOX_IN_ARM_SRC: &str = "\
+program unbox_in_arm;
+oper mk { n: Integer } -> Tuple { code: Integer, msg: Text } [ { code: n, msg: \"def\" || \"ault\" } ];
+oper pick { hit: Boolean, found: Boolean } -> Text [
+    let picked = if hit then [
+        let r = mk { n: 404 };
+        var code := r.code;
+        var body := r.msg;
+        if found then [ code := 200; body := \"x\" || \"y\"; ];
+        { code, body }
+    ] else [
+        return \"early\";
+    ];
+    picked.body
+];
+oper main {} [
+    write_line { message: pick { hit: true, found: true } };
+    write_line { message: pick { hit: true, found: false } };
+    write_line { message: pick { hit: false, found: false } };
 ];
 ";
 
@@ -2138,6 +2172,15 @@ fn nameref_tuple_cell_ownership_is_leak_clean() {
         "nameref-tuple-cell",
         b"Welcome\nno\naabb\nccdd\nhello\n{m: \"row\"}\nalias\nnest\n",
     );
+}
+
+// Binding a boxed small-tuple `oper` call result inside an `if` arm and reading
+// its fields (the wiki `/wiki/{slug}` shape) — the deferred backing-box release
+// must land at the arm's exit, dominated by the call, not the merge/epilogue.
+// Runs under the leak gate on both backends.
+#[test]
+fn unbox_in_if_arm_lowers_and_is_leak_clean() {
+    assert_both_backends("unbox-in-arm", b"xy\ndefault\nearly\n");
 }
 
 // ROADMAP L8: a deferred `extract`-source release lands inside the `if` arm (not
