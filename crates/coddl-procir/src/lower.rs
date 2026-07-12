@@ -485,15 +485,26 @@ struct Lowerer {
     /// record's retain-on-store of a temp consumed into a cell. A standalone
     /// tuple's entry is never drained (its temps flow out via `.field`).
     tuple_cell_heap_temps: HashMap<ValueId, Vec<ValueId>>,
-    /// Relation temporaries whose release is deferred to **function** scope
-    /// exit. `extract` copies a record's cells into a tuple as *borrowed*
-    /// `(ptr,len)` values, then the source relation would normally be released
-    /// at once — but the relation drop walker now frees its `Text` cells, which
-    /// the borrowed fields still point at. Deferring the source's release to the
-    /// function epilogue keeps those cells alive past every use (including after
-    /// a `transaction [...]` the extract sat inside), with no leak (it *is*
-    /// released, just last). Drained in `lower_oper_decl`.
-    deferred_relation_releases: Vec<ValueId>,
+    /// Heap temporaries whose release is deferred past their producer because a
+    /// later value *borrows* their cells: `extract` copies a record's cells into
+    /// a tuple as borrowed `(ptr,len)` values, and a boxed-tuple call return is
+    /// unboxed into a flattened borrowed value. Releasing the source at once
+    /// would dangle those cells, so the release waits until every borrowing use
+    /// is past.
+    ///
+    /// The `bool` is `true` when the source may be released at the end of an
+    /// enclosing `if`-arm — the `extract` case, whose borrowed cells are normally
+    /// *consumed* within the arm (copied into a fresh `Text` by `format`/`||`, or
+    /// read as a scalar). Draining it there keeps the release dominated by its
+    /// def; draining at the true epilogue — the `if`-merge block, which the arm
+    /// does not dominate — would be an SSA violation. It is `false` for an
+    /// unbox'd call return, whose borrowed cells *escape* the arm (they are the
+    /// arm's result), so its release must stay at the function epilogue; an
+    /// unbox inside an arm therefore still fails to lower (ROADMAP L8's other
+    /// half — merging an `oper` call's boxed result through an `if`).
+    ///
+    /// Drained (every entry) in `lower_oper_decl` and the helper epilogues.
+    deferred_relation_releases: Vec<(ValueId, bool)>,
     /// Signatures of every user-defined `oper`, collected in a pre-pass over
     /// `lower_root` before any body is lowered, so a call to an operator
     /// defined later in the file still resolves. `lower_call` consults this
@@ -829,15 +840,15 @@ impl Lowerer {
     /// The outer `var`s reassigned within `body`, captured as
     /// `(name, pre-join value, type)` for block-parameter threading across a
     /// control-flow join (a loop back-edge or an `if` merge). Value-typed vars
-    /// thread with no refcount work. When `allow_text` is set (the loop forms),
-    /// an owned `Text` carry is threaded too — the caller marks its header param
-    /// owned so the per-iteration old-value release fires and the final value is
-    /// released once at scope exit. A carried var of a heap-managed type
-    /// (relation/sequence/boxed tuple), or a `Text` when `allow_text` is unset
-    /// (the `if` merge), is **not yet lowered** — refcount-correct heap mutation
-    /// across that join is future work — so each emits T0076 at `span` and is
-    /// excluded (the error makes the IR unsafe to run, so the body's own
-    /// straight-line rebind never executes).
+    /// thread with no refcount work. When `allow_text` is set (both the loop
+    /// forms and the `if` merge), an owned `Text` carry is threaded too — the
+    /// caller marks the join's block param owned so the old-value release fires
+    /// on reassignment and the final value is released once at scope exit. A
+    /// carried var of a heap-managed type (relation/sequence/boxed tuple), or a
+    /// `Text` when `allow_text` is unset, is **not yet lowered** — refcount-
+    /// correct heap mutation across that join is future work — so each emits
+    /// T0076 at `span` and is excluded (the error makes the IR unsafe to run, so
+    /// the body's own straight-line rebind never executes).
     fn carried_value_vars(
         &mut self,
         bodies: &[Option<&Block>],
@@ -1023,7 +1034,7 @@ impl Lowerer {
     /// current instruction stream (the function/helper epilogue). The list is
     /// drained, so it's safe to call once per function or helper body.
     fn drain_deferred_relation_releases(&mut self) {
-        for src in std::mem::take(&mut self.deferred_relation_releases) {
+        for (src, _) in std::mem::take(&mut self.deferred_relation_releases) {
             self.insts.push(Inst::Release { src });
         }
     }
@@ -2935,13 +2946,16 @@ impl Lowerer {
         let then_body = ife.then_body();
         let else_body = ife.else_body();
 
-        // Value-typed outer vars reassigned in either arm are carried through
-        // the merge as block parameters — the SSA join of the two edges. The
-        // not-taken edge forwards the pre-`if` value (a missing `else` gets an
-        // explicit skip block for that, since `CondBr` carries no args).
-        // Captured before the arms rebind `locals`.
+        // Value-typed *and* owned-`Text` outer vars reassigned in either arm are
+        // carried through the merge as block parameters — the SSA join of the two
+        // edges. The not-taken edge forwards the pre-`if` value (a missing `else`
+        // gets an explicit skip block for that, since `CondBr` carries no args).
+        // Captured before the arms rebind `locals`. `allow_text = true` threads an
+        // owned `Text` carry the way the loop forms do (the carried merge param is
+        // marked owned below); a heap-managed carry (relation/sequence/boxed
+        // tuple) still emits T0076.
         let carried =
-            self.carried_value_vars(&[then_body.as_ref(), else_body.as_ref()], span, false);
+            self.carried_value_vars(&[then_body.as_ref(), else_body.as_ref()], span, true);
 
         let cond = self.lower_expr(&cond_expr);
 
@@ -3060,6 +3074,14 @@ impl Lowerer {
         for (name, _, cty) in &carried {
             let p = self.fresh_value();
             self.record_type(p, cty.clone());
+            // An owned `Text` carry: mark the merge param owned so the merged
+            // var's value is released once at the enclosing scope exit and a
+            // later reassignment releases the old param (mirrors the loop header
+            // param and the join-value mark above). A pre-`if` immortal-literal
+            // edge is safe — releasing an immortal `Text` is a runtime no-op.
+            if matches!(cty, ProcType::Text) {
+                self.mark_text_owned(p);
+            }
             params.push((p, cty.clone()));
             carried_params.push((name.clone(), p, cty.clone()));
         }
@@ -3136,6 +3158,15 @@ impl Lowerer {
     fn lower_if_arm(&mut self, block: Option<Block>) -> ValueId {
         match block {
             Some(b) => {
+                // Deferred `extract`-source releases registered *within* this arm
+                // must be emitted here, in the arm block, not drained at the
+                // function epilogue: the epilogue is the merge block, which the
+                // arm does not dominate, so releasing an arm-local source there
+                // is an SSA violation (a use of a value the other edge never
+                // defined). Only this arm's deferrals are drained (everything
+                // added since `deferred_mark`); deferrals from an enclosing scope
+                // stay for that scope's own drain.
+                let deferred_mark = self.deferred_relation_releases.len();
                 self.push_local_scope();
                 let val = self.lower_block(&b);
                 // The arm's tail value always flows out to the merge block, so
@@ -3144,6 +3175,30 @@ impl Lowerer {
                 self.retain_if_escaping_local(val);
                 self.release_top_scope_heap_locals();
                 self.pop_local_scope();
+                // Release this arm's *arm-local* deferred sources (the `extract`
+                // sources, tagged `true`) here in the arm block: their def is in
+                // this block, so releasing them at the true epilogue — the
+                // if-merge block, which the arm does not dominate — would be an
+                // SSA violation. This is correct when the extracted cells are
+                // consumed within the arm (the common case: `format`/`||` copy
+                // them into a fresh owned `Text`, or a scalar field is read); a
+                // bound-local escape is retained by `retain_if_escaping_local`
+                // above. Non-arm-local deferrals (tagged `false` — an unbox'd
+                // call return, whose cells escape the arm) are left in place for
+                // the true epilogue, so an unbox inside an arm still fails to
+                // lower (ROADMAP L8's other half).
+                let tail = self.deferred_relation_releases.split_off(deferred_mark);
+                let mut arm_sources = Vec::new();
+                for (src, arm_local) in tail {
+                    if arm_local {
+                        arm_sources.push(src);
+                    } else {
+                        self.deferred_relation_releases.push((src, arm_local));
+                    }
+                }
+                for src in arm_sources {
+                    self.insts.push(Inst::Release { src });
+                }
                 val
             }
             None => {
@@ -4524,7 +4579,10 @@ impl Lowerer {
                     .iter()
                     .any(|layer| layer.values().any(|(vid, _)| *vid == src));
                 if !is_owned {
-                    self.deferred_relation_releases.push(src);
+                    // `true`: an `extract` source may be released at an enclosing
+                    // if-arm's end (its borrowed cells are normally consumed
+                    // within the arm).
+                    self.deferred_relation_releases.push((src, true));
                 }
                 dst
             }
@@ -5970,7 +6028,12 @@ impl Lowerer {
                 src: box_v,
                 heading_id,
             });
-            self.deferred_relation_releases.push(box_v);
+            // `false`: the unbox'd cells escape as the surrounding value, so the
+            // box must live to the true epilogue — it cannot be released at an
+            // if-arm's end (its result flows through the merge). Merging an `oper`
+            // call's boxed result through an `if` therefore still fails to lower
+            // (ROADMAP L8).
+            self.deferred_relation_releases.push((box_v, false));
             return flat;
         }
         dst.unwrap_or_else(|| {
@@ -6864,13 +6927,30 @@ mod tests {
     }
 
     #[test]
-    fn text_var_carried_across_if_diagnoses_t0076() {
-        // Text-carried across a *loop* now lowers, but across an `if` merge it
-        // is still deferred (refcount-correct heap mutation across that join is
-        // future work) — it remains a lowering error, not a miscompile.
+    fn text_var_carried_across_if_now_lowers() {
+        // A `Text` var reassigned across an `if` merge is carried as an owned
+        // merge block param (mirrors the loop-carried `Text` case) — no longer a
+        // T0076 error.
         let src = "program p;\n\
                    oper main {} [ var s := \"a\"; \
                    if true then [ s := s || \"b\"; ] else [ s := s || \"c\"; ]; let _z = s; ];";
+        let out = lower(src, FileId(0));
+        assert!(
+            !out.diagnostics.iter().any(|d| d.code == "T0076"),
+            "unexpected T0076: {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn heap_var_carried_across_if_still_diagnoses_t0076() {
+        // A heap-managed (relation/sequence/boxed-tuple) `var` reassigned across
+        // an `if` merge is still deferred — refcount-correct heap mutation for
+        // those across the join is future work — so it stays a lowering error.
+        let src = "program p;\n\
+                   oper main {} [ var r := Relation { { a: 1 } }; \
+                   if true then [ r := Relation { { a: 2 } }; ] \
+                   else [ r := Relation { { a: 3 } }; ]; let _z = r; ];";
         let out = lower(src, FileId(0));
         assert!(
             out.diagnostics.iter().any(|d| d.code == "T0076"),

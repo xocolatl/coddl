@@ -141,6 +141,19 @@ instructions inline.
   `crates/coddl-stdlib/modules/coddl/web.cd`.
 - **Runtime is single-threaded** (global Mutex registries, one connection per db, atomic
   tx-depth). Concurrency is deferred. *Re-verify:* `docs/webhost.md` "What's deferred".
+- **Deferred heap-source release inside a merged if-branch (L8, partly fixed).** `extract`-in-
+  branch now lowers (the source release is drained inside the arm) — the wiki home route `extract`s
+  in-branch; *re-verify:* e2e `extract_source_release_lands_in_if_arm`. STILL failing: merging an
+  `oper` CALL's boxed result through an if (`if c then [ f{} ] else [ g{} ]`, route sub-oper
+  dispatch) — kept a hard error, not silent-wrong. So the router merges a `{status, body}`
+  **literal** and calls one builder after the dispatch (see F1). *Re-verify:* `emit-obj` two
+  `oper`s returning `RawResponse` literals merged through an if.
+- **Reassigning a heap `Text` `var` across an `if` merge now lowers (T0076 lifted for `Text`).**
+  `var body := ""; if … then [ body := format{…} ]` compiles on both backends, RC-balanced (mirrors
+  the loop-carried-`Text` lift — the carried `Text` merge param is marked owned). Relation/sequence/
+  boxed-tuple carries across a join, and the `introduced`-var case (a `var x;` first-assigned in both
+  arms), stay T0076. *Re-verify:* e2e `if_carried_text_var_lowers_and_is_leak_clean`; the wiki home
+  route's guarded `var body`. Enables the wiki's graceful maybe-absent-home rendering.
 
 ---
 

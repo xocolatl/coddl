@@ -71,6 +71,8 @@ fn fixtures_dir() -> &'static Path {
                 BOXED_TUPLE_TRANSIENT_FIELDS_SRC,
             ),
             ("fresh-relation-write", FRESH_RELATION_WRITE_SRC),
+            ("extract-in-if-arm", EXTRACT_IN_IF_ARM_SRC),
+            ("if-carried-text", IF_CARRIED_TEXT_SRC),
         ] {
             std::fs::write(tmp.path().join(format!("{name}.cd")), src)
                 .unwrap_or_else(|e| panic!("write {name}.cd fixture: {e}"));
@@ -262,6 +264,77 @@ const FRESH_RELATION_WRITE_SRC: &str = "\
 program fresh_relation_write;
 oper main {} [
     write_relation { rel: Relation { { a: 1 }, { a: 2 } } };
+];
+";
+
+// `extract` inside an `if` arm: the extracted source relation is a temporary
+// whose release is deferred (its cells are borrowed by the tuple). That release
+// must be emitted *inside the arm* (dominated by its def), not at the function
+// epilogue — the `if`-merge block, which the arm doesn't dominate — or the SSA is
+// invalid and neither backend can lower it (ROADMAP L8). Here `t.v` (a borrowed,
+// non-immortal `Text`) is consumed by `||` into a fresh owned result before the
+// source is released, so the run is leak-clean under the default gate.
+const EXTRACT_IN_IF_ARM_SRC: &str = "\
+program extract_in_if_arm;
+oper describe { flag: Boolean } -> Text [
+    if flag then [
+        let t = extract (Relation { { k: \"a\", v: \"wor\" || \"ld\" } } where k = \"a\");
+        \"[\" || t.v || \"]\"
+    ] else [
+        \"none\"
+    ]
+];
+oper main {} [
+    write_line { message: describe { flag: true } };
+    write_line { message: describe { flag: false } };
+];
+";
+
+// Reassigning a heap-typed (`Text`) `var` across an `if` merge — the sibling of
+// the loop-carried `Text` lift (see `TEXT_ACCUM_SRC`). Each carried `Text` is
+// non-immortal (`||`) so releases actually free; `assert_both_backends` runs
+// under the leak gate, so an RC imbalance trips the run. Covers: (c1) then-only
+// reassign / no else, forwarding the pre-`if` value on the skip edge; (c2) both
+// arms reassign; (c3) alias reassign; (c4) the arm tail value *is* the carried
+// var (value-param and carried-param both own it); (c5) the nested body-building
+// idiom (extract + `format` into a carried `Text`) the wiki home route uses.
+const IF_CARRIED_TEXT_SRC: &str = "\
+program if_carried_text;
+oper c1 { flag: Boolean } -> Text [
+    var b := \"x\" || \"y\";
+    if flag then [ b := \"a\" || \"b\"; ];
+    b
+];
+oper c2 { flag: Boolean } -> Text [
+    var b := \"x\" || \"y\";
+    if flag then [ b := \"a\" || \"b\"; ] else [ b := \"c\" || \"d\"; ];
+    b
+];
+oper c3 { flag: Boolean } -> Text [
+    var b := \"x\" || \"y\";
+    let o = \"p\" || \"q\";
+    if flag then [ b := o; ];
+    b
+];
+oper c4 { flag: Boolean } -> Text [
+    var b := \"x\" || \"y\";
+    let r = if flag then [ b := \"a\" || \"b\"; b ] else [ \"z\" || \"z\" ];
+    r
+];
+oper c5 { flag: Boolean } -> Text [
+    var body := \"\";
+    if flag then [
+        let info = extract (Relation { { title: \"Ho\" || \"me\", body: \"Wel\" || \"come\" } } where title = \"Home\");
+        body := format { template: f\"<h1>{title}</h1><div>{body}</div>\", args: { title: info.title, body: info.body } };
+    ];
+    body
+];
+oper main {} [
+    write_line { message: c1 { flag: true } };  write_line { message: c1 { flag: false } };
+    write_line { message: c2 { flag: true } };  write_line { message: c2 { flag: false } };
+    write_line { message: c3 { flag: true } };  write_line { message: c3 { flag: false } };
+    write_line { message: c4 { flag: true } };  write_line { message: c4 { flag: false } };
+    write_line { message: c5 { flag: true } };  write_line { message: c5 { flag: false } };
 ];
 ";
 
@@ -1958,6 +2031,23 @@ fn possrep_scalar_select_and_access() {
 #[test]
 fn tuple_value_merges_through_if() {
     assert_both_backends("tuple-through-if", b"yes\nno\n");
+}
+
+// ROADMAP L8: a deferred `extract`-source release lands inside the `if` arm (not
+// the merge block), so the arm compiles on both backends and is leak-clean.
+#[test]
+fn extract_source_release_lands_in_if_arm() {
+    assert_both_backends("extract-in-if-arm", b"[world]\nnone\n");
+}
+
+// T0076 lift: a reassigned heap `Text` `var` carried across an `if` merge lowers
+// (mirrors the loop-carried `Text` case) and is refcount-balanced on both edges.
+#[test]
+fn if_carried_text_var_lowers_and_is_leak_clean() {
+    assert_both_backends(
+        "if-carried-text",
+        b"ab\nxy\nab\ncd\npq\nxy\nab\nzz\n<h1>Home</h1><div>Welcome</div>\n\n",
+    );
 }
 
 #[test]
