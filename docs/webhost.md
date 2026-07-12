@@ -284,6 +284,16 @@ the same shape. Two language capabilities gate the ergonomic form: `Text` primit
 matching (pushable to backends' native string functions), and first-class `oper` references to *call* the
 handler a matched row names. `coddl::web` itself stays neutral — it ships neither `Routes` nor a router.
 
+<!-- DESIGN-AHEAD-XREF: provisional cross-reference from this authoritative doc into a wiki-example
+artifact. Remove it (or fold the design into this doc) when F7 lands, or when the wiki framework
+extracts to its own repo (ROADMAP D4) and this path breaks. Grep `DESIGN-AHEAD-XREF` for every such marker. -->
+This sketch has since been fully scoped — and refined past the single-`pattern`-column shape shown above — in
+[`examples/wiki/routing-design.md`](../examples/wiki/routing-design.md): the route table is vertically
+decomposed (`Routes` / `RouteLiterals` / `RouteParams` + the `OperParams` catalog — no nulls, RM Pro 4),
+`handler` is a module **path** (not a pointer, RM Pro 7), typed params ride a `to_url_regexp` protocol, forward
+matching is simulated relational division, and ambiguity is a forward-key / specificity constraint (ties
+rejected). See ROADMAP items **F7 / L6 / L7**. <!-- /DESIGN-AHEAD-XREF -->
+
 ## Deployment
 
 The deployable unit is a **single self-contained native binary**: the `coddl-web` host loop, the app's

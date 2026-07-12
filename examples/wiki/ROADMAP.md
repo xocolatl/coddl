@@ -200,6 +200,14 @@ instructions inline.
   a large separate arc. Sets how far Phase 6 matters.
 - **D4 — When to extract the framework to its own repo?** `[ ] OPEN` — triggers: L1 + L2 +
   L3 all `DONE` and stable. Until then, in-tree. (See Phase 5.)
+- **D5 — Data-driven routing representation.**
+  `[x] DECIDED: vertically-decomposed routes + module-path handlers + typed params — see `examples/wiki/routing-design.md`.`
+  Route table = `Routes`/`RouteLiterals`/`RouteParams` + the `OperParams` catalog (no nulls);
+  `handler` = module PATH, not a pointer (RM Pro 7); the pattern↔handler fit is a constraint (a
+  join), not a column type; captures are a transient tuple; forward match = simulated relational
+  division (or a compiled regex for typed/composite params); ambiguity = a forward-key/specificity
+  constraint with ties rejected (no first-match-by-order, RM Pro 1). Feeds F7 / L6 / L7. Deferred
+  per app-leads — recorded so it is not relitigated when routing eventually generalizes past F1.
 
 ---
 
@@ -437,12 +445,61 @@ The keystone phase. Routing rides **H1** (a host transform — no L1); safe rend
 - `[ ] L4 (LANG) — `Binary` type` (byte bodies) — only if the wiki needs file uploads.
   Depends on: —. Unblocks: uploads. (Deferred; bodies stay `Text` until a concrete need.)
 
-- `[ ] F7 (FW) — Routes-as-data.`
-  A `Routes { name, method, pattern, handler }` relvar queried two ways (forward dispatch;
-  reverse URL resolution). Ergonomic form needs L1 **and** first-class `oper` references
-  (L6, a language feature — to *call* the handler a matched row names). Until then F1's
-  explicit dispatch suffices. See `docs/webhost.md` "Routes are data".
-  Depends on: L1, L6 (first-class oper refs — not yet scoped). Unblocks: data-driven routing.
+- `[~] L8 (LANG) — deferred heap-source release inside a merged if-branch.` **`extract` half
+  DONE (this commit); unbox half remains.** Discovered by F1. Root cause (NOT Cranelift-specific —
+  both backends): the lowerer *defers* an `extract` source's / an unbox'd call return's release
+  (their cells are borrowed downstream) to the **function epilogue**, which is the if-merge block.
+  When the producer is inside an if-arm, the arm doesn't dominate the merge, so the deferred
+  release is an SSA violation — Cranelift's verifier rejects it; LLVM's llc says "does not dominate
+  all uses". (`load`+`for` was unaffected: it releases its source inline in the arm.)
+  - **FIXED:** the lowerer now tags each deferral and drains the `extract`-source ones inside the
+    arm (`lower_if_arm` in `crates/coddl-procir/src/lower.rs`). Correct when the extracted cells are
+    consumed within the arm (the common case — `format`/`||` copy them into a fresh owned `Text`,
+    or a scalar field is read). The wiki's home route now `extract`s in-branch; e2e
+    `extract_source_release_lands_in_if_arm` (both backends, leak-gated).
+  - **REMAINING:** an unbox'd call return's cells *escape* the arm, so its release must stay at the
+    true epilogue — merging an `oper` CALL's boxed result through an if (`if c then [ f{} ] else
+    [ g{} ]`, route sub-oper dispatch) still fails to lower. Kept a hard compile error (not a silent
+    miscompile) by leaving that deferral untagged. The proper fix is to make the escaping value own
+    its cells (retain-on-escape / make `extract`/unbox copy). Same class as the **pre-existing** gap
+    where a borrowed `extract` cell returned *raw* from any oper (not just a branch) is wrong.
+  Depends on: —. Unblocks: sub-oper route dispatch, `extract`-raw-per-route, cleaner F1/A2/A3.
+  Acceptance (remaining): `if c then [ f{} ] else [ g{} ]` (tuple-returning `f`/`g` with non-immortal
+  `Text` cells) emit-objs on Cranelift and runs byte-identically to LLVM, leak-clean.
+
+- `[ ] L6 (LANG) — First-class `oper` references.` **Scoped — `examples/wiki/routing-design.md` §3.**
+  An `oper` reference is a VALUE = its fully-qualified module PATH (Text-backed): equality is
+  path comparison (decidable), identity is a name not a code address — so it is NOT a pointer
+  (RM Pro 7) and does not reopen the operator-value/equality problem. Written `oper path::name
+  { sig } -> Ret` (the `oper` keyword disambiguates a signature from a call). Direct call of a
+  value: `(expr){ args }` or bind-to-local `let h = expr; h{ args }`; `x.name{}` stays UFCS.
+  Depends on: — (independent LANG work). Unblocks: F7. (Needed to name/call the handler a matched route row carries.)
+  Acceptance: an `oper` value stored in a tuple/relation, then called; equality of two references = same path.
+
+- `[ ] L7 (LANG/HOST) — Typed URL params: the `to_url_regexp` protocol.` **Scoped — `examples/wiki/routing-design.md` §3.4.**
+  Param types become OPEN + type-directed: a type is URL-usable iff it has `to_url_regexp{self:
+  T} -> RegularExpression` (its match grammar). Text/Integer builtin; users opt their own scalars
+  in (UFCS overload, like `to_text`). A URL-usable type is a TRIPLE — `to_url_regexp` (match) +
+  `from_url_text` (parse Text→value, the still-absent direction) + `to_text` (format, exists).
+  `RegularExpression` is a Text-backed scalar; the regex engine is a Rust HOST primitive
+  (`regex_match`); the per-route regex is a compile-time fold of the decomposed parts. Caveat:
+  arbitrary user regexes must be `/`-bounded and complicate the static ambiguity check.
+  Depends on: L1 (for `from_url_text` + reverse assembly). Unblocks: F7's typed/composite params.
+  Acceptance: `/news/articles/{slug: Text}-{id: PositiveInteger}/` matches and yields typed captures; a user-defined `PositiveInteger` works end-to-end.
+
+- `[ ] F7 (FW) — Routes-as-data.` **Design now fully scoped — `examples/wiki/routing-design.md`.**
+  Route table queried two ways (forward dispatch; reverse `url_for`). NOT one fat relvar:
+  vertically decomposed into `Routes {name, method, handler}` + `RouteLiterals {route, seg, part,
+  text}` + `RouteParams {route, seg, part, name, type}` + the `OperParams` catalog (no `kind`
+  discriminator → no nulls, RM Pro 4). `handler` is a module PATH (Text), not a pointer (RM Pro 7);
+  the "handler fits its route" rule is a constraint (a join between `OperParams` and `RouteParams`),
+  not a column type. Forward match = simulated relational division (arity + literal anti-join), or a
+  compile-time-folded regex for composite/typed segments (L7); reverse folds the parts the other
+  way. Captures are a transient heterogeneous tuple, never stored. Ambiguity = a forward-key
+  (extent) constraint, resolved by specificity, ties rejected — no first-match-by-list-order
+  (RM Pro 1). **Deferred per app-leads:** F1's explicit match covers the wiki; build this when an
+  app needs data-driven routing / typed params. Supersedes `docs/webhost.md` "Routes are data".
+  Depends on: L1, L6 (oper refs), L7 (typed params); rides H1. Unblocks: data-driven routing.
 
 ---
 
@@ -459,7 +516,8 @@ A2 ─► [P3] L3 (public writes via web) ┐
         H1 ─► F5 (host form parse) ────┼─► A3 (edit/create) ─► A4 (revisions)
 L1 ─────────────────────────────────► A5 (wikilinks)
 L1+L2+L3 stable ─► D4-extract (own repo)
-[P6] L5 (concurrency), L4 (Binary), F7+L6 (routes-as-data)  — deferred
+[P6] L5 (concurrency), L4 (Binary);  L6 (oper refs) + L7 (to_url_regexp) + L1 + H1 ─► F7 (routes-as-data)
+     — deferred; design captured in examples/wiki/routing-design.md
 ```
 
 **Critical path to a recognizable wiki:** routing via `H1 → (F1,F2)` (no L1) joined with
