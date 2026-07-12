@@ -74,6 +74,7 @@ fn fixtures_dir() -> &'static Path {
             ("extract-in-if-arm", EXTRACT_IN_IF_ARM_SRC),
             ("if-carried-text", IF_CARRIED_TEXT_SRC),
             ("return-early", RETURN_EARLY_SRC),
+            ("nameref-tuple-cell", NAMEREF_TUPLE_CELL_SRC),
         ] {
             std::fs::write(tmp.path().join(format!("{name}.cd")), src)
                 .unwrap_or_else(|e| panic!("write {name}.cd fixture: {e}"));
@@ -369,6 +370,64 @@ oper main {} [
     write_line { message: classify { n: 3 } };
     write_line { message: unwind { flag: true } };
     write_line { message: unwind { flag: false } };
+];
+";
+
+// Flattened-tuple `NameRef` cell ownership — the web double-free. A flattened
+// tuple that embeds a `let`/`var`-bound owned heap cell (a `NameRef`) must own
+// its own reference to that cell, independent of the binding: otherwise, when
+// the tuple flows out of an `if`-arm to a merge param and the arm frees the
+// binding, the merged cell dangles (use-after-free → later double-free). Every
+// `Text` cell is non-immortal (`||`) so releases actually free, and
+// `assert_both_backends` runs under the leak gate — an over- or under-release
+// trips the run. Covers: (route) the exact repro — a then-arm `NameRef` Text
+// cell through an `if`-merge, else-arm an immortal-literal cell, read back by
+// field; (both) both arms own a fresh Text cell; (whole) a `NameRef`-cell tuple
+// returned *whole* (boxed on return) rather than field-extracted; (rel_cell) a
+// `NameRef` Text cell consumed into a `Relation` literal (the heading-based
+// consume path); (alias) `let x = y` aliasing a `NameRef`-cell tuple — released
+// once, not twice; (nested) a `NameRef` cell that is *itself* a flattened tuple
+// carrying a heap cell — retain/release recurse through the nesting.
+const NAMEREF_TUPLE_CELL_SRC: &str = "\
+program nameref;
+oper route { hit: Boolean } -> Tuple { status: Integer, body: Text } [
+    let picked = if hit then [ let body = \"Wel\" || \"come\"; { status: 200, body } ]
+                 else [ { status: 404, body: \"no\" } ];
+    { status: picked.status, body: picked.body }
+];
+oper both { hit: Boolean } -> Text [
+    let t = if hit then [ let a = \"aa\" || \"bb\"; { m: a } ]
+            else [ let b = \"cc\" || \"dd\"; { m: b } ];
+    t.m
+];
+oper whole {} -> Tuple { m: Text } [
+    let s = \"he\" || \"llo\";
+    { m: s }
+];
+oper rel_cell {} -> Relation { m: Text } [
+    let s = \"ro\" || \"w\";
+    Relation { { m: s } }
+];
+oper alias {} -> Text [
+    let s = \"al\" || \"ias\";
+    let y = { m: s };
+    let x = y;
+    x.m
+];
+oper nested {} -> Text [
+    let inner_t = { inner: \"ne\" || \"st\" };
+    let wrapped = { outer: inner_t };
+    wrapped.outer.inner
+];
+oper main {} [
+    let r1 = route { hit: true };   write_line { message: r1.body };
+    let r2 = route { hit: false };  write_line { message: r2.body };
+    write_line { message: both { hit: true } };
+    write_line { message: both { hit: false } };
+    let w = whole {};               write_line { message: w.m };
+    write_relation { rel: rel_cell {} };
+    write_line { message: alias {} };
+    write_line { message: nested {} };
 ];
 ";
 
@@ -2065,6 +2124,20 @@ fn possrep_scalar_select_and_access() {
 #[test]
 fn tuple_value_merges_through_if() {
     assert_both_backends("tuple-through-if", b"yes\nno\n");
+}
+
+// Flattened-tuple `NameRef` cell ownership (the web double-free). A flattened
+// tuple embedding a bound owned heap cell must own its own reference so the
+// cell survives its binding's release when the tuple flows through an `if`-merge
+// or is returned/consumed. Runs under the leak gate on both backends, so a
+// dangling cell (use-after-free / double-free) or an over-retain (leak) trips
+// the run. See `NAMEREF_TUPLE_CELL_SRC` for the cases covered.
+#[test]
+fn nameref_tuple_cell_ownership_is_leak_clean() {
+    assert_both_backends(
+        "nameref-tuple-cell",
+        b"Welcome\nno\naabb\nccdd\nhello\n{m: \"row\"}\nalias\nnest\n",
+    );
 }
 
 // ROADMAP L8: a deferred `extract`-source release lands inside the `if` arm (not

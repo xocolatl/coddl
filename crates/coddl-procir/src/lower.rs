@@ -499,6 +499,21 @@ struct Lowerer {
     /// record's retain-on-store of a temp consumed into a cell. A standalone
     /// tuple's entry is never drained (its temps flow out via `.field`).
     tuple_cell_heap_temps: HashMap<ValueId, Vec<ValueId>>,
+    /// Flattened tuple **values** that own one reference to each of their heap
+    /// cells *without* a per-cell producer temp to release — released by walking
+    /// the heading (`TupleField` borrow + `Release`, recursively) at death or
+    /// consumption. Two shapes land here: a tuple literal that embeds a
+    /// `NameRef` heap cell (retained at construction so the tuple's ref is
+    /// independent of the binding — the fix for the flattened-tuple NameRef
+    /// use-after-free), and an `if`-merge result parameter that inherited a
+    /// heap-cell-owning arm value (its cells exist only at runtime, no
+    /// `ValueId`). **Disjoint from [`Self::tuple_cell_heap_temps`]:** a
+    /// construction populates exactly one of the two, and a merge result is a
+    /// fresh `ValueId` never in the temp map — a value in both would
+    /// double-release. Membership is by `ValueId`, and the scope-exit /
+    /// consumption drain *removes* on release, so an aliased or duplicated
+    /// binding (`let x = y`, two names for one flattened owner) releases once.
+    flattened_heading_owners: HashSet<ValueId>,
     /// Heap temporaries whose release is deferred past their producer because a
     /// later value *borrows* their cells: `extract` copies a record's cells into
     /// a tuple as borrowed `(ptr,len)` values, and a boxed-tuple call return is
@@ -597,6 +612,7 @@ impl Lowerer {
             owned_texts: HashSet::new(),
             param_value_ids: Vec::new(),
             tuple_cell_heap_temps: HashMap::new(),
+            flattened_heading_owners: HashSet::new(),
             deferred_relation_releases: Vec::new(),
             user_opers: HashMap::new(),
             current_module: None,
@@ -886,7 +902,18 @@ impl Lowerer {
             let Some((v, ty)) = self.lookup_local(&name) else {
                 continue; // a relvar or inner-scope name — not an outer var
             };
-            if Self::is_heap_managed(&ty) || (matches!(ty, ProcType::Text) && !allow_text) {
+            // A flattened tuple carrying heap cells owns those cells (retained
+            // `NameRef` cells or producer temps); threading it across a loop
+            // back-edge as a plain value carry drops that RC bookkeeping — the
+            // same class of leak/use-after-free the heap-managed carry defers.
+            // Reject conservatively until loop-carried cell ownership is lowered.
+            let flattened_tuple_with_heap = matches!(&ty,
+                ProcType::Tuple(h)
+                    if !crate::layout::tuple_is_boxed(h) && Self::heading_has_heap_cells(h));
+            if Self::is_heap_managed(&ty)
+                || (matches!(ty, ProcType::Text) && !allow_text)
+                || flattened_tuple_with_heap
+            {
                 self.diagnostics.push(Diagnostic::error(
                     span,
                     "T0076",
@@ -1003,6 +1030,7 @@ impl Lowerer {
         self.owned_texts.clear();
         self.param_value_ids.clear();
         self.tuple_cell_heap_temps.clear();
+        self.flattened_heading_owners.clear();
         self.deferred_relation_releases.clear();
     }
 
@@ -1108,8 +1136,12 @@ impl Lowerer {
     /// Box a small (flattened) tuple return value into a heap record so the
     /// return ABI is a single pointer for *every* non-empty tuple. A large
     /// tuple is already boxed (returned as-is); an empty tuple / non-tuple is
-    /// untouched. The flattened tuple's owned `Text` cell temps are released —
-    /// the box co-owns them now (mirrors `lower_relation_lit` / `lower_tuple_lit`).
+    /// untouched. The flattened tuple's owned heap cells are released — the box
+    /// co-owns them now (mirrors `lower_relation_lit` / `lower_tuple_lit`) —
+    /// covering both a producer-temp cell and a `NameRef`-retained / merged-in
+    /// heading-owner (`release_flattened_tuple_cells` handles either track and
+    /// removes `v` from its set, so the scope-exit release that follows is a
+    /// no-op for it).
     fn box_return_value_if_needed(&mut self, v: ValueId, declared_return: &ProcType) -> ValueId {
         let ProcType::Tuple(heading) = declared_return else {
             return v;
@@ -1125,33 +1157,154 @@ impl Lowerer {
             src: v,
             heading_id,
         });
-        if let Some(temps) = self.tuple_cell_heap_temps.remove(&v) {
-            for t in temps {
-                self.release_call_arg_temp(t);
-            }
-        }
+        self.release_flattened_tuple_cells(v);
         boxed
     }
 
-    /// Release a **flattened** tuple local's owned heap cell temps at scope
-    /// exit. A flattened tuple isn't heap-managed, so [`Self::needs_scope_release`]
-    /// skips it — but it owns the producer references of any directly-consumed
-    /// heap cell (an owned `Text`, a relation/sequence temp), collected in
-    /// [`Self::tuple_cell_heap_temps`]. Those are otherwise released only when
-    /// the tuple is *boxed*; a read-and-discarded flattened tuple is never
-    /// boxed, so its cells would leak (and, under a caller that releases the
-    /// tuple's cell independently — a returned response over the web ABI —
-    /// double-free). Drain them here. `release_call_arg_temp` no-ops for an
-    /// immortal literal or a value another local still owns (the aliasing
-    /// guard). A field read of such a tuple retains its own copy
-    /// (`lower_field_access`), so draining the cell here never invalidates a
-    /// live field.
+    /// Drop the owned heap-cell references of a **flattened** tuple value `v`
+    /// at scope exit *or* consumption. A flattened tuple isn't heap-managed, so
+    /// [`Self::needs_scope_release`] skips it — but it owns one reference to
+    /// each of its heap cells, tracked one of two ways:
+    ///
+    /// - [`Self::tuple_cell_heap_temps`] — a per-cell producer temp (an owned
+    ///   `Text`, a relation/sequence temp): released with `release_call_arg_temp`
+    ///   (no-op for an immortal literal or a value another local still owns).
+    /// - [`Self::flattened_heading_owners`] — no per-cell `ValueId` (a retained
+    ///   `NameRef` cell, or a merge param): released by walking the heading.
+    ///
+    /// The two sets are disjoint (one is populated per construction; a merge
+    /// result is a fresh id), so the `else if` never fires both. Membership is
+    /// *removed* on release, making a second call for the same value (a
+    /// duplicate binding, or a consume-then-scope-exit) a no-op — so an owned
+    /// cell is released exactly once. Those refs are otherwise released only
+    /// when the tuple is *boxed*; a read-and-discarded or merged-out flattened
+    /// tuple is never boxed, so its cells would leak (and, under a caller that
+    /// releases the cell independently — a returned response over the web ABI —
+    /// double-free or use-after-free). A field read of such a tuple retains its
+    /// own copy (`lower_field_access`), so dropping the cell here never
+    /// invalidates a live field.
     fn release_flattened_tuple_cells(&mut self, v: ValueId) {
         if let Some(temps) = self.tuple_cell_heap_temps.remove(&v) {
             for t in temps {
                 self.release_call_arg_temp(t);
             }
+        } else if self.flattened_heading_owners.remove(&v) {
+            if let ProcType::Tuple(h) = self.value_type(v) {
+                self.release_flattened_tuple_by_heading(v, &h);
+            }
         }
+    }
+
+    /// Whether a surface `Type`, appearing as a flattened-tuple cell, carries a
+    /// heap reference the tuple must own/release: a `Text`/relation/sequence
+    /// leaf, or a nested tuple that is itself boxed (a pointer) or contains
+    /// heap cells (walked recursively).
+    fn type_has_heap(ty: &Type) -> bool {
+        match ty {
+            Type::Text | Type::Relation(_) | Type::Sequence(_) => true,
+            Type::Tuple(h) => crate::layout::tuple_is_boxed(h) || Self::heading_has_heap_cells(h),
+            _ => false,
+        }
+    }
+
+    /// Whether any attribute of `h` is a heap cell (see [`Self::type_has_heap`]).
+    fn heading_has_heap_cells(h: &Heading) -> bool {
+        h.attrs().iter().any(|(_, ty)| Self::type_has_heap(ty))
+    }
+
+    /// The `ProcType` mirror of [`Self::type_has_heap`]: whether a value of this
+    /// type carries a heap reference (a `Text`/relation/sequence, or a boxed /
+    /// heap-cell-bearing tuple).
+    fn proc_type_has_heap(pty: &ProcType) -> bool {
+        match pty {
+            ProcType::Text | ProcType::Relation(_) | ProcType::Sequence(_) => true,
+            ProcType::Tuple(h) => {
+                crate::layout::tuple_is_boxed(h) || Self::heading_has_heap_cells(h)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the flattened tuple value `v` currently owns its heap cells —
+    /// membership in either ownership set. Used to decide whether an `if`-merge
+    /// result inherits ownership from an arm value.
+    fn flattened_owns_cells(&self, v: ValueId) -> bool {
+        self.flattened_heading_owners.contains(&v) || self.tuple_cell_heap_temps.contains_key(&v)
+    }
+
+    /// Emit one `Inst::Release` per heap cell of a flattened tuple `v` by
+    /// walking its heading `h`: for each heap attribute, `TupleField` (a
+    /// compile-time projection — a *borrow* of the cell) then `Release`. A
+    /// nested flattened tuple recurses (its cells release individually); a
+    /// boxed nested tuple / relation / sequence / `Text` releases the single
+    /// pointer. Scalars own no heap. This drops exactly the tuple's own
+    /// reference to each cell (retained at construction for a `NameRef`,
+    /// transferred in for a producer temp), released once at the tuple's death.
+    fn release_flattened_tuple_by_heading(&mut self, v: ValueId, h: &Heading) {
+        for (name, ty) in h.attrs().to_vec() {
+            match &ty {
+                Type::Tuple(sub) if !crate::layout::tuple_is_boxed(sub) => {
+                    if Self::heading_has_heap_cells(sub) {
+                        let field_ty = self.proc_type_from_resolved(&ty);
+                        let sub_v = self.emit_tuple_field(v, &name, field_ty);
+                        self.release_flattened_tuple_by_heading(sub_v, sub);
+                    }
+                }
+                _ if Self::type_has_heap(&ty) => {
+                    let field_ty = self.proc_type_from_resolved(&ty);
+                    let field = self.emit_tuple_field(v, &name, field_ty);
+                    self.insts.push(Inst::Release { src: field });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The symmetric retain: emit one `Inst::Retain` per heap cell of a
+    /// flattened tuple `v` by walking its heading — used when a heading-owning
+    /// tuple *escapes* its scope (an `if`-arm / transaction / return-of-local
+    /// yield), so the scope-exit [`Self::release_flattened_tuple_by_heading`]
+    /// leaves the consumer a live reference. Recurses into nested flattened
+    /// tuples exactly like the release walk, so the counts stay balanced.
+    fn retain_flattened_tuple_by_heading(&mut self, v: ValueId, h: &Heading) {
+        for (name, ty) in h.attrs().to_vec() {
+            match &ty {
+                Type::Tuple(sub) if !crate::layout::tuple_is_boxed(sub) => {
+                    if Self::heading_has_heap_cells(sub) {
+                        let field_ty = self.proc_type_from_resolved(&ty);
+                        let sub_v = self.emit_tuple_field(v, &name, field_ty);
+                        self.retain_flattened_tuple_by_heading(sub_v, sub);
+                    }
+                }
+                _ if Self::type_has_heap(&ty) => {
+                    let field_ty = self.proc_type_from_resolved(&ty);
+                    let field = self.emit_tuple_field(v, &name, field_ty);
+                    self.insts.push(Inst::Retain { src: field });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Emit a bare `Inst::TupleField` projection (no retain) and return its
+    /// `ValueId`. A raw borrow of `src`'s named cell — the caller decides
+    /// whether to retain/release it. Shared by the heading-walk retain/release
+    /// helpers.
+    fn emit_tuple_field(
+        &mut self,
+        src: ValueId,
+        field_name: &str,
+        field_type: ProcType,
+    ) -> ValueId {
+        let dst = self.fresh_value();
+        self.record_type(dst, field_type.clone());
+        self.insts.push(Inst::TupleField {
+            dst,
+            src,
+            field_name: field_name.to_string(),
+            field_type,
+        });
+        dst
     }
 
     /// Emit `Inst::Release` for every heap-managed binding in the
@@ -1233,6 +1386,20 @@ impl Lowerer {
                 .any(|s| s.values().any(|(v, _)| *v == value));
         if bound && self.needs_scope_release(value, &ty) {
             self.insts.push(Inst::Retain { src: value });
+        }
+        // A flattened tuple that owns its cells by heading (a `NameRef`-cell
+        // literal, or an inherited merge param) is not `needs_scope_release`,
+        // but its cells *are* dropped by heading walk at scope exit. When such a
+        // bound owner escapes (an `if`-arm / transaction yields `let t = {…}; t`),
+        // retain its cells so the scope-exit release leaves the merge/consumer a
+        // live reference. A fresh (unbound) owner escapes without a scope-exit
+        // release, so it needs none. A tuple owning cells via producer temps
+        // (`tuple_cell_heap_temps`) is not scope-released for an escaping tail
+        // (its temps drain only on box/consume), so it needs no escape retain.
+        if bound && self.flattened_heading_owners.contains(&value) {
+            if let ProcType::Tuple(h) = ty {
+                self.retain_flattened_tuple_by_heading(value, &h);
+            }
         }
     }
 
@@ -3135,7 +3302,7 @@ impl Lowerer {
                 else_block: merge_id,
             });
             self.start_block(then_id, Vec::new());
-            let (_, then_div) = self.lower_if_arm(then_body);
+            let (_, then_div, _) = self.lower_if_arm(then_body);
             if !then_div {
                 self.finish_block(Terminator::Br {
                     target: merge_id,
@@ -3168,7 +3335,7 @@ impl Lowerer {
         // block with `Return` and unwound every scope, so it emits no `Br` and
         // is not a merge predecessor.
         self.start_block(then_id, Vec::new());
-        let (then_val, then_div) = self.lower_if_arm(then_body);
+        let (then_val, then_div, then_owns) = self.lower_if_arm(then_body);
         // The merge's value/param shape follows a live arm — provisionally the
         // then arm, re-derived from the else arm below if the then arm is the
         // one that diverges.
@@ -3204,13 +3371,13 @@ impl Lowerer {
         // Else arm — the real `else` block, or an empty skip block forwarding
         // the pre-`if` values when there is no `else`.
         self.start_block(else_id, Vec::new());
-        let (else_val, else_div) = if else_body.is_some() {
+        let (else_val, else_div, else_owns) = if else_body.is_some() {
             self.lower_if_arm(else_body)
         } else {
             // No `else`: the value is Unit (typecheck guarantees a Unit then).
             let v = self.fresh_value();
             self.record_type(v, ProcType::Unit);
-            (v, false)
+            (v, false, false)
         };
         if !else_div {
             // If the then arm diverged, the merge shape (and its introduced
@@ -3249,10 +3416,24 @@ impl Lowerer {
         // literal arm is a no-op; an owned-temp arm is freed).
         let result = self.fresh_value();
         self.record_type(result, merge_ty.clone());
+        // A flattened tuple join value inherits cell ownership when a reaching
+        // arm owned its cells: the arm's tuple (retained `NameRef` cells /
+        // transferred temps) flows in as the merge param, whose per-leaf cells
+        // exist only at runtime — so the merge param owns them by heading and is
+        // released by heading walk at its own scope exit. A diverged arm never
+        // reaches the merge, so its ownership doesn't count.
+        let reaching_owns = (!then_div && then_owns) || (!else_div && else_owns);
         let mut params = Vec::new();
         if !merge_is_unit {
             if matches!(merge_ty, ProcType::Text) {
                 self.mark_text_owned(result);
+            }
+            if reaching_owns {
+                if let ProcType::Tuple(h) = &merge_ty {
+                    if !crate::layout::tuple_is_boxed(h) && Self::heading_has_heap_cells(h) {
+                        self.flattened_heading_owners.insert(result);
+                    }
+                }
             }
             params.push((result, merge_ty.clone()));
         }
@@ -3347,7 +3528,12 @@ impl Lowerer {
     /// `diverged` is `true`: the `return` already sealed the block and unwound
     /// every scope, so none of the normal arm-exit emission runs (it would land
     /// in a sealed block) and the caller drops the arm from the merge.
-    fn lower_if_arm(&mut self, block: Option<Block>) -> (ValueId, bool) {
+    /// Lower one `if` arm. Returns `(tail value, diverged, owns_flattened_cells)`.
+    /// The third flag — whether the tail value is a flattened tuple owning heap
+    /// cells — is captured *before* the arm's scope release (which removes an
+    /// escaping owner from its set), so the merge can propagate ownership to the
+    /// result parameter.
+    fn lower_if_arm(&mut self, block: Option<Block>) -> (ValueId, bool, bool) {
         match block {
             Some(b) => {
                 // Deferred `extract`-source releases registered *within* this arm
@@ -3361,6 +3547,9 @@ impl Lowerer {
                 let deferred_mark = self.deferred_relation_releases.len();
                 self.push_local_scope();
                 let val = self.lower_block(&b);
+                // Capture ownership before the scope release below removes an
+                // escaping heading-owner from its set.
+                let owns_cells = self.flattened_owns_cells(val);
                 if self.diverged {
                     // The arm ended in an early `return`, which already unwound
                     // every scope (this arm's included) and released every
@@ -3373,7 +3562,7 @@ impl Lowerer {
                     // mark) stay for their own drain.
                     self.pop_local_scope();
                     self.deferred_relation_releases.truncate(deferred_mark);
-                    return (val, true);
+                    return (val, true, false);
                 }
                 // The arm's tail value always flows out to the merge block, so
                 // retain it if it's a heap-managed local before releasing the
@@ -3405,12 +3594,12 @@ impl Lowerer {
                 for src in arm_sources {
                     self.insts.push(Inst::Release { src });
                 }
-                (val, false)
+                (val, false, owns_cells)
             }
             None => {
                 let v = self.fresh_value();
                 self.record_type(v, ProcType::Unit);
-                (v, false)
+                (v, false, false)
             }
         }
     }
@@ -5595,6 +5784,16 @@ impl Lowerer {
         // `NameRef`-aliased field (tuple or text) is skipped — its value may be
         // referenced elsewhere, so releasing it here would double-free.
         let mut cell_heap_temps: Vec<ValueId> = Vec::new();
+        // Heap cells that alias a `NameRef` binding (a `let`/`var`-bound owned
+        // value, or a borrowed parameter). Unlike a fresh producer temp, whose
+        // single reference *transfers* into the tuple, a `NameRef` cell is owned
+        // elsewhere — the tuple only aliases the binding's pointer. If the tuple
+        // outlives the binding (it flows out of an `if`-arm to a merge param,
+        // then the arm frees the binding), that alias dangles. So the tuple must
+        // hold its **own** reference: retain each `NameRef` heap cell below and
+        // register the flattened tuple as a heading-owner, released by heading
+        // walk at its own death (independent of the binding's release).
+        let mut nameref_heap_cells: Vec<(ValueId, ProcType)> = Vec::new();
         for field in tup.fields() {
             let name_tok = match field.name() {
                 Some(t) => t,
@@ -5606,21 +5805,27 @@ impl Lowerer {
             };
             let id = self.lower_expr(&value_expr);
             let ty = self.value_type(id);
+            let is_nameref = matches!(value_expr, Expr::NameRef(_));
             match &ty {
                 // A fresh (non-binding) heap cell — an owned `Text`, or a
                 // relation/sequence temp — is retain-on-stored by the record
                 // build (`TupleBox` / `RelationLit`), so its producer reference
                 // must be released after. A `NameRef` is a binding owned
                 // elsewhere; a nested tuple contributes its own collected temps.
-                ProcType::Text | ProcType::Relation(_) | ProcType::Sequence(_)
-                    if !matches!(value_expr, Expr::NameRef(_)) =>
-                {
+                ProcType::Text | ProcType::Relation(_) | ProcType::Sequence(_) if !is_nameref => {
                     cell_heap_temps.push(id);
                 }
                 ProcType::Tuple(_) if matches!(value_expr, Expr::TupleLit(_)) => {
                     if let Some(sub) = self.tuple_cell_heap_temps.get(&id) {
                         cell_heap_temps.extend(sub.iter().copied());
                     }
+                }
+                // A `NameRef` cell carrying a heap reference: the tuple takes its
+                // own count (retained after the `TupleLit` below, in the
+                // flattened branch). A boxed tuple's `TupleBox` store already
+                // retains every cell, so it needs nothing here.
+                _ if is_nameref && Self::proc_type_has_heap(&ty) => {
+                    nameref_heap_cells.push((id, ty.clone()));
                 }
                 _ => {}
             }
@@ -5665,7 +5870,26 @@ impl Lowerer {
             }
             return boxed;
         }
-        if !cell_heap_temps.is_empty() {
+        // Flattened tuple. When it embeds a `NameRef` heap cell, give it its own
+        // reference to each such cell (a leaf `Text`/relation/sequence pointer,
+        // or a nested flattened tuple's cells recursively) and track it as a
+        // heading-owner: its cells — the `NameRef`-retained *and* the transferred
+        // producer temps (`cell_heap_temps`) alike — are released by the heading
+        // walk at death, so `tuple_cell_heap_temps` is left unpopulated (the two
+        // ownership tracks stay disjoint). Otherwise the pre-existing producer-
+        // temp track carries the owned cells.
+        if !nameref_heap_cells.is_empty() {
+            for (id, pty) in nameref_heap_cells {
+                match &pty {
+                    ProcType::Tuple(h) if !crate::layout::tuple_is_boxed(h) => {
+                        let h = h.clone();
+                        self.retain_flattened_tuple_by_heading(id, &h);
+                    }
+                    _ => self.insts.push(Inst::Retain { src: id }),
+                }
+            }
+            self.flattened_heading_owners.insert(dst);
+        } else if !cell_heap_temps.is_empty() {
             self.tuple_cell_heap_temps.insert(dst, cell_heap_temps);
         }
         dst
@@ -5949,22 +6173,20 @@ impl Lowerer {
         let dst = self.fresh_value();
         self.record_type(dst, ProcType::Relation(heading_id));
         // Backend `RelationLit` retain-on-store gives the relation its own
-        // reference to each `Text` cell. Release the producer reference of any
-        // owned `Text` *temporary* consumed directly into a cell so the cell's
-        // retained ref is the sole owner. `release_text_temp` no-ops on locals
-        // and literals; the collected temps are single-use fresh expressions.
-        let cell_temps: Vec<ValueId> = tuple_values
-            .iter()
-            .filter_map(|tv| self.tuple_cell_heap_temps.remove(tv))
-            .flatten()
-            .collect();
+        // reference to each heap cell. Drop each tuple operand's own reference
+        // so the record's retained ref is the sole owner — via
+        // `release_flattened_tuple_cells`, which handles both a producer-temp
+        // cell (no-op on locals/literals) and a `NameRef`-retained heading-owner
+        // (heading walk). Deferred until after the `RelationLit` so the cells
+        // are still live when the record retains them.
+        let operands = tuple_values.clone();
         self.insts.push(Inst::RelationLit {
             dst,
             tuples: tuple_values,
             heading_id,
         });
-        for t in cell_temps {
-            self.release_call_arg_temp(t);
+        for tv in operands {
+            self.release_flattened_tuple_cells(tv);
         }
         dst
     }
@@ -6541,15 +6763,12 @@ impl Lowerer {
             }
         };
 
-        // Release the owned `Text` cells the materialized `args` tuple
-        // holds (mirrors `lower_relation_lit`). A `NameRef`-aliased args
-        // tuple contributes none, so this is a no-op there.
+        // Drop the owned heap cells of the materialized `args` tuple (mirrors
+        // `lower_relation_lit`) — a producer-temp cell or a `NameRef`-retained
+        // heading-owner alike. An args tuple that is itself a `NameRef` to a
+        // parameter owns nothing here, so this is a no-op there.
         if let Some(tv) = args_tv {
-            if let Some(temps) = self.tuple_cell_heap_temps.remove(&tv) {
-                for t in temps {
-                    self.release_call_arg_temp(t);
-                }
-            }
+            self.release_flattened_tuple_cells(tv);
         }
 
         result
@@ -7234,6 +7453,63 @@ mod tests {
             "expected T0076, got {:?}",
             out.diagnostics
         );
+    }
+
+    #[test]
+    fn flattened_tuple_with_heap_cell_carried_across_loop_diagnoses_t0076() {
+        // A flattened tuple carrying a heap cell reassigned across a loop
+        // back-edge owns that cell (retained `NameRef` / producer temp); the
+        // plain value carry would drop the refcount bookkeeping, so it is
+        // conservatively deferred (T0076) rather than silently mis-lowered.
+        let src = "program p;\n\
+                   oper main {} [ var t := { m: \"a\" || \"b\" }; \
+                   for i := 1 to 3 do [ t := { m: \"c\" || \"d\" }; ]; \
+                   let _z = t; ];";
+        let out = lower(src, FileId(0));
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "T0076"),
+            "expected T0076, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn nameref_cell_tuple_through_if_merge_lowers_with_balanced_rc() {
+        // A flattened tuple embedding a `NameRef` owned `Text` cell, flowed
+        // through an `if`-merge and read back by field — the web double-free
+        // shape. It must lower cleanly (no T0076) and emit both a retain (the
+        // tuple's independent reference at construction) and releases (the
+        // heading-based drop at scope exit).
+        let src = "program p;\n\
+                   oper route { hit: Boolean } -> Text [ \
+                       let picked = if hit then [ let body = \"a\" || \"b\"; { m: body } ] \
+                                    else [ { m: \"c\" || \"d\" } ]; \
+                       picked.m \
+                   ];\n\
+                   oper main {} [ let r = route { hit: true }; let _z = r; ];";
+        let out = lower(src, FileId(0));
+        let errors: Vec<_> = out
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == coddl_diagnostics::Severity::Error)
+            .collect();
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        let module = out.module.expect("module produced");
+        let route = module
+            .functions
+            .iter()
+            .find(|f| f.name == "route")
+            .expect("route function");
+        let has_retain = route
+            .blocks
+            .iter()
+            .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Retain { .. })));
+        let has_release = route
+            .blocks
+            .iter()
+            .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Release { .. })));
+        assert!(has_retain, "route retains the tuple's own cell reference");
+        assert!(has_release, "route releases the owned cell at scope exit");
     }
 
     // ── SQL pushdown ──────────────────────────────────────────────────
