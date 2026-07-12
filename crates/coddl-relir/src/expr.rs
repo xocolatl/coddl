@@ -180,8 +180,18 @@ fn apply_rename(renames: &[(String, String)], name: &str) -> String {
 fn render_predicate(pred: &Predicate) -> String {
     match pred {
         Predicate::AttrCmp { attr, op, value } => {
-            format!("{attr} {} {}", op.sql(), render_literal(value))
+            format!("{attr} {} {}", op.sql(), render_value(value))
         }
+    }
+}
+
+/// Render a restriction value for `RelExpr::render`. A literal renders
+/// transparently (`render_literal`); a bound parameter renders as `:name` — the
+/// placeholder form the explain output shows for a runtime-bound value.
+fn render_value(value: &RestrictValue) -> String {
+    match value {
+        RestrictValue::Lit(lit) => render_literal(lit),
+        RestrictValue::Param(name) => format!(":{name}"),
     }
 }
 
@@ -199,17 +209,31 @@ fn render_literal(lit: &Literal) -> String {
     }
 }
 
-/// A restriction predicate: a single `<attr> <cmp> <literal>` test. This grows
+/// A restriction predicate: a single `<attr> <cmp> <value>` test. This grows
 /// to conjunction/disjunction and attribute-vs-attribute tests as the surface
 /// `where` support grows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Predicate {
-    /// `<attr> <op> <literal>`.
+    /// `<attr> <op> <value>`.
     AttrCmp {
         attr: String,
         op: CmpOp,
-        value: Literal,
+        value: RestrictValue,
     },
+}
+
+/// The right-hand side of a pushable restriction: either a compile-time
+/// literal, or a **bound parameter** identified by the surface name of an
+/// in-scope local/parameter whose runtime value binds at query time. The name
+/// is a backend-agnostic free-variable identity — deliberately *not* a ProcIR
+/// value id or an AST node, so this IR stays independent of the lowerer. Both
+/// forms render to a `?`/`$n` placeholder in SQL (see `coddl-sqlemit`); the
+/// lowerer resolves a `Param` name to the local's already-lowered value when it
+/// emits the query's bind arguments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RestrictValue {
+    Lit(Literal),
+    Param(String),
 }
 
 /// A scalar comparison operator in a pushable restriction. Equality (`Eq`/`Ne`)
@@ -767,7 +791,7 @@ mod tests {
         Predicate::AttrCmp {
             attr: "id".to_string(),
             op: CmpOp::Eq,
-            value: Literal::Integer(1),
+            value: RestrictValue::Lit(Literal::Integer(1)),
         }
     }
 
@@ -845,7 +869,7 @@ mod tests {
             pred: Predicate::AttrCmp {
                 attr: "message".to_string(),
                 op: CmpOp::Eq,
-                value: Literal::Text("hi".to_string()),
+                value: RestrictValue::Lit(Literal::Text("hi".to_string())),
             },
         };
         assert!(
@@ -853,6 +877,41 @@ mod tests {
             "text literals render quoted: {}",
             r.render()
         );
+    }
+
+    #[test]
+    fn render_shows_bound_param_as_placeholder() {
+        // A restriction against a bound local renders its value as `:name` — the
+        // explain-output placeholder for a runtime-bound value.
+        let r = RelExpr::Restrict {
+            input: Box::new(greetings()),
+            pred: Predicate::AttrCmp {
+                attr: "message".to_string(),
+                op: CmpOp::Eq,
+                value: RestrictValue::Param("wanted".to_string()),
+            },
+        };
+        assert!(
+            r.render().contains("Restrict { message = :wanted }"),
+            "bound params render as :name — {}",
+            r.render()
+        );
+    }
+
+    #[test]
+    fn key_equality_against_a_param_still_bounds_cardinality() {
+        // `Greetings where id = :p` — a key equality pins ≤ 1 tuple regardless of
+        // whether the value is a literal or a runtime-bound parameter.
+        let r = RelExpr::Restrict {
+            input: Box::new(greetings()),
+            pred: Predicate::AttrCmp {
+                attr: "id".to_string(),
+                op: CmpOp::Eq,
+                value: RestrictValue::Param("p".to_string()),
+            },
+        };
+        assert!(r.card_le_one());
+        assert!(!r.needs_distinct());
     }
 
     // ── DISTINCT-elision analyses ─────────────────────────────────────
@@ -888,7 +947,7 @@ mod tests {
                 pred: Predicate::AttrCmp {
                     attr: "id".to_string(),
                     op,
-                    value: Literal::Integer(1),
+                    value: RestrictValue::Lit(Literal::Integer(1)),
                 },
             }),
             keep: vec!["message".to_string()],

@@ -31,6 +31,7 @@ These are not optimizations; they're correctness requirements imposed by TTM's P
 | Always emit explicit `BEGIN` / `COMMIT`. Never rely on SQL's implicit transaction start. Set constraints `IMMEDIATE` at session start; never `INITIALLY DEFERRED`. | OO Pre 4; RM Pre 23 (statement-boundary check). |
 | Avoid SQL `CHARACTER` / `CHAR(n)` entirely; use `VARCHAR`/`TEXT`. SQL's `CHAR` pads with trailing blanks under equality — violates RM Pre 8. | RM Pre 8. |
 | Every base table emitted from a relvar has a `PRIMARY KEY` from the relvar's declared candidate key (RM Pre 15). The candidate key with the fewest attributes wins ties; the rest become `UNIQUE`. The compiler verifies minimality before emission. | RM Pre 15. |
+| A restriction value binds as a positional `?`/`$n` parameter in `WHERE`-clause order — never inlined into the SQL text. It is either a compile-time literal **or a bound local**: `let s = …; R where col = s` (with `s` an in-scope local of a pushable scalar type matching `col`) pushes as `WHERE "col" = ?` with `s`'s runtime value bound, instead of loading the whole relvar and filtering in-process. Each parameter is a `ParamSource::{Lit(Value), Param(name)}` in `SqlQuery.params`, in placeholder order; the lowerer resolves a `Param` name to the local's already-lowered value at bind time. `Rational` is literal-only (see its row — the literal path pre-serializes `n/d`, a runtime rational has no such text). A general scalar-*expression* RHS (`col = x.f`, arithmetic) still declines and runs in-process. | Performance (docs/principles.md): a keyed lookup by a runtime value must not force a full-table scan. |
 | `reltrue` / `relfalse` (nullary relations): emit as `(SELECT) WHERE TRUE` / `WHERE FALSE`. SQLite/Postgres tolerate this; non-conforming backends would need a synthesized dummy column. | RM Pro 5. |
 | Transitive closure (`tclose`) emits a two-CTE `WITH RECURSIVE` with the operand defined once (params appear once) and `UNION` (never `UNION ALL`) so the closure is a set. It is emitted only at the statement root — a `WITH`-prefixed query can't be a compound operand or a `FROM` subquery, so a nested/operand `TClose` declines and decomposes in-process. | RM Pro 3; the one irreducible Algebra-A operator. |
 | SQLite-specific: Coddl `Boolean` lowers to SQL `INTEGER CHECK (col IN (0, 1))`. Avoid the SQLite affinity-coercion footguns by always `CAST`-ing on `INSERT`. | dialect quirk. |
@@ -125,9 +126,10 @@ emitted SQL:
 
 The `minus`-restrict and whole-table delete rows delegate to a shared
 `emit_delete` on the `minus` subtrahend, which bottoms out in the target base
-relvar; the `WHERE` reuses the same `(column, literal)` collection a
+relvar; the `WHERE` reuses the same `(column, RestrictValue)` collection a
 `SELECT … WHERE` builds for the equivalent restriction, so a delete predicate is
-byte-identical to the matching read predicate. The **keep-filter** row
+byte-identical to the matching read predicate — and a bound-local value
+(`delete R where col = s`) binds the same way it does in a read. The **keep-filter** row
 (`t := t where p` — keep the matching rows) is the same machinery with the
 predicate flipped: `emit_delete` runs over `Restrict(t, ¬p)`, the negated
 restriction (`CmpOp::negate` complements the comparison — `=`↔`<>`, `<`↔`>=`,

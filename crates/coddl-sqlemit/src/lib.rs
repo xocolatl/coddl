@@ -14,7 +14,9 @@
 
 use std::fmt;
 
-use coddl_relir::{CmpOp, Heading, Literal, Predicate, RelExpr, ScalarBinOp, ScalarExpr, Type};
+use coddl_relir::{
+    CmpOp, Heading, Literal, Predicate, RelExpr, RestrictValue, ScalarBinOp, ScalarExpr, Type,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Dialect {
@@ -55,9 +57,22 @@ pub struct PlanId(pub u64);
 #[derive(Clone, Debug)]
 pub struct SqlQuery {
     pub sql: SqlString,
-    pub params: Vec<Value>,
+    pub params: Vec<ParamSource>,
     pub result_heading: Heading,
     pub plan_id: PlanId,
+}
+
+/// One positional bind parameter of an emitted query, in `?`/`$n` order. Either
+/// a compile-time literal value, or a **bound parameter** carrying the surface
+/// name of an in-scope local/parameter — the lowerer resolves the name to that
+/// local's already-lowered runtime value when it builds the query's bind
+/// arguments (see `crates/coddl-procir` `emit_params`). Both forms render to a
+/// placeholder; only the runtime value differs (compile-time constant vs a
+/// value computed earlier in the same function).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParamSource {
+    Lit(Value),
+    Param(String),
 }
 
 /// Identifier for a prepared statement cached by the runtime.
@@ -276,9 +291,9 @@ fn emit_delete(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
             "delete operand does not resolve to a single base relvar".to_string(),
         ));
     }
-    let mut wheres: Vec<(String, CmpOp, Literal)> = Vec::new();
+    let mut wheres: Vec<(String, CmpOp, RestrictValue)> = Vec::new();
     let (from_clause, _cols) = resolve(expr, &mut wheres)?;
-    let mut params: Vec<Value> = Vec::new();
+    let mut params: Vec<ParamSource> = Vec::new();
     let where_sql = render_where_clause(&wheres, dialect, 0, &mut params)?;
     let text = format!("DELETE FROM {from_clause}{where_sql}");
     let plan_id = PlanId(fnv1a(dialect, &text));
@@ -562,7 +577,7 @@ fn emit_update(target: &RelExpr, rhs: &RelExpr, dialect: Dialect) -> Result<SqlQ
 
     // Resolve the inner to its table + column map, collecting the WHERE predicate
     // (`p`, or none for update-all).
-    let mut wheres: Vec<(String, CmpOp, Literal)> = Vec::new();
+    let mut wheres: Vec<(String, CmpOp, RestrictValue)> = Vec::new();
     let (from_clause, cols) = resolve(inner, &mut wheres)?;
 
     let mut set_sql = Vec::with_capacity(sets.len());
@@ -577,7 +592,7 @@ fn emit_update(target: &RelExpr, rhs: &RelExpr, dialect: Dialect) -> Result<SqlQ
         return Err(BackendError::Other("update: empty SET list".to_string()));
     }
 
-    let mut params: Vec<Value> = Vec::new();
+    let mut params: Vec<ParamSource> = Vec::new();
     let where_sql = render_where_clause(&wheres, dialect, 0, &mut params)?;
     let text = format!("UPDATE {from_clause} SET {}{where_sql}", set_sql.join(", "));
     let plan_id = PlanId(fnv1a(dialect, &text));
@@ -875,7 +890,7 @@ fn emit_select_offset(
     // Resolve the core to its physical table and output `(attr, column)` map —
     // renames remap the attr side, projects narrow it — collecting each
     // restriction as a resolved `(column, value)` conjunct along the way.
-    let mut wheres: Vec<(String, CmpOp, Literal)> = Vec::new();
+    let mut wheres: Vec<(String, CmpOp, RestrictValue)> = Vec::new();
     let (from_clause, mut output_cols) = resolve(core, &mut wheres)?;
 
     // Computed columns: each extend value rendered to SQL against the resolved
@@ -948,7 +963,7 @@ fn emit_select_offset(
     // WHERE = the conjunction of the collected (column, literal) tests. Each
     // predicate was resolved to its physical column at its own level in the
     // tree (so a `where` above a `rename` resolves through the rename).
-    let mut params: Vec<Value> = Vec::new();
+    let mut params: Vec<ParamSource> = Vec::new();
     text.push_str(&render_where_clause(
         &wheres,
         dialect,
@@ -1005,7 +1020,7 @@ fn emit_select_offset(
 /// `(column, value)` onto `wheres`; `And` joins two FROM expressions.
 fn resolve(
     expr: &RelExpr,
-    wheres: &mut Vec<(String, CmpOp, Literal)>,
+    wheres: &mut Vec<(String, CmpOp, RestrictValue)>,
 ) -> Result<(String, Vec<(String, String)>)> {
     match expr {
         RelExpr::RelvarRef {
@@ -1173,10 +1188,10 @@ fn column_for<'a>(columns: &'a [(String, String)], attr: &str) -> Result<&'a str
 /// caller can unconditionally append the result. Shared by `emit_select_offset`
 /// (SELECT) and `emit_delete` (DELETE); the conjunction shape is identical.
 fn render_where_clause(
-    wheres: &[(String, CmpOp, Literal)],
+    wheres: &[(String, CmpOp, RestrictValue)],
     dialect: Dialect,
     param_offset: u32,
-    params: &mut Vec<Value>,
+    params: &mut Vec<ParamSource>,
 ) -> Result<String> {
     if wheres.is_empty() {
         return Ok(String::new());
@@ -1191,17 +1206,27 @@ fn render_where_clause(
         // `"n/d"` TEXT, which sorts lexicographically — wrong for rationals. Sort
         // by numeric value via the `coddl_rational` collation. Equality (`= <>`)
         // needs no collation (canonical text `=` already is value-equality).
-        let collate = if matches!(value, Literal::Rational(..)) && is_ordering(*op) {
-            rational_order_collation(dialect)?
-        } else {
-            ""
-        };
+        // Only a *literal* value can be a `Rational` here — the dynamic-parameter
+        // path excludes `Rational` (the literal path pre-serializes `n/d` to
+        // canonical text at compile time; a runtime value cannot), so a `Param`
+        // never needs the collation.
+        let collate =
+            if matches!(value, RestrictValue::Lit(Literal::Rational(..))) && is_ordering(*op) {
+                rational_order_collation(dialect)?
+            } else {
+                ""
+            };
         conjuncts.push(format!(
             "{} {} {placeholder}{collate}",
             quote_ident(col),
             op.sql()
         ));
-        params.push(Value::from(value.clone()));
+        // Both forms occupy one positional placeholder in `wheres` order, so the
+        // pushed `ParamSource` list lines up with the emitted `?`/`$n` sequence.
+        params.push(match value {
+            RestrictValue::Lit(lit) => ParamSource::Lit(Value::from(lit.clone())),
+            RestrictValue::Param(name) => ParamSource::Param(name.clone()),
+        });
     }
     Ok(format!(" WHERE {}", conjuncts.join(" AND ")))
 }
@@ -1356,7 +1381,7 @@ mod tests {
             pred: Predicate::AttrCmp {
                 op: CmpOp::Eq,
                 attr: "id".to_string(),
-                value: Literal::Integer(1),
+                value: RestrictValue::Lit(Literal::Integer(1)),
             },
         }
     }
@@ -1368,7 +1393,7 @@ mod tests {
             pred: Predicate::AttrCmp {
                 attr: attr.to_string(),
                 op,
-                value,
+                value: RestrictValue::Lit(value),
             },
         }
     }
@@ -1395,7 +1420,11 @@ mod tests {
                 format!(r#"SELECT "id", "message" FROM "greetings" WHERE "id" {sym} ?"#),
                 "op {op:?}"
             );
-            assert_eq!(q.params, vec![Value::Integer(3)], "op {op:?}");
+            assert_eq!(
+                q.params,
+                vec![ParamSource::Lit(Value::Integer(3))],
+                "op {op:?}"
+            );
         }
     }
 
@@ -1462,7 +1491,7 @@ mod tests {
             r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?"#
         );
         assert_eq!(q.sql.param_count, 1);
-        assert_eq!(q.params, vec![Value::Integer(1)]);
+        assert_eq!(q.params, vec![ParamSource::Lit(Value::Integer(1))]);
         assert_eq!(q.result_heading, greetings_heading());
     }
 
@@ -1512,7 +1541,7 @@ mod tests {
             q.sql.text,
             r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ? ORDER BY "message""#
         );
-        assert_eq!(q.params, vec![Value::Integer(1)]);
+        assert_eq!(q.params, vec![ParamSource::Lit(Value::Integer(1))]);
     }
 
     #[test]
@@ -1568,7 +1597,7 @@ mod tests {
             pred: Predicate::AttrCmp {
                 op: CmpOp::Eq,
                 attr: "message".to_string(),
-                value: Literal::Text("hello world".to_string()),
+                value: RestrictValue::Lit(Literal::Text("hello world".to_string())),
             },
         };
         let q = emit_select(&expr, Dialect::SQLite).unwrap();
@@ -1577,7 +1606,10 @@ mod tests {
             r#"SELECT "id", "message" FROM "greetings" WHERE "message" = ?"#
         );
         assert_eq!(q.sql.param_count, 1);
-        assert_eq!(q.params, vec![Value::Text("hello world".to_string())]);
+        assert_eq!(
+            q.params,
+            vec![ParamSource::Lit(Value::Text("hello world".to_string()))]
+        );
     }
 
     #[test]
@@ -1589,7 +1621,7 @@ mod tests {
             pred: Predicate::AttrCmp {
                 op: CmpOp::Eq,
                 attr: "message".to_string(),
-                value: Literal::Character('a' as u32),
+                value: RestrictValue::Lit(Literal::Character('a' as u32)),
             },
         };
         let q = emit_select(&expr, Dialect::SQLite).unwrap();
@@ -1598,7 +1630,10 @@ mod tests {
             r#"SELECT "id", "message" FROM "greetings" WHERE "message" = ?"#
         );
         assert_eq!(q.sql.param_count, 1);
-        assert_eq!(q.params, vec![Value::Character('a' as u32)]);
+        assert_eq!(
+            q.params,
+            vec![ParamSource::Lit(Value::Character('a' as u32))]
+        );
     }
 
     #[test]
@@ -1610,7 +1645,7 @@ mod tests {
             pred: Predicate::AttrCmp {
                 op: CmpOp::Eq,
                 attr: "message".to_string(),
-                value: Literal::Approximate(1.5f64.to_bits()),
+                value: RestrictValue::Lit(Literal::Approximate(1.5f64.to_bits())),
             },
         };
         let q = emit_select(&expr, Dialect::SQLite).unwrap();
@@ -1619,7 +1654,10 @@ mod tests {
             r#"SELECT "id", "message" FROM "greetings" WHERE "message" = ?"#
         );
         assert_eq!(q.sql.param_count, 1);
-        assert_eq!(q.params, vec![Value::Approximate(1.5f64.to_bits())]);
+        assert_eq!(
+            q.params,
+            vec![ParamSource::Lit(Value::Approximate(1.5f64.to_bits()))]
+        );
     }
 
     #[test]
@@ -1632,7 +1670,7 @@ mod tests {
             pred: Predicate::AttrCmp {
                 op: CmpOp::Eq,
                 attr: "message".to_string(),
-                value: Literal::Rational(17, 5),
+                value: RestrictValue::Lit(Literal::Rational(17, 5)),
             },
         };
         let q = emit_select(&expr, Dialect::SQLite).unwrap();
@@ -1641,7 +1679,7 @@ mod tests {
             r#"SELECT "id", "message" FROM "greetings" WHERE "message" = ?"#
         );
         assert_eq!(q.sql.param_count, 1);
-        assert_eq!(q.params, vec![Value::Rational(17, 5)]);
+        assert_eq!(q.params, vec![ParamSource::Lit(Value::Rational(17, 5))]);
     }
 
     #[test]
@@ -1654,7 +1692,7 @@ mod tests {
             pred: Predicate::AttrCmp {
                 op: CmpOp::Lt,
                 attr: "message".to_string(),
-                value: Literal::Rational(1, 2),
+                value: RestrictValue::Lit(Literal::Rational(1, 2)),
             },
         };
         let q = emit_select(&expr, Dialect::SQLite).unwrap();
@@ -1662,7 +1700,7 @@ mod tests {
             q.sql.text,
             r#"SELECT "id", "message" FROM "greetings" WHERE "message" < ? COLLATE coddl_rational"#
         );
-        assert_eq!(q.params, vec![Value::Rational(1, 2)]);
+        assert_eq!(q.params, vec![ParamSource::Lit(Value::Rational(1, 2))]);
     }
 
     #[test]
@@ -1675,7 +1713,7 @@ mod tests {
             pred: Predicate::AttrCmp {
                 op: CmpOp::Gt,
                 attr: "message".to_string(),
-                value: Literal::Rational(1, 2),
+                value: RestrictValue::Lit(Literal::Rational(1, 2)),
             },
         };
         assert!(emit_select(&expr, Dialect::Postgres).is_err());
@@ -1693,7 +1731,7 @@ mod tests {
             pred: Predicate::AttrCmp {
                 op: CmpOp::Eq,
                 attr: "message".to_string(),
-                value: Literal::Text("hi".to_string()),
+                value: RestrictValue::Lit(Literal::Text("hi".to_string())),
             },
         };
         let q = emit_select(&expr, Dialect::SQLite).unwrap();
@@ -1704,7 +1742,54 @@ mod tests {
         assert_eq!(q.sql.param_count, 2);
         assert_eq!(
             q.params,
-            vec![Value::Integer(1), Value::Text("hi".to_string())]
+            vec![
+                ParamSource::Lit(Value::Integer(1)),
+                ParamSource::Lit(Value::Text("hi".to_string()))
+            ]
+        );
+    }
+
+    #[test]
+    fn mixed_literal_and_bound_param_bind_in_placeholder_order() {
+        // `Greetings where id = 1 where message = :wanted` mixes a literal and a
+        // bound-local value. Both occupy a placeholder in `wheres` order, so the
+        // emitted `?`s and the `params` list line up: literal `id` first, bound
+        // `message` second. A mis-ordering here would bind the wrong runtime
+        // value to the wrong column.
+        let expr = RelExpr::Restrict {
+            input: Box::new(where_id_1(greetings())),
+            pred: Predicate::AttrCmp {
+                op: CmpOp::Eq,
+                attr: "message".to_string(),
+                value: RestrictValue::Param("wanted".to_string()),
+            },
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ? AND "message" = ?"#
+        );
+        assert_eq!(q.sql.param_count, 2);
+        assert_eq!(
+            q.params,
+            vec![
+                ParamSource::Lit(Value::Integer(1)),
+                ParamSource::Param("wanted".to_string())
+            ]
+        );
+
+        // Postgres numbers the placeholders `$1`, `$2` in the same order.
+        let qp = emit_select(&expr, Dialect::Postgres).unwrap();
+        assert_eq!(
+            qp.sql.text,
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = $1 AND "message" = $2"#
+        );
+        assert_eq!(
+            qp.params,
+            vec![
+                ParamSource::Lit(Value::Integer(1)),
+                ParamSource::Param("wanted".to_string())
+            ]
         );
     }
 
@@ -1735,7 +1820,7 @@ mod tests {
         let q = emit_assignment(&greetings(), &rhs, Dialect::SQLite).unwrap();
         assert_eq!(q.sql.text, r#"DELETE FROM "greetings" WHERE "id" = ?"#);
         assert_eq!(q.sql.param_count, 1);
-        assert_eq!(q.params, vec![Value::Integer(1)]);
+        assert_eq!(q.params, vec![ParamSource::Lit(Value::Integer(1))]);
     }
 
     #[test]
@@ -1804,7 +1889,7 @@ mod tests {
             pred: Predicate::AttrCmp {
                 op: CmpOp::Eq,
                 attr: "id".to_string(),
-                value: Literal::Integer(2),
+                value: RestrictValue::Lit(Literal::Integer(2)),
             },
         };
         let rhs = minus(greetings(), x);
@@ -1815,7 +1900,7 @@ mod tests {
             r#"DELETE FROM "greetings" WHERE EXISTS (SELECT 1 FROM (SELECT "id", "message" FROM "stale" WHERE "id" = ?) AS coddl_anti WHERE "greetings"."id" = coddl_anti."id" AND "greetings"."message" = coddl_anti."message")"#
         );
         assert_eq!(q.sql.param_count, 1);
-        assert_eq!(q.params, vec![Value::Integer(2)]);
+        assert_eq!(q.params, vec![ParamSource::Lit(Value::Integer(2))]);
 
         // Postgres numbers the derived table's placeholder from $1 (nothing
         // precedes it in the DELETE).
@@ -1899,7 +1984,7 @@ mod tests {
             pred: Predicate::AttrCmp {
                 op: CmpOp::Eq,
                 attr: "id".to_string(),
-                value: Literal::Integer(5),
+                value: RestrictValue::Lit(Literal::Integer(5)),
             },
         };
         let rhs = union(greetings(), x);
@@ -1910,7 +1995,7 @@ mod tests {
             q.sql.text
         );
         assert_eq!(q.sql.param_count, 1);
-        assert_eq!(q.params, vec![Value::Integer(5)]);
+        assert_eq!(q.params, vec![ParamSource::Lit(Value::Integer(5))]);
     }
 
     #[test]
@@ -1977,7 +2062,7 @@ mod tests {
             r#"UPDATE "greetings" SET "message" = ("message" || '!') WHERE "id" = ?"#
         );
         assert_eq!(q.sql.param_count, 1);
-        assert_eq!(q.params, vec![Value::Integer(1)]);
+        assert_eq!(q.params, vec![ParamSource::Lit(Value::Integer(1))]);
     }
 
     #[test]
@@ -2028,7 +2113,7 @@ mod tests {
         let rhs = restrict_cmp("id", CmpOp::Eq, Literal::Integer(1));
         let q = emit_assignment(&greetings(), &rhs, Dialect::SQLite).unwrap();
         assert_eq!(q.sql.text, r#"DELETE FROM "greetings" WHERE "id" <> ?"#);
-        assert_eq!(q.params, vec![Value::Integer(1)]);
+        assert_eq!(q.params, vec![ParamSource::Lit(Value::Integer(1))]);
     }
 
     #[test]
@@ -2439,7 +2524,7 @@ mod tests {
             pred: Predicate::AttrCmp {
                 op: CmpOp::Eq,
                 attr: "from".to_string(),
-                value: Literal::Integer(1),
+                value: RestrictValue::Lit(Literal::Integer(1)),
             },
         };
         let expr = RelExpr::TClose {
@@ -2448,7 +2533,7 @@ mod tests {
 
         let q = emit_select(&expr, Dialect::SQLite).unwrap();
         assert_eq!(q.sql.param_count, 1);
-        assert_eq!(q.params, vec![Value::Integer(1)]);
+        assert_eq!(q.params, vec![ParamSource::Lit(Value::Integer(1))]);
         assert_eq!(
             q.sql.text.matches('?').count(),
             1,
@@ -2539,7 +2624,7 @@ mod tests {
                 pred: Predicate::AttrCmp {
                     op: CmpOp::Eq,
                     attr: "dept_name".to_string(),
-                    value: Literal::Text("Engineering".to_string()),
+                    value: RestrictValue::Lit(Literal::Text("Engineering".to_string())),
                 },
             }),
             keep: vec!["dept_name".to_string(), "emp_name".to_string()],
@@ -2550,7 +2635,10 @@ mod tests {
             r#"SELECT DISTINCT "dept_name", "emp_name" FROM "employees" INNER JOIN "departments" USING ("dept_id") WHERE "dept_name" = ?"#
         );
         assert_eq!(q.sql.param_count, 1);
-        assert_eq!(q.params, vec![Value::Text("Engineering".to_string())]);
+        assert_eq!(
+            q.params,
+            vec![ParamSource::Lit(Value::Text("Engineering".to_string()))]
+        );
         assert_eq!(
             q.result_heading,
             Heading::new(vec![
@@ -2802,7 +2890,7 @@ mod tests {
             pred: Predicate::AttrCmp {
                 op: CmpOp::Eq,
                 attr: "identifier".to_string(),
-                value: Literal::Integer(1),
+                value: RestrictValue::Lit(Literal::Integer(1)),
             },
         };
         let q = emit_select(&expr, Dialect::SQLite).unwrap();

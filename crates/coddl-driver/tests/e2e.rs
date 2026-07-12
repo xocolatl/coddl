@@ -3211,6 +3211,134 @@ fn relvar_pushdown_audit_cranelift() {
     assert_pushdown_audit("cranelift");
 }
 
+// ── dynamic-parameter pushdown (bound-local restrict value) ───────────
+
+/// Seed the two-row `greetings` db (`(1,'hello world')`, `(2,'goodbye')`) + its
+/// `.cddb`/`.cdstore` companions, compile and run `program` on `backend`, and
+/// return its stdout. Companion of `run_greetings_dml` for read/print programs.
+/// The suite owns its source — it never reads `examples/`.
+fn run_greetings_stdout(backend: &str, program: &str) -> Vec<u8> {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("greetings.cddb"),
+        "database greetings;\n\
+         base relvar Greetings { id: Integer, message: Text } key { id };\n",
+    )
+    .expect("write greetings.cddb");
+    std::fs::write(
+        dir.join("greetings.cdstore"),
+        "store for greetings;\n\
+         backend sqlite { file: \"greetings.sqlite\" };\n\
+         relvar Greetings: table \"greetings\" { columns: { id: \"id\", message: \"message\" } };\n",
+    )
+    .expect("write greetings.cdstore");
+    let db = dir.join("greetings.sqlite");
+    let seed = Command::new("sqlite3")
+        .arg(&db)
+        .arg(
+            "CREATE TABLE greetings (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
+             INSERT INTO greetings (id, message) VALUES (1, 'hello world'), (2, 'goodbye');",
+        )
+        .status()
+        .expect("invoke sqlite3");
+    assert!(seed.success(), "greetings fixture seed failed");
+
+    let cd = dir.join("sel.cd");
+    std::fs::write(&cd, program).expect("write sel.cd");
+
+    let out = coddl()
+        .env("CODDL_GREETINGS_FILE", &db)
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend={backend} {:?} failed: stderr=\n{}",
+        cd,
+        String::from_utf8_lossy(&out.stderr),
+    );
+    out.stdout
+}
+
+/// `Greetings where message = wanted`, with `wanted` a **runtime-computed** Text
+/// local, pushes as `WHERE "message" = ?` and binds the local's value — so it
+/// selects the row equal to the *computed* string. Picking `"good" || "bye"` out
+/// of the two-row table proves the bind carried the right runtime value: a
+/// broken bind (empty / wrong / a stale literal) would match nothing or row 1.
+/// The whole path exercises build_predicate → sqlemit → emit_params → codegen →
+/// the runtime positional bind, on both backends.
+fn assert_dynamic_param_selects_by_local(backend: &str) {
+    let stdout = run_greetings_stdout(
+        backend,
+        "program p;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             let wanted = \"good\" || \"bye\";\n\
+             let g = transaction [\n\
+                 extract (Greetings where message = wanted project { message })\n\
+             ];\n\
+             write_line { message: g.message };\n\
+         ];\n",
+    );
+    assert_eq!(
+        stdout,
+        b"goodbye\n",
+        "backend={backend}: got {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+}
+
+#[test]
+fn dynamic_param_selects_by_local_llvm() {
+    assert_dynamic_param_selects_by_local("llvm");
+}
+
+#[test]
+fn dynamic_param_selects_by_local_cranelift() {
+    assert_dynamic_param_selects_by_local("cranelift");
+}
+
+/// A restriction mixing a **literal** and a **bound-local** value in one `where`
+/// binds both params in placeholder order (`WHERE "message" = ? AND "id" = ?`).
+/// Selecting the row whose message equals the computed local AND whose id is the
+/// literal `2` returns exactly `goodbye`; swapping the intended order would match
+/// nothing. Proves lit + dyn params interleave correctly end-to-end.
+fn assert_mixed_literal_and_dynamic_param(backend: &str) {
+    let stdout = run_greetings_stdout(
+        backend,
+        "program p;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             let wanted = \"good\" || \"bye\";\n\
+             let g = transaction [\n\
+                 extract (Greetings where message = wanted and id = 2 project { message })\n\
+             ];\n\
+             write_line { message: g.message };\n\
+         ];\n",
+    );
+    assert_eq!(
+        stdout,
+        b"goodbye\n",
+        "backend={backend}: got {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+}
+
+#[test]
+fn mixed_literal_and_dynamic_param_llvm() {
+    assert_mixed_literal_and_dynamic_param("llvm");
+}
+
+#[test]
+fn mixed_literal_and_dynamic_param_cranelift() {
+    assert_mixed_literal_and_dynamic_param("cranelift");
+}
+
 // ── surgical writes (relational assignment → DML) ─────────────────────
 
 /// Seed a fresh two-row `greetings` db + its `.cddb`/`.cdstore` companions,
@@ -3303,6 +3431,35 @@ fn dml_delete_where_persists_llvm() {
 #[test]
 fn dml_delete_where_persists_cranelift() {
     assert_delete_where_persists("cranelift");
+}
+
+/// `delete Greetings where message = doomed` with `doomed` a bound Text local
+/// pushes as `DELETE FROM greetings WHERE "message" = ?` and binds the local, so
+/// only the matching row is removed — the dynamic-parameter path rides the DML
+/// predicate for free (same `emit_params`). Deleting the computed `"goodbye"`
+/// leaves only `hello world`. Same result on both backends.
+fn assert_delete_where_dynamic_param_persists(backend: &str) {
+    let rows = run_greetings_dml(
+        backend,
+        "program p;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             let doomed = \"good\" || \"bye\";\n\
+             transaction [ delete Greetings where message = doomed; ];\n\
+         ];\n",
+    );
+    assert_eq!(rows, vec!["1|hello world".to_string()], "backend={backend}");
+}
+
+#[test]
+fn dml_delete_where_dynamic_param_persists_llvm() {
+    assert_delete_where_dynamic_param_persists("llvm");
+}
+
+#[test]
+fn dml_delete_where_dynamic_param_persists_cranelift() {
+    assert_delete_where_dynamic_param_persists("cranelift");
 }
 
 /// `R := R minus R` empties the relvar with a whole-table `DELETE FROM

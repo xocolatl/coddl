@@ -38,7 +38,7 @@ pub fn try_push_ordered(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coddl_relir::{CmpOp, Heading, Literal, Predicate, Type};
+    use coddl_relir::{CmpOp, Heading, Literal, Predicate, RestrictValue, Type};
 
     fn greetings() -> RelExpr {
         RelExpr::RelvarRef {
@@ -64,7 +64,7 @@ mod tests {
             pred: Predicate::AttrCmp {
                 attr: "id".to_string(),
                 op: CmpOp::Eq,
-                value: Literal::Integer(1),
+                value: RestrictValue::Lit(Literal::Integer(1)),
             },
         };
         let q = try_push(&expr, Dialect::SQLite).expect("relvar-rooted subtree pushes");
@@ -119,7 +119,7 @@ mod tests {
             pred: Predicate::AttrCmp {
                 attr: "id".to_string(),
                 op: CmpOp::Eq,
-                value: Literal::Integer(1),
+                value: RestrictValue::Lit(Literal::Integer(1)),
             },
         };
         let q = try_push_ordered(&expr, Dialect::SQLite, &[("message".to_string(), false)])

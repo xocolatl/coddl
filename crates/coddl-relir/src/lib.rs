@@ -22,4 +22,6 @@
 mod expr;
 
 pub use coddl_types::{Heading, Type};
-pub use expr::{CmpOp, Literal, Predicate, RelExpr, ScalarBinOp, ScalarExpr, StorageOrigin};
+pub use expr::{
+    CmpOp, Literal, Predicate, RelExpr, RestrictValue, ScalarBinOp, ScalarExpr, StorageOrigin,
+};

@@ -17,15 +17,28 @@ This doc describes the **target** RelIR. The code implements a thin slice of it;
 - **The cut** as a trivial origin gate — *not* a cost model: push a subtree iff every leaf is relvar-rooted and SQL emission succeeds (`coddl-procir/src/cut.rs`).
 - **SQL pushdown** of relvar-rooted `RelvarRef` / `Restrict` / `Project` / `Rename` via `coddl-sqlemit`.
 - An **in-process path** for non-pushable subtrees — currently lowered to ProcIR within `coddl-procir` itself (not yet through `coddl-execlocal`).
-- Restriction predicates are an `attr <cmp> literal` comparison
-  (`Predicate::AttrCmp { attr, op: CmpOp, value }`), where `<cmp>` is `=`/`<>`
-  (Integer/Text/Boolean) or `<`/`<=`/`>`/`>=` (Integer). Only `=` pins a value,
-  so only it bounds cardinality for `DISTINCT`-elision. A **bare Boolean
-  attribute** predicate `R where flag` is the equality `flag = true` (a
+- Restriction predicates are an `attr <cmp> value` comparison
+  (`Predicate::AttrCmp { attr, op: CmpOp, value: RestrictValue }`), where `<cmp>`
+  is `=`/`<>` (Integer/Text/Boolean) or `<`/`<=`/`>`/`>=` (Integer). Only `=`
+  pins a value, so only it bounds cardinality for `DISTINCT`-elision. A **bare
+  Boolean attribute** predicate `R where flag` is the equality `flag = true` (a
   Boolean-valued attribute is itself a proposition) and pushes as
-  `Predicate::AttrCmp { attr, Eq, Boolean(true) }` → `WHERE "flag" = ?` — the
-  formatter canonicalizes `flag = true` to the bare form, so both surface
+  `Predicate::AttrCmp { attr, Eq, Lit(Boolean(true)) }` → `WHERE "flag" = ?` —
+  the formatter canonicalizes `flag = true` to the bare form, so both surface
   spellings must push identically.
+- The value is a `RestrictValue`: either a compile-time `Lit(Literal)`, or a
+  **bound parameter** `Param(name)` — the surface name of an in-scope
+  local/parameter whose runtime value binds at query time. `Param` keeps the IR
+  backend- and lowerer-agnostic (a free-variable *name*, never a ProcIR value id
+  or an AST node); the lowerer resolves the name to that local's already-lowered
+  value when it emits the query's bind arguments. So `let s = …; R where col = s`
+  pushes as `WHERE "col" = ?` bound to `s` instead of loading `R` and filtering
+  in-process. Cut-1 accepts a bare-local RHS of a pushable scalar
+  (`{Integer, Text, Character, Approximate, Boolean}`; `Rational` stays
+  literal-only, since the literal path pre-serializes `n/d` to text at compile
+  time and a runtime rational has no such text). A general scalar-*expression*
+  RHS (`col = x.f`, arithmetic) still declines — name the value first. Both
+  forms render to a `?`/`$n` placeholder; see `coddl-sqlemit`'s `ParamSource`.
 - A **conjunctive `where`** (`R where p and q and …`) of pushable comparisons
   pushes: the lowerer (`collect_conjuncts`) splits it into one `Restrict` per
   conjunct — the identical tree the stacked spelling `R where p where q` builds —

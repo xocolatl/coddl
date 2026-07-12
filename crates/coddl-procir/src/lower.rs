@@ -27,11 +27,12 @@ use coddl_types::{
 };
 
 use coddl_relir::{
-    CmpOp, Literal as RelLiteral, Predicate, RelExpr, ScalarBinOp, ScalarExpr, StorageOrigin,
+    CmpOp, Literal as RelLiteral, Predicate, RelExpr, RestrictValue, ScalarBinOp, ScalarExpr,
+    StorageOrigin,
 };
 use coddl_sqlemit::{
-    emit_assignment, emit_insert_template, emit_replace_insert, emit_truncate, Dialect, SqlQuery,
-    Value,
+    emit_assignment, emit_insert_template, emit_replace_insert, emit_truncate, Dialect,
+    ParamSource, SqlQuery, Value,
 };
 
 use crate::ir::{
@@ -4374,7 +4375,7 @@ impl Lowerer {
                 Some(Type::Boolean) => Some(Predicate::AttrCmp {
                     attr,
                     op: CmpOp::Eq,
-                    value: RelLiteral::Boolean(true),
+                    value: RestrictValue::Lit(RelLiteral::Boolean(true)),
                 }),
                 _ => None,
             };
@@ -4397,17 +4398,44 @@ impl Lowerer {
         };
         let lhs = b.lhs()?;
         let rhs = b.rhs()?;
-        // The attribute may be either operand. With it on the right
-        // (`literal OP attr`) the operator is flipped so the stored predicate is
-        // always `attr OP' literal` (`5 < id` ⇒ `id > 5`).
-        let (attr, op, lit_expr) = match (attr_ref_name(&lhs), attr_ref_name(&rhs)) {
-            (Some(a), None) => (a, op, rhs),
-            (None, Some(a)) => (a, op.flip(), lhs),
-            // attr-vs-attr or literal-vs-literal: not a pushable comparison.
+        // Identify which operand is the restricted attribute and which is the
+        // value. The attribute is the operand that names a *heading* member; the
+        // value is the other side (a literal, or a bound local). With the
+        // attribute on the right (`value OP attr`) the operator is flipped so the
+        // stored predicate is always `attr OP' value` (`5 < id` ⇒ `id > 5`).
+        // When *both* operands are bare names, the heading disambiguates: exactly
+        // one may be an attribute — `attr = attr` (both members) and
+        // `local = local` (neither) are not pushable restrictions.
+        let attr_is = |name: &str| heading.lookup(name).is_some();
+        let (attr, op, value_expr) = match (attr_ref_name(&lhs), attr_ref_name(&rhs)) {
+            (Some(a), None) if attr_is(&a) => (a, op, rhs),
+            (None, Some(a)) if attr_is(&a) => (a, op.flip(), lhs),
+            (Some(la), Some(ra)) => match (attr_is(&la), attr_is(&ra)) {
+                (true, false) => (la, op, rhs),        // rhs is the bound local
+                (false, true) => (ra, op.flip(), lhs), // lhs is the bound local
+                // both attributes or neither: not a pushable comparison.
+                _ => return None,
+            },
             _ => return None,
         };
-        heading.lookup(&attr)?;
-        let value = self.literal_value(&lit_expr)?;
+        // The attribute must exist (guaranteed by `attr_is` above). The value is a
+        // compile-time literal, or a bound local whose runtime value binds at
+        // query time — the latter pushes only when the attribute is a plain
+        // pushable scalar and the local's type matches it (see
+        // `pushable_scalar_proc_type`, which excludes `Rational`).
+        let attr_ty = heading.lookup(&attr)?;
+        let value = match self.literal_value(&value_expr) {
+            Some(lit) => RestrictValue::Lit(lit),
+            None => {
+                let name = attr_ref_name(&value_expr)?;
+                let (_vid, local_ty) = self.lookup_local(&name)?;
+                let attr_pt = pushable_scalar_proc_type(attr_ty)?;
+                if local_ty != attr_pt {
+                    return None; // type mismatch → decline the push (runs in-process)
+                }
+                RestrictValue::Param(name)
+            }
+        };
         Some(Predicate::AttrCmp { attr, op, value })
     }
 
@@ -4485,33 +4513,53 @@ impl Lowerer {
         }
     }
 
-    /// Emit one `Inst::Const` per bind value and return the `(ValueId, ProcType)`
-    /// param list a `Query`/`Dml` instruction passes to the runtime. Shared by
-    /// `emit_query` and `emit_dml`.
+    /// Build the `(ValueId, ProcType)` bind-argument list a `Query`/`Dml`
+    /// instruction passes to the runtime, in placeholder order. A `Lit` param
+    /// emits one `Inst::Const`; a `Param` param resolves the bound local's name
+    /// to its already-lowered value (no new instruction). Shared by `emit_query`
+    /// and `emit_dml`.
     fn emit_params(&mut self, query: &SqlQuery) -> Vec<(ValueId, ProcType)> {
         let mut params: Vec<(ValueId, ProcType)> = Vec::with_capacity(query.params.len());
-        for v in &query.params {
-            let (value, ty) = match v {
-                Value::Integer(n) => (Const::Integer(*n), ProcType::Integer),
-                Value::Text(s) => (Const::Text(s.clone().into_bytes()), ProcType::Text),
-                Value::Character(cp) => (Const::Character(*cp), ProcType::Character),
-                Value::Approximate(bits) => (Const::Approximate(*bits), ProcType::Approximate),
-                // A `Rational` bind param serializes to its canonical `"n/d"`
-                // string and rides the existing Text param path (SQLite has no
-                // exact-rational type; canonical text ⇒ text-`=` is value-`=`).
-                Value::Rational(n, d) => {
-                    (Const::Text(format!("{n}/{d}").into_bytes()), ProcType::Text)
+        for p in &query.params {
+            match p {
+                ParamSource::Lit(v) => {
+                    let (value, ty) = match v {
+                        Value::Integer(n) => (Const::Integer(*n), ProcType::Integer),
+                        Value::Text(s) => (Const::Text(s.clone().into_bytes()), ProcType::Text),
+                        Value::Character(cp) => (Const::Character(*cp), ProcType::Character),
+                        Value::Approximate(bits) => {
+                            (Const::Approximate(*bits), ProcType::Approximate)
+                        }
+                        // A `Rational` bind param serializes to its canonical
+                        // `"n/d"` string and rides the existing Text param path
+                        // (SQLite has no exact-rational type; canonical text ⇒
+                        // text-`=` is value-`=`).
+                        Value::Rational(n, d) => {
+                            (Const::Text(format!("{n}/{d}").into_bytes()), ProcType::Text)
+                        }
+                        Value::Boolean(b) => (Const::Boolean(*b), ProcType::Boolean),
+                    };
+                    let dst = self.fresh_value();
+                    self.record_type(dst, ty.clone());
+                    self.insts.push(Inst::Const {
+                        dst,
+                        value,
+                        ty: ty.clone(),
+                    });
+                    params.push((dst, ty));
                 }
-                Value::Boolean(b) => (Const::Boolean(*b), ProcType::Boolean),
-            };
-            let dst = self.fresh_value();
-            self.record_type(dst, ty.clone());
-            self.insts.push(Inst::Const {
-                dst,
-                value,
-                ty: ty.clone(),
-            });
-            params.push((dst, ty));
+                // A bound local: reuse its already-lowered value directly. The
+                // name is guaranteed in scope — `build_predicate` accepted this
+                // `Param` only after `lookup_local` succeeded, and no scope is
+                // pushed or popped between that acceptance and here (both run
+                // inside one statement lowering).
+                ParamSource::Param(name) => {
+                    let (vid, ty) = self
+                        .lookup_local(name)
+                        .expect("bound-param local resolved at build_predicate");
+                    params.push((vid, ty));
+                }
+            }
         }
         params
     }
@@ -6424,6 +6472,26 @@ fn proc_type_from_kind(kind: u32) -> ProcType {
 /// (which needs the heading interner); the free function below is
 /// the simple total mapping for non-relation cells. Phase 19's tuple
 /// cells don't yet carry relations, so this path is fine.
+/// The `ProcType` a bound-local restriction value binds as, when the attribute
+/// it is compared to is a plain pushable scalar — else `None`, declining the
+/// dynamic-parameter push (the restriction then runs in-process). The set is the
+/// literal-pushdown scalars MINUS `Rational`: the literal path pre-serializes a
+/// rational to canonical `"n/d"` TEXT at compile time, but a runtime `Rational`
+/// value carries no such text, so a rational local stays in-process (this also
+/// sidesteps the ordering collation the literal path applies to `Rational`).
+/// Non-scalar and `Binary`/`Byte`/user-`Scalar` attributes are never pushed as
+/// bound params. Used only by `build_predicate`.
+fn pushable_scalar_proc_type(ty: &Type) -> Option<ProcType> {
+    match ty {
+        Type::Integer => Some(ProcType::Integer),
+        Type::Text => Some(ProcType::Text),
+        Type::Character => Some(ProcType::Character),
+        Type::Approximate => Some(ProcType::Approximate),
+        Type::Boolean => Some(ProcType::Boolean),
+        _ => None,
+    }
+}
+
 fn proc_type_from_type(ty: &Type) -> ProcType {
     match ty {
         Type::Integer => ProcType::Integer,
@@ -7226,6 +7294,92 @@ oper main {}\n\
         );
         assert_eq!(m.plans.len(), 1, "exactly one baked plan");
         assert_eq!(m.plans[0].param_count, 2, "two bound conjunct literals");
+    }
+
+    const HELLO_WORLD_DB_DYN_PARAM: &str = "\
+program hello_world_db;\n\
+database greetings;\n\
+\n\
+public relvar Greetings {\n\
+    id: Integer,\n\
+    message: Text,\n\
+}\n\
+key { id };\n\
+\n\
+oper main {}\n\
+[\n\
+    let wanted = \"hi\";\n\
+    let g = transaction [\n\
+        extract (Greetings where message = wanted)\n\
+    ];\n\
+    write_line { message: g.message };\n\
+];\n";
+
+    #[test]
+    fn dynamic_bound_local_restrict_pushes_and_binds_the_local() {
+        // `Greetings where message = wanted` — the restriction value is a bound
+        // `Text` local, not a literal. It pushes as `WHERE "message" = ?` and the
+        // query binds the local's already-lowered value (no fresh `Const`), which
+        // is what turns the old whole-relvar in-process load into one SELECT.
+        let out = explain_with_plan(HELLO_WORLD_DB_DYN_PARAM, FileId(0), Some(&greetings_plan()));
+        assert_eq!(out.relir.len(), 1, "one pushed query expected");
+        assert_eq!(
+            out.relir[0].sql,
+            r#"SELECT "id", "message" FROM "greetings" WHERE "message" = ?"#
+        );
+        // The RelExpr carries a bound parameter, rendered as `:wanted`.
+        assert_eq!(
+            out.relir[0].expr.render(),
+            "Restrict { message = :wanted }\n  \
+             RelvarRef Greetings { db: greetings, table: greetings }"
+        );
+
+        let m = lower_ok_with_plan(HELLO_WORLD_DB_DYN_PARAM, &greetings_plan());
+        assert_eq!(m.plans.len(), 1, "exactly one baked plan");
+        assert_eq!(m.plans[0].param_count, 1, "one bound param");
+
+        let main = m.functions.iter().find(|f| f.name == "main").expect("main");
+        let insts = &main.blocks[0].insts;
+
+        // It really pushed — no in-process `where` / relvar read remains.
+        assert!(
+            !insts.iter().any(|i| matches!(i, Inst::Where { .. })),
+            "dynamic-param where should push, not run in-process:\n{m}"
+        );
+        assert!(!insts.iter().any(|i| matches!(i, Inst::RelvarRead { .. })));
+
+        // The `wanted` binding emits exactly one `Const::Text("hi")`; the query
+        // reuses that value rather than synthesizing a second copy for the bind.
+        let wanted_consts: Vec<ValueId> = insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::Const {
+                    dst,
+                    value: Const::Text(b),
+                    ..
+                } if b == b"hi" => Some(*dst),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            wanted_consts.len(),
+            1,
+            "no duplicate const for the bound param:\n{m}"
+        );
+
+        let query_params = insts
+            .iter()
+            .find_map(|i| match i {
+                Inst::Query { params, .. } => Some(params),
+                _ => None,
+            })
+            .expect("one Inst::Query");
+        assert_eq!(query_params.len(), 1, "one bind arg");
+        assert_eq!(
+            query_params[0].0, wanted_consts[0],
+            "the query binds the `wanted` local's value, not a fresh const"
+        );
+        assert_eq!(query_params[0].1, ProcType::Text);
     }
 
     #[test]
