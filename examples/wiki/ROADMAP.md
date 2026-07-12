@@ -293,15 +293,25 @@ The keystone phase. Routing rides **H1** (a host transform — no L1); safe rend
   Acceptance: a page whose title contains `<script>` renders escaped; a unit test asserts
   the entity output.
 
-- `[ ] F1 (FW) — Router (method + path dispatch).`
+- `[x] F1 (FW) — Router (method + path dispatch).` DONE (this commit) — `handle` reads
+  `req.method` + the cooked `req.path` relation and dispatches by relational query:
+  `req.path.cardinality{} = 0` → `/` (home), `(req.path where ordinality = 0 and segment =
+  "wiki").cardinality{} = 1` → `/wiki/{slug}` (a STUB — F2 extracts the slug), else → 404. No L1.
+  **Forced-dependency discovery: L8.** The natural shape `if … then [ home_page{} ] else [
+  not_found{} ]` (route sub-opers) does NOT emit-obj — Cranelift's verifier rejects merging an
+  `oper` CALL's boxed-tuple result through an if/else (LLVM is fine). Workaround (compiles on
+  BOTH backends): each branch selects a `{ status, body }` **literal** (a literal merge is fine),
+  and one `html_response{ … }` call wraps it after the dispatch. `html_response` + the inline 404
+  anticipate F3 (rest deferred). Verified: emit-obj (Cranelift) + emit-llvm clean; curl smoke —
+  `/` → 200 home (125 B), `/wiki/Home` → 200 stub (147 B), `/bogus` + `POST /` → 404 (107 B).
+  Depends on: H1. Unblocks: A2 (still needs F2 + F4 + F6 + A1). Original spec:
   A `handle` helper that reads `req.method` and dispatches on `req.path` — the cooked
   `{ordinality, segment}` relation from H1. Dispatch is a **relational query**: e.g.
   `cardinality { req.path } = 0` for `/`, `req.path where ordinality = 0 and segment = "wiki"`
   for `/wiki/...` — so **no L1** (H1 already split + decoded the path). Start with a small
-  explicit match; do NOT build a generic route table yet (that's F7). Keep it FW-tagged.
-  Depends on: H1, F3. Unblocks: A2.
-  Acceptance: GET `/` and GET `/wiki/{slug}` reach different sub-opers; an unknown path
-  returns F3's `not_found`.
+  explicit match; do NOT build a generic route table yet (that's F7 — now fully scoped in
+  `examples/wiki/routing-design.md`). Keep it FW-tagged.
+  Acceptance: GET `/` and GET `/wiki/{slug}` reach different routes; an unknown path returns 404.
 
 - `[ ] F2 (FW) — Path-param extraction.`
   Capture a segment from the cooked `req.path` relation (H1 already split + percent-decoded
