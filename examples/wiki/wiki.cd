@@ -12,7 +12,7 @@ library wiki;
 // Routes (F1 — method + path dispatch, a small explicit match, not F7's route
 // table):
 //   GET /            -> the home page
-//   GET /wiki/{slug} -> a page view   (STUB: per-slug rendering is F2 + A2)
+//   GET /wiki/{slug} -> the matching Pages row, or 404 (F2)
 //   anything else    -> 404
 //
 // Dispatch is a relational query over `req.path` — no Text primitives needed (H1
@@ -42,9 +42,10 @@ library wiki;
 //   CODDL_APP_OBJ=/tmp/wiki.o \
 //     CODDL_WIKI_FILE=$PWD/examples/wiki/wiki.sqlite \
 //     cargo run -p coddl-web
-//   curl -si localhost:8000/            # => 200, text/html, the Home page
-//   curl -si localhost:8000/wiki/Home   # => 200, the /wiki/{slug} stub
-//   curl -si localhost:8000/bogus       # => 404 Not Found
+//   curl -si localhost:8000/             # => 200, text/html, the Home page
+//   curl -si localhost:8000/wiki/about   # => 200, the About page
+//   curl -si localhost:8000/wiki/missing # => 404 Not Found (no such slug)
+//   curl -si localhost:8000/bogus        # => 404 Not Found
 use module coddl::web;
 
 database wiki;
@@ -63,6 +64,17 @@ oper html_response{ status: Integer, body: Text } -> RawResponse [
         status,
         headers: Relation { { name: "Content-Type", value: "text/html", ordinality: 0 } },
         body
+    }
+];
+
+// Render a page (title + body) into the shared HTML shell. Extracted from the
+// home route (F2) so the home page, /wiki/{slug}, and the 404 all share one
+// template. Bodies are interpolated raw — the seed data is trusted; HTML
+// escaping (F4's `escape_html`) lands with L1 Text primitives.
+oper page_html{ title: Text, body: Text } -> Text [
+    format{
+        template: f"<!doctype html>\n<html>\n<head><title>{title}</title></head>\n<body>\n<h1>{title}</h1>\n<div>{body}</div>\n</body>\n</html>\n",
+        args: { title: title, body: body }
     }
 ];
 
@@ -90,21 +102,32 @@ oper handle{ req: Request } -> RawResponse [
 
         if home.cardinality{} <> 0 then [
             let info = extract home;
-            body := format{
-                template: f"<!doctype html>\n<html>\n<head><title>{title}</title></head>\n<body>\n<h1>{title}</h1>\n<div>{body}</div>\n</body>\n</html>\n",
-                args: { title: info.title, body: info.body }
-            };
+            body := page_html{ title: info.title, body: info.body };
         ];
 
         { status: 200, body }
     ] else [
-        if is_get and wiki_seg.cardinality{} = 1 then [
-            // GET /wiki/{slug} — STUB. F2 extracts the slug from `req.path` and
-            // queries the matching `Pages` row; A2 renders it.
-            {
-                status: 200,
-                body: "<!doctype html>\n<html>\n<head><title>Wiki page</title></head>\n<body>\n<h1>Wiki page</h1>\n<p>Per-slug rendering lands in F2 + A2.</p>\n</body>\n</html>\n"
-            }
+        if is_get and wiki_seg.cardinality{} = 1 and req.path.cardinality{} = 2 then [
+            // GET /wiki/{slug} (F2) — extract the slug at path position 1 and
+            // render the matching `Pages` row, or 404 if there is none. The slug
+            // is bound to a `Text` local, so `Pages where slug = slug_text`
+            // pushes to SQL as `WHERE "slug" = ?` (dynamic-parameter pushdown) —
+            // one filtered read, not a whole-table scan. `status`/`body` are
+            // carried across the then-only `if` (the proven two-carried-var shape,
+            // like the home route's `body`); a missing slug leaves the 404 default.
+            var status := 404;
+            var body := "<!doctype html>\n<html>\n<head><title>Not Found</title></head>\n<body>\n<h1>404 Not Found</h1>\n</body>\n</html>\n";
+            let slug_seg = extract (req.path where ordinality = 1 project { segment });
+            let slug_text = slug_seg.segment;
+            let page = transaction [
+                Pages where slug = slug_text project { title, body }
+            ];
+            if page.cardinality{} <> 0 then [
+                let info = extract page;
+                status := 200;
+                body := page_html{ title: info.title, body: info.body };
+            ];
+            { status, body }
         ] else [
             // Any unmatched method/path.
             {

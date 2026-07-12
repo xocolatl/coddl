@@ -321,14 +321,30 @@ The keystone phase. Routing rides **H1** (a host transform — no L1); safe rend
   `examples/wiki/routing-design.md`). Keep it FW-tagged.
   Acceptance: GET `/` and GET `/wiki/{slug}` reach different routes; an unknown path returns 404.
 
-- `[ ] F2 (FW) — Path-param extraction.`
-  Capture a segment from the cooked `req.path` relation (H1 already split + percent-decoded
-  it). The slug at position 1 is `extract (req.path where ordinality = 1 project { segment })`
-  — safe because F1's route guard guarantees exactly one tuple there (else `extract` errors
-  on 0 rows; memory `extract-errors-on-empty`). No L1. (One thing to verify: `extract` over a
-  relation-valued *tuple field* `req.path`, not just a relvar/query result.)
+- `[x] F2 (FW) — Path-param extraction.` DONE.
+  `/wiki/{slug}` captures the slug from the cooked `req.path` relation (H1 split + decoded it):
+  under the guard `is_get and wiki_seg.cardinality{} = 1 and req.path.cardinality{} = 2`,
+  `slug_seg = extract (req.path where ordinality = 1 project { segment })` — `extract` over a
+  relation-valued *tuple field* works (verified). The slug binds to a `Text` local and
+  `Pages where slug = slug_text project { title, body }` fetches the row → 200 + `page_html`
+  if found, else 404. `page_html { title, body } -> Text` is the shared render helper the home
+  route now reuses too. No L1.
+  **Forced a compiler feature — dynamic-parameter SQL pushdown.** A restrict whose value is a
+  bound local (`where slug = slug_text`) now pushes as `WHERE "slug" = ?` with the local's
+  runtime value bound, instead of loading the whole relvar and filtering in-process — the
+  fallback `docs/principles.md` rejects. New `RestrictValue { Lit | Param(name) }` (relir) +
+  `ParamSource` (sqlemit); the lowerer resolves the `Param` name to the local's already-lowered
+  value in `emit_params`. Cut-1 = a bare-local RHS of a pushable scalar
+  (`{Integer, Text, Character, Approximate, Boolean}`; `Rational` literal-only; a general
+  scalar-*expression* RHS names the value first). DML `where col = s` rides it for free.
+  Docs: `docs/relir.md`, `docs/sqlemit.md`.
   Depends on: H1. Unblocks: A2, A3.
-  Acceptance: `/wiki/Home` yields `slug = "Home"`; a unit/e2e test covers extraction.
+  Done: pushdown across coddl-relir/procir/sqlemit + golden-SQL unit test (`WHERE "col" = ?`
+  binds the local's value id, not a fresh const) + leak-gated e2e both backends (local restrict
+  selects by the computed value; mixed lit+dyn param ordering; DML delete-where). `wiki.cd`'s
+  `/wiki/{slug}` route + `page_html`; `coddl explain` shows the slug read as `Restrict { slug =
+  :slug_text }` → `WHERE "slug" = ?`; routing verified in the web host (`/wiki/about`,
+  `/wiki/home` → 200; `/wiki/missing`, `/wiki` → 404).
 
 - `[ ] F6 (FW) — Templating / HTML rendering helpers.`
   The body-building idiom from P4 (T0076 loop-carried `Text`) factored into reusable
