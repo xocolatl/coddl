@@ -73,6 +73,7 @@ fn fixtures_dir() -> &'static Path {
             ("fresh-relation-write", FRESH_RELATION_WRITE_SRC),
             ("extract-in-if-arm", EXTRACT_IN_IF_ARM_SRC),
             ("if-carried-text", IF_CARRIED_TEXT_SRC),
+            ("return-early", RETURN_EARLY_SRC),
         ] {
             std::fs::write(tmp.path().join(format!("{name}.cd")), src)
                 .unwrap_or_else(|e| panic!("write {name}.cd fixture: {e}"));
@@ -335,6 +336,39 @@ oper main {} [
     write_line { message: c3 { flag: true } };  write_line { message: c3 { flag: false } };
     write_line { message: c4 { flag: true } };  write_line { message: c4 { flag: false } };
     write_line { message: c5 { flag: true } };  write_line { message: c5 { flag: false } };
+];
+";
+
+// Early `return` (mid-operator exit). `pick` is a no-`else` guard clause (the
+// then-arm diverges; the false edge falls through). `classify` is the wiki
+// 404-route shape — `let x = if c then [v] else [ return … ]` — where the
+// diverging `else` arm unifies with its value-producing sibling. `unwind`
+// exercises the cross-scope release: an early `return` past a live relation
+// local (`rows`) must free it on every exit path — `assert_both_backends` runs
+// under the leak gate, so a missed or double release trips the run.
+const RETURN_EARLY_SRC: &str = "\
+program return_early;
+oper pick { n: Integer } -> Text [
+    if n = 0 then [ return \"zero\"; ];
+    \"nonzero\"
+];
+oper classify { n: Integer } -> Text [
+    let label = if n = 0 then [ \"even-zero\" ] else [ return \"nonzero-branch\"; ];
+    label
+];
+oper unwind { flag: Boolean } -> Text [
+    let rows = Relation { { a: 1 }, { a: 2 } };
+    if flag then [ return \"early\"; ];
+    if rows.cardinality {} = 2 then [ return \"two\"; ];
+    \"other\"
+];
+oper main {} [
+    write_line { message: pick { n: 0 } };
+    write_line { message: pick { n: 7 } };
+    write_line { message: classify { n: 0 } };
+    write_line { message: classify { n: 3 } };
+    write_line { message: unwind { flag: true } };
+    write_line { message: unwind { flag: false } };
 ];
 ";
 
@@ -2053,6 +2087,18 @@ fn if_carried_text_var_lowers_and_is_leak_clean() {
 #[test]
 fn handler_shape_tuple_param_relation_result() {
     assert_both_backends("handler-shape", b"{line: \"/users\"}\n");
+}
+
+// Early `return`: a no-`else` guard, the wiki `if … else [ return … ]` route
+// shape, and an early exit that unwinds past a live relation local. Runs under
+// the leak gate, so the cross-scope release on the `return` path is proven
+// RC-balanced on both backends.
+#[test]
+fn early_return_lowers_and_is_leak_clean() {
+    assert_both_backends(
+        "return-early",
+        b"zero\nnonzero\neven-zero\nnonzero-branch\nearly\ntwo\n",
+    );
 }
 
 // ── Size-threshold boxing for large tuples + returning a tuple ─────────

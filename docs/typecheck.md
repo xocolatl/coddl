@@ -66,6 +66,14 @@ The `Relation { … }` syntax is contextual: in **type** position it's the type 
 
 Relations can be bound to variables, passed to and returned from operators, stored in tuples, nested inside other relations, used as function arguments and results everywhere a scalar can — subject to the lazy-evaluation semantics in [runtime.md](runtime.md). The calling convention treats them uniformly.
 
+## The bottom type `Never`
+
+`Never` is the **bottom type**: the type of an expression or block that never yields a value because control leaves it first. Today the only producer is an early **`return`** — a block whose control flow ends in a `return` (or whose tail is itself `Never`, e.g. an `if` both of whose arms return) has type `Never`.
+
+`Never` is **assignable to every type** (a diverging path can stand in wherever any value is expected) and **unifies as the identity** (`Never` with `T` yields `T`). This is what lets a `return`-only `if` arm agree with its value-producing sibling instead of tripping `T0068`, and a guard clause `if bad then [ return … ]` (no `else`) not trip `T0069`. An operator body that always returns is thus `Never`, which is assignable to any declared return type.
+
+Like [`FormatText`](#format-and-the-formattext-firewall), `Never` is **unspellable** — it is absent from `from_builtin_name`, so no user `TypeRef` can name it; it is produced only by divergent control flow and never survives lowering (a diverging expression's value is never materialized — the lowerer hands back a `Unit` placeholder and a diverging `if`-arm feeds no merge argument). It is Coddl's analogue of Rust's `!` or Swift's `Never`, and is designed to extend cleanly to future diverging constructs (`break` / `continue` / error-raising operators). The early-`return` lowering — a mid-function `Return` terminator that unwinds every active scope's heap locals — is described in [procir.md](procir.md).
+
 ## Type inference and constraint inference
 
 Type inference for relational expressions is mandatory and mechanical from operator semantics (RM Pre 18): every RelIR node's heading is the heading of its operands transformed by its operator. The optimizer further runs:
@@ -386,16 +394,29 @@ each `parse_<x>` has a corresponding `check_<x>`.
   of binding maps — outermost is the operator parameter layer; each
   `transaction [...]` block pushes a layer on entry and pops on
   exit. Lookups walk innermost-first so inner bindings shadow
-  outer ones.
+  outer ones. A block whose control flow leaves via a `return` (a
+  top-level `return` statement, or a tail whose own type is `Never`)
+  has type **`Never`** — it never falls through to a value (see
+  "The bottom type `Never`" below).
 - **`check_if_expr`** — `if <cond> then [ … ] else [ … ]`. The
   condition must be `Boolean` (`T0067`). Each arm is a `check_block`
   in its own pushed scope (like a `transaction` body, but without the
   transaction-depth bump — an `if` is not a transaction boundary). With
   `else`, the two arm types must unify (`T0068`) and that is the
-  expression's type. Without `else`, the then-arm must be Unit
-  (`Tuple {}`, `T0069`) and the expression's type is Unit — the
-  statement form. `else if` is spelled by nesting an `if` in the
-  `else` block.
+  expression's type; a **`Never`** arm (one ending in `return`) unifies
+  as the identity, so the `if` takes its sibling's type (both `Never` ⇒
+  `Never`) — this is what lets a guard's value-route sit opposite an
+  `else [ return … ]`. Without `else`, the then-arm must be Unit
+  (`Tuple {}`) or `Never` (a guard clause `if bad then [ return … ]`),
+  else `T0069`; the expression's type is Unit — the statement form.
+  `else if` is spelled by nesting an `if` in the `else` block.
+- **`check_return_stmt`** — `return [<expr>];`, an early exit from the
+  enclosing operator body. The value (or `Tuple {}` for a bare
+  `return;`) is checked against the operator's declared return type,
+  stashed while the body is walked; a mismatch is `T0018`. A `return`
+  lexically inside a `transaction [...]` is `T0093` (its early exit
+  would skip the commit). The statement itself has no value; it makes
+  its enclosing block `Never` (see below).
 - **`check_let_stmt`** — infers the RHS expression's type. If the
   binding carries an explicit `: <type-ref>` annotation, the
   declared type is authoritative: the RHS must conform (or `T0010`
@@ -708,7 +729,7 @@ check script enforces that.
 | T0015 | Duplicate field name in tuple literal                    |
 | T0016 | Field access on a value whose type isn't a tuple         |
 | T0017 | Unknown field name in tuple field access                 |
-| T0018 | *retired* (available for reuse). Formerly gated a `Tuple`/`Relation` heading in an operator signature; every such shape now lowers — small tuples flatten, large tuples and returns box (a boxed tuple is a `length = 1` relation payload). |
+| T0018 | a `return` value's type doesn't match the enclosing operator's declared return type (a bare `return;` requires a Unit-returning oper). *(Reused: formerly gated a `Tuple`/`Relation` heading in an operator signature — that shape now lowers, so the code was retired and re-allocated here.)* |
 | T0019 | Tuple heading mismatch in relation literal                |
 | T0020 | `where` predicate must be Boolean                         |
 | T0021 | Scalar operator operand type mismatch                     |
@@ -783,3 +804,4 @@ check script enforces that.
 | T0090 | a `builtin relvar` from an opt-in stdlib module is referenced without importing it — add `use module <path>;` (e.g. `Environment` needs `use module coddl::env;`) |
 | T0091 | a possrep-scalar declaration `type Name { … }` has other than exactly one component — multi-component possreps are not yet supported (single-component tier) |
 | T0092 | a call names an operator exported by **more than one** imported userspace module (ambiguous import) — define a local `oper` of that name to disambiguate |
+| T0093 | a `return` sits lexically inside a `transaction [...]` — its early exit would skip the transaction's commit, so it is rejected until real BEGIN/COMMIT lands (hoist the `return` out of the transaction, or restructure) |

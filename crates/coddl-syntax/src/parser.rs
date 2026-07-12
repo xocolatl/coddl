@@ -635,6 +635,33 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
+    /// `return [<expr>];` — an early return from the enclosing operator body.
+    /// The value is optional: `return;` is legal only for a `Unit`-returning
+    /// oper, and a present value is checked against the declared return type —
+    /// both enforced in typecheck (T0018). `return` is a contextual keyword,
+    /// recognized only here in statement position, so it never reserves the
+    /// identifier `return` elsewhere (Coddl has no reserved words).
+    fn parse_return_stmt(&mut self) {
+        debug_assert!(self.at_keyword("return"));
+        self.start_node(SyntaxKind::RETURN_STMT);
+        self.bump(); // `return`
+
+        // Optional value: any expression before the terminating `;`. A closing
+        // `]` (the block's end) also stops the value scan so a malformed
+        // `return` recovers at the block boundary rather than past it.
+        if !self.at(SyntaxKind::SEMICOLON) && !self.at(SyntaxKind::R_BRACKET) {
+            let before = self.pos;
+            self.parse_expr();
+            if self.pos == before {
+                self.error("P0013", "expected `;` after `return`");
+            }
+        }
+        if !self.eat(SyntaxKind::SEMICOLON) {
+            self.error("P0013", "expected `;` after `return`");
+        }
+        self.finish_node();
+    }
+
     /// `let <name> [: <type-ref>] = <expr>;` — an immutable value binding
     /// visible to subsequent statements in the same block. Type annotation
     /// is optional; when absent, the binding's type is inferred from the
@@ -1127,6 +1154,10 @@ impl<'a> Parser<'a> {
         }
         if self.at_keyword("load") {
             self.parse_load_stmt();
+            return;
+        }
+        if self.at_keyword("return") {
+            self.parse_return_stmt();
             return;
         }
 
@@ -2741,6 +2772,44 @@ mod tests {
         assert!(
             out.diagnostics.iter().any(|d| d.code == "P0018"),
             "expected P0018, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn return_stmt_with_value_parses() {
+        let out = parse_str("oper f {} -> Integer [ return 1; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let ret = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::RETURN_STMT)
+            .expect("RETURN_STMT in tree");
+        let kinds: Vec<_> = ret.children_with_tokens().map(|e| e.kind()).collect();
+        assert!(
+            kinds.contains(&SyntaxKind::LITERAL),
+            "no returned value in {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn return_stmt_bare_parses() {
+        let out = parse_str("oper f {} [ return; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert!(
+            out.tree
+                .descendants()
+                .any(|n| n.kind() == SyntaxKind::RETURN_STMT),
+            "no RETURN_STMT for bare `return;`"
+        );
+    }
+
+    #[test]
+    fn return_stmt_missing_semicolon_diagnoses_p0013() {
+        let out = parse_str("oper f {} -> Integer [ return 1 ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0013"),
+            "expected P0013, got {:?}",
             out.diagnostics
         );
     }

@@ -18,8 +18,9 @@ use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, DeleteStmt, DoWhileStmt,
     Expr, ExprStmt, ExtendExpr, FieldAccess, ForStmt, IfExpr, IndexExpr, InsertStmt, Item, LetStmt,
     Literal, LoadStmt, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit,
-    RenameExpr, ReplaceExpr, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt,
-    TupleLit, TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WhileStmt, WrapExpr,
+    RenameExpr, ReplaceExpr, ReturnStmt, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr,
+    TruncateStmt, TupleLit, TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt,
+    WhileStmt, WrapExpr,
 };
 use coddl_syntax::{parse, parse_format_template, SyntaxKind, TemplateChunk};
 use coddl_types::{
@@ -362,6 +363,18 @@ struct Lowerer {
     /// Parameters of `current_block` (SSA values bound on block entry).
     /// Non-empty only for an `if` merge block that carries the join value.
     current_block_params: Vec<(ValueId, ProcType)>,
+    /// True once the current block has been sealed by an early `return` — the
+    /// control-flow path has left the function, so no further instruction may
+    /// be emitted into this block (it would land in a sealed block). Set by
+    /// `lower_return_stmt`, cleared by `start_block` (a fresh block is live)
+    /// and `reset_function_state`. `lower_block` stops walking a block once it
+    /// is set; `lower_if_arm` reports it up so a diverging arm is dropped from
+    /// the merge's predecessors.
+    diverged: bool,
+    /// Declared return type of the operator currently being lowered, set at the
+    /// top of `lower_oper_decl`. An early `return` reads it to box its value to
+    /// the return ABI (the same `box_return_value_if_needed` the epilogue uses).
+    current_fn_return: ProcType,
     /// Stack of binding scopes. The outermost layer is the function's
     /// parameter scope; each `transaction [...]` block pushes a new
     /// layer; `let` statements insert into the topmost layer. Each
@@ -559,6 +572,8 @@ impl Lowerer {
             blocks: Vec::new(),
             current_block: BlockId(0),
             current_block_params: Vec::new(),
+            diverged: false,
+            current_fn_return: ProcType::Unit,
             locals: vec![HashMap::new()],
             relexpr_aliases: vec![HashMap::new()],
             format_templates: vec![HashMap::new()],
@@ -958,10 +973,13 @@ impl Lowerer {
     }
 
     /// Make `id` the current block, with the given block parameters. `insts`
-    /// is already empty (the previous block was sealed by `finish_block`).
+    /// is already empty (the previous block was sealed by `finish_block`). A
+    /// fresh block is live, so clear any `diverged` flag left by the block
+    /// just sealed.
     fn start_block(&mut self, id: BlockId, params: Vec<(ValueId, ProcType)>) {
         self.current_block = id;
         self.current_block_params = params;
+        self.diverged = false;
     }
 
     fn reset_function_state(&mut self) {
@@ -971,6 +989,8 @@ impl Lowerer {
         self.blocks.clear();
         self.current_block = BlockId(0);
         self.current_block_params.clear();
+        self.diverged = false;
+        self.current_fn_return = ProcType::Unit;
         self.locals.clear();
         self.locals.push(HashMap::new());
         self.relexpr_aliases.clear();
@@ -1113,6 +1133,27 @@ impl Lowerer {
         boxed
     }
 
+    /// Release a **flattened** tuple local's owned heap cell temps at scope
+    /// exit. A flattened tuple isn't heap-managed, so [`Self::needs_scope_release`]
+    /// skips it — but it owns the producer references of any directly-consumed
+    /// heap cell (an owned `Text`, a relation/sequence temp), collected in
+    /// [`Self::tuple_cell_heap_temps`]. Those are otherwise released only when
+    /// the tuple is *boxed*; a read-and-discarded flattened tuple is never
+    /// boxed, so its cells would leak (and, under a caller that releases the
+    /// tuple's cell independently — a returned response over the web ABI —
+    /// double-free). Drain them here. `release_call_arg_temp` no-ops for an
+    /// immortal literal or a value another local still owns (the aliasing
+    /// guard). A field read of such a tuple retains its own copy
+    /// (`lower_field_access`), so draining the cell here never invalidates a
+    /// live field.
+    fn release_flattened_tuple_cells(&mut self, v: ValueId) {
+        if let Some(temps) = self.tuple_cell_heap_temps.remove(&v) {
+            for t in temps {
+                self.release_call_arg_temp(t);
+            }
+        }
+    }
+
     /// Emit `Inst::Release` for every heap-managed binding in the
     /// topmost local scope, in unspecified (HashMap) order. Called
     /// before popping a scope (transaction exit) and at function
@@ -1130,6 +1171,35 @@ impl Lowerer {
             if self.param_value_ids.contains(&v) {
                 continue;
             }
+            self.release_flattened_tuple_cells(v);
+            if self.needs_scope_release(v, &ty) {
+                self.insts.push(Inst::Release { src: v });
+            }
+        }
+    }
+
+    /// Emit `Inst::Release` for every heap-managed binding across **all** active
+    /// scopes (not just the topmost). Used by an early `return`, which unwinds
+    /// every enclosing scope at once — the arm/transaction scope it sits in, any
+    /// intervening scopes, and the function scope. A shadowed binding in an
+    /// outer scope is still live (just inaccessible by name) and is released
+    /// too; dedup by `ValueId` guards the (normally impossible) case of one
+    /// value bound in two layers. Borrowed parameters are skipped.
+    fn release_all_scopes_heap_locals(&mut self) {
+        let mut seen: HashSet<ValueId> = HashSet::new();
+        let mut candidates: Vec<(ValueId, ProcType)> = Vec::new();
+        for scope in &self.locals {
+            for (v, ty) in scope.values() {
+                if seen.insert(*v) {
+                    candidates.push((*v, ty.clone()));
+                }
+            }
+        }
+        for (v, ty) in candidates {
+            if self.param_value_ids.contains(&v) {
+                continue;
+            }
+            self.release_flattened_tuple_cells(v);
             if self.needs_scope_release(v, &ty) {
                 self.insts.push(Inst::Release { src: v });
             }
@@ -1564,6 +1634,9 @@ impl Lowerer {
         let (name, params, declared_return) = self.oper_signature(decl);
         let linkage_name = mangle_linkage(self.current_module.as_deref(), &name);
         let is_main = name == "main";
+        // Visible to `lower_return_stmt` so an early `return` boxes its value
+        // to the same return ABI the epilogue below uses.
+        self.current_fn_return = declared_return.clone();
 
         // Bind parameters as body locals so a body reference (e.g. `self`)
         // resolves to the parameter value rather than the `Unit` placeholder.
@@ -1606,63 +1679,74 @@ impl Lowerer {
 
         let mut body_value = decl.body().map(|body| self.lower_block(&body));
 
-        // When the body's tail value is actually returned (a non-`main`,
-        // non-Unit oper — the same condition that builds `Return(Some(v))`
-        // below), and that value is a heap-managed local, it escapes the
-        // function: retain it so the scope release below leaves the caller a
-        // live reference (return-of-local, `[ let s = a || b; s ]`). `main` and
-        // Unit-returning opers discard the tail value, so retaining it would
-        // leak — hence the guard.
-        let returns_value = !is_main && !matches!(declared_return, ProcType::Unit);
-        if returns_value {
-            if let Some(v) = body_value {
-                // The return ABI for any non-empty tuple is one boxed pointer.
-                // A large tuple is already boxed; box a small (flattened) one
-                // here so the value handed back is always a pointer.
-                let v = self.box_return_value_if_needed(v, &declared_return);
-                body_value = Some(v);
-                self.retain_if_escaping_local(v);
+        // If the body diverges on every path — each ending in an early
+        // `return` — its final block is already sealed by the body's own
+        // `Return` (with its own unwind), so there is no fall-through epilogue
+        // to emit. Emitting one would push a second terminator into an
+        // already-sealed block. The common case (a partial early return with a
+        // live fall-through tail) leaves `diverged` false and runs the epilogue
+        // normally on the fall-through path; each early-return path unwound
+        // itself in `lower_return_stmt`.
+        if !self.diverged {
+            // When the body's tail value is actually returned (a non-`main`,
+            // non-Unit oper — the same condition that builds `Return(Some(v))`
+            // below), and that value is a heap-managed local, it escapes the
+            // function: retain it so the scope release below leaves the caller a
+            // live reference (return-of-local, `[ let s = a || b; s ]`). `main`
+            // and Unit-returning opers discard the tail value, so retaining it
+            // would leak — hence the guard.
+            let returns_value = !is_main && !matches!(declared_return, ProcType::Unit);
+            if returns_value {
+                if let Some(v) = body_value {
+                    // The return ABI for any non-empty tuple is one boxed
+                    // pointer. A large tuple is already boxed; box a small
+                    // (flattened) one here so the value handed back is always a
+                    // pointer.
+                    let v = self.box_return_value_if_needed(v, &declared_return);
+                    body_value = Some(v);
+                    self.retain_if_escaping_local(v);
+                }
             }
-        }
 
-        // Release every heap-typed function-scope local before either the
-        // runtime-shutdown call (main) or the terminator (others). The escaping
-        // return value, if any, was retained just above so it survives.
-        self.release_top_scope_heap_locals();
-        // Then the deferred `extract`-source relations — released last, after
-        // every borrowed field they fed has been consumed.
-        self.drain_deferred_relation_releases();
+            // Release every heap-typed function-scope local before either the
+            // runtime-shutdown call (main) or the terminator (others). The
+            // escaping return value, if any, was retained just above.
+            self.release_top_scope_heap_locals();
+            // Then the deferred `extract`-source relations — released last,
+            // after every borrowed field they fed has been consumed.
+            self.drain_deferred_relation_releases();
 
-        if is_main {
-            // Per-relvar slot releases are inserted before this shutdown
-            // call by `finalize_main_prologue`, mirroring the slot inits it
-            // emits. The runtime's own `coddl_runtime_shutdown` also frees
-            // any slot still alive (defense in depth).
-            self.ensure_runtime_extern("coddl_runtime_shutdown", Vec::new(), ProcType::Integer);
-            let dst = self.fresh_value();
-            self.record_type(dst, ProcType::Integer);
-            self.insts.push(Inst::Call {
-                dst: Some(dst),
-                callee: "coddl_runtime_shutdown".to_string(),
-                args: Vec::new(),
-                return_type: ProcType::Integer,
-            });
-        }
-
-        // Non-main opers with a non-Unit declared return carry their
-        // body's tail-expression value out via `Return(Some(v))`.
-        // Main + Unit-returning opers use `Return(None)`; the backend
-        // special-cases main as `ret i32 0`.
-        let terminator = if !is_main && !matches!(declared_return, ProcType::Unit) {
-            match body_value {
-                Some(v) => Terminator::Return(Some(v)),
-                None => Terminator::Return(None),
+            if is_main {
+                // Per-relvar slot releases are inserted before this shutdown
+                // call by `finalize_main_prologue`, mirroring the slot inits it
+                // emits. The runtime's own `coddl_runtime_shutdown` also frees
+                // any slot still alive (defense in depth).
+                self.ensure_runtime_extern("coddl_runtime_shutdown", Vec::new(), ProcType::Integer);
+                let dst = self.fresh_value();
+                self.record_type(dst, ProcType::Integer);
+                self.insts.push(Inst::Call {
+                    dst: Some(dst),
+                    callee: "coddl_runtime_shutdown".to_string(),
+                    args: Vec::new(),
+                    return_type: ProcType::Integer,
+                });
             }
-        } else {
-            Terminator::Return(None)
-        };
 
-        self.finish_block(terminator);
+            // Non-main opers with a non-Unit declared return carry their
+            // body's tail-expression value out via `Return(Some(v))`.
+            // Main + Unit-returning opers use `Return(None)`; the backend
+            // special-cases main as `ret i32 0`.
+            let terminator = if !is_main && !matches!(declared_return, ProcType::Unit) {
+                match body_value {
+                    Some(v) => Terminator::Return(Some(v)),
+                    None => Terminator::Return(None),
+                }
+            } else {
+                Terminator::Return(None)
+            };
+
+            self.finish_block(terminator);
+        }
 
         Function {
             name,
@@ -1676,6 +1760,13 @@ impl Lowerer {
     /// Lower a block. Returns the block's value — the tail
     /// expression's `ValueId` if there is one, otherwise a fresh
     /// placeholder representing Unit (never consumed downstream).
+    ///
+    /// If a statement is an early `return`, the block's current basic block is
+    /// sealed by that `return` and `self.diverged` is set: the remaining
+    /// statements (and the tail) are dead, so lowering stops and returns a Unit
+    /// placeholder. The block's value is never consumed on a diverging path —
+    /// `lower_if_arm` drops such an arm from the merge, and `lower_oper_decl`
+    /// skips the epilogue when the whole body diverges.
     fn lower_block(&mut self, block: &Block) -> ValueId {
         for stmt in block.statements() {
             match stmt {
@@ -1691,6 +1782,14 @@ impl Lowerer {
                 Stmt::While(w) => self.lower_while_stmt(&w),
                 Stmt::DoWhile(d) => self.lower_do_while_stmt(&d),
                 Stmt::Load(l) => self.lower_load_stmt(&l),
+                Stmt::Return(r) => self.lower_return_stmt(&r),
+            }
+            if self.diverged {
+                // The block has been sealed by a `return`; anything after is
+                // dead code and must not be emitted into the sealed block.
+                let v = self.fresh_value();
+                self.record_type(v, ProcType::Unit);
+                return v;
             }
         }
         match block.tail_expr() {
@@ -1701,6 +1800,38 @@ impl Lowerer {
                 v
             }
         }
+    }
+
+    /// Lower `return [<expr>];` — a mid-function early return. The value (if
+    /// any) is lowered, boxed to the return ABI, and retained if it escapes a
+    /// local (mirroring the epilogue's escape discipline). Then the **unwind**:
+    /// every active scope's heap locals are released — an early return leaves
+    /// the arm scope it sits in, every enclosing scope, and the function scope
+    /// at once — followed by every pending deferred `extract`-source release.
+    /// The block is sealed with `Return` and `self.diverged` set. Typecheck
+    /// (T0093) has already rejected a `return` inside a `transaction [...]`, so
+    /// no open transaction needs committing here.
+    fn lower_return_stmt(&mut self, stmt: &ReturnStmt) {
+        let value = stmt.value().map(|e| self.lower_expr(&e));
+
+        let value = value.map(|v| {
+            let declared = self.current_fn_return.clone();
+            let v = self.box_return_value_if_needed(v, &declared);
+            self.retain_if_escaping_local(v);
+            v
+        });
+
+        // Unwind every active scope's heap locals (not just the top one).
+        self.release_all_scopes_heap_locals();
+        // Release every pending deferred `extract`-source relation on this
+        // path. The list is cloned, not drained: sibling fall-through paths
+        // still release the same sources at their own arm-end / epilogue.
+        for (src, _) in self.deferred_relation_releases.clone() {
+            self.insts.push(Inst::Release { src });
+        }
+
+        self.finish_block(Terminator::Return(value));
+        self.diverged = true;
     }
 
     /// Lower a relational assignment `R := <expr>;`. A **private** target stores
@@ -2941,6 +3072,36 @@ impl Lowerer {
     /// entry stays first and every predecessor precedes the block it branches
     /// to — the ordering the backends rely on. Nesting composes: an `if` in an
     /// arm seals its own blocks between that arm's `start` and `Br`.
+    /// Collect the value-typed introduced vars (`var x;` first-assigned in an
+    /// arm) currently bound in the arm scope, as `(name, type, value)` for the
+    /// merge's block params. A heap- or `Text`-typed introduced var crossing
+    /// the merge is not yet lowered (T0076). Shared by both arms so the merge
+    /// shape follows whichever arm is live when its sibling diverges.
+    fn collect_introduced(
+        &mut self,
+        names: &[String],
+        span: Span,
+    ) -> Vec<(String, ProcType, ValueId)> {
+        let mut introduced = Vec::new();
+        for name in names {
+            if let Some((v, vty)) = self.lookup_local(name) {
+                if Self::is_heap_managed(&vty) || matches!(vty, ProcType::Text) {
+                    self.diagnostics.push(Diagnostic::error(
+                        span,
+                        "T0076",
+                        format!(
+                            "initializing the heap-typed variable `{name}` on both branches \
+                             of an `if` is not yet lowered"
+                        ),
+                    ));
+                } else {
+                    introduced.push((name.clone(), vty, v));
+                }
+            }
+        }
+        introduced
+    }
+
     fn lower_if_expr(&mut self, ife: &IfExpr) -> ValueId {
         let cond_expr = ife.condition().expect("typechecked if has a condition");
         let span = self.node_span(ife.syntax());
@@ -2960,8 +3121,11 @@ impl Lowerer {
 
         let cond = self.lower_expr(&cond_expr);
 
-        // No `else` and nothing mutated: the false edge goes straight to the
-        // merge (statement form, Unit value) — no skip block, three blocks.
+        // Fast path — no `else`, nothing mutated: the false edge goes straight
+        // to the merge (statement form, Unit value), no skip block. A `return`
+        // in the then-arm (a guard clause) just omits the arm's `Br`; the merge
+        // is still reached via the `CondBr` false edge, so the whole `if` is
+        // Unit, not divergent.
         if else_body.is_none() && carried.is_empty() {
             let then_id = self.fresh_block();
             let merge_id = self.fresh_block();
@@ -2971,11 +3135,13 @@ impl Lowerer {
                 else_block: merge_id,
             });
             self.start_block(then_id, Vec::new());
-            self.lower_if_arm(then_body);
-            self.finish_block(Terminator::Br {
-                target: merge_id,
-                args: Vec::new(),
-            });
+            let (_, then_div) = self.lower_if_arm(then_body);
+            if !then_div {
+                self.finish_block(Terminator::Br {
+                    target: merge_id,
+                    args: Vec::new(),
+                });
+            }
             let result = self.fresh_value();
             self.record_type(result, ProcType::Unit);
             self.start_block(merge_id, Vec::new());
@@ -2986,7 +3152,7 @@ impl Lowerer {
         // arms — definitely assigned after the `if`, so it also rides the merge
         // as a block parameter, but with no pre-`if` value (each arm
         // first-assigns/rebinds it). Detected by name here; its type is known
-        // only after the then-arm infers it (heap ⇒ T0076, like heap-carried).
+        // only after a live arm infers it (heap ⇒ T0076, like heap-carried).
         let introduced_names = self.introduced_var_names(then_body.as_ref(), else_body.as_ref());
 
         let then_id = self.fresh_block();
@@ -2998,38 +3164,35 @@ impl Lowerer {
             else_block: else_id,
         });
 
-        // Then arm.
+        // Then arm. A diverging arm (one ending in `return`) sealed its own
+        // block with `Return` and unwound every scope, so it emits no `Br` and
+        // is not a merge predecessor.
         self.start_block(then_id, Vec::new());
-        let then_val = self.lower_if_arm(then_body);
-        let ty = self.value_type(then_val);
-        let is_unit = matches!(ty, ProcType::Unit);
-        // Introduced vars are now bound (first-assigned in the then-arm); keep
-        // the value-typed ones (name, type, then-value). A heap type crossing
-        // the merge is deferred (T0076).
-        let mut introduced: Vec<(String, ProcType, ValueId)> = Vec::new();
-        for name in &introduced_names {
-            if let Some((v, vty)) = self.lookup_local(name) {
-                if Self::is_heap_managed(&vty) || matches!(vty, ProcType::Text) {
-                    self.diagnostics.push(Diagnostic::error(
-                        span,
-                        "T0076",
-                        format!(
-                            "initializing the heap-typed variable `{name}` on both branches \
-                             of an `if` is not yet lowered"
-                        ),
-                    ));
-                } else {
-                    introduced.push((name.clone(), vty, v));
-                }
-            }
+        let (then_val, then_div) = self.lower_if_arm(then_body);
+        // The merge's value/param shape follows a live arm — provisionally the
+        // then arm, re-derived from the else arm below if the then arm is the
+        // one that diverges.
+        let mut merge_ty = self.value_type(then_val);
+        let mut merge_is_unit = matches!(merge_ty, ProcType::Unit);
+        // Introduced vars only ride the merge from an arm that reaches it.
+        let mut merge_introduced = if then_div {
+            Vec::new()
+        } else {
+            self.collect_introduced(&introduced_names, span)
+        };
+        if !then_div {
+            let mut then_args = if merge_is_unit {
+                Vec::new()
+            } else {
+                vec![then_val]
+            };
+            then_args.extend(self.carried_current_values(&carried));
+            then_args.extend(merge_introduced.iter().map(|(_, _, v)| *v));
+            self.finish_block(Terminator::Br {
+                target: merge_id,
+                args: then_args,
+            });
         }
-        let mut then_args = if is_unit { Vec::new() } else { vec![then_val] };
-        then_args.extend(self.carried_current_values(&carried));
-        then_args.extend(introduced.iter().map(|(_, _, v)| *v));
-        self.finish_block(Terminator::Br {
-            target: merge_id,
-            args: then_args,
-        });
 
         // Arms are alternatives, not sequential: restore each carried var to
         // its pre-`if` value before the else/skip edge. Introduced vars are
@@ -3041,34 +3204,57 @@ impl Lowerer {
         // Else arm — the real `else` block, or an empty skip block forwarding
         // the pre-`if` values when there is no `else`.
         self.start_block(else_id, Vec::new());
-        let else_val = if else_body.is_some() {
+        let (else_val, else_div) = if else_body.is_some() {
             self.lower_if_arm(else_body)
         } else {
             // No `else`: the value is Unit (typecheck guarantees a Unit then).
             let v = self.fresh_value();
             self.record_type(v, ProcType::Unit);
-            v
+            (v, false)
         };
-        let mut else_args = if is_unit { Vec::new() } else { vec![else_val] };
-        else_args.extend(self.carried_current_values(&carried));
-        else_args.extend(self.introduced_current_values(&introduced));
-        self.finish_block(Terminator::Br {
-            target: merge_id,
-            args: else_args,
-        });
+        if !else_div {
+            // If the then arm diverged, the merge shape (and its introduced
+            // vars) comes from the else arm — the only live edge.
+            if then_div {
+                merge_ty = self.value_type(else_val);
+                merge_is_unit = matches!(merge_ty, ProcType::Unit);
+                merge_introduced = self.collect_introduced(&introduced_names, span);
+            }
+            let mut else_args = if merge_is_unit {
+                Vec::new()
+            } else {
+                vec![else_val]
+            };
+            else_args.extend(self.carried_current_values(&carried));
+            else_args.extend(self.introduced_current_values(&merge_introduced));
+            self.finish_block(Terminator::Br {
+                target: merge_id,
+                args: else_args,
+            });
+        }
+
+        // Both arms diverge: the merge is unreachable, so leave it unstarted
+        // and propagate divergence to the enclosing block.
+        if then_div && else_div {
+            self.diverged = true;
+            let v = self.fresh_value();
+            self.record_type(v, ProcType::Unit);
+            return v;
+        }
 
         // Merge: the join value (unless Unit) plus one parameter per carried
-        // then introduced var. A `Text` join value is owned downstream (safe:
-        // releasing an immortal literal arm is a no-op; an owned-temp arm is
-        // freed).
+        // then introduced var, fed by whichever arm(s) reach it. When exactly
+        // one arm diverges the merge has a single predecessor — valid SSA. A
+        // `Text` join value is owned downstream (safe: releasing an immortal
+        // literal arm is a no-op; an owned-temp arm is freed).
         let result = self.fresh_value();
-        self.record_type(result, ty.clone());
+        self.record_type(result, merge_ty.clone());
         let mut params = Vec::new();
-        if !is_unit {
-            if matches!(ty, ProcType::Text) {
+        if !merge_is_unit {
+            if matches!(merge_ty, ProcType::Text) {
                 self.mark_text_owned(result);
             }
-            params.push((result, ty));
+            params.push((result, merge_ty.clone()));
         }
         let mut carried_params: Vec<(String, ValueId, ProcType)> =
             Vec::with_capacity(carried.len());
@@ -3087,8 +3273,8 @@ impl Lowerer {
             carried_params.push((name.clone(), p, cty.clone()));
         }
         let mut introduced_params: Vec<(String, ValueId, ProcType)> =
-            Vec::with_capacity(introduced.len());
-        for (name, ity, _) in &introduced {
+            Vec::with_capacity(merge_introduced.len());
+        for (name, ity, _) in &merge_introduced {
             let p = self.fresh_value();
             self.record_type(p, ity.clone());
             params.push((p, ity.clone()));
@@ -3156,7 +3342,12 @@ impl Lowerer {
     /// arm's tail value flows out as the join value and is a temporary, so it
     /// is not among the released bindings. An absent block (parse recovery)
     /// yields a fresh Unit value.
-    fn lower_if_arm(&mut self, block: Option<Block>) -> ValueId {
+    ///
+    /// Returns `(value, diverged)`. When the arm ends in an early `return`,
+    /// `diverged` is `true`: the `return` already sealed the block and unwound
+    /// every scope, so none of the normal arm-exit emission runs (it would land
+    /// in a sealed block) and the caller drops the arm from the merge.
+    fn lower_if_arm(&mut self, block: Option<Block>) -> (ValueId, bool) {
         match block {
             Some(b) => {
                 // Deferred `extract`-source releases registered *within* this arm
@@ -3170,6 +3361,20 @@ impl Lowerer {
                 let deferred_mark = self.deferred_relation_releases.len();
                 self.push_local_scope();
                 let val = self.lower_block(&b);
+                if self.diverged {
+                    // The arm ended in an early `return`, which already unwound
+                    // every scope (this arm's included) and released every
+                    // pending deferred source on the return path, then sealed
+                    // the block. So no arm-exit emission runs. Balance the scope
+                    // stack, and drop this arm's own deferrals (released on the
+                    // return path; they are defined only in this arm, which does
+                    // not dominate the merge, so the fall-through epilogue must
+                    // not touch them). Enclosing-scope deferrals (before the
+                    // mark) stay for their own drain.
+                    self.pop_local_scope();
+                    self.deferred_relation_releases.truncate(deferred_mark);
+                    return (val, true);
+                }
                 // The arm's tail value always flows out to the merge block, so
                 // retain it if it's a heap-managed local before releasing the
                 // arm scope (return-of-local from an arm).
@@ -3200,12 +3405,12 @@ impl Lowerer {
                 for src in arm_sources {
                     self.insts.push(Inst::Release { src });
                 }
-                val
+                (val, false)
             }
             None => {
                 let v = self.fresh_value();
                 self.record_type(v, ProcType::Unit);
-                v
+                (v, false)
             }
         }
     }
@@ -5514,22 +5719,20 @@ impl Lowerer {
                 field_type: field_type.clone(),
             });
         }
-        // A tuple heap-field read is a *borrow*. Retain it to an independent
-        // owned copy in the cases the boxing work introduced, where a bare
-        // borrow breaks:
-        //   * a **boxed** tuple's `Text` field — the box can be freed before the
-        //     field is consumed (returned from the oper, or an owned-temp box
-        //     argument freed right after the call); the copy joins `owned_texts`.
-        //   * any **relation/sequence** field (boxed *or* a flattened tuple with
-        //     a relation-valued attribute) — relations carry no owned/borrowed
-        //     mark, so a borrowing consumer (`write_relation`) would over-release
-        //     a bare borrow; owning the copy balances that release.
-        // A *flattened* `Text` field stays a zero-cost borrow (its consumer
-        // — `write_line` — leaves borrowed Text alone; see
-        // `borrowed_text_field_is_not_released`). Scalars own no heap.
-        let boxed = crate::layout::tuple_is_boxed(&heading);
+        // A tuple heap-field read is a *borrow* of a cell the tuple owns. Retain
+        // it to an independent owned copy so it stays valid once the tuple's own
+        // reference is dropped — the box on release for a boxed tuple, or the
+        // owned-cell release at scope exit for a flattened one (see
+        // `release_top_scope_heap_locals`, which drains a flattened tuple's
+        // `tuple_cell_heap_temps`). Both cases are now symmetric: without the
+        // copy, a field that escapes the tuple's lifetime — returned from the
+        // oper, passed as an owned argument, or embedded in another value —
+        // would be freed out from under its consumer. A `Text` copy joins
+        // `owned_texts`; a relation/sequence copy carries no owned mark but its
+        // retain balances a borrowing consumer's release. Retaining an immortal
+        // literal cell is a runtime no-op. Scalars own no heap.
         match &field_type {
-            ProcType::Text if boxed => {
+            ProcType::Text => {
                 self.insts.push(Inst::Retain { src: dst });
                 self.mark_text_owned(dst);
             }
@@ -6517,6 +6720,12 @@ fn proc_type_from_type(ty: &Type) -> ProcType {
              nominal-scalar table to reach the possrep component)"
         ),
         Type::Unknown => unreachable!("Type::Unknown survived typecheck"),
+        Type::Never => {
+            // Bottom: a diverging expression's value is never materialized —
+            // `lower_block` hands back a Unit placeholder and a diverging arm
+            // feeds no merge arg — so no `Never`-typed value reaches lowering.
+            unreachable!("Type::Never is compile-time-only and never lowered")
+        }
     }
 }
 
@@ -8595,6 +8804,18 @@ oper main {} [
             .collect()
     }
 
+    fn main_retains(m: &Module) -> Vec<ValueId> {
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        main.blocks[0]
+            .insts
+            .iter()
+            .filter_map(|i| match i {
+                Inst::Retain { src } => Some(*src),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The dst of the first `ScalarOp::Concat` in `main`'s entry block.
     fn first_concat_dst(m: &Module) -> ValueId {
         let main = m.functions.iter().find(|f| f.name == "main").unwrap();
@@ -8689,16 +8910,30 @@ oper main {} [
     }
 
     #[test]
-    fn borrowed_text_field_is_not_released() {
-        // `t.message` is a `TupleField` — a borrowed `(ptr,len)` into the
-        // tuple, NOT an owned heap Text. It must never be released (that would
-        // be a premature free). The literal is borrowed too. Zero releases.
-        let src =
-            "oper main {} [ let t = { message: \"hi\" }; write_line { message: t.message }; ];";
+    fn flattened_tuple_text_field_is_retained_and_balanced() {
+        // A flattened tuple's `Text` field read is retained to an independent
+        // owned copy, so it stays valid once the tuple's own cell is released at
+        // scope exit — the retain and the two releases (the field copy + the
+        // tuple's owned cell) must balance, with no leak and no double-free.
+        // Regression test for the web-handler double-free where
+        // `html_response{ body: picked.body }` freed the response body twice: a
+        // flattened tuple that captures an owned `Text` cell must release that
+        // cell at scope exit, and the field read must own its own copy so the
+        // two releases target distinct references of the same value.
+        let src = "oper main {} [ let t = { message: \"a\" || \"b\" }; \
+                   write_line { message: t.message }; ];";
         let module = lower_ok(src);
+        let retains = main_retains(&module).len();
+        let releases = main_releases(&module).len();
         assert!(
-            main_releases(&module).is_empty(),
-            "borrowed Text field must not be released"
+            retains >= 1,
+            "the flattened-tuple field read must retain an owned copy"
+        );
+        assert_eq!(
+            retains + 1,
+            releases,
+            "expected balance: each retain freed once, plus the tuple's own owned \
+             cell released once ({retains} retains, {releases} releases)"
         );
     }
 

@@ -166,6 +166,18 @@ pub enum Type {
     /// checker can keep walking without piling errors on top of
     /// errors.
     Unknown,
+    /// The **bottom** type: the type of an expression or block that never
+    /// yields a value because control leaves it first — today only a block
+    /// whose control flow ends in a `return`, or an `if` both of whose arms
+    /// diverge. `Never` is assignable to *every* type (a diverging path can
+    /// stand in wherever any value is expected) and unifies as the identity
+    /// (`Never` with `T` is `T`), so a `return`-only `if` arm agrees with its
+    /// value-producing sibling. It is **unspellable** — absent from
+    /// [`Type::from_builtin_name`], produced only by divergent control flow —
+    /// and never survives lowering (a divergent value is never materialized).
+    /// Same compile-time-only spirit as [`Type::FormatText`]. See
+    /// `docs/typecheck.md`.
+    Never,
 }
 
 impl Type {
@@ -202,6 +214,10 @@ impl Type {
     pub fn assignable_to(&self, other: &Type) -> bool {
         match (self, other) {
             (Type::Unknown, _) | (_, Type::Unknown) => true,
+            // Bottom: a diverging path produces no value, so it satisfies any
+            // expected type. (`Never` as a *target* accepts only `Never`, via
+            // the `_ => false` fallthrough — nothing is coerced *to* bottom.)
+            (Type::Never, _) => true,
             (Type::Integer, Type::Integer)
             | (Type::Rational, Type::Rational)
             | (Type::Approximate, Type::Approximate)
@@ -242,6 +258,7 @@ impl fmt::Display for Type {
             Type::Sequence(t) => write!(f, "Sequence {t}"),
             Type::Scalar(name) => f.write_str(name),
             Type::Unknown => f.write_str("<unknown>"),
+            Type::Never => f.write_str("Never"),
         }
     }
 }

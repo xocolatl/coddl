@@ -442,8 +442,9 @@ impl Block {
 /// `Insert` adds tuples (`insert R <source>;`, sugar for `R := R union
 /// <source>`); `Update` overwrites attributes (`update R where p { c: e };`,
 /// sugar for `R := (R where ¬p) union ((R where p) «sub»)`); `ExprStmt`
-/// evaluates an expression and discards the result. `mut` / `return` arrive
-/// when their semantics are settled.
+/// evaluates an expression and discards the result. `Return` is an early
+/// return from the enclosing operator body. `mut` arrives when its semantics
+/// are settled.
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Let(LetStmt),
@@ -458,7 +459,7 @@ pub enum Stmt {
     While(WhileStmt),
     DoWhile(DoWhileStmt),
     Load(LoadStmt),
-    // `return` arrives when its semantics are settled.
+    Return(ReturnStmt),
 }
 
 impl Stmt {
@@ -476,6 +477,7 @@ impl Stmt {
             SyntaxKind::WHILE_STMT => Stmt::While(WhileStmt { syntax }),
             SyntaxKind::DO_WHILE_STMT => Stmt::DoWhile(DoWhileStmt { syntax }),
             SyntaxKind::LOAD_STMT => Stmt::Load(LoadStmt { syntax }),
+            SyntaxKind::RETURN_STMT => Stmt::Return(ReturnStmt { syntax }),
             _ => return None,
         })
     }
@@ -494,6 +496,7 @@ impl Stmt {
             Stmt::While(s) => s.syntax(),
             Stmt::DoWhile(s) => s.syntax(),
             Stmt::Load(s) => s.syntax(),
+            Stmt::Return(s) => s.syntax(),
         }
     }
 }
@@ -515,6 +518,16 @@ impl LetStmt {
     }
 
     /// The right-hand-side expression.
+    pub fn value(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+}
+
+ast_node!(pub ReturnStmt, RETURN_STMT);
+
+impl ReturnStmt {
+    /// The optional returned value — the expression between `return` and `;`.
+    /// Absent for a bare `return;` (valid only for a `Unit`-returning oper).
     pub fn value(&self) -> Option<Expr> {
         self.syntax.children().find_map(Expr::cast)
     }

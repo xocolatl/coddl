@@ -1198,6 +1198,7 @@ fn proc_type_from_attr(ty: &Type) -> ProcType {
             unreachable!("Type::Sequence is not yet lowered; never reaches codegen")
         }
         Type::Unknown => unreachable!("Type::Unknown reached codegen"),
+        Type::Never => unreachable!("Type::Never is compile-time-only; never reaches codegen"),
     }
 }
 

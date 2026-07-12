@@ -499,8 +499,21 @@ function that implements it.
                   | <delete-stmt>
                   | <insert-stmt>
                   | <update-stmt>
+                  | <return-stmt>
                   | <assign-stmt>
                   | <expr> ';' ;                               -- parse_stmt (LET_STMT, VAR_STMT, TRUNCATE_STMT, DELETE_STMT, INSERT_STMT, UPDATE_STMT, ASSIGN_STMT, or EXPR_STMT)
+<return-stmt>   ::= 'return' [ <expr> ] ';' ;                   -- parse_return_stmt (RETURN_STMT)
+                    -- Early return from the enclosing operator body. The value
+                    -- is optional (`return;` yields Unit); a present value is
+                    -- checked against the declared return type (T0018), and a
+                    -- bare `return;` requires a Unit-returning oper. The value
+                    -- is missing `;` recovers via P0013. `return` is a
+                    -- contextual keyword recognized only as the leading token of
+                    -- a statement (the `let` precedent). A `return` inside a
+                    -- `transaction [...]` is rejected for now (T0093). Lowers to
+                    -- a mid-function `Return` terminator that unwinds every
+                    -- active scope; a `return`-terminated block or if-arm has
+                    -- bottom type (see typecheck.md, `Never`).
 <assign-stmt>   ::= <expr> ':=' <expr> ';' ;                   -- parse_stmt (ASSIGN_STMT)
                     -- Relational assignment. The parser accepts any
                     -- expression as the target (LHS); the typechecker
@@ -930,9 +943,10 @@ The following are decided design intent (see the rationale section
 above) but not yet wired into the parser. Listed here so the omission
 is explicit, not implied:
 
-- **Statement forms** other than `<let-stmt>`, `<assign-stmt>`,
-  `<truncate-stmt>`, `<delete-stmt>`, `<insert-stmt>`, `<update-stmt>`,
-  and `<expr> ';'` — `mut`, `return`.
+- **Statement forms** other than the ones in `<stmt>` above (`<let-stmt>`,
+  `<var-stmt>`, the loop forms, `<load-stmt>`, `<truncate-stmt>`,
+  `<delete-stmt>`, `<insert-stmt>`, `<update-stmt>`, `<return-stmt>`,
+  `<assign-stmt>`, and `<expr> ';'`) — `mut`.
 - **Type / relvar / constraint declarations** at the top level.
 - **Literals**: sequence `[ … ]` in expression position. (Tuple
   `{ … }` literals and dot-prefix field access landed in Phase 18.

@@ -17,9 +17,9 @@ use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, DeleteStmt, DoWhileStmt, Expr,
     ExprStmt, ExtendExpr, FieldAccess, ForStmt, Heading as AstHeading, IfExpr, IndexExpr,
     InsertStmt, Item, KeyClause, LetStmt, LoadStmt, NamedArg, OperDecl, PrivateRelvarDecl,
-    ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr, ReplaceExpr, Root,
-    SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit, TypeDecl, TypeRef,
-    UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WhileStmt, WrapExpr,
+    ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr, ReplaceExpr, ReturnStmt,
+    Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit, TypeDecl,
+    TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WhileStmt, WrapExpr,
 };
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
@@ -381,6 +381,7 @@ fn check_inner(
         stdlib_oper_owner: HashMap::new(),
         stdlib_type_owner: HashMap::new(),
         stdlib_relvar_owner: HashMap::new(),
+        current_return_type: None,
     };
     match file_kind {
         FileKind::Cd => {
@@ -679,6 +680,12 @@ struct TypeChecker {
     /// module. The relvar analogue of [`Self::stdlib_oper_owner`]; upgrades an
     /// unresolved `NameRef` → T0090.
     stdlib_relvar_owner: HashMap<String, ModulePath>,
+    /// The declared return type of the operator whose body is currently being
+    /// walked, set by [`Self::check_oper_decl`] around the body. A `return`
+    /// statement checks its value against this (T0018); `None` outside any
+    /// operator body (no statement position exists there, so it stays a
+    /// defensive guard).
+    current_return_type: Option<Type>,
 }
 
 impl TypeChecker {
@@ -1512,9 +1519,13 @@ impl TypeChecker {
 
         // The body's result type must match the declared return. The tail is
         // checked *against* the return type (bidirectional), so an empty
-        // relation / nested tuple in the returned value infers from it.
+        // relation / nested tuple in the returned value infers from it. The
+        // return type is also stashed so any early `return` inside the body
+        // checks its value against the same target (T0018).
         if let Some(body) = decl.body() {
+            let prev_return = self.current_return_type.replace(return_type.clone());
             let body_ty = self.check_block_expected(&body, &mut scope, &return_type);
+            self.current_return_type = prev_return;
             if !body_ty.assignable_to(&return_type) {
                 let span = body
                     .tail_expr()
@@ -1613,16 +1624,70 @@ impl TypeChecker {
             Stmt::While(w) => self.check_while_stmt(w, scope),
             Stmt::DoWhile(d) => self.check_do_while_stmt(d, scope),
             Stmt::Load(l) => self.check_load_stmt(l, scope),
+            Stmt::Return(r) => self.check_return_stmt(r, scope),
+        }
+    }
+
+    /// Check `return [<expr>];`. The value (or its absence, `Unit`) is checked
+    /// against the enclosing operator's declared return type (T0018), stashed
+    /// in [`Self::current_return_type`]. A `return` lexically inside a
+    /// `transaction [...]` is rejected (T0093): its early exit would skip the
+    /// transaction's commit, so it is a hard error until real BEGIN/COMMIT
+    /// lands (mirrors the L8 "hard error over silent-wrong" discipline).
+    fn check_return_stmt(&mut self, stmt: &ReturnStmt, scope: &mut Scope) {
+        // The declared return type of the operator we're inside. Absent only
+        // in a malformed tree (a statement outside any oper body); check the
+        // value defensively against Unknown so we never cascade.
+        let expected = self.current_return_type.clone().unwrap_or(Type::Unknown);
+
+        let value_ty = match stmt.value() {
+            Some(expr) => self.check_expr_expected(&expr, scope, &expected),
+            // A bare `return;` yields the unit value.
+            None => Type::unit(),
+        };
+
+        if !value_ty.assignable_to(&expected) {
+            let span = stmt
+                .value()
+                .map(|e| self.node_span(e.syntax()))
+                .unwrap_or_else(|| self.node_span(stmt.syntax()));
+            self.error(
+                span,
+                "T0018",
+                format!("`return` produces {value_ty}, but the operator returns {expected}"),
+            );
+        }
+
+        if self.transaction_depth > 0 {
+            self.error(
+                self.node_span(stmt.syntax()),
+                "T0093",
+                "`return` from within a `transaction` is not yet supported",
+            );
         }
     }
 
     fn check_block(&mut self, block: &Block, scope: &mut Scope) -> Type {
+        let mut diverges = false;
         for stmt in block.statements() {
             self.check_stmt(&stmt, scope);
+            if matches!(stmt, Stmt::Return(_)) {
+                diverges = true;
+            }
         }
-        match block.tail_expr() {
+        // The tail is still walked for diagnostics even when a preceding
+        // `return` made it dead code.
+        let tail_ty = match block.tail_expr() {
             Some(expr) => self.check_expr(&expr, scope),
             None => Type::unit(),
+        };
+        // A block whose control flow leaves via `return` (or whose tail itself
+        // diverges — e.g. an `if` both of whose arms return) is `Never`: it
+        // never falls through to a value, so it unifies with any sibling.
+        if diverges || tail_ty == Type::Never {
+            Type::Never
+        } else {
+            tail_ty
         }
     }
 
@@ -2819,6 +2884,12 @@ impl TypeChecker {
                 match (&then_ty, &else_ty) {
                     (Type::Unknown, _) => else_ty,
                     (_, Type::Unknown) => then_ty,
+                    // A diverging arm (one ending in `return`) yields no value,
+                    // so the `if` takes the other arm's type; both diverging is
+                    // `Never`. This is what lets a `{ status, body }` route sit
+                    // opposite an `else [ return not_found{} ]`.
+                    (Type::Never, _) => else_ty,
+                    (_, Type::Never) => then_ty,
                     _ if then_ty == else_ty => then_ty,
                     _ => {
                         self.error(
@@ -2835,7 +2906,10 @@ impl TypeChecker {
             None => {
                 // No `else`: the then-arm may not run, so nothing it assigned is
                 // definite afterward (already rolled back by `restore_uninit`).
-                if then_ty != Type::unit() && then_ty != Type::Unknown {
+                // A Unit then-arm is the statement form; a `Never` then-arm is a
+                // guard clause (`if bad then [ return … ]`) — both are fine, and
+                // the whole expression's value is Unit (the false fall-through).
+                if then_ty != Type::unit() && then_ty != Type::Unknown && then_ty != Type::Never {
                     let span = ife
                         .then_body()
                         .map(|b| self.node_span(b.syntax()))
@@ -3672,12 +3746,23 @@ impl TypeChecker {
     /// Like [`Self::check_block`] but the tail expression is checked against
     /// `expected` (bidirectional). Statements are unaffected.
     fn check_block_expected(&mut self, block: &Block, scope: &mut Scope, expected: &Type) -> Type {
+        let mut diverges = false;
         for stmt in block.statements() {
             self.check_stmt(&stmt, scope);
+            if matches!(stmt, Stmt::Return(_)) {
+                diverges = true;
+            }
         }
-        match block.tail_expr() {
+        let tail_ty = match block.tail_expr() {
             Some(expr) => self.check_expr_expected(&expr, scope, expected),
             None => Type::unit(),
+        };
+        // See [`Self::check_block`]: a `return`-terminated (or divergent-tail)
+        // block has bottom type `Never`.
+        if diverges || tail_ty == Type::Never {
+            Type::Never
+        } else {
+            tail_ty
         }
     }
 
@@ -6363,6 +6448,55 @@ mod tests {
         let src = "oper main {} [ if true then [ {} ]; ];";
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "expected clean, got {diags:?}");
+    }
+
+    // ── `return` (early exit) ────────────────────────────────────────
+
+    #[test]
+    fn return_value_type_mismatch_emits_t0018() {
+        // `return "x"` in an `Integer`-returning oper.
+        let src = "oper f {} -> Integer [ return \"x\"; ]; oper main {} [];";
+        assert!(codes(src).contains(&"T0018"), "got {:?}", codes(src));
+    }
+
+    #[test]
+    fn return_matching_declared_type_clean() {
+        // A guard `return` plus a matching tail; both are Integer.
+        let src = "oper f { n: Integer } -> Integer [ if n = 0 then [ return 7; ]; 9 ]; \
+                   oper main {} [];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected clean, got {diags:?}");
+    }
+
+    #[test]
+    fn if_arm_return_unifies_no_t0068() {
+        // The `else` arm diverges (`return`), so it unifies with the `Integer`
+        // then-arm rather than tripping T0068 — the wiki 404-route shape.
+        let src = "oper f {} -> Integer [ \
+                   let x = if true then [ 1 ] else [ return 2; ]; x ]; \
+                   oper main {} [];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected clean, got {diags:?}");
+        assert!(!codes(src).contains(&"T0068"), "unexpected T0068");
+    }
+
+    #[test]
+    fn guard_return_no_else_no_t0069() {
+        // A guard clause `if bad then [ return … ]` with no `else` — the
+        // `Never` then-arm must not trip T0069.
+        let src = "oper f { n: Integer } -> Integer [ if n = 0 then [ return 1; ]; 2 ]; \
+                   oper main {} [];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected clean, got {diags:?}");
+        assert!(!codes(src).contains(&"T0069"), "unexpected T0069");
+    }
+
+    #[test]
+    fn return_inside_transaction_emits_t0093() {
+        // An early `return` from within a `transaction [...]` would skip the
+        // commit — rejected for now.
+        let src = "oper f {} -> Integer [ transaction [ return 1; ]; 2 ]; oper main {} [];";
+        assert!(codes(src).contains(&"T0093"), "got {:?}", codes(src));
     }
 
     // ── UFCS method calls (`x.m {}` ≡ `m { self: x }`) ───────────────
