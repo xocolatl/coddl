@@ -99,9 +99,7 @@ oper handle{ req: Request } -> RawResponse [
         return html_response_404{};
     ];
 
-    let path_card = req.path.cardinality{};
-
-    if path_card = 0 then [
+    if req.path.is_empty{} then [
         // GET / — serve the single "home" page. The read is pushed to SQL in a
         // transaction; the `not home.is_empty{}` guard makes a *missing* "home"
         // row leave `body` empty (no error — unlike a bare `extract`, which
@@ -124,6 +122,7 @@ oper handle{ req: Request } -> RawResponse [
     ];
 
     let wiki_seg = req.path where ordinality = 0 and segment = "wiki";
+    let path_card = req.path.cardinality{};
 
     if wiki_seg.cardinality{} = 1 and path_card = 2 then [
         // GET /wiki/{slug} (F2) — extract the slug at path position 1 and
@@ -133,20 +132,16 @@ oper handle{ req: Request } -> RawResponse [
         // one filtered read, not a whole-table scan. `status`/`body` are
         // carried across the then-only `if` (the proven two-carried-var shape,
         // like the home route's `body`); a missing slug leaves the 404 default.
-        let resp404 = html_response_404{};
-        var status := resp404.status;
-        var body := resp404.body;
-        let slug_seg = extract (req.path where ordinality = 1 project { segment });
-        let slug_text = slug_seg.segment;
+        let slug_text = (extract (req.path where ordinality = 1 project { segment })).segment;
         let page = transaction [
             Pages where slug = slug_text project { title, body }
         ];
-        if not page.is_empty{} then [
-            let info = extract page;
-            status := 200;
-            body := page_html{ title: info.title, body: info.body };
+        if page.is_empty{} then [
+            return html_response_404{};
         ];
-        return html_response{ status, body };
+
+        let info = extract page;
+        return html_response{ status: 200, body: page_html{ title: info.title, body: info.body } };
     ];
 
     return html_response_404{};
