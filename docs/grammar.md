@@ -33,7 +33,7 @@ Three operator-shape categories, with deliberate exceptions:
 ### Infix for binary operators (symbolic *and* textual)
 
 - **Symbolic**: `=`, `<>`, `<`, `>`, `<=`, `>=`, `+`, `-`, `*`, `/`. The comparison operators `<=` and `>=` are polymorphic: scalar comparison on scalars (as ever); **subset** and **superset** on relations (`R <= S` iff every tuple in `R` appears in `S`; `S >= R` iff `R <= S`). `<` and `>` give strict subset / superset analogously. Identical headings are required for the relation overload — checked at compile time. There's no separate `subset` keyword; `<=` covers it.
-- **Textual relational**: `join`, `times`, `intersect`, `compose`, `union`, `minus`, `where`.
+- **Textual relational**: `join`, `times`, `intersect`, `compose`, `union`, `minus`, `matching`, `not matching`, `where`.
 - **Textual logical**: `and`, `or` (infix, both `Boolean × Boolean → Boolean`) and `not` (prefix, `Boolean → Boolean`). Precedence ladder `or` (1) < `and` (2) < `not` < comparison (3): `not` is a prefix operator whose operand parses at comparison level, so `not a and b` reads as `(not a) and b` and `not a = b` as `not (a = b)`. `not` also has the Unicode glyph `¬` (see "Unicode operator glyphs").
 - **Textual arithmetic**: `div` (truncating integer division, toward zero), and the planned `mod` (remainder). `div` is `Integer × Integer → Integer` and binds at multiplicative precedence, alongside `*` and `/`. **The symbolic `/` is *exact* division**: `Integer × Integer → Rational` — `7 / 2` is the rational `7/2`, whereas `7 div 2` is the integer `3`. (`div` is the recognized keyword; `mod` is documented here but not yet wired.)
 
@@ -48,6 +48,8 @@ Reason: the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-
 
 **`union` and `minus` require identical headings.** `union` lowers to A-core `OR` (heading-agnostic relational union, restricted at the type level to matching headings since Coddl has no nulls). `minus` lowers to `AND NOT` (set difference is `R join (NOT S)` when headings match). Both checks are static; mismatched-heading attempts are rejected at compile time with a diagnostic.
 
+**`matching` (semijoin) and `not matching` (antijoin) filter the *left* operand by existence in the right.** `R matching S` keeps the `R`-tuples that have a match in `S` on the shared attributes (`(R join S)` projected back onto `R`'s heading — TTM's SEMIJOIN); `R not matching S` keeps the `R`-tuples with **no** match (TTM's SEMIMINUS, `R minus (R matching S)`). The result heading is always `R`'s. Both take the **same legal domain as `join`/`compose` — partial overlap**: they match on the shared attributes, so identical headings are rejected and suggest the set operator they collapse to (`matching` → `intersect`, `not matching` → `minus`; T0094), and disjoint headings are rejected as a degenerate existence-guard with no key to match on (T0095); a shared-attribute type clash is T0036. They lower to the RelIR `Semijoin` sugar node, which the SQL emitter pushes as a correlated `WHERE [NOT] EXISTS` and the in-process path expands to join+project(+minus) (see [relir.md](relir.md), [sqlemit.md](sqlemit.md)). `matching`/`not matching` also have the Unicode glyph synonyms `⋉`/`▷` (see "Unicode operator glyphs"); `▷` is a single token, giving the two-word `not matching` a one-token spelling.
+
 **`where` (restriction) is also infix and special-cased in two ways.** The right operand is a *predicate*, not another relation, and that has two consequences:
 
 - **Scope injection.** Identifiers in the predicate resolve against the left operand's heading first, the enclosing scope second. `SP where s# = supplier` reads as: `s#` is the `SP` attribute; `supplier` is a parameter from the enclosing `oper`. The parser and typechecker inject the left operand's heading into the predicate's name-resolution scope automatically. This is the first construct with a non-uniform scoping rule; every later construct that takes a predicate (`extend`, `summarize`'s aggregate expressions, possrep constraints) reuses the same machinery.
@@ -57,7 +59,7 @@ Reason: the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-
 
 ### Named-prefix with braces — the only call form
 
-Every operator invocation is `name { … }` (or its dot-method sugar `R.method { … }`, see "Method-style call syntax"): selectors, `oper` calls, `extend`, `summarize`, `replace`, `group`, `ungroup`, `wrap`, `unwrap`, and so on. **There is no positional call form** — Coddl has no `f(x)` syntax; parentheses are for expression grouping only (see "Brackets vs braces encode ordering"). Arguments are named (`name: expr`); a brace may instead hold a bare list of attribute *names* where that is the operand shape (`project { a, b }`, `key { a, b }`). The binary relational operators — `join`, `times`, `intersect`, `compose`, `union`, `minus`, `where` — are **infix only**; there is no named-prefix brace variant for them.
+Every operator invocation is `name { … }` (or its dot-method sugar `R.method { … }`, see "Method-style call syntax"): selectors, `oper` calls, `extend`, `summarize`, `replace`, `group`, `ungroup`, `wrap`, `unwrap`, and so on. **There is no positional call form** — Coddl has no `f(x)` syntax; parentheses are for expression grouping only (see "Brackets vs braces encode ordering"). Arguments are named (`name: expr`); a brace may instead hold a bare list of attribute *names* where that is the operand shape (`project { a, b }`, `key { a, b }`). The binary relational operators — `join`, `times`, `intersect`, `compose`, `union`, `minus`, `matching`, `not matching`, `where` — are **infix only**; there is no named-prefix brace variant for them.
 
 This eliminates the relational-algebra/scalar-op syntactic distinction the authors regret, and matches RM Pro 1 (no ordinal-position semantics) at the surface where it's easiest to enforce.
 
@@ -100,7 +102,7 @@ The TextMate grammar still pattern-highlights these words at the lexical level (
 A small set of single-codepoint mathematical glyphs are **exact synonyms** for their ASCII / keyword counterparts, so `R ⋈ S` and `R join S` are interchangeable in source. There are two lexing mechanisms behind the one meaning:
 
 - **Symbolic glyphs** (`≤ ⊆ ≥ ⊇ ⊂ ⊃ ≠`) lex directly to the same *token kind* as their ASCII spelling (`≤` → `LtEq`), so the parser matches them with no glyph-specific logic.
-- **Word glyphs** (`⋈ ∪ ∩ ∖ ¬`) lex as an `IDENT` that keeps the glyph in the CST (formatter-friendly); the parser and AST then recognize the glyph text as a synonym at the *same recognition site* as the ASCII keyword — `⋈`/`∪`/`∩`/`∖` alongside `join`/`union`/`intersect`/`minus` in `peek_infix_prec` and `BinaryExpr::op_kind`, and `¬` alongside `not`.
+- **Word glyphs** (`⋈ ∪ ∩ ∖ ¬ ⋉ ▷`) lex as an `IDENT` that keeps the glyph in the CST (formatter-friendly); the parser and AST then recognize the glyph text as a synonym at the *same recognition site* as the ASCII keyword — `⋈`/`∪`/`∩`/`∖` alongside `join`/`union`/`intersect`/`minus` in `peek_infix_prec` and `BinaryExpr::op_kind`, `¬` alongside `not`, and `⋉`/`▷` alongside `matching`/`not matching`. `▷` is a single token — it spells the two-word `not matching` in one glyph.
 
 Grammar productions below name only the ASCII form.
 
@@ -110,6 +112,8 @@ Grammar productions below name only the ASCII form.
 | `union` | `∪` | U+222A |
 | `intersect` | `∩` | U+2229 |
 | `minus` | `∖` | U+2216 SET MINUS (**not** U+005C reverse solidus — that's the string-escape character) |
+| `matching` | `⋉` | U+22C9 LEFT NORMAL FACTOR SEMIDIRECT PRODUCT (the left-semijoin symbol) |
+| `not matching` | `▷` | U+25B7 WHITE RIGHT-POINTING TRIANGLE (the antijoin symbol; one token) |
 | `not` | `¬` | U+00AC NOT SIGN |
 | `<=` | `≤`, `⊆` | U+2264, U+2286 |
 | `>=` | `≥`, `⊇` | U+2265, U+2287 |
@@ -327,6 +331,8 @@ either way; grammar productions below name only the ASCII form.
 | `∪`   | U+222A    | `Ident("union")`| `union`                |
 | `∩`   | U+2229    | `Ident("intersect")` | `intersect`       |
 | `∖`   | U+2216    | `Ident("minus")`| `minus`                |
+| `⋉`   | U+22C9    | `Ident("⋉")`    | `matching` (semijoin)  |
+| `▷`   | U+25B7    | `Ident("▷")`    | `not matching` (antijoin; one token) |
 | `≤`   | U+2264    | `LtEq`          | `<=`                   |
 | `⊆`   | U+2286    | `LtEq`          | `<=` (subset reading)  |
 | `≥`   | U+2265    | `GtEq`          | `>=`                   |
@@ -723,6 +729,8 @@ function that implements it.
                   | 'intersect'                                -- prec 0
                   | 'union'                                    -- prec 0
                   | 'minus'                                    -- prec 0
+                  | 'matching'                                 -- prec 0
+                  | 'not' 'matching'                           -- prec 0 (two tokens)
                   | 'or'                                       -- prec 1
                   | 'and'                                      -- prec 2
                   | '=' | '<>' | '<' | '>' | '<=' | '>='       -- prec 3
@@ -739,12 +747,18 @@ function that implements it.
                     -- there is immaterial since its operands
                     -- (Text/Character) never mix with arithmetic.
                     -- The relational ops `join`/`times`/`compose`/
-                    -- `intersect`/`union`/`minus` are also contextual
-                    -- keywords. (Symbolic `-` is `Sub`; the keyword
-                    -- `minus` is the relational set-difference op.)
-                    -- `join`/`union`/`intersect`/`minus` also accept
-                    -- their glyph synonyms `⋈`/`∪`/`∩`/`∖` (§ Unicode
-                    -- operator glyphs); `times`/`compose` have none.
+                    -- `intersect`/`union`/`minus`/`matching`/
+                    -- `not matching` are also contextual keywords.
+                    -- (Symbolic `-` is `Sub`; the keyword `minus` is
+                    -- the relational set-difference op.) `matching`
+                    -- (semijoin) is one token; `not matching`
+                    -- (antijoin) is two — the parser peeks `not`+
+                    -- `matching` and bumps both. `join`/`union`/
+                    -- `intersect`/`minus`/`matching`/`not matching`
+                    -- also accept their glyph synonyms
+                    -- `⋈`/`∪`/`∩`/`∖`/`⋉`/`▷` (§ Unicode operator
+                    -- glyphs; `▷` is a one-token `not matching`);
+                    -- `times`/`compose` have none.
 <postfix>       ::= <arg-list>                                 -- call: CALL_EXPR
                   | <field-access-tail>                        -- field access: FIELD_ACCESS
                   | <index-tail> ;                             -- index: INDEX_EXPR

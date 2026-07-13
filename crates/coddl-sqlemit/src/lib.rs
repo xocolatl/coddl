@@ -812,6 +812,70 @@ fn emit_select_offset(
     param_offset: u32,
     order: &[(String, bool)],
 ) -> Result<SqlQuery> {
+    // Root semijoin (`matching`) / antijoin (`not matching`) → a correlated
+    // `WHERE [NOT] EXISTS`: filter the left operand to the rows that have
+    // (semijoin) / lack (antijoin) a match in the right operand on the shared
+    // attributes. This is the idiomatic, planner-friendly semijoin SQL — no join
+    // row-multiplication and no `DISTINCT`/`EXCEPT` dedup. Handled here at the
+    // root like set-ops; a semijoin nested *under* a relational op errs in
+    // `resolve` and decomposes in-process.
+    if let RelExpr::Semijoin { lhs, rhs, negated } = expr {
+        // A trailing ORDER BY over a semijoin root is deferred (like set-op /
+        // tclose roots): decline so the caller sorts in-process.
+        if !order.is_empty() {
+            return Err(BackendError::Other(
+                "order pushdown: a trailing ORDER BY cannot attach to a semijoin source"
+                    .to_string(),
+            ));
+        }
+        let lhs_h = lhs.heading();
+        let rhs_h = rhs.heading();
+        // Correlate on the shared attributes (the match key; ≥1, typechecked).
+        // Both subqueries name their outputs by attribute, so a shared attribute
+        // is the same column on each side. Tuple equality (RM Pre 8) is on every
+        // leaf column; a Tuple-valued shared key expands to multiple columns
+        // (out of scope here), so decline it to the in-process path.
+        let mut conjuncts = Vec::new();
+        for (name, ty) in lhs_h.attrs() {
+            if rhs_h.attrs().iter().any(|(n, _)| n == name) {
+                if matches!(ty, Type::Tuple(_)) {
+                    return Err(BackendError::Other(
+                        "semijoin on a tuple-valued shared attribute does not push to SQL"
+                            .to_string(),
+                    ));
+                }
+                conjuncts.push(format!("coddl_l.{c} = coddl_r.{c}", c = quote_ident(name)));
+            }
+        }
+        // Operands emit as derived tables; the rhs's placeholders start after the
+        // lhs's (params concatenate lhs then rhs).
+        let l = emit_select_offset(lhs, dialect, param_offset, &[])?;
+        let r = emit_select_offset(rhs, dialect, param_offset + l.sql.param_count, &[])?;
+        let exists = if *negated { "NOT EXISTS" } else { "EXISTS" };
+        // `coddl_l.*` passes the left subquery's columns through unchanged (in its
+        // canonical-heading order), so the result marshals against `lhs`'s heading
+        // — including any flattened Tuple leaf columns. No outer `DISTINCT`: the
+        // result is a subset of the already-set left operand.
+        let text = format!(
+            "SELECT coddl_l.* FROM ({}) AS coddl_l WHERE {exists} (SELECT 1 FROM ({}) AS coddl_r WHERE {})",
+            l.sql.text,
+            r.sql.text,
+            conjuncts.join(" AND ")
+        );
+        let mut params = l.params;
+        params.extend(r.params);
+        let plan_id = PlanId(fnv1a(dialect, &text));
+        return Ok(SqlQuery {
+            sql: SqlString {
+                param_count: params.len() as u32,
+                text,
+            },
+            params,
+            result_heading: l.result_heading,
+            plan_id,
+        });
+    }
+
     // Root set-op: each operand emits as a full sub-SELECT, combined with a bare
     // compound operator (`UNION` for `Or`, `EXCEPT` for `Minus`; set semantics,
     // never `… ALL`). Params concatenate (lhs then rhs); the rhs's placeholders
@@ -1099,6 +1163,12 @@ fn resolve(
         RelExpr::Or { .. } | RelExpr::Minus { .. } => Err(BackendError::Other(
             "set operation nested under a relational operator does not push to SQL".to_string(),
         )),
+        // A semijoin nested under a relational operator: its `WHERE EXISTS` shape
+        // is not a FROM table-expression, so decline — the whole push declines and
+        // it runs in-process. A *root* semijoin is handled in `emit_select_offset`.
+        RelExpr::Semijoin { .. } => Err(BackendError::Other(
+            "semijoin nested under a relational operator does not push to SQL".to_string(),
+        )),
         // A `TClose` reached *here* (via `resolve`) is non-root — nested under a
         // relational op (`(R tclose) where p`), or a set-op operand
         // (`(R tclose) union S`). A `WITH RECURSIVE` query can't be a `FROM`
@@ -1375,6 +1445,25 @@ mod tests {
         }
     }
 
+    /// A second relvar sharing `id` with `greetings` (heading `{ id, topic }`),
+    /// for the semijoin/antijoin tests.
+    fn mentions() -> RelExpr {
+        RelExpr::RelvarRef {
+            name: "Mentions".to_string(),
+            database: "greetings".to_string(),
+            heading: Heading::new(vec![
+                ("id".to_string(), Type::Integer),
+                ("topic".to_string(), Type::Text),
+            ]),
+            table_name: "mentions".to_string(),
+            columns: vec![
+                ("id".to_string(), "id".to_string()),
+                ("topic".to_string(), "topic".to_string()),
+            ],
+            keys: vec![vec!["id".to_string(), "topic".to_string()]],
+        }
+    }
+
     fn where_id_1(input: RelExpr) -> RelExpr {
         RelExpr::Restrict {
             input: Box::new(input),
@@ -1426,6 +1515,60 @@ mod tests {
                 "op {op:?}"
             );
         }
+    }
+
+    #[test]
+    fn semijoin_emits_where_exists() {
+        // `Greetings matching Mentions` (shared `id`) → a correlated `WHERE
+        // EXISTS`: no INNER JOIN, no DISTINCT, no EXCEPT. `coddl_l.*` passes the
+        // left subquery's columns through; the result heading is `Greetings`'s.
+        let expr = RelExpr::Semijoin {
+            lhs: Box::new(greetings()),
+            rhs: Box::new(mentions()),
+            negated: false,
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT coddl_l.* FROM (SELECT "id", "message" FROM "greetings") AS coddl_l WHERE EXISTS (SELECT 1 FROM (SELECT "id", "topic" FROM "mentions") AS coddl_r WHERE coddl_l."id" = coddl_r."id")"#
+        );
+        assert_eq!(q.result_heading, greetings_heading());
+        assert!(q.params.is_empty());
+    }
+
+    #[test]
+    fn antijoin_emits_where_not_exists() {
+        // `not matching` flips the correlated subquery to `NOT EXISTS`.
+        let expr = RelExpr::Semijoin {
+            lhs: Box::new(greetings()),
+            rhs: Box::new(mentions()),
+            negated: true,
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT coddl_l.* FROM (SELECT "id", "message" FROM "greetings") AS coddl_l WHERE NOT EXISTS (SELECT 1 FROM (SELECT "id", "topic" FROM "mentions") AS coddl_r WHERE coddl_l."id" = coddl_r."id")"#
+        );
+    }
+
+    #[test]
+    fn semijoin_operand_restrict_params_thread_through() {
+        // `(Greetings where id = 1) matching Mentions` — the left operand's bind
+        // parameter survives into the outer query (params concatenate lhs→rhs).
+        let expr = RelExpr::Semijoin {
+            lhs: Box::new(where_id_1(greetings())),
+            rhs: Box::new(mentions()),
+            negated: false,
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert!(
+            q.sql
+                .text
+                .contains(r#"(SELECT "id", "message" FROM "greetings" WHERE "id" = ?) AS coddl_l"#),
+            "{}",
+            q.sql.text
+        );
+        assert_eq!(q.params, vec![ParamSource::Lit(Value::Integer(1))]);
     }
 
     #[test]

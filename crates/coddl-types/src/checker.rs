@@ -4006,6 +4006,9 @@ impl TypeChecker {
             BinaryOp::Intersect => self.check_intersect_binary(bin, scope),
             BinaryOp::Union => self.check_union_binary(bin, scope),
             BinaryOp::Minus => self.check_minus_binary(bin, scope),
+            BinaryOp::Matching | BinaryOp::NotMatching => {
+                self.check_matching_binary(bin, op, scope)
+            }
             BinaryOp::And | BinaryOp::Or => self.check_logical_op(bin, op, scope),
             BinaryOp::Eq | BinaryOp::NotEq => self.check_equality_op(bin, op, scope),
             BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => {
@@ -4281,6 +4284,72 @@ impl TypeChecker {
             .cloned()
             .collect();
         Type::Relation(Heading::new(kept))
+    }
+
+    /// `R matching S` (semijoin) / `R not matching S` (antijoin) — filter the
+    /// **left** operand by whether each of its tuples has (matching) / lacks (not
+    /// matching) a match in `S` on the shared attributes. Both are typed like
+    /// `join`/`compose` — partial overlap required — because the shared
+    /// attributes are the key matched on. The result heading is always the left
+    /// operand's (a subset of its tuples). The two degenerate cases are rejected
+    /// with the set operator they collapse to / their non-meaning:
+    /// identical headings → a join on every attribute = `intersect` (matching) /
+    /// `minus` (not matching), so T0094 suggests it; disjoint headings → no key to
+    /// match on (the semijoin degenerates to an existence guard on the left
+    /// operand), so T0095 rejects it. A shared-attribute type clash → T0036 (the
+    /// same join-key check `join`/`compose` use).
+    fn check_matching_binary(&mut self, bin: &BinaryExpr, op: BinaryOp, scope: &mut Scope) -> Type {
+        let (op_name, set_op) = match op {
+            BinaryOp::Matching => ("matching", "intersect"),
+            BinaryOp::NotMatching => ("not matching", "minus"),
+            _ => unreachable!("check_matching_binary called on {op:?}"),
+        };
+        // Check both operands first so each surfaces its own diagnostics.
+        let lhs_h = self.relation_operand(bin.lhs(), op_name, scope);
+        let rhs_h = self.relation_operand(bin.rhs(), op_name, scope);
+        let (Some(lhs_h), Some(rhs_h)) = (lhs_h, rhs_h) else {
+            return Type::Unknown;
+        };
+        // Identical headings: the semijoin matches on every attribute, which is a
+        // set intersection (matching) / difference (not matching). Suggest that
+        // set operator. Checked before the disjoint case so two nullary operands
+        // (identical *and* share-nothing) report the more useful suggestion.
+        if lhs_h == rhs_h {
+            self.error(
+                self.node_span(bin.syntax()),
+                "T0094",
+                format!("`{op_name}` operands have identical headings — did you mean `{set_op}`?"),
+            );
+            return Type::Unknown;
+        }
+        // Disjoint headings: no shared attribute means no key to match on; the
+        // semijoin degenerates to an existence guard on the left operand. Reject —
+        // the operands must share the attributes the match is computed over.
+        if lhs_h.is_disjoint_from(&rhs_h) {
+            self.error(
+                self.node_span(bin.syntax()),
+                "T0095",
+                format!(
+                    "`{op_name}` operands share no attribute — a semijoin has no key to match on"
+                ),
+            );
+            return Type::Unknown;
+        }
+        // Partial overlap: the shared attributes must agree in type (the same
+        // join-key check as `join`/`compose`); the result keeps the left heading.
+        match lhs_h.union(&rhs_h) {
+            Ok(_) => Type::Relation(lhs_h),
+            Err(name) => {
+                self.error(
+                    self.node_span(bin.syntax()),
+                    "T0036",
+                    format!(
+                        "`{op_name}` shared attribute `{name}` has different types on each side"
+                    ),
+                );
+                Type::Unknown
+            }
+        }
     }
 
     /// `R intersect S` — set intersection (Algebra-A AND on identical headings:
@@ -5364,6 +5433,8 @@ fn op_display(op: BinaryOp) -> &'static str {
         BinaryOp::Intersect => "intersect",
         BinaryOp::Union => "union",
         BinaryOp::Minus => "minus",
+        BinaryOp::Matching => "matching",
+        BinaryOp::NotMatching => "not matching",
         BinaryOp::Add => "+",
         BinaryOp::Sub => "-",
         BinaryOp::Mul => "*",
@@ -5939,6 +6010,104 @@ mod tests {
                    oper main {} [ write_relation { rel: R compose S }; ];";
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn matching_with_shared_attribute_checks_clean() {
+        // R { a, b } matching S { a, c } shares `a` -> semijoin on `a`, result
+        // keeps R's heading { a, b }.
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   private relvar S { a: Integer, c: Text } key { a }; \
+                   oper main {} [ write_relation { rel: R matching S }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn matching_with_subset_heading_checks_clean() {
+        // R { a, b } matching S { a } — S's heading is a subset; partial overlap,
+        // result keeps R's heading { a, b }.
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   private relvar S { a: Integer } key { a }; \
+                   oper main {} [ write_relation { rel: R matching S }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn matching_result_keeps_left_heading() {
+        // The semijoin result is a subset of the left operand, so its heading is
+        // R's — not the join's union. `(R matching S) union R` type-checks clean
+        // only if `R matching S` has R's heading (else union -> T0038).
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   private relvar S { a: Integer, c: Text } key { a }; \
+                   oper main {} [ write_relation { rel: (R matching S) union R }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn matching_with_identical_headings_diagnoses_t0094() {
+        // Semijoin on every attribute is a set intersection -> suggest `intersect`.
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   private relvar S { a: Integer, b: Text } key { a }; \
+                   oper main {} [ write_relation { rel: R matching S }; ];";
+        assert!(codes(src).contains(&"T0094"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn matching_with_disjoint_headings_diagnoses_t0095() {
+        // No shared attribute -> no key to match on -> reject.
+        let src = "program p; \
+                   private relvar R { a: Integer } key { a }; \
+                   private relvar S { b: Integer } key { b }; \
+                   oper main {} [ write_relation { rel: R matching S }; ];";
+        assert!(codes(src).contains(&"T0095"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn matching_with_shared_type_mismatch_diagnoses_t0036() {
+        // Shared name `a` but Integer on one side, Text on the other.
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   private relvar S { a: Text, c: Text } key { a }; \
+                   oper main {} [ write_relation { rel: R matching S }; ];";
+        assert!(codes(src).contains(&"T0036"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn not_matching_with_shared_attribute_checks_clean() {
+        // R { a, b } not matching S { a, c } shares `a` -> antijoin, result keeps
+        // R's heading { a, b }.
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   private relvar S { a: Integer, c: Text } key { a }; \
+                   oper main {} [ write_relation { rel: R not matching S }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn not_matching_with_identical_headings_diagnoses_t0094() {
+        // Antijoin on every attribute is a set difference -> suggest `minus`.
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   private relvar S { a: Integer, b: Text } key { a }; \
+                   oper main {} [ write_relation { rel: R not matching S }; ];";
+        assert!(codes(src).contains(&"T0094"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn not_matching_with_disjoint_headings_diagnoses_t0095() {
+        let src = "program p; \
+                   private relvar R { a: Integer } key { a }; \
+                   private relvar S { b: Integer } key { b }; \
+                   oper main {} [ write_relation { rel: R not matching S }; ];";
+        assert!(codes(src).contains(&"T0095"), "{:?}", codes(src));
     }
 
     #[test]

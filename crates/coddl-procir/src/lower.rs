@@ -3902,14 +3902,17 @@ impl Lowerer {
             Expr::Binary(b) => match b.op_kind() {
                 // `where`'s relational operand is the lhs (rhs is the predicate).
                 Some(BinaryOp::Where) => b.lhs().into_iter().collect(),
-                // The AND/OR-family binaries take two relational operands.
+                // The AND/OR-family and semijoin binaries take two relational
+                // operands.
                 Some(
                     BinaryOp::Join
                     | BinaryOp::Times
                     | BinaryOp::Intersect
                     | BinaryOp::Compose
                     | BinaryOp::Union
-                    | BinaryOp::Minus,
+                    | BinaryOp::Minus
+                    | BinaryOp::Matching
+                    | BinaryOp::NotMatching,
                 ) => b.lhs().into_iter().chain(b.rhs()).collect(),
                 // A scalar binary (arithmetic / comparison / logical) is not a
                 // relational operator — nothing to guard.
@@ -5219,6 +5222,8 @@ impl Lowerer {
                 | BinaryOp::Intersect
                 | BinaryOp::Union
                 | BinaryOp::Minus
+                | BinaryOp::Matching
+                | BinaryOp::NotMatching
         ) {
             return self.lower_join_inprocess(bin);
         }
@@ -5287,7 +5292,9 @@ impl Lowerer {
             | BinaryOp::Compose
             | BinaryOp::Intersect
             | BinaryOp::Union
-            | BinaryOp::Minus => {
+            | BinaryOp::Minus
+            | BinaryOp::Matching
+            | BinaryOp::NotMatching => {
                 unreachable!("handled above")
             }
         };
@@ -5415,6 +5422,19 @@ impl Lowerer {
                     keep,
                 })
             }
+            // `A matching B` (semijoin) / `A not matching B` (antijoin) → the
+            // `Semijoin` node, which the SQL emitter pushes as `WHERE [NOT]
+            // EXISTS` and the in-process path expands to join+project(+minus).
+            // (Typecheck guarantees ≥1 shared attribute.)
+            Some(BinaryOp::Matching) | Some(BinaryOp::NotMatching) => {
+                let lhs = self.build_rel_expr(&b.lhs()?)?;
+                let rhs = self.build_rel_expr(&b.rhs()?)?;
+                Some(RelExpr::Semijoin {
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    negated: matches!(b.op_kind(), Some(BinaryOp::NotMatching)),
+                })
+            }
             _ => None,
         }
     }
@@ -5443,6 +5463,27 @@ impl Lowerer {
                 self.emit_union(lhs, rhs)
             } else if matches!(bin.op_kind(), Some(BinaryOp::Minus)) {
                 self.emit_minus(lhs, rhs)
+            } else if matches!(
+                bin.op_kind(),
+                Some(BinaryOp::Matching) | Some(BinaryOp::NotMatching)
+            ) {
+                // Semijoin = project(join) back onto `lhs`'s heading; antijoin =
+                // `lhs minus` that. For the antijoin `lhs` is lowered a *second*
+                // time (via `lhs_e`) for the minus, so no value is reused across
+                // two ops (matching the algebraic `lhs minus (lhs matching rhs)`).
+                let keep = self.relation_attr_names(lhs);
+                let joined = self.emit_join(lhs, rhs);
+                let sj = self.emit_project(joined, &keep);
+                self.release_call_arg_temp(joined); // the intermediate join
+                if matches!(bin.op_kind(), Some(BinaryOp::NotMatching)) {
+                    let lhs2 = self.lower_expr(&lhs_e);
+                    let dst = self.emit_minus(lhs2, sj);
+                    self.release_call_arg_temp(lhs2);
+                    self.release_call_arg_temp(sj);
+                    dst
+                } else {
+                    sj
+                }
             } else {
                 let joined = self.emit_join(lhs, rhs);
                 // `compose` removes the shared attributes after the join.
@@ -5466,6 +5507,20 @@ impl Lowerer {
         let v = self.fresh_value();
         self.record_type(v, ProcType::Unit);
         v
+    }
+
+    /// The attribute names of an already-lowered relation value's heading, in
+    /// canonical order — the semijoin keep-list (a semijoin projects the join
+    /// back onto the left operand's full heading).
+    fn relation_attr_names(&self, v: ValueId) -> Vec<String> {
+        match self.value_type(v) {
+            ProcType::Relation(id) => self.headings[id.0 as usize]
+                .attrs()
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect(),
+            other => unreachable!("matching operand non-relation `{other}` survived typecheck"),
+        }
     }
 
     /// The `compose` keep-list (attributes appearing in exactly one operand),
@@ -5543,6 +5598,34 @@ impl Lowerer {
                 let dst = self.emit_project(src, keep);
                 self.release_call_arg_temp(src);
                 Some(dst)
+            }
+            // Semijoin = `project(join(lhs, rhs))` back onto `lhs`'s heading;
+            // antijoin = `lhs minus` that. `lhs` is lowered twice for the antijoin
+            // (matching the algebraic `lhs minus (lhs matching rhs)`) so each op
+            // consumes fresh rc=1 temps — no operand reused across two ops.
+            RelExpr::Semijoin { lhs, rhs, negated } => {
+                let keep: Vec<String> = lhs
+                    .heading()
+                    .attrs()
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                let l = self.lower_relexpr_inprocess(lhs)?;
+                let r = self.lower_relexpr_inprocess(rhs)?;
+                let joined = self.emit_join(l, r);
+                let sj = self.emit_project(joined, &keep);
+                self.release_call_arg_temp(l);
+                self.release_call_arg_temp(r);
+                self.release_call_arg_temp(joined);
+                if *negated {
+                    let l2 = self.lower_relexpr_inprocess(lhs)?;
+                    let dst = self.emit_minus(l2, sj);
+                    self.release_call_arg_temp(l2);
+                    self.release_call_arg_temp(sj);
+                    Some(dst)
+                } else {
+                    Some(sj)
+                }
             }
             RelExpr::TClose { input } => {
                 let src = self.lower_relexpr_inprocess(input)?;
@@ -6954,9 +7037,10 @@ fn contains_restrict(rel: &RelExpr) -> bool {
         | RelExpr::TClose { input }
         | RelExpr::Wrap { input, .. }
         | RelExpr::Unwrap { input, .. } => contains_restrict(input),
-        RelExpr::And { lhs, rhs } | RelExpr::Or { lhs, rhs } | RelExpr::Minus { lhs, rhs } => {
-            contains_restrict(lhs) || contains_restrict(rhs)
-        }
+        RelExpr::And { lhs, rhs }
+        | RelExpr::Or { lhs, rhs }
+        | RelExpr::Minus { lhs, rhs }
+        | RelExpr::Semijoin { lhs, rhs, .. } => contains_restrict(lhs) || contains_restrict(rhs),
         RelExpr::RelvarRef { .. } | RelExpr::MaterializedRelvar { .. } => false,
     }
 }
@@ -6974,9 +7058,10 @@ fn relvar_root_name(rel: &RelExpr) -> Option<&str> {
         | RelExpr::TClose { input }
         | RelExpr::Wrap { input, .. }
         | RelExpr::Unwrap { input, .. } => relvar_root_name(input),
-        RelExpr::And { lhs, .. } | RelExpr::Or { lhs, .. } | RelExpr::Minus { lhs, .. } => {
-            relvar_root_name(lhs)
-        }
+        RelExpr::And { lhs, .. }
+        | RelExpr::Or { lhs, .. }
+        | RelExpr::Minus { lhs, .. }
+        | RelExpr::Semijoin { lhs, .. } => relvar_root_name(lhs),
         RelExpr::MaterializedRelvar { .. } => None,
     }
 }

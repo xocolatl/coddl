@@ -168,7 +168,7 @@ impl<'a> Lexer<'a> {
             '|' => self.lex_pipe(start),
 
             // Unicode glyph synonyms (§3 "Unicode operator glyphs")
-            '⋈' | '∪' | '∩' | '∖' | '¬' => self.lex_word_glyph(start),
+            '⋈' | '∪' | '∩' | '∖' | '¬' | '⋉' | '▷' => self.lex_word_glyph(start),
             '≤' | '⊆' => self.lex_glyph(TokenKind::LtEq, start),
             '≥' | '⊇' => self.lex_glyph(TokenKind::GtEq, start),
             '⊂' => self.lex_glyph(TokenKind::Lt, start),
@@ -524,10 +524,10 @@ impl<'a> Lexer<'a> {
         self.emit(TokenKind::Ident, start);
     }
 
-    /// A single-codepoint Unicode word operator (`⋈ ∪ ∩ ∖ ¬`) emitted as an
+    /// A single-codepoint Unicode word operator (`⋈ ∪ ∩ ∖ ¬ ⋉ ▷`) emitted as an
     /// `Ident` token — the parser resolves it to its canonical word
-    /// (`join`, `union`, `intersect`, `minus`, `not`) at the same recognition
-    /// site as the ASCII spelling.
+    /// (`join`, `union`, `intersect`, `minus`, `not`, `matching`, `not matching`)
+    /// at the same recognition site as the ASCII spelling.
     fn lex_word_glyph(&mut self, start: usize) {
         self.bump();
         self.emit(TokenKind::Ident, start);
@@ -879,8 +879,8 @@ mod tests {
     #[test]
     fn unicode_glyph_synonyms_lex_to_canonical_tokens() {
         use TokenKind::*;
-        // ⋈ ∪ ∩ ∖ ¬ emit Ident; ≤ ⊆ → LtEq; ⊂ → Lt; ≠ → NotEq
-        let out = lex_all("⋈ ∪ ∩ ∖ ¬ ≤ ⊆ ≥ ⊇ ⊂ ⊃ ≠");
+        // ⋈ ∪ ∩ ∖ ¬ ⋉ ▷ emit Ident; ≤ ⊆ → LtEq; ⊂ → Lt; ≠ → NotEq
+        let out = lex_all("⋈ ∪ ∩ ∖ ¬ ⋉ ▷ ≤ ⊆ ≥ ⊇ ⊂ ⊃ ≠");
         let kinds: Vec<_> = out
             .tokens
             .iter()
@@ -889,8 +889,27 @@ mod tests {
             .collect();
         assert_eq!(
             kinds,
-            vec![Ident, Ident, Ident, Ident, Ident, LtEq, LtEq, GtEq, GtEq, Lt, Gt, NotEq, Eof]
+            vec![
+                Ident, Ident, Ident, Ident, Ident, Ident, Ident, LtEq, LtEq, GtEq, GtEq, Lt, Gt,
+                NotEq, Eof
+            ]
         );
+        assert!(out.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn semijoin_glyphs_preserve_lexeme() {
+        // ⋉ (matching) and ▷ (not matching) lex as Ident, keeping the glyph
+        // as the lexeme so the parser resolves them at the recognition site.
+        let src = "⋉ ▷";
+        let out = lex_all(src);
+        let idents: Vec<_> = out
+            .tokens
+            .iter()
+            .filter(|t| t.kind == TokenKind::Ident)
+            .map(|t| &src[t.span.start as usize..t.span.end as usize])
+            .collect();
+        assert_eq!(idents, vec!["⋉", "▷"]);
         assert!(out.diagnostics.is_empty());
     }
 

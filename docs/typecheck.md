@@ -760,7 +760,7 @@ check script enforces that.
 | T0033 | relational-assignment target is not an assignable (private) relvar (not a relvar name, or a read-only public relvar) |
 | T0034 | relational-assignment RHS does not match the target relvar's heading |
 | T0035 | `join`/`compose` operands share no attribute (disjoint headings) — suggest `times` |
-| T0036 | `join`/`compose` shared attribute has different types on each side |
+| T0036 | `join`/`compose`/`matching`/`not matching` shared attribute has different types on each side |
 | T0037 | `times` operands share an attribute (overlapping headings) — suggest `join` |
 | T0038 | `union`/`intersect`/`minus` operands must have identical headings |
 | T0039 | `join` operands have identical headings (the join is a set intersection) — suggest `intersect` |
@@ -818,3 +818,5 @@ check script enforces that.
 | T0091 | a possrep-scalar declaration `type Name { … }` has other than exactly one component — multi-component possreps are not yet supported (single-component tier) |
 | T0092 | a call names an operator exported by **more than one** imported userspace module (ambiguous import) — define a local `oper` of that name to disambiguate |
 | T0093 | a `return` sits lexically inside a `transaction [...]` — its early exit would skip the transaction's commit, so it is rejected until real BEGIN/COMMIT lands (hoist the `return` out of the transaction, or restructure) |
+| T0094 | `matching` / `not matching` operands have **identical** headings — the semijoin/antijoin matches on every attribute, which is a set intersection / difference; suggests `intersect` (matching) / `minus` (not matching) |
+| T0095 | `matching` / `not matching` operands are **disjoint** (share no attribute) — a semijoin has no key to match on and degenerates to an existence guard on the left operand; rejected (like `join`/`compose`, the operands must partially overlap) |

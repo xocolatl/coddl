@@ -50,7 +50,7 @@ This doc describes the **target** RelIR. The code implements a thin slice of it;
 **Designed, not yet built**
 
 - The remaining **A-core nodes** (`AND`, `OR`, `NOT`, `TCLOSE`) and the **sugar → A-core desugaring**. The four nodes above are consumed as-is; nothing is rewritten into A-core form yet. (`REMOVE` and `RENAME` already exist, as `Project` and `Rename`.)
-- The rest of the **sugar layer**: `Intersect`, `Compose`, `SemiJoin`, `SemiMinus`, `Summarize`, `Group`, `Ungroup`. (`Join`/`Union`/`Minus`/`Extend`/`Rename`/`Wrap`/`Unwrap` are built — the last two as `RelExpr::Wrap`/`Unwrap`, lowering to `Inst::Restructure` → `coddl_relation_restructure`, in-process; SQL push deferred.)
+- The rest of the **sugar layer**: `Summarize`, `Group`, `Ungroup`. (`Join`/`Union`/`Minus`/`Intersect`/`Compose`/`Extend`/`Rename`/`Wrap`/`Unwrap`/`Semijoin` are built. `Wrap`/`Unwrap` lower to `Inst::Restructure` → `coddl_relation_restructure`, in-process, SQL push deferred. `Semijoin { lhs, rhs, negated }` is the one node covering both surface `matching` (semijoin) and `not matching` (antijoin) — see the Sugar layer section below.)
 - The **optimizer** and **cost model**, the `MaterializeAtBoundary` node, and mixed-origin handling beyond the `StorageOrigin::Mixed` flag.
 - The per-node **FD set** and **constraint set** (only heading, origin, and leaf keys exist today).
 - `coddl-execlocal` (an empty stub) as the RelIR→ProcIR consumer, and the runtime RelIR interpreter (the dynamic path).
@@ -90,7 +90,9 @@ Over-reducing for SQL specifically is a pessimization: SQL is itself a high-leve
 
 Desugars to A core during the same lowering pass that builds RelIR — sugar does not survive into the optimizer:
 
-`Project`, `Restrict` (surface `where`), `Join`, `Union`, `Minus`, `Intersect`, `Compose`, `SemiJoin`, `SemiMinus`, `Extend`, `Summarize`, `Group`, `Ungroup`, `Wrap`, `Unwrap`.
+`Project`, `Restrict` (surface `where`), `Join`, `Union`, `Minus`, `Intersect`, `Compose`, `Semijoin`, `Extend`, `Summarize`, `Group`, `Ungroup`, `Wrap`, `Unwrap`.
+
+**`Semijoin { lhs, rhs, negated }`** covers surface `matching` (semijoin, `negated: false`) and `not matching` (antijoin, `negated: true`). Algebraically it is `(lhs AND rhs)` projected back onto `lhs`'s heading (semijoin), or `lhs` minus that (antijoin) — but it is kept as an explicit sugar node rather than pre-desugared to `Project(And)`/`Minus` so the SQL emitter can push it as the idiomatic correlated `WHERE [NOT] EXISTS` (no join row-multiplication, no `DISTINCT`/`EXCEPT` dedup — the semijoin SQL a planner recognizes). The result heading is `lhs`'s; the typechecker requires the operands to partially overlap (the same legal domain as `join`/`compose`), so the `EXISTS` correlation on the shared attributes is never empty. In-process it expands to join+project(+minus).
 
 `Compose` lowers to `AND` followed by `REMOVE` of the attributes common to both operands (Manifesto appendix A); it is *not* an A-core primitive.
 
@@ -139,6 +141,7 @@ The storage-origin flag drives the optimizer's central decision: **where each su
 
 What pushes cleanly:
 - Algebra A core (JOIN, AND, OR, AND NOT, project, replace — the `Rename` node).
+- Semijoin / antijoin (surface `matching` / `not matching`) — a root `Semijoin` emits a correlated `WHERE [NOT] EXISTS` (see [sqlemit.md](sqlemit.md)).
 - Plain transitive closure (TCLOSE) — a root `tclose` emits a `WITH RECURSIVE` query (see [sqlemit.md](sqlemit.md)).
 - Aggregation (SUMMARIZE).
 - Restriction predicates whose operators have SQL equivalents (`=`, `<`, `+`, `mod`, etc.).

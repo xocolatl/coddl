@@ -55,6 +55,7 @@ fn fixtures_dir() -> &'static Path {
             ("transaction", TRANSACTION_SRC),
             ("join-times-compose", JOIN_TIMES_COMPOSE_SRC),
             ("union-intersect-minus", UNION_INTERSECT_MINUS_SRC),
+            ("matching-not-matching", MATCHING_NOT_MATCHING_SRC),
             ("transitive-closure", TCLOSE_SRC),
             ("handle-mainless", HANDLE_MAINLESS_SRC),
             ("app-lifecycle", APP_LIFECYCLE_SRC),
@@ -964,6 +965,44 @@ oper main {} [
 
     let morning_only = Morning minus Evening;
     write_relation { rel: morning_only };
+];
+";
+
+// Semijoin (`matching`) / antijoin (`not matching`) over two `private` relvars
+// (in-process path). `Suppliers { sno, sname }` and `Shipments { sno, pno }` share
+// `sno`; suppliers 1 and 2 ship, supplier 3 ships nothing. `matching` keeps the
+// suppliers that ship (deduped to one row per supplier despite S1's two
+// shipments); `not matching` keeps the supplier that ships nothing. The `⋉`/`▷`
+// glyph synonyms recompute the same two relations.
+const MATCHING_NOT_MATCHING_SRC: &str = "\
+program matching_not_matching;
+
+private relvar Suppliers { sno: Integer, sname: Text } key { sno };
+private relvar Shipments { sno: Integer, pno: Integer } key { sno, pno };
+
+oper main {} [
+    Suppliers := Relation {
+        { sno: 1, sname: \"Smith\" },
+        { sno: 2, sname: \"Jones\" },
+        { sno: 3, sname: \"Blake\" },
+    };
+    Shipments := Relation {
+        { sno: 1, pno: 100 },
+        { sno: 1, pno: 200 },
+        { sno: 2, pno: 100 },
+    };
+
+    let suppliers_who_ship = Suppliers matching Shipments;
+    write_relation { rel: suppliers_who_ship };
+
+    let suppliers_who_dont = Suppliers not matching Shipments;
+    write_relation { rel: suppliers_who_dont };
+
+    let via_glyph = Suppliers ⋉ Shipments;
+    write_relation { rel: via_glyph };
+
+    let via_anti_glyph = Suppliers ▷ Shipments;
+    write_relation { rel: via_anti_glyph };
 ];
 ";
 
@@ -3286,6 +3325,84 @@ fn explain_dumps_relir_tree_paired_with_its_sql() {
     }
 }
 
+/// Author a two-public-relvar pushdown program (`Suppliers`, `Shipments`, sharing
+/// `sno`) with its `parts.cddb` / `parts.cdstore` companions into `dir`, for the
+/// semijoin explain test. No SQLite db is seeded — `explain` is compile-time only
+/// (it resolves relvars from the store metadata, never opens the backend file).
+fn write_semijoin_pushdown_fixtures(dir: &Path) -> PathBuf {
+    std::fs::write(
+        dir.join("parts.cddb"),
+        "database parts;\n\
+         base relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         base relvar Shipments { pno: Integer, sno: Integer } key { pno, sno };\n",
+    )
+    .expect("write parts.cddb");
+    std::fs::write(
+        dir.join("parts.cdstore"),
+        "store for parts;\n\
+         backend sqlite { file: \"parts.sqlite\" };\n\
+         relvar Suppliers: table \"suppliers\" { columns: { sno: \"sno\", sname: \"sname\" } };\n\
+         relvar Shipments: table \"shipments\" { columns: { pno: \"pno\", sno: \"sno\" } };\n",
+    )
+    .expect("write parts.cdstore");
+    let cd = dir.join("semijoin.cd");
+    std::fs::write(
+        &cd,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         public relvar Shipments { pno: Integer, sno: Integer } key { pno, sno };\n\
+         oper main {} [\n\
+             let shipping = transaction [ Suppliers matching Shipments ];\n\
+             write_relation { rel: shipping };\n\
+             let idle = transaction [ Suppliers not matching Shipments ];\n\
+             write_relation { rel: idle };\n\
+         ];\n",
+    )
+    .expect("write semijoin.cd");
+    cd
+}
+
+/// A relvar-rooted `matching` / `not matching` pushes to SQL as a correlated
+/// `WHERE [NOT] EXISTS` — not a join + `DISTINCT`/`EXCEPT`. `coddl explain`
+/// (compile-time only) surfaces the `Semijoin`/`Antijoin` RelIR nodes paired with
+/// that SQL, correlated on the shared attribute `sno`.
+#[test]
+fn explain_dumps_semijoin_as_where_exists() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cd = write_semijoin_pushdown_fixtures(tmp.path());
+
+    let out = coddl()
+        .args(["explain"])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl explain {:?} failed: stderr=\n{}",
+        cd,
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for needle in [
+        "Semijoin",
+        "Antijoin",
+        r#"WHERE EXISTS (SELECT 1 FROM"#,
+        r#"WHERE NOT EXISTS (SELECT 1 FROM"#,
+        r#"coddl_l."sno" = coddl_r."sno""#,
+    ] {
+        assert!(
+            stdout.contains(needle),
+            "explain output missing {needle:?}; got:\n{stdout}"
+        );
+    }
+    // The idiomatic semijoin SQL avoids the join+dedup shape entirely.
+    assert!(
+        !stdout.contains("INNER JOIN") && !stdout.contains("EXCEPT"),
+        "semijoin pushed as a join/EXCEPT instead of EXISTS:\n{stdout}"
+    );
+}
+
 /// Compile + run a self-owned relvar-rooted pushdown program on `backend`,
 /// pointing `CODDL_AUDIT_LOG` at a fresh per-run temp file, then assert the
 /// audit log proves the pushdown path ran: the program printed `hello world`,
@@ -3499,6 +3616,105 @@ fn mixed_literal_and_dynamic_param_llvm() {
 #[test]
 fn mixed_literal_and_dynamic_param_cranelift() {
     assert_mixed_literal_and_dynamic_param("cranelift");
+}
+
+// ── semijoin / antijoin SQL pushdown (public relvars against SQLite) ───
+
+/// Seed a two-table `parts` SQLite db (`suppliers`, `shipments`) + its
+/// `.cddb`/`.cdstore` companions, compile and run `program` on `backend`, and
+/// return its stdout. The suppliers 1 and 2 ship; supplier 3 ships nothing. The
+/// suite owns its source. `CODDL_PARTS_FILE` overrides the store's relative path
+/// with the absolute temp-db path (the run's cwd isn't the fixture dir).
+fn run_parts_stdout(backend: &str, program: &str) -> Vec<u8> {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    std::fs::write(
+        dir.join("parts.cddb"),
+        "database parts;\n\
+         base relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         base relvar Shipments { pno: Integer, sno: Integer } key { pno, sno };\n",
+    )
+    .expect("write parts.cddb");
+    std::fs::write(
+        dir.join("parts.cdstore"),
+        "store for parts;\n\
+         backend sqlite { file: \"parts.sqlite\" };\n\
+         relvar Suppliers: table \"suppliers\" { columns: { sno: \"sno\", sname: \"sname\" } };\n\
+         relvar Shipments: table \"shipments\" { columns: { pno: \"pno\", sno: \"sno\" } };\n",
+    )
+    .expect("write parts.cdstore");
+    let db = dir.join("parts.sqlite");
+    let seed = Command::new("sqlite3")
+        .arg(&db)
+        .arg(
+            "CREATE TABLE suppliers (sno INTEGER NOT NULL, sname TEXT NOT NULL, PRIMARY KEY (sno)); \
+             CREATE TABLE shipments (pno INTEGER NOT NULL, sno INTEGER NOT NULL, PRIMARY KEY (pno, sno)); \
+             INSERT INTO suppliers (sno, sname) VALUES (1,'Smith'),(2,'Jones'),(3,'Blake'); \
+             INSERT INTO shipments (pno, sno) VALUES (100,1),(200,1),(100,2);",
+        )
+        .status()
+        .expect("invoke sqlite3");
+    assert!(seed.success(), "parts fixture seed failed");
+
+    let cd = dir.join("sel.cd");
+    std::fs::write(&cd, program).expect("write sel.cd");
+
+    let out = coddl()
+        .env("CODDL_PARTS_FILE", &db)
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl run --backend={backend} {:?} failed: stderr=\n{}",
+        cd,
+        String::from_utf8_lossy(&out.stderr),
+    );
+    out.stdout
+}
+
+/// `Suppliers matching Shipments` / `not matching` pushed to SQL as correlated
+/// `WHERE [NOT] EXISTS` and executed against SQLite: the semijoin returns the
+/// suppliers that ship (1, 2 — deduped despite S1's two shipments), the antijoin
+/// the one that doesn't (3). Exercises the whole path — `Semijoin` RelIR →
+/// EXISTS emission → SQLite execution → `coddl_l.*` result marshalling.
+fn assert_semijoin_pushdown(backend: &str) {
+    let stdout = run_parts_stdout(
+        backend,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         public relvar Shipments { pno: Integer, sno: Integer } key { pno, sno };\n\
+         oper main {} [\n\
+             let shipping = transaction [ Suppliers matching Shipments ];\n\
+             write_relation { rel: shipping };\n\
+             let idle = transaction [ Suppliers not matching Shipments ];\n\
+             write_relation { rel: idle };\n\
+         ];\n",
+    );
+    assert_eq!(
+        tuple_lines(&stdout),
+        sorted_tuples(&[
+            // Suppliers matching Shipments
+            "{sname: \"Smith\", sno: 1}",
+            "{sname: \"Jones\", sno: 2}",
+            // Suppliers not matching Shipments
+            "{sname: \"Blake\", sno: 3}",
+        ]),
+        "backend={backend}"
+    );
+}
+
+#[test]
+fn semijoin_pushdown_llvm() {
+    assert_semijoin_pushdown("llvm");
+}
+
+#[test]
+fn semijoin_pushdown_cranelift() {
+    assert_semijoin_pushdown("cranelift");
 }
 
 // ── Boolean `not` (prefix negation) ───────────────────────────────────
@@ -6287,6 +6503,63 @@ fn union_intersect_minus_inprocess_relations_equal_across_backends() {
         tuple_lines(&llvm.stdout),
         tuple_lines(&cranelift.stdout),
         "backends disagree on the union-intersect-minus tuple set"
+    );
+}
+
+/// The in-process twin populates `Suppliers { sno, sname }` and `Shipments { sno,
+/// pno }` (sharing `sno`), then dumps `Suppliers matching Shipments` (the suppliers
+/// that ship — 1, 2), `Suppliers not matching Shipments` (the one that doesn't — 3),
+/// and the `⋉`/`▷` glyph twins (identical relations). The semijoin dedups S1's two
+/// shipments to a single supplier row. Tuple order is unspecified (RM Pro 1), so the
+/// test compares the multiset of lines (each glyph twin repeats its word-form set).
+const MATCHING_NOT_MATCHING_TUPLES: &[&str] = &[
+    // Suppliers matching Shipments
+    "{sname: \"Smith\", sno: 1}",
+    "{sname: \"Jones\", sno: 2}",
+    // Suppliers not matching Shipments
+    "{sname: \"Blake\", sno: 3}",
+    // Suppliers ⋉ Shipments (same as matching)
+    "{sname: \"Smith\", sno: 1}",
+    "{sname: \"Jones\", sno: 2}",
+    // Suppliers ▷ Shipments (same as not matching)
+    "{sname: \"Blake\", sno: 3}",
+];
+
+#[test]
+fn matching_not_matching_inprocess_llvm_dumps_semijoins() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=llvm"])
+        .arg(fixture_path("matching-not-matching"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "matching-not-matching LLVM failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        tuple_lines(&out.stdout),
+        sorted_tuples(MATCHING_NOT_MATCHING_TUPLES)
+    );
+}
+
+#[test]
+fn matching_not_matching_inprocess_cranelift_dumps_semijoins() {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", "--backend=cranelift"])
+        .arg(fixture_path("matching-not-matching"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "matching-not-matching Cranelift failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        tuple_lines(&out.stdout),
+        sorted_tuples(MATCHING_NOT_MATCHING_TUPLES)
     );
 }
 

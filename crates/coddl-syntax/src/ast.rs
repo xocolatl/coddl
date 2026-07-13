@@ -1038,6 +1038,15 @@ pub enum BinaryOp {
     Intersect,
     Union,
     Minus,
+    /// Semijoin (surface `matching` / `⋉`) — the left-operand tuples that have
+    /// a match in the right operand on the shared attributes (`(r join s){r}`).
+    /// Result heading = the left operand's. Typed like `join`/`compose`
+    /// (partial overlap required).
+    Matching,
+    /// Antijoin / semiminus (surface `not matching` / `▷`) — the left-operand
+    /// tuples with **no** match in the right operand (`r minus (r matching s)`).
+    /// Result heading = the left operand's. Same heading discipline as `Matching`.
+    NotMatching,
     /// Scalar arithmetic: `Integer × Integer → Integer`. The symbolic `-`
     /// (token `MINUS`) is `Sub`, distinct from the relational `minus`
     /// keyword (`Minus`).
@@ -1101,14 +1110,22 @@ impl BinaryExpr {
                                 | "intersect"
                                 | "union"
                                 | "minus"
+                                | "matching"
                                 | "div"
                                 // Unicode glyph synonyms (lexed as IDENT).
                                 | "⋈"
                                 | "∪"
                                 | "∩"
                                 | "∖"
+                                | "⋉"
+                                | "▷"
                         ) =>
                     {
+                        // `not` is deliberately *not* recognized here: for the
+                        // two-word `not matching`, the loop skips the leading
+                        // `not` IDENT and returns the `matching` token;
+                        // `op_kind` then spots the sibling `not` to pick
+                        // `NotMatching`. The `▷` glyph is a one-token synonym.
                         return Some(tok);
                     }
                     _ => {}
@@ -1144,11 +1161,28 @@ impl BinaryExpr {
                 "intersect" | "∩" => BinaryOp::Intersect,
                 "union" | "∪" => BinaryOp::Union,
                 "minus" | "∖" => BinaryOp::Minus,
+                // `matching` (and its `⋉` glyph) is the semijoin; the two-word
+                // `not matching` prefixes a sibling `not` IDENT, which promotes
+                // it to the antijoin. `▷` is the one-token antijoin glyph.
+                "matching" | "⋉" if self.has_not_prefix() => BinaryOp::NotMatching,
+                "matching" | "⋉" => BinaryOp::Matching,
+                "▷" => BinaryOp::NotMatching,
                 "div" => BinaryOp::IntDiv,
                 _ => return None,
             },
             _ => return None,
         })
+    }
+
+    /// True if this binary expression's operator is prefixed by a `not` IDENT —
+    /// the two-word `not matching` (antijoin) spelling. A bare `not` operator
+    /// token is a direct child of the `BINARY_EXPR` only for `not matching`
+    /// (unary `not` is its own node), so its presence is unambiguous.
+    fn has_not_prefix(&self) -> bool {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .any(|tok| tok.kind() == SyntaxKind::IDENT && tok.text() == "not")
     }
 }
 

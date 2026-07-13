@@ -1341,9 +1341,16 @@ impl<'a> Parser<'a> {
             }
             self.start_node_at(cp, SyntaxKind::BINARY_EXPR);
             self.bump_trivia();
-            self.bump(); // operator token or keyword IDENT
+            // The two-word `not matching` antijoin bumps both operator tokens;
+            // every other infix op (incl. the `⋉`/`▷` glyphs) is a single token.
+            let two_word = self.at_keyword("not") && self.nth_at_keyword(1, "matching");
+            self.bump(); // operator token or keyword IDENT (`not` for `not matching`)
                          // Missing-rhs (e.g. `1 = ;`) surfaces as P0014 from the
                          // inner `parse_primary_expr` — no dedicated code needed.
+            if two_word {
+                self.bump_trivia();
+                self.bump(); // the `matching` token of `not matching`
+            }
             self.parse_expr_prec(prec + 1, allow_brace_call);
             self.finish_node();
         }
@@ -1383,6 +1390,14 @@ impl<'a> Parser<'a> {
             SyntaxKind::IDENT if self.at_keyword("intersect") || self.at_keyword("∩") => Some(0),
             SyntaxKind::IDENT if self.at_keyword("union") || self.at_keyword("∪") => Some(0),
             SyntaxKind::IDENT if self.at_keyword("minus") || self.at_keyword("∖") => Some(0),
+            // Semijoin `matching`/`⋉` and antijoin `▷` are single-token infix
+            // ops; the two-word `not matching` is recognized by a two-token
+            // peek (`not` then `matching`) and bumps both tokens in the loop.
+            SyntaxKind::IDENT if self.at_keyword("matching") || self.at_keyword("⋉") => Some(0),
+            SyntaxKind::IDENT if self.at_keyword("▷") => Some(0),
+            SyntaxKind::IDENT if self.at_keyword("not") && self.nth_at_keyword(1, "matching") => {
+                Some(0)
+            }
             _ => None,
         }
     }
@@ -2208,6 +2223,8 @@ mod tests {
             ("∪", BinaryOp::Union),
             ("∩", BinaryOp::Intersect),
             ("∖", BinaryOp::Minus),
+            ("⋉", BinaryOp::Matching),
+            ("▷", BinaryOp::NotMatching),
         ] {
             let src = format!("program p; oper main {{}} [ let x = r {glyph} s; ];");
             let out = parse_str(&src);
@@ -3378,6 +3395,53 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["R".to_string(), "S".to_string()]);
         assert!(bin.text().to_string().contains("minus"));
+    }
+
+    #[test]
+    fn matching_infix_parses() {
+        use crate::ast::AstNode;
+        let out = parse_str("oper main {} [ R matching S ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let bin = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .and_then(<crate::ast::BinaryExpr as crate::ast::AstNode>::cast)
+            .expect("BINARY_EXPR for `R matching S`");
+        let names: Vec<_> = bin
+            .syntax()
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::NAME_REF)
+            .map(|n| n.text().to_string())
+            .collect();
+        assert_eq!(names, vec!["R".to_string(), "S".to_string()]);
+        assert_eq!(bin.op_kind(), Some(crate::ast::BinaryOp::Matching));
+    }
+
+    #[test]
+    fn not_matching_infix_parses() {
+        use crate::ast::AstNode;
+        // The two-word `not matching` bumps both operator tokens and resolves
+        // to `NotMatching` (not `Matching`) via the sibling-`not` check.
+        let out = parse_str("oper main {} [ R not matching S ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let bin = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .and_then(<crate::ast::BinaryExpr as crate::ast::AstNode>::cast)
+            .expect("BINARY_EXPR for `R not matching S`");
+        let names: Vec<_> = bin
+            .syntax()
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::NAME_REF)
+            .map(|n| n.text().to_string())
+            .collect();
+        assert_eq!(names, vec!["R".to_string(), "S".to_string()]);
+        assert_eq!(bin.op_kind(), Some(crate::ast::BinaryOp::NotMatching));
+        // Both `not` and `matching` are captured as operator tokens, so the
+        // node text round-trips the two-word spelling.
+        assert!(bin.syntax().text().to_string().contains("not matching"));
     }
 
     #[test]

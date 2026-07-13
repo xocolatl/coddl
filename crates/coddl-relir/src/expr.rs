@@ -119,6 +119,22 @@ pub enum RelExpr {
         lhs: Box<RelExpr>,
         rhs: Box<RelExpr>,
     },
+    /// Semijoin (surface `matching`, `negated == false`) / antijoin (surface `not
+    /// matching`, `negated == true`) — filter `lhs` to the tuples that have
+    /// (semijoin) / lack (antijoin) a match in `rhs` on the shared attributes.
+    /// The result is a subset of `lhs`, so its heading is `lhs`'s. A **sugar
+    /// node**: in Algebra A this is `(lhs AND rhs)` projected back onto `lhs`
+    /// (semijoin) or `lhs` minus that (antijoin), but keeping it explicit lets
+    /// the SQL emitter push it as the idiomatic `WHERE [NOT] EXISTS` correlated
+    /// subquery (no join row-multiplication, no `DISTINCT`/`EXCEPT`) instead of
+    /// reconstructing the semijoin from an `And`+`Project`. In-process it expands
+    /// to join+project(+minus). Origin combines like the other binary nodes: both
+    /// relvar-rooted → pushes; both materialized → in-process; mixed → boundary.
+    Semijoin {
+        lhs: Box<RelExpr>,
+        rhs: Box<RelExpr>,
+        negated: bool,
+    },
     /// Transitive closure (surface `tclose`) — the Algebra-A `◄TCLOSE►` core,
     /// the one genuinely irreducible operator (transitive closure is not
     /// first-order expressible, so it cannot be built from finite AND/OR/NOT
@@ -408,6 +424,8 @@ impl RelExpr {
             RelExpr::Or { lhs, .. } => lhs.heading(),
             // The result is a subset of `lhs`, so its heading is `lhs`'s.
             RelExpr::Minus { lhs, .. } => lhs.heading(),
+            // Semijoin/antijoin filter `lhs`, so the result heading is `lhs`'s.
+            RelExpr::Semijoin { lhs, .. } => lhs.heading(),
             // Closure preserves the (binary) operand heading.
             RelExpr::TClose { input } => input.heading(),
             // Input attributes plus each computed `(name, type)`; `Heading::new`
@@ -479,6 +497,7 @@ impl RelExpr {
             RelExpr::And { lhs, rhs } => combine_origin(lhs.origin(), rhs.origin()),
             RelExpr::Or { lhs, rhs } => combine_origin(lhs.origin(), rhs.origin()),
             RelExpr::Minus { lhs, rhs } => combine_origin(lhs.origin(), rhs.origin()),
+            RelExpr::Semijoin { lhs, rhs, .. } => combine_origin(lhs.origin(), rhs.origin()),
             // A unary node inherits its input's origin (like Restrict/Project).
             // Note v1 has no `tclose` SQL emission, so a relvar-rooted closure
             // still declines the push (sqlemit errs) and runs in-process — the
@@ -560,6 +579,15 @@ impl RelExpr {
                 lhs.render_into(out, depth + 1);
                 rhs.render_into(out, depth + 1);
             }
+            RelExpr::Semijoin { lhs, rhs, negated } => {
+                let _ = writeln!(
+                    out,
+                    "{pad}{}",
+                    if *negated { "Antijoin" } else { "Semijoin" }
+                );
+                lhs.render_into(out, depth + 1);
+                rhs.render_into(out, depth + 1);
+            }
             RelExpr::TClose { input } => {
                 let _ = writeln!(out, "{pad}TClose");
                 input.render_into(out, depth + 1);
@@ -626,6 +654,10 @@ impl RelExpr {
             // Conservative: `minus` preserves `lhs`'s keys (the result is a
             // subset of `lhs`), but lhs-key preservation is deferred.
             RelExpr::Minus { .. } => Vec::new(),
+            // Semijoin/antijoin filter `lhs` without changing its heading, so
+            // every `lhs` candidate key still uniquely identifies a result tuple
+            // — the result is already a set, no `DISTINCT` needed.
+            RelExpr::Semijoin { lhs, .. } => lhs.surviving_keys(),
             // Closure introduces new tuples, so the operand's keys need not
             // survive; conservatively keyless.
             RelExpr::TClose { .. } => Vec::new(),
@@ -671,6 +703,8 @@ impl RelExpr {
             RelExpr::And { .. } => false,
             RelExpr::Or { .. } => false,
             RelExpr::Minus { .. } => false,
+            // A subset of `lhs`: if `lhs` has ≤ 1 tuple, so does the filtered result.
+            RelExpr::Semijoin { lhs, .. } => lhs.card_le_one(),
             RelExpr::TClose { .. } => false,
             // Extend is cardinality-preserving (one input tuple → one output).
             RelExpr::Extend { input, .. } => input.card_le_one(),
@@ -707,7 +741,10 @@ impl RelExpr {
             | RelExpr::TClose { input }
             | RelExpr::Wrap { input, .. }
             | RelExpr::Unwrap { input, .. } => input.references_table(table),
-            RelExpr::And { lhs, rhs } | RelExpr::Or { lhs, rhs } | RelExpr::Minus { lhs, rhs } => {
+            RelExpr::And { lhs, rhs }
+            | RelExpr::Or { lhs, rhs }
+            | RelExpr::Minus { lhs, rhs }
+            | RelExpr::Semijoin { lhs, rhs, .. } => {
                 lhs.references_table(table) || rhs.references_table(table)
             }
             RelExpr::MaterializedRelvar { .. } => false,
