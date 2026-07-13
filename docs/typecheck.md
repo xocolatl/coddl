@@ -68,7 +68,7 @@ Relations can be bound to variables, passed to and returned from operators, stor
 
 ## The bottom type `Never`
 
-`Never` is the **bottom type**: the type of an expression or block that never yields a value because control leaves it first. Today the only producer is an early **`return`** — a block whose control flow ends in a `return` (or whose tail is itself `Never`, e.g. an `if` both of whose arms return) has type `Never`.
+`Never` is the **bottom type**: the type of an expression or block that never yields a value because control leaves it first. The producer is an early **`return`**. A block has type `Never` when **any statement diverges** — a bare `return`, or a statement-position `if/else` both of whose arms return (its own type is `Never`) — or when its **tail** is itself `Never` (e.g. a tail `if` both of whose arms return). Everything after a divergent statement is dead code; the block can't fall through to a value.
 
 `Never` is **assignable to every type** (a diverging path can stand in wherever any value is expected) and **unifies as the identity** (`Never` with `T` yields `T`). This is what lets a `return`-only `if` arm agree with its value-producing sibling instead of tripping `T0068`, and a guard clause `if bad then [ return … ]` (no `else`) not trip `T0069`. An operator body that always returns is thus `Never`, which is assignable to any declared return type.
 
@@ -394,10 +394,13 @@ each `parse_<x>` has a corresponding `check_<x>`.
   of binding maps — outermost is the operator parameter layer; each
   `transaction [...]` block pushes a layer on entry and pops on
   exit. Lookups walk innermost-first so inner bindings shadow
-  outer ones. A block whose control flow leaves via a `return` (a
-  top-level `return` statement, or a tail whose own type is `Never`)
-  has type **`Never`** — it never falls through to a value (see
-  "The bottom type `Never`" below).
+  outer ones. A block whose control flow leaves via a `return` — any
+  statement whose type is `Never` (a bare `return`, or a
+  statement-position `if/else` both of whose arms return), or a tail
+  whose own type is `Never` — has type **`Never`**: it never falls
+  through to a value (see "The bottom type `Never`" below). The
+  per-statement type comes from `check_stmt`, which returns `Never`
+  for a `return` and the expression's type for an expression-statement.
 - **`check_if_expr`** — `if <cond> then [ … ] else [ … ]`. The
   condition must be `Boolean` (`T0067`). Each arm is a `check_block`
   in its own pushed scope (like a `transaction` body, but without the

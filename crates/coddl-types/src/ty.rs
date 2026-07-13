@@ -167,9 +167,10 @@ pub enum Type {
     /// errors.
     Unknown,
     /// The **bottom** type: the type of an expression or block that never
-    /// yields a value because control leaves it first — today only a block
-    /// whose control flow ends in a `return`, or an `if` both of whose arms
-    /// diverge. `Never` is assignable to *every* type (a diverging path can
+    /// yields a value because control leaves it first — a block containing a
+    /// statement that diverges (a bare `return`, or a statement-position
+    /// `if/else` both of whose arms return) or whose tail itself diverges.
+    /// `Never` is assignable to *every* type (a diverging path can
     /// stand in wherever any value is expected) and unifies as the identity
     /// (`Never` with `T` is `T`), so a `return`-only `if` arm agrees with its
     /// value-producing sibling. It is **unspellable** — absent from

@@ -3583,6 +3583,46 @@ fn not_pushdown_cranelift() {
     assert_not_pushdown("cranelift");
 }
 
+// ── all-early-return operator body (divergence) ───────────────────────
+
+/// An operator whose body exits every path via an explicit `return`, ending in
+/// a statement-position `if/else` both of whose arms return (no tail
+/// expression), typechecks (the fall-through is recognized as unreachable, so
+/// no implicit `Tuple {}`), lowers (the lowerer's `diverged` path — no bogus
+/// trailing return), and runs. Calling it with each branch prints the matching
+/// string. This is the wiki `handle` router shape.
+fn assert_all_early_return_body(backend: &str) {
+    let stdout = run_greetings_stdout(
+        backend,
+        "program p;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper pick { n: Integer } -> Text [\n\
+             if n = 0 then [ return \"zero\"; ] else [ return \"nonzero\"; ];\n\
+         ];\n\
+         oper main {} [\n\
+             write_line { message: pick { n: 0 } };\n\
+             write_line { message: pick { n: 1 } };\n\
+         ];\n",
+    );
+    assert_eq!(
+        stdout,
+        b"zero\nnonzero\n",
+        "backend={backend}: got {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+}
+
+#[test]
+fn all_early_return_body_llvm() {
+    assert_all_early_return_body("llvm");
+}
+
+#[test]
+fn all_early_return_body_cranelift() {
+    assert_all_early_return_body("cranelift");
+}
+
 // ── surgical writes (relational assignment → DML) ─────────────────────
 
 /// Seed a fresh two-row `greetings` db + its `.cddb`/`.cdstore` companions,

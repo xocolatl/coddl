@@ -1610,21 +1610,62 @@ impl TypeChecker {
         self.resolve_type_name(&name_tok)
     }
 
-    fn check_stmt(&mut self, stmt: &Stmt, scope: &mut Scope) {
+    /// Check one statement and return its type — `Type::unit()` for the
+    /// value-less statements, the expression's type for a bare `ExprStmt`
+    /// (so a statement-position `if/else` both of whose arms `return`
+    /// surfaces as `Never`), and `Type::Never` for `return` (it diverges).
+    /// `check_block` uses this to decide whether the block falls through.
+    fn check_stmt(&mut self, stmt: &Stmt, scope: &mut Scope) -> Type {
         match stmt {
-            Stmt::Let(l) => self.check_let_stmt(l, scope),
-            Stmt::Var(v) => self.check_var_stmt(v, scope),
-            Stmt::Assign(a) => self.check_assignment_stmt(a, scope),
-            Stmt::Truncate(t) => self.check_truncate_stmt(t, scope),
-            Stmt::Delete(d) => self.check_delete_stmt(d, scope),
-            Stmt::Insert(i) => self.check_insert_stmt(i, scope),
-            Stmt::Update(u) => self.check_update_stmt(u, scope),
+            Stmt::Let(l) => {
+                self.check_let_stmt(l, scope);
+                Type::unit()
+            }
+            Stmt::Var(v) => {
+                self.check_var_stmt(v, scope);
+                Type::unit()
+            }
+            Stmt::Assign(a) => {
+                self.check_assignment_stmt(a, scope);
+                Type::unit()
+            }
+            Stmt::Truncate(t) => {
+                self.check_truncate_stmt(t, scope);
+                Type::unit()
+            }
+            Stmt::Delete(d) => {
+                self.check_delete_stmt(d, scope);
+                Type::unit()
+            }
+            Stmt::Insert(i) => {
+                self.check_insert_stmt(i, scope);
+                Type::unit()
+            }
+            Stmt::Update(u) => {
+                self.check_update_stmt(u, scope);
+                Type::unit()
+            }
             Stmt::ExprStmt(e) => self.check_expr_stmt(e, scope),
-            Stmt::For(f) => self.check_for_stmt(f, scope),
-            Stmt::While(w) => self.check_while_stmt(w, scope),
-            Stmt::DoWhile(d) => self.check_do_while_stmt(d, scope),
-            Stmt::Load(l) => self.check_load_stmt(l, scope),
-            Stmt::Return(r) => self.check_return_stmt(r, scope),
+            Stmt::For(f) => {
+                self.check_for_stmt(f, scope);
+                Type::unit()
+            }
+            Stmt::While(w) => {
+                self.check_while_stmt(w, scope);
+                Type::unit()
+            }
+            Stmt::DoWhile(d) => {
+                self.check_do_while_stmt(d, scope);
+                Type::unit()
+            }
+            Stmt::Load(l) => {
+                self.check_load_stmt(l, scope);
+                Type::unit()
+            }
+            Stmt::Return(r) => {
+                self.check_return_stmt(r, scope);
+                Type::Never
+            }
         }
     }
 
@@ -1670,20 +1711,23 @@ impl TypeChecker {
     fn check_block(&mut self, block: &Block, scope: &mut Scope) -> Type {
         let mut diverges = false;
         for stmt in block.statements() {
-            self.check_stmt(&stmt, scope);
-            if matches!(stmt, Stmt::Return(_)) {
+            // A statement whose own type is `Never` diverges — a bare
+            // `return`, or a statement-position `if/else` both of whose arms
+            // return. Everything after it is dead code (still walked for
+            // diagnostics), and the block can't fall through.
+            if self.check_stmt(&stmt, scope) == Type::Never {
                 diverges = true;
             }
         }
         // The tail is still walked for diagnostics even when a preceding
-        // `return` made it dead code.
+        // divergent statement made it dead code.
         let tail_ty = match block.tail_expr() {
             Some(expr) => self.check_expr(&expr, scope),
             None => Type::unit(),
         };
-        // A block whose control flow leaves via `return` (or whose tail itself
-        // diverges — e.g. an `if` both of whose arms return) is `Never`: it
-        // never falls through to a value, so it unifies with any sibling.
+        // A block that diverges (a statement or the tail leaves via `return`)
+        // is `Never`: it never falls through to a value, so it unifies with
+        // any sibling and satisfies any declared return type.
         if diverges || tail_ty == Type::Never {
             Type::Never
         } else {
@@ -2687,9 +2731,14 @@ impl TypeChecker {
         }
     }
 
-    fn check_expr_stmt(&mut self, stmt: &ExprStmt, scope: &mut Scope) {
-        if let Some(expr) = stmt.expr() {
-            let _ = self.check_expr(&expr, scope); // result discarded
+    /// An expression in statement position. Its value is discarded *unless*
+    /// this is the block's tail — but its type still flows back to
+    /// `check_stmt`, so a divergent expression (a statement-position
+    /// `if/else` both of whose arms `return`) can make the block diverge.
+    fn check_expr_stmt(&mut self, stmt: &ExprStmt, scope: &mut Scope) -> Type {
+        match stmt.expr() {
+            Some(expr) => self.check_expr(&expr, scope),
+            None => Type::unit(),
         }
     }
 
@@ -3770,8 +3819,8 @@ impl TypeChecker {
     fn check_block_expected(&mut self, block: &Block, scope: &mut Scope, expected: &Type) -> Type {
         let mut diverges = false;
         for stmt in block.statements() {
-            self.check_stmt(&stmt, scope);
-            if matches!(stmt, Stmt::Return(_)) {
+            // See [`Self::check_block`]: any statement typed `Never` diverges.
+            if self.check_stmt(&stmt, scope) == Type::Never {
                 diverges = true;
             }
         }
@@ -3779,8 +3828,8 @@ impl TypeChecker {
             Some(expr) => self.check_expr_expected(&expr, scope, expected),
             None => Type::unit(),
         };
-        // See [`Self::check_block`]: a `return`-terminated (or divergent-tail)
-        // block has bottom type `Never`.
+        // See [`Self::check_block`]: a block that diverges (a statement or the
+        // tail leaves via `return`) has bottom type `Never`.
         if diverges || tail_ty == Type::Never {
             Type::Never
         } else {
@@ -6530,6 +6579,39 @@ mod tests {
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "expected clean, got {diags:?}");
         assert!(!codes(src).contains(&"T0069"), "unexpected T0069");
+    }
+
+    #[test]
+    fn terminal_if_else_both_return_is_never_no_t0009() {
+        // A body that exits every path via `return`, ending in a
+        // statement-position `if/else` both of whose arms return (no tail
+        // expression), diverges — the fall-through is unreachable, so there is
+        // no implicit `Tuple {}` and no T0009. The wiki `handle` shape, minimized.
+        let src = "oper f { n: Integer } -> Text [ \
+                   if n = 0 then [ return \"a\"; ] else [ return \"b\"; ]; ]; \
+                   oper main {} [];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected clean, got {diags:?}");
+        assert!(
+            !codes(src).contains(&"T0009"),
+            "unexpected T0009: {:?}",
+            codes(src)
+        );
+    }
+
+    #[test]
+    fn then_only_guard_without_tail_still_t0009() {
+        // A *then-only* guard can fall through (the false path continues), so a
+        // body that is just a guard with no tail really can reach the implicit
+        // `Tuple {}` — T0009 must still fire against the declared `Text` return.
+        // Confirms the divergence rule wasn't over-broadened to then-only ifs.
+        let src = "oper f { n: Integer } -> Text [ if n = 0 then [ return \"a\"; ]; ]; \
+                   oper main {} [];";
+        assert!(
+            codes(src).contains(&"T0009"),
+            "expected T0009, got {:?}",
+            codes(src)
+        );
     }
 
     #[test]
