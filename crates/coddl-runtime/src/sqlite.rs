@@ -77,14 +77,17 @@ fn database_registry() -> &'static Mutex<HashMap<String, DbEntry>> {
 }
 
 /// One registered query plan: the SQL text codegen baked from RelIR, the
-/// logical database it targets, the number of bind parameters, and a pointer
-/// to the result heading descriptor (stored as `usize` so the map stays
-/// `Send + Sync` — the descriptor is a codegen-emitted static, valid for the
-/// program's life, same discipline as [`relvar_slots`]).
+/// logical database it targets, the number of scalar bind parameters, the
+/// arity of each relation-valued parameter (one per `__CODDL_REL_<slot>__`
+/// marker in the text, in slot order), and a pointer to the result heading
+/// descriptor (stored as `usize` so the map stays `Send + Sync` — the
+/// descriptor is a codegen-emitted static, valid for the program's life, same
+/// discipline as [`relvar_slots`]).
 struct PlanEntry {
     db_name: String,
     sql: String,
     param_count: u32,
+    rel_arities: Vec<u32>,
     desc: usize,
 }
 
@@ -109,6 +112,20 @@ pub struct CoddlParam {
     pub ptr: *const u8,
     pub len: usize,
     pub kind: u32,
+}
+
+/// A **relation-valued** bind parameter crossing the FFI boundary into
+/// [`coddl_query`]: an in-memory relation payload plus its static heading
+/// descriptor (the same `(src, desc)` pair [`coddl_exec_insert`] takes). The
+/// runtime expands the plan's matching `__CODDL_REL_<slot>__` marker with the
+/// relation's rows — a `(VALUES …)` table primary whose cells bind numbered
+/// after the plan's scalar parameters, or a typed zero-row `SELECT` when the
+/// relation is empty. `#[repr(C)]`: two pointers, no padding; codegen mirrors
+/// this layout when it builds the array.
+#[repr(C)]
+pub struct CoddlRelParam {
+    pub src: *const u8,
+    pub desc: *const CoddlHeadingDesc,
 }
 
 /// Resolve an operational field's value: env var if set, else the
@@ -768,16 +785,18 @@ pub unsafe extern "C" fn coddl_register_database(
     CoddlStatus::Ok
 }
 
-/// Register a static query plan: the SQL codegen baked from a relvar-rooted
-/// RelIR subtree, the logical database it runs against, its bind-parameter
-/// count, and the result heading descriptor. Called once per plan in the
-/// program prologue. Aborts on a null descriptor or a duplicate `plan_id`
-/// (static plan ids are unique by construction — a collision is a codegen bug).
+/// Register a static query plan: the SQL codegen baked from a RelIR subtree,
+/// the logical database it runs against, its scalar bind-parameter count, the
+/// arities of its relation-valued parameters (`rel_arities` points at
+/// `n_rels` `u32`s, in slot order; null when `n_rels == 0`), and the result
+/// heading descriptor. Called once per plan in the program prologue. Aborts
+/// on a null descriptor or a duplicate `plan_id` (static plan ids are unique
+/// by construction — a collision is a codegen bug).
 ///
 /// # Safety
 /// `result_desc` must point to a heading descriptor that lives for the
 /// program's lifetime (a codegen-emitted static). The (ptr, len) pairs must
-/// describe valid UTF-8.
+/// describe valid UTF-8; `rel_arities` must be valid for `n_rels` reads.
 #[no_mangle]
 pub unsafe extern "C" fn coddl_register_plan(
     plan_id: PlanId,
@@ -786,6 +805,8 @@ pub unsafe extern "C" fn coddl_register_plan(
     sql: *const u8,
     sql_len: usize,
     param_count: u32,
+    rel_arities: *const u32,
+    n_rels: usize,
     result_desc: *const CoddlHeadingDesc,
 ) -> CoddlStatus {
     if result_desc.is_null() {
@@ -797,6 +818,11 @@ pub unsafe extern "C" fn coddl_register_plan(
     }
     let db_name = bytes_to_str("plan database name", db_name, db_name_len);
     let sql = bytes_to_str("plan SQL", sql, sql_len);
+    let rel_arities: Vec<u32> = if rel_arities.is_null() || n_rels == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(rel_arities, n_rels).to_vec()
+    };
     let mut registry = plan_registry().lock().expect("plan registry poisoned");
     if registry.contains_key(&plan_id.0) {
         eprintln!(
@@ -811,6 +837,7 @@ pub unsafe extern "C" fn coddl_register_plan(
             db_name: db_name.to_string(),
             sql: sql.to_string(),
             param_count,
+            rel_arities,
             desc: result_desc as usize,
         },
     );
@@ -823,30 +850,45 @@ pub unsafe extern "C" fn coddl_register_plan(
 /// statement runs now, lazily, at the force point. The result is a transient
 /// handle the caller releases via `coddl_rc_release` (it is *not* a relvar slot).
 ///
+/// `rels` are the plan's **relation-valued** parameters (`n_rels` entries, in
+/// slot order; null when `n_rels == 0`): each slot's `__CODDL_REL_<slot>__`
+/// marker is substituted with a table primary built from the bound relation's
+/// rows — a `(VALUES …)` of numbered groups, or a typed zero-row SELECT when
+/// the relation is empty — and its cells bind after the scalar params
+/// (scalars are `?1..?param_count`; slot cells number onward, in slot order),
+/// so the bind vector is scalars ++ slot cells regardless of where each
+/// marker sits in the text. A read never batch-splits; a statement whose
+/// total binds exceed [`QUERY_BIND_CEILING`] aborts loud.
+///
 /// Runs on a connection minted by [`ensure_connection`], so the audit `trace`
-/// hook captures the statement. Aborts on any hard error (unknown plan
-/// or database, parameter-count or kind mismatch, prepare/step failure, NULL
-/// cell) — these are codegen/schema bugs, and the `*Relation` return type has
-/// no status channel.
+/// hook captures the (expanded) statement. Aborts on any hard error (unknown
+/// plan or database, parameter-count/arity or kind mismatch, prepare/step
+/// failure, NULL cell) — these are codegen/schema bugs, and the `*Relation`
+/// return type has no status channel.
 ///
 /// # Safety
 /// `plan_id` must have been registered by [`coddl_register_plan`]. `params`
-/// must point to `n` valid [`CoddlParam`] values (or be null when `n == 0`).
+/// must point to `n` valid [`CoddlParam`] values (or be null when `n == 0`);
+/// `rels` must point to `n_rels` valid [`CoddlRelParam`] values (or be null
+/// when `n_rels == 0`).
 #[no_mangle]
 pub unsafe extern "C" fn coddl_query(
     plan_id: PlanId,
     params: *const CoddlParam,
     n: usize,
+    rels: *const CoddlRelParam,
+    n_rels: usize,
 ) -> *mut u8 {
     // Look up the plan; clone what we need and drop the registry lock before
     // taking any other lock (no lock-order coupling).
-    let (db_name, sql, param_count, desc_addr) = {
+    let (db_name, sql, param_count, rel_arities, desc_addr) = {
         let registry = plan_registry().lock().expect("plan registry poisoned");
         match registry.get(&plan_id.0) {
             Some(entry) => (
                 entry.db_name.clone(),
                 entry.sql.clone(),
                 entry.param_count,
+                entry.rel_arities.clone(),
                 entry.desc,
             ),
             None => {
@@ -861,6 +903,14 @@ pub unsafe extern "C" fn coddl_query(
         eprintln!(
             "coddl: query: plan {} expects {param_count} param(s), got {n}",
             plan_id.0
+        );
+        std::process::abort();
+    }
+    if n_rels != rel_arities.len() {
+        eprintln!(
+            "coddl: query: plan {} expects {} relation param(s), got {n_rels}",
+            plan_id.0,
+            rel_arities.len()
         );
         std::process::abort();
     }
@@ -893,10 +943,56 @@ pub unsafe extern "C" fn coddl_query(
     } else {
         std::slice::from_raw_parts(params, n)
     };
-    let bindings: Vec<rusqlite::types::Value> = param_slice
+    let mut bindings: Vec<rusqlite::types::Value> = param_slice
         .iter()
         .map(|p| param_to_sqlite(p, plan_id.0))
         .collect();
+
+    // Relation-valued parameters: validate each bound relation's arity
+    // against the plan, substitute its marker with the table primary built
+    // from its rows, and append its cells to the bind vector (scalars first,
+    // then slot cells in slot order — matching the numbered placeholders).
+    let rel_slice: &[CoddlRelParam] = if rels.is_null() || n_rels == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(rels, n_rels)
+    };
+    let mut sql = sql;
+    for (slot, rel) in rel_slice.iter().enumerate() {
+        let arity = if rel.desc.is_null() {
+            0
+        } else {
+            (*rel.desc).attr_count as usize
+        };
+        if arity != rel_arities[slot] as usize {
+            eprintln!(
+                "coddl: query: plan {}: relation param {slot} has arity {arity}, expected {}",
+                plan_id.0, rel_arities[slot]
+            );
+            std::process::abort();
+        }
+        let marker = coddl_sqlemit::rel_param_marker(slot);
+        if !sql.contains(&marker) {
+            eprintln!(
+                "coddl: query: plan {}: marker `{marker}` missing from plan SQL",
+                plan_id.0
+            );
+            std::process::abort();
+        }
+        let (primary, cells) = rel_table_primary(rel, bindings.len(), plan_id.0);
+        sql = sql.replacen(&marker, &primary, 1);
+        bindings.extend(cells);
+    }
+    if bindings.len() > QUERY_BIND_CEILING {
+        eprintln!(
+            "coddl: query: plan {}: {} bind values exceed the {QUERY_BIND_CEILING} ceiling \
+             ({param_count} scalar param(s) + shipped relation rows); a read query is never \
+             batch-split — ship fewer rows or wait for the temp-table escalation",
+            plan_id.0,
+            bindings.len()
+        );
+        std::process::abort();
+    }
 
     let attrs = std::slice::from_raw_parts((*desc).attrs, (*desc).attr_count as usize);
     let record_size = (*desc).record_size as usize;
@@ -1038,17 +1134,197 @@ pub unsafe extern "C" fn coddl_exec(
 /// are sized so `rows × arity` stays below it.
 const INSERT_PARAM_BUDGET: usize = 900;
 
+/// Hard ceiling on a read query's total bind variables (scalars + every
+/// shipped relation's cells). A read is **never batch-split** — splitting a
+/// `(VALUES …)` operand changes the query's meaning for any non-distributive
+/// surrounding shape — so a shipped relation that doesn't fit under SQLite's
+/// historical bind floor fails loud instead (the temp-table escalation is
+/// future work; see docs/sqlemit.md "Relation-valued parameters").
+const QUERY_BIND_CEILING: usize = 999;
+
+/// Decode every row of an in-memory relation payload into owned rusqlite bind
+/// values (row-major), reusing the record layout `coddl_write_relation`
+/// reads. Covers every scalar cell kind: Integer/Boolean/Character as their
+/// 8-byte integer (Character is its codepoint), Approximate as REAL with the
+/// NaN value encoded as SQL NULL (the mirror of [`param_to_sqlite`] /
+/// `marshal_rows`), Rational as canonical `TEXT "n/d"`, Text as owned copied
+/// bytes. A Tuple- or Relation-valued cell aborts — compile-time emission
+/// declines those headings, so reaching one here is a compiler bug. Returns
+/// the empty vector for a null/empty relation.
+///
+/// # Safety
+/// `src`/`desc` must describe a valid relation payload (as for
+/// `coddl_write_relation`), or be null.
+unsafe fn decode_relation_cells(
+    src: *const u8,
+    desc: *const CoddlHeadingDesc,
+    site: &str,
+) -> Vec<rusqlite::types::Value> {
+    use crate::rc::{CoddlRcHeader, HEADER_SIZE};
+    use rusqlite::types::Value;
+
+    if src.is_null() || desc.is_null() {
+        return Vec::new();
+    }
+    let header = src.sub(HEADER_SIZE) as *const CoddlRcHeader;
+    let count = (*header).length as usize;
+    let arity = (*desc).attr_count as usize;
+    if count == 0 || arity == 0 {
+        return Vec::new();
+    }
+    let record_size = (*desc).record_size as usize;
+    let attrs = std::slice::from_raw_parts((*desc).attrs, arity);
+    let payload = std::slice::from_raw_parts(src, count * record_size);
+
+    let mut cells: Vec<Value> = Vec::with_capacity(count * arity);
+    for record_idx in 0..count {
+        let record = &payload[record_idx * record_size..(record_idx + 1) * record_size];
+        for attr in attrs {
+            let offset = attr.offset as usize;
+            if attr.kind == CoddlAttrKind::Integer as u32
+                || attr.kind == CoddlAttrKind::Boolean as u32
+                || attr.kind == CoddlAttrKind::Character as u32
+            {
+                // Character binds as its integer codepoint (SQLite has no
+                // char type); Boolean as the 0/1 it stores.
+                let bytes: [u8; 8] = record[offset..offset + 8].try_into().unwrap();
+                cells.push(Value::Integer(i64::from_ne_bytes(bytes)));
+            } else if attr.kind == CoddlAttrKind::Approximate as u32 {
+                // Canonical IEEE-754 bits; the NaN *value* encodes as SQL
+                // NULL (SQLite can't store NaN) — a value encoding, not a
+                // Coddl null (RM Pro 4 stands).
+                let bytes: [u8; 8] = record[offset..offset + 8].try_into().unwrap();
+                let v = f64::from_bits(u64::from_ne_bytes(bytes));
+                cells.push(if v.is_nan() {
+                    Value::Null
+                } else {
+                    Value::Real(v)
+                });
+            } else if attr.kind == CoddlAttrKind::Rational as u32 {
+                // Reduced `(numer, denom)` pair → canonical `TEXT "n/d"`
+                // (canonical form makes SQL text-`=` value-equality).
+                let n_bytes: [u8; 8] = record[offset..offset + 8].try_into().unwrap();
+                let d_bytes: [u8; 8] = record[offset + 8..offset + 16].try_into().unwrap();
+                cells.push(Value::Text(format!(
+                    "{}/{}",
+                    i64::from_ne_bytes(n_bytes),
+                    i64::from_ne_bytes(d_bytes)
+                )));
+            } else if attr.kind == CoddlAttrKind::Text as u32 {
+                let ptr_bytes: [u8; 8] = record[offset..offset + 8].try_into().unwrap();
+                let len_bytes: [u8; 8] = record[offset + 8..offset + 16].try_into().unwrap();
+                let cptr = usize::from_ne_bytes(ptr_bytes) as *const u8;
+                let len = usize::from_ne_bytes(len_bytes);
+                let s = if cptr.is_null() {
+                    String::new()
+                } else {
+                    match std::str::from_utf8(std::slice::from_raw_parts(cptr, len)) {
+                        Ok(s) => s.to_string(),
+                        Err(err) => {
+                            eprintln!("coddl: {site}: non-UTF-8 Text cell: {err}");
+                            std::process::abort();
+                        }
+                    }
+                };
+                cells.push(Value::Text(s));
+            } else {
+                eprintln!(
+                    "coddl: {site}: cell kind {} has no SQL representation",
+                    attr.kind
+                );
+                std::process::abort();
+            }
+        }
+    }
+    cells
+}
+
+/// Render `n_groups` numbered `(?b+1, ?b+2, …)` VALUES row-groups of `arity`
+/// cells each, numbering from `base + 1`. Numbered placeholders keep every
+/// bind site's index independent of its position in the statement text, so
+/// runtime-expanded groups compose with a plan's compile-time scalar
+/// placeholders (`?1..?param_count`) without renumbering anything.
+fn values_groups(arity: usize, n_groups: usize, base: usize) -> String {
+    let mut idx = base;
+    let mut groups = Vec::with_capacity(n_groups);
+    for _ in 0..n_groups {
+        let cells: Vec<String> = (0..arity)
+            .map(|_| {
+                idx += 1;
+                format!("?{idx}")
+            })
+            .collect();
+        groups.push(format!("({})", cells.join(", ")));
+    }
+    groups.join(", ")
+}
+
+/// The SQL **table primary** substituted for one relation-parameter marker,
+/// plus the decoded cells to bind: a `(VALUES …)` of numbered groups over the
+/// relation's rows (numbering from `base + 1`), or — for an empty relation —
+/// a typed zero-row SELECT naming the same positional `column1…N` columns a
+/// VALUES table exposes. The empty form's dummies are type-shaped literals
+/// (`0` / `0.0` / `'0/1'` / `''`), never returned (`WHERE 0`), and **no NULL
+/// token is ever emitted** (RM Pro 4).
+///
+/// # Safety
+/// `rel` must carry a valid (or null-empty) relation payload + descriptor.
+unsafe fn rel_table_primary(
+    rel: &CoddlRelParam,
+    base: usize,
+    plan_id: u32,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let arity = if rel.desc.is_null() {
+        0
+    } else {
+        (*rel.desc).attr_count as usize
+    };
+    if arity == 0 {
+        // Emission declines nullary relation parameters; a zero-arity
+        // descriptor here is a codegen bug.
+        eprintln!("coddl: query: plan {plan_id}: nullary relation parameter");
+        std::process::abort();
+    }
+    let cells = decode_relation_cells(rel.src, rel.desc, "query");
+    if cells.is_empty() {
+        let attrs = std::slice::from_raw_parts((*rel.desc).attrs, arity);
+        let cols: Vec<String> = attrs
+            .iter()
+            .enumerate()
+            .map(|(i, attr)| {
+                let dummy = if attr.kind == CoddlAttrKind::Approximate as u32 {
+                    "0.0"
+                } else if attr.kind == CoddlAttrKind::Rational as u32 {
+                    "'0/1'"
+                } else if attr.kind == CoddlAttrKind::Text as u32 {
+                    "''"
+                } else {
+                    "0"
+                };
+                format!("{dummy} AS column{}", i + 1)
+            })
+            .collect();
+        return (format!("(SELECT {} WHERE 0)", cols.join(", ")), cells);
+    }
+    let n_groups = cells.len() / arity;
+    (
+        format!("(VALUES {})", values_groups(arity, n_groups, base)),
+        cells,
+    )
+}
+
 /// Insert the rows of an **in-memory** relation `src` into a public relvar,
 /// idempotently, via the registered insert template `plan_id` (an
-/// `INSERT … SELECT … FROM (VALUES <marker>) … WHERE NOT EXISTS (…)`). Mirrors
-/// [`coddl_write_relation`]'s record iteration to decode each row's cells, then
-/// expands the template's [`coddl_sqlemit::INSERT_ROWS_MARKER`] to a batch of
-/// `(?,…)` groups and binds the cells — a bulk multi-row `INSERT`, **no temp
-/// table** (so no catalog churn) and no per-row round-trip. Batched so
-/// `rows × arity` stays under the bind-variable limit; `prepare_cached` reuses
-/// the full-batch statement. Runs inside the current transaction; the
-/// `NOT EXISTS` keeps it idempotent and a key-clash hits the `PRIMARY KEY` (the
-/// Golden Rule). Aborts on prepare/execute failure.
+/// `INSERT … SELECT … FROM __CODDL_REL_0__ … WHERE NOT EXISTS (…)`). Decodes
+/// each row's cells via [`decode_relation_cells`], then expands the
+/// template's slot-0 marker to a `(VALUES …)` of numbered `(?N,…)` groups and
+/// binds the cells — a bulk multi-row `INSERT`, **no temp table** (so no
+/// catalog churn) and no per-row round-trip. Batched so `rows × arity` stays
+/// under the bind-variable limit — safe here because an insert is cumulative,
+/// unlike a read (`coddl_query` never splits); `prepare_cached` reuses the
+/// full-batch statement. Runs inside the current transaction; the
+/// `NOT EXISTS` keeps it idempotent and a key-clash hits the `PRIMARY KEY`
+/// (the Golden Rule). Aborts on prepare/execute failure.
 ///
 /// # Safety
 /// `plan_id` must be a registered insert template. `src`/`desc` must describe a
@@ -1059,9 +1335,6 @@ pub unsafe extern "C" fn coddl_exec_insert(
     src: *const u8,
     desc: *const CoddlHeadingDesc,
 ) -> CoddlStatus {
-    use crate::rc::{CoddlRcHeader, HEADER_SIZE};
-    use rusqlite::types::Value;
-
     let (db_name, template) = {
         let registry = plan_registry().lock().expect("plan registry poisoned");
         match registry.get(&plan_id.0) {
@@ -1077,57 +1350,11 @@ pub unsafe extern "C" fn coddl_exec_insert(
     };
 
     // An empty (or null) relation inserts nothing.
-    if src.is_null() || desc.is_null() {
+    let cells = decode_relation_cells(src, desc, "exec_insert");
+    if cells.is_empty() {
         return CoddlStatus::Ok;
     }
-    let header = src.sub(HEADER_SIZE) as *const CoddlRcHeader;
-    let count = (*header).length as usize;
     let arity = (*desc).attr_count as usize;
-    if count == 0 || arity == 0 {
-        return CoddlStatus::Ok;
-    }
-    let record_size = (*desc).record_size as usize;
-    let attrs = std::slice::from_raw_parts((*desc).attrs, arity);
-    let payload = std::slice::from_raw_parts(src, count * record_size);
-
-    // Decode every row's cells into owned bind values (row-major), reusing the
-    // same record layout `coddl_write_relation` reads.
-    let mut rows: Vec<Value> = Vec::with_capacity(count * arity);
-    for record_idx in 0..count {
-        let record = &payload[record_idx * record_size..(record_idx + 1) * record_size];
-        for attr in attrs {
-            let offset = attr.offset as usize;
-            if attr.kind == CoddlAttrKind::Integer as u32
-                || attr.kind == CoddlAttrKind::Boolean as u32
-            {
-                let bytes: [u8; 8] = record[offset..offset + 8].try_into().unwrap();
-                rows.push(Value::Integer(i64::from_ne_bytes(bytes)));
-            } else if attr.kind == CoddlAttrKind::Text as u32 {
-                let ptr_bytes: [u8; 8] = record[offset..offset + 8].try_into().unwrap();
-                let len_bytes: [u8; 8] = record[offset + 8..offset + 16].try_into().unwrap();
-                let cptr = usize::from_ne_bytes(ptr_bytes) as *const u8;
-                let len = usize::from_ne_bytes(len_bytes);
-                let s = if cptr.is_null() {
-                    String::new()
-                } else {
-                    match std::str::from_utf8(std::slice::from_raw_parts(cptr, len)) {
-                        Ok(s) => s.to_string(),
-                        Err(err) => {
-                            eprintln!("coddl: exec_insert: non-UTF-8 Text cell: {err}");
-                            std::process::abort();
-                        }
-                    }
-                };
-                rows.push(Value::Text(s));
-            } else {
-                eprintln!(
-                    "coddl: exec_insert: unsupported cell kind {} (only Integer/Boolean/Text)",
-                    attr.kind
-                );
-                std::process::abort();
-            }
-        }
-    }
 
     // Resolve the plan's database to its connection path (as `coddl_exec`).
     let path = {
@@ -1147,19 +1374,20 @@ pub unsafe extern "C" fn coddl_exec_insert(
     };
     ensure_connection(&path);
 
-    // One `(?, …)` group per row; substitute the template marker for a batch's
-    // worth of groups. Batch so `rows × arity` stays under the bind limit.
-    let one_group = format!("({})", vec!["?"; arity].join(", "));
+    // Substitute the slot-0 marker for a batch's worth of numbered `(?N,…)`
+    // groups (the template carries no scalar placeholders, so numbering
+    // starts at 1). Batch so `rows × arity` stays under the bind limit.
+    let marker = coddl_sqlemit::rel_param_marker(0);
     let batch_rows = (INSERT_PARAM_BUDGET / arity).max(1);
 
     let conn_guard = db_connections().lock().expect("conn map poisoned");
     let conn = conn_guard
         .get(&path)
         .expect("connection inserted by ensure_connection");
-    for batch in rows.chunks(batch_rows * arity) {
+    for batch in cells.chunks(batch_rows * arity) {
         let n_groups = batch.len() / arity;
-        let groups = vec![one_group.as_str(); n_groups].join(", ");
-        let sql = template.replace(coddl_sqlemit::INSERT_ROWS_MARKER, &groups);
+        let values = format!("(VALUES {})", values_groups(arity, n_groups, 0));
+        let sql = template.replacen(&marker, &values, 1);
         let mut stmt = match conn.prepare_cached(&sql) {
             Ok(s) => s,
             Err(err) => {
@@ -1363,12 +1591,12 @@ mod tests {
         };
         let db = b"greetings";
         let select_sql = br#"SELECT "id", "message" FROM "greetings""#;
-        let delete_sql = br#"DELETE FROM "greetings" WHERE "id" = ?"#;
+        let delete_sql = br#"DELETE FROM "greetings" WHERE "id" = ?1"#;
 
         // The number of rows a fresh read returns.
         let read_len = |plan: u32| -> usize {
             unsafe {
-                let rel = coddl_query(PlanId(plan), ptr::null(), 0);
+                let rel = coddl_query(PlanId(plan), ptr::null(), 0, ptr::null(), 0);
                 assert!(!rel.is_null());
                 let header = &*(rel.sub(crate::rc::HEADER_SIZE) as *const CoddlRcHeader);
                 let len = header.length as usize;
@@ -1391,6 +1619,8 @@ mod tests {
                     select_sql.as_ptr(),
                     select_sql.len(),
                     0,
+                    ptr::null(),
+                    0,
                     &desc,
                 ),
                 CoddlStatus::Ok
@@ -1403,6 +1633,8 @@ mod tests {
                     delete_sql.as_ptr(),
                     delete_sql.len(),
                     1,
+                    ptr::null(),
+                    0,
                     &desc,
                 ),
                 CoddlStatus::Ok
@@ -1544,7 +1776,7 @@ mod tests {
             attrs: attrs.as_ptr(),
         };
         let db = b"greetings";
-        let sql = br#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = ?"#;
+        let sql = br#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = ?1"#;
 
         unsafe {
             assert_eq!(
@@ -1559,6 +1791,8 @@ mod tests {
                     sql.as_ptr(),
                     sql.len(),
                     1,
+                    ptr::null(),
+                    0,
                     &desc,
                 ),
                 CoddlStatus::Ok
@@ -1570,7 +1804,7 @@ mod tests {
                 len: 0,
                 kind: CoddlAttrKind::Integer as u32,
             };
-            let rel = coddl_query(PlanId(0), &param, 1);
+            let rel = coddl_query(PlanId(0), &param, 1, ptr::null(), 0);
             assert!(!rel.is_null());
 
             // One row back — the WHERE filtered out id=2 — sealed RC relation.
@@ -1613,7 +1847,7 @@ mod tests {
             attrs: attrs.as_ptr(),
         };
         let db = b"greetings";
-        let sql = br#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = ?"#;
+        let sql = br#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = ?1"#;
 
         unsafe {
             coddl_register_database(db.as_ptr(), db.len(), path_str.as_ptr(), path_str.len());
@@ -1624,6 +1858,8 @@ mod tests {
                 sql.as_ptr(),
                 sql.len(),
                 1,
+                ptr::null(),
+                0,
                 &desc,
             );
 
@@ -1634,7 +1870,7 @@ mod tests {
                 len: 0,
                 kind: CoddlAttrKind::Integer as u32,
             };
-            let rel = coddl_query(PlanId(0), &param, 1);
+            let rel = coddl_query(PlanId(0), &param, 1, ptr::null(), 0);
             assert!(!rel.is_null());
             let header = &*(rel.sub(crate::rc::HEADER_SIZE) as *const CoddlRcHeader);
             assert_eq!(header.length, 0);
@@ -1657,7 +1893,7 @@ mod tests {
             attrs: attrs.as_ptr(),
         };
         let db = b"greetings";
-        let sql = br#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = ?"#;
+        let sql = br#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = ?1"#;
 
         unsafe {
             coddl_register_database(db.as_ptr(), db.len(), path_str.as_ptr(), path_str.len());
@@ -1668,6 +1904,8 @@ mod tests {
                 sql.as_ptr(),
                 sql.len(),
                 1,
+                ptr::null(),
+                0,
                 &desc,
             );
 
@@ -1679,7 +1917,7 @@ mod tests {
                 len: 0,
                 kind: CoddlAttrKind::Integer as u32,
             };
-            let r1 = coddl_query(PlanId(0), &p1, 1);
+            let r1 = coddl_query(PlanId(0), &p1, 1, ptr::null(), 0);
             assert_eq!(
                 (*(r1.sub(crate::rc::HEADER_SIZE) as *const CoddlRcHeader)).length,
                 1
@@ -1693,7 +1931,7 @@ mod tests {
                 len: 0,
                 kind: CoddlAttrKind::Integer as u32,
             };
-            let r2 = coddl_query(PlanId(0), &p2, 1);
+            let r2 = coddl_query(PlanId(0), &p2, 1, ptr::null(), 0);
             assert_eq!(
                 (*(r2.sub(crate::rc::HEADER_SIZE) as *const CoddlRcHeader)).length,
                 1

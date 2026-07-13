@@ -117,10 +117,16 @@ pub struct PlanEntry {
     /// handle). Resolved to a connection path through the runtime's
     /// database registry.
     pub db_name: String,
-    /// The baked SQL text, ready to prepare (`?` placeholders for SQLite).
+    /// The baked SQL text, ready to prepare (`?N` placeholders for SQLite).
     pub sql: String,
-    /// Number of bind parameters the SQL expects.
+    /// Number of scalar bind parameters the SQL expects (`?1..?N`).
     pub param_count: u32,
+    /// Arity (column count) of each relation-valued parameter, in slot order.
+    /// One entry per `__CODDL_REL_<slot>__` marker in `sql`; the runtime
+    /// validates a matching `Inst::Query`'s bound relations against these
+    /// before expanding the markers. Empty for a plan with no shipped
+    /// relation.
+    pub rel_arities: Vec<u32>,
     /// Heading id (into `Module::headings`) of the rows the plan returns.
     pub result_heading_id: HeadingId,
 }
@@ -510,20 +516,27 @@ pub enum Inst {
     /// Register one baked query plan with the runtime. Emitted once per
     /// `Module::plans` entry in `main`'s prologue, after `RegisterDatabase`.
     /// Backends look the entry up by `plan_id` and call `coddl_register_plan`
-    /// with its SQL text, database name, param count, and the result heading
-    /// descriptor.
+    /// with its SQL text, database name, param count, rel-param arities, and
+    /// the result heading descriptor.
     RegisterPlan { plan_id: u32 },
     /// Execute a registered plan with the given bind parameters and bind the
     /// returned sealed relation to `dst`. Fire-on-call: the prepared
     /// statement runs at this point (the force site), lazily. Each param
     /// pairs the bind SSA value with its scalar `ProcType` so backends pick
-    /// the right `CoddlParam` kind and field. `dst` carries
-    /// `ProcType::Relation(heading_id)` — the plan's result heading. Backends
-    /// build a `CoddlParam` array and call `coddl_query`.
+    /// the right `CoddlParam` kind and field. `rels` are the plan's
+    /// **relation-valued** parameters in slot order — each pairs an in-memory
+    /// relation value with its static heading descriptor (like
+    /// [`Inst::InsertFrom`]'s source); the runtime expands the plan's
+    /// `__CODDL_REL_<slot>__` markers with the bound rows (numbered after the
+    /// scalar params) before preparing. Empty for an ordinary query. `dst`
+    /// carries `ProcType::Relation(heading_id)` — the plan's result heading.
+    /// Backends build a `CoddlParam` array plus a `CoddlRelParam` array and
+    /// call `coddl_query`.
     Query {
         dst: ValueId,
         plan_id: u32,
         params: Vec<(ValueId, ProcType)>,
+        rels: Vec<(ValueId, HeadingId)>,
         heading_id: HeadingId,
     },
     /// Execute a registered **DML** plan (a `DELETE`/`INSERT`/`UPDATE`) with the
@@ -539,8 +552,10 @@ pub enum Inst {
     },
     /// Insert the rows of an **in-memory** relation `src` into a public relvar,
     /// idempotently. `plan_id` is a registered *insert template* — an
-    /// `INSERT … SELECT … FROM (VALUES {{ROWS}}) … WHERE NOT EXISTS (…)` whose
-    /// `{{ROWS}}` marker the runtime expands to a batch of `(?,…)` row-groups.
+    /// `INSERT … SELECT … FROM __CODDL_REL_0__ … WHERE NOT EXISTS (…)` whose
+    /// rel-param marker the runtime expands to a `(VALUES …)` of `(?,…)`
+    /// row-groups, in batches (an insert is cumulative, so batching is safe —
+    /// unlike a read query, which never splits).
     /// Backends pass `src`'s relation pointer + its static heading descriptor
     /// (like [`Inst::WriteRelation`]) to `coddl_exec_insert`, which iterates the
     /// relation, binds each row's cells, and runs the template in batches. Used
@@ -973,6 +988,7 @@ impl fmt::Display for Inst {
                 dst,
                 plan_id,
                 params,
+                rels,
                 heading_id,
             } => {
                 write!(f, "{dst} = query plan_{plan_id} heading_{} (", heading_id.0)?;
@@ -982,7 +998,18 @@ impl fmt::Display for Inst {
                     }
                     write!(f, "{v}")?;
                 }
-                f.write_str(")")
+                f.write_str(")")?;
+                if !rels.is_empty() {
+                    f.write_str(" rels (")?;
+                    for (i, (v, hid)) in rels.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{v} heading_{}", hid.0)?;
+                    }
+                    f.write_str(")")?;
+                }
+                Ok(())
             }
             Inst::Dml { plan_id, params } => {
                 write!(f, "dml plan_{plan_id} (")?;

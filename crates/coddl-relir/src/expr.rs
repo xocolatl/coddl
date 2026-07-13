@@ -169,6 +169,18 @@ pub enum RelExpr {
     /// the relvar-rooted `RelvarRef` leaf. No SQL source, so any subtree
     /// containing it is `Materialized` and lowers in-process.
     MaterializedRelvar { name: String, heading: Heading },
+    /// A relation-valued **bind parameter** — an in-process relation value
+    /// shipped into the backend at query time as a `VALUES`-backed derived
+    /// table (see `coddl-sqlemit`). The relation analogue of
+    /// [`RestrictValue::Param`]: the free-variable identity is `slot`, an index
+    /// into the per-build slot table the lowerer owns (each slot holds the AST
+    /// subexpression whose lowered value binds at run time), so this IR stays
+    /// independent of the lowerer and the backend exactly as `Param(name)`
+    /// does. Origin is `Materialized`: a `RelParam` beside a relvar-rooted
+    /// sibling makes the tree `Mixed`, which the cut pushes by shipping the
+    /// slot's rows *up* into SQL — never by pulling the relvar down into
+    /// memory (the settled mixed-origin rule, `docs/relir.md` "The cut").
+    RelParam { slot: usize, heading: Heading },
 }
 
 /// Combine the storage origins of a binary node's two operands (`And` / `Or`):
@@ -478,6 +490,7 @@ impl RelExpr {
                 Heading::new(attrs)
             }
             RelExpr::MaterializedRelvar { heading, .. } => heading.clone(),
+            RelExpr::RelParam { heading, .. } => heading.clone(),
         }
     }
 
@@ -511,6 +524,9 @@ impl RelExpr {
             RelExpr::Wrap { input, .. } => input.origin(),
             RelExpr::Unwrap { input, .. } => input.origin(),
             RelExpr::MaterializedRelvar { .. } => StorageOrigin::Materialized,
+            // A relation value lives in the process; what makes it *pushable*
+            // anyway is the rel-param shipping, decided at the cut, not here.
+            RelExpr::RelParam { .. } => StorageOrigin::Materialized,
         }
     }
 
@@ -622,6 +638,15 @@ impl RelExpr {
                 let _ = writeln!(out, "{pad}Unwrap {{ {} }}", names.join(", "));
                 input.render_into(out, depth + 1);
             }
+            RelExpr::RelParam { slot, heading } => {
+                let attrs = heading
+                    .attrs()
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(out, "{pad}RelParam #{slot} {{ {attrs} }}");
+            }
         }
     }
 
@@ -727,6 +752,15 @@ impl RelExpr {
             RelExpr::Wrap { .. } => Vec::new(),
             RelExpr::Unwrap { .. } => Vec::new(),
             RelExpr::MaterializedRelvar { .. } => Vec::new(),
+            // Every relation value is a set (RM Pro 3 — the in-process seal
+            // enforces it), so the full heading is a trivially-true superkey.
+            // Sound for every consumer: `needs_distinct` only checks non-empty,
+            // `Project` drops the key the moment any attribute is projected
+            // away, and for a *nullary* rel-param the empty key is exactly
+            // right (a nullary relation holds at most one tuple).
+            RelExpr::RelParam { heading, .. } => {
+                vec![heading.attrs().iter().map(|(n, _)| n.clone()).collect()]
+            }
         }
     }
 
@@ -769,6 +803,7 @@ impl RelExpr {
             RelExpr::Wrap { input, .. } => input.card_le_one(),
             RelExpr::Unwrap { input, .. } => input.card_le_one(),
             RelExpr::MaterializedRelvar { .. } => false,
+            RelExpr::RelParam { .. } => false,
         }
     }
 
@@ -805,6 +840,8 @@ impl RelExpr {
                 lhs.references_table(table) || rhs.references_table(table)
             }
             RelExpr::MaterializedRelvar { .. } => false,
+            // A relation value carries rows, not a table reference.
+            RelExpr::RelParam { .. } => false,
         }
     }
 }
@@ -1363,5 +1400,95 @@ mod tests {
             "Extend { twice = (id * id) }\n  \
              RelvarRef Greetings { db: greetings, table: greetings }"
         );
+    }
+
+    // ── relation-valued parameters (RelParam) ──────────────────────────
+
+    fn path_param() -> RelExpr {
+        // A request-derived local relation shipped as slot 0 — e.g. the wiki's
+        // `req.path where ordinality = 1 rename { slug: segment }`.
+        RelExpr::RelParam {
+            slot: 0,
+            heading: Heading::new(vec![
+                ("ordinality".to_string(), Type::Integer),
+                ("slug".to_string(), Type::Text),
+            ]),
+        }
+    }
+
+    #[test]
+    fn rel_param_is_materialized_with_its_carried_heading() {
+        let p = path_param();
+        assert_eq!(p.origin(), StorageOrigin::Materialized);
+        assert_eq!(
+            p.heading(),
+            Heading::new(vec![
+                ("ordinality".to_string(), Type::Integer),
+                ("slug".to_string(), Type::Text),
+            ])
+        );
+        assert!(!p.card_le_one());
+        assert!(!p.references_table("pages"));
+    }
+
+    #[test]
+    fn rel_param_full_heading_is_a_key_so_no_distinct() {
+        // A relation value is a set, so its whole heading is a superkey: the
+        // bare parameter (and anything that keeps every attribute) needs no
+        // DISTINCT; projecting any attribute away drops the key.
+        let p = path_param();
+        assert_eq!(
+            p.surviving_keys(),
+            vec![vec!["ordinality".to_string(), "slug".to_string()]]
+        );
+        assert!(!p.needs_distinct());
+        let projected = RelExpr::Project {
+            input: Box::new(p),
+            keep: vec!["slug".to_string()],
+        };
+        assert!(projected.surviving_keys().is_empty());
+        assert!(projected.needs_distinct());
+    }
+
+    #[test]
+    fn relvar_matching_rel_param_is_mixed() {
+        // The wiki shape: a public relvar semijoined against a shipped local.
+        let sj = RelExpr::Semijoin {
+            lhs: Box::new(greetings()),
+            rhs: Box::new(path_param()),
+            negated: false,
+        };
+        assert_eq!(sj.origin(), StorageOrigin::Mixed);
+        // The semijoin result heading is the lhs's, and the lhs keys survive.
+        assert_eq!(sj.heading(), greetings_heading());
+        assert!(!sj.needs_distinct());
+    }
+
+    #[test]
+    fn rel_param_renders_slot_and_attrs_as_a_leaf() {
+        assert_eq!(path_param().render(), "RelParam #0 { ordinality, slug }");
+        let sj = RelExpr::Semijoin {
+            lhs: Box::new(greetings()),
+            rhs: Box::new(path_param()),
+            negated: false,
+        };
+        assert_eq!(
+            sj.render(),
+            "Semijoin\n  \
+             RelvarRef Greetings { db: greetings, table: greetings }\n  \
+             RelParam #0 { ordinality, slug }"
+        );
+    }
+
+    #[test]
+    fn nullary_rel_param_empty_key_bounds_it() {
+        // A nullary relation value (reltrue/relfalse) holds ≤ 1 tuple; the
+        // empty key expresses exactly that, so no DISTINCT.
+        let p = RelExpr::RelParam {
+            slot: 0,
+            heading: Heading::new(vec![]),
+        };
+        assert_eq!(p.surviving_keys(), vec![Vec::<String>::new()]);
+        assert!(!p.needs_distinct());
     }
 }

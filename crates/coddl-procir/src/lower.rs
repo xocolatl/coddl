@@ -2134,7 +2134,7 @@ impl Lowerer {
             let Some(dialect) = self.require_public_write(&name, &operand) else {
                 return;
             };
-            let Some(target_rel) = self.build_rel_expr(&operand) else {
+            let Some(target_rel) = self.build_rel_expr(&operand, &mut Vec::new()) else {
                 return;
             };
             let value_rel = RelExpr::Minus {
@@ -2194,8 +2194,8 @@ impl Lowerer {
             // Build the target `RelvarRef` and the restriction `Restrict{t, p}`,
             // then the `Minus{t, Restrict}` the DELETE arm recognizes.
             let recognized = self
-                .build_rel_expr(&lhs_expr)
-                .zip(self.build_rel_expr(&operand))
+                .build_rel_expr(&lhs_expr, &mut Vec::new())
+                .zip(self.build_rel_expr(&operand, &mut Vec::new()))
                 .and_then(|(t, restrict)| {
                     let value = RelExpr::Minus {
                         lhs: Box::new(t.clone()),
@@ -2262,17 +2262,24 @@ impl Lowerer {
             let Some(dialect) = self.require_public_write(&name, &target_expr) else {
                 return;
             };
-            let Some(target_rel) = self.build_rel_expr(&target_expr) else {
+            let Some(target_rel) = self.build_rel_expr(&target_expr, &mut Vec::new()) else {
                 return;
             };
-            // Pushable source → a single pushed idempotent INSERT.
-            let pushed = self.build_rel_expr(&source_expr).and_then(|s| {
-                let value = RelExpr::Or {
-                    lhs: Box::new(target_rel.clone()),
-                    rhs: Box::new(s),
-                };
-                emit_assignment(&target_rel, &value, dialect).ok()
-            });
+            // Pushable source → a single pushed idempotent INSERT. A source
+            // that builds only as a relation parameter (`rel_params`
+            // non-empty) is not SQL-backed — route it to the row-shipping
+            // `Inst::InsertFrom` below instead (`Inst::Dml` carries no
+            // relations, and the write path batches where a read must not).
+            let pushed = self
+                .build_rel_expr(&source_expr, &mut Vec::new())
+                .and_then(|s| {
+                    let value = RelExpr::Or {
+                        lhs: Box::new(target_rel.clone()),
+                        rhs: Box::new(s),
+                    };
+                    emit_assignment(&target_rel, &value, dialect).ok()
+                })
+                .filter(|q| q.rel_params.is_empty());
             if let Some(query) = pushed {
                 self.emit_dml(query);
                 return;
@@ -2459,14 +2466,14 @@ impl Lowerer {
         let Some(dialect) = self.require_public_write(name, root_expr) else {
             return;
         };
-        let Some(target_rel) = self.build_rel_expr(root_expr) else {
+        let Some(target_rel) = self.build_rel_expr(root_expr, &mut Vec::new()) else {
             return;
         };
 
         // The substitute input (`Restrict(t, p)` or `RelvarRef(t)`) and, for
         // update-where, the complement `Restrict(t, ¬p)`.
         let (sub_input, complement) = if has_where {
-            let Some(restrict) = self.build_rel_expr(operand) else {
+            let Some(restrict) = self.build_rel_expr(operand, &mut Vec::new()) else {
                 self.decline_public_update(name, operand);
                 return;
             };
@@ -2573,9 +2580,13 @@ impl Lowerer {
         // then `emit_assignment`. A pushable shape becomes a single surgical
         // statement (`Inst::Dml`).
         let recognized = self
-            .build_rel_expr(target_expr)
-            .zip(self.build_rel_expr(value_expr))
-            .and_then(|(t, r)| emit_assignment(&t, &r, dialect).ok());
+            .build_rel_expr(target_expr, &mut Vec::new())
+            .zip(self.build_rel_expr(value_expr, &mut Vec::new()))
+            .and_then(|(t, r)| emit_assignment(&t, &r, dialect).ok())
+            // An RHS whose rows live in the process (`rel_params` non-empty)
+            // is not a pushed write — it routes to the row-shipping paths
+            // below (`Inst::Dml` carries no relations).
+            .filter(|q| q.rel_params.is_empty());
         if let Some(query) = recognized {
             self.emit_dml(query);
             return;
@@ -2585,7 +2596,7 @@ impl Lowerer {
         // private relvar) ships `e`'s rows from the process into `R` at runtime —
         // an idempotent batched-`VALUES` insert (`Inst::InsertFrom`).
         if let Some(e) = self.union_insert_source(name, value_expr) {
-            if let Some(target_rel) = self.build_rel_expr(target_expr) {
+            if let Some(target_rel) = self.build_rel_expr(target_expr, &mut Vec::new()) {
                 if self.ship_union_insert(&target_rel, &e, dialect) {
                     return;
                 }
@@ -2595,7 +2606,7 @@ impl Lowerer {
         // Replace-all fallback. `R` is absent from a recognized surgical shape;
         // empty `R` and refill it from the RHS (two `Inst::Dml` in the
         // transaction — atomic).
-        let Some(target_rel) = self.build_rel_expr(target_expr) else {
+        let Some(target_rel) = self.build_rel_expr(target_expr, &mut Vec::new()) else {
             return;
         };
         let RelExpr::RelvarRef { table_name: t, .. } = &target_rel else {
@@ -2603,7 +2614,7 @@ impl Lowerer {
         };
         let t = t.clone();
 
-        let x = self.build_rel_expr(value_expr);
+        let x = self.build_rel_expr(value_expr, &mut Vec::new());
 
         // Self-referential but unrecognized (e.g. a compound-predicate keep-filter
         // whose negation is a disjunction the single-predicate model can't push):
@@ -2626,6 +2637,9 @@ impl Lowerer {
         if let Some(insert) = x
             .as_ref()
             .and_then(|x| emit_replace_insert(&target_rel, x, dialect).ok())
+            // A row-shipped refill (`R := <in-memory X>`) goes through the
+            // `Inst::InsertFrom` path below, not a rel-param DML.
+            .filter(|q| q.rel_params.is_empty())
         {
             if let Ok(truncate) = emit_truncate(&target_rel, dialect) {
                 self.emit_dml(truncate);
@@ -2726,8 +2740,15 @@ impl Lowerer {
         // returns `None`), so it materializes here — keeping public-relvar
         // reads inside their transaction.
         if let (Some(dialect), Some(name_tok)) = (self.dialect, stmt.name()) {
-            if let Some(rel) = self.build_rel_expr(&value_expr) {
-                if crate::cut::try_push(&rel, dialect).is_some() {
+            if let Some(rel) = self.build_rel_expr(&value_expr, &mut Vec::new()) {
+                // A deferred alias must be **pure SQL** (`RelvarRooted`): a
+                // mixed RHS would re-lower its rel-param slot expressions at
+                // every use of the alias, re-evaluating in-process work and
+                // duplicating its side conditions — so it materializes here
+                // like any other local instead.
+                if rel.origin() == StorageOrigin::RelvarRooted
+                    && crate::cut::try_push(&rel, dialect).is_some()
+                {
                     self.bind_alias(name_tok.text().to_string(), rel);
                     return;
                 }
@@ -3928,7 +3949,7 @@ impl Lowerer {
             _ => return,
         };
         for operand in operands {
-            let Some(rel) = self.build_rel_expr(&operand) else {
+            let Some(rel) = self.build_rel_expr(&operand, &mut Vec::new()) else {
                 continue;
             };
             if rel.origin() == StorageOrigin::RelvarRooted && !contains_restrict(&rel) {
@@ -4488,8 +4509,17 @@ impl Lowerer {
         order: &[(String, bool)],
     ) -> Option<ValueId> {
         let dialect = self.dialect?;
-        let rel = self.build_rel_expr(expr)?;
+        let mut slots = Vec::new();
+        let rel = self.build_rel_expr(expr, &mut slots)?;
         let query = crate::cut::try_push_ordered(&rel, dialect, order)?;
+        // The emitted rel-params are exactly the build's slot table (the
+        // collapse invariant) — both pure, so nothing was emitted if either
+        // failed above.
+        debug_assert_eq!(
+            query.rel_params.len(),
+            slots.len(),
+            "emitted rel_params disagree with the build's slot table"
+        );
         // For `coddl explain`: a successful push is a clean RelExpr root (the
         // caller returns here, so no nested sub-expression is captured twice).
         if self.collect_relir {
@@ -4498,26 +4528,44 @@ impl Lowerer {
                 sql: query.sql.text.clone(),
             });
         }
-        Some(self.emit_query(query))
+        Some(self.emit_query(query, &slots))
     }
 
     /// Build a `coddl-relir` expression from a relational AST subtree, or
-    /// `None` if the shape isn't one the cut handles (v1: a public-relvar
-    /// leaf, optionally restricted by a single `attr = literal`). A `NameRef`
-    /// that resolves to a deferred relation alias substitutes the aliased
-    /// expression (binding transparency); a `NameRef` shadowed by a
-    /// materialized local is not a relvar read, so it returns `None`.
-    fn build_rel_expr(&self, expr: &Expr) -> Option<RelExpr> {
+    /// `None` if the shape isn't one the cut handles. A `NameRef` that
+    /// resolves to a deferred relation alias substitutes the aliased
+    /// expression (binding transparency); a **relation-typed local** (a bound
+    /// relation value, or a relation-valued tuple field like `req.path`)
+    /// builds as a [`RelExpr::RelParam`] leaf — `slots[slot]` records the AST
+    /// subexpression whose in-process value binds at query time. `slots` is
+    /// the per-build slot table: indices are allocated depth-first
+    /// left-to-right, and a discarded subtree's entries are truncated at its
+    /// collapse point ([`Self::build_rel_operand`]), so on a `Some` return
+    /// `slots[i]` is exactly the tree's `RelParam #i`. On a `None` return the
+    /// table may hold discarded entries — callers discard it with the tree.
+    fn build_rel_expr(&self, expr: &Expr, slots: &mut Vec<Expr>) -> Option<RelExpr> {
         match expr {
             Expr::NameRef(n) => {
                 let name = n.ident()?;
                 let name = name.text();
                 // A relation `let`-binding recorded as an alias is transparent:
                 // substitute its `RelExpr` so the surrounding algebra folds
-                // down to one pushed query.
+                // down to one pushed query. (Aliases are bound only for
+                // relvar-rooted RHSes, so the substitution carries no slots.)
                 if let Some(rel) = self.lookup_alias(name) {
                     return Some(rel.clone());
                 }
+                // A relation-typed local is an in-process value: a relation
+                // parameter, shipped into SQL if the surrounding tree pushes.
+                if let Some((_, ProcType::Relation(heading_id))) = self.lookup_local(name) {
+                    let slot = slots.len();
+                    slots.push(expr.clone());
+                    return Some(RelExpr::RelParam {
+                        slot,
+                        heading: self.headings[heading_id.0 as usize].clone(),
+                    });
+                }
+                // Any other local shadows relvars but isn't relational.
                 if self.lookup_local(name).is_some() {
                     return None;
                 }
@@ -4538,7 +4586,28 @@ impl Lowerer {
                     keys: binding.keys.clone(),
                 })
             }
-            Expr::Binary(b) => self.build_rel_binary(b),
+            // A relation-valued field of a tuple-typed local (`req.path`).
+            // The heading is static — the tuple's heading carries it — so the
+            // leaf builds without lowering anything; the slot's value is
+            // computed in-process only after emission succeeds.
+            Expr::FieldAccess(fa) => {
+                let base = fa.base()?;
+                let Expr::NameRef(n) = &base else {
+                    return None;
+                };
+                let base_name = n.ident()?;
+                let Some((_, ProcType::Tuple(h))) = self.lookup_local(base_name.text()) else {
+                    return None;
+                };
+                let Some(Type::Relation(heading)) = h.lookup(fa.field()?.text()) else {
+                    return None;
+                };
+                let heading = heading.clone();
+                let slot = slots.len();
+                slots.push(expr.clone());
+                Some(RelExpr::RelParam { slot, heading })
+            }
+            Expr::Binary(b) => self.build_rel_binary(b, slots),
             Expr::Project(p) => {
                 // Projection over a pushable subtree pushes too — the cut
                 // gates on `origin()`, which `RelExpr::Project` propagates,
@@ -4546,7 +4615,7 @@ impl Lowerer {
                 // `keep` order is irrelevant (the heading re-sorts). For
                 // `all but`, resolve the complement against the operand
                 // heading so RelIR still carries a concrete `keep` set.
-                let input = self.build_rel_expr(&p.input()?)?;
+                let input = self.build_rel_expr(&p.input()?, slots)?;
                 let listed: Vec<String> = p.attrs().map(|t| t.text().to_string()).collect();
                 let keep: Vec<String> = if p.is_all_but() {
                     input
@@ -4565,7 +4634,7 @@ impl Lowerer {
                 })
             }
             Expr::Replace(r) => {
-                let input = self.build_rel_expr(&r.input()?)?;
+                let input = self.build_rel_expr(&r.input()?, slots)?;
                 // Every value computes (a bare-ref relabel is rejected by
                 // typecheck → `rename`): build the substitute chain, removing the
                 // attributes each value *reads* (compute-and-consume).
@@ -4584,7 +4653,7 @@ impl Lowerer {
             }
             Expr::Rename(r) => {
                 // A pure relabel → one `Rename` node (pushes as `col AS new`).
-                let input = self.build_rel_expr(&r.input()?)?;
+                let input = self.build_rel_expr(&r.input()?, slots)?;
                 let mut renames = Vec::new();
                 for (old, new) in r.renames() {
                     let (Some(old), Some(new)) = (old, new) else {
@@ -4604,7 +4673,7 @@ impl Lowerer {
                 // errs on `TClose`), so a relvar-rooted closure still declines
                 // the push and runs in-process; building the RelExpr is what
                 // lets the `explain` path render the `TClose` node.
-                let mut input = self.build_rel_expr(&t.input()?)?;
+                let mut input = self.build_rel_expr(&t.input()?, slots)?;
                 let keep: Vec<String> = t.attrs().map(|tok| tok.text().to_string()).collect();
                 if !keep.is_empty() {
                     input = RelExpr::Project {
@@ -4623,7 +4692,7 @@ impl Lowerer {
                 // SQL renderer can't express yet, e.g. a comparison or call).
                 // The result type is computed from the operand heading; the
                 // typechecker is the authority, so this just mirrors its rule.
-                let input = self.build_rel_expr(&e.input()?)?;
+                let input = self.build_rel_expr(&e.input()?, slots)?;
                 let in_heading = input.heading();
                 let mut extends = Vec::new();
                 for (name_tok, value) in e.pairs() {
@@ -4642,7 +4711,7 @@ impl Lowerer {
                 // `wrap` SQL emission (sqlemit's `resolve` errs), so a
                 // relvar-rooted wrap declines the push and restructures
                 // in-process; building the RelExpr lets `explain` render it.
-                let input = self.build_rel_expr(&w.input()?)?;
+                let input = self.build_rel_expr(&w.input()?, slots)?;
                 let wraps = wrap_spec(&input.heading(), w);
                 Some(RelExpr::Wrap {
                     input: Box::new(input),
@@ -4650,7 +4719,7 @@ impl Lowerer {
                 })
             }
             Expr::Unwrap(u) => {
-                let input = self.build_rel_expr(&u.input()?)?;
+                let input = self.build_rel_expr(&u.input()?, slots)?;
                 let names: Vec<String> = u.attrs().map(|t| t.text().to_string()).collect();
                 Some(RelExpr::Unwrap {
                     input: Box::new(input),
@@ -4950,6 +5019,7 @@ impl Lowerer {
                 db_name: self.db_name.clone().unwrap_or_default(),
                 sql: query.sql.text.clone(),
                 param_count: query.sql.param_count,
+                rel_arities: query.rel_params.iter().map(|s| s.arity).collect(),
                 result_heading_id,
             });
             self.plan_ids.insert(query.plan_id.0, id);
@@ -5008,24 +5078,70 @@ impl Lowerer {
         params
     }
 
-    fn emit_query(&mut self, query: SqlQuery) -> ValueId {
+    /// Register `query` and emit the `Inst::Query` that fires it. `slot_exprs`
+    /// are the AST subexpressions behind the query's relation-valued
+    /// parameters (one per `query.rel_params` entry, in slot order): each is
+    /// lowered **in-process** here — a slot tree contains no public relvar by
+    /// the collapse invariant — and its relation value rides the instruction's
+    /// `rels`, bound into the plan's rel-param markers at run time. Empty for
+    /// an ordinary query.
+    fn emit_query(&mut self, query: SqlQuery, slot_exprs: &[Expr]) -> ValueId {
+        debug_assert_eq!(query.rel_params.len(), slot_exprs.len());
         let result_heading_id = self.intern_heading(&query.result_heading);
         let plan_id = self.register_plan(&query, result_heading_id);
         let params = self.emit_params(&query);
+        let mut rels: Vec<(ValueId, HeadingId)> = Vec::with_capacity(slot_exprs.len());
+        for (spec, ast) in query.rel_params.iter().zip(slot_exprs) {
+            let v = self.lower_expr(ast);
+            let ProcType::Relation(heading_id) = self.value_type(v) else {
+                unreachable!("rel-param slot lowered to a non-relation value");
+            };
+            // The lowered relation's shape must be the one emission rendered
+            // the marker's wrapper columns from — a mismatch is a compiler
+            // bug, not a user error.
+            assert_eq!(
+                self.headings[heading_id.0 as usize].attrs().len(),
+                spec.arity as usize,
+                "rel-param slot {} lowered to a relation of the wrong arity",
+                spec.slot,
+            );
+            rels.push((v, heading_id));
+        }
         let dst = self.fresh_value();
         self.record_type(dst, ProcType::Relation(result_heading_id));
         self.insts.push(Inst::Query {
             dst,
             plan_id,
             params,
+            rels: rels.clone(),
             heading_id: result_heading_id,
         });
+        // A slot value is an anonymous temporary unless a local owns it —
+        // release it once the query has consumed its rows (`coddl_query` reads
+        // the payload synchronously; the fresh-source discipline
+        // `ship_union_insert` uses).
+        for (v, _) in rels {
+            let is_owned = self
+                .locals
+                .iter()
+                .any(|layer| layer.values().any(|(vid, _)| *vid == v));
+            if !is_owned {
+                self.insts.push(Inst::Release { src: v });
+            }
+        }
         dst
     }
 
     /// Register a baked DML `SqlQuery` and emit an `Inst::Dml` to fire it for
     /// effect (no result bound). Mirrors `emit_query` minus the result value.
     fn emit_dml(&mut self, query: SqlQuery) {
+        // `Inst::Dml` carries no relation-valued parameters — a DML plan whose
+        // source ships rows goes through `Inst::InsertFrom` instead. The DML
+        // lowerers route on `rel_params.is_empty()` before calling this.
+        assert!(
+            query.rel_params.is_empty(),
+            "DML plan with relation-valued parameters reached emit_dml"
+        );
         // The DML plan returns no rows; its registered heading is unused but
         // `PlanEntry` carries one, so intern the operand heading honestly.
         let result_heading_id = self.intern_heading(&query.result_heading);
@@ -5343,10 +5459,11 @@ impl Lowerer {
     /// in-process by `origin()`. Shared by `build_rel_expr` (the SQL-push path)
     /// and `lower_join_inprocess` (the in-process path) so the lowering is
     /// identical on both. `None` for non-relational binaries.
-    fn build_rel_binary(&self, b: &BinaryExpr) -> Option<RelExpr> {
+    fn build_rel_binary(&self, b: &BinaryExpr, slots: &mut Vec<Expr>) -> Option<RelExpr> {
         match b.op_kind() {
             Some(BinaryOp::Where) => {
-                let input = self.build_rel_expr(&b.lhs()?)?;
+                let mark = slots.len();
+                let input = self.build_rel_expr(&b.lhs()?, slots)?;
                 let heading = input.heading();
                 // Decompose a conjunctive predicate `p and q and …` into one
                 // `Restrict` per conjunct — the identical RelIR `R where p where
@@ -5359,6 +5476,20 @@ impl Lowerer {
                 // conjunct resolves against the same operand `heading`.
                 let mut preds = Vec::new();
                 if !self.collect_conjuncts(&b.rhs()?, &heading, &mut preds) {
+                    // A non-pushable predicate over a **materialized** input:
+                    // the whole restriction runs in-process (the per-tuple
+                    // predicate path) and its *result* ships as one relation
+                    // parameter — `where` is heading-preserving, so the node's
+                    // heading is the input's. Over a relvar-rooted/mixed input
+                    // the decline stands (the S1 tripwire stays honest — a
+                    // non-pushable filter over a relvar is a pushdown gap, not
+                    // something to paper over by pulling the relvar).
+                    if input.origin() == StorageOrigin::Materialized {
+                        slots.truncate(mark);
+                        let slot = slots.len();
+                        slots.push(Expr::Binary(b.clone()));
+                        return Some(RelExpr::RelParam { slot, heading });
+                    }
                     return None;
                 }
                 let mut expr = input;
@@ -5375,8 +5506,8 @@ impl Lowerer {
             // attribute = set intersection). The heading check that
             // distinguishes the three is the typechecker's, not the lowerer's.
             Some(BinaryOp::Join) | Some(BinaryOp::Times) | Some(BinaryOp::Intersect) => {
-                let lhs = self.build_rel_expr(&b.lhs()?)?;
-                let rhs = self.build_rel_expr(&b.rhs()?)?;
+                let lhs = self.build_rel_operand(&b.lhs()?, slots)?;
+                let rhs = self.build_rel_operand(&b.rhs()?, slots)?;
                 Some(RelExpr::And {
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
@@ -5384,8 +5515,8 @@ impl Lowerer {
             }
             // `union` → the A-core `OR` node (identical headings, typechecked).
             Some(BinaryOp::Union) => {
-                let lhs = self.build_rel_expr(&b.lhs()?)?;
-                let rhs = self.build_rel_expr(&b.rhs()?)?;
+                let lhs = self.build_rel_operand(&b.lhs()?, slots)?;
+                let rhs = self.build_rel_operand(&b.rhs()?, slots)?;
                 Some(RelExpr::Or {
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
@@ -5393,8 +5524,8 @@ impl Lowerer {
             }
             // `minus` → the A-core `AND NOT` node (identical headings, typechecked).
             Some(BinaryOp::Minus) => {
-                let lhs = self.build_rel_expr(&b.lhs()?)?;
-                let rhs = self.build_rel_expr(&b.rhs()?)?;
+                let lhs = self.build_rel_operand(&b.lhs()?, slots)?;
+                let rhs = self.build_rel_operand(&b.rhs()?, slots)?;
                 Some(RelExpr::Minus {
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
@@ -5404,8 +5535,8 @@ impl Lowerer {
             // `Project` keeping only the attributes that appear in exactly one
             // operand. (Typecheck guarantees ≥1 shared attribute.)
             Some(BinaryOp::Compose) => {
-                let lhs = self.build_rel_expr(&b.lhs()?)?;
-                let rhs = self.build_rel_expr(&b.rhs()?)?;
+                let lhs = self.build_rel_operand(&b.lhs()?, slots)?;
+                let rhs = self.build_rel_operand(&b.rhs()?, slots)?;
                 let shared = lhs.heading().shared_names(&rhs.heading());
                 let union = lhs.heading().union(&rhs.heading()).ok()?;
                 let keep: Vec<String> = union
@@ -5427,8 +5558,8 @@ impl Lowerer {
             // EXISTS` and the in-process path expands to join+project(+minus).
             // (Typecheck guarantees ≥1 shared attribute.)
             Some(BinaryOp::Matching) | Some(BinaryOp::NotMatching) => {
-                let lhs = self.build_rel_expr(&b.lhs()?)?;
-                let rhs = self.build_rel_expr(&b.rhs()?)?;
+                let lhs = self.build_rel_operand(&b.lhs()?, slots)?;
+                let rhs = self.build_rel_operand(&b.rhs()?, slots)?;
                 Some(RelExpr::Semijoin {
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
@@ -5436,6 +5567,34 @@ impl Lowerer {
                 })
             }
             _ => None,
+        }
+    }
+
+    /// Build one **operand** of a relational binary, collapsing a *maximal
+    /// materialized subtree* to a single [`RelExpr::RelParam`] slot: when the
+    /// operand builds with origin `Materialized`, its structural tree is
+    /// discarded (its slot entries truncated) and the whole operand AST
+    /// becomes one slot — the existing in-process machinery computes it, and
+    /// only its *result rows* ship into the pushed query. The heading comes
+    /// free from the discarded structural build. A `RelvarRooted`/`Mixed`
+    /// operand stays structural (its relvar parts belong in the SQL); a
+    /// non-buildable operand stays `None` (truncating any entries its partial
+    /// build left, so a sibling operand's slot indices stay contiguous).
+    fn build_rel_operand(&self, ast: &Expr, slots: &mut Vec<Expr>) -> Option<RelExpr> {
+        let mark = slots.len();
+        match self.build_rel_expr(ast, slots) {
+            Some(rel) if rel.origin() == StorageOrigin::Materialized => {
+                let heading = rel.heading();
+                slots.truncate(mark);
+                let slot = slots.len();
+                slots.push(ast.clone());
+                Some(RelExpr::RelParam { slot, heading })
+            }
+            None => {
+                slots.truncate(mark);
+                None
+            }
+            other => other,
         }
     }
 
@@ -5448,8 +5607,9 @@ impl Lowerer {
     /// (e.g. a relation-literal operand), dispatching on the surface operator.
     fn lower_join_inprocess(&mut self, bin: &BinaryExpr) -> ValueId {
         if let (Some(lhs_e), Some(rhs_e)) = (bin.lhs(), bin.rhs()) {
-            if let Some(rel) = self.build_rel_binary(bin) {
-                if let Some(v) = self.lower_relexpr_inprocess(&rel) {
+            let mut slots = Vec::new();
+            if let Some(rel) = self.build_rel_binary(bin, &mut slots) {
+                if let Some(v) = self.lower_relexpr_inprocess(&rel, &slots) {
                     return v;
                 }
             }
@@ -5546,8 +5706,11 @@ impl Lowerer {
     /// Consume a materialized `RelExpr` subtree into ProcIR. `Some(value)` for
     /// the nodes the in-process path handles today (`MaterializedRelvar`, `And`,
     /// `Project`); `None` otherwise so the caller falls back.
-    fn lower_relexpr_inprocess(&mut self, rel: &RelExpr) -> Option<ValueId> {
+    fn lower_relexpr_inprocess(&mut self, rel: &RelExpr, slots: &[Expr]) -> Option<ValueId> {
         match rel {
+            // A relation-valued parameter in a fully-local tree: the slot's
+            // AST subexpression lowers through the ordinary in-process path.
+            RelExpr::RelParam { slot, .. } => Some(self.lower_expr(&slots[*slot])),
             RelExpr::MaterializedRelvar { name, .. } => {
                 let &heading_id = self.private_relvars.get(name)?;
                 self.used_private_relvars.insert(name.clone());
@@ -5568,24 +5731,24 @@ impl Lowerer {
             // inputs. `release_call_arg_temp` no-ops on the (impossible here)
             // bound-local / parameter case.
             RelExpr::And { lhs, rhs } => {
-                let l = self.lower_relexpr_inprocess(lhs)?;
-                let r = self.lower_relexpr_inprocess(rhs)?;
+                let l = self.lower_relexpr_inprocess(lhs, slots)?;
+                let r = self.lower_relexpr_inprocess(rhs, slots)?;
                 let dst = self.emit_join(l, r);
                 self.release_call_arg_temp(l);
                 self.release_call_arg_temp(r);
                 Some(dst)
             }
             RelExpr::Or { lhs, rhs } => {
-                let l = self.lower_relexpr_inprocess(lhs)?;
-                let r = self.lower_relexpr_inprocess(rhs)?;
+                let l = self.lower_relexpr_inprocess(lhs, slots)?;
+                let r = self.lower_relexpr_inprocess(rhs, slots)?;
                 let dst = self.emit_union(l, r);
                 self.release_call_arg_temp(l);
                 self.release_call_arg_temp(r);
                 Some(dst)
             }
             RelExpr::Minus { lhs, rhs } => {
-                let l = self.lower_relexpr_inprocess(lhs)?;
-                let r = self.lower_relexpr_inprocess(rhs)?;
+                let l = self.lower_relexpr_inprocess(lhs, slots)?;
+                let r = self.lower_relexpr_inprocess(rhs, slots)?;
                 let dst = self.emit_minus(l, r);
                 self.release_call_arg_temp(l);
                 self.release_call_arg_temp(r);
@@ -5594,7 +5757,7 @@ impl Lowerer {
             // `compose` lowers to `Project{And}`: lower the join, then narrow to
             // the kept attributes via `Inst::Project`.
             RelExpr::Project { input, keep } => {
-                let src = self.lower_relexpr_inprocess(input)?;
+                let src = self.lower_relexpr_inprocess(input, slots)?;
                 let dst = self.emit_project(src, keep);
                 self.release_call_arg_temp(src);
                 Some(dst)
@@ -5610,15 +5773,15 @@ impl Lowerer {
                     .iter()
                     .map(|(name, _)| name.clone())
                     .collect();
-                let l = self.lower_relexpr_inprocess(lhs)?;
-                let r = self.lower_relexpr_inprocess(rhs)?;
+                let l = self.lower_relexpr_inprocess(lhs, slots)?;
+                let r = self.lower_relexpr_inprocess(rhs, slots)?;
                 let joined = self.emit_join(l, r);
                 let sj = self.emit_project(joined, &keep);
                 self.release_call_arg_temp(l);
                 self.release_call_arg_temp(r);
                 self.release_call_arg_temp(joined);
                 if *negated {
-                    let l2 = self.lower_relexpr_inprocess(lhs)?;
+                    let l2 = self.lower_relexpr_inprocess(lhs, slots)?;
                     let dst = self.emit_minus(l2, sj);
                     self.release_call_arg_temp(l2);
                     self.release_call_arg_temp(sj);
@@ -5628,14 +5791,14 @@ impl Lowerer {
                 }
             }
             RelExpr::TClose { input } => {
-                let src = self.lower_relexpr_inprocess(input)?;
+                let src = self.lower_relexpr_inprocess(input, slots)?;
                 let dst = self.emit_tclose(src);
                 self.release_call_arg_temp(src);
                 Some(dst)
             }
             // wrap/unwrap restructure into the node's (already-computed) heading.
             RelExpr::Wrap { input, .. } | RelExpr::Unwrap { input, .. } => {
-                let src = self.lower_relexpr_inprocess(input)?;
+                let src = self.lower_relexpr_inprocess(input, slots)?;
                 let dst_heading = rel.heading();
                 let dst = self.emit_restructure(src, dst_heading);
                 self.release_call_arg_temp(src);
@@ -7073,7 +7236,9 @@ fn contains_restrict(rel: &RelExpr) -> bool {
         | RelExpr::Or { lhs, rhs }
         | RelExpr::Minus { lhs, rhs }
         | RelExpr::Semijoin { lhs, rhs, .. } => contains_restrict(lhs) || contains_restrict(rhs),
-        RelExpr::RelvarRef { .. } | RelExpr::MaterializedRelvar { .. } => false,
+        RelExpr::RelvarRef { .. }
+        | RelExpr::MaterializedRelvar { .. }
+        | RelExpr::RelParam { .. } => false,
     }
 }
 
@@ -7094,7 +7259,7 @@ fn relvar_root_name(rel: &RelExpr) -> Option<&str> {
         | RelExpr::Or { lhs, .. }
         | RelExpr::Minus { lhs, .. }
         | RelExpr::Semijoin { lhs, .. } => relvar_root_name(lhs),
-        RelExpr::MaterializedRelvar { .. } => None,
+        RelExpr::MaterializedRelvar { .. } | RelExpr::RelParam { .. } => None,
     }
 }
 
@@ -7854,7 +8019,7 @@ oper main {}\n\
         let entry = &out.relir[0];
         assert_eq!(
             entry.sql,
-            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?"#
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?1"#
         );
         assert_eq!(
             entry.expr.render(),
@@ -7891,12 +8056,12 @@ oper main {}\n\
         // `R where flag` (a bare Boolean attribute) is `R where flag = true` and
         // must push to SQL as an equality — the two surface forms are equivalent
         // (the formatter canonicalizes `= true` to the bare form), so both reach
-        // the backend as `WHERE "active" = ?`.
+        // the backend as `WHERE "active" = ?1`.
         let out = explain_with_plan(FLAGS_BARE_BOOL, FileId(0), Some(&flags_plan()));
         assert_eq!(out.relir.len(), 1, "one pushed query expected");
         let entry = &out.relir[0];
         assert!(
-            entry.sql.contains(r#"WHERE "active" = ?"#),
+            entry.sql.contains(r#"WHERE "active" = ?1"#),
             "bare Boolean predicate should push as an equality, got: {}",
             entry.sql
         );
@@ -7989,7 +8154,7 @@ oper main {}\n\
         assert_eq!(
             entry.sql,
             // Conjuncts in source order; full heading keeps key `id` → no DISTINCT.
-            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ? AND "message" = ?"#
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?1 AND "message" = ?2"#
         );
         assert_eq!(
             entry.expr.render(),
@@ -8032,14 +8197,14 @@ oper main {}\n\
     #[test]
     fn dynamic_bound_local_restrict_pushes_and_binds_the_local() {
         // `Greetings where message = wanted` — the restriction value is a bound
-        // `Text` local, not a literal. It pushes as `WHERE "message" = ?` and the
+        // `Text` local, not a literal. It pushes as `WHERE "message" = ?1` and the
         // query binds the local's already-lowered value (no fresh `Const`), which
         // is what turns the old whole-relvar in-process load into one SELECT.
         let out = explain_with_plan(HELLO_WORLD_DB_DYN_PARAM, FileId(0), Some(&greetings_plan()));
         assert_eq!(out.relir.len(), 1, "one pushed query expected");
         assert_eq!(
             out.relir[0].sql,
-            r#"SELECT "id", "message" FROM "greetings" WHERE "message" = ?"#
+            r#"SELECT "id", "message" FROM "greetings" WHERE "message" = ?1"#
         );
         // The RelExpr carries a bound parameter, rendered as `:wanted`.
         assert_eq!(
@@ -8141,7 +8306,7 @@ oper main {}\n\
         assert_eq!(
             m.plans[0].sql,
             // No DISTINCT: the full heading keeps key `id`, so already a set.
-            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?"#
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?1"#
         );
         assert_eq!(m.plans[0].param_count, 1);
         assert_eq!(m.plans[0].db_name, "greetings");
@@ -8216,7 +8381,7 @@ public relvar Greetings { id: Integer, message: Text } key { id };\n\
         assert_eq!(m.plans.len(), 1);
         assert_eq!(
             m.plans[0].sql,
-            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?"#
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?1"#
         );
     }
 
@@ -8244,7 +8409,7 @@ public relvar Greetings { id: Integer, message: Text } key { id };\n\
         assert_eq!(m.plans.len(), 1);
         assert_eq!(
             m.plans[0].sql,
-            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?"#
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?1"#
         );
     }
 
@@ -8445,7 +8610,7 @@ oper main {}\n\
         assert_eq!(
             m.plans[0].sql,
             // No DISTINCT: `where id = 1` on the key bounds cardinality to ≤ 1.
-            r#"SELECT "message" FROM "greetings" WHERE "id" = ?"#
+            r#"SELECT "message" FROM "greetings" WHERE "id" = ?1"#
         );
         assert_eq!(m.plans[0].param_count, 1);
     }
@@ -8494,7 +8659,7 @@ oper main {}\n\
         assert_eq!(m.plans.len(), 1);
         assert_eq!(
             m.plans[0].sql,
-            r#"SELECT "message" FROM "greetings" WHERE "id" = ?"#
+            r#"SELECT "message" FROM "greetings" WHERE "id" = ?1"#
         );
     }
 
@@ -8634,7 +8799,7 @@ oper main {} [
         assert_eq!(m.plans.len(), 1);
         assert_eq!(
             m.plans[0].sql,
-            r#"SELECT "id" AS "identifier", "message" AS "msg" FROM "greetings" WHERE "id" = ?"#
+            r#"SELECT "id" AS "identifier", "message" AS "msg" FROM "greetings" WHERE "id" = ?1"#
         );
         let main = m.functions.iter().find(|f| f.name == "main").unwrap();
         assert_eq!(
@@ -8664,7 +8829,7 @@ oper main {} [
         assert_eq!(m.plans.len(), 1);
         assert_eq!(
             m.plans[0].sql,
-            r#"SELECT "id", "message", ("id" + "id") AS "twice" FROM "greetings" WHERE "id" = ?"#
+            r#"SELECT "id", "message", ("id" + "id") AS "twice" FROM "greetings" WHERE "id" = ?1"#
         );
     }
 
@@ -8755,7 +8920,7 @@ oper main {} [
     #[test]
     fn delete_public_relvar_emits_dml() {
         // `delete Greetings where id = 1` desugars to `Greetings := Greetings
-        // minus (Greetings where id = 1)` → a surgical `DELETE … WHERE id = ?`.
+        // minus (Greetings where id = 1)` → a surgical `DELETE … WHERE id = ?1`.
         let src = "\
 program hello_world_db;
 database greetings;
@@ -8843,7 +9008,7 @@ oper main {} [
     #[test]
     fn update_public_where_emits_dml() {
         // `update Greetings where id = 1 { message: … }` desugars to the
-        // substitute-union shape → a surgical `UPDATE … SET … WHERE id = ?`.
+        // substitute-union shape → a surgical `UPDATE … SET … WHERE id = ?1`.
         let src = "\
 program hello_world_db;
 database greetings;

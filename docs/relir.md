@@ -14,7 +14,8 @@ This doc describes the **target** RelIR. The code implements a thin slice of it;
 
 - `RelExpr` (`coddl-relir/src/expr.rs`) — four nodes: the `RelvarRef` leaf, `Restrict` (surface `where`), `Project` (project-over *and* project-away), and `Rename`.
 - Per-node **heading** inference and the **storage-origin** flag; declared candidate **keys** on the leaf, used for key-based `DISTINCT`-elision (`needs_distinct`).
-- **The cut** as a trivial origin gate — *not* a cost model: push a subtree iff every leaf is relvar-rooted and SQL emission succeeds (`coddl-procir/src/cut.rs`).
+- **The cut** as an origin gate — *not* a cost model: push a subtree when it touches a relvar (`RelvarRooted` **or** `Mixed`) and SQL emission succeeds (`coddl-procir/src/cut.rs`); a fully `Materialized` tree stays in-process.
+- **Mixed-origin pushdown** via the **`RelParam` leaf** — a relation-valued bind parameter, the relation analogue of `RestrictValue::Param`. A relation-typed local (a bound relation value, a relation-valued tuple field like `req.path`) builds as `RelParam { slot, heading }`; a *maximal materialized subtree* under a binary operator collapses to one slot (its structural build is discarded, its whole AST recorded — the in-process machinery computes it and only its result rows ship). Emission renders each slot as a `VALUES`-backed derived table (`coddl-sqlemit`, "Relation-valued parameters"); the runtime binds the rows at the force point. This implements the settled rule: **ship the local relation up, never pull the relvar down** (see "The cut" below).
 - **SQL pushdown** of relvar-rooted `RelvarRef` / `Restrict` / `Project` / `Rename` via `coddl-sqlemit`.
 - An **in-process path** for non-pushable subtrees — currently lowered to ProcIR within `coddl-procir` itself (not yet through `coddl-execlocal`).
 - Restriction predicates are an `attr <cmp> value` comparison
@@ -51,7 +52,7 @@ This doc describes the **target** RelIR. The code implements a thin slice of it;
 
 - The remaining **A-core nodes** (`AND`, `OR`, `NOT`, `TCLOSE`) and the **sugar → A-core desugaring**. The four nodes above are consumed as-is; nothing is rewritten into A-core form yet. (`REMOVE` and `RENAME` already exist, as `Project` and `Rename`.)
 - The rest of the **sugar layer**: `Summarize`, `Group`, `Ungroup`. (`Join`/`Union`/`Minus`/`Intersect`/`Compose`/`Extend`/`Rename`/`Wrap`/`Unwrap`/`Semijoin` are built. `Wrap`/`Unwrap` lower to `Inst::Restructure` → `coddl_relation_restructure`, in-process, SQL push deferred. `Semijoin { lhs, rhs, negated }` is the one node covering both surface `matching` (semijoin) and `not matching` (antijoin) — see the Sugar layer section below.)
-- The **optimizer** and **cost model**, the `MaterializeAtBoundary` node, and mixed-origin handling beyond the `StorageOrigin::Mixed` flag.
+- The **optimizer** and **cost model**. Mixed-origin handling is built in its default form (`RelParam` shipping, above); a cost model would refine *which* side crosses the boundary for large local relations (temp tables — see [sqlemit.md](sqlemit.md)), not reopen the ship-up default.
 - The per-node **FD set** and **constraint set** (only heading, origin, and leaf keys exist today). **Key inference through the binary nodes** now covers `And` (`join`/`times`/`intersect`/`compose`), `Minus`, and `Semijoin` — `surviving_keys()` propagates keys via the cover + composite rules so those stop emitting a redundant `DISTINCT`, per the "our optimizer does all the work" rule ([principles.md](principles.md) §1). Soundness rules and the running catalog live in [sqlemit.md](sqlemit.md) ("`DISTINCT` elision"). Still open: `Or` (`union`) stays keyless without a disjointness proof (keyless by nature, not a gap), and the in-process **seal** — the ProcIR analogue of `DISTINCT` — is not yet driven by `surviving_keys()`.
 - `coddl-execlocal` (an empty stub) as the RelIR→ProcIR consumer, and the runtime RelIR interpreter (the dynamic path).
 - Pushdown / predicate surface beyond `attr <cmp> literal` comparisons and their conjunctions — disjunction, attribute-vs-attribute, arithmetic in predicates, subset/superset. (Scalar comparisons `=`/`<>`/`<`/`<=`/`>`/`>=` and `and`-chains of them already push.)
@@ -131,11 +132,11 @@ The storage-origin flag drives the optimizer's central decision: **where each su
 
 - A subtree whose every leaf is a public relvar in the same backend → push to SQL via [`coddl-sqlemit`](sqlemit.md). The optimizer can rewrite the whole subtree as one prepared SQL plan.
 - A subtree whose every leaf is a `Relation` literal or private relvar (or any other materialized value) → evaluate in-process. `coddl-execlocal` lowers it to a sequence of ProcIR calls into the runtime library at compile time; the [runtime](runtime.md) RelIR interpreter walks it at runtime for dynamic plans.
-- A mixed-origin subtree → the optimizer inserts a `MaterializeAtBoundary` node. Each side lowers independently; the boundary becomes either "pull SQL results into memory" or "ship in-process rows into a temp table." The cost model picks.
+- A mixed-origin subtree → **ship the local relation up into SQL, never pull the relvar down into memory** (settled while waiting for a cost model; see [principles.md](principles.md) §1). Each maximal materialized subtree collapses to a `RelParam` leaf — a relation-valued bind parameter: the in-process engine computes the local operand, and its *result rows* ship into the pushed query as a `VALUES`-backed derived table at the force point. The whole op runs where the unbounded data lives; the bounded side crosses the boundary. A future cost model refines the mechanism for large local relations (temp tables); it does not reopen the default direction.
 
 **Maximum pushdown** is the goal — draw the cut as close to the leaves as possible, push everything that touches a relvar into SQL, do the rest in-process. The cut is per-subtree, not per-program; one program can mix both engines freely.
 
-*Built today: the cut is a trivial origin gate (push when every leaf is relvar-rooted); the cost model, `MaterializeAtBoundary`, and mixed-origin splitting are not yet built — see Implementation status.*
+*Built today: the origin gate (`Materialized` stays in-process; `RelvarRooted` and `Mixed` push when emission succeeds) and the `RelParam` shipping above. The cost model is not built; the remaining non-pushable shapes fall to the in-process path, where the S1 tripwire (`guard_no_full_relvar_pull`) panics rather than silently pulling a whole relvar — see Implementation status.*
 
 ## What pushes down and what doesn't
 
@@ -150,7 +151,7 @@ What pushes cleanly:
 What doesn't push (and forces the cut higher):
 - User-defined scalar operators not registered with the backend (this is open — see [risks.md](risks.md) risk #2, "How honest about SQL are you willing to be?").
 - Recursive / fixpoint queries beyond the dialect's `WITH RECURSIVE` support.
-- Anything that touches a private relvar or a relation literal on either side of a join.
+- A local relation whose heading carries a Tuple-valued attribute (no scalar SQL cell), or a nullary local (no zero-column `VALUES` form) — the mixed push declines and the S1 tripwire marks the gap. A plain scalar-celled local operand *does* push, shipped as a relation-valued parameter (see "The cut").
 
 ## RelIR as data, RelIR as compile target
 

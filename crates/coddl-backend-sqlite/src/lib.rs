@@ -195,7 +195,7 @@ mod tests {
         }
 
         let sql = SqlString {
-            text: r#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = ?"#.to_string(),
+            text: r#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = ?1"#.to_string(),
             param_count: 1,
         };
 
@@ -228,7 +228,7 @@ mod tests {
         }
 
         let sql = SqlString {
-            text: r#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = ?"#.to_string(),
+            text: r#"SELECT DISTINCT "id", "message" FROM "greetings" WHERE "id" = ?1"#.to_string(),
             param_count: 1,
         };
         let backend = SqliteBackend;

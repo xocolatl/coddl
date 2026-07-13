@@ -566,7 +566,7 @@ fn declare_runtime_plan_externs(
     }
     // coddl_register_plan(plan_id: i32, db_name: ptr, db_name_len: i64,
     //                     sql: ptr, sql_len: i64, param_count: i32,
-    //                     desc: ptr) -> i32
+    //                     rel_arities: ptr, n_rels: i64, desc: ptr) -> i32
     {
         let mut sig = obj.make_signature();
         sig.params.push(AbiParam::new(types::I32));
@@ -575,6 +575,8 @@ fn declare_runtime_plan_externs(
         sig.params.push(AbiParam::new(ptr_ty));
         sig.params.push(AbiParam::new(types::I64));
         sig.params.push(AbiParam::new(types::I32));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
         sig.params.push(AbiParam::new(ptr_ty));
         sig.returns.push(AbiParam::new(types::I32));
         let id = obj
@@ -582,10 +584,12 @@ fn declare_runtime_plan_externs(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert("coddl_register_plan".into(), id);
     }
-    // coddl_query(plan_id: i32, params: ptr, n: i64) -> ptr
+    // coddl_query(plan_id: i32, params: ptr, n: i64, rels: ptr, n_rels: i64) -> ptr
     {
         let mut sig = obj.make_signature();
         sig.params.push(AbiParam::new(types::I32));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
         sig.params.push(AbiParam::new(ptr_ty));
         sig.params.push(AbiParam::new(types::I64));
         sig.returns.push(AbiParam::new(ptr_ty));
@@ -632,13 +636,18 @@ struct DbDataIds {
     default_path_len: i64,
 }
 
-/// Per-plan data symbols: the SQL text and the logical database name.
+/// Per-plan data symbols: the SQL text, the logical database name, and (for
+/// a mixed-origin plan) the relation-parameter arity array.
 struct PlanDataIds {
     db_name: DataId,
     db_name_len: i64,
     sql: DataId,
     sql_len: i64,
     param_count: i32,
+    /// The `u32` arity array for the plan's relation-valued parameters, in
+    /// slot order; `None` when the plan ships no relation.
+    rel_arities: Option<DataId>,
+    n_rels: i64,
     /// Index into the module's `heading_desc_ids` for the result heading.
     result_heading_id: usize,
 }
@@ -663,7 +672,9 @@ fn emit_db_data(
     })
 }
 
-/// Emit one plan's SQL + db-name byte constants.
+/// Emit one plan's SQL + db-name byte constants, plus — for a mixed-origin
+/// plan — its relation-parameter arity array (native-endian `u32`s, 4-byte
+/// aligned so the runtime's `*const u32` slice read is well-defined).
 fn emit_plan_data(
     obj: &mut ObjectModule,
     p: &PlanEntry,
@@ -674,12 +685,33 @@ fn emit_plan_data(
         &format!(".plan.{}.db_name", p.plan_id),
         p.db_name.as_bytes(),
     )?;
+    let rel_arities = if p.rel_arities.is_empty() {
+        None
+    } else {
+        let id = obj
+            .declare_data(
+                &format!(".plan.{}.rel_arities", p.plan_id),
+                Linkage::Local,
+                false,
+                false,
+            )
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        let mut dd = DataDescription::new();
+        dd.set_align(4);
+        let bytes: Vec<u8> = p.rel_arities.iter().flat_map(|a| a.to_ne_bytes()).collect();
+        dd.define(bytes.into_boxed_slice());
+        obj.define_data(id, &dd)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        Some(id)
+    };
     Ok(PlanDataIds {
         db_name: dbn,
         db_name_len: p.db_name.len() as i64,
         sql,
         sql_len: p.sql.len() as i64,
         param_count: p.param_count as i32,
+        rel_arities,
+        n_rels: p.rel_arities.len() as i64,
         result_heading_id: p.result_heading_id.0 as usize,
     })
 }
@@ -2685,6 +2717,14 @@ fn emit_inst(
             let sql_addr = builder.ins().symbol_value(ptr_ty, sql_gv);
             let sql_len = builder.ins().iconst(types::I64, p.sql_len);
             let pcount = builder.ins().iconst(types::I32, p.param_count as i64);
+            let arities_addr = match p.rel_arities {
+                Some(id) => {
+                    let gv = obj.declare_data_in_func(id, builder.func);
+                    builder.ins().symbol_value(ptr_ty, gv)
+                }
+                None => builder.ins().iconst(ptr_ty, 0),
+            };
+            let n_rels_v = builder.ins().iconst(types::I64, p.n_rels);
             let desc_id = heading_desc_ids[p.result_heading_id];
             let desc_gv = obj.declare_data_in_func(desc_id, builder.func);
             let desc_addr = builder.ins().symbol_value(ptr_ty, desc_gv);
@@ -2698,6 +2738,8 @@ fn emit_inst(
                     sql_addr,
                     sql_len,
                     pcount,
+                    arities_addr,
+                    n_rels_v,
                     desc_addr,
                 ],
             );
@@ -2707,15 +2749,42 @@ fn emit_inst(
             dst,
             plan_id,
             params,
+            rels,
             heading_id: _,
         } => {
+            let ptr_ty = obj.target_config().pointer_type();
             let params_arg = build_coddl_param_array_cl(obj, builder, values, params)?;
             let plan_id_v = builder.ins().iconst(types::I32, *plan_id as i64);
             let n_v = builder.ins().iconst(types::I64, params.len() as i64);
+            // The CoddlRelParam array — `{ ptr src, ptr desc }` pairs, one per
+            // shipped relation slot (16-byte stride; the runtime owns this
+            // layout, mirroring `build_coddl_param_array_cl`).
+            let rels_arg = if rels.is_empty() {
+                builder.ins().iconst(ptr_ty, 0)
+            } else {
+                let slot =
+                    builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                        (rels.len() * 16) as u32,
+                        3,
+                    ));
+                for (i, (vid, hid)) in rels.iter().enumerate() {
+                    let base = (i * 16) as i32;
+                    let src_v = scalar_value(values, vid)?;
+                    builder.ins().stack_store(src_v, slot, base);
+                    let desc_id = heading_desc_ids[hid.0 as usize];
+                    let desc_gv = obj.declare_data_in_func(desc_id, builder.func);
+                    let desc_v = builder.ins().symbol_value(ptr_ty, desc_gv);
+                    builder.ins().stack_store(desc_v, slot, base + 8);
+                }
+                builder.ins().stack_addr(ptr_ty, slot, 0)
+            };
+            let n_rels_v = builder.ins().iconst(types::I64, rels.len() as i64);
             let query_local = obj.declare_func_in_func(funcs["coddl_query"], builder.func);
-            let call = builder
-                .ins()
-                .call(query_local, &[plan_id_v, params_arg, n_v]);
+            let call = builder.ins().call(
+                query_local,
+                &[plan_id_v, params_arg, n_v, rels_arg, n_rels_v],
+            );
             let result = builder.inst_results(call)[0];
             values.insert(*dst, ValueRepr::Scalar(result));
             Ok(())

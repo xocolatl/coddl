@@ -136,10 +136,20 @@ struct Emitter {
     /// right (ptr, len) pair to `coddl_resolve_op_field` and
     /// `coddl_sqlite_relvar_init`.
     byte_const_lens: HashMap<String, usize>,
-    /// Per-module pushed-plan metadata: plan id → (param count, result
-    /// heading id). `Inst::RegisterPlan` reads these to call
-    /// `coddl_register_plan` with the right bind count and descriptor.
-    plan_meta: HashMap<u32, (u32, u32)>,
+    /// Per-module pushed-plan metadata. `Inst::RegisterPlan` reads these to
+    /// call `coddl_register_plan` with the right bind count, rel-param
+    /// arities, and descriptor.
+    plan_meta: HashMap<u32, PlanMeta>,
+}
+
+/// One pushed plan's registration metadata: scalar bind count, result heading
+/// id, and the number of relation-valued parameters (whose arities live in
+/// the `@.plan.<id>.rel_arities` static this count sizes).
+#[derive(Clone)]
+struct PlanMeta {
+    param_count: u32,
+    result_heading_id: u32,
+    n_rels: usize,
 }
 
 impl Emitter {
@@ -407,10 +417,14 @@ impl Emitter {
         .unwrap();
         writeln!(
             self.body,
-            "declare i32 @coddl_register_plan(i32, ptr, i64, ptr, i64, i32, ptr)"
+            "declare i32 @coddl_register_plan(i32, ptr, i64, ptr, i64, i32, ptr, i64, ptr)"
         )
         .unwrap();
-        writeln!(self.body, "declare ptr @coddl_query(i32, ptr, i64)").unwrap();
+        writeln!(
+            self.body,
+            "declare ptr @coddl_query(i32, ptr, i64, ptr, i64)"
+        )
+        .unwrap();
         writeln!(self.body, "declare i32 @coddl_exec(i32, ptr, i64)").unwrap();
         writeln!(self.body, "declare i32 @coddl_exec_insert(i32, ptr, ptr)").unwrap();
     }
@@ -432,8 +446,29 @@ impl Emitter {
                 &format!("@.plan.{}.db_name", p.plan_id),
                 p.db_name.as_bytes(),
             );
-            self.plan_meta
-                .insert(p.plan_id, (p.param_count, p.result_heading_id.0));
+            // The relation-parameter arities ride a static i32 array (one
+            // entry per shipped slot, in slot order); a plan with none passes
+            // a null pointer instead.
+            if !p.rel_arities.is_empty() {
+                let entries: Vec<String> =
+                    p.rel_arities.iter().map(|a| format!("i32 {a}")).collect();
+                writeln!(
+                    self.globals,
+                    "@.plan.{}.rel_arities = private unnamed_addr constant [{} x i32] [{}]",
+                    p.plan_id,
+                    p.rel_arities.len(),
+                    entries.join(", "),
+                )
+                .unwrap();
+            }
+            self.plan_meta.insert(
+                p.plan_id,
+                PlanMeta {
+                    param_count: p.param_count,
+                    result_heading_id: p.result_heading_id.0,
+                    n_rels: p.rel_arities.len(),
+                },
+            );
         }
     }
 
@@ -1198,8 +1233,9 @@ impl Emitter {
                 dst,
                 plan_id,
                 params,
+                rels,
                 heading_id,
-            } => self.lower_query(*dst, *plan_id, params, *heading_id),
+            } => self.lower_query(*dst, *plan_id, params, rels, *heading_id),
             Inst::Dml { plan_id, params } => self.lower_dml(*plan_id, params),
             Inst::InsertFrom {
                 plan_id,
@@ -1248,20 +1284,28 @@ impl Emitter {
         Ok(())
     }
 
-    /// Register one baked plan: SQL text + database name + bind count + the
-    /// result heading descriptor, keyed by the dense plan id.
+    /// Register one baked plan: SQL text + database name + scalar bind count
+    /// + relation-parameter arities + the result heading descriptor, keyed by
+    /// the dense plan id.
     fn lower_register_plan(&mut self, plan_id: u32) -> Result<(), LlvmEmitError> {
-        let (param_count, result_heading_id) = *self.plan_meta.get(&plan_id).ok_or_else(|| {
+        let meta = self.plan_meta.get(&plan_id).cloned().ok_or_else(|| {
             LlvmEmitError::UnsupportedInst(format!(
                 "RegisterPlan references unknown plan {plan_id}"
             ))
         })?;
+        let arities_arg = if meta.n_rels == 0 {
+            "ptr null".to_string()
+        } else {
+            format!("ptr @.plan.{plan_id}.rel_arities")
+        };
         writeln!(
             self.body,
-            "    call i32 @coddl_register_plan(i32 {plan_id}, ptr @.plan.{plan_id}.db_name, i64 {db_len}, ptr @.plan.{plan_id}.sql, i64 {sql_len}, i32 {param_count}, ptr @.heading.{hid})",
+            "    call i32 @coddl_register_plan(i32 {plan_id}, ptr @.plan.{plan_id}.db_name, i64 {db_len}, ptr @.plan.{plan_id}.sql, i64 {sql_len}, i32 {param_count}, {arities_arg}, i64 {n_rels}, ptr @.heading.{hid})",
             db_len = self.const_byte_len(&format!("@.plan.{plan_id}.db_name")),
             sql_len = self.const_byte_len(&format!("@.plan.{plan_id}.sql")),
-            hid = result_heading_id,
+            param_count = meta.param_count,
+            n_rels = meta.n_rels,
+            hid = meta.result_heading_id,
         )
         .unwrap();
         Ok(())
@@ -1342,21 +1386,52 @@ impl Emitter {
         Ok(format!("ptr {arr}"))
     }
 
-    /// Execute a registered plan: build the `CoddlParam` array on the stack,
-    /// call `coddl_query`, and bind the returned relation pointer to `dst`.
+    /// Execute a registered plan: build the `CoddlParam` array (and, for a
+    /// mixed-origin plan, the `CoddlRelParam` array — `{ src, desc }` pointer
+    /// pairs, one per shipped relation slot) on the stack, call `coddl_query`,
+    /// and bind the returned relation pointer to `dst`.
     fn lower_query(
         &mut self,
         dst: ValueId,
         plan_id: u32,
         params: &[(ValueId, ProcType)],
+        rels: &[(ValueId, HeadingId)],
         _heading_id: HeadingId,
     ) -> Result<(), LlvmEmitError> {
         let n = params.len();
         let dst_name = format!("%v{}", dst.0);
         let params_arg = self.build_coddl_param_array(params)?;
+        // CoddlRelParam is `{ ptr src, ptr desc }` (16-byte stride; the
+        // runtime owns this layout, mirroring `build_coddl_param_array`).
+        let n_rels = rels.len();
+        let rels_arg = if n_rels == 0 {
+            "ptr null".to_string()
+        } else {
+            let arr = format!("%qrels.{}", self.next_str);
+            self.next_str += 1;
+            writeln!(
+                self.body,
+                "    {arr} = alloca [{n_rels} x {{ ptr, ptr }}], align 8"
+            )
+            .unwrap();
+            for (i, (vid, hid)) in rels.iter().enumerate() {
+                let base = i * 16;
+                let op = self.scalar_op(vid)?;
+                let src_slot = self.gep_byte(&arr, base);
+                writeln!(self.body, "    store ptr {op}, ptr {src_slot}").unwrap();
+                let desc_slot = self.gep_byte(&arr, base + 8);
+                writeln!(
+                    self.body,
+                    "    store ptr @.heading.{}, ptr {desc_slot}",
+                    hid.0
+                )
+                .unwrap();
+            }
+            format!("ptr {arr}")
+        };
         writeln!(
             self.body,
-            "    {dst_name} = call ptr @coddl_query(i32 {plan_id}, {params_arg}, i64 {n})"
+            "    {dst_name} = call ptr @coddl_query(i32 {plan_id}, {params_arg}, i64 {n}, {rels_arg}, i64 {n_rels})"
         )
         .unwrap();
         self.values.insert(

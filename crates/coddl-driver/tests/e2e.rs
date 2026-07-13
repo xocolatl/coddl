@@ -3367,7 +3367,7 @@ fn explain_dumps_relir_tree_paired_with_its_sql() {
         "Project { keep: message }",
         "Restrict { id = 1 }",
         "RelvarRef Greetings { db: greetings, table: greetings }",
-        r#"SELECT "message" FROM "greetings" WHERE "id" = ?"#,
+        r#"SELECT "message" FROM "greetings" WHERE "id" = ?1"#,
     ] {
         assert!(
             stdout.contains(needle),
@@ -3452,6 +3452,58 @@ fn explain_dumps_semijoin_as_where_exists() {
         !stdout.contains("INNER JOIN") && !stdout.contains("EXCEPT"),
         "semijoin pushed as a join/EXCEPT instead of EXISTS:\n{stdout}"
     );
+}
+
+/// A **mixed-origin** projected semijoin — public relvar `matching` a local
+/// relation, projected — pushes as one plan: `coddl explain` shows the
+/// `RelParam` leaf in the RelIR tree, the `__CODDL_REL_0__` marker standing
+/// for the shipped rows, and `SELECT DISTINCT` (the projection drops the
+/// surviving key `sno`).
+#[test]
+fn explain_dumps_mixed_semijoin_with_rel_param() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_semijoin_pushdown_fixtures(tmp.path());
+    let cd = tmp.path().join("mixed.cd");
+    std::fs::write(
+        &cd,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         public relvar Shipments { pno: Integer, sno: Integer } key { pno, sno };\n\
+         oper main {} [\n\
+             let wanted = Relation { { sno: 1, ordinality: 0 } };\n\
+             let names = transaction [ Suppliers matching wanted project { sname } ];\n\
+             write_relation { rel: names };\n\
+         ];\n",
+    )
+    .expect("write mixed.cd");
+
+    let out = coddl()
+        .args(["explain"])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl explain {:?} failed: stderr=\n{}",
+        cd,
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for needle in [
+        "Project { keep: sname }",
+        "Semijoin",
+        "RelParam #0 { ordinality, sno }",
+        "__CODDL_REL_0__",
+        r#"SELECT DISTINCT coddl_l."sname""#,
+        r#"WHERE EXISTS (SELECT 1 FROM"#,
+        r#"coddl_l."sno" = coddl_r."sno""#,
+    ] {
+        assert!(
+            stdout.contains(needle),
+            "explain output missing {needle:?}; got:\n{stdout}"
+        );
+    }
 }
 
 /// Compile + run a self-owned relvar-rooted pushdown program on `backend`,
@@ -3594,7 +3646,7 @@ fn run_greetings_stdout(backend: &str, program: &str) -> Vec<u8> {
 }
 
 /// `Greetings where message = wanted`, with `wanted` a **runtime-computed** Text
-/// local, pushes as `WHERE "message" = ?` and binds the local's value — so it
+/// local, pushes as `WHERE "message" = ?1` and binds the local's value — so it
 /// selects the row equal to the *computed* string. Picking `"good" || "bye"` out
 /// of the two-row table proves the bind carried the right runtime value: a
 /// broken bind (empty / wrong / a stale literal) would match nothing or row 1.
@@ -3633,7 +3685,7 @@ fn dynamic_param_selects_by_local_cranelift() {
 }
 
 /// A restriction mixing a **literal** and a **bound-local** value in one `where`
-/// binds both params in placeholder order (`WHERE "message" = ? AND "id" = ?`).
+/// binds both params in placeholder order (`WHERE "message" = ?1 AND "id" = ?2`).
 /// Selecting the row whose message equals the computed local AND whose id is the
 /// literal `2` returns exactly `goodbye`; swapping the intended order would match
 /// nothing. Proves lit + dyn params interleave correctly end-to-end.
@@ -3673,10 +3725,12 @@ fn mixed_literal_and_dynamic_param_cranelift() {
 
 /// Seed a two-table `parts` SQLite db (`suppliers`, `shipments`) + its
 /// `.cddb`/`.cdstore` companions, compile and run `program` on `backend`, and
-/// return its stdout. The suppliers 1 and 2 ship; supplier 3 ships nothing. The
-/// suite owns its source. `CODDL_PARTS_FILE` overrides the store's relative path
-/// with the absolute temp-db path (the run's cwd isn't the fixture dir).
-fn run_parts_stdout(backend: &str, program: &str) -> Vec<u8> {
+/// return its stdout plus (when `want_audit`) the runtime's audit log — every
+/// SQL statement the run fired, in expanded form. The suppliers 1 and 2 ship;
+/// supplier 3 ships nothing. The suite owns its source. `CODDL_PARTS_FILE`
+/// overrides the store's relative path with the absolute temp-db path (the
+/// run's cwd isn't the fixture dir).
+fn run_parts_program(backend: &str, program: &str, want_audit: bool) -> (Vec<u8>, String) {
     ensure_runtime_built();
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
@@ -3711,8 +3765,13 @@ fn run_parts_stdout(backend: &str, program: &str) -> Vec<u8> {
     let cd = dir.join("sel.cd");
     std::fs::write(&cd, program).expect("write sel.cd");
 
-    let out = coddl()
-        .env("CODDL_PARTS_FILE", &db)
+    let audit_path = dir.join("audit.log");
+    let mut cmd = coddl();
+    cmd.env("CODDL_PARTS_FILE", &db);
+    if want_audit {
+        cmd.env("CODDL_AUDIT_LOG", &audit_path);
+    }
+    let out = cmd
         .args(["run", &format!("--backend={backend}")])
         .arg(&cd)
         .output()
@@ -3723,14 +3782,27 @@ fn run_parts_stdout(backend: &str, program: &str) -> Vec<u8> {
         cd,
         String::from_utf8_lossy(&out.stderr),
     );
-    out.stdout
+    let audit = if want_audit {
+        std::fs::read_to_string(&audit_path).expect("read audit log")
+    } else {
+        String::new()
+    };
+    (out.stdout, audit)
+}
+
+/// [`run_parts_program`] without the audit log.
+fn run_parts_stdout(backend: &str, program: &str) -> Vec<u8> {
+    run_parts_program(backend, program, false).0
 }
 
 /// `Suppliers matching Shipments` / `not matching` pushed to SQL as correlated
 /// `WHERE [NOT] EXISTS` and executed against SQLite: the semijoin returns the
 /// suppliers that ship (1, 2 — deduped despite S1's two shipments), the antijoin
-/// the one that doesn't (3). Exercises the whole path — `Semijoin` RelIR →
-/// EXISTS emission → SQLite execution → `coddl_l.*` result marshalling.
+/// the one that doesn't (3). The third query pushes a **projected** semijoin
+/// (`… matching … project { sname }` — the root `Project` peels over the
+/// `Semijoin` and the dropped key makes the outer SELECT `DISTINCT`). Exercises
+/// the whole path — `Semijoin` RelIR → EXISTS emission → SQLite execution →
+/// enumerated-column result marshalling.
 fn assert_semijoin_pushdown(backend: &str) {
     let stdout = run_parts_stdout(
         backend,
@@ -3743,6 +3815,8 @@ fn assert_semijoin_pushdown(backend: &str) {
              write_relation { rel: shipping };\n\
              let idle = transaction [ Suppliers not matching Shipments ];\n\
              write_relation { rel: idle };\n\
+             let names = transaction [ Suppliers matching Shipments project { sname } ];\n\
+             write_relation { rel: names };\n\
          ];\n",
     );
     assert_eq!(
@@ -3753,6 +3827,9 @@ fn assert_semijoin_pushdown(backend: &str) {
             "{sname: \"Jones\", sno: 2}",
             // Suppliers not matching Shipments
             "{sname: \"Blake\", sno: 3}",
+            // Suppliers matching Shipments project { sname }
+            "{sname: \"Smith\"}",
+            "{sname: \"Jones\"}",
         ]),
         "backend={backend}"
     );
@@ -3766,6 +3843,124 @@ fn semijoin_pushdown_llvm() {
 #[test]
 fn semijoin_pushdown_cranelift() {
     assert_semijoin_pushdown("cranelift");
+}
+
+// ── mixed-origin pushdown: relation-valued parameters ──────────────────
+
+/// A public relvar combined with an **in-process relation value** pushes to
+/// SQL with the local operand shipped as a relation-valued parameter — a
+/// `(VALUES …)` derived table bound at run time — never by pulling the relvar
+/// into memory (the settled mixed-origin rule). Four shapes, each against the
+/// live SQLite fixture:
+///   - `Suppliers matching wanted` — the local `{sno, ordinality}` relation
+///     rides the EXISTS; suppliers 1 and 3 match.
+///   - `Suppliers not matching wanted` — the antijoin complement (2).
+///   - `Suppliers matching none` — an **empty** local (an in-process `where`
+///     filtered everything out) ships as the typed zero-row SELECT; the
+///     semijoin returns nothing (no output lines).
+///   - `(Suppliers where sname = who) matching narrowed` — a **scalar** bind
+///     parameter (`?1`, the local `who`) composed with a shipped relation
+///     (cells `?2…`), proving the numbered placeholders interleave correctly;
+///     only Smith survives both filters.
+fn assert_mixed_origin_pushdown(backend: &str) {
+    let (stdout, audit) = run_parts_program(
+        backend,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         public relvar Shipments { pno: Integer, sno: Integer } key { pno, sno };\n\
+         oper main {} [\n\
+             let wanted = Relation { { sno: 1, ordinality: 0 }, { sno: 3, ordinality: 1 } };\n\
+             let shipping = transaction [ Suppliers matching wanted ];\n\
+             write_relation { rel: shipping };\n\
+             let idle = transaction [ Suppliers not matching wanted ];\n\
+             write_relation { rel: idle };\n\
+             let none = wanted where sno = 99;\n\
+             let nothing = transaction [ Suppliers matching none ];\n\
+             write_relation { rel: nothing };\n\
+             let who = \"Smith\";\n\
+             let narrowed = Relation { { sno: 1 }, { sno: 2 } };\n\
+             let both = transaction [ (Suppliers where sname = who) matching narrowed ];\n\
+             write_relation { rel: both };\n\
+         ];\n",
+        true,
+    );
+    assert_eq!(
+        tuple_lines(&stdout),
+        sorted_tuples(&[
+            // Suppliers matching wanted
+            "{sname: \"Smith\", sno: 1}",
+            "{sname: \"Blake\", sno: 3}",
+            // Suppliers not matching wanted
+            "{sname: \"Jones\", sno: 2}",
+            // Suppliers matching none — empty, no lines
+            // (Suppliers where sname = who) matching narrowed
+            "{sname: \"Smith\", sno: 1}",
+        ]),
+        "backend={backend}"
+    );
+    // The audit log (expanded SQL) proves where the work ran: every mixed
+    // query is one EXISTS statement over `suppliers` with the local rows
+    // inlined as VALUES — and no statement ever pulled the relvar bare.
+    assert!(
+        audit.contains("WHERE EXISTS") && audit.contains("(VALUES ("),
+        "expected an EXISTS query with a VALUES-shipped operand; audit:\n{audit}"
+    );
+    assert!(
+        audit.contains("WHERE 0"),
+        "expected the empty local to ship as the typed zero-row SELECT; audit:\n{audit}"
+    );
+    for line in audit.lines() {
+        assert!(
+            !line.trim_end().ends_with(r#"FROM "suppliers""#),
+            "a statement pulled the whole relvar bare: {line}"
+        );
+    }
+}
+
+#[test]
+fn mixed_origin_pushdown_llvm() {
+    assert_mixed_origin_pushdown("llvm");
+}
+
+#[test]
+fn mixed_origin_pushdown_cranelift() {
+    assert_mixed_origin_pushdown("cranelift");
+}
+
+/// The `req.path` shape: a relation-valued **field of a tuple-typed local**
+/// builds as a `RelParam` leaf directly (`t.path` — the heading is static in
+/// the tuple's type), so a handler-style `Relvar matching t.path` pushes as
+/// the mixed semijoin without naming the relation first.
+fn assert_mixed_origin_field_access(backend: &str) {
+    let stdout = run_parts_stdout(
+        backend,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         public relvar Shipments { pno: Integer, sno: Integer } key { pno, sno };\n\
+         oper main {} [\n\
+             let wanted = Relation { { sno: 1, ordinality: 0 }, { sno: 3, ordinality: 1 } };\n\
+             let t = { path: wanted };\n\
+             let viafield = transaction [ Suppliers matching t.path ];\n\
+             write_relation { rel: viafield };\n\
+         ];\n",
+    );
+    assert_eq!(
+        tuple_lines(&stdout),
+        sorted_tuples(&["{sname: \"Smith\", sno: 1}", "{sname: \"Blake\", sno: 3}",]),
+        "backend={backend}"
+    );
+}
+
+#[test]
+fn mixed_origin_field_access_llvm() {
+    assert_mixed_origin_field_access("llvm");
+}
+
+#[test]
+fn mixed_origin_field_access_cranelift() {
+    assert_mixed_origin_field_access("cranelift");
 }
 
 // ── Boolean `not` (prefix negation) ───────────────────────────────────
@@ -4024,7 +4219,7 @@ fn dml_delete_where_persists_cranelift() {
 }
 
 /// `delete Greetings where message = doomed` with `doomed` a bound Text local
-/// pushes as `DELETE FROM greetings WHERE "message" = ?` and binds the local, so
+/// pushes as `DELETE FROM greetings WHERE "message" = ?1` and binds the local, so
 /// only the matching row is removed — the dynamic-parameter path rides the DML
 /// predicate for free (same `emit_params`). Deleting the computed `"goodbye"`
 /// leaves only `hello world`. Same result on both backends.
@@ -5234,7 +5429,7 @@ fn project_nullary_collapses_to_single_empty_tuple() {
 }
 
 /// Pushed nullary projection: `Greetings where id = <n> project {}` lowers to
-/// `SELECT DISTINCT 1 … WHERE "id" = ?`, which the runtime marshals against the
+/// `SELECT DISTINCT 1 … WHERE "id" = ?1`, which the runtime marshals against the
 /// empty descriptor as `reltrue` (one `{}` row when the tuple exists) or
 /// `relfalse` (no rows when it doesn't).
 fn run_pushed_nullary(backend: &str, where_id: i64) -> Vec<u8> {

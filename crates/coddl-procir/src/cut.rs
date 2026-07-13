@@ -1,35 +1,45 @@
-//! The SQL pushdown cut: decide whether a relvar-rooted relational subtree
-//! can be served by the backend and, if so, bake its SQL.
+//! The SQL pushdown cut: decide whether a relational subtree can be served by
+//! the backend and, if so, bake its SQL.
 //!
-//! v1 is a trivial gate, not a cost model: push when every leaf is a public
-//! relvar (`StorageOrigin::RelvarRooted`) and SQL emission succeeds; otherwise
-//! fall back to the in-process materialize path so nothing regresses. This is
-//! the seam where a real cost model lands later.
+//! The gate is origin-driven, not a cost model. A `RelvarRooted` tree (every
+//! leaf a public relvar) pushes when SQL emission succeeds. A `Mixed` tree —
+//! public relvars combined with in-process relation values — **also pushes**:
+//! the lowerer has already collapsed every materialized subtree to a
+//! `RelExpr::RelParam` leaf, and emission renders each as a VALUES-backed
+//! derived table whose rows the runtime binds. This is the settled
+//! mixed-origin rule (docs/relir.md "The cut"): always ship the local relation
+//! *up* into SQL, never pull the relvar *down* into memory — the local side
+//! is bounded (a request path, a literal, a private relvar) while the relvar
+//! side is unbounded. A fully `Materialized` tree stays in-process (there may
+//! not even be a database). The seam where a real cost model lands later is
+//! here; until then ship-up is unconditional.
 
 use coddl_relir::{RelExpr, StorageOrigin};
 use coddl_sqlemit::{emit_select_ordered, Dialect, SqlQuery};
 
 /// Try to push `expr` to the backend.
 ///
-/// Returns the baked [`SqlQuery`] when the subtree is relvar-rooted and emits
-/// cleanly, else `None` — the caller then lowers `expr` via the legacy
-/// in-process path.
+/// Returns the baked [`SqlQuery`] when the subtree touches a relvar
+/// (`RelvarRooted` or `Mixed`) and emits cleanly, else `None` — the caller
+/// then lowers `expr` via the in-process path. A `Mixed` query's
+/// `rel_params` name the shipped relation slots.
 pub fn try_push(expr: &RelExpr, dialect: Dialect) -> Option<SqlQuery> {
     try_push_ordered(expr, dialect, &[])
 }
 
 /// Try to push `expr` with a trailing `ORDER BY` for the `load … order [ … ]`
 /// boundary. `order` is the sort keys as `(attribute-name, is_descending)`
-/// pairs. Returns the ordered [`SqlQuery`] when the subtree is relvar-rooted and
-/// the order attaches cleanly; `None` otherwise (not relvar-rooted, or a root
-/// set-op / `tclose` that can't carry a trailing `ORDER BY` in v1) — the caller
-/// then sorts in-process. An empty `order` is exactly [`try_push`].
+/// pairs. Returns the ordered [`SqlQuery`] when the subtree touches a relvar
+/// and the order attaches cleanly; `None` otherwise (fully materialized, or a
+/// root set-op / semijoin / `tclose` that can't carry a trailing `ORDER BY`
+/// in v1) — the caller then sorts in-process. An empty `order` is exactly
+/// [`try_push`].
 pub fn try_push_ordered(
     expr: &RelExpr,
     dialect: Dialect,
     order: &[(String, bool)],
 ) -> Option<SqlQuery> {
-    if expr.origin() != StorageOrigin::RelvarRooted {
+    if expr.origin() == StorageOrigin::Materialized {
         return None;
     }
     emit_select_ordered(expr, dialect, order).ok()
@@ -71,7 +81,7 @@ mod tests {
         assert_eq!(
             q.sql.text,
             // Full heading keeps key `id` → already a set → no DISTINCT.
-            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?"#
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?1"#
         );
         assert_eq!(q.sql.param_count, 1);
     }
@@ -126,7 +136,7 @@ mod tests {
             .expect("relvar-rooted ordered load pushes");
         assert_eq!(
             q.sql.text,
-            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ? ORDER BY "message""#
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?1 ORDER BY "message""#
         );
     }
 
