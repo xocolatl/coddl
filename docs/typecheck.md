@@ -820,3 +820,4 @@ check script enforces that.
 | T0093 | a `return` sits lexically inside a `transaction [...]` — its early exit would skip the transaction's commit, so it is rejected until real BEGIN/COMMIT lands (hoist the `return` out of the transaction, or restructure) |
 | T0094 | `matching` / `not matching` operands have **identical** headings — the semijoin/antijoin matches on every attribute, which is a set intersection / difference; suggests `intersect` (matching) / `minus` (not matching) |
 | T0095 | `matching` / `not matching` operands are **disjoint** (share no attribute) — a semijoin has no key to match on and degenerates to an existence guard on the left operand; rejected (like `join`/`compose`, the operands must partially overlap) |
+| T0096 | a `Relation { … }` literal element is not a tuple — the relation selector's elements are tuple-typed expressions (a tuple literal `{a:1}`, or a tuple-valued name/call), and a relation is a set of tuples |

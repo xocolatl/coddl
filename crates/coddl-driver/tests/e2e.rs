@@ -56,6 +56,9 @@ fn fixtures_dir() -> &'static Path {
             ("join-times-compose", JOIN_TIMES_COMPOSE_SRC),
             ("union-intersect-minus", UNION_INTERSECT_MINUS_SRC),
             ("matching-not-matching", MATCHING_NOT_MATCHING_SRC),
+            ("relation-lit-expr", RELATION_LIT_EXPR_SRC),
+            ("relation-lit-boxed", RELATION_LIT_BOXED_SRC),
+            ("nested-relation-print", NESTED_RELATION_PRINT_SRC),
             ("transitive-closure", TCLOSE_SRC),
             ("handle-mainless", HANDLE_MAINLESS_SRC),
             ("app-lifecycle", APP_LIFECYCLE_SRC),
@@ -1003,6 +1006,54 @@ oper main {} [
 
     let via_anti_glyph = Suppliers ▷ Shipments;
     write_relation { rel: via_anti_glyph };
+];
+";
+
+// Relation selector with tuple-valued **expression** elements (not just inline
+// tuple literals). Binds a tuple local `t`, builds `Relation { t }` (the singleton
+// relation containing it), then reuses `t` in a second literal mixed with an inline
+// tuple — which catches a premature release of `t`'s cells (a use-after-free) — and
+// ships tuple variables into a private relvar via `:=` (the runtime row path).
+const RELATION_LIT_EXPR_SRC: &str = "\
+program relation_lit_expr;
+
+private relvar Items { a: Integer, b: Text } key { a };
+
+oper main {} [
+    let t = { a: 1, b: \"x\" };
+    write_relation { rel: Relation { t } };
+    write_relation { rel: Relation { { a: 2, b: \"y\" }, t } };
+    let u = { a: 3, b: \"z\" };
+    Items := Relation { t, u };
+    write_relation { rel: Items };
+];
+";
+
+// A **wide (boxed) tuple** as a relation-literal element. Coddl boxes wide
+// tuples (a single pointer), but `Inst::RelationLit` writes flattened tuple
+// bytes — so lowering unboxes the element first (`Inst::TupleUnbox`). Reusing
+// `w` in a second literal catches a premature release of the box (use-after-free).
+const RELATION_LIT_BOXED_SRC: &str = "\
+program relation_lit_boxed;
+
+oper main {} [
+    let w = { c1: 1, c2: 2, c3: 3, c4: 4, c5: 5, c6: 6, c7: 7, c8: 8 };
+    write_relation { rel: Relation { w } };
+    write_relation { rel: Relation { { c1: 9, c2: 9, c3: 9, c4: 9, c5: 9, c6: 9, c7: 9, c8: 9 }, w } };
+];
+";
+
+// A relation with a **relation-valued attribute** — the printer renders the
+// nested relation recursively (`items: {{a: 1}, {a: 2}}`) instead of a `{...}`
+// placeholder. Also covers an empty nested relation (`items: {}`).
+const NESTED_RELATION_PRINT_SRC: &str = "\
+program nested_relation_print;
+
+oper main {} [
+    let inner = Relation { {a: 1}, {a: 2} };
+    write_relation { rel: Relation { { label: \"xs\", items: inner } } };
+    let empty = inner minus inner;
+    write_relation { rel: Relation { { label: \"none\", items: empty } } };
 ];
 ";
 
@@ -6561,6 +6612,126 @@ fn matching_not_matching_inprocess_cranelift_dumps_semijoins() {
         tuple_lines(&out.stdout),
         sorted_tuples(MATCHING_NOT_MATCHING_TUPLES)
     );
+}
+
+/// `Relation { t }` (a tuple-variable element) prints `t`; the mixed literal +
+/// variable literal prints both; and `Items := Relation { t, u }` ships the two
+/// tuples into the relvar. The reuse of `t` after the first `Relation { t }`
+/// exercises RC — a premature release would crash or corrupt the later reads.
+const RELATION_LIT_EXPR_TUPLES: &[&str] = &[
+    // Relation { t }
+    "{a: 1, b: \"x\"}",
+    // Relation { {a:2,b:"y"}, t }
+    "{a: 1, b: \"x\"}",
+    "{a: 2, b: \"y\"}",
+    // Items (:= Relation { t, u })
+    "{a: 1, b: \"x\"}",
+    "{a: 3, b: \"z\"}",
+];
+
+fn assert_relation_lit_expr(backend: &str) {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", &format!("--backend={backend}")])
+        .arg(fixture_path("relation-lit-expr"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "relation-lit-expr {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        tuple_lines(&out.stdout),
+        sorted_tuples(RELATION_LIT_EXPR_TUPLES),
+        "backend={backend}"
+    );
+}
+
+#[test]
+fn relation_lit_expression_elements_llvm() {
+    assert_relation_lit_expr("llvm");
+}
+
+#[test]
+fn relation_lit_expression_elements_cranelift() {
+    assert_relation_lit_expr("cranelift");
+}
+
+/// A wide (boxed) tuple element unboxes to a flattened operand for the
+/// `RelationLit`; the second literal reuses `w` (proving the box wasn't released
+/// prematurely). Prints the 8-field tuple twice (`{w}` and the mixed literal)
+/// plus the all-9s row.
+const RELATION_LIT_BOXED_TUPLES: &[&str] = &[
+    "{c1: 1, c2: 2, c3: 3, c4: 4, c5: 5, c6: 6, c7: 7, c8: 8}",
+    "{c1: 9, c2: 9, c3: 9, c4: 9, c5: 9, c6: 9, c7: 9, c8: 9}",
+    "{c1: 1, c2: 2, c3: 3, c4: 4, c5: 5, c6: 6, c7: 7, c8: 8}",
+];
+
+fn assert_relation_lit_boxed(backend: &str) {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", &format!("--backend={backend}")])
+        .arg(fixture_path("relation-lit-boxed"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "relation-lit-boxed {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        tuple_lines(&out.stdout),
+        sorted_tuples(RELATION_LIT_BOXED_TUPLES),
+        "backend={backend}"
+    );
+}
+
+#[test]
+fn relation_lit_boxed_tuple_element_llvm() {
+    assert_relation_lit_boxed("llvm");
+}
+
+#[test]
+fn relation_lit_boxed_tuple_element_cranelift() {
+    assert_relation_lit_boxed("cranelift");
+}
+
+/// A relation-valued attribute renders recursively: a non-empty nested relation
+/// as `{{a: 1}, {a: 2}}`, an empty one as `{}` — not the old `{...}` placeholder.
+/// Attributes stay in canonical order (`items` before `label`).
+const NESTED_RELATION_PRINT_TUPLES: &[&str] = &[
+    "{items: {{a: 1}, {a: 2}}, label: \"xs\"}",
+    "{items: {}, label: \"none\"}",
+];
+
+fn assert_nested_relation_print(backend: &str) {
+    ensure_runtime_built();
+    let out = coddl()
+        .args(["run", &format!("--backend={backend}")])
+        .arg(fixture_path("nested-relation-print"))
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "nested-relation-print {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        tuple_lines(&out.stdout),
+        sorted_tuples(NESTED_RELATION_PRINT_TUPLES),
+        "backend={backend}"
+    );
+}
+
+#[test]
+fn nested_relation_prints_recursively_llvm() {
+    assert_nested_relation_print("llvm");
+}
+
+#[test]
+fn nested_relation_prints_recursively_cranelift() {
+    assert_nested_relation_print("cranelift");
 }
 
 /// The in-process twin populates a binary edge relvar (`Edges`, heading { from,

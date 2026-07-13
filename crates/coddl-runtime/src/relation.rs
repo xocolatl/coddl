@@ -40,9 +40,11 @@
 //!
 //! [`coddl_write_relation`] prints one tuple per line as
 //! `{name: value, name: value}\n`. Attributes appear in canonical
-//! heading order (matching the descriptor). Tuple and Relation cells
-//! print as `{...}` placeholders in Phase 19; the recursive printer
-//! lands when nested compound types become a real workflow.
+//! heading order (matching the descriptor). Nested compound cells render
+//! recursively: a `Tuple` cell as `{name: value, …}` (its inline sub-region),
+//! a `Relation` cell as `{{rec}, {rec}, …}` (reading the nested payload's
+//! descriptor from its RC header). Any cell kind not yet handled falls back to
+//! a `{...}` placeholder so the printer stays total.
 
 use std::io::Write;
 
@@ -628,23 +630,73 @@ pub unsafe extern "C" fn coddl_write_relation(ptr: *const u8, desc: *const Coddl
     let mut w = stdout.lock();
     for record_idx in 0..count {
         let record = &payload[record_idx * record_size..(record_idx + 1) * record_size];
-        let _ = w.write_all(b"{");
-        for (i, attr) in attrs.iter().enumerate() {
-            if i > 0 {
-                let _ = w.write_all(b", ");
-            }
-            let name_slice = std::slice::from_raw_parts(attr.name, attr.name_len as usize);
-            let _ = w.write_all(name_slice);
-            let _ = w.write_all(b": ");
-            print_cell(&mut w, attr, record, 0);
-        }
-        let _ = w.write_all(b"}\n");
+        print_record(&mut w, attrs, record);
+        let _ = w.write_all(b"\n");
     }
 }
 
-/// Format one cell within a record to `w`. Dispatches on
-/// `CoddlAttrKind`. Cells the printer doesn't recognize yet (Tuple,
-/// Relation) print as `{...}` so the printer remains total.
+/// Format one record — a `{name: value, …}` tuple in the descriptor's
+/// (name-sorted) attribute order — to `w`, without a trailing newline. Shared
+/// by the top-level relation printer (one record per line) and the nested-
+/// relation cell printer (records comma-separated inside braces).
+///
+/// # Safety
+/// `attrs`/`record` must describe the same heading, with `record` at least
+/// `record_size` bytes; the same contract as [`print_cell`].
+unsafe fn print_record<W: Write>(w: &mut W, attrs: &[CoddlAttrDesc], record: &[u8]) {
+    let _ = w.write_all(b"{");
+    for (i, attr) in attrs.iter().enumerate() {
+        if i > 0 {
+            let _ = w.write_all(b", ");
+        }
+        let name_slice = std::slice::from_raw_parts(attr.name, attr.name_len as usize);
+        let _ = w.write_all(name_slice);
+        let _ = w.write_all(b": ");
+        print_cell(w, attr, record, 0);
+    }
+    let _ = w.write_all(b"}");
+}
+
+/// Render a relation-valued cell inline as `{{rec}, {rec}, …}` (an empty or
+/// null relation is `{}`). The nested payload's heading descriptor and record
+/// count come from its RC header at `payload - HEADER_SIZE`; recursion runs
+/// back through [`print_record`] → [`print_cell`], so relations nested to any
+/// depth render.
+///
+/// # Safety
+/// `ptr`, if non-null, is a live relation payload pointer whose RC header holds
+/// a valid `desc`; the record co-owns it (retain-on-store), so it outlives this
+/// read.
+unsafe fn print_nested_relation<W: Write>(w: &mut W, ptr: *const u8) {
+    if ptr.is_null() {
+        let _ = w.write_all(b"{}");
+        return;
+    }
+    let header = ptr.sub(HEADER_SIZE) as *const CoddlRcHeader;
+    let desc = (*header).desc;
+    if desc.is_null() {
+        let _ = w.write_all(b"{}");
+        return;
+    }
+    let count = (*header).length as usize;
+    let record_size = (*desc).record_size as usize;
+    let attrs = std::slice::from_raw_parts((*desc).attrs, (*desc).attr_count as usize);
+    let payload = std::slice::from_raw_parts(ptr, count * record_size);
+    let _ = w.write_all(b"{");
+    for record_idx in 0..count {
+        if record_idx > 0 {
+            let _ = w.write_all(b", ");
+        }
+        let record = &payload[record_idx * record_size..(record_idx + 1) * record_size];
+        print_record(w, attrs, record);
+    }
+    let _ = w.write_all(b"}");
+}
+
+/// Format one cell within a record to `w`. Dispatches on `CoddlAttrKind`:
+/// scalars print inline, a `Tuple` cell recurses through its inline sub-region,
+/// and a `Relation` cell recurses into its nested payload. Any future cell kind
+/// the printer doesn't recognize yet prints as `{...}` so the printer stays total.
 unsafe fn print_cell<W: Write>(w: &mut W, attr: &CoddlAttrDesc, record: &[u8], base: usize) {
     let offset = base + attr.offset as usize;
     if attr.kind == CoddlAttrKind::Integer as u32 {
@@ -714,8 +766,15 @@ unsafe fn print_cell<W: Write>(w: &mut W, attr: &CoddlAttrDesc, record: &[u8], b
             }
         }
         let _ = w.write_all(b"}");
+    } else if attr.kind == CoddlAttrKind::Relation as u32 {
+        // Relation-valued cell: a single RC payload pointer (8 bytes). Recurse
+        // into the nested relation, whose heading descriptor and record count
+        // live in its RC header — rendered inline as `{{rec}, {rec}, …}`.
+        let ptr_bytes: [u8; 8] = record[offset..offset + 8].try_into().unwrap();
+        let nested = usize::from_ne_bytes(ptr_bytes) as *const u8;
+        print_nested_relation(w, nested);
     } else {
-        // Relation or future cells.
+        // Any future cell kind the printer doesn't recognize yet.
         let _ = w.write_all(b"{...}");
     }
 }
@@ -2903,6 +2962,81 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         unsafe { print_cell(&mut buf, &pt_attr, &record, 0) };
         assert_eq!(buf, b"{x: 1, y: 2}");
+    }
+
+    // ── relation-valued cells (recursive printer) ────────────────────
+
+    /// Build a two-record `{a: Integer}` relation payload (`a = 1`, `a = 2`);
+    /// caller releases it. `desc` is boxed so its address (stored in the
+    /// payload's RC header) stays stable when returned; keep both boxes alive
+    /// while the payload's descriptor is used.
+    fn inner_relation() -> (*mut u8, Box<CoddlHeadingDesc>, Box<[CoddlAttrDesc; 1]>) {
+        let attrs = Box::new([CoddlAttrDesc {
+            name: b"a".as_ptr(),
+            name_len: 1,
+            kind: CoddlAttrKind::Integer as u32,
+            offset: 0,
+            sub: std::ptr::null(),
+        }]);
+        let desc = Box::new(CoddlHeadingDesc {
+            attr_count: 1,
+            record_size: 8,
+            attrs: attrs.as_ptr(),
+        });
+        let payload = unsafe {
+            let p = coddl_rc_alloc(2 * 8, 2, CoddlKind::Relation as u32, &*desc);
+            std::ptr::write(p.add(0) as *mut i64, 1);
+            std::ptr::write(p.add(8) as *mut i64, 2);
+            p
+        };
+        (payload, desc, attrs)
+    }
+
+    /// A `Relation`-kind attr whose 8-byte cell holds a nested payload pointer.
+    fn relation_cell(ptr: *mut u8) -> ([u8; 8], CoddlAttrDesc) {
+        let attr = CoddlAttrDesc {
+            name: b"items".as_ptr(),
+            name_len: 5,
+            kind: CoddlAttrKind::Relation as u32,
+            offset: 0,
+            sub: std::ptr::null(),
+        };
+        ((ptr as usize).to_ne_bytes(), attr)
+    }
+
+    #[test]
+    fn print_cell_renders_relation_recursively() {
+        // A relation-valued cell renders its records inline — `{{a: 1}, {a: 2}}` —
+        // not the old `{...}` placeholder. The nested heading/length come from the
+        // payload's RC header (`sub` is null for a Relation attr).
+        let (inner, _desc, _attrs) = inner_relation();
+        let (cell, attr) = relation_cell(inner);
+        let mut buf: Vec<u8> = Vec::new();
+        unsafe { print_cell(&mut buf, &attr, &cell, 0) };
+        assert_eq!(String::from_utf8(buf).unwrap(), "{{a: 1}, {a: 2}}");
+        unsafe { coddl_rc_release(inner) };
+    }
+
+    #[test]
+    fn print_cell_renders_empty_relation_as_empty_braces() {
+        let attrs = Box::new([CoddlAttrDesc {
+            name: b"a".as_ptr(),
+            name_len: 1,
+            kind: CoddlAttrKind::Integer as u32,
+            offset: 0,
+            sub: std::ptr::null(),
+        }]);
+        let desc = CoddlHeadingDesc {
+            attr_count: 1,
+            record_size: 8,
+            attrs: attrs.as_ptr(),
+        };
+        let inner = unsafe { coddl_rc_alloc(0, 0, CoddlKind::Relation as u32, &desc) };
+        let (cell, attr) = relation_cell(inner);
+        let mut buf: Vec<u8> = Vec::new();
+        unsafe { print_cell(&mut buf, &attr, &cell, 0) };
+        assert_eq!(String::from_utf8(buf).unwrap(), "{}");
+        unsafe { coddl_rc_release(inner) };
     }
 
     #[test]

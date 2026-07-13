@@ -3837,22 +3837,22 @@ impl TypeChecker {
         }
     }
 
-    /// Walk a `Relation { <tuple-lit>, <tuple-lit>, … }` literal. The
-    /// first tuple establishes the heading; subsequent tuples must
-    /// have the same `(name, type)` set. An empty `Relation {}` is the
-    /// nullary empty relation `relfalse` (empty heading, zero tuples —
-    /// the zero of the join semiring); its sibling `reltrue` is
-    /// `Relation { {} }` (one empty tuple). A heading mismatch emits
-    /// T0019 on the offending tuple; the typechecker keeps the first
-    /// tuple's heading so downstream checks see a stable type.
+    /// Walk a `Relation { <expr>, <expr>, … }` literal. Each element is an
+    /// arbitrary expression that must be **tuple-typed** — a tuple literal
+    /// `{ a: 1 }`, or a tuple-valued name/call/field-access (`Relation { req }`);
+    /// a non-tuple element is T0096. The first tuple-typed element establishes
+    /// the heading; the rest must have the same `(name, type)` set (T0019 on the
+    /// offending element). An empty `Relation {}` is the nullary empty relation
+    /// `relfalse` (empty heading, zero tuples — the zero of the join semiring);
+    /// its sibling `reltrue` is `Relation { {} }` (one empty tuple).
     fn check_relation_lit(
         &mut self,
         rel: &RelationLit,
         scope: &mut Scope,
         expected: Option<Heading>,
     ) -> Type {
-        let tuples: Vec<TupleLit> = rel.tuples().collect();
-        if tuples.is_empty() {
+        let elements: Vec<Expr> = rel.elements().collect();
+        if elements.is_empty() {
             // Empty `Relation {}`: take the heading from the expected type when
             // there is one (a `let`/`var` annotation → a *headed* empty
             // relation), else default to `relfalse` — the nullary empty relation
@@ -3860,29 +3860,44 @@ impl TypeChecker {
             // is *required*: relfalse is a sensible unconstrained default.
             return Type::Relation(expected.unwrap_or_else(Heading::empty));
         }
-        let first_heading = match self.check_tuple_lit(&tuples[0], scope) {
-            Type::Tuple(h) => h,
-            // The tuple typecheck only ever returns Tuple or Unknown
-            // (on internal recovery); fall through with Unknown so we
-            // don't cascade.
-            _ => return Type::Unknown,
-        };
-        for tuple in &tuples[1..] {
-            let h = match self.check_tuple_lit(tuple, scope) {
+        // Each element is an arbitrary expression that must be tuple-typed (a
+        // tuple literal, or a tuple-valued name/call/…). Check every element so
+        // each surfaces its own diagnostic; the first tuple-typed element fixes
+        // the heading, the rest must be assignable to it (T0019). A non-tuple
+        // element is T0096.
+        let mut first_heading: Option<Heading> = None;
+        for e in &elements {
+            let h = match self.check_expr(e, scope) {
                 Type::Tuple(h) => h,
-                _ => continue,
+                // Recovery: skip, don't cascade.
+                Type::Unknown => continue,
+                other => {
+                    self.error(
+                        self.node_span(e.syntax()),
+                        "T0096",
+                        format!("relation literal element must be a tuple, got {other}"),
+                    );
+                    continue;
+                }
             };
-            if !h.assignable_to(&first_heading) {
-                self.error(
-                    self.node_span(tuple.syntax()),
-                    "T0019",
-                    format!(
-                        "tuple heading {h} differs from relation's first tuple {first_heading}"
-                    ),
-                );
+            match &first_heading {
+                None => first_heading = Some(h),
+                Some(first) if !h.assignable_to(first) => {
+                    self.error(
+                        self.node_span(e.syntax()),
+                        "T0019",
+                        format!(
+                            "tuple heading {h} differs from the relation's first tuple {first}"
+                        ),
+                    );
+                }
+                Some(_) => {}
             }
         }
-        Type::Relation(first_heading)
+        match first_heading {
+            Some(h) => Type::Relation(h),
+            None => Type::Unknown,
+        }
     }
 
     /// Walk a `Sequence [ e, … ]` literal. The element type is inferred
@@ -7199,6 +7214,50 @@ mod tests {
                    ];";
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn relation_lit_from_tuple_variable_checks_clean() {
+        // A tuple-valued expression (a local) is a valid element — `Relation { t }`
+        // is the singleton relation containing `t`. This is the motivating case.
+        let src = "oper main {} [ \
+                   let t = {a: 1, b: \"x\"}; \
+                   let _r = Relation { t }; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn relation_lit_mixes_literal_and_expression_elements() {
+        // A tuple literal and a tuple variable with the same heading coexist.
+        let src = "oper main {} [ \
+                   let t = {a: 2}; \
+                   let _r = Relation { {a: 1}, t }; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn relation_lit_non_tuple_element_diagnoses_t0096() {
+        // A non-tuple element (an Integer) is rejected — a relation is a set of
+        // tuples. This moved from the parser (retired P0032) to typecheck.
+        let src = "oper main {} [ let _r = Relation { 42 }; ];";
+        assert!(codes(src).contains(&"T0096"), "{:?}", diagnostics(src));
+    }
+
+    #[test]
+    fn relation_lit_element_heading_mismatch_diagnoses_t0019() {
+        // Two elements with different headings — the second differs from the
+        // first (whether both are literals or one is a variable).
+        let lit = "oper main {} [ let _r = Relation { {a: 1}, {b: 2} }; ];";
+        assert!(codes(lit).contains(&"T0019"), "{:?}", diagnostics(lit));
+        let var = "oper main {} [ \
+                   let t = {b: 2}; \
+                   let _r = Relation { {a: 1}, t }; \
+                   ];";
+        assert!(codes(var).contains(&"T0019"), "{:?}", diagnostics(var));
     }
 
     #[test]

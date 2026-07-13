@@ -1033,42 +1033,18 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
-    /// `{ <tuple-lit> , … }` — a brace tuple-set, the keyword-less spelling of a
-    /// relation literal (the body is identical to `parse_relation_lit`'s, and it
-    /// builds the same `RELATION_LIT` node so the checker/lowerer treat it as a
-    /// relation source uniformly). Reuses the relation-literal tuple-body codes
-    /// (P0032 / P0033). An empty `{}` yields a zero-tuple relation literal (the
-    /// typechecker rejects it, T0018).
+    /// `{ <expr> , … }` — a brace tuple-set, the keyword-less spelling of a
+    /// relation literal (shares the element-expression body with
+    /// `parse_relation_lit` and builds the same `RELATION_LIT` node, so the
+    /// checker/lowerer treat it as a relation source uniformly). Each element is
+    /// a tuple-typed expression (P0033 if unterminated). An empty `{}` yields a
+    /// zero-tuple relation literal (the typechecker rejects it, T0018).
     fn parse_tuple_set(&mut self) {
         debug_assert!(self.at(SyntaxKind::L_BRACE));
         self.bump_trivia();
         self.start_node(SyntaxKind::RELATION_LIT);
         self.bump(); // {
-
-        if self.eat(SyntaxKind::R_BRACE) {
-            self.finish_node();
-            return;
-        }
-
-        loop {
-            if self.at(SyntaxKind::L_BRACE) {
-                self.parse_tuple_lit();
-            } else {
-                self.error("P0032", "expected `{` to start tuple in relation literal");
-                break;
-            }
-            if !self.eat(SyntaxKind::COMMA) {
-                break;
-            }
-            // Trailing comma: `{ {a:1}, }` is the same as `{ {a:1} }`.
-            if self.at(SyntaxKind::R_BRACE) {
-                break;
-            }
-        }
-
-        if !self.eat(SyntaxKind::R_BRACE) {
-            self.error("P0033", "expected `}` to close relation literal");
-        }
+        self.parse_relation_lit_body();
         self.finish_node();
     }
 
@@ -1526,11 +1502,15 @@ impl<'a> Parser<'a> {
         self.finish_node();
     }
 
-    /// `Relation { <tuple-lit>, <tuple-lit>, … }` in expression
-    /// position. The body is a comma-separated list of tuple literals
-    /// (each of which is itself `{ name: value, … }`). Empty
-    /// `Relation {}` parses cleanly here; the typechecker emits T0018
-    /// since there's no inference context for the heading.
+    /// `Relation { <expr>, <expr>, … }` in expression position. The body is a
+    /// comma-separated list of element **expressions**, each of which must be
+    /// tuple-typed (the typechecker enforces it, T0096). A tuple literal
+    /// `{ name: value, … }` is an expression (it parses as `Expr::TupleLit` via
+    /// `parse_primary_expr`), so `Relation { {a:1}, {a:2} }` still works; a
+    /// tuple-valued name / call / field-access is any other expression, so
+    /// `Relation { req }` works too. Trailing comma allowed. Empty `Relation {}`
+    /// parses cleanly (typechecked to `relfalse` absent an annotation). Symmetric
+    /// with `Sequence [ … ]` (`parse_sequence_lit`).
     fn parse_relation_lit(&mut self) {
         debug_assert!(self.at_keyword("Relation"));
         self.bump_trivia();
@@ -1544,16 +1524,26 @@ impl<'a> Parser<'a> {
         }
         self.bump(); // {
 
+        self.parse_relation_lit_body();
+        self.finish_node();
+    }
+
+    /// The comma-separated element-expression body shared by `Relation { … }`
+    /// (`parse_relation_lit`) and the keyword-less `insert R { … }` tuple-set
+    /// (`parse_tuple_set`). Assumes the opening `{` is already consumed; consumes
+    /// through the closing `}`. Each element is parsed with `parse_expr` (the
+    /// no-progress guard bails on a garbage element rather than spinning),
+    /// mirroring `parse_sequence_lit`.
+    fn parse_relation_lit_body(&mut self) {
         if self.eat(SyntaxKind::R_BRACE) {
-            self.finish_node();
             return;
         }
-
         loop {
-            if self.at(SyntaxKind::L_BRACE) {
-                self.parse_tuple_lit();
-            } else {
-                self.error("P0032", "expected `{` to start tuple in relation literal");
+            let before = self.pos;
+            self.parse_expr();
+            // No progress (garbage element) — bail rather than spin; recovery
+            // happens at the enclosing statement anchor.
+            if self.pos == before {
                 break;
             }
             if !self.eat(SyntaxKind::COMMA) {
@@ -1565,11 +1555,9 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-
         if !self.eat(SyntaxKind::R_BRACE) {
             self.error("P0033", "expected `}` to close relation literal");
         }
-        self.finish_node();
     }
 
     /// `Sequence [ <expr>, <expr>, … ]` in expression position — a
@@ -4578,13 +4566,38 @@ mod tests {
     }
 
     #[test]
-    fn relation_literal_non_tuple_element_diagnoses_p0032() {
+    fn relation_literal_expression_element_parses() {
+        // A tuple-valued expression (a bare name) is a valid element — it parses
+        // cleanly as a `NAME_REF` child; the tuple-typed constraint is a
+        // typecheck concern (T0096), not a parse one.
+        let out = parse_str("oper f {} [ let r = Relation { req }; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let rel = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::RELATION_LIT)
+            .expect("RELATION_LIT in tree");
+        let names: Vec<_> = rel
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::NAME_REF)
+            .collect();
+        assert_eq!(names.len(), 1);
+        // Mixed literal + expression elements also parse.
+        let mixed = parse_str("oper f {} [ let r = Relation { {a: 1}, req }; ];");
+        assert!(mixed.diagnostics.is_empty(), "{:?}", mixed.diagnostics);
+    }
+
+    #[test]
+    fn relation_literal_non_tuple_element_parses_defers_to_typecheck() {
+        // `Relation { 42 }` now parses (42 is an expression element); rejecting a
+        // non-tuple element is the typechecker's job (T0096), not the parser's —
+        // P0032 is retired.
         let out = parse_str("oper f {} [ let r = Relation { 42 }; ];");
-        assert!(
-            out.diagnostics.iter().any(|d| d.code == "P0032"),
-            "expected P0032, got {:?}",
-            out.diagnostics
-        );
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert!(out
+            .tree
+            .descendants()
+            .any(|n| n.kind() == SyntaxKind::RELATION_LIT));
     }
 
     #[test]

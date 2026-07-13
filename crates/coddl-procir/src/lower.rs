@@ -6230,7 +6230,7 @@ impl Lowerer {
     /// `lower_var_stmt` in place of the bare `lower_expr`.
     fn lower_binding_rhs(&mut self, value_expr: &Expr, type_ref: Option<TypeRef>) -> ValueId {
         if let Expr::RelationLit(r) = value_expr {
-            if r.tuples().next().is_none() {
+            if r.elements().next().is_none() {
                 let heading = type_ref
                     .as_ref()
                     .and_then(|tr| match self.resolve_type_ref_aliased(tr) {
@@ -6297,45 +6297,77 @@ impl Lowerer {
     }
 
     fn lower_relation_lit(&mut self, rel: &RelationLit) -> ValueId {
-        let tuples: Vec<TupleLit> = rel.tuples().collect();
+        let elements: Vec<Expr> = rel.elements().collect();
         // `Relation {}` = `relfalse`: the nullary empty relation. Build it with
         // the empty heading. (A *headed* empty relation — the same literal under
         // a `Relation { H }` annotation — is built by `lower_binding_rhs`, which
         // supplies the heading.) The sibling `reltrue` (`Relation { {} }`) takes
         // the general path below with a single empty tuple.
-        if tuples.is_empty() {
+        if elements.is_empty() {
             return self.lower_empty_relation_lit(Heading::empty());
         }
-        let mut tuple_values: Vec<ValueId> = Vec::with_capacity(tuples.len());
+        let mut tuple_values: Vec<ValueId> = Vec::with_capacity(elements.len());
+        // Cleanup runs *after* the `RelationLit` so each cell is still live when
+        // the record retains it. `Inst::RelationLit` writes **flattened** tuple
+        // bytes, so a boxed (wide) element — e.g. a `Request` parameter — is
+        // unboxed to a flat value first (its cells borrowed into the flat repr,
+        // then retained by the record); the box's own reference is dropped via
+        // `release_call_arg_temp` (a temp → `Inst::Release`, an aliased
+        // parameter / bound local → skipped). An *unboxed* tuple temp drops its
+        // flattened cells directly; an unboxed `NameRef` alias keeps its binding's
+        // ownership (releasing it would be a use-after-free once the record temp
+        // dies before the binding is next read).
+        enum ElemCleanup {
+            /// A flattened tuple temp — drop its own cell references.
+            FlatCells(ValueId),
+            /// A boxed tuple — drop the box (`release_call_arg_temp` skips an alias).
+            Box(ValueId),
+        }
+        let mut cleanups: Vec<ElemCleanup> = Vec::new();
         let mut heading: Option<Heading> = None;
-        for tup in &tuples {
-            let v = self.lower_tuple_lit(tup);
-            tuple_values.push(v);
+        for e in &elements {
+            let v = self.lower_expr(e);
+            let stored = match self.value_type(v) {
+                ProcType::Tuple(h) if crate::layout::tuple_is_boxed(&h) => {
+                    let heading_id = self.intern_heading(&h);
+                    let flat = self.fresh_value();
+                    self.record_type(flat, ProcType::Tuple(h));
+                    self.insts.push(Inst::TupleUnbox {
+                        dst: flat,
+                        src: v,
+                        heading_id,
+                    });
+                    cleanups.push(ElemCleanup::Box(v));
+                    flat
+                }
+                _ => {
+                    if !matches!(e, Expr::NameRef(_)) {
+                        cleanups.push(ElemCleanup::FlatCells(v));
+                    }
+                    v
+                }
+            };
             if heading.is_none() {
-                if let ProcType::Tuple(h) = self.value_type(v) {
+                if let ProcType::Tuple(h) = self.value_type(stored) {
                     heading = Some(h);
                 }
             }
+            tuple_values.push(stored);
         }
-        let heading = heading.expect("typechecked tuple has a heading");
+        let heading = heading.expect("typechecked relation element has a tuple heading");
         let heading_id = self.intern_heading(&heading);
         let dst = self.fresh_value();
         self.record_type(dst, ProcType::Relation(heading_id));
-        // Backend `RelationLit` retain-on-store gives the relation its own
-        // reference to each heap cell. Drop each tuple operand's own reference
-        // so the record's retained ref is the sole owner — via
-        // `release_flattened_tuple_cells`, which handles both a producer-temp
-        // cell (no-op on locals/literals) and a `NameRef`-retained heading-owner
-        // (heading walk). Deferred until after the `RelationLit` so the cells
-        // are still live when the record retains them.
-        let operands = tuple_values.clone();
         self.insts.push(Inst::RelationLit {
             dst,
             tuples: tuple_values,
             heading_id,
         });
-        for tv in operands {
-            self.release_flattened_tuple_cells(tv);
+        for cleanup in cleanups {
+            match cleanup {
+                ElemCleanup::FlatCells(v) => self.release_flattened_tuple_cells(v),
+                ElemCleanup::Box(v) => self.release_call_arg_temp(v),
+            }
         }
         dst
     }

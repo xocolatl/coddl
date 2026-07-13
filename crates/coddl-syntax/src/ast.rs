@@ -972,10 +972,13 @@ impl TupleLit {
 ast_node!(pub RelationLit, RELATION_LIT);
 
 impl RelationLit {
-    /// All tuples in source order. Each is a nested `TUPLE_LIT` child.
-    /// An empty relation literal yields zero elements.
-    pub fn tuples(&self) -> impl Iterator<Item = TupleLit> + '_ {
-        children(&self.syntax)
+    /// All element expressions in source order — each must be tuple-typed
+    /// (the typechecker enforces it). A tuple literal `{ a: 1 }` casts to
+    /// `Expr::TupleLit`; a tuple-valued name / call / field-access is any other
+    /// `Expr`. An empty relation literal yields zero elements. Mirrors
+    /// [`SequenceLit::elements`].
+    pub fn elements(&self) -> impl Iterator<Item = Expr> + '_ {
+        self.syntax.children().filter_map(Expr::cast)
     }
 }
 
@@ -1881,25 +1884,24 @@ mod tests {
     }
 
     #[test]
-    fn relation_lit_tuples_iterate() {
-        let root = ast("oper f {} [ let r = Relation { {a: 1}, {a: 2} }; ];");
+    fn relation_lit_elements_iterate() {
+        // Tuple-literal elements cast to `Expr::TupleLit`; a bare tuple-valued
+        // expression (`x`) casts to another `Expr`.
+        let root = ast("oper f {} [ let r = Relation { {a: 1}, x }; ];");
         let rel_node = root
             .syntax()
             .descendants()
             .find(|n| n.kind() == SyntaxKind::RELATION_LIT)
             .unwrap();
         let rel = RelationLit::cast(rel_node).unwrap();
-        let tuples: Vec<TupleLit> = rel.tuples().collect();
-        assert_eq!(tuples.len(), 2);
-        assert_eq!(tuples[0].fields().count(), 1);
-        assert_eq!(
-            tuples[0].fields().next().unwrap().name().unwrap().text(),
-            "a"
-        );
+        let elements: Vec<Expr> = rel.elements().collect();
+        assert_eq!(elements.len(), 2);
+        assert!(matches!(elements[0], Expr::TupleLit(_)));
+        assert!(matches!(elements[1], Expr::NameRef(_)));
     }
 
     #[test]
-    fn empty_relation_lit_has_no_tuples() {
+    fn empty_relation_lit_has_no_elements() {
         let root = ast("oper f {} [ let r = Relation {}; ];");
         let rel_node = root
             .syntax()
@@ -1907,7 +1909,7 @@ mod tests {
             .find(|n| n.kind() == SyntaxKind::RELATION_LIT)
             .unwrap();
         let rel = RelationLit::cast(rel_node).unwrap();
-        assert_eq!(rel.tuples().count(), 0);
+        assert_eq!(rel.elements().count(), 0);
     }
 
     // ── BoolLit + BinaryExpr (Phase 20) ──────────────────────────────

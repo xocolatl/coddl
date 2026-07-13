@@ -565,13 +565,13 @@ function that implements it.
                     -- (T0033), a transaction for a public relvar (T0025), and
                     -- the source heading to match the relvar's (T0034).
                     -- `insert` is a contextual keyword (the `let` precedent).
-<tuple-set>     ::= '{' [ <tuple-lit> { ',' <tuple-lit> } [ ',' ] ] '}' ;
-                                                               -- parse_tuple_set
+<tuple-set>     ::= '{' <relation-lit-body> ;                 -- parse_tuple_set
                     -- A brace tuple-set — the keyword-less spelling of a
-                    -- relation literal. It builds the same RELATION_LIT node
-                    -- (the body is identical to <relation-lit>'s and reuses its
-                    -- tuple-body codes P0032 / P0033), so the checker and
-                    -- lowerer treat it as a relation source uniformly. An empty
+                    -- relation literal. It builds the same RELATION_LIT node and
+                    -- shares the <relation-lit-body> element-expression body, so
+                    -- the checker and lowerer treat it as a relation source
+                    -- uniformly (each element is a tuple-typed expression;
+                    -- `insert R { req }` inserts the single tuple `req`). An empty
                     -- `{}` is `relfalse` (the nullary empty relation); inserting
                     -- it into a headed relvar is a heading mismatch (T0034).
 <update-stmt>   ::= 'update' <expr> <arg-list> ';' ;           -- parse_update_stmt
@@ -937,15 +937,23 @@ function that implements it.
                     -- tuple value from a call-site argument list.
                     -- Field-init shorthand applies (e.g. `{a}` ≡ `{a: a}`).
                     -- Empty '{}' is the unit value, type Tuple {}.
-<relation-lit>  ::= 'Relation' '{' [ <tuple-lit> commalist ] '}' ;  -- parse_relation_lit
+<relation-lit>  ::= 'Relation' '{' <relation-lit-body> ;    -- parse_relation_lit
                     -- 'Relation' is a contextual keyword; recognized
-                    -- by name in primary-expr position. The body is
-                    -- a comma-separated list of tuple literals,
-                    -- trailing comma allowed. Empty `Relation {}` is
-                    -- `relfalse` — the nullary empty relation (empty
+                    -- by name in primary-expr position. Its sibling
+                    -- `reltrue` is the one-empty-tuple literal
+                    -- `Relation { {} }`.
+<relation-lit-body> ::= [ <expr> commalist ] '}' ;         -- parse_relation_lit_body
+                    -- The '{' is already consumed; the body is a
+                    -- comma-separated list of element **expressions**
+                    -- (trailing comma allowed), each of which must be
+                    -- tuple-typed — a tuple literal `{a:1}`, or a
+                    -- tuple-valued name/call/… (`Relation { req }`).
+                    -- Symmetric with <sequence-lit>; the tuple-typed
+                    -- constraint is enforced in typecheck (T0096), not
+                    -- here. Unterminated → P0033. Empty `Relation {}`
+                    -- is `relfalse` — the nullary empty relation (empty
                     -- heading, zero tuples; the zero of the join
-                    -- semiring). Its sibling `reltrue` is the one-empty-
-                    -- tuple literal `Relation { {} }`.
+                    -- semiring). Shared with <tuple-set>.
 <sequence-lit>  ::= 'Sequence' '[' [ <expr> commalist ] ']' ;     -- parse_sequence_lit
                     -- 'Sequence' is a contextual keyword; recognized
                     -- by name in primary-expr position. The body is a
@@ -1033,7 +1041,7 @@ enforces that.
 | P0029 | Expected `}` to close tuple literal                     |
 | P0030 | Expected field name after `.`                           |
 | P0031 | Expected `{` after `Relation`                           |
-| P0032 | Expected `{` to start a tuple in a relation literal     |
+| P0032 | *(retired)* — relation-literal elements are now arbitrary expressions (`parse_relation_lit_body`); a non-tuple element is rejected in typecheck (T0096), not here |
 | P0033 | Expected `}` to close relation literal                  |
 | P0034 | Expected `{` to start rename list                       |
 | P0035 | Expected `)` to close parenthesized expression          |
