@@ -97,7 +97,12 @@ The TextMate grammar still pattern-highlights these words at the lexical level (
 
 ## Unicode operator glyphs
 
-A small set of single-codepoint mathematical glyphs lex as **exact synonyms** for their ASCII / keyword counterparts. The lexer emits the same token either way; grammar productions name only the ASCII form, but `R ⋈ S` and `R join S` are interchangeable in source.
+A small set of single-codepoint mathematical glyphs are **exact synonyms** for their ASCII / keyword counterparts, so `R ⋈ S` and `R join S` are interchangeable in source. There are two lexing mechanisms behind the one meaning:
+
+- **Symbolic glyphs** (`≤ ⊆ ≥ ⊇ ⊂ ⊃ ≠`) lex directly to the same *token kind* as their ASCII spelling (`≤` → `LtEq`), so the parser matches them with no glyph-specific logic.
+- **Word glyphs** (`⋈ ∪ ∩ ∖ ¬`) lex as an `IDENT` that keeps the glyph in the CST (formatter-friendly); the parser and AST then recognize the glyph text as a synonym at the *same recognition site* as the ASCII keyword — `⋈`/`∪`/`∩`/`∖` alongside `join`/`union`/`intersect`/`minus` in `peek_infix_prec` and `BinaryExpr::op_kind`, and `¬` alongside `not`.
+
+Grammar productions below name only the ASCII form.
 
 | ASCII | Glyph(s) | Codepoint(s) |
 |---|---|---|
@@ -737,6 +742,9 @@ function that implements it.
                     -- `intersect`/`union`/`minus` are also contextual
                     -- keywords. (Symbolic `-` is `Sub`; the keyword
                     -- `minus` is the relational set-difference op.)
+                    -- `join`/`union`/`intersect`/`minus` also accept
+                    -- their glyph synonyms `⋈`/`∪`/`∩`/`∖` (§ Unicode
+                    -- operator glyphs); `times`/`compose` have none.
 <postfix>       ::= <arg-list>                                 -- call: CALL_EXPR
                   | <field-access-tail>                        -- field access: FIELD_ACCESS
                   | <index-tail> ;                             -- index: INDEX_EXPR

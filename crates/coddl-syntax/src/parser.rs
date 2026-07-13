@@ -1373,12 +1373,16 @@ impl<'a> Parser<'a> {
             SyntaxKind::IDENT if self.at_keyword("and") => Some(2),
             SyntaxKind::IDENT if self.at_keyword("or") => Some(1),
             SyntaxKind::IDENT if self.at_keyword("where") => Some(0),
-            SyntaxKind::IDENT if self.at_keyword("join") => Some(0),
+            // Relational ops (prec 0). Each with a Unicode glyph synonym —
+            // lexed as an IDENT whose text is the glyph, matched by
+            // `at_keyword` directly (a raw source-text compare), the same way
+            // `not`/`¬` is recognized. `times`/`compose` have no glyph.
+            SyntaxKind::IDENT if self.at_keyword("join") || self.at_keyword("⋈") => Some(0),
             SyntaxKind::IDENT if self.at_keyword("times") => Some(0),
             SyntaxKind::IDENT if self.at_keyword("compose") => Some(0),
-            SyntaxKind::IDENT if self.at_keyword("intersect") => Some(0),
-            SyntaxKind::IDENT if self.at_keyword("union") => Some(0),
-            SyntaxKind::IDENT if self.at_keyword("minus") => Some(0),
+            SyntaxKind::IDENT if self.at_keyword("intersect") || self.at_keyword("∩") => Some(0),
+            SyntaxKind::IDENT if self.at_keyword("union") || self.at_keyword("∪") => Some(0),
+            SyntaxKind::IDENT if self.at_keyword("minus") || self.at_keyword("∖") => Some(0),
             _ => None,
         }
     }
@@ -2190,6 +2194,35 @@ mod tests {
                 .and_then(<crate::ast::UnaryExpr as crate::ast::AstNode>::cast)
                 .unwrap_or_else(|| panic!("src={src}: expected a UNARY_EXPR"));
             assert_eq!(unary.op_kind(), Some(crate::ast::UnaryOp::Not), "src={src}");
+        }
+    }
+
+    #[test]
+    fn relational_word_glyphs_parse_to_binary_ops() {
+        // `⋈ ∪ ∩ ∖` are exact synonyms for `join`/`union`/`intersect`/`minus`:
+        // each parses into a BINARY_EXPR the AST resolves to the same `BinaryOp`
+        // as its ASCII spelling. (`times`/`compose` have no glyph.)
+        use crate::ast::BinaryOp;
+        for (glyph, want) in [
+            ("⋈", BinaryOp::Join),
+            ("∪", BinaryOp::Union),
+            ("∩", BinaryOp::Intersect),
+            ("∖", BinaryOp::Minus),
+        ] {
+            let src = format!("program p; oper main {{}} [ let x = r {glyph} s; ];");
+            let out = parse_str(&src);
+            assert!(
+                out.diagnostics.is_empty(),
+                "glyph={glyph}: {:?}",
+                out.diagnostics
+            );
+            let bin = out
+                .tree
+                .descendants()
+                .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+                .and_then(<crate::ast::BinaryExpr as crate::ast::AstNode>::cast)
+                .unwrap_or_else(|| panic!("glyph={glyph}: expected a BINARY_EXPR"));
+            assert_eq!(bin.op_kind(), Some(want), "glyph={glyph}");
         }
     }
 

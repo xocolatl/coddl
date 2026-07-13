@@ -1102,6 +1102,11 @@ impl BinaryExpr {
                                 | "union"
                                 | "minus"
                                 | "div"
+                                // Unicode glyph synonyms (lexed as IDENT).
+                                | "⋈"
+                                | "∪"
+                                | "∩"
+                                | "∖"
                         ) =>
                     {
                         return Some(tok);
@@ -1133,12 +1138,12 @@ impl BinaryExpr {
                 "and" => BinaryOp::And,
                 "or" => BinaryOp::Or,
                 "where" => BinaryOp::Where,
-                "join" => BinaryOp::Join,
+                "join" | "⋈" => BinaryOp::Join,
                 "times" => BinaryOp::Times,
                 "compose" => BinaryOp::Compose,
-                "intersect" => BinaryOp::Intersect,
-                "union" => BinaryOp::Union,
-                "minus" => BinaryOp::Minus,
+                "intersect" | "∩" => BinaryOp::Intersect,
+                "union" | "∪" => BinaryOp::Union,
+                "minus" | "∖" => BinaryOp::Minus,
                 "div" => BinaryOp::IntDiv,
                 _ => return None,
             },
