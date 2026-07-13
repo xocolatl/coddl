@@ -2347,8 +2347,10 @@ mod tests {
     fn and_emits_inner_join_using_the_shared_column() {
         // `Employees join Departments` → RelExpr::And. Natural join on the one
         // shared attribute `dept_id`, emitted as `INNER JOIN ... USING`. The
-        // SELECT list is the union heading in canonical (sorted) order; the join
-        // drops both keys so `DISTINCT` stays (RM Pro 3).
+        // SELECT list is the union heading in canonical (sorted) order. No
+        // `DISTINCT`: the join key `{dept_id}` covers Departments' key, so each
+        // Employee matches ≤ 1 Department and Employees' key `{emp_id}` survives
+        // — the result is already a set (see `RelExpr::surviving_keys`).
         let expr = RelExpr::And {
             lhs: Box::new(employees()),
             rhs: Box::new(departments()),
@@ -2356,7 +2358,7 @@ mod tests {
         let q = emit_select(&expr, Dialect::SQLite).unwrap();
         assert_eq!(
             q.sql.text,
-            r#"SELECT DISTINCT "dept_id", "dept_name", "emp_id", "emp_name" FROM "employees" INNER JOIN "departments" USING ("dept_id")"#
+            r#"SELECT "dept_id", "dept_name", "emp_id", "emp_name" FROM "employees" INNER JOIN "departments" USING ("dept_id")"#
         );
         assert_eq!(q.sql.param_count, 0);
         assert!(q.params.is_empty());
@@ -2398,8 +2400,9 @@ mod tests {
         // `JobTitles times Locations` → RelExpr::And with no shared column.
         // `USING ()` is invalid SQL, so a disjoint product emits `CROSS JOIN`.
         // SELECT list is the union heading in canonical (sorted) order
-        // (`location` before `title`); both single-attr keys are dropped, so
-        // `DISTINCT` stays (RM Pro 3).
+        // (`location` before `title`). No `DISTINCT`: the composite key
+        // {location, title} keys the Cartesian product, so it is already a set
+        // (a `times` of two sets is a set — see `RelExpr::surviving_keys`).
         let expr = RelExpr::And {
             lhs: Box::new(job_titles()),
             rhs: Box::new(locations()),
@@ -2407,7 +2410,7 @@ mod tests {
         let q = emit_select(&expr, Dialect::SQLite).unwrap();
         assert_eq!(
             q.sql.text,
-            r#"SELECT DISTINCT "location", "title" FROM "job_titles" CROSS JOIN "locations""#
+            r#"SELECT "location", "title" FROM "job_titles" CROSS JOIN "locations""#
         );
         assert_eq!(q.sql.param_count, 0);
         assert!(q.params.is_empty());
@@ -2458,8 +2461,9 @@ mod tests {
     fn intersect_emits_inner_join_using_all_columns() {
         // `Morning intersect Evening` → RelExpr::And on identical headings, so
         // every column is shared and the join key is all of them, emitted as
-        // `INNER JOIN ... USING ("id", "name")`. DISTINCT stays — the join drops
-        // both keys (RM Pro 3), like `and_emits_inner_join_using_the_shared_column`.
+        // `INNER JOIN ... USING ("id", "name")`. No `DISTINCT`: the shared key
+        // (all attributes) covers each operand's key `{id}`, so both survive —
+        // the intersection is a subset of a set, already a set.
         let expr = RelExpr::And {
             lhs: Box::new(morning()),
             rhs: Box::new(evening()),
@@ -2467,7 +2471,7 @@ mod tests {
         let q = emit_select(&expr, Dialect::SQLite).unwrap();
         assert_eq!(
             q.sql.text,
-            r#"SELECT DISTINCT "id", "name" FROM "morning" INNER JOIN "evening" USING ("id", "name")"#
+            r#"SELECT "id", "name" FROM "morning" INNER JOIN "evening" USING ("id", "name")"#
         );
         assert_eq!(q.sql.param_count, 0);
         assert!(q.params.is_empty());
@@ -2722,7 +2726,10 @@ mod tests {
         // `Employees compose Departments` → Project{And} keeping the non-shared
         // attributes. The And builds the natural join on `dept_id`; the Project
         // narrows the SELECT to drop `dept_id`. Result heading in canonical
-        // (sorted) order; the dropped key means `DISTINCT` stays (RM Pro 3).
+        // (sorted) order. No `DISTINCT`: the join key `{dept_id}` covers
+        // Departments' key, so Employees' key `{emp_id}` survives the And, and
+        // `{emp_id}` is kept by the projection — the result is provably unique.
+        // This is the motivating `compose` case for join key inference.
         let expr = RelExpr::Project {
             input: Box::new(RelExpr::And {
                 lhs: Box::new(employees()),
@@ -2737,7 +2744,7 @@ mod tests {
         let q = emit_select(&expr, Dialect::SQLite).unwrap();
         assert_eq!(
             q.sql.text,
-            r#"SELECT DISTINCT "dept_name", "emp_id", "emp_name" FROM "employees" INNER JOIN "departments" USING ("dept_id")"#
+            r#"SELECT "dept_name", "emp_id", "emp_name" FROM "employees" INNER JOIN "departments" USING ("dept_id")"#
         );
         assert_eq!(q.sql.param_count, 0);
         assert!(q.params.is_empty());
@@ -2757,7 +2764,10 @@ mod tests {
         //  project { emp_name, dept_name }` — a join feeding `where` then
         // `project`. The Restrict resolves `dept_name` against the join's merged
         // column map and pushes it as a bound `WHERE`; the Project narrows the
-        // SELECT. The join drops both keys, so `DISTINCT` stays.
+        // SELECT. `DISTINCT` stays here — unlike the bare join, this projection
+        // drops `emp_id`, the key the join preserved, so two engineers could
+        // collapse to one `{dept_name, emp_name}` row. The soundness guard that
+        // join key inference doesn't over-elide.
         let expr = RelExpr::Project {
             input: Box::new(RelExpr::Restrict {
                 input: Box::new(RelExpr::And {

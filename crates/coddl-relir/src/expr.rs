@@ -625,13 +625,16 @@ impl RelExpr {
         }
     }
 
-    /// The candidate keys whose attributes all survive into this expression's
+    /// The surviving keys whose attributes all appear in this expression's
     /// heading. A surviving key guarantees row-uniqueness on the (possibly
     /// projected) heading, so the emitted `SELECT` need not be `DISTINCT`.
     ///
-    /// `RelvarRef` yields its declared keys; `Restrict` preserves them
-    /// (filtering a set is a set); `Project` keeps only keys whose attributes
-    /// are all retained.
+    /// `RelvarRef` yields its declared keys; `Restrict`/`Semijoin`/`Minus`
+    /// preserve them (each returns a subset of its input); `Project` keeps only
+    /// keys whose attributes are all retained; `And` (join) *derives* keys via
+    /// the cover and composite rules below. Derived entries may be **superkeys**
+    /// rather than minimal candidate keys — sound for every consumer, since the
+    /// only property used downstream is uniqueness.
     pub fn surviving_keys(&self) -> Vec<Vec<String>> {
         match self {
             RelExpr::RelvarRef { keys, .. } => keys.clone(),
@@ -646,14 +649,67 @@ impl RelExpr {
                 .into_iter()
                 .map(|k| k.iter().map(|a| apply_rename(renames, a)).collect())
                 .collect(),
-            // Conservative: join / union key-inference is deferred. (A `union`
-            // pushes as a SQL `UNION`, which dedups itself, so no DISTINCT is
-            // needed on the operand SELECTs anyway.)
-            RelExpr::And { .. } => Vec::new(),
+            // A natural join of two sets is itself a set. Two rules derive its
+            // surviving keys (see docs/sqlemit.md "`DISTINCT` elision"):
+            //  - **Cover:** if the join attributes `J = shared` contain a
+            //    candidate key of one operand, each row of the *other* operand
+            //    matches ≤ 1 row here, so the other operand's keys survive. This
+            //    is what lets `compose` (`Project(And)` over a FK→PK join) drop
+            //    `DISTINCT`: the surviving single-side key outlives the
+            //    projection that removes `J`.
+            //  - **Composite:** `k_lhs ∪ k_rhs` is always a superkey (handles a
+            //    bare `join`/`times` — including disjoint `times`, where `J` is
+            //    empty and the cover rule can't fire).
+            // Entries may be derived superkeys, not minimal candidate keys —
+            // sound for every consumer (`needs_distinct` only checks non-empty,
+            // `card_le_one` only matches genuine length-1 keys, `Project` filters
+            // by kept attrs).
+            RelExpr::And { lhs, rhs } => {
+                let shared = lhs.heading().shared_names(&rhs.heading());
+                let covers = |key: &[String]| key.iter().all(|a| shared.contains(a));
+                let lhs_keys = lhs.surviving_keys();
+                let rhs_keys = rhs.surviving_keys();
+                let mut out: Vec<Vec<String>> = Vec::new();
+                let add = |k: Vec<String>, out: &mut Vec<Vec<String>>| {
+                    if !out.contains(&k) {
+                        out.push(k);
+                    }
+                };
+                // Cover rule (symmetric): a key of one side survives when the
+                // join attributes cover a key of the *other* side.
+                if rhs_keys.iter().any(|k| covers(k)) {
+                    for k in &lhs_keys {
+                        add(k.clone(), &mut out);
+                    }
+                }
+                if lhs_keys.iter().any(|k| covers(k)) {
+                    for k in &rhs_keys {
+                        add(k.clone(), &mut out);
+                    }
+                }
+                // Composite rule: `k_lhs ∪ k_rhs` is always a superkey.
+                for kl in &lhs_keys {
+                    for kr in &rhs_keys {
+                        let mut composite = kl.clone();
+                        for a in kr {
+                            if !composite.contains(a) {
+                                composite.push(a.clone());
+                            }
+                        }
+                        add(composite, &mut out);
+                    }
+                }
+                out
+            }
+            // `union` is keyless in general — two same-heading operands can hold
+            // rows that agree on any candidate key without a disjointness proof.
+            // (SQL `UNION` dedups itself anyway, so the operand SELECTs need no
+            // `DISTINCT` regardless.)
             RelExpr::Or { .. } => Vec::new(),
-            // Conservative: `minus` preserves `lhs`'s keys (the result is a
-            // subset of `lhs`), but lhs-key preservation is deferred.
-            RelExpr::Minus { .. } => Vec::new(),
+            // `minus` returns a subset of `lhs` (the `lhs` rows not in `rhs`), so
+            // every surviving `lhs` key still identifies a result row — mirrors
+            // `Semijoin`.
+            RelExpr::Minus { lhs, .. } => lhs.surviving_keys(),
             // Semijoin/antijoin filter `lhs` without changing its heading, so
             // every `lhs` candidate key still uniquely identifies a result tuple
             // — the result is already a set, no `DISTINCT` needed.
@@ -700,7 +756,8 @@ impl RelExpr {
             }
             RelExpr::Project { input, .. } => input.card_le_one(),
             RelExpr::Rename { input, .. } => input.card_le_one(),
-            RelExpr::And { .. } => false,
+            // A join has ≤ 1 tuple when both operands do (0 or 1 matching pair).
+            RelExpr::And { lhs, rhs } => lhs.card_le_one() && rhs.card_le_one(),
             RelExpr::Or { .. } => false,
             RelExpr::Minus { .. } => false,
             // A subset of `lhs`: if `lhs` has ≤ 1 tuple, so does the filtered result.
@@ -1033,6 +1090,141 @@ mod tests {
         assert!(r.surviving_keys().is_empty());
         assert!(r.card_le_one());
         assert!(!r.needs_distinct());
+    }
+
+    // ── key inference through joins (cover + composite rules) ──────────
+
+    fn orders() -> RelExpr {
+        RelExpr::RelvarRef {
+            name: "Orders".to_string(),
+            database: "shop".to_string(),
+            heading: Heading::new(vec![
+                ("order_id".to_string(), Type::Integer),
+                ("cust_id".to_string(), Type::Integer),
+            ]),
+            table_name: "orders".to_string(),
+            columns: vec![
+                ("order_id".to_string(), "order_id".to_string()),
+                ("cust_id".to_string(), "cust_id".to_string()),
+            ],
+            keys: vec![vec!["order_id".to_string()]],
+        }
+    }
+
+    fn customers() -> RelExpr {
+        RelExpr::RelvarRef {
+            name: "Customers".to_string(),
+            database: "shop".to_string(),
+            heading: Heading::new(vec![
+                ("cust_id".to_string(), Type::Integer),
+                ("cname".to_string(), Type::Text),
+            ]),
+            table_name: "customers".to_string(),
+            columns: vec![
+                ("cust_id".to_string(), "cust_id".to_string()),
+                ("cname".to_string(), "cname".to_string()),
+            ],
+            keys: vec![vec!["cust_id".to_string()]],
+        }
+    }
+
+    fn sizes() -> RelExpr {
+        RelExpr::RelvarRef {
+            name: "Sizes".to_string(),
+            database: "greetings".to_string(),
+            heading: Heading::new(vec![("size".to_string(), Type::Text)]),
+            table_name: "sizes".to_string(),
+            columns: vec![("size".to_string(), "size".to_string())],
+            keys: vec![vec!["size".to_string()]],
+        }
+    }
+
+    #[test]
+    fn join_covering_a_key_lets_the_other_side_key_survive() {
+        // Orders join Customers on cust_id. The join key {cust_id} covers
+        // Customers' key, so each Order matches ≤ 1 Customer and Orders' key
+        // {order_id} survives — the bare join is already a set, no DISTINCT.
+        let j = RelExpr::And {
+            lhs: Box::new(orders()),
+            rhs: Box::new(customers()),
+        };
+        assert!(
+            j.surviving_keys().contains(&vec!["order_id".to_string()]),
+            "orders' key survives the FK->PK join: {:?}",
+            j.surviving_keys()
+        );
+        assert!(!j.needs_distinct());
+    }
+
+    #[test]
+    fn compose_over_fk_pk_join_elides_distinct() {
+        // Orders compose Customers = Project(And, keep = {order_id, cname}),
+        // dropping the shared cust_id. {order_id} survives the projection, so the
+        // result is provably unique: no DISTINCT. (The case that motivated this.)
+        let compose = RelExpr::Project {
+            input: Box::new(RelExpr::And {
+                lhs: Box::new(orders()),
+                rhs: Box::new(customers()),
+            }),
+            keep: vec!["order_id".to_string(), "cname".to_string()],
+        };
+        assert_eq!(compose.surviving_keys(), vec![vec!["order_id".to_string()]]);
+        assert!(!compose.needs_distinct());
+    }
+
+    #[test]
+    fn join_projected_below_every_key_keeps_distinct() {
+        // Project the compose down to just {cname}: order_id (the only surviving
+        // key) is gone, so two orders for one customer collapse — DISTINCT stays.
+        // The soundness guard that the derived keys don't over-elide.
+        let r = RelExpr::Project {
+            input: Box::new(RelExpr::And {
+                lhs: Box::new(orders()),
+                rhs: Box::new(customers()),
+            }),
+            keep: vec!["cname".to_string()],
+        };
+        assert!(r.surviving_keys().is_empty());
+        assert!(
+            r.needs_distinct(),
+            "dropping every key may create duplicates"
+        );
+    }
+
+    #[test]
+    fn times_composite_key_elides_distinct() {
+        // Greetings times Sizes (disjoint headings): the cover rule can't fire
+        // (empty join key), but the composite {id, size} keys the Cartesian
+        // product, so a bare times needs no DISTINCT.
+        let t = RelExpr::And {
+            lhs: Box::new(greetings()),
+            rhs: Box::new(sizes()),
+        };
+        assert!(!t.surviving_keys().is_empty());
+        assert!(!t.needs_distinct());
+    }
+
+    #[test]
+    fn minus_preserves_lhs_keys() {
+        // R minus S returns a subset of R, so R's key survives — no DISTINCT.
+        let m = RelExpr::Minus {
+            lhs: Box::new(greetings()),
+            rhs: Box::new(greetings()),
+        };
+        assert_eq!(m.surviving_keys(), vec![vec!["id".to_string()]]);
+        assert!(!m.needs_distinct());
+    }
+
+    #[test]
+    fn union_stays_keyless() {
+        // Two same-heading operands can share key values, so `union` is keyless —
+        // conservative (and SQL `UNION` dedups itself anyway).
+        let u = RelExpr::Or {
+            lhs: Box::new(greetings()),
+            rhs: Box::new(greetings()),
+        };
+        assert!(u.surviving_keys().is_empty());
+        assert!(u.needs_distinct());
     }
 
     // ── rename ────────────────────────────────────────────────────────
