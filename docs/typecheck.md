@@ -509,7 +509,8 @@ each `parse_<x>` has a corresponding `check_<x>`.
     runtime's cross-multiply comparator (`a/b ⋛ c/d ⟺ a·d ⋛ c·b`, both
     products fitting the i128 intermediate), never lexicographic text order.
   - **Logical (`and`, `or`)**: both operands must be Boolean.
-    Result is `Boolean`. T0021 otherwise.
+    Result is `Boolean`. T0021 otherwise. (Prefix `not` is the unary
+    sibling — see `check_unary_expr` below, same T0021.)
   - **Arithmetic (`+`, `-`, `*`, `/`)**: both operands must be
     Integer (integer division truncates toward zero). Result is
     `Integer`. T0043 otherwise.
@@ -529,9 +530,12 @@ each `parse_<x>` has a corresponding `check_<x>`.
   scope) and emits T0022. Future phase will lift this restriction
   via a user_data pointer threaded through `coddl_relation_where`.
 - **`check_unary_expr`** — dispatches on the parsed `UnaryOp`.
-  Phase 21 ships `Extract` only. The operand must be
-  `Type::Relation(H)`; the result is `Type::Tuple(H)`. T0024 on
-  a non-relation operand. Other unary ops slot in here.
+  `Extract`: the operand must be `Type::Relation(H)`; the result is
+  `Type::Tuple(H)`; T0024 on a non-relation operand. `Not` (prefix
+  `not` / `¬`): the operand must be `Boolean`; the result is always
+  `Boolean` — returned even on a non-Boolean operand (T0021, shared
+  with `and`/`or`) so the error doesn't cascade into the enclosing
+  `if`/`and`/`or`. Other unary ops slot in here.
 - **`check_project_expr`** — `R project { a, … }`. The operand must be
   `Type::Relation(H)` (T0023, shared with `where`). Each projected
   attribute must exist in `H` (T0027) and appear at most once (T0028);

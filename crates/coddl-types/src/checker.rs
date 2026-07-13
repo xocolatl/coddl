@@ -3620,14 +3620,36 @@ impl TypeChecker {
     }
 
     /// Walk a unary prefix expression. Dispatches on `UnaryOp`.
-    /// Phase 21's only operator is `Extract`: operand must be
-    /// `Relation H`; result is `Tuple H`. T0024 on mismatch.
+    /// `Extract`: operand must be `Relation H`; result is `Tuple H`
+    /// (T0024 on mismatch). `Not`: operand must be `Boolean`; result
+    /// is `Boolean` (T0021 on mismatch — shared with `and`/`or`).
     fn check_unary_expr(&mut self, ue: &UnaryExpr, scope: &mut Scope) -> Type {
         let op = match ue.op_kind() {
             Some(op) => op,
             None => return Type::Unknown,
         };
         match op {
+            UnaryOp::Not => {
+                let operand_ty = match ue.operand() {
+                    Some(e) => self.check_expr(&e, scope),
+                    None => return Type::Boolean,
+                };
+                if !matches!(operand_ty, Type::Boolean | Type::Unknown) {
+                    let span = ue
+                        .operand()
+                        .map(|e| self.node_span(e.syntax()))
+                        .unwrap_or_else(|| self.node_span(ue.syntax()));
+                    self.error(
+                        span,
+                        "T0021",
+                        format!("`not` expects Boolean, got {operand_ty}"),
+                    );
+                }
+                // `not` is always Boolean-valued; return `Boolean` even on a
+                // bad operand (like `check_logical_op`) so the error doesn't
+                // cascade into the enclosing `if`/`and`/`or`.
+                Type::Boolean
+            }
             UnaryOp::Extract => {
                 let operand_ty = match ue.operand() {
                     Some(e) => self.check_expr(&e, scope),
@@ -5333,6 +5355,25 @@ mod tests {
     fn hello_world_checks_clean() {
         let diags = diagnostics(HELLO_WORLD);
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn not_on_boolean_checks_clean() {
+        // `not` (and its `¬` glyph) on a Boolean is `Boolean` — no diagnostics.
+        for src in [
+            "program p; oper main {} [ let b = not true; if b then [ write_line { message: \"x\" }; ]; ];",
+            "program p; oper main {} [ let b = ¬ true; if b then [ write_line { message: \"x\" }; ]; ];",
+        ] {
+            let diags = diagnostics(src);
+            assert!(diags.is_empty(), "src={src}: {diags:?}");
+        }
+    }
+
+    #[test]
+    fn not_on_non_boolean_is_t0021() {
+        // A non-Boolean operand is T0021, the same code `and`/`or` use.
+        let src = "program p; oper main {} [ let b = not 3; if b then [ write_line { message: \"x\" }; ]; ];";
+        assert!(codes(src).contains(&"T0021"), "{:?}", codes(src));
     }
 
     #[test]

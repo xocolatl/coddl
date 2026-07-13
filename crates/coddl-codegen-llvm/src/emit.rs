@@ -1795,6 +1795,17 @@ impl Emitter {
                     },
                 );
             }
+            ScalarOp::Not => {
+                // Unary Boolean negation; `rhs_op` (a dummy = `lhs_op`) unused.
+                writeln!(self.body, "    {dst_name} = xor i1 {lhs_op}, true").unwrap();
+                self.values.insert(
+                    dst,
+                    ValueRepr::Scalar {
+                        ty: "i1".to_string(),
+                        op: dst_name,
+                    },
+                );
+            }
             ScalarOp::Add | ScalarOp::Sub | ScalarOp::Mul | ScalarOp::Div => {
                 // `Integer × Integer → Integer`; `sdiv` truncates toward zero.
                 let instr = match op {

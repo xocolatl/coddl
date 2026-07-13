@@ -4803,6 +4803,24 @@ impl Lowerer {
                 _ => None,
             };
         }
+        // `not <p>` pushes when `<p>` is itself a single pushable comparison:
+        // negate the operator (`not (x = v)` ⇒ `x <> v`, `not flag` ⇒
+        // `flag <> true`). Anything whose operand isn't one `AttrCmp`
+        // (`not (a and b)`, a non-pushable inner) declines here and runs
+        // in-process, where `ScalarOp::Not` evaluates it per-tuple.
+        if let Expr::Unary(ue) = expr {
+            if matches!(ue.op_kind(), Some(UnaryOp::Not)) {
+                let inner = ue.operand()?;
+                let Predicate::AttrCmp { attr, op, value } =
+                    self.build_predicate(&inner, heading)?;
+                return Some(Predicate::AttrCmp {
+                    attr,
+                    op: op.negate(),
+                    value,
+                });
+            }
+            return None;
+        }
         let b = match expr {
             Expr::Binary(b) => b,
             _ => return None,
@@ -5021,6 +5039,23 @@ impl Lowerer {
     fn lower_unary_expr(&mut self, ue: &UnaryExpr) -> ValueId {
         let op = ue.op_kind().expect("typechecked unary expr has an op");
         match op {
+            UnaryOp::Not => {
+                let operand_expr = ue.operand().expect("typechecked not has an operand");
+                let val = self.lower_expr(&operand_expr);
+                let dst = self.fresh_value();
+                self.record_type(dst, ProcType::Boolean);
+                // `Inst::ScalarOp` is binary-shaped; `Not` is unary, so pass a
+                // dummy `rhs = lhs` that the codegen arms ignore. Boolean is a
+                // scalar `i1` — no RC/Text release to track.
+                self.insts.push(Inst::ScalarOp {
+                    dst,
+                    op: ScalarOp::Not,
+                    operand_type: ProcType::Boolean,
+                    lhs: val,
+                    rhs: val,
+                });
+                dst
+            }
             UnaryOp::Extract => {
                 let operand_expr = ue.operand().expect("typechecked extract has an operand");
                 let src = self.lower_expr(&operand_expr);

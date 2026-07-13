@@ -1411,6 +1411,14 @@ impl<'a> Parser<'a> {
             self.parse_extract_expr();
             return true;
         }
+        // `not <expr>` — Boolean prefix negation. Recognized before the
+        // generic IDENT branch so the AST gets a distinct `UNARY_EXPR` node.
+        // The `¬` glyph is a lexed IDENT whose text is the glyph, matched by
+        // `at_keyword` directly (a raw source-text compare).
+        if self.at_keyword("not") || self.at_keyword("¬") {
+            self.parse_not_expr();
+            return true;
+        }
         // `true` / `false` — contextual-keyword Boolean literal.
         // Recognized before the generic IDENT branch so the AST gets
         // a distinct `BOOL_LITERAL` node rather than a NAME_REF.
@@ -1608,6 +1616,23 @@ impl<'a> Parser<'a> {
                      // `or`, comparisons all bind inside. Missing operand surfaces
                      // as P0014 from the inner `parse_primary_expr`.
         self.parse_expr_prec(0, true);
+        self.finish_node();
+    }
+
+    /// `not <expr>` / `¬ <expr>` — Boolean prefix negation. Parsed as a
+    /// `UNARY_EXPR` containing one operand (typechecked to be Boolean). The
+    /// operand parses at precedence 3 (comparison level): since
+    /// `parse_expr_prec` continues while `prec >= min_prec`, comparison and
+    /// arithmetic (prec 3–5) bind inside the operand while `and` (2) / `or`
+    /// (1) stay outside — so `not a and b` reads as `(not a) and b` and
+    /// `not a = b` as `not (a = b)`, matching the `and < not < comparison`
+    /// ladder. Nested `not not p` falls out naturally.
+    fn parse_not_expr(&mut self) {
+        debug_assert!(self.at_keyword("not") || self.at_keyword("¬"));
+        self.bump_trivia();
+        self.start_node(SyntaxKind::UNARY_EXPR);
+        self.bump(); // `not` / `¬`
+        self.parse_expr_prec(3, true);
         self.finish_node();
     }
 
@@ -2142,6 +2167,30 @@ mod tests {
                 SyntaxKind::SEMICOLON,
             ]
         );
+    }
+
+    #[test]
+    fn not_and_glyph_parse_to_unary_expr() {
+        // `not <expr>` and its `¬` glyph both build a UNARY_EXPR with no
+        // diagnostics; the AST resolves either spelling to `UnaryOp::Not`.
+        for src in [
+            "program p; oper main {} [ let x = not true; ];",
+            "program p; oper main {} [ let x = ¬ true; ];",
+        ] {
+            let out = parse_str(src);
+            assert!(
+                out.diagnostics.is_empty(),
+                "src={src}: {:?}",
+                out.diagnostics
+            );
+            let unary = out
+                .tree
+                .descendants()
+                .find(|n| n.kind() == SyntaxKind::UNARY_EXPR)
+                .and_then(<crate::ast::UnaryExpr as crate::ast::AstNode>::cast)
+                .unwrap_or_else(|| panic!("src={src}: expected a UNARY_EXPR"));
+            assert_eq!(unary.op_kind(), Some(crate::ast::UnaryOp::Not), "src={src}");
+        }
     }
 
     #[test]

@@ -3501,6 +3501,88 @@ fn mixed_literal_and_dynamic_param_cranelift() {
     assert_mixed_literal_and_dynamic_param("cranelift");
 }
 
+// ── Boolean `not` (prefix negation) ───────────────────────────────────
+
+/// `not` lowers to `ScalarOp::Not` in ProcIR and evaluates on both backends,
+/// with the settled precedence `or < and < not < comparison`. Each `if` prints
+/// its marker only when the guarded condition is true under the *correct* parse:
+///   - `not f and f` ⇒ `(not f) and f` = false — a `not (f and f)` misparse
+///     would be true and leak "and-BUG" into the (exact-matched) output.
+///   - `not 1 = 2` ⇒ `not (1 = 2)` = true — a `(not 1) = 2` misparse is a type
+///     error and wouldn't compile, so a clean run proves `not < comparison`.
+///   - `not not t` ⇒ true (nested prefix).
+///   - `¬ f` ⇒ true (the glyph is a synonym for `not`).
+///   - `not t or t` ⇒ `(not t) or t` = true — a `not (t or t)` misparse = false.
+fn assert_not_precedence_and_glyph(backend: &str) {
+    let stdout = run_greetings_stdout(
+        backend,
+        "program p;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             let t = true;\n\
+             let f = false;\n\
+             if not f and f then [ write_line { message: \"and-BUG\" }; ];\n\
+             if not 1 = 2 then [ write_line { message: \"cmp-ok\" }; ];\n\
+             if not not t then [ write_line { message: \"dneg-ok\" }; ];\n\
+             if ¬ f then [ write_line { message: \"glyph-ok\" }; ];\n\
+             if not t or t then [ write_line { message: \"or-ok\" }; ];\n\
+         ];\n",
+    );
+    assert_eq!(
+        stdout,
+        b"cmp-ok\ndneg-ok\nglyph-ok\nor-ok\n",
+        "backend={backend}: got {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+}
+
+#[test]
+fn not_precedence_and_glyph_llvm() {
+    assert_not_precedence_and_glyph("llvm");
+}
+
+#[test]
+fn not_precedence_and_glyph_cranelift() {
+    assert_not_precedence_and_glyph("cranelift");
+}
+
+/// `where not (id = 1)` pushes to SQL as `WHERE "id" <> ?` (the pushdown
+/// negates the comparison via `CmpOp::negate`), so it selects the one row with
+/// `id <> 1` — `goodbye` (id 2). A broken negation (or an un-negated push)
+/// would select `hello world` (id 1) or both rows and fail `extract`'s
+/// single-row check. Exercises build_predicate → sqlemit on both backends.
+fn assert_not_pushdown(backend: &str) {
+    let stdout = run_greetings_stdout(
+        backend,
+        "program p;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             let g = transaction [\n\
+                 extract (Greetings where not (id = 1) project { message })\n\
+             ];\n\
+             write_line { message: g.message };\n\
+         ];\n",
+    );
+    assert_eq!(
+        stdout,
+        b"goodbye\n",
+        "backend={backend}: got {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+}
+
+#[test]
+fn not_pushdown_llvm() {
+    assert_not_pushdown("llvm");
+}
+
+#[test]
+fn not_pushdown_cranelift() {
+    assert_not_pushdown("cranelift");
+}
+
 // ── surgical writes (relational assignment → DML) ─────────────────────
 
 /// Seed a fresh two-row `greetings` db + its `.cddb`/`.cdstore` companions,

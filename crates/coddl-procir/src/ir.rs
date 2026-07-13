@@ -568,6 +568,10 @@ pub enum ScalarOp {
     GtEq,
     And,
     Or,
+    /// `Boolean → Boolean` prefix negation (surface `not` / `¬`). Unary:
+    /// backends read only `lhs` (the lowerer passes a dummy `rhs = lhs`)
+    /// and emit a single `xor i1 x, true`.
+    Not,
     /// `Integer × Integer → Integer`. `Div` truncates toward zero (surface
     /// `div`).
     Add,
@@ -1014,6 +1018,7 @@ impl fmt::Display for ScalarOp {
             ScalarOp::GtEq => "ge",
             ScalarOp::And => "and",
             ScalarOp::Or => "or",
+            ScalarOp::Not => "not",
             ScalarOp::Add => "add",
             ScalarOp::Sub => "sub",
             ScalarOp::Mul => "mul",

@@ -34,7 +34,7 @@ Three operator-shape categories, with deliberate exceptions:
 
 - **Symbolic**: `=`, `<>`, `<`, `>`, `<=`, `>=`, `+`, `-`, `*`, `/`. The comparison operators `<=` and `>=` are polymorphic: scalar comparison on scalars (as ever); **subset** and **superset** on relations (`R <= S` iff every tuple in `R` appears in `S`; `S >= R` iff `R <= S`). `<` and `>` give strict subset / superset analogously. Identical headings are required for the relation overload — checked at compile time. There's no separate `subset` keyword; `<=` covers it.
 - **Textual relational**: `join`, `times`, `intersect`, `compose`, `union`, `minus`, `where`.
-- **Textual logical**: `and`, `or`. (Both `Boolean × Boolean → Boolean`. `or` < `and` < `not` < comparison on the precedence ladder; final ordering deferred to the parser phase.)
+- **Textual logical**: `and`, `or` (infix, both `Boolean × Boolean → Boolean`) and `not` (prefix, `Boolean → Boolean`). Precedence ladder `or` (1) < `and` (2) < `not` < comparison (3): `not` is a prefix operator whose operand parses at comparison level, so `not a and b` reads as `(not a) and b` and `not a = b` as `not (a = b)`. `not` also has the Unicode glyph `¬` (see "Unicode operator glyphs").
 - **Textual arithmetic**: `div` (truncating integer division, toward zero), and the planned `mod` (remainder). `div` is `Integer × Integer → Integer` and binds at multiplicative precedence, alongside `*` and `/`. **The symbolic `/` is *exact* division**: `Integer × Integer → Rational` — `7 / 2` is the rational `7/2`, whereas `7 div 2` is the integer `3`. (`div` is the recognized keyword; `mod` is documented here but not yet wired.)
 
 Reason: the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-unfriendly names, and the textual binary ops all have natural infix readings from math and SQL. No-reserved-words still holds — `join` is recognized contextually in expression position; it remains a valid identifier elsewhere.
@@ -105,6 +105,7 @@ A small set of single-codepoint mathematical glyphs lex as **exact synonyms** fo
 | `union` | `∪` | U+222A |
 | `intersect` | `∩` | U+2229 |
 | `minus` | `∖` | U+2216 SET MINUS (**not** U+005C reverse solidus — that's the string-escape character) |
+| `not` | `¬` | U+00AC NOT SIGN |
 | `<=` | `≤`, `⊆` | U+2264, U+2286 |
 | `>=` | `≥`, `⊇` | U+2265, U+2287 |
 | `<` | `⊂` | U+2282 (relational strict-subset reading; scalar `<` keeps its ASCII form) |
@@ -764,6 +765,7 @@ function that implements it.
                   | <relation-lit>
                   | <sequence-lit>
                   | <extract-expr>
+                  | <not-expr>
                   | <paren-expr> ;                             -- parse_primary_expr
 <bool-lit>      ::= 'true' | 'false' ;                         -- BOOL_LITERAL
 <extract-expr>  ::= 'extract' <expr-prec> ;                    -- parse_extract_expr
@@ -773,6 +775,16 @@ function that implements it.
                     -- lowest precedence so `extract R where p`
                     -- reads as `extract (R where p)` without
                     -- parens.
+<not-expr>      ::= ( 'not' | '¬' ) <expr-prec> ;               -- parse_not_expr
+                    -- Boolean prefix negation (`Boolean →
+                    -- Boolean`). Wraps in UNARY_EXPR. The operand
+                    -- parses at prec 3 (comparison level), so
+                    -- comparison/arithmetic bind inside but
+                    -- `and`/`or` stay outside: `not a and b` is
+                    -- `(not a) and b`, `not a = b` is `not (a = b)`.
+                    -- `¬` is the glyph synonym (lexed as an IDENT,
+                    -- matched at the same recognition site). T0021
+                    -- if the operand isn't Boolean.
 <paren-expr>    ::= '(' <expr-prec> ')' ;                       -- PAREN_EXPR
                     -- Transparent grouping; AST view unwraps to
                     -- the inner expression so the typechecker /

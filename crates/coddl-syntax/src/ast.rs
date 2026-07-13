@@ -1147,13 +1147,16 @@ impl BinaryExpr {
     }
 }
 
-/// Unary prefix operator kinds. Phase 21 ships `Extract` only —
-/// future unary ops (`not`, unary `-`) slot in here.
+/// Unary prefix operator kinds — `Extract` and Boolean `Not`
+/// (future unary ops, e.g. unary `-`, slot in here).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
     /// `extract <relexpr>` — TTM RM Pre 10 cardinality-checked
     /// relation-to-tuple primitive.
     Extract,
+    /// `not <boolexpr>` (or its `¬` glyph) — Boolean prefix negation
+    /// (`Boolean → Boolean`).
+    Not,
 }
 
 ast_node!(pub UnaryExpr, UNARY_EXPR);
@@ -1164,12 +1167,13 @@ impl UnaryExpr {
         self.syntax.children().find_map(Expr::cast)
     }
 
-    /// The operator's keyword token. Phase 21's only unary op is
-    /// `extract`, recognized via its IDENT lexeme.
+    /// The operator's keyword token, recognized via its IDENT lexeme:
+    /// `extract`, `not`, or the `¬` glyph (also lexed as an IDENT).
     pub fn op_token(&self) -> Option<SyntaxToken> {
         for el in self.syntax.children_with_tokens() {
             if let Some(tok) = el.into_token() {
-                if tok.kind() == SyntaxKind::IDENT && matches!(tok.text(), "extract") {
+                if tok.kind() == SyntaxKind::IDENT && matches!(tok.text(), "extract" | "not" | "¬")
+                {
                     return Some(tok);
                 }
             }
@@ -1183,6 +1187,7 @@ impl UnaryExpr {
         let tok = self.op_token()?;
         Some(match tok.text() {
             "extract" => UnaryOp::Extract,
+            "not" | "¬" => UnaryOp::Not,
             _ => return None,
         })
     }

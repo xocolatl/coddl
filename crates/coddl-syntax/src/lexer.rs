@@ -168,7 +168,7 @@ impl<'a> Lexer<'a> {
             '|' => self.lex_pipe(start),
 
             // Unicode glyph synonyms (§3 "Unicode operator glyphs")
-            '⋈' | '∪' | '∩' | '∖' => self.lex_word_glyph(start),
+            '⋈' | '∪' | '∩' | '∖' | '¬' => self.lex_word_glyph(start),
             '≤' | '⊆' => self.lex_glyph(TokenKind::LtEq, start),
             '≥' | '⊇' => self.lex_glyph(TokenKind::GtEq, start),
             '⊂' => self.lex_glyph(TokenKind::Lt, start),
@@ -524,9 +524,9 @@ impl<'a> Lexer<'a> {
         self.emit(TokenKind::Ident, start);
     }
 
-    /// A single-codepoint Unicode word operator (`⋈ ∪ ∩ ∖`) emitted as an
+    /// A single-codepoint Unicode word operator (`⋈ ∪ ∩ ∖ ¬`) emitted as an
     /// `Ident` token — the parser resolves it to its canonical word
-    /// (`join`, `union`, `intersect`, `minus`) at the same recognition
+    /// (`join`, `union`, `intersect`, `minus`, `not`) at the same recognition
     /// site as the ASCII spelling.
     fn lex_word_glyph(&mut self, start: usize) {
         self.bump();
@@ -879,8 +879,8 @@ mod tests {
     #[test]
     fn unicode_glyph_synonyms_lex_to_canonical_tokens() {
         use TokenKind::*;
-        // ⋈ ∪ ∩ ∖ emit Ident; ≤ ⊆ → LtEq; ⊂ → Lt; ≠ → NotEq
-        let out = lex_all("⋈ ∪ ∩ ∖ ≤ ⊆ ≥ ⊇ ⊂ ⊃ ≠");
+        // ⋈ ∪ ∩ ∖ ¬ emit Ident; ≤ ⊆ → LtEq; ⊂ → Lt; ≠ → NotEq
+        let out = lex_all("⋈ ∪ ∩ ∖ ¬ ≤ ⊆ ≥ ⊇ ⊂ ⊃ ≠");
         let kinds: Vec<_> = out
             .tokens
             .iter()
@@ -889,7 +889,7 @@ mod tests {
             .collect();
         assert_eq!(
             kinds,
-            vec![Ident, Ident, Ident, Ident, LtEq, LtEq, GtEq, GtEq, Lt, Gt, NotEq, Eof]
+            vec![Ident, Ident, Ident, Ident, Ident, LtEq, LtEq, GtEq, GtEq, Lt, Gt, NotEq, Eof]
         );
         assert!(out.diagnostics.is_empty());
     }

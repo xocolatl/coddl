@@ -2037,6 +2037,9 @@ fn emit_inst(
             let result = match op {
                 ScalarOp::And => builder.ins().band(lhs_v, rhs_v),
                 ScalarOp::Or => builder.ins().bor(lhs_v, rhs_v),
+                // Unary Boolean negation; `rhs_v` (a dummy = `lhs_v`) unused.
+                // Cranelift I8 boolean lane: xor with 1 flips the low bit.
+                ScalarOp::Not => builder.ins().bxor_imm(lhs_v, 1),
                 // `Integer × Integer → Integer`; `sdiv` truncates toward zero.
                 ScalarOp::Add => builder.ins().iadd(lhs_v, rhs_v),
                 ScalarOp::Sub => builder.ins().isub(lhs_v, rhs_v),

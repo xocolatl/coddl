@@ -97,7 +97,7 @@ oper page_html{ title: Text, body: Text } -> Text [
 // is a 404. A generic route table is F7; this stays a small explicit match.
 oper handle{ req: Request } -> RawResponse [
     let is_get = req.method = "GET";
-    if is_get = false then [
+    if not is_get then [
         return html_response_404{};
     ];
 
