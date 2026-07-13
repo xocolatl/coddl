@@ -406,6 +406,13 @@ fn cmd_explain(args: &[String]) -> ExitCode {
                 }
                 let _ = writeln!(w, "  SQL:");
                 let _ = writeln!(w, "    {}", entry.sql);
+                // A root `matching` over a shipped relation bakes a second
+                // plan: the runtime fires this specialized form instead when
+                // the shipped relation holds exactly one row.
+                if let Some(card1) = &entry.card1_sql {
+                    let _ = writeln!(w, "  SQL (card-1 dispatch):");
+                    let _ = writeln!(w, "    {card1}");
+                }
             }
         }
     }

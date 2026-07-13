@@ -77,18 +77,37 @@ fn database_registry() -> &'static Mutex<HashMap<String, DbEntry>> {
 }
 
 /// One registered query plan: the SQL text codegen baked from RelIR, the
-/// logical database it targets, the number of scalar bind parameters, the
-/// arity of each relation-valued parameter (one per `__CODDL_REL_<slot>__`
-/// marker in the text, in slot order), and a pointer to the result heading
-/// descriptor (stored as `usize` so the map stays `Send + Sync` — the
-/// descriptor is a codegen-emitted static, valid for the program's life, same
-/// discipline as [`relvar_slots`]).
+/// logical database it targets, the number of bind placeholders, the spec of
+/// each relation-valued parameter (one per `__CODDL_REL_<slot>__` marker in
+/// the text, in slot order), a pointer to the result heading descriptor
+/// (stored as `usize` so the map stays `Send + Sync` — the descriptor is a
+/// codegen-emitted static, valid for the program's life, same discipline as
+/// [`relvar_slots`]), and the cardinality-1 sibling linkage.
 struct PlanEntry {
     db_name: String,
     sql: String,
     param_count: u32,
-    rel_arities: Vec<u32>,
+    rel_specs: Vec<RelSpec>,
     desc: usize,
+    /// Plan id of the cardinality-1 sibling — the specialized `WHERE shared
+    /// = ?N…` form [`coddl_query`] fires instead of this plan when the
+    /// dispatch slot's relation holds exactly one row, binding the row's
+    /// cells after the scalar params.
+    card1_alt: Option<u32>,
+    /// Which relation-parameter slot's cardinality drives the dispatch.
+    dispatch_slot: u32,
+}
+
+/// One relation-valued parameter's registration spec (the decoded half of
+/// the codegen's interleaved `[arity, flags]` pair array).
+#[derive(Clone, Copy)]
+struct RelSpec {
+    /// Leaf-column count the bound relation must have.
+    arity: u32,
+    /// Whether an empty relation at this slot makes the whole result
+    /// provably empty — [`coddl_query`] then returns a fresh empty relation
+    /// without firing a statement (the empty-slot short-circuit).
+    absorbs_empty: bool,
 }
 
 /// Plan registry, keyed by the codegen-assigned [`PlanId`] (a dense `u32`,
@@ -796,7 +815,9 @@ pub unsafe extern "C" fn coddl_register_database(
 /// # Safety
 /// `result_desc` must point to a heading descriptor that lives for the
 /// program's lifetime (a codegen-emitted static). The (ptr, len) pairs must
-/// describe valid UTF-8; `rel_arities` must be valid for `n_rels` reads.
+/// describe valid UTF-8; `rel_specs` must be valid for `2 * n_rels` `u32`
+/// reads (interleaved `[arity, flags]` pairs, flags bit 0 = absorbs_empty).
+/// `card1_alt` is the sibling's dense plan id, or −1 for none.
 #[no_mangle]
 pub unsafe extern "C" fn coddl_register_plan(
     plan_id: PlanId,
@@ -805,9 +826,11 @@ pub unsafe extern "C" fn coddl_register_plan(
     sql: *const u8,
     sql_len: usize,
     param_count: u32,
-    rel_arities: *const u32,
+    rel_specs: *const u32,
     n_rels: usize,
     result_desc: *const CoddlHeadingDesc,
+    card1_alt: i64,
+    dispatch_slot: u32,
 ) -> CoddlStatus {
     if result_desc.is_null() {
         eprintln!(
@@ -818,10 +841,27 @@ pub unsafe extern "C" fn coddl_register_plan(
     }
     let db_name = bytes_to_str("plan database name", db_name, db_name_len);
     let sql = bytes_to_str("plan SQL", sql, sql_len);
-    let rel_arities: Vec<u32> = if rel_arities.is_null() || n_rels == 0 {
+    let rel_specs: Vec<RelSpec> = if rel_specs.is_null() || n_rels == 0 {
         Vec::new()
     } else {
-        std::slice::from_raw_parts(rel_arities, n_rels).to_vec()
+        std::slice::from_raw_parts(rel_specs, n_rels * 2)
+            .chunks_exact(2)
+            .map(|pair| RelSpec {
+                arity: pair[0],
+                absorbs_empty: pair[1] & 1 != 0,
+            })
+            .collect()
+    };
+    let card1_alt = match card1_alt {
+        -1 => None,
+        id if id >= 0 && id <= u32::MAX as i64 => Some(id as u32),
+        other => {
+            eprintln!(
+                "coddl: register_plan: plan {} has out-of-range card1_alt {other}",
+                plan_id.0
+            );
+            std::process::abort();
+        }
     };
     let mut registry = plan_registry().lock().expect("plan registry poisoned");
     if registry.contains_key(&plan_id.0) {
@@ -837,8 +877,10 @@ pub unsafe extern "C" fn coddl_register_plan(
             db_name: db_name.to_string(),
             sql: sql.to_string(),
             param_count,
-            rel_arities,
+            rel_specs,
             desc: result_desc as usize,
+            card1_alt,
+            dispatch_slot,
         },
     );
     CoddlStatus::Ok
@@ -881,15 +923,17 @@ pub unsafe extern "C" fn coddl_query(
 ) -> *mut u8 {
     // Look up the plan; clone what we need and drop the registry lock before
     // taking any other lock (no lock-order coupling).
-    let (db_name, sql, param_count, rel_arities, desc_addr) = {
+    let (db_name, sql, param_count, rel_specs, desc_addr, card1_alt, dispatch_slot) = {
         let registry = plan_registry().lock().expect("plan registry poisoned");
         match registry.get(&plan_id.0) {
             Some(entry) => (
                 entry.db_name.clone(),
                 entry.sql.clone(),
                 entry.param_count,
-                entry.rel_arities.clone(),
+                entry.rel_specs.clone(),
                 entry.desc,
+                entry.card1_alt,
+                entry.dispatch_slot,
             ),
             None => {
                 eprintln!("coddl: query: no plan registered for plan_id {}", plan_id.0);
@@ -906,13 +950,61 @@ pub unsafe extern "C" fn coddl_query(
         );
         std::process::abort();
     }
-    if n_rels != rel_arities.len() {
+    if n_rels != rel_specs.len() {
         eprintln!(
             "coddl: query: plan {} expects {} relation param(s), got {n_rels}",
             plan_id.0,
-            rel_arities.len()
+            rel_specs.len()
         );
         std::process::abort();
+    }
+
+    let rel_slice: &[CoddlRelParam] = if rels.is_null() || n_rels == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(rels, n_rels)
+    };
+
+    // Validate every bound relation's arity up front and read its row count —
+    // the count is free (the RC header holds it) and it drives the
+    // cardinality dispatch: 0 at an absorbing slot → empty result without a
+    // statement; 1 at the dispatch slot → the specialized sibling plan;
+    // otherwise the general marker-expansion form.
+    let mut row_counts: Vec<usize> = Vec::with_capacity(rel_slice.len());
+    for (slot, rel) in rel_slice.iter().enumerate() {
+        let arity = if rel.desc.is_null() {
+            0
+        } else {
+            (*rel.desc).attr_count as usize
+        };
+        if arity != rel_specs[slot].arity as usize {
+            eprintln!(
+                "coddl: query: plan {}: relation param {slot} has arity {arity}, expected {}",
+                plan_id.0, rel_specs[slot].arity
+            );
+            std::process::abort();
+        }
+        row_counts.push(rel_row_count(rel));
+    }
+
+    let ctx = MarshalCtx {
+        site: "query",
+        step_subject: format!("plan {}", plan_id.0),
+        of_subject: format!("plan {}", plan_id.0),
+    };
+    let record_size = (*desc).record_size as usize;
+
+    // Empty-slot short-circuit: an empty relation at an absorbing slot makes
+    // the whole result provably empty (the empty relation is the join
+    // family's multiplicative zero), so return a fresh empty relation on the
+    // plan's result descriptor without preparing a statement or even touching
+    // the connection. Observationally identical to firing (RM Pre 8).
+    if rel_specs
+        .iter()
+        .zip(&row_counts)
+        .any(|(spec, &count)| spec.absorbs_empty && count == 0)
+    {
+        return finalize_relation(&[], record_size, desc, &ctx);
     }
 
     // Resolve the plan's logical database to its connection path.
@@ -948,29 +1040,66 @@ pub unsafe extern "C" fn coddl_query(
         .map(|p| param_to_sqlite(p, plan_id.0))
         .collect();
 
-    // Relation-valued parameters: validate each bound relation's arity
-    // against the plan, substitute its marker with the table primary built
-    // from its rows, and append its cells to the bind vector (scalars first,
-    // then slot cells in slot order — matching the numbered placeholders).
-    let rel_slice: &[CoddlRelParam] = if rels.is_null() || n_rels == 0 {
-        &[]
-    } else {
-        std::slice::from_raw_parts(rels, n_rels)
-    };
+    // Cardinality-1 dispatch: the dispatch slot holds exactly one row, so the
+    // existence test degenerates to an equality conjunction and the baked
+    // sibling plan (`WHERE shared = ?N…`) fires instead — for a keyed lookup
+    // that is the direct-PK plan, no EXISTS and no DISTINCT. The sibling's
+    // binds are this plan's scalars (`?1..?k`, same argument list) followed
+    // by the row's cells (`?k+1..?k+m`, decoded in the shipped descriptor's
+    // canonical order — the same order its equality conjuncts were emitted
+    // in). The row's values bind as parameters like everything else; the
+    // audit log's inlined values are trace expansion, not inlining.
+    if let Some(alt_id) = card1_alt {
+        if row_counts.get(dispatch_slot as usize) == Some(&1) {
+            let (alt_sql, alt_param_count, alt_n_rels, alt_desc) = {
+                let registry = plan_registry().lock().expect("plan registry poisoned");
+                match registry.get(&alt_id) {
+                    Some(entry) => (
+                        entry.sql.clone(),
+                        entry.param_count,
+                        entry.rel_specs.len(),
+                        entry.desc,
+                    ),
+                    None => {
+                        eprintln!(
+                            "coddl: query: plan {} names unregistered card-1 sibling {alt_id}",
+                            plan_id.0
+                        );
+                        std::process::abort();
+                    }
+                }
+            };
+            // The sibling was registered from the same emission with the same
+            // result heading, no markers of its own (v1 bakes it only for a
+            // single-slot plan); a mismatch is a codegen bug.
+            if alt_n_rels != 0 || alt_desc != desc_addr {
+                eprintln!(
+                    "coddl: query: card-1 sibling {alt_id} of plan {} is malformed",
+                    plan_id.0
+                );
+                std::process::abort();
+            }
+            let rel = &rel_slice[dispatch_slot as usize];
+            bindings.extend(decode_relation_cells(rel.src, rel.desc, "query"));
+            if bindings.len() != alt_param_count as usize {
+                eprintln!(
+                    "coddl: query: card-1 sibling {alt_id} of plan {} expects {alt_param_count} \
+                     bind(s), got {}",
+                    plan_id.0,
+                    bindings.len()
+                );
+                std::process::abort();
+            }
+            return fire_and_marshal(&path, &alt_sql, &bindings, desc, alt_id, &ctx);
+        }
+    }
+
+    // General form: substitute each slot's marker with the table primary
+    // built from its rows and append its cells to the bind vector (scalars
+    // first, then slot cells in slot order — matching the numbered
+    // placeholders).
     let mut sql = sql;
     for (slot, rel) in rel_slice.iter().enumerate() {
-        let arity = if rel.desc.is_null() {
-            0
-        } else {
-            (*rel.desc).attr_count as usize
-        };
-        if arity != rel_arities[slot] as usize {
-            eprintln!(
-                "coddl: query: plan {}: relation param {slot} has arity {arity}, expected {}",
-                plan_id.0, rel_arities[slot]
-            );
-            std::process::abort();
-        }
         let marker = coddl_sqlemit::rel_param_marker(slot);
         if !sql.contains(&marker) {
             eprintln!(
@@ -994,44 +1123,54 @@ pub unsafe extern "C" fn coddl_query(
         std::process::abort();
     }
 
+    fire_and_marshal(&path, &sql, &bindings, desc, plan_id.0, &ctx)
+}
+
+/// Prepare, execute, and marshal one read statement into a fresh RC
+/// `Relation` — the shared tail of [`coddl_query`]'s general and
+/// cardinality-1 paths. `prepare_cached` keys by SQL text per connection, so
+/// repeat queries of the same plan reuse the compiled statement; the audit
+/// `trace` hook captures the (expanded) statement on execution.
+///
+/// # Safety
+/// `desc` must be a valid heading descriptor outliving the returned relation;
+/// the connection for `path` must have been opened by `ensure_connection`.
+unsafe fn fire_and_marshal(
+    path: &str,
+    sql: &str,
+    bindings: &[rusqlite::types::Value],
+    desc: *const CoddlHeadingDesc,
+    plan_id: u32,
+    ctx: &MarshalCtx,
+) -> *mut u8 {
     let attrs = std::slice::from_raw_parts((*desc).attrs, (*desc).attr_count as usize);
     let record_size = (*desc).record_size as usize;
-    let ctx = MarshalCtx {
-        site: "query",
-        step_subject: format!("plan {}", plan_id.0),
-        of_subject: format!("plan {}", plan_id.0),
-    };
-
     // Fire the prepared statement and marshal its rows under one pool guard.
-    // `prepare_cached` keys by SQL text per connection, so repeat queries of
-    // the same plan reuse the compiled statement. The CachedStatement / Rows /
-    // &Connection / guard are all frame-local and drop at the block's end.
+    // The CachedStatement / Rows / &Connection / guard are all frame-local
+    // and drop at the block's end.
     let row_buffers = {
         let conn_guard = db_connections().lock().expect("conn map poisoned");
         let conn = conn_guard
-            .get(&path)
+            .get(path)
             .expect("connection inserted by ensure_connection");
-        let mut stmt = match conn.prepare_cached(&sql) {
+        let mut stmt = match conn.prepare_cached(sql) {
             Ok(s) => s,
             Err(err) => {
-                eprintln!("coddl: query: prepare failed for plan {}: {err}", plan_id.0);
+                eprintln!("coddl: query: prepare failed for plan {plan_id}: {err}");
                 std::process::abort();
             }
         };
         let mut rows = match stmt.query(params_from_iter(bindings.iter())) {
             Ok(r) => r,
             Err(err) => {
-                eprintln!(
-                    "coddl: query: execution failed for plan {}: {err}",
-                    plan_id.0
-                );
+                eprintln!("coddl: query: execution failed for plan {plan_id}: {err}");
                 std::process::abort();
             }
         };
-        marshal_rows(&mut rows, attrs, record_size, &ctx)
+        marshal_rows(&mut rows, attrs, record_size, ctx)
     };
 
-    finalize_relation(&row_buffers, record_size, desc, &ctx)
+    finalize_relation(&row_buffers, record_size, desc, ctx)
 }
 
 /// Execute a registered **DML** plan (`DELETE`/`INSERT`/`UPDATE`) for its
@@ -1155,6 +1294,22 @@ const QUERY_BIND_CEILING: usize = 999;
 /// # Safety
 /// `src`/`desc` must describe a valid relation payload (as for
 /// `coddl_write_relation`), or be null.
+/// Row count of a relation-valued parameter — a free read of the RC header
+/// (a null payload is the empty relation). This is what makes the force
+/// point's cardinality dispatch cost nothing: the shipped relation is already
+/// in hand, its count already counted.
+///
+/// # Safety
+/// `rel.src` must be a valid relation payload or null.
+unsafe fn rel_row_count(rel: &CoddlRelParam) -> usize {
+    use crate::rc::{CoddlRcHeader, HEADER_SIZE};
+    if rel.src.is_null() {
+        return 0;
+    }
+    let header = rel.src.sub(HEADER_SIZE) as *const CoddlRcHeader;
+    (*header).length as usize
+}
+
 unsafe fn decode_relation_cells(
     src: *const u8,
     desc: *const CoddlHeadingDesc,
@@ -1622,6 +1777,8 @@ mod tests {
                     ptr::null(),
                     0,
                     &desc,
+                    -1,
+                    0,
                 ),
                 CoddlStatus::Ok
             );
@@ -1636,6 +1793,8 @@ mod tests {
                     ptr::null(),
                     0,
                     &desc,
+                    -1,
+                    0,
                 ),
                 CoddlStatus::Ok
             );
@@ -1794,6 +1953,8 @@ mod tests {
                     ptr::null(),
                     0,
                     &desc,
+                    -1,
+                    0,
                 ),
                 CoddlStatus::Ok
             );
@@ -1861,6 +2022,8 @@ mod tests {
                 ptr::null(),
                 0,
                 &desc,
+                -1,
+                0,
             );
 
             // No row has id = 99 → an empty (length-0) relation, not an abort.
@@ -1907,6 +2070,8 @@ mod tests {
                 ptr::null(),
                 0,
                 &desc,
+                -1,
+                0,
             );
 
             // Two queries through the same plan hit rusqlite's prepared-statement

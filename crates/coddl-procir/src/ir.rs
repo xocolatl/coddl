@@ -119,16 +119,42 @@ pub struct PlanEntry {
     pub db_name: String,
     /// The baked SQL text, ready to prepare (`?N` placeholders for SQLite).
     pub sql: String,
-    /// Number of scalar bind parameters the SQL expects (`?1..?N`).
+    /// Number of bind placeholders in `sql` (`?1..?N`). For a cardinality-1
+    /// sibling plan this counts the scalar args *plus* the trailing cell
+    /// binds the runtime fills from the dispatch slot's single row.
     pub param_count: u32,
-    /// Arity (column count) of each relation-valued parameter, in slot order.
-    /// One entry per `__CODDL_REL_<slot>__` marker in `sql`; the runtime
-    /// validates a matching `Inst::Query`'s bound relations against these
-    /// before expanding the markers. Empty for a plan with no shipped
-    /// relation.
-    pub rel_arities: Vec<u32>,
+    /// One entry per relation-valued parameter (`__CODDL_REL_<slot>__`
+    /// marker) in `sql`, in slot order; the runtime validates a matching
+    /// `Inst::Query`'s bound relations against these before expanding the
+    /// markers. Empty for a plan with no shipped relation.
+    pub rel_params: Vec<RelParamReg>,
     /// Heading id (into `Module::headings`) of the rows the plan returns.
     pub result_heading_id: HeadingId,
+    /// Dense plan id of this plan's cardinality-1 sibling, when one was
+    /// baked: the specialized `WHERE shared = ?N…` form of a root `matching`
+    /// over a shipped relation. The runtime fires it instead of this plan
+    /// when the dispatch slot holds exactly one row, binding the row's cells
+    /// after the scalar args. The sibling is an ordinary entry of its own;
+    /// nothing references it from an `Inst::Query`.
+    pub card1_alt: Option<u32>,
+    /// Which slot's runtime cardinality drives the `card1_alt` dispatch.
+    /// Meaningful only when `card1_alt` is set (v1 bakes a sibling only for
+    /// a single-slot plan, so this is always 0 today — carried explicitly so
+    /// the registration ABI doesn't assume it).
+    pub dispatch_slot: u32,
+}
+
+/// Registration metadata for one relation-valued parameter of a plan — the
+/// per-slot half of what `coddl_register_plan` receives (the codegen emits
+/// these as an interleaved `[arity, flags]` static array).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelParamReg {
+    /// Column count the bound relation must have.
+    pub arity: u32,
+    /// Whether an empty relation at this slot makes the whole result
+    /// provably empty — the runtime then returns a fresh empty relation
+    /// without firing a statement (the empty-slot short-circuit).
+    pub absorbs_empty: bool,
 }
 
 /// A function — either a defined one (non-empty `blocks`) or an extern

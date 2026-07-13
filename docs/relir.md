@@ -15,7 +15,7 @@ This doc describes the **target** RelIR. The code implements a thin slice of it;
 - `RelExpr` (`coddl-relir/src/expr.rs`) — four nodes: the `RelvarRef` leaf, `Restrict` (surface `where`), `Project` (project-over *and* project-away), and `Rename`.
 - Per-node **heading** inference and the **storage-origin** flag; declared candidate **keys** on the leaf, used for key-based `DISTINCT`-elision (`needs_distinct`).
 - **The cut** as an origin gate — *not* a cost model: push a subtree when it touches a relvar (`RelvarRooted` **or** `Mixed`) and SQL emission succeeds (`coddl-procir/src/cut.rs`); a fully `Materialized` tree stays in-process.
-- **Mixed-origin pushdown** via the **`RelParam` leaf** — a relation-valued bind parameter, the relation analogue of `RestrictValue::Param`. A relation-typed local (a bound relation value, a relation-valued tuple field like `req.path`) builds as `RelParam { slot, heading }`; a *maximal materialized subtree* under a binary operator collapses to one slot (its structural build is discarded, its whole AST recorded — the in-process machinery computes it and only its result rows ship). Emission renders each slot as a `VALUES`-backed derived table (`coddl-sqlemit`, "Relation-valued parameters"); the runtime binds the rows at the force point. This implements the settled rule: **ship the local relation up, never pull the relvar down** (see "The cut" below).
+- **Mixed-origin pushdown** via the **`RelParam` leaf** — a relation-valued bind parameter, the relation analogue of `RestrictValue::Param`. A relation-typed local (a bound relation value, a relation-valued tuple field like `req.path`) builds as `RelParam { slot, heading }`; a *maximal materialized subtree* under a binary operator collapses to one slot (its structural build is discarded, its whole AST recorded — the in-process machinery computes it and only its result rows ship). A semijoin rhs is **narrowed to the shared attributes** at build time (`L matching R ≡ L matching (R project {shared})` — a `RelParam` shrinks its heading, a structural rhs wraps in `Project`); the ship-time project seals, so fewer cells *and* fewer rows cross. Emission renders each slot as a `VALUES`-backed derived table (`coddl-sqlemit`, "Relation-valued parameters"); the runtime binds the rows at the force point and **dispatches on the cardinality it is already holding** — 0 at an absorbing slot returns empty without a statement, 1 at a root-`matching` rhs fires the baked cardinality-1 sibling plan (built by `RelExpr::card1_semijoin_specialization`, the first RelIR rewrite — its equality values are `RestrictValue::SlotCell` cells of the shipped row), n runs the general form. This implements the settled rule: **ship the local relation up, never pull the relvar down** (see "The cut" below).
 - **SQL pushdown** of relvar-rooted `RelvarRef` / `Restrict` / `Project` / `Rename` via `coddl-sqlemit`.
 - An **in-process path** for non-pushable subtrees — currently lowered to ProcIR within `coddl-procir` itself (not yet through `coddl-execlocal`).
 - Restriction predicates are an `attr <cmp> value` comparison
@@ -27,9 +27,13 @@ This doc describes the **target** RelIR. The code implements a thin slice of it;
   `Predicate::AttrCmp { attr, Eq, Lit(Boolean(true)) }` → `WHERE "flag" = ?` —
   the formatter canonicalizes `flag = true` to the bare form, so both surface
   spellings must push identically.
-- The value is a `RestrictValue`: either a compile-time `Lit(Literal)`, or a
+- The value is a `RestrictValue`: a compile-time `Lit(Literal)`, a
   **bound parameter** `Param(name)` — the surface name of an in-scope
-  local/parameter whose runtime value binds at query time. `Param` keeps the IR
+  local/parameter whose runtime value binds at query time — or a
+  **slot cell** `SlotCell { slot, cell }`, a cell of a relation-valued
+  parameter's single shipped row (appears only in the cardinality-1 semijoin
+  sibling; the runtime fills it at dispatch time — never a lowerer bind
+  argument). `Param` keeps the IR
   backend- and lowerer-agnostic (a free-variable *name*, never a ProcIR value id
   or an AST node); the lowerer resolves the name to that local's already-lowered
   value when it emits the query's bind arguments. So `let s = …; R where col = s`
@@ -132,7 +136,7 @@ The storage-origin flag drives the optimizer's central decision: **where each su
 
 - A subtree whose every leaf is a public relvar in the same backend → push to SQL via [`coddl-sqlemit`](sqlemit.md). The optimizer can rewrite the whole subtree as one prepared SQL plan.
 - A subtree whose every leaf is a `Relation` literal or private relvar (or any other materialized value) → evaluate in-process. `coddl-execlocal` lowers it to a sequence of ProcIR calls into the runtime library at compile time; the [runtime](runtime.md) RelIR interpreter walks it at runtime for dynamic plans.
-- A mixed-origin subtree → **ship the local relation up into SQL, never pull the relvar down into memory** (settled while waiting for a cost model; see [principles.md](principles.md) §1). Each maximal materialized subtree collapses to a `RelParam` leaf — a relation-valued bind parameter: the in-process engine computes the local operand, and its *result rows* ship into the pushed query as a `VALUES`-backed derived table at the force point. The whole op runs where the unbounded data lives; the bounded side crosses the boundary. A future cost model refines the mechanism for large local relations (temp tables); it does not reopen the default direction.
+- A mixed-origin subtree → **ship the local relation up into SQL, never pull the relvar down into memory** (settled while waiting for a cost model; see [principles.md](principles.md) §1). Each maximal materialized subtree collapses to a `RelParam` leaf — a relation-valued bind parameter: the in-process engine computes the local operand (a semijoin rhs narrowed to the shared attributes), and its *result rows* ship into the pushed query as a `VALUES`-backed derived table at the force point — which, holding the relation, dispatches on its cardinality: 0 at an absorbing slot short-circuits to an empty result with no statement, 1 at a root-`matching` rhs fires the baked cardinality-1 sibling plan (a plain `WHERE shared = ?N…` keyed lookup), n runs the general `EXISTS`+`VALUES` form. The whole op runs where the unbounded data lives; the bounded side crosses the boundary. A future cost model refines the mechanism for large local relations (temp tables); it does not reopen the default direction.
 
 **Maximum pushdown** is the goal — draw the cut as close to the leaves as possible, push everything that touches a relvar into SQL, do the rest in-process. The cut is per-subtree, not per-program; one program can mix both engines freely.
 
@@ -173,6 +177,6 @@ RelIR plays two roles depending on when it's consumed:
 | `coddl-procir` | The procedural IR both sqlemit and execlocal write into. See [procir.md](procir.md). |
 | `coddl-runtime` | Hosts the in-process runtime library, the runtime RelIR interpreter, and `coddl-sqlemit` as a library. See [runtime.md](runtime.md). |
 
-*Status: `coddl-relir` today is types only (no optimizer); `coddl-execlocal` is an empty stub — in-process lowering currently lives in `coddl-procir`. See Implementation status.*
+*Status: `coddl-relir` today is types + analyses plus one rewrite (`card1_semijoin_specialization`, the cardinality-1 semijoin sibling — the seed of the normalize pass); `coddl-execlocal` is an empty stub — in-process lowering currently lives in `coddl-procir`. See Implementation status.*
 
 See [workspace.md](workspace.md) for the broader crate layout.

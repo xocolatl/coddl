@@ -67,6 +67,18 @@ impl Heading {
             .all(|((an, at), (bn, bt))| an == bn && at.assignable_to(bt))
     }
 
+    /// The sub-heading keeping only the named attributes; names not present
+    /// in the heading are ignored. Filtering preserves the canonical sort.
+    pub fn project(&self, keep: &[String]) -> Heading {
+        Heading(
+            self.0
+                .iter()
+                .filter(|(n, _)| keep.iter().any(|k| k == n))
+                .cloned()
+                .collect(),
+        )
+    }
+
     /// Attribute names present in both headings (the natural-join key), in
     /// `self`'s canonical order.
     pub fn shared_names(&self, other: &Heading) -> Vec<String> {

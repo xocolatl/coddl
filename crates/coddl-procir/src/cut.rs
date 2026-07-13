@@ -15,21 +15,36 @@
 //! here; until then ship-up is unconditional.
 
 use coddl_relir::{RelExpr, StorageOrigin};
-use coddl_sqlemit::{emit_select_ordered, Dialect, SqlQuery};
+use coddl_sqlemit::{emit_select, emit_select_ordered, Dialect, ParamSource, SqlQuery};
+
+/// A pushed subtree's baked plan(s): the general query, plus — for a root
+/// `matching` whose rhs is the plan's only shipped relation — the
+/// cardinality-1 sibling the runtime dispatches to when that relation holds
+/// exactly one row (`L matching {t}` ≡ `L where shared = t.shared and …`).
+/// The sibling's binds are the general plan's scalars followed by the row's
+/// cells (`RestrictValue::SlotCell` placeholders); cardinality is runtime
+/// knowledge, SQL text is compile-time, so both shapes are baked and the
+/// force point picks.
+pub struct PushedPlan {
+    pub query: SqlQuery,
+    /// `(sibling plan, dispatch slot)` — the slot whose runtime cardinality
+    /// selects the sibling.
+    pub card1_alt: Option<(SqlQuery, usize)>,
+}
 
 /// Try to push `expr` to the backend.
 ///
-/// Returns the baked [`SqlQuery`] when the subtree touches a relvar
+/// Returns the baked [`PushedPlan`] when the subtree touches a relvar
 /// (`RelvarRooted` or `Mixed`) and emits cleanly, else `None` — the caller
 /// then lowers `expr` via the in-process path. A `Mixed` query's
 /// `rel_params` name the shipped relation slots.
-pub fn try_push(expr: &RelExpr, dialect: Dialect) -> Option<SqlQuery> {
+pub fn try_push(expr: &RelExpr, dialect: Dialect) -> Option<PushedPlan> {
     try_push_ordered(expr, dialect, &[])
 }
 
 /// Try to push `expr` with a trailing `ORDER BY` for the `load … order [ … ]`
 /// boundary. `order` is the sort keys as `(attribute-name, is_descending)`
-/// pairs. Returns the ordered [`SqlQuery`] when the subtree touches a relvar
+/// pairs. Returns the ordered [`PushedPlan`] when the subtree touches a relvar
 /// and the order attaches cleanly; `None` otherwise (fully materialized, or a
 /// root set-op / semijoin / `tclose` that can't carry a trailing `ORDER BY`
 /// in v1) — the caller then sorts in-process. An empty `order` is exactly
@@ -38,11 +53,42 @@ pub fn try_push_ordered(
     expr: &RelExpr,
     dialect: Dialect,
     order: &[(String, bool)],
-) -> Option<SqlQuery> {
+) -> Option<PushedPlan> {
     if expr.origin() == StorageOrigin::Materialized {
         return None;
     }
-    emit_select_ordered(expr, dialect, order).ok()
+    let query = emit_select_ordered(expr, dialect, order).ok()?;
+    // A semijoin root can't carry a trailing ORDER BY (the push above would
+    // have declined), so a successful ordered push never qualifies — the
+    // shape check inside the rewrite handles that without a special case.
+    let card1_alt = card1_alt_of(expr, &query, dialect);
+    Some(PushedPlan { query, card1_alt })
+}
+
+/// Bake the cardinality-1 sibling of a qualifying pushed query (see
+/// [`PushedPlan::card1_alt`]), or `None` when the root shape doesn't qualify
+/// or the sibling doesn't emit.
+fn card1_alt_of(expr: &RelExpr, general: &SqlQuery, dialect: Dialect) -> Option<(SqlQuery, usize)> {
+    let (specialized, slot) = expr.card1_semijoin_specialization()?;
+    let alt = emit_select(&specialized, dialect).ok()?;
+    // The rewrite requires the dispatch slot to be the tree's only rel param,
+    // so the sibling carries no markers of its own.
+    debug_assert!(
+        alt.rel_params.is_empty(),
+        "card-1 sibling still carries rel-param markers"
+    );
+    // The numbering invariant the runtime dispatch relies on: the sibling's
+    // binds are exactly the general plan's scalars (same lhs, same resolve
+    // order → same `?1..?k`) followed by only slot cells (`?k+1..?k+m`).
+    debug_assert!(
+        alt.params.len() > general.params.len()
+            && alt.params[..general.params.len()] == general.params[..]
+            && alt.params[general.params.len()..]
+                .iter()
+                .all(|p| matches!(p, ParamSource::SlotCell { .. })),
+        "card-1 sibling's binds must be the general plan's scalars plus slot cells"
+    );
+    Some((alt, slot))
 }
 
 #[cfg(test)]
@@ -77,7 +123,9 @@ mod tests {
                 value: RestrictValue::Lit(Literal::Integer(1)),
             },
         };
-        let q = try_push(&expr, Dialect::SQLite).expect("relvar-rooted subtree pushes");
+        let q = try_push(&expr, Dialect::SQLite)
+            .expect("relvar-rooted subtree pushes")
+            .query;
         assert_eq!(
             q.sql.text,
             // Full heading keeps key `id` → already a set → no DISTINCT.
@@ -108,7 +156,9 @@ mod tests {
         let expr = RelExpr::TClose {
             input: Box::new(edges),
         };
-        let q = try_push(&expr, Dialect::SQLite).expect("relvar-rooted tclose pushes");
+        let q = try_push(&expr, Dialect::SQLite)
+            .expect("relvar-rooted tclose pushes")
+            .query;
         assert!(
             q.sql.text.starts_with("WITH RECURSIVE "),
             "tclose pushes as a recursive CTE: {}",
@@ -133,11 +183,107 @@ mod tests {
             },
         };
         let q = try_push_ordered(&expr, Dialect::SQLite, &[("message".to_string(), false)])
-            .expect("relvar-rooted ordered load pushes");
+            .expect("relvar-rooted ordered load pushes")
+            .query;
         assert_eq!(
             q.sql.text,
             r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?1 ORDER BY "message""#
         );
+    }
+
+    #[test]
+    fn mixed_matching_root_bakes_the_card1_sibling() {
+        // `Greetings matching <local {id}> project { message }` — the general
+        // plan is the EXISTS+VALUES form; the sibling is the plain keyed
+        // lookup the runtime fires when the shipped relation holds one row.
+        let expr = RelExpr::Project {
+            input: Box::new(RelExpr::Semijoin {
+                lhs: Box::new(greetings()),
+                rhs: Box::new(RelExpr::RelParam {
+                    slot: 0,
+                    heading: Heading::new(vec![("id".to_string(), Type::Integer)]),
+                }),
+                negated: false,
+            }),
+            keep: vec!["message".to_string()],
+        };
+        let plan = try_push(&expr, Dialect::SQLite).expect("mixed matching pushes");
+        assert!(plan.query.sql.text.contains("WHERE EXISTS"));
+        let (alt, dispatch_slot) = plan.card1_alt.expect("card-1 sibling baked");
+        assert_eq!(dispatch_slot, 0);
+        assert_eq!(
+            alt.sql.text,
+            r#"SELECT "message" FROM "greetings" WHERE "id" = ?1"#
+        );
+        // The antijoin gets no sibling (cardinality-1 `not matching` is a
+        // disjunction — B1's territory).
+        let anti = RelExpr::Semijoin {
+            lhs: Box::new(greetings()),
+            rhs: Box::new(RelExpr::RelParam {
+                slot: 0,
+                heading: Heading::new(vec![("id".to_string(), Type::Integer)]),
+            }),
+            negated: true,
+        };
+        let plan = try_push(&anti, Dialect::SQLite).expect("mixed antijoin pushes");
+        assert!(plan.card1_alt.is_none());
+    }
+
+    #[test]
+    fn stacked_semijoins_push_general_only() {
+        // Two semijoins in one query never bake a sibling, for two distinct
+        // reasons — but the general nested-EXISTS plan pushes either way.
+        let mentions = RelExpr::RelvarRef {
+            name: "Mentions".to_string(),
+            database: "greetings".to_string(),
+            heading: Heading::new(vec![
+                ("id".to_string(), Type::Integer),
+                ("topic".to_string(), Type::Text),
+            ]),
+            table_name: "mentions".to_string(),
+            columns: vec![
+                ("id".to_string(), "id".to_string()),
+                ("topic".to_string(), "topic".to_string()),
+            ],
+            keys: vec![vec!["id".to_string(), "topic".to_string()]],
+        };
+        let id_param = |slot| RelExpr::RelParam {
+            slot,
+            heading: Heading::new(vec![("id".to_string(), Type::Integer)]),
+        };
+        // A relvar-rooted semijoin in the lhs: the card-1 rewrite fires on
+        // shape (rhs is the only rel param) but the rewritten tree is a
+        // `Restrict` over a nested `Semijoin`, which doesn't emit — the
+        // sibling declines gracefully and only the general plan is baked.
+        let inner_relvar = RelExpr::Semijoin {
+            lhs: Box::new(RelExpr::Semijoin {
+                lhs: Box::new(greetings()),
+                rhs: Box::new(mentions),
+                negated: false,
+            }),
+            rhs: Box::new(id_param(0)),
+            negated: false,
+        };
+        let plan = try_push(&inner_relvar, Dialect::SQLite).expect("nested semijoin pushes");
+        assert_eq!(plan.query.sql.text.matches("WHERE EXISTS").count(), 2);
+        assert!(plan.card1_alt.is_none());
+        // Two shipped slots: the v1 single-slot gate declines the rewrite
+        // outright; both markers ride the general plan.
+        let two_slots = RelExpr::Semijoin {
+            lhs: Box::new(RelExpr::Semijoin {
+                lhs: Box::new(greetings()),
+                rhs: Box::new(id_param(0)),
+                negated: false,
+            }),
+            rhs: Box::new(id_param(1)),
+            negated: false,
+        };
+        let plan = try_push(&two_slots, Dialect::SQLite).expect("two-slot semijoin pushes");
+        assert!(
+            plan.query.sql.text.contains("__CODDL_REL_0__")
+                && plan.query.sql.text.contains("__CODDL_REL_1__")
+        );
+        assert!(plan.card1_alt.is_none());
     }
 
     #[test]

@@ -142,14 +142,17 @@ struct Emitter {
     plan_meta: HashMap<u32, PlanMeta>,
 }
 
-/// One pushed plan's registration metadata: scalar bind count, result heading
-/// id, and the number of relation-valued parameters (whose arities live in
-/// the `@.plan.<id>.rel_arities` static this count sizes).
+/// One pushed plan's registration metadata: bind count, result heading id,
+/// the number of relation-valued parameters (whose `[arity, flags]` pairs
+/// live in the `@.plan.<id>.rel_specs` static this count sizes), and the
+/// cardinality-1 sibling linkage.
 #[derive(Clone)]
 struct PlanMeta {
     param_count: u32,
     result_heading_id: u32,
     n_rels: usize,
+    card1_alt: Option<u32>,
+    dispatch_slot: u32,
 }
 
 impl Emitter {
@@ -417,7 +420,7 @@ impl Emitter {
         .unwrap();
         writeln!(
             self.body,
-            "declare i32 @coddl_register_plan(i32, ptr, i64, ptr, i64, i32, ptr, i64, ptr)"
+            "declare i32 @coddl_register_plan(i32, ptr, i64, ptr, i64, i32, ptr, i64, ptr, i64, i32)"
         )
         .unwrap();
         writeln!(
@@ -446,17 +449,26 @@ impl Emitter {
                 &format!("@.plan.{}.db_name", p.plan_id),
                 p.db_name.as_bytes(),
             );
-            // The relation-parameter arities ride a static i32 array (one
-            // entry per shipped slot, in slot order); a plan with none passes
-            // a null pointer instead.
-            if !p.rel_arities.is_empty() {
-                let entries: Vec<String> =
-                    p.rel_arities.iter().map(|a| format!("i32 {a}")).collect();
+            // The relation-parameter specs ride a static i32 array of
+            // interleaved `[arity, flags]` pairs (one pair per shipped slot,
+            // in slot order; flags bit 0 = absorbs_empty); a plan with none
+            // passes a null pointer instead.
+            if !p.rel_params.is_empty() {
+                let entries: Vec<String> = p
+                    .rel_params
+                    .iter()
+                    .flat_map(|s| {
+                        [
+                            format!("i32 {}", s.arity),
+                            format!("i32 {}", u32::from(s.absorbs_empty)),
+                        ]
+                    })
+                    .collect();
                 writeln!(
                     self.globals,
-                    "@.plan.{}.rel_arities = private unnamed_addr constant [{} x i32] [{}]",
+                    "@.plan.{}.rel_specs = private unnamed_addr constant [{} x i32] [{}]",
                     p.plan_id,
-                    p.rel_arities.len(),
+                    p.rel_params.len() * 2,
                     entries.join(", "),
                 )
                 .unwrap();
@@ -466,7 +478,9 @@ impl Emitter {
                 PlanMeta {
                     param_count: p.param_count,
                     result_heading_id: p.result_heading_id.0,
-                    n_rels: p.rel_arities.len(),
+                    n_rels: p.rel_params.len(),
+                    card1_alt: p.card1_alt,
+                    dispatch_slot: p.dispatch_slot,
                 },
             );
         }
@@ -1284,28 +1298,31 @@ impl Emitter {
         Ok(())
     }
 
-    /// Register one baked plan: SQL text + database name + scalar bind count
-    /// + relation-parameter arities + the result heading descriptor, keyed by
-    /// the dense plan id.
+    /// Register one baked plan: SQL text + database name + bind count +
+    /// relation-parameter specs + the result heading descriptor + the
+    /// cardinality-1 sibling linkage, keyed by the dense plan id.
     fn lower_register_plan(&mut self, plan_id: u32) -> Result<(), LlvmEmitError> {
         let meta = self.plan_meta.get(&plan_id).cloned().ok_or_else(|| {
             LlvmEmitError::UnsupportedInst(format!(
                 "RegisterPlan references unknown plan {plan_id}"
             ))
         })?;
-        let arities_arg = if meta.n_rels == 0 {
+        let specs_arg = if meta.n_rels == 0 {
             "ptr null".to_string()
         } else {
-            format!("ptr @.plan.{plan_id}.rel_arities")
+            format!("ptr @.plan.{plan_id}.rel_specs")
         };
+        // −1 = no sibling; a dense plan id otherwise (0 is a valid id).
+        let card1_alt = meta.card1_alt.map(i64::from).unwrap_or(-1);
         writeln!(
             self.body,
-            "    call i32 @coddl_register_plan(i32 {plan_id}, ptr @.plan.{plan_id}.db_name, i64 {db_len}, ptr @.plan.{plan_id}.sql, i64 {sql_len}, i32 {param_count}, {arities_arg}, i64 {n_rels}, ptr @.heading.{hid})",
+            "    call i32 @coddl_register_plan(i32 {plan_id}, ptr @.plan.{plan_id}.db_name, i64 {db_len}, ptr @.plan.{plan_id}.sql, i64 {sql_len}, i32 {param_count}, {specs_arg}, i64 {n_rels}, ptr @.heading.{hid}, i64 {card1_alt}, i32 {dispatch_slot})",
             db_len = self.const_byte_len(&format!("@.plan.{plan_id}.db_name")),
             sql_len = self.const_byte_len(&format!("@.plan.{plan_id}.sql")),
             param_count = meta.param_count,
             n_rels = meta.n_rels,
             hid = meta.result_heading_id,
+            dispatch_slot = meta.dispatch_slot,
         )
         .unwrap();
         Ok(())

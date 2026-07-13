@@ -220,6 +220,7 @@ fn render_value(value: &RestrictValue) -> String {
     match value {
         RestrictValue::Lit(lit) => render_literal(lit),
         RestrictValue::Param(name) => format!(":{name}"),
+        RestrictValue::SlotCell { slot, cell } => format!(":rel{slot}[{cell}]"),
     }
 }
 
@@ -262,6 +263,18 @@ pub enum Predicate {
 pub enum RestrictValue {
     Lit(Literal),
     Param(String),
+    /// A cell of a relation-valued parameter's **single row** — the bind form
+    /// of the cardinality-1 semijoin specialization
+    /// ([`RelExpr::card1_semijoin_specialization`]). `slot` names the
+    /// [`RelExpr::RelParam`] whose runtime cardinality drives the dispatch;
+    /// `cell` indexes its heading in canonical (sorted) order. Renders to an
+    /// ordinary numbered placeholder; the *runtime* fills it from the shipped
+    /// row at the force point when it selects the specialized sibling plan —
+    /// the lowerer never sees it as a bind argument.
+    SlotCell {
+        slot: usize,
+        cell: usize,
+    },
 }
 
 /// A scalar comparison operator in a pushable restriction. Equality (`Eq`/`Ne`)
@@ -843,6 +856,102 @@ impl RelExpr {
             // A relation value carries rows, not a table reference.
             RelExpr::RelParam { .. } => false,
         }
+    }
+
+    /// Number of [`RelExpr::RelParam`] leaves in this tree.
+    pub fn rel_param_count(&self) -> usize {
+        match self {
+            RelExpr::RelParam { .. } => 1,
+            RelExpr::Restrict { input, .. }
+            | RelExpr::Project { input, .. }
+            | RelExpr::Rename { input, .. }
+            | RelExpr::Extend { input, .. }
+            | RelExpr::TClose { input }
+            | RelExpr::Wrap { input, .. }
+            | RelExpr::Unwrap { input, .. } => input.rel_param_count(),
+            RelExpr::And { lhs, rhs }
+            | RelExpr::Or { lhs, rhs }
+            | RelExpr::Minus { lhs, rhs }
+            | RelExpr::Semijoin { lhs, rhs, .. } => lhs.rel_param_count() + rhs.rel_param_count(),
+            RelExpr::RelvarRef { .. } | RelExpr::MaterializedRelvar { .. } => 0,
+        }
+    }
+
+    /// The cardinality-1 specialization of a root semijoin over a
+    /// relation-valued parameter: `L matching {t}` degenerates the existence
+    /// test into an equality conjunction on the shared attributes —
+    /// `L where shared₁ = t.shared₁ and …`. Returns the rewritten tree (the
+    /// semijoin replaced by a [`RelExpr::Restrict`] chain whose values are
+    /// [`RestrictValue::SlotCell`] cells of the rhs slot's single row, one
+    /// conjunct per shared attribute in canonical order, under the same peeled
+    /// projection if any) and the dispatch slot, or `None` when the shape
+    /// doesn't qualify.
+    ///
+    /// The emitter bakes *both* plans; the runtime force point — which is
+    /// already holding the shipped relation — picks the specialized one when
+    /// the slot has exactly one row (see `coddl_query`). `DISTINCT` elision on
+    /// the rewritten tree is not a special case: a pinned key hits the
+    /// existing [`RelExpr::card_le_one`] proof.
+    ///
+    /// v1 limits: `matching` only (`not matching` at cardinality 1 negates a
+    /// conjunction — a disjunction, which the predicate surface can't push
+    /// yet), and the rhs must be the tree's **only** rel param (a sibling plan
+    /// with leftover slots would need sparse slot numbering and marker
+    /// expansion of its own).
+    pub fn card1_semijoin_specialization(&self) -> Option<(RelExpr, usize)> {
+        // Root shape: `Semijoin { negated: false }`, optionally under the
+        // peeled root `Project` the semijoin emission recognizes.
+        let (lhs, rhs, keep) = match self {
+            RelExpr::Semijoin {
+                lhs,
+                rhs,
+                negated: false,
+            } => (lhs, rhs, None),
+            RelExpr::Project { input, keep } => match input.as_ref() {
+                RelExpr::Semijoin {
+                    lhs,
+                    rhs,
+                    negated: false,
+                } => (lhs, rhs, Some(keep.clone())),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let RelExpr::RelParam { slot, heading } = rhs.as_ref() else {
+            return None;
+        };
+        if self.rel_param_count() != 1 {
+            return None;
+        }
+        // The rhs is narrowed to exactly the shared attributes at build time
+        // (`build_rel_binary`); a wider rhs would leave cells that don't map
+        // to equality conjuncts, so require the narrowed form.
+        let shared = lhs.heading().shared_names(heading);
+        if shared.len() != heading.len() {
+            return None;
+        }
+        // One equality conjunct per shared attribute, cell indices in the
+        // heading's canonical order — the same order the runtime decodes the
+        // shipped row's cells in, which is what lets it bind them positionally
+        // after the scalar params.
+        let mut rewritten = (**lhs).clone();
+        for (cell, (attr, _)) in heading.attrs().iter().enumerate() {
+            rewritten = RelExpr::Restrict {
+                input: Box::new(rewritten),
+                pred: Predicate::AttrCmp {
+                    attr: attr.clone(),
+                    op: CmpOp::Eq,
+                    value: RestrictValue::SlotCell { slot: *slot, cell },
+                },
+            };
+        }
+        if let Some(keep) = keep {
+            rewritten = RelExpr::Project {
+                input: Box::new(rewritten),
+                keep,
+            };
+        }
+        Some((rewritten, *slot))
     }
 }
 
@@ -1490,5 +1599,136 @@ mod tests {
         };
         assert_eq!(p.surviving_keys(), vec![Vec::<String>::new()]);
         assert!(!p.needs_distinct());
+    }
+
+    /// A rel param already narrowed to the shared attribute `id` — the shape
+    /// `build_rel_binary` produces for a semijoin rhs after A1 narrowing.
+    fn id_param() -> RelExpr {
+        RelExpr::RelParam {
+            slot: 0,
+            heading: Heading::new(vec![("id".to_string(), Type::Integer)]),
+        }
+    }
+
+    #[test]
+    fn card1_specialization_rewrites_projected_matching_to_a_restrict_chain() {
+        // The wiki shape: `Pages matching (…) project { … }` — a peeled root
+        // projection over a semijoin whose rhs is the only rel param.
+        let expr = RelExpr::Project {
+            input: Box::new(RelExpr::Semijoin {
+                lhs: Box::new(greetings()),
+                rhs: Box::new(id_param()),
+                negated: false,
+            }),
+            keep: vec!["message".to_string()],
+        };
+        let (rewritten, slot) = expr.card1_semijoin_specialization().unwrap();
+        assert_eq!(slot, 0);
+        assert_eq!(
+            rewritten,
+            RelExpr::Project {
+                input: Box::new(RelExpr::Restrict {
+                    input: Box::new(greetings()),
+                    pred: Predicate::AttrCmp {
+                        attr: "id".to_string(),
+                        op: CmpOp::Eq,
+                        value: RestrictValue::SlotCell { slot: 0, cell: 0 },
+                    },
+                }),
+                keep: vec!["message".to_string()],
+            }
+        );
+        // The pinned key drives DISTINCT elision with no new machinery: the
+        // equality is on `greetings`' key, so cardinality is provably ≤ 1.
+        assert!(rewritten.card_le_one());
+        assert!(!rewritten.needs_distinct());
+    }
+
+    #[test]
+    fn card1_specialization_handles_a_bare_semijoin_and_multi_attr_keys() {
+        // No peeled projection; two shared attributes → one equality conjunct
+        // per attribute, cells numbered in canonical heading order.
+        let both = RelExpr::RelParam {
+            slot: 0,
+            heading: greetings_heading(),
+        };
+        let expr = RelExpr::Semijoin {
+            lhs: Box::new(greetings()),
+            rhs: Box::new(both),
+            negated: false,
+        };
+        let (rewritten, slot) = expr.card1_semijoin_specialization().unwrap();
+        assert_eq!(slot, 0);
+        let RelExpr::Restrict { input, pred } = &rewritten else {
+            panic!("expected the outer conjunct, got {rewritten:?}");
+        };
+        // Canonical order: `id` (cell 0) innermost, `message` (cell 1) outer.
+        assert_eq!(
+            *pred,
+            Predicate::AttrCmp {
+                attr: "message".to_string(),
+                op: CmpOp::Eq,
+                value: RestrictValue::SlotCell { slot: 0, cell: 1 },
+            }
+        );
+        let RelExpr::Restrict { input, pred } = input.as_ref() else {
+            panic!("expected the inner conjunct");
+        };
+        assert_eq!(
+            *pred,
+            Predicate::AttrCmp {
+                attr: "id".to_string(),
+                op: CmpOp::Eq,
+                value: RestrictValue::SlotCell { slot: 0, cell: 0 },
+            }
+        );
+        assert_eq!(**input, greetings());
+    }
+
+    #[test]
+    fn card1_specialization_declines_out_of_scope_shapes() {
+        // Antijoin: cardinality-1 `not matching` negates the conjunction — a
+        // disjunction the predicate surface can't push yet (B1).
+        let anti = RelExpr::Semijoin {
+            lhs: Box::new(greetings()),
+            rhs: Box::new(id_param()),
+            negated: true,
+        };
+        assert_eq!(anti.card1_semijoin_specialization(), None);
+        // Structural rhs: no shipped slot to dispatch on.
+        let structural = RelExpr::Semijoin {
+            lhs: Box::new(greetings()),
+            rhs: Box::new(RelExpr::Project {
+                input: Box::new(greetings()),
+                keep: vec!["id".to_string()],
+            }),
+            negated: false,
+        };
+        assert_eq!(structural.card1_semijoin_specialization(), None);
+        // A rhs wider than the shared attributes (not the narrowed form):
+        // `ordinality` has no `greetings` counterpart to pin.
+        let wide = RelExpr::Semijoin {
+            lhs: Box::new(greetings()),
+            rhs: Box::new(path_param()),
+            negated: false,
+        };
+        assert_eq!(wide.card1_semijoin_specialization(), None);
+        // A second rel param elsewhere in the tree: the sibling plan would
+        // inherit its marker — out of v1 scope.
+        let two_slots = RelExpr::Semijoin {
+            lhs: Box::new(RelExpr::And {
+                lhs: Box::new(greetings()),
+                rhs: Box::new(RelExpr::RelParam {
+                    slot: 0,
+                    heading: Heading::new(vec![("id".to_string(), Type::Integer)]),
+                }),
+            }),
+            rhs: Box::new(RelExpr::RelParam {
+                slot: 1,
+                heading: Heading::new(vec![("id".to_string(), Type::Integer)]),
+            }),
+            negated: false,
+        };
+        assert_eq!(two_slots.card1_semijoin_specialization(), None);
     }
 }

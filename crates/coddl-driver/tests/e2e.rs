@@ -3493,11 +3493,16 @@ fn explain_dumps_mixed_semijoin_with_rel_param() {
     for needle in [
         "Project { keep: sname }",
         "Semijoin",
-        "RelParam #0 { ordinality, sno }",
+        // The rhs is narrowed to the shared attribute — `ordinality` never
+        // ships.
+        "RelParam #0 { sno }",
         "__CODDL_REL_0__",
         r#"SELECT DISTINCT coddl_l."sname""#,
         r#"WHERE EXISTS (SELECT 1 FROM"#,
         r#"coddl_l."sno" = coddl_r."sno""#,
+        // The cardinality-1 sibling is baked alongside the general plan.
+        "SQL (card-1 dispatch):",
+        r#"SELECT "sname" FROM "suppliers" WHERE "sno" = ?1"#,
     ] {
         assert!(
             stdout.contains(needle),
@@ -3850,18 +3855,27 @@ fn semijoin_pushdown_cranelift() {
 /// A public relvar combined with an **in-process relation value** pushes to
 /// SQL with the local operand shipped as a relation-valued parameter — a
 /// `(VALUES …)` derived table bound at run time — never by pulling the relvar
-/// into memory (the settled mixed-origin rule). Four shapes, each against the
-/// live SQLite fixture:
+/// into memory (the settled mixed-origin rule). The shipped operand is
+/// **narrowed** to the shared attributes (`L matching R ≡ L matching
+/// (R project {shared})`), so only `sno` cells cross the boundary. Five
+/// shapes, each against the live SQLite fixture:
 ///   - `Suppliers matching wanted` — the local `{sno, ordinality}` relation
-///     rides the EXISTS; suppliers 1 and 3 match.
+///     rides the EXISTS, narrowed to single-`sno` VALUES groups; suppliers
+///     1 and 3 match. (Two rows, so the general form fires — one row would
+///     dispatch to the card-1 sibling, covered separately.)
 ///   - `Suppliers not matching wanted` — the antijoin complement (2).
-///   - `Suppliers matching none` — an **empty** local (an in-process `where`
-///     filtered everything out) ships as the typed zero-row SELECT; the
-///     semijoin returns nothing (no output lines).
+///   - `Suppliers not matching none` — an **empty** local on the antijoin
+///     rhs does *not* absorb (everything survives), so the statement still
+///     fires with the typed zero-row SELECT; all three suppliers come back.
+///     (The `matching`-an-empty case short-circuits without a statement —
+///     covered separately.)
 ///   - `(Suppliers where sname = who) matching narrowed` — a **scalar** bind
 ///     parameter (`?1`, the local `who`) composed with a shipped relation
 ///     (cells `?2…`), proving the numbered placeholders interleave correctly;
 ///     only Smith survives both filters.
+///   - `Suppliers union nobody` — an empty local on a union operand doesn't
+///     absorb either (union's additive identity); the relvar side comes back
+///     whole.
 fn assert_mixed_origin_pushdown(backend: &str) {
     let (stdout, audit) = run_parts_program(
         backend,
@@ -3876,12 +3890,15 @@ fn assert_mixed_origin_pushdown(backend: &str) {
              let idle = transaction [ Suppliers not matching wanted ];\n\
              write_relation { rel: idle };\n\
              let none = wanted where sno = 99;\n\
-             let nothing = transaction [ Suppliers matching none ];\n\
-             write_relation { rel: nothing };\n\
+             let everyone = transaction [ Suppliers not matching none ];\n\
+             write_relation { rel: everyone };\n\
              let who = \"Smith\";\n\
              let narrowed = Relation { { sno: 1 }, { sno: 2 } };\n\
              let both = transaction [ (Suppliers where sname = who) matching narrowed ];\n\
              write_relation { rel: both };\n\
+             let nobody = Relation { { sno: 0, sname: \"x\" } } where sno = 99;\n\
+             let unioned = transaction [ Suppliers union nobody ];\n\
+             write_relation { rel: unioned };\n\
          ];\n",
         true,
     );
@@ -3893,22 +3910,43 @@ fn assert_mixed_origin_pushdown(backend: &str) {
             "{sname: \"Blake\", sno: 3}",
             // Suppliers not matching wanted
             "{sname: \"Jones\", sno: 2}",
-            // Suppliers matching none — empty, no lines
+            // Suppliers not matching none — empty rhs, everything survives
+            "{sname: \"Smith\", sno: 1}",
+            "{sname: \"Jones\", sno: 2}",
+            "{sname: \"Blake\", sno: 3}",
             // (Suppliers where sname = who) matching narrowed
             "{sname: \"Smith\", sno: 1}",
+            // Suppliers union nobody — the empty operand adds nothing
+            "{sname: \"Smith\", sno: 1}",
+            "{sname: \"Jones\", sno: 2}",
+            "{sname: \"Blake\", sno: 3}",
         ]),
         "backend={backend}"
     );
     // The audit log (expanded SQL) proves where the work ran: every mixed
-    // query is one EXISTS statement over `suppliers` with the local rows
-    // inlined as VALUES — and no statement ever pulled the relvar bare.
+    // query is one statement over `suppliers` with the local rows inlined as
+    // VALUES — and no statement ever pulled the relvar bare.
     assert!(
         audit.contains("WHERE EXISTS") && audit.contains("(VALUES ("),
         "expected an EXISTS query with a VALUES-shipped operand; audit:\n{audit}"
     );
+    // Semijoin-rhs narrowing: `wanted`'s rows ship as single-cell groups —
+    // the `ordinality` column never crosses the boundary.
+    assert!(
+        audit.contains("(VALUES (1), (3))") || audit.contains("(VALUES (3), (1))"),
+        "expected the shipped semijoin rhs narrowed to single-`sno` groups; audit:\n{audit}"
+    );
+    assert!(
+        !audit.contains("(VALUES (1, 0)") && !audit.contains("(VALUES (0, 1)"),
+        "a shipped semijoin rhs still carries its non-shared column; audit:\n{audit}"
+    );
+    assert!(
+        audit.contains("NOT EXISTS"),
+        "expected the antijoin to fire as NOT EXISTS; audit:\n{audit}"
+    );
     assert!(
         audit.contains("WHERE 0"),
-        "expected the empty local to ship as the typed zero-row SELECT; audit:\n{audit}"
+        "expected the empty non-absorbing local to ship as the typed zero-row SELECT; audit:\n{audit}"
     );
     for line in audit.lines() {
         assert!(
@@ -3928,12 +3966,250 @@ fn mixed_origin_pushdown_cranelift() {
     assert_mixed_origin_pushdown("cranelift");
 }
 
+/// Cardinality-1 dispatch: a mixed `matching` bakes **two** plans — the
+/// general `EXISTS`+`VALUES` form and a specialized `WHERE shared = ?N…`
+/// sibling — and the force point picks by the count of the relation it is
+/// already holding. A single-row rhs fires the sibling: a plain keyed lookup,
+/// no `EXISTS`, no `DISTINCT`, no `VALUES`, the row's cells bound as ordinary
+/// trailing parameters. Four shapes:
+///   - `Suppliers matching one` — a 1-row `{sno, ordinality}` local narrows
+///     to `{sno}` and dispatches: `WHERE "sno" = 2`.
+///   - `Suppliers matching dup` — two rows that agree on `sno` collapse to
+///     one when the narrowing project seals, so the dispatch counts the
+///     *narrowed* relation and still fires the sibling (`WHERE "sno" = 3`).
+///   - `(Suppliers where sname = who) matching onemore` — the sibling keeps
+///     the lhs's scalar as `?1` and appends the cell as `?2`.
+///   - `Suppliers matching one project { sname }` — the peeled projection
+///     survives into the sibling; the pinned key still elides `DISTINCT`.
+///   - `Suppliers not matching one` — the antijoin has no card-1 sibling
+///     (a negated conjunction is a disjunction — B1); the general
+///     `NOT EXISTS` form fires even at one row.
+fn assert_mixed_origin_card1_dispatch(backend: &str) {
+    let (stdout, audit) = run_parts_program(
+        backend,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         public relvar Shipments { pno: Integer, sno: Integer } key { pno, sno };\n\
+         oper main {} [\n\
+             let one = Relation { { sno: 2, ordinality: 7 } };\n\
+             let hit = transaction [ Suppliers matching one ];\n\
+             write_relation { rel: hit };\n\
+             let dup = Relation { { sno: 3, ordinality: 0 }, { sno: 3, ordinality: 1 } };\n\
+             let collapsed = transaction [ Suppliers matching dup ];\n\
+             write_relation { rel: collapsed };\n\
+             let who = \"Smith\";\n\
+             let onemore = Relation { { sno: 1 } };\n\
+             let both = transaction [ (Suppliers where sname = who) matching onemore ];\n\
+             write_relation { rel: both };\n\
+             let names = transaction [ Suppliers matching one project { sname } ];\n\
+             write_relation { rel: names };\n\
+             let others = transaction [ Suppliers not matching one ];\n\
+             write_relation { rel: others };\n\
+         ];\n",
+        true,
+    );
+    assert_eq!(
+        tuple_lines(&stdout),
+        sorted_tuples(&[
+            // Suppliers matching one
+            "{sname: \"Jones\", sno: 2}",
+            // Suppliers matching dup (narrowed+sealed to one row)
+            "{sname: \"Blake\", sno: 3}",
+            // (Suppliers where sname = who) matching onemore
+            "{sname: \"Smith\", sno: 1}",
+            // Suppliers matching one project { sname }
+            "{sname: \"Jones\"}",
+            // Suppliers not matching one
+            "{sname: \"Smith\", sno: 1}",
+            "{sname: \"Blake\", sno: 3}",
+        ]),
+        "backend={backend}"
+    );
+    // Each single-row `matching` fired the specialized sibling: a plain WHERE
+    // equality on the shared attribute (values inlined by trace expansion),
+    // with no existential subquery and no VALUES operand on that statement.
+    for needle in [r#""sno" = 2"#, r#""sno" = 3"#] {
+        let line = audit
+            .lines()
+            .find(|l| l.contains(needle) && !l.contains("NOT EXISTS"))
+            .unwrap_or_else(|| {
+                panic!("no specialized statement matching `{needle}`; audit:\n{audit}")
+            });
+        assert!(
+            !line.contains("EXISTS") && !line.contains("VALUES") && !line.contains("DISTINCT"),
+            "expected a plain keyed lookup for `{needle}`, got: {line}"
+        );
+    }
+    // Scalars keep their compile-time numbers; the row's cells bind after
+    // them — expanded, the sibling shows both conjuncts in one WHERE.
+    assert!(
+        audit.contains(r#""sname" = 'Smith' AND "sno" = 1"#),
+        "expected the scalar+cell sibling WHERE; audit:\n{audit}"
+    );
+    // The antijoin stayed on the general form even at one row.
+    assert!(
+        audit.contains("NOT EXISTS") && audit.contains("(VALUES (2))"),
+        "expected the antijoin to fire the general NOT EXISTS form; audit:\n{audit}"
+    );
+    assert!(
+        !audit.contains("DISTINCT"),
+        "no statement here needs DISTINCT (pinned key / bare semijoin); audit:\n{audit}"
+    );
+}
+
+#[test]
+fn mixed_origin_card1_dispatch_llvm() {
+    assert_mixed_origin_card1_dispatch("llvm");
+}
+
+#[test]
+fn mixed_origin_card1_dispatch_cranelift() {
+    assert_mixed_origin_card1_dispatch("cranelift");
+}
+
+/// Two semijoins in one query: the general nested-`EXISTS` plan pushes, and
+/// the cardinality-1 sibling exists only when the *pushed* tree is a root
+/// `matching` over its only shipped slot. Three shapes:
+///   - `(Suppliers matching Shipments) matching one` — the second semijoin is
+///     relvar-rooted in the lhs; no sibling (the rewritten `Restrict` over a
+///     nested `Semijoin` doesn't emit), so the general form runs even at one
+///     row. The inner rhs is narrowed to `Project { keep: sno }` over
+///     `shipments`, whose dropped key must NOT reintroduce a `DISTINCT`
+///     inside the `EXISTS` (existential-context suppression).
+///   - `(Suppliers matching one) matching also_one` — two shipped slots; the
+///     v1 single-slot gate declines the rewrite, both markers expand, cells
+///     number across slots.
+///   - `Suppliers matching (one matching filt)` — the second semijoin is
+///     fully local, so it collapses *into* the slot (computed in-process);
+///     the pushed tree has one semijoin + one slot and the card-1 sibling
+///     fires as usual.
+fn assert_mixed_origin_two_semijoins(backend: &str) {
+    let (stdout, audit) = run_parts_program(
+        backend,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         public relvar Shipments { pno: Integer, sno: Integer } key { pno, sno };\n\
+         oper main {} [\n\
+             let one = Relation { { sno: 1 } };\n\
+             let ships = transaction [ (Suppliers matching Shipments) matching one ];\n\
+             write_relation { rel: ships };\n\
+             let also_one = Relation { { sno: 1, ordinality: 5 } };\n\
+             let both = transaction [ (Suppliers matching one) matching also_one ];\n\
+             write_relation { rel: both };\n\
+             let filt = Relation { { sno: 1, ordinality: 0 } };\n\
+             let inner = transaction [ Suppliers matching (one matching filt) ];\n\
+             write_relation { rel: inner };\n\
+         ];\n",
+        true,
+    );
+    assert_eq!(
+        tuple_lines(&stdout),
+        sorted_tuples(&[
+            // (Suppliers matching Shipments) matching one
+            "{sname: \"Smith\", sno: 1}",
+            // (Suppliers matching one) matching also_one
+            "{sname: \"Smith\", sno: 1}",
+            // Suppliers matching (one matching filt)
+            "{sname: \"Smith\", sno: 1}",
+        ]),
+        "backend={backend}"
+    );
+    // Shape 1: nested EXISTS over `shipments` + the shipped slot; the inner
+    // projected rhs stays DISTINCT-free.
+    let nested = audit
+        .lines()
+        .find(|l| l.contains(r#"FROM "shipments""#))
+        .unwrap_or_else(|| panic!("no nested relvar-semijoin statement; audit:\n{audit}"));
+    assert_eq!(
+        nested.matches("WHERE EXISTS").count(),
+        2,
+        "expected two existence tests in one statement: {nested}"
+    );
+    assert!(
+        !nested.contains("DISTINCT"),
+        "the EXISTS rhs must not dedup (existential context): {nested}"
+    );
+    // Shape 2: both slots expanded in one statement, each narrowed to `sno`.
+    let two_slots = audit
+        .lines()
+        .find(|l| l.matches("(VALUES (1))").count() == 2)
+        .unwrap_or_else(|| panic!("no two-slot statement; audit:\n{audit}"));
+    assert_eq!(two_slots.matches("WHERE EXISTS").count(), 2);
+    // Shape 3: the collapsed inner semijoin leaves a one-slot root `matching`,
+    // which dispatches to the specialized sibling.
+    assert!(
+        audit
+            .lines()
+            .any(|l| l.contains(r#""sno" = 1"#) && !l.contains("EXISTS") && !l.contains("VALUES")),
+        "expected the collapsed-inner shape to fire the card-1 sibling; audit:\n{audit}"
+    );
+}
+
+#[test]
+fn mixed_origin_two_semijoins_llvm() {
+    assert_mixed_origin_two_semijoins("llvm");
+}
+
+#[test]
+fn mixed_origin_two_semijoins_cranelift() {
+    assert_mixed_origin_two_semijoins("cranelift");
+}
+
+/// Empty-slot short-circuit: an empty relation at an **absorbing** slot (a
+/// `matching` rhs) makes the whole result provably empty, so the force point
+/// returns a fresh empty relation **without firing a statement** — the typed
+/// zero-row SELECT no longer ships for this shape. The control query proves
+/// the audit log works and is the only SELECT the program runs.
+fn assert_mixed_origin_empty_short_circuit(backend: &str) {
+    let (stdout, audit) = run_parts_program(
+        backend,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         public relvar Shipments { pno: Integer, sno: Integer } key { pno, sno };\n\
+         oper main {} [\n\
+             let none = Relation { { sno: 1, ordinality: 0 } } where sno = 99;\n\
+             let nothing = transaction [ Suppliers matching none ];\n\
+             write_relation { rel: nothing };\n\
+             let control = transaction [ Suppliers where sno = 2 ];\n\
+             write_relation { rel: control };\n\
+         ];\n",
+        true,
+    );
+    assert_eq!(
+        tuple_lines(&stdout),
+        // `Suppliers matching none` is empty — only the control row prints.
+        sorted_tuples(&["{sname: \"Jones\", sno: 2}"]),
+        "backend={backend}"
+    );
+    let selects: Vec<&str> = audit.lines().filter(|l| l.contains("SELECT")).collect();
+    assert!(
+        selects.len() == 1 && selects[0].contains(r#""sno" = 2"#),
+        "expected the control query to be the only SELECT (the absorbing \
+         empty slot short-circuits without a statement); audit:\n{audit}"
+    );
+}
+
+#[test]
+fn mixed_origin_empty_short_circuit_llvm() {
+    assert_mixed_origin_empty_short_circuit("llvm");
+}
+
+#[test]
+fn mixed_origin_empty_short_circuit_cranelift() {
+    assert_mixed_origin_empty_short_circuit("cranelift");
+}
+
 /// The `req.path` shape: a relation-valued **field of a tuple-typed local**
 /// builds as a `RelParam` leaf directly (`t.path` — the heading is static in
 /// the tuple's type), so a handler-style `Relvar matching t.path` pushes as
-/// the mixed semijoin without naming the relation first.
+/// the mixed semijoin without naming the relation first. A single-row field
+/// (the wiki's slug lookup) rides the same cardinality dispatch as a named
+/// local: the specialized sibling fires, not the EXISTS form.
 fn assert_mixed_origin_field_access(backend: &str) {
-    let stdout = run_parts_stdout(
+    let (stdout, audit) = run_parts_program(
         backend,
         "program parts;\n\
          database parts;\n\
@@ -3944,12 +4220,29 @@ fn assert_mixed_origin_field_access(backend: &str) {
              let t = { path: wanted };\n\
              let viafield = transaction [ Suppliers matching t.path ];\n\
              write_relation { rel: viafield };\n\
+             let single = Relation { { sno: 2, ordinality: 0 } };\n\
+             let u = { path: single };\n\
+             let via1 = transaction [ Suppliers matching u.path ];\n\
+             write_relation { rel: via1 };\n\
          ];\n",
+        true,
     );
     assert_eq!(
         tuple_lines(&stdout),
-        sorted_tuples(&["{sname: \"Smith\", sno: 1}", "{sname: \"Blake\", sno: 3}",]),
+        sorted_tuples(&[
+            "{sname: \"Smith\", sno: 1}",
+            "{sname: \"Blake\", sno: 3}",
+            "{sname: \"Jones\", sno: 2}",
+        ]),
         "backend={backend}"
+    );
+    let line = audit
+        .lines()
+        .find(|l| l.contains(r#""sno" = 2"#))
+        .unwrap_or_else(|| panic!("no specialized statement for the 1-row field; audit:\n{audit}"));
+    assert!(
+        !line.contains("EXISTS") && !line.contains("VALUES"),
+        "expected the single-row tuple field to dispatch to the sibling plan, got: {line}"
     );
 }
 

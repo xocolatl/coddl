@@ -566,7 +566,8 @@ fn declare_runtime_plan_externs(
     }
     // coddl_register_plan(plan_id: i32, db_name: ptr, db_name_len: i64,
     //                     sql: ptr, sql_len: i64, param_count: i32,
-    //                     rel_arities: ptr, n_rels: i64, desc: ptr) -> i32
+    //                     rel_specs: ptr, n_rels: i64, desc: ptr,
+    //                     card1_alt: i64, dispatch_slot: i32) -> i32
     {
         let mut sig = obj.make_signature();
         sig.params.push(AbiParam::new(types::I32));
@@ -578,6 +579,8 @@ fn declare_runtime_plan_externs(
         sig.params.push(AbiParam::new(ptr_ty));
         sig.params.push(AbiParam::new(types::I64));
         sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I32));
         sig.returns.push(AbiParam::new(types::I32));
         let id = obj
             .declare_function("coddl_register_plan", Linkage::Import, &sig)
@@ -636,20 +639,26 @@ struct DbDataIds {
     default_path_len: i64,
 }
 
-/// Per-plan data symbols: the SQL text, the logical database name, and (for
-/// a mixed-origin plan) the relation-parameter arity array.
+/// Per-plan data symbols: the SQL text, the logical database name, (for a
+/// mixed-origin plan) the relation-parameter spec array, and the
+/// cardinality-1 sibling linkage.
 struct PlanDataIds {
     db_name: DataId,
     db_name_len: i64,
     sql: DataId,
     sql_len: i64,
     param_count: i32,
-    /// The `u32` arity array for the plan's relation-valued parameters, in
-    /// slot order; `None` when the plan ships no relation.
-    rel_arities: Option<DataId>,
+    /// The interleaved `[arity, flags]` `u32`-pair array for the plan's
+    /// relation-valued parameters, in slot order (flags bit 0 =
+    /// absorbs_empty); `None` when the plan ships no relation.
+    rel_specs: Option<DataId>,
     n_rels: i64,
     /// Index into the module's `heading_desc_ids` for the result heading.
     result_heading_id: usize,
+    /// Dense plan id of the cardinality-1 sibling; −1 = none.
+    card1_alt: i64,
+    /// Slot whose runtime cardinality drives the sibling dispatch.
+    dispatch_slot: i32,
 }
 
 /// Emit the database-level byte constants for `RegisterDatabase`.
@@ -673,8 +682,9 @@ fn emit_db_data(
 }
 
 /// Emit one plan's SQL + db-name byte constants, plus — for a mixed-origin
-/// plan — its relation-parameter arity array (native-endian `u32`s, 4-byte
-/// aligned so the runtime's `*const u32` slice read is well-defined).
+/// plan — its relation-parameter spec array: interleaved `[arity, flags]`
+/// pairs (native-endian `u32`s, 4-byte aligned so the runtime's `*const u32`
+/// slice read is well-defined).
 fn emit_plan_data(
     obj: &mut ObjectModule,
     p: &PlanEntry,
@@ -685,12 +695,12 @@ fn emit_plan_data(
         &format!(".plan.{}.db_name", p.plan_id),
         p.db_name.as_bytes(),
     )?;
-    let rel_arities = if p.rel_arities.is_empty() {
+    let rel_specs = if p.rel_params.is_empty() {
         None
     } else {
         let id = obj
             .declare_data(
-                &format!(".plan.{}.rel_arities", p.plan_id),
+                &format!(".plan.{}.rel_specs", p.plan_id),
                 Linkage::Local,
                 false,
                 false,
@@ -698,7 +708,15 @@ fn emit_plan_data(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         let mut dd = DataDescription::new();
         dd.set_align(4);
-        let bytes: Vec<u8> = p.rel_arities.iter().flat_map(|a| a.to_ne_bytes()).collect();
+        let bytes: Vec<u8> = p
+            .rel_params
+            .iter()
+            .flat_map(|s| {
+                let mut pair = s.arity.to_ne_bytes().to_vec();
+                pair.extend(u32::from(s.absorbs_empty).to_ne_bytes());
+                pair
+            })
+            .collect();
         dd.define(bytes.into_boxed_slice());
         obj.define_data(id, &dd)
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
@@ -710,9 +728,11 @@ fn emit_plan_data(
         sql,
         sql_len: p.sql.len() as i64,
         param_count: p.param_count as i32,
-        rel_arities,
-        n_rels: p.rel_arities.len() as i64,
+        rel_specs,
+        n_rels: p.rel_params.len() as i64,
         result_heading_id: p.result_heading_id.0 as usize,
+        card1_alt: p.card1_alt.map(i64::from).unwrap_or(-1),
+        dispatch_slot: p.dispatch_slot as i32,
     })
 }
 
@@ -2717,7 +2737,7 @@ fn emit_inst(
             let sql_addr = builder.ins().symbol_value(ptr_ty, sql_gv);
             let sql_len = builder.ins().iconst(types::I64, p.sql_len);
             let pcount = builder.ins().iconst(types::I32, p.param_count as i64);
-            let arities_addr = match p.rel_arities {
+            let specs_addr = match p.rel_specs {
                 Some(id) => {
                     let gv = obj.declare_data_in_func(id, builder.func);
                     builder.ins().symbol_value(ptr_ty, gv)
@@ -2728,6 +2748,8 @@ fn emit_inst(
             let desc_id = heading_desc_ids[p.result_heading_id];
             let desc_gv = obj.declare_data_in_func(desc_id, builder.func);
             let desc_addr = builder.ins().symbol_value(ptr_ty, desc_gv);
+            let card1_alt_v = builder.ins().iconst(types::I64, p.card1_alt);
+            let dispatch_slot_v = builder.ins().iconst(types::I32, p.dispatch_slot as i64);
             let reg_local = obj.declare_func_in_func(funcs["coddl_register_plan"], builder.func);
             builder.ins().call(
                 reg_local,
@@ -2738,9 +2760,11 @@ fn emit_inst(
                     sql_addr,
                     sql_len,
                     pcount,
-                    arities_addr,
+                    specs_addr,
                     n_rels_v,
                     desc_addr,
+                    card1_alt_v,
+                    dispatch_slot_v,
                 ],
             );
             Ok(())

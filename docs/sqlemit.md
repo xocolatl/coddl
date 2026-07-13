@@ -32,10 +32,10 @@ These are not optimizations; they're correctness requirements imposed by TTM's P
 | Avoid SQL `CHARACTER` / `CHAR(n)` entirely; use `VARCHAR`/`TEXT`. SQL's `CHAR` pads with trailing blanks under equality — violates RM Pre 8. | RM Pre 8. |
 | Every base table emitted from a relvar has a `PRIMARY KEY` from the relvar's declared candidate key (RM Pre 15). The candidate key with the fewest attributes wins ties; the rest become `UNIQUE`. The compiler verifies minimality before emission. | RM Pre 15. |
 | A restriction value binds as a **numbered** `?N`/`$N` parameter (same absolute index on both dialects) in `WHERE`-clause order — never inlined into the SQL text. Numbering (rather than SQLite's bare `?`) keeps every bind site's index independent of its position in the text, which is what lets the runtime expand a relation-parameter marker anywhere in the query without renumbering the scalar binds around it. The value is either a compile-time literal **or a bound local**: `let s = …; R where col = s` (with `s` an in-scope local of a pushable scalar type matching `col`) pushes as `WHERE "col" = ?1` with `s`'s runtime value bound, instead of loading the whole relvar and filtering in-process. Each parameter is a `ParamSource::{Lit(Value), Param(name)}` in `SqlQuery.params`, in placeholder order; the lowerer resolves a `Param` name to the local's already-lowered value at bind time. `Rational` is literal-only (see its row — the literal path pre-serializes `n/d`, a runtime rational has no such text). A general scalar-*expression* RHS (`col = x.f`, arithmetic) still declines and runs in-process. A `where not <p>` predicate pushes when `<p>` is itself a single pushable comparison (or a bare Boolean attribute): the operator is complemented via `CmpOp::negate` (`not (col = v)` ⇒ `"col" <> ?1`, `not flag` ⇒ `"flag" <> ?1` bound `true`), the same complement the surgical-delete keep-filter uses. A `not` over a non-single-comparison (`not (a and b)`) declines and runs in-process, where `ScalarOp::Not` evaluates it per row. | Performance (docs/principles.md): a keyed lookup by a runtime value must not force a full-table scan. |
-| A **relation-valued operand** whose data lives in the process (a relation-typed local, a relation-valued tuple field like `req.path`, a private relvar) binds as a **relation-valued parameter** (`RelExpr::RelParam`): a `__CODDL_REL_<slot>__` marker stands for the whole table primary, which the runtime replaces with `(VALUES (?k+1, …), …)` over the bound relation's rows (cells numbered after the scalar params, slot order) — or, for an empty relation, a typed zero-row `SELECT` that emits **no `NULL` token**. The local relation is never inlined as literals and the public relvar is never pulled into the process. See "Relation-valued parameters" below. | Performance (docs/principles.md §1, the mixed-origin rule); RM Pro 4 (the empty form stays NULL-free). |
+| A **relation-valued operand** whose data lives in the process (a relation-typed local, a relation-valued tuple field like `req.path`, a private relvar) binds as a **relation-valued parameter** (`RelExpr::RelParam`): a `__CODDL_REL_<slot>__` marker stands for the whole table primary, which the runtime replaces with `(VALUES (?k+1, …), …)` over the bound relation's rows (cells numbered after the scalar params, slot order) — or, for an empty relation, a typed zero-row `SELECT` that emits **no `NULL` token**. A semijoin rhs ships **narrowed to the shared attributes**; the force point, holding the relation, **dispatches on its cardinality**: 0 at an absorbing slot → a fresh empty relation with *no statement*; 1 at a root-`matching` rhs → the baked cardinality-1 sibling plan (`WHERE shared = ?N…`, the row's cells as ordinary trailing binds); else the general form. The local relation is never inlined as literals and the public relvar is never pulled into the process. See "Relation-valued parameters" below. | Performance (docs/principles.md §1, the mixed-origin rule); RM Pro 4 (the empty form stays NULL-free); RM Pre 8 (the short-circuit is observationally identical). |
 | `reltrue` / `relfalse` (nullary relations): emit as `(SELECT) WHERE TRUE` / `WHERE FALSE`. SQLite/Postgres tolerate this; non-conforming backends would need a synthesized dummy column. | RM Pro 5. |
 | Transitive closure (`tclose`) emits a two-CTE `WITH RECURSIVE` with the operand defined once (params appear once) and `UNION` (never `UNION ALL`) so the closure is a set. It is emitted only at the statement root — a `WITH`-prefixed query can't be a compound operand or a `FROM` subquery, so a nested/operand `TClose` declines and decomposes in-process. | RM Pro 3; the one irreducible Algebra-A operator. |
-| Semijoin (`matching`) / antijoin (`not matching`) emit a correlated `SELECT coddl_l."a", … FROM (<lhs>) AS coddl_l WHERE [NOT] EXISTS (SELECT 1 FROM (<rhs>) AS coddl_r WHERE coddl_l.k = coddl_r.k AND …)`, correlated on the shared attributes, the outer columns **enumerated explicitly** (never `coddl_l.*` — the no-`SELECT *` rule above). Never a join + `SELECT DISTINCT` (or `EXCEPT`) — `EXISTS` avoids the join's row-multiplication. A root `Project` **peels over the semijoin** (`R matching S project { … }` narrows the outer list); `DISTINCT` appears only when a projection was peeled *and* the standard proof fails (a bare semijoin is a subset of its already-set lhs, so it never needs one). Emitted only at the statement root (like set-ops); a semijoin nested under any *other* relational op declines and runs in-process. | RM Pro 1 (enumerate columns); RM Pro 3 (`EXISTS` yields each left row at most once); performance (the semijoin SQL a planner recognizes, not a materialized join). |
+| Semijoin (`matching`) / antijoin (`not matching`) emit a correlated `SELECT coddl_l."a", … FROM (<lhs>) AS coddl_l WHERE [NOT] EXISTS (SELECT 1 FROM (<rhs>) AS coddl_r WHERE coddl_l.k = coddl_r.k AND …)`, correlated on the shared attributes, the outer columns **enumerated explicitly** (never `coddl_l.*` — the no-`SELECT *` rule above). Never a join + `SELECT DISTINCT` (or `EXCEPT`) — `EXISTS` avoids the join's row-multiplication. A root `Project` **peels over the semijoin** (`R matching S project { … }` narrows the outer list); `DISTINCT` appears only when a projection was peeled *and* the standard proof fails (a bare semijoin is a subset of its already-set lhs, so it never needs one). The **rhs** emits with its own `DISTINCT` suppressed — duplicates can't change `EXISTS` truth, so the dedup sort inside the existential subquery is never emitted (which is what lets the rhs narrow to the shared attributes without reintroducing a sort). Emitted only at the statement root (like set-ops); a semijoin nested under any *other* relational op declines and runs in-process. | RM Pro 1 (enumerate columns); RM Pro 3 (`EXISTS` yields each left row at most once); performance (the semijoin SQL a planner recognizes, not a materialized join). |
 | SQLite-specific: Coddl `Boolean` lowers to SQL `INTEGER CHECK (col IN (0, 1))`. Avoid the SQLite affinity-coercion footguns by always `CAST`-ing on `INSERT`. | dialect quirk. |
 | Coddl `Character` binds, stores, and reads back as its **integer Unicode codepoint** (`Value::Character` → `INTEGER`), never as a SQL `CHAR`/`CHARACTER` column. A pushed `where c = 'a'` renders `"c" = ?` bound to `97`; the result column reads back as an integer codepoint into a `Character` cell. Sidesteps the RM Pre 8 `CHAR`-padding footgun (row above) and needs no char type. | RM Pre 8; SQLite has no character type. |
 | Coddl `Rational` binds, stores, and reads back as canonical **`TEXT "n/d"`** (`Value::Rational` carries the reduced `(numer, denom)` pair). Neither backend has an exact-rational type (`NUMERIC` is decimal — can't hold `1/3`), so the reduced fraction serializes to text; because it's canonical (lowest terms, `d>0`), SQL text `=` coincides with value-equality, so a pushed `where r = 3.4` renders `"r" = ?` bound to `'17/5'`. Read-back parses `"n/d"` (reducing defensively) into the 16-byte cell. Plain `NOT NULL TEXT` — no NaN-analog, so no NULL games. **Ordering** (`< <= > >=`, and `order [r]`) can't use text order — `"17/5"` sorts before `"2/1"` lexically but `17/5 > 2` — so it emits `… COLLATE coddl_rational`, a SQLite collation the runtime registers on every connection that defers to the same `coddl_rational_cmp` the in-process `<` uses. Postgres has no backend yet and no such collation, so a Rational ordering push there is a hard error (`BackendError::Other`), never a silently-wrong lexicographic sort. | RM Pre 8; no native exact-rational type. |
@@ -227,6 +227,18 @@ lowerer-side table of AST subexpressions, keeping RelIR lowerer-agnostic. The
 slot's value is computed by the ordinary **in-process** machinery at the force
 point; only its *result rows* cross into SQL.
 
+**Semijoin-rhs narrowing.** A `matching` / `not matching` rhs is narrowed to
+the attributes it shares with the lhs at build time — `L matching R ≡
+L matching (R project {shared})`; the rest is existentially quantified away. A
+collapsed `RelParam` shrinks its *heading* (the lowerer inserts the matching
+in-process project at ship time — which **seals**, so rows agreeing on the
+shared attributes collapse before crossing: fewer cells per row *and* fewer
+rows under the bind ceiling); a structural rhs wraps in a `Project`, narrowing
+the `EXISTS` subquery's select list. In existential position a dedup sort is
+pure waste, so the semijoin arm emits its rhs with `DISTINCT` **suppressed**
+(duplicates cannot change `EXISTS` truth) — the narrowing `Project` never
+reintroduces the sort it exists to avoid.
+
 `resolve` renders the leaf as a column-aliasing wrapper over a marker (SQLite
 has no `AS v(col, …)` column-list alias; both dialects expose `column1…N` on a
 `VALUES` table):
@@ -238,29 +250,67 @@ has no `AS v(col, …)` column-list alias; both dialects expose `column1…N` on
 so downstream composition — `USING` joins, `EXISTS` correlation, restriction
 resolution — sees attribute-named columns exactly as from any other derived
 table. The marker (`rel_param_marker(slot)`; `SqlQuery.rel_params` carries one
-`RelParamSpec { slot, arity }` per marker) stands for the **whole table
-primary**. At run time `coddl_query` substitutes each marker, in slot order,
-with:
+`RelParamSpec { slot, heading, absorbs_empty }` per marker) stands for the
+**whole table primary**. At run time `coddl_query` — which is *holding* every
+shipped relation when it fires, so each slot's actual cardinality is free —
+dispatches on the narrowed count, **0 / 1 / n**:
 
-- rows > 0 → `(VALUES (?k+1, …), (…))` — numbered groups whose cells bind
-  **after** the scalar params (`?1..?k`); numbered placeholders are what make
-  the expansion position-independent (the mandatory-rules row above);
-- rows = 0 → `(SELECT 0 AS column1, '' AS column2, … WHERE 0)` — a typed
-  zero-row SELECT naming the same positional columns; the dummies are
-  type-shaped literals, never returned, and **no `NULL` token is ever
-  emitted** (RM Pro 4).
+- **0 rows at an absorbing slot** → the whole result is provably empty (the
+  empty relation is the join family's multiplicative zero), so a fresh empty
+  relation returns on the plan's result descriptor **without firing a
+  statement** — no prepare, no round trip; observationally identical
+  (RM Pre 8). Whether a slot *absorbs* is static, computed top-down at the
+  emission root: emptiness propagates through every unary heading op, both
+  operands of `join`/`times`/`intersect`, both sides of `matching`, and the
+  `minus` lhs; it does **not** propagate through a `union` operand (additive
+  identity), a `minus` rhs, or a `not matching` rhs (empty rhs ⇒ everything
+  survives — those still fire, the empty slot shipping as the typed zero-row
+  form below).
+- **1 row at the dispatch slot** (a root `matching` whose rhs is the plan's
+  only rel param) → the **cardinality-1 sibling plan** fires instead:
+  `L matching {t}` degenerates the existence test into an equality
+  conjunction, `L where shared₁ = t.shared₁ and …`. Both plans are baked at
+  compile time (cardinality is runtime knowledge, SQL text is compile-time):
+  the sibling is the general plan's lhs wrapped in per-shared-attribute
+  equality `Restrict`s whose values are `RestrictValue::SlotCell` binds —
+  ordinary numbered placeholders (`?k+1..?k+m`, after the lhs's own scalars)
+  that the runtime fills from the shipped row's cells, decoded in canonical
+  heading order. Values bind as parameters in every form (the never-inline
+  rule; audit-log quoting is trace expansion). `DISTINCT` elision on the
+  sibling is not a special case — a pinned key hits the existing
+  `card_le_one` proof. v1 limits: `matching` only (`not matching` at
+  cardinality 1 negates the conjunction — a disjunction, B1's territory;
+  `join` needs constant extends), single-rel-param plans only.
+- **otherwise** → the general form: each marker substitutes, in slot order,
+  with `(VALUES (?k+1, …), (…))` — numbered groups whose cells bind **after**
+  the scalar params (`?1..?k`); numbered placeholders are what make the
+  expansion position-independent (the mandatory-rules row above). An empty
+  slot at a *non-absorbing* position substitutes
+  `(SELECT 0 AS column1, '' AS column2, … WHERE 0)` — a typed zero-row SELECT
+  naming the same positional columns; the dummies are type-shaped literals,
+  never returned, and **no `NULL` token is ever emitted** (RM Pro 4).
 
 The wiki route is the flagship: `Pages matching (req.path where ordinality = 1
-rename { slug: segment }) project { title, body }` pushes as
+rename { slug: segment }) project { title, body }` bakes both
 
 ```
 SELECT DISTINCT coddl_l."body", coddl_l."title" FROM (SELECT "body", "slug", "title" FROM "pages") AS coddl_l
-WHERE EXISTS (SELECT 1 FROM (SELECT "ordinality", "slug" FROM
-  (SELECT column1 AS "ordinality", column2 AS "slug" FROM __CODDL_REL_0__ AS coddl_v0) AS coddl_rel0) AS coddl_r
+WHERE EXISTS (SELECT 1 FROM (SELECT "slug" FROM
+  (SELECT column1 AS "slug" FROM __CODDL_REL_0__ AS coddl_v0) AS coddl_rel0) AS coddl_r
 WHERE coddl_l."slug" = coddl_r."slug")
 ```
 
-with the request path's row bound as `(VALUES (?1, ?2))` at run time.
+(the rhs narrowed to the shared `slug` — `ordinality` never crosses) and the
+sibling
+
+```
+SELECT "body", "title" FROM "pages" WHERE "slug" = ?1
+```
+
+— and since the request path filtered to one segment always has exactly one
+row, every `/wiki/{slug}` request runs the sibling: the direct keyed lookup
+the old scalar spelling produced, no `EXISTS`, no `DISTINCT`. The relational
+spelling is free.
 
 Bounds and declines: a read query **never batch-splits** (splitting a `VALUES`
 operand changes the query's meaning for non-distributive shapes), so scalars +
@@ -268,10 +318,8 @@ shipped cells must fit under the historical SQLite bind floor (999) — a bigger
 local relation aborts loud; the escalation for large relations is the
 temp-table path below. A local heading with a Tuple-valued attribute (no
 scalar SQL cell) or a nullary local (no zero-column `VALUES` form) declines
-the push and falls to the in-process path. Deferred by choice: shipping only
-the correlation-relevant attributes of a semijoin's rhs (an optimization, not
-a correctness need), and eliding the nested no-op wrappers (SQLite's subquery
-flattener collapses them).
+the push and falls to the in-process path. Deferred by choice: eliding the
+nested no-op wrappers (SQLite's subquery flattener collapses them).
 
 ### Statement-verb sugar
 
@@ -334,7 +382,7 @@ Keep emitted SQL to a **portable subset** (CTEs, window functions, standard join
 
 **Set operations emit unparenthesized.** A root `Or` (surface `union`) emits `<lhs> UNION <rhs>` — a bare compound `SELECT`, *not* `(<lhs>) UNION (<rhs>)`. SQLite rejects parentheses around the operands of a compound query (`(SELECT …) UNION …` is a syntax error), whereas Postgres tolerates them; the unparenthesized form is valid in both and is the portable subset. `UNION` is associative, so a nested root chain `A union B union C` emits `… UNION … UNION …` and binds correctly. Operand `$N` placeholders (Postgres) are renumbered: the right operand starts after the left's parameter count, threaded via an `emit_select` start-offset. Bare `UNION` (set semantics, never `UNION ALL`); CORRESPONDING is satisfied for free because both operands emit canonical-sorted column lists over identical (typechecked) headings. A set operation *nested under* a relational operator (`(A union B) where p`) does not push — `resolve` errs on it, so the cut runs it in-process.
 
-**Semijoin / antijoin emit a correlated `WHERE [NOT] EXISTS`.** A root `Semijoin` (surface `matching`, `negated: false`) / antijoin (`not matching`, `negated: true`) — optionally under a root `Project` (`R matching S project { … }`), which **peels** and narrows the outer list — emits `SELECT coddl_l."a", … FROM (<lhs>) AS coddl_l WHERE EXISTS (SELECT 1 FROM (<rhs>) AS coddl_r WHERE coddl_l."k" = coddl_r."k" AND …)`, correlated on the shared attributes (the antijoin uses `NOT EXISTS`). This is the idiomatic semijoin SQL — no `INNER JOIN` row-multiplication and no `EXCEPT` dedup. The outer SELECT **enumerates** the result heading's columns (never `coddl_l.*` — the no-`SELECT *` rule), qualified by the left derived table, whose subquery names its outputs by attribute (leaf names for Tuple-valued attributes, flattened in canonical order) — so the qualified name *is* the output name and the result marshals against the (possibly projected) heading. `DISTINCT` is emitted only when a projection was peeled *and* `needs_distinct()` holds: a bare semijoin selects a subset of the already-set lhs rows, and a projection that keeps a surviving key is still a set. The correlation reuses the same all-`=` tuple-comparison pattern the surgical anti-join delete uses (`emit_anti_join_delete`), but over the **shared** attributes (the typechecked join key, always ≥1) rather than every attribute, and in SELECT rather than DELETE position. Operand placeholders are renumbered (rhs starts after lhs). Handled at the statement root like set-ops; a semijoin nested under any other relational op (`(A matching B) where p`) and a Tuple-valued shared key both decline through `resolve` and run in-process, and a trailing `ORDER BY` over a semijoin root is deferred (declines to an in-process sort, like a set-op root).
+**Semijoin / antijoin emit a correlated `WHERE [NOT] EXISTS`.** A root `Semijoin` (surface `matching`, `negated: false`) / antijoin (`not matching`, `negated: true`) — optionally under a root `Project` (`R matching S project { … }`), which **peels** and narrows the outer list — emits `SELECT coddl_l."a", … FROM (<lhs>) AS coddl_l WHERE EXISTS (SELECT 1 FROM (<rhs>) AS coddl_r WHERE coddl_l."k" = coddl_r."k" AND …)`, correlated on the shared attributes (the antijoin uses `NOT EXISTS`). This is the idiomatic semijoin SQL — no `INNER JOIN` row-multiplication and no `EXCEPT` dedup. The outer SELECT **enumerates** the result heading's columns (never `coddl_l.*` — the no-`SELECT *` rule), qualified by the left derived table, whose subquery names its outputs by attribute (leaf names for Tuple-valued attributes, flattened in canonical order) — so the qualified name *is* the output name and the result marshals against the (possibly projected) heading. `DISTINCT` is emitted only when a projection was peeled *and* `needs_distinct()` holds: a bare semijoin selects a subset of the already-set lhs rows, and a projection that keeps a surviving key is still a set. The correlation reuses the same all-`=` tuple-comparison pattern the surgical anti-join delete uses (`emit_anti_join_delete`), but over the **shared** attributes (the typechecked join key, always ≥1) rather than every attribute, and in SELECT rather than DELETE position. Operand placeholders are renumbered (rhs starts after lhs). The rhs is narrowed to the shared attributes at build time and emits with its own `DISTINCT` suppressed (existential context — duplicates can't change the outcome); a root `matching` over a relation-valued parameter additionally bakes the cardinality-1 sibling plan (see "Relation-valued parameters"). Handled at the statement root like set-ops; a semijoin nested under any other relational op (`(A matching B) where p`) and a Tuple-valued shared key both decline through `resolve` and run in-process, and a trailing `ORDER BY` over a semijoin root is deferred (declines to an in-process sort, like a set-op root).
 
 **Transitive closure emits `WITH RECURSIVE`.** A root `TClose` (surface `tclose`) over a binary same-typed relation with attributes `a` (canonical `attrs[0]`, source) and `b` (`attrs[1]`, target) emits a **two-CTE** recursive query: the operand is defined **once** as a non-recursive CTE (`coddl_tc_op`) — so its bind parameters appear once — and the recursive closure CTE (`coddl_tc`) references it for both the base and recursive members, composing on `tc.b = op.a`. `WITH RECURSIVE … UNION …` (not `UNION ALL`) converges to `⋃_{k≥1} Eᵏ`; the closure is direction-agnostic, so the result heading equals the operand heading. Both SQLite and Postgres accept it (a non-recursive CTE may sit alongside a recursive one; the recursive member references the recursive CTE exactly once). A `WITH`-prefixed query **cannot be a compound (`UNION`/`EXCEPT`) operand** — SQLite also forbids parenthesizing it — so a `TClose` reached as a set-op operand or nested under another relational op is handled like a nested set-op: `resolve` errs and the cut declines, and the expression **decomposes in-process** (each closure pushes its own `WITH RECURSIVE`, the surrounding operator runs in process). This is why the root `TClose` is emitted in the `emit_select` entry, *before* the `emit_select_offset` set-op recursion. Recursion *beyond* plain TCLOSE (labels / generalized closure) stays the cut-higher case ([relir.md](relir.md)).
 

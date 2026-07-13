@@ -38,7 +38,7 @@ use coddl_sqlemit::{
 
 use crate::ir::{
     BasicBlock, BlockId, Const, Function, HeadingId, Inst, Module, PlanEntry, ProcType,
-    PublicRelvarBinding, ScalarOp, Terminator, ValueId,
+    PublicRelvarBinding, RelParamReg, ScalarOp, Terminator, ValueId,
 };
 
 /// Surface name → C-ABI linkage name for each runtime extern. The
@@ -167,6 +167,11 @@ pub struct LowerOutput {
 pub struct ExplainEntry {
     pub expr: RelExpr,
     pub sql: String,
+    /// The cardinality-1 sibling plan's SQL, when one was baked (a root
+    /// `matching` over a shipped relation): the specialized keyed lookup the
+    /// runtime fires instead of `sql` when the shipped relation holds exactly
+    /// one row.
+    pub card1_sql: Option<String>,
 }
 
 /// Tokenize, parse, type-check, and lower `source` to ProcIR.
@@ -2313,7 +2318,7 @@ impl Lowerer {
             return false;
         };
         let result_heading_id = self.intern_heading(&template.result_heading);
-        let plan_id = self.register_plan(&template, result_heading_id);
+        let plan_id = self.register_plan(&template, result_heading_id, None);
         let src = self.lower_expr(source_expr);
         let ProcType::Relation(heading_id) = self.value_type(src) else {
             return false;
@@ -2655,7 +2660,7 @@ impl Lowerer {
             if let Ok(truncate) = emit_truncate(&target_rel, dialect) {
                 self.emit_dml(truncate);
                 let result_heading_id = self.intern_heading(&template.result_heading);
-                let plan_id = self.register_plan(&template, result_heading_id);
+                let plan_id = self.register_plan(&template, result_heading_id, None);
                 let src = self.lower_expr(value_expr);
                 if let ProcType::Relation(heading_id) = self.value_type(src) {
                     self.insts.push(Inst::InsertFrom {
@@ -4511,12 +4516,12 @@ impl Lowerer {
         let dialect = self.dialect?;
         let mut slots = Vec::new();
         let rel = self.build_rel_expr(expr, &mut slots)?;
-        let query = crate::cut::try_push_ordered(&rel, dialect, order)?;
+        let plan = crate::cut::try_push_ordered(&rel, dialect, order)?;
         // The emitted rel-params are exactly the build's slot table (the
         // collapse invariant) — both pure, so nothing was emitted if either
         // failed above.
         debug_assert_eq!(
-            query.rel_params.len(),
+            plan.query.rel_params.len(),
             slots.len(),
             "emitted rel_params disagree with the build's slot table"
         );
@@ -4525,10 +4530,11 @@ impl Lowerer {
         if self.collect_relir {
             self.relir.push(ExplainEntry {
                 expr: rel.clone(),
-                sql: query.sql.text.clone(),
+                sql: plan.query.sql.text.clone(),
+                card1_sql: plan.card1_alt.as_ref().map(|(alt, _)| alt.sql.text.clone()),
             });
         }
-        Some(self.emit_query(query, &slots))
+        Some(self.emit_query(plan, &slots))
     }
 
     /// Build a `coddl-relir` expression from a relational AST subtree, or
@@ -5006,10 +5012,27 @@ impl Lowerer {
     /// Register a baked `SqlQuery` as a module plan, deduping by its text-stable
     /// id, and return the dense per-module plan id. `result_heading_id` is the
     /// interned heading the runtime marshals rows into (unused for DML, which
-    /// returns no rows — pass the operand heading). Shared by `emit_query` and
-    /// `emit_dml`.
-    fn register_plan(&mut self, query: &SqlQuery, result_heading_id: HeadingId) -> u32 {
+    /// returns no rows — pass the operand heading). `card1_alt` links a
+    /// cardinality-1 sibling — `(sibling dense id, dispatch slot)` — onto the
+    /// general plan's entry; every other registration passes `None`. Shared by
+    /// `emit_query` and `emit_dml`.
+    fn register_plan(
+        &mut self,
+        query: &SqlQuery,
+        result_heading_id: HeadingId,
+        card1_alt: Option<(u32, usize)>,
+    ) -> u32 {
         if let Some(id) = self.plan_ids.get(&query.plan_id.0) {
+            // A dedup hit is the same text under the same dialect — the same
+            // tree shape, so the same sibling linkage was derived for it.
+            debug_assert_eq!(
+                self.plans
+                    .iter()
+                    .find(|p| p.plan_id == *id)
+                    .map(|p| p.card1_alt),
+                Some(card1_alt.map(|(alt, _)| alt)),
+                "one plan text registered with two different card-1 siblings"
+            );
             *id
         } else {
             let id = self.next_plan_id;
@@ -5019,8 +5042,17 @@ impl Lowerer {
                 db_name: self.db_name.clone().unwrap_or_default(),
                 sql: query.sql.text.clone(),
                 param_count: query.sql.param_count,
-                rel_arities: query.rel_params.iter().map(|s| s.arity).collect(),
+                rel_params: query
+                    .rel_params
+                    .iter()
+                    .map(|s| RelParamReg {
+                        arity: s.arity(),
+                        absorbs_empty: s.absorbs_empty,
+                    })
+                    .collect(),
                 result_heading_id,
+                card1_alt: card1_alt.map(|(alt, _)| alt),
+                dispatch_slot: card1_alt.map(|(_, slot)| slot as u32).unwrap_or(0),
             });
             self.plan_ids.insert(query.plan_id.0, id);
             id
@@ -5073,39 +5105,91 @@ impl Lowerer {
                         .expect("bound-param local resolved at build_predicate");
                     params.push((vid, ty));
                 }
+                // A slot cell is never a lowerer bind argument: it appears
+                // only in a cardinality-1 sibling plan, which is registered
+                // but never named by an `Inst::Query` — the runtime fills its
+                // trailing binds from the dispatch slot's row.
+                ParamSource::SlotCell { .. } => {
+                    unreachable!("slot-cell binds are runtime-dispatched, never lowered")
+                }
             }
         }
         params
     }
 
-    /// Register `query` and emit the `Inst::Query` that fires it. `slot_exprs`
-    /// are the AST subexpressions behind the query's relation-valued
-    /// parameters (one per `query.rel_params` entry, in slot order): each is
-    /// lowered **in-process** here — a slot tree contains no public relvar by
-    /// the collapse invariant — and its relation value rides the instruction's
-    /// `rels`, bound into the plan's rel-param markers at run time. Empty for
-    /// an ordinary query.
-    fn emit_query(&mut self, query: SqlQuery, slot_exprs: &[Expr]) -> ValueId {
+    /// Lower one rel-param slot's AST and narrow the produced relation to the
+    /// slot's shipped heading. The build narrows a semijoin rhs's `RelParam`
+    /// heading to the shared attributes (`build_rel_binary`), but the slot's
+    /// AST still computes its natural, wider relation — so ship time inserts
+    /// the in-process `Project` here. The project **seals** (dedups), so rows
+    /// that agree on the kept attributes collapse before crossing the
+    /// boundary: fewer cells per row *and* fewer rows. The wider temp is
+    /// released immediately (a bare local is left alone); the narrowed value
+    /// is always a fresh temp the consumer releases. A heading mismatch that
+    /// isn't a narrowing is a compiler bug, not a user error.
+    fn lower_slot_narrowed(
+        &mut self,
+        ast: &Expr,
+        want: &Heading,
+        slot: usize,
+    ) -> (ValueId, HeadingId) {
+        let v = self.lower_expr(ast);
+        let ProcType::Relation(heading_id) = self.value_type(v) else {
+            unreachable!("rel-param slot lowered to a non-relation value");
+        };
+        let have = &self.headings[heading_id.0 as usize];
+        if have == want {
+            return (v, heading_id);
+        }
+        assert!(
+            want.attrs()
+                .iter()
+                .all(|(name, ty)| have.lookup(name) == Some(ty)),
+            "rel-param slot {slot} lowered to `{have:?}`, which does not cover \
+             its shipped heading `{want:?}`",
+        );
+        let keep: Vec<String> = want.attrs().iter().map(|(name, _)| name.clone()).collect();
+        let narrowed = self.emit_project(v, &keep);
+        self.release_call_arg_temp(v);
+        let ProcType::Relation(narrowed_id) = self.value_type(narrowed) else {
+            unreachable!("project produced a non-relation value");
+        };
+        (narrowed, narrowed_id)
+    }
+
+    /// Register a pushed plan and emit the `Inst::Query` that fires it.
+    /// `slot_exprs` are the AST subexpressions behind the query's
+    /// relation-valued parameters (one per `query.rel_params` entry, in slot
+    /// order): each is lowered **in-process** here — a slot tree contains no
+    /// public relvar by the collapse invariant — and its relation value rides
+    /// the instruction's `rels`, bound into the plan's rel-param markers at
+    /// run time. Empty for an ordinary query. A cardinality-1 sibling
+    /// registers as an ordinary entry of its own, linked from the general
+    /// plan's entry; the instruction always names the general plan — the
+    /// runtime dispatches.
+    fn emit_query(&mut self, plan: crate::cut::PushedPlan, slot_exprs: &[Expr]) -> ValueId {
+        let crate::cut::PushedPlan { query, card1_alt } = plan;
         debug_assert_eq!(query.rel_params.len(), slot_exprs.len());
         let result_heading_id = self.intern_heading(&query.result_heading);
-        let plan_id = self.register_plan(&query, result_heading_id);
+        let alt = card1_alt.map(|(alt_query, dispatch_slot)| {
+            // The sibling returns the same rows — same heading, same
+            // descriptor, so the runtime can marshal either plan's result
+            // identically.
+            debug_assert_eq!(alt_query.result_heading, query.result_heading);
+            (
+                self.register_plan(&alt_query, result_heading_id, None),
+                dispatch_slot,
+            )
+        });
+        let plan_id = self.register_plan(&query, result_heading_id, alt);
         let params = self.emit_params(&query);
         let mut rels: Vec<(ValueId, HeadingId)> = Vec::with_capacity(slot_exprs.len());
-        for (spec, ast) in query.rel_params.iter().zip(slot_exprs) {
-            let v = self.lower_expr(ast);
-            let ProcType::Relation(heading_id) = self.value_type(v) else {
-                unreachable!("rel-param slot lowered to a non-relation value");
-            };
-            // The lowered relation's shape must be the one emission rendered
-            // the marker's wrapper columns from — a mismatch is a compiler
-            // bug, not a user error.
-            assert_eq!(
-                self.headings[heading_id.0 as usize].attrs().len(),
-                spec.arity as usize,
-                "rel-param slot {} lowered to a relation of the wrong arity",
-                spec.slot,
-            );
-            rels.push((v, heading_id));
+        for (i, (spec, ast)) in query.rel_params.iter().zip(slot_exprs).enumerate() {
+            // The positional pairing relies on the *root* spec list being
+            // slot-dense (sub-emissions may see a suffix, but operand lists
+            // concatenate back in DFS order — see `rel_params_of`).
+            debug_assert_eq!(spec.slot, i, "root rel-param list is not slot-dense");
+            rels.push(self.lower_slot_narrowed(ast, &spec.heading, spec.slot));
         }
         let dst = self.fresh_value();
         self.record_type(dst, ProcType::Relation(result_heading_id));
@@ -5145,7 +5229,7 @@ impl Lowerer {
         // The DML plan returns no rows; its registered heading is unused but
         // `PlanEntry` carries one, so intern the operand heading honestly.
         let result_heading_id = self.intern_heading(&query.result_heading);
-        let plan_id = self.register_plan(&query, result_heading_id);
+        let plan_id = self.register_plan(&query, result_heading_id, None);
         let params = self.emit_params(&query);
         self.insts.push(Inst::Dml { plan_id, params });
     }
@@ -5556,10 +5640,17 @@ impl Lowerer {
             // `A matching B` (semijoin) / `A not matching B` (antijoin) → the
             // `Semijoin` node, which the SQL emitter pushes as `WHERE [NOT]
             // EXISTS` and the in-process path expands to join+project(+minus).
-            // (Typecheck guarantees ≥1 shared attribute.)
+            // (Typecheck guarantees ≥1 shared attribute.) The rhs narrows to
+            // the shared attributes — `L matching R ≡ L matching (R project
+            // {shared})`, the rest is existentially quantified away. A shipped
+            // rhs then crosses the boundary with fewer cells per row and fewer
+            // rows (the narrowing project seals); a single-shared-attr rhs is
+            // what makes the cardinality-1 sibling plan's cells line up with
+            // its equality conjuncts.
             Some(BinaryOp::Matching) | Some(BinaryOp::NotMatching) => {
                 let lhs = self.build_rel_operand(&b.lhs()?, slots)?;
-                let rhs = self.build_rel_operand(&b.rhs()?, slots)?;
+                let rhs =
+                    Self::narrow_semijoin_rhs(&lhs, self.build_rel_operand(&b.rhs()?, slots)?);
                 Some(RelExpr::Semijoin {
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
@@ -5595,6 +5686,31 @@ impl Lowerer {
                 None
             }
             other => other,
+        }
+    }
+
+    /// Narrow a semijoin/antijoin rhs to the attributes it shares with the
+    /// lhs — the only ones the existence test reads; the rest is
+    /// existentially quantified away. A collapsed `RelParam` shrinks its
+    /// heading in place (ship time inserts the matching in-process project —
+    /// `lower_slot_narrowed`); a structural rhs wraps in a `Project`, which
+    /// narrows the pushed `EXISTS` subquery's select list (its `DISTINCT` is
+    /// suppressed in existential context) or the in-process join's rhs. An
+    /// rhs already at the shared attributes is returned unchanged.
+    fn narrow_semijoin_rhs(lhs: &RelExpr, rhs: RelExpr) -> RelExpr {
+        let shared = rhs.heading().shared_names(&lhs.heading());
+        if shared.len() == rhs.heading().len() {
+            return rhs;
+        }
+        match rhs {
+            RelExpr::RelParam { slot, heading } => RelExpr::RelParam {
+                slot,
+                heading: heading.project(&shared),
+            },
+            other => RelExpr::Project {
+                input: Box::new(other),
+                keep: shared,
+            },
         }
     }
 
@@ -5709,8 +5825,13 @@ impl Lowerer {
     fn lower_relexpr_inprocess(&mut self, rel: &RelExpr, slots: &[Expr]) -> Option<ValueId> {
         match rel {
             // A relation-valued parameter in a fully-local tree: the slot's
-            // AST subexpression lowers through the ordinary in-process path.
-            RelExpr::RelParam { slot, .. } => Some(self.lower_expr(&slots[*slot])),
+            // AST subexpression lowers through the ordinary in-process path,
+            // narrowed to the leaf's heading when the build shrank it (a
+            // semijoin rhs narrowed to the shared attributes) — the same
+            // discipline the ship-up path applies in `emit_query`.
+            RelExpr::RelParam { slot, heading } => {
+                Some(self.lower_slot_narrowed(&slots[*slot], heading, *slot).0)
+            }
             RelExpr::MaterializedRelvar { name, .. } => {
                 let &heading_id = self.private_relvars.get(name)?;
                 self.used_private_relvars.insert(name.clone());

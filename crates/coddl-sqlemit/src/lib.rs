@@ -70,13 +70,32 @@ pub struct SqlQuery {
 }
 
 /// One relation-valued parameter of an emitted query (a [`RelExpr::RelParam`]
-/// leaf): its slot index and the arity (leaf-column count) the bound relation
-/// must have. The runtime validates the bound relation's descriptor against
-/// `arity` before substituting the slot's marker.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// leaf): its slot index, the (possibly narrowed) heading the bound relation
+/// ships under, and whether an empty relation at this slot makes the whole
+/// result provably empty. The runtime validates the bound relation's
+/// descriptor against [`RelParamSpec::arity`] before substituting the slot's
+/// marker; the lowerer compares `heading` against the slot expression's
+/// natural heading to insert the narrowing projection (semijoin-rhs
+/// narrowing — only the shared attributes of a `matching` rhs matter).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RelParamSpec {
     pub slot: usize,
-    pub arity: u32,
+    pub heading: Heading,
+    /// Whether emptiness at this slot **absorbs**: an empty relation here
+    /// makes the whole query result empty (the empty relation is the
+    /// multiplicative zero of the join family), so the runtime returns a
+    /// fresh empty relation without firing a statement. Static knowledge —
+    /// computed top-down from the query root (see `annotate_absorbs`);
+    /// whether the slot *is* empty is runtime knowledge the force point has
+    /// for free.
+    pub absorbs_empty: bool,
+}
+
+impl RelParamSpec {
+    /// The leaf-column count the bound relation must have.
+    pub fn arity(&self) -> u32 {
+        self.heading.attrs().len() as u32
+    }
 }
 
 /// The marker token standing for relation-parameter `slot`'s **entire table
@@ -103,6 +122,14 @@ pub fn rel_param_marker(slot: usize) -> String {
 pub enum ParamSource {
     Lit(Value),
     Param(String),
+    /// A cell of the dispatch slot's single shipped row (see
+    /// `RestrictValue::SlotCell`). Never a lowerer bind argument: the runtime
+    /// fills it from the relation it is already holding when it selects the
+    /// cardinality-1 sibling plan at the force point.
+    SlotCell {
+        slot: usize,
+        cell: usize,
+    },
 }
 
 /// Identifier for a prepared statement cached by the runtime.
@@ -188,15 +215,24 @@ pub type Result<T> = std::result::Result<T, BackendError>;
 
 /// Collect the [`RelExpr::RelParam`] leaves of `expr`, in depth-first
 /// left-to-right order — the order the lowerer allocates slot indices in, so
-/// the collected list is in slot order (debug-asserted). Called at every
-/// `SqlQuery` construction whose text was built from `expr`, so the query's
-/// `rel_params` is always the honest set of markers in its text.
+/// the collected list is in slot order (debug-asserted as strictly
+/// increasing, not dense: `expr` may be an operand **sub-emission** — a
+/// semijoin or set-op operand emitted as its own derived table — whose slots
+/// are a suffix of the build's, e.g. `(A matching P₀) matching P₁`'s rhs
+/// alone carries slot 1. The *root* list is dense because operand lists
+/// concatenate in the same DFS order; `emit_query` asserts that when it pairs
+/// specs with slot expressions). Called at every `SqlQuery` construction
+/// whose text was built from `expr`, so the query's `rel_params` is always
+/// the honest set of markers in its text.
 fn rel_params_of(expr: &RelExpr) -> Vec<RelParamSpec> {
     fn walk(e: &RelExpr, out: &mut Vec<RelParamSpec>) {
         match e {
             RelExpr::RelParam { slot, heading } => out.push(RelParamSpec {
                 slot: *slot,
-                arity: heading.attrs().len() as u32,
+                heading: heading.clone(),
+                // Filled by `annotate_absorbs` at the emission root — a
+                // bottom-up collection can't know its context.
+                absorbs_empty: false,
             }),
             RelExpr::Restrict { input, .. }
             | RelExpr::Project { input, .. }
@@ -218,10 +254,58 @@ fn rel_params_of(expr: &RelExpr) -> Vec<RelParamSpec> {
     let mut out = Vec::new();
     walk(expr, &mut out);
     debug_assert!(
-        out.iter().enumerate().all(|(i, spec)| spec.slot == i),
+        out.windows(2).all(|pair| pair[0].slot < pair[1].slot),
         "RelParam slots out of DFS order: {out:?}"
     );
     out
+}
+
+/// Mark each rel-param spec whose emptiness **absorbs** — makes the whole
+/// query result provably empty. Top-down from the query root: emptiness
+/// propagates through every unary heading op, both operands of `And`
+/// (join/times/intersect — the empty relation is the join family's
+/// multiplicative zero), both sides of a semijoin, and the `Minus` /
+/// antijoin **lhs**. It does *not* propagate through an `Or` operand (the
+/// empty relation is union's additive identity), a `Minus` rhs, or a
+/// `not matching` rhs (an empty rhs means everything survives — the typed
+/// zero-row `SELECT … WHERE 0` form stays correct and must still fire).
+/// Called once per read-side emission root so the flags describe the whole
+/// statement, not a subquery.
+fn annotate_absorbs(expr: &RelExpr, specs: &mut [RelParamSpec]) {
+    fn walk(e: &RelExpr, absorbs: bool, specs: &mut [RelParamSpec]) {
+        match e {
+            RelExpr::RelParam { slot, .. } => {
+                if let Some(spec) = specs.iter_mut().find(|s| s.slot == *slot) {
+                    spec.absorbs_empty = absorbs;
+                }
+            }
+            RelExpr::Restrict { input, .. }
+            | RelExpr::Project { input, .. }
+            | RelExpr::Rename { input, .. }
+            | RelExpr::Extend { input, .. }
+            | RelExpr::TClose { input }
+            | RelExpr::Wrap { input, .. }
+            | RelExpr::Unwrap { input, .. } => walk(input, absorbs, specs),
+            RelExpr::And { lhs, rhs } => {
+                walk(lhs, absorbs, specs);
+                walk(rhs, absorbs, specs);
+            }
+            RelExpr::Or { lhs, rhs } => {
+                walk(lhs, false, specs);
+                walk(rhs, false, specs);
+            }
+            RelExpr::Minus { lhs, rhs } => {
+                walk(lhs, absorbs, specs);
+                walk(rhs, false, specs);
+            }
+            RelExpr::Semijoin { lhs, rhs, negated } => {
+                walk(lhs, absorbs, specs);
+                walk(rhs, absorbs && !negated, specs);
+            }
+            RelExpr::RelvarRef { .. } | RelExpr::MaterializedRelvar { .. } => {}
+        }
+    }
+    walk(expr, true, specs);
 }
 
 /// CTE names for the `WITH RECURSIVE` transitive-closure emission: `coddl_tc`
@@ -248,10 +332,15 @@ pub fn emit_select(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
     // rejects parenthesizing it), so a `TClose` reached as a set-op operand
     // goes through `emit_select_offset` → `resolve`'s Err arm, declines the
     // push, and decomposes in-process instead.
-    if let RelExpr::TClose { input } = expr {
-        return emit_tclose(input, dialect);
-    }
-    emit_select_offset(expr, dialect, 0, &[])
+    let mut query = if let RelExpr::TClose { input } = expr {
+        emit_tclose(input, dialect)?
+    } else {
+        emit_select_offset(expr, dialect, 0, &[], false)?
+    };
+    // The absorption flags describe the whole statement, so they are computed
+    // here at the true root, not in the sub-emission recursion.
+    annotate_absorbs(expr, &mut query.rel_params);
+    Ok(query)
 }
 
 /// Emit a relvar-rooted relational expression as a `SELECT` with a trailing
@@ -287,7 +376,9 @@ pub fn emit_select_ordered(
                 .to_string(),
         ));
     }
-    emit_select_offset(expr, dialect, 0, order)
+    let mut query = emit_select_offset(expr, dialect, 0, order, false)?;
+    annotate_absorbs(expr, &mut query.rel_params);
+    Ok(query)
 }
 
 /// Emit a root `TClose` (surface `tclose`) as a backend `WITH RECURSIVE` query.
@@ -318,7 +409,7 @@ fn emit_tclose(input: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
                                       // itself a root `TClose` (a nested `(R tclose) tclose` declines through
                                       // `resolve` and decomposes in-process), and its placeholders start at the
                                       // statement's `$1`.
-    let op = emit_select_offset(input, dialect, 0, &[])?;
+    let op = emit_select_offset(input, dialect, 0, &[], false)?;
     let src = &op.sql.text;
     let result = TCLOSE_RESULT_CTE;
     let edges = TCLOSE_OPERAND_CTE;
@@ -739,7 +830,11 @@ pub fn emit_insert_template(target: &RelExpr, dialect: Dialect) -> Result<SqlQue
         result_heading: target.heading(),
         rel_params: vec![RelParamSpec {
             slot: 0,
-            arity: columns.len() as u32,
+            heading: target.heading(),
+            // Write-side templates never dispatch on emptiness — an empty
+            // source relation simply inserts nothing (the batching loop runs
+            // zero batches).
+            absorbs_empty: false,
         }],
         plan_id,
     })
@@ -887,6 +982,12 @@ fn emit_select_offset(
     dialect: Dialect,
     param_offset: u32,
     order: &[(String, bool)],
+    // Suppress this emission root's own `DISTINCT` decision. Set for the rhs
+    // of a semijoin: duplicates cannot change `EXISTS` truth, so a dedup sort
+    // inside the existential subquery is pure waste — never emit a shape a
+    // planner would have to improve. Load-bearing for the semijoin-rhs
+    // narrowing, whose `Project` wrap can drop every key of a structural rhs.
+    suppress_distinct: bool,
 ) -> Result<SqlQuery> {
     // Root semijoin (`matching`) / antijoin (`not matching`), optionally under
     // a root `Project` (`R matching S project { … }` — the projection narrows
@@ -934,9 +1035,10 @@ fn emit_select_offset(
             }
         }
         // Operands emit as derived tables; the rhs's placeholders start after the
-        // lhs's (params concatenate lhs then rhs).
-        let l = emit_select_offset(lhs, dialect, param_offset, &[])?;
-        let r = emit_select_offset(rhs, dialect, param_offset + l.sql.param_count, &[])?;
+        // lhs's (params concatenate lhs then rhs). The rhs sits inside the
+        // `EXISTS` — existential context, so its own dedup is suppressed.
+        let l = emit_select_offset(lhs, dialect, param_offset, &[], false)?;
+        let r = emit_select_offset(rhs, dialect, param_offset + l.sql.param_count, &[], true)?;
         let exists = if *negated { "NOT EXISTS" } else { "EXISTS" };
         // The outer SELECT enumerates the result heading's columns explicitly
         // (never `coddl_l.*` — RM Pro 1's no-`SELECT *` rule), qualified by the
@@ -959,8 +1061,9 @@ fn emit_select_offset(
         // A bare semijoin never needs `DISTINCT`: it selects a subset of the
         // left subquery's rows, which are already a set. A peeled projection
         // may collapse distinct lhs rows, so it uses the standard proof
-        // (surviving key / cardinality bound on the projected expression).
-        let distinct = if projected && expr.needs_distinct() {
+        // (surviving key / cardinality bound on the projected expression) —
+        // unless this semijoin is itself an EXISTS rhs (existential context).
+        let distinct = if !suppress_distinct && projected && expr.needs_distinct() {
             "DISTINCT "
         } else {
             ""
@@ -1005,8 +1108,8 @@ fn emit_select_offset(
         // Operands never carry the load boundary's `ORDER BY` (it applies to the
         // whole compound, appended by the caller — and v1 declines ordered
         // set-op roots anyway), so they emit with no order.
-        let l = emit_select_offset(lhs, dialect, param_offset, &[])?;
-        let r = emit_select_offset(rhs, dialect, param_offset + l.sql.param_count, &[])?;
+        let l = emit_select_offset(lhs, dialect, param_offset, &[], false)?;
+        let r = emit_select_offset(rhs, dialect, param_offset + l.sql.param_count, &[], false)?;
         // Unparenthesized compound SELECT: `… UNION/EXCEPT …`. SQLite rejects
         // parenthesized operands in a compound query (`(SELECT …) UNION …` is a
         // syntax error); the bare form is valid in both SQLite and Postgres and
@@ -1131,8 +1234,10 @@ fn emit_select_offset(
     };
     // `DISTINCT` only when the result isn't provably already a set — a
     // surviving candidate key or a cardinality-≤-1 restriction makes it
-    // redundant (RM Pro 3 is still upheld; we only drop a proven no-op).
-    let distinct = if expr.needs_distinct() {
+    // redundant (RM Pro 3 is still upheld; we only drop a proven no-op) —
+    // and never inside an EXISTS rhs (existential context; duplicates can't
+    // change the outcome).
+    let distinct = if !suppress_distinct && expr.needs_distinct() {
         "DISTINCT "
     } else {
         ""
@@ -1468,11 +1573,17 @@ fn render_where_clause(
             quote_ident(col),
             op.sql()
         ));
-        // Both forms occupy one positional placeholder in `wheres` order, so the
-        // pushed `ParamSource` list lines up with the emitted `?`/`$n` sequence.
+        // Every form occupies one positional placeholder in `wheres` order, so
+        // the pushed `ParamSource` list lines up with the emitted `?`/`$n`
+        // sequence. A `SlotCell` renders like any other bind; only who fills
+        // it differs (the runtime, from the dispatch slot's single row).
         params.push(match value {
             RestrictValue::Lit(lit) => ParamSource::Lit(Value::from(lit.clone())),
             RestrictValue::Param(name) => ParamSource::Param(name.clone()),
+            RestrictValue::SlotCell { slot, cell } => ParamSource::SlotCell {
+                slot: *slot,
+                cell: *cell,
+            },
         });
     }
     Ok(format!(" WHERE {}", conjuncts.join(" AND ")))
@@ -2404,7 +2515,14 @@ mod tests {
             r#"INSERT INTO "greetings" ("id", "message") SELECT v.column1, v.column2 FROM __CODDL_REL_0__ AS v WHERE NOT EXISTS (SELECT 1 FROM "greetings" WHERE "greetings"."id" = v.column1 AND "greetings"."message" = v.column2)"#
         );
         assert!(q.sql.text.contains(&rel_param_marker(0)));
-        assert_eq!(q.rel_params, vec![RelParamSpec { slot: 0, arity: 2 }]);
+        assert_eq!(
+            q.rel_params,
+            vec![RelParamSpec {
+                slot: 0,
+                heading: greetings_heading(),
+                absorbs_empty: false,
+            }]
+        );
     }
 
     // ── relation-valued parameters (RelParam emission) ─────────────────
@@ -2432,7 +2550,15 @@ mod tests {
             q.sql.text,
             r#"SELECT "ordinality", "slug" FROM (SELECT column1 AS "ordinality", column2 AS "slug" FROM __CODDL_REL_0__ AS coddl_v0) AS coddl_rel0"#
         );
-        assert_eq!(q.rel_params, vec![RelParamSpec { slot: 0, arity: 2 }]);
+        // A bare read of the slot: an empty slot is an empty result — absorbs.
+        assert_eq!(
+            q.rel_params,
+            vec![RelParamSpec {
+                slot: 0,
+                heading: slug_param().heading(),
+                absorbs_empty: true,
+            }]
+        );
         assert_eq!(q.sql.param_count, 0);
     }
 
@@ -2461,7 +2587,19 @@ mod tests {
             q.sql.text,
             r#"SELECT DISTINCT coddl_l."message" FROM (SELECT "id", "message" FROM "greetings") AS coddl_l WHERE EXISTS (SELECT 1 FROM (SELECT "id", "ordinality" FROM (SELECT column1 AS "id", column2 AS "ordinality" FROM __CODDL_REL_0__ AS coddl_v0) AS coddl_rel0) AS coddl_r WHERE coddl_l."id" = coddl_r."id")"#
         );
-        assert_eq!(q.rel_params, vec![RelParamSpec { slot: 0, arity: 2 }]);
+        // A semijoin absorbs emptiness from either side: empty rhs → nothing
+        // matches → empty result.
+        assert_eq!(
+            q.rel_params,
+            vec![RelParamSpec {
+                slot: 0,
+                heading: Heading::new(vec![
+                    ("id".to_string(), Type::Integer),
+                    ("ordinality".to_string(), Type::Integer),
+                ]),
+                absorbs_empty: true,
+            }]
+        );
     }
 
     #[test]
@@ -2480,7 +2618,16 @@ mod tests {
             "{}",
             q.sql.text
         );
-        assert_eq!(q.rel_params, vec![RelParamSpec { slot: 0, arity: 1 }]);
+        // An antijoin rhs does NOT absorb: an empty rhs means every lhs row
+        // survives — the typed zero-row form must still fire.
+        assert_eq!(
+            q.rel_params,
+            vec![RelParamSpec {
+                slot: 0,
+                heading: Heading::new(vec![("id".to_string(), Type::Integer)]),
+                absorbs_empty: false,
+            }]
+        );
     }
 
     #[test]
@@ -2504,7 +2651,18 @@ mod tests {
             q.sql.text,
             r#"SELECT "id", "message", "ordinality" FROM "greetings" INNER JOIN (SELECT column1 AS "id", column2 AS "ordinality" FROM __CODDL_REL_0__ AS coddl_v0) AS coddl_rel0 USING ("id")"#
         );
-        assert_eq!(q.rel_params, vec![RelParamSpec { slot: 0, arity: 2 }]);
+        // The empty relation is the join's multiplicative zero — absorbs.
+        assert_eq!(
+            q.rel_params,
+            vec![RelParamSpec {
+                slot: 0,
+                heading: Heading::new(vec![
+                    ("id".to_string(), Type::Integer),
+                    ("ordinality".to_string(), Type::Integer),
+                ]),
+                absorbs_empty: true,
+            }]
+        );
     }
 
     #[test]
@@ -2523,7 +2681,16 @@ mod tests {
             q.sql.text,
             r#"SELECT "id", "message" FROM "greetings" UNION SELECT "id", "message" FROM (SELECT column1 AS "id", column2 AS "message" FROM __CODDL_REL_0__ AS coddl_v0) AS coddl_rel0"#
         );
-        assert_eq!(q.rel_params, vec![RelParamSpec { slot: 0, arity: 2 }]);
+        // The empty relation is union's additive identity — does NOT absorb;
+        // the statement must still fire to return the relvar side.
+        assert_eq!(
+            q.rel_params,
+            vec![RelParamSpec {
+                slot: 0,
+                heading: greetings_heading(),
+                absorbs_empty: false,
+            }]
+        );
     }
 
     #[test]
@@ -2547,7 +2714,14 @@ mod tests {
         );
         assert_eq!(q.sql.param_count, 1);
         assert_eq!(q.params, vec![ParamSource::Lit(Value::Integer(5))]);
-        assert_eq!(q.rel_params, vec![RelParamSpec { slot: 0, arity: 1 }]);
+        assert_eq!(
+            q.rel_params,
+            vec![RelParamSpec {
+                slot: 0,
+                heading: Heading::new(vec![("id".to_string(), Type::Integer)]),
+                absorbs_empty: true,
+            }]
+        );
     }
 
     #[test]
@@ -2587,6 +2761,141 @@ mod tests {
     fn ordinary_queries_carry_no_rel_params() {
         let q = emit_select(&greetings(), Dialect::SQLite).unwrap();
         assert!(q.rel_params.is_empty());
+    }
+
+    #[test]
+    fn exists_rhs_suppresses_distinct() {
+        // `Greetings matching (Mentions project { id })` — the projection drops
+        // Mentions' composite key {id, topic}, which outside an EXISTS would
+        // require DISTINCT. Inside the existential subquery duplicates cannot
+        // change the outcome, so the dedup sort is suppressed. Load-bearing
+        // for semijoin-rhs narrowing, which introduces exactly this shape.
+        let expr = RelExpr::Semijoin {
+            lhs: Box::new(greetings()),
+            rhs: Box::new(RelExpr::Project {
+                input: Box::new(mentions()),
+                keep: vec!["id".to_string()],
+            }),
+            negated: false,
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT coddl_l."id", coddl_l."message" FROM (SELECT "id", "message" FROM "greetings") AS coddl_l WHERE EXISTS (SELECT 1 FROM (SELECT "id" FROM "mentions") AS coddl_r WHERE coddl_l."id" = coddl_r."id")"#
+        );
+    }
+
+    #[test]
+    fn stacked_semijoins_ship_both_rel_params() {
+        // `(Greetings matching <local {id}>) matching <local {id}>` — two
+        // shipped slots across a nested semijoin. The rhs operand's
+        // sub-emission sees only slot 1 (a suffix of the build's slots, not a
+        // 0-based list — this shape used to trip the over-tight DFS-density
+        // assert); the root list concatenates back dense. Emptiness at either
+        // slot absorbs through both semijoin levels.
+        let expr = RelExpr::Semijoin {
+            lhs: Box::new(RelExpr::Semijoin {
+                lhs: Box::new(greetings()),
+                rhs: Box::new(RelExpr::RelParam {
+                    slot: 0,
+                    heading: Heading::new(vec![("id".to_string(), Type::Integer)]),
+                }),
+                negated: false,
+            }),
+            rhs: Box::new(RelExpr::RelParam {
+                slot: 1,
+                heading: Heading::new(vec![("id".to_string(), Type::Integer)]),
+            }),
+            negated: false,
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert!(
+            q.sql.text.contains("__CODDL_REL_0__") && q.sql.text.contains("__CODDL_REL_1__"),
+            "{}",
+            q.sql.text
+        );
+        assert_eq!(
+            q.sql.text.matches("WHERE EXISTS").count(),
+            2,
+            "{}",
+            q.sql.text
+        );
+        assert_eq!(
+            q.rel_params,
+            vec![
+                RelParamSpec {
+                    slot: 0,
+                    heading: Heading::new(vec![("id".to_string(), Type::Integer)]),
+                    absorbs_empty: true,
+                },
+                RelParamSpec {
+                    slot: 1,
+                    heading: Heading::new(vec![("id".to_string(), Type::Integer)]),
+                    absorbs_empty: true,
+                },
+            ]
+        );
+    }
+
+    // ── cardinality-1 sibling plans (SlotCell emission) ─────────────────
+
+    #[test]
+    fn card1_specialization_emits_the_plain_restrict_plan() {
+        // The wiki shape: the general plan is the EXISTS+VALUES form; the
+        // sibling emitted from the card-1 rewrite is the plain keyed lookup —
+        // identical to what the scalar spelling produces, DISTINCT elided by
+        // the existing key-pin proof (`card_le_one`), the cell placeholder an
+        // ordinary numbered bind the runtime fills from the shipped row.
+        let general = RelExpr::Project {
+            input: Box::new(RelExpr::Semijoin {
+                lhs: Box::new(greetings()),
+                rhs: Box::new(RelExpr::RelParam {
+                    slot: 0,
+                    heading: Heading::new(vec![("id".to_string(), Type::Integer)]),
+                }),
+                negated: false,
+            }),
+            keep: vec!["message".to_string()],
+        };
+        let (specialized, slot) = general.card1_semijoin_specialization().unwrap();
+        assert_eq!(slot, 0);
+        let q = emit_select(&specialized, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "message" FROM "greetings" WHERE "id" = ?1"#
+        );
+        assert_eq!(q.sql.param_count, 1);
+        assert_eq!(q.params, vec![ParamSource::SlotCell { slot: 0, cell: 0 }]);
+        assert!(q.rel_params.is_empty());
+    }
+
+    #[test]
+    fn card1_specialization_numbers_cells_after_the_scalars() {
+        // `(Greetings where id = 5) matching <local {message}>` — the lhs's
+        // own scalar keeps `?1` in the sibling exactly as in the general plan
+        // (same lhs, same resolve order); the cell binds append after it. The
+        // runtime binds the same argument list, then the row's cells.
+        let general = RelExpr::Semijoin {
+            lhs: Box::new(restrict_cmp("id", CmpOp::Eq, Literal::Integer(5))),
+            rhs: Box::new(RelExpr::RelParam {
+                slot: 0,
+                heading: Heading::new(vec![("message".to_string(), Type::Text)]),
+            }),
+            negated: false,
+        };
+        let (specialized, _) = general.card1_semijoin_specialization().unwrap();
+        let q = emit_select(&specialized, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?1 AND "message" = ?2"#
+        );
+        assert_eq!(
+            q.params,
+            vec![
+                ParamSource::Lit(Value::Integer(5)),
+                ParamSource::SlotCell { slot: 0, cell: 0 },
+            ]
+        );
     }
 
     /// `(inner) replace { message: message || "!" }` desugar shape — the
