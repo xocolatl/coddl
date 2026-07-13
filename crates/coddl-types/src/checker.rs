@@ -6634,6 +6634,29 @@ mod tests {
     }
 
     #[test]
+    fn ufcs_is_empty_on_relation_resolves() {
+        // `r.is_empty {}` on a Relation resolves to Boolean (usable as a
+        // condition), like `cardinality` but over `Relation H` only.
+        let src = "oper main {} [ \
+                   let r = Relation { { a: 1 } }; \
+                   if r.is_empty {} then [ write_line { message: \"e\" }; ]; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected clean, got {diags:?}");
+    }
+
+    #[test]
+    fn is_empty_on_non_relation_is_error() {
+        // `is_empty` is registered over `Relation H` only — an Integer receiver
+        // has no matching overload, so the call is a type error.
+        let src = "oper main {} [ let n = 3; let _b = n.is_empty {}; ];";
+        assert!(
+            !diagnostics(src).is_empty(),
+            "expected a diagnostic for is_empty on an Integer, got clean"
+        );
+    }
+
+    #[test]
     fn ufcs_user_oper_method_resolves() {
         // `"hi".greet {}` ≡ `greet { self: "hi" }`.
         let src = "oper greet { self: Text } -> Text [ self ]; \

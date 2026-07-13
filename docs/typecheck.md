@@ -197,6 +197,7 @@ produces `T0001`.
 | `read_line`      | `{ prompt: Text }`                 | `Text`     |
 | `to_text`        | `{ self: T }`                      | `Text`     |
 | `cardinality`    | `{ self: Relation H / Sequence T }`| `Integer`  |
+| `is_empty`       | `{ self: Relation H }`             | `Boolean`  |
 
 `write_relation` is polymorphic over the heading `H` (see
 "`write_relation` polymorphism" below). `read_line` is the first
@@ -212,6 +213,11 @@ the refcount). Like `write_relation`, each overload is heading-/element-type
 polymorphic — a dedicated `ParamKind` (`AnyRelation` / `AnySequence`)
 accepts any heading or element type. `Text` is intentionally excluded: its
 `length` is a byte count, not a character count.
+
+`is_empty` (`Relation H`, pure) is true iff the cardinality is zero — a
+compile-time convenience over `cardinality`. It has no runtime symbol: the
+lowerer desugars `R.is_empty{}` to the same `coddl_rc_length` read compared
+to `0` (`cardinality = 0`). Registered over `Relation H` only for now.
 
 `to_text` is the first **overloaded** builtin: one monomorphic signature
 per scalar type `T` — `Text` (an identity copy), `Character`, `Integer`

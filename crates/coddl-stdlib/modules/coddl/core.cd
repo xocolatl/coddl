@@ -19,6 +19,8 @@ module core;
 //   * cardinality    — `self: Relation H | Sequence T`, heading/element-poly.
 //                       Heading polymorphism has no surface syntax; deferred
 //                       (see docs/risks.md, "Heading polymorphism design space").
+//   * is_empty       — `self: Relation H` -> Boolean; heading-poly, same
+//                       reason. Desugars to `cardinality = 0` in the lowerer.
 //   * the infix / symbolic operators (`+ - * / div mod = <> < > <= >= join
 //     times intersect union minus compose where …`) — recognized directly by
 //     the parser and checker, not `name { }` calls.

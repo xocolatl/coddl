@@ -3623,6 +3623,45 @@ fn all_early_return_body_cranelift() {
     assert_all_early_return_body("cranelift");
 }
 
+// ── is_empty (Relation H -> Boolean) ──────────────────────────────────
+
+/// `R.is_empty{}` is true iff the relation's cardinality is zero (it desugars
+/// to `cardinality = 0`). A query for an absent row is empty; one for a present
+/// row is not. Also exercises the wiki's `not R.is_empty{}` pattern. The two
+/// `-BUG` markers must never print (exact-match output enforces it).
+fn assert_is_empty(backend: &str) {
+    let stdout = run_greetings_stdout(
+        backend,
+        "program p;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [\n\
+             let present = transaction [ Greetings where id = 1 project { message } ];\n\
+             let absent = transaction [ Greetings where id = 99 project { message } ];\n\
+             if absent.is_empty{} then [ write_line { message: \"absent-empty\" }; ];\n\
+             if present.is_empty{} then [ write_line { message: \"present-empty-BUG\" }; ];\n\
+             if not present.is_empty{} then [ write_line { message: \"present-nonempty\" }; ];\n\
+             if not absent.is_empty{} then [ write_line { message: \"absent-nonempty-BUG\" }; ];\n\
+         ];\n",
+    );
+    assert_eq!(
+        stdout,
+        b"absent-empty\npresent-nonempty\n",
+        "backend={backend}: got {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+}
+
+#[test]
+fn is_empty_llvm() {
+    assert_is_empty("llvm");
+}
+
+#[test]
+fn is_empty_cranelift() {
+    assert_is_empty("cranelift");
+}
+
 // ── surgical writes (relational assignment → DML) ─────────────────────
 
 /// Seed a fresh two-row `greetings` db + its `.cddb`/`.cdstore` companions,

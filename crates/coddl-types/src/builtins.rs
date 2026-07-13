@@ -189,6 +189,19 @@ impl Builtins {
                 },
             );
         }
+        // `is_empty { self: Relation H } -> Boolean` — true iff the cardinality
+        // is zero. A compile-time convenience over `cardinality`: the lowerer
+        // desugars it to `cardinality = 0` (a `coddl_rc_length` read compared
+        // to 0), with no dedicated runtime symbol. Pure. Registered over
+        // `Relation H` only; a `Sequence T` overload is a trivial add.
+        self.register(
+            "is_empty".to_string(),
+            OperSig {
+                params: vec![("self".into(), ParamKind::AnyRelation)],
+                return_type: Type::Boolean,
+                purity: Purity::Pure,
+            },
+        );
     }
 
     fn register(&mut self, name: String, sig: OperSig) {

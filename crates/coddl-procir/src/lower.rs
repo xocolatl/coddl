@@ -6367,6 +6367,48 @@ impl Lowerer {
             });
             return dst;
         }
+        // `is_empty { self: Relation H } -> Boolean` is `self.cardinality{} = 0`:
+        // read the RC header length (the same `coddl_rc_length` extern
+        // `cardinality` uses) and compare to 0. No dedicated runtime symbol.
+        if surface == "is_empty" {
+            let self_v = self_val.unwrap_or_else(|| {
+                let arg_list = call.args().expect("typechecked call has an arg list");
+                let arg = arg_list
+                    .args()
+                    .find(|a| a.name().map(|t| t.text().to_string()).as_deref() == Some("self"))
+                    .expect("typechecked is_empty has a `self` arg");
+                self.lower_expr(&arg.value().expect("typechecked named arg has a value"))
+            });
+            let ext = self
+                .lookup_extern("cardinality")
+                .expect("cardinality extern is always registered");
+            self.ensure_extern(ext);
+            let len = self.fresh_value();
+            self.record_type(len, ProcType::Integer);
+            self.insts.push(Inst::Call {
+                dst: Some(len),
+                callee: ext.linkage.to_string(),
+                args: vec![self_v],
+                return_type: ProcType::Integer,
+            });
+            let zero = self.fresh_value();
+            self.record_type(zero, ProcType::Integer);
+            self.insts.push(Inst::Const {
+                dst: zero,
+                value: Const::Integer(0),
+                ty: ProcType::Integer,
+            });
+            let dst = self.fresh_value();
+            self.record_type(dst, ProcType::Boolean);
+            self.insts.push(Inst::ScalarOp {
+                dst,
+                op: ScalarOp::Eq,
+                operand_type: ProcType::Integer,
+                lhs: len,
+                rhs: zero,
+            });
+            return dst;
+        }
         // The `write_line { template, args }` overload: fold the template like
         // `format`, then write the resulting `Text`. Only reached for the
         // template form — the `message: Text` form flows through the generic
@@ -9975,6 +10017,40 @@ oper main {} [
         assert_eq!(
             calls, 1,
             "the method call lowers to one coddl_rc_length call"
+        );
+    }
+
+    #[test]
+    fn is_empty_lowers_to_cardinality_read_and_eq() {
+        // `r.is_empty {}` desugars to `coddl_rc_length(r) = 0`: one length read
+        // plus an integer `Eq` producing the Boolean — no dedicated symbol.
+        let src = "oper main {} [ \
+                   let r = Relation { { a: 1 } }; \
+                   let _b = r.is_empty {}; \
+                   ];";
+        let m = lower_ok(src);
+        let main = m.functions.iter().find(|f| f.name == "main").unwrap();
+        let insts = &main.blocks[0].insts;
+        let len_calls = insts
+            .iter()
+            .filter(|i| matches!(i, Inst::Call { callee, .. } if callee == "coddl_rc_length"))
+            .count();
+        assert_eq!(len_calls, 1, "is_empty reads the length once");
+        assert!(
+            insts.iter().any(|i| matches!(
+                i,
+                Inst::ScalarOp {
+                    op: ScalarOp::Eq,
+                    ..
+                }
+            )),
+            "is_empty compares the length to 0 with ScalarOp::Eq"
+        );
+        assert!(
+            insts
+                .iter()
+                .all(|i| !matches!(i, Inst::Call { callee, .. } if callee == "coddl_is_empty")),
+            "there is no dedicated coddl_is_empty runtime symbol"
         );
     }
 
