@@ -16,7 +16,7 @@ use coddl_stdlib::ModulePath;
 use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, DeleteStmt, DoWhileStmt, Expr,
     ExprStmt, ExtendExpr, FieldAccess, ForStmt, Heading as AstHeading, IfExpr, IndexExpr,
-    InsertStmt, Item, KeyClause, LetStmt, LoadStmt, NamedArg, OperDecl, PrivateRelvarDecl,
+    InsertStmt, Item, KeyClause, LetStmt, LoadStmt, NameRef, NamedArg, OperDecl, PrivateRelvarDecl,
     ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr, ReplaceExpr, ReturnStmt,
     Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit, TypeDecl,
     TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WhileStmt, WrapExpr,
@@ -349,18 +349,24 @@ pub struct PossrepScalar {
 /// function is parse-only — the result carries the tree and parser
 /// diagnostics; the relvar table is empty.
 pub fn check(source: &str, file: FileId, file_kind: FileKind) -> CheckOutput {
-    check_inner(source, file, file_kind, HashMap::new()).0
+    check_inner(source, file, file_kind, HashMap::new(), HashMap::new()).0
 }
 
-/// Type-check one unit with `imported_opers` seeded from its module imports.
-/// Returns the [`CheckOutput`] and the unit's own exported operator signatures
-/// (its top-level `oper`s), which feed [`check_program`]'s export catalog.
+/// Type-check one unit with `imported_opers` / `imported_lets` seeded from its
+/// module imports. Returns the [`CheckOutput`] and the unit's own exports —
+/// its top-level `oper` signatures and module-level `let` types — which feed
+/// [`check_program`]'s export catalog.
 fn check_inner(
     source: &str,
     file: FileId,
     file_kind: FileKind,
     imported_opers: HashMap<String, Vec<(ModulePath, crate::builtins::OperSig)>>,
-) -> (CheckOutput, HashMap<String, crate::builtins::OperSig>) {
+    imported_lets: HashMap<String, Vec<(ModulePath, Type)>>,
+) -> (
+    CheckOutput,
+    HashMap<String, crate::builtins::OperSig>,
+    HashMap<String, Type>,
+) {
     let parse_out = parse(source, file, file_kind);
     let tree = parse_out.tree.clone();
     let mut tc = TypeChecker {
@@ -375,6 +381,8 @@ fn check_inner(
         public_relvars: HashSet::new(),
         user_opers: HashMap::new(),
         imported_opers,
+        module_lets: HashMap::new(),
+        imported_lets,
         type_aliases: HashMap::new(),
         nominal_scalars: HashMap::new(),
         active_modules: HashSet::new(),
@@ -400,6 +408,7 @@ fn check_inner(
         }
     }
     let exports = tc.user_opers.clone();
+    let let_exports = tc.module_lets.clone();
     (
         CheckOutput {
             tree,
@@ -411,6 +420,7 @@ fn check_inner(
             nominal_scalars: tc.nominal_scalars,
         },
         exports,
+        let_exports,
     )
 }
 
@@ -446,15 +456,18 @@ pub struct ProgramCheckOutput {
 pub fn check_program(units: &[CheckUnit]) -> ProgramCheckOutput {
     let mut catalog: HashMap<ModulePath, HashMap<String, crate::builtins::OperSig>> =
         HashMap::new();
+    let mut let_catalog: HashMap<ModulePath, HashMap<String, Type>> = HashMap::new();
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     let mut entry: Option<CheckOutput> = None;
 
     for unit in units {
-        // Seed the imported-operator scope from the catalog for this unit's
-        // direct `use module` imports. Stdlib (`coddl::*`) paths aren't in the
-        // catalog — they're handled by `resolve_modules` inside the unit check.
+        // Seed the imported-operator and imported-let scopes from the catalog
+        // for this unit's direct `use module` imports. Stdlib (`coddl::*`)
+        // paths aren't in the catalog — they're handled by `resolve_modules`
+        // inside the unit check.
         let mut imported: HashMap<String, Vec<(ModulePath, crate::builtins::OperSig)>> =
             HashMap::new();
+        let mut imported_lets: HashMap<String, Vec<(ModulePath, Type)>> = HashMap::new();
         for path in use_module_paths(unit.source) {
             if let Some(exports) = catalog.get(&path) {
                 for (name, sig) in exports {
@@ -464,12 +477,27 @@ pub fn check_program(units: &[CheckUnit]) -> ProgramCheckOutput {
                         .push((path.clone(), sig.clone()));
                 }
             }
+            if let Some(lets) = let_catalog.get(&path) {
+                for (name, ty) in lets {
+                    imported_lets
+                        .entry(name.clone())
+                        .or_default()
+                        .push((path.clone(), ty.clone()));
+                }
+            }
         }
-        let (out, exports) = check_inner(unit.source, unit.file, FileKind::Cd, imported);
+        let (out, exports, let_exports) = check_inner(
+            unit.source,
+            unit.file,
+            FileKind::Cd,
+            imported,
+            imported_lets,
+        );
         diagnostics.extend(out.diagnostics.iter().cloned());
         match &unit.module {
             Some(m) => {
                 catalog.insert(m.clone(), exports);
+                let_catalog.insert(m.clone(), let_exports);
             }
             None => entry = Some(out),
         }
@@ -645,6 +673,20 @@ struct TypeChecker {
     /// single-unit [`check`]; seeded by [`check_program`] from the export catalog
     /// for a unit's direct imports.
     imported_opers: HashMap<String, Vec<(ModulePath, crate::builtins::OperSig)>>,
+    /// Module-level `let` bindings (constants), name → bound type. Collected
+    /// and checked in a pre-pass (in initializer-dependency order — module
+    /// lets are order-independent like every other item; a reference cycle is
+    /// T0097), so a use resolves regardless of declaration order. Consulted
+    /// by name resolution after the local scope (an oper-local shadows a
+    /// module let) and mirrored into the export catalog by
+    /// [`check_program`].
+    module_lets: HashMap<String, Type>,
+    /// Module lets imported via `use module <leaf>;`, keyed by name → the
+    /// `(owning module, type)` pairs that export it. Held separately from
+    /// `module_lets` for the same reason `imported_opers` is: local names
+    /// shadow imports, and two modules exporting the same name coexist until
+    /// the name is actually used (then **T0092**).
+    imported_lets: HashMap<String, Vec<(ModulePath, Type)>>,
     /// User-defined type aliases (`type Name = <type-ref>;`), collected in a
     /// pre-pass so a later type reference resolves regardless of declaration
     /// order. Consulted by `resolve_type_name` after the built-in type names.
@@ -800,6 +842,11 @@ impl TypeChecker {
                 self.register_user_oper(&o);
             }
         }
+        // Pre-pass: module-level `let` bindings (constants), checked in
+        // initializer-dependency order so they are order-independent like
+        // every other item (the sibling of the operator forward-reference
+        // rule above).
+        self.check_module_lets(root);
         // Main pass: walk operator bodies + label-only items.
         for item in root.items() {
             match item {
@@ -833,6 +880,201 @@ impl TypeChecker {
                     // `builtin relvar` simply fails to resolve at its use site
                     // rather than tripping a decl-site error the LSP can't scope.
                 }
+                Item::LetBinding(_) => {
+                    // Module lets are collected and checked in the pre-pass
+                    // above (dependency order, not source order).
+                }
+            }
+        }
+    }
+
+    /// Collect and check every module-level `let` binding. Bindings are
+    /// **order-independent** like every other module item: a syntactic walk
+    /// over each initializer builds the in-module reference graph, and
+    /// checking runs in topological order so a binding's dependencies are
+    /// typed (and, later, folded/materialized) before it — purity is what
+    /// makes dependency order the only observable order. A reference cycle
+    /// is T0097.
+    fn check_module_lets(&mut self, root: &Root) {
+        let bindings: Vec<LetStmt> = root
+            .items()
+            .filter_map(|item| match item {
+                Item::LetBinding(b) => Some(b),
+                _ => None,
+            })
+            .collect();
+        if bindings.is_empty() {
+            return;
+        }
+        // Names first, so the reference graph and duplicate checks see the
+        // whole set regardless of order.
+        let mut index: HashMap<String, usize> = HashMap::new();
+        for (i, b) in bindings.iter().enumerate() {
+            let Some(name_tok) = b.name() else { continue };
+            let name = name_tok.text().to_string();
+            // One namespace per module: a module let can't reuse another
+            // module-level name (another let, an oper, a possrep scalar, or
+            // a relvar) — same discipline as oper registration (T0060).
+            let collides = index.contains_key(&name)
+                || self.user_opers.contains_key(&name)
+                || self.nominal_scalars.contains_key(&name)
+                || self.relvars.get(&name).is_some();
+            if collides {
+                self.error(
+                    self.token_span(&name_tok),
+                    "T0060",
+                    format!("`{name}` is already defined at module level"),
+                );
+                continue;
+            }
+            index.insert(name, i);
+        }
+        // Reference edges: binding i depends on binding j when i's
+        // initializer names j. Purity forbids every binding form inside an
+        // initializer, so a bare syntactic walk over NAME_REFs is exact.
+        let edges: Vec<Vec<usize>> = bindings
+            .iter()
+            .map(|b| {
+                let Some(value) = b.value() else {
+                    return Vec::new();
+                };
+                let mut deps: Vec<usize> = value
+                    .syntax()
+                    .descendants_with_tokens()
+                    .filter_map(|el| el.into_node())
+                    .filter(|n| n.kind() == SyntaxKind::NAME_REF)
+                    .filter_map(|n| NameRef::cast(n)?.ident())
+                    .filter_map(|tok| index.get(tok.text()).copied())
+                    .collect();
+                deps.sort_unstable();
+                deps.dedup();
+                deps
+            })
+            .collect();
+        // Depth-first topological sort; a back edge is a reference cycle.
+        #[derive(Clone, Copy, PartialEq)]
+        enum State {
+            Unvisited,
+            InProgress,
+            Done,
+        }
+        fn visit(
+            i: usize,
+            edges: &[Vec<usize>],
+            state: &mut [State],
+            order: &mut Vec<usize>,
+        ) -> Result<(), usize> {
+            match state[i] {
+                State::Done => return Ok(()),
+                State::InProgress => return Err(i),
+                State::Unvisited => {}
+            }
+            state[i] = State::InProgress;
+            for &dep in &edges[i] {
+                visit(dep, edges, state, order)?;
+            }
+            state[i] = State::Done;
+            order.push(i);
+            Ok(())
+        }
+        let mut state = vec![State::Unvisited; bindings.len()];
+        let mut order: Vec<usize> = Vec::new();
+        for i in 0..bindings.len() {
+            if let Err(at) = visit(i, &edges, &mut state, &mut order) {
+                let name = bindings[at]
+                    .name()
+                    .map(|t| t.text().to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                self.error(
+                    self.node_span(bindings[at].syntax()),
+                    "T0097",
+                    format!("module-level `let` bindings form a reference cycle through `{name}`"),
+                );
+                // Recover: mark the whole strongly-connected tangle done so
+                // one cycle reports once, not once per member.
+                for s in state.iter_mut() {
+                    if *s == State::InProgress {
+                        *s = State::Done;
+                    }
+                }
+            }
+        }
+        for i in order {
+            self.check_module_let(&bindings[i]);
+        }
+    }
+
+    /// Check one module-level `let`: mandatory constant-expression
+    /// initializer (T0098), then the shared binding discipline
+    /// (`check_binding_rhs` — annotation as the expected type for empty
+    /// constructor literals, T0010 conformance, inlay hint), landing in
+    /// `module_lets` instead of a scope.
+    fn check_module_let(&mut self, binding: &LetStmt) {
+        let name = binding.name();
+        let declared = binding.type_ref().map(|tr| self.resolve_type_ref(&tr));
+        let value = binding.value();
+        let Some(value_expr) = &value else {
+            self.error(
+                self.node_span(binding.syntax()),
+                "T0098",
+                "a module-level `let` requires an initializer — it is a constant binding",
+            );
+            return;
+        };
+        self.check_module_let_purity(value_expr);
+        let mut scope = Scope::default();
+        let bound_ty =
+            self.check_binding_rhs(declared, &name, &value, binding.syntax(), "let", &mut scope);
+        if let Some(name_tok) = name {
+            // Registered even after a purity error (with the checked type),
+            // so downstream uses resolve and don't cascade T0001s.
+            self.module_lets
+                .insert(name_tok.text().to_string(), bound_ty);
+        }
+    }
+
+    /// The module-let purity walk: an initializer must be a **constant
+    /// expression** — literals, tuple/relation/sequence literals, and
+    /// built-in operators over them, with names restricted to other module
+    /// lets. Everything effectful or not-yet-foldable is rejected here with
+    /// T0098 (calls stay out until purity derivation lands; relvar reads are
+    /// never constant). The walk recurses syntactically; name *resolution*
+    /// still happens in `check_expr`, so an unknown name is a plain T0001,
+    /// not a purity error.
+    fn check_module_let_purity(&mut self, expr: &Expr) {
+        let reject = |kind: &str| -> Option<String> {
+            Some(format!(
+                "module-level `let` initializer must be a constant expression — {kind} is not allowed here"
+            ))
+        };
+        let message = match expr {
+            Expr::Call(_) => reject("a call (purity derivation is not built yet)"),
+            Expr::Transaction(_) => reject("a `transaction` block"),
+            Expr::FieldAccess(_) => reject("a field access"),
+            Expr::If(_) => reject("an `if` expression"),
+            Expr::Index(_) => reject("indexing"),
+            Expr::NameRef(n) => {
+                let named_relvar = n
+                    .ident()
+                    .map(|t| self.relvars.get(t.text()).is_some())
+                    .unwrap_or(false);
+                if named_relvar {
+                    reject("a relvar read")
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(message) = message {
+            self.error(self.node_span(expr.syntax()), "T0098", message);
+            return;
+        }
+        // Recurse into child expressions (operator operands, literal
+        // elements, parenthesized bodies).
+        for child in expr.syntax().children() {
+            if let Some(e) = Expr::cast(child) {
+                self.check_module_let_purity(&e);
             }
         }
     }
@@ -2639,14 +2881,48 @@ impl TypeChecker {
             }
         }
 
-        // Infer the RHS type. A sequence literal is checked specially so
-        // it can take its element type from `declared` when empty and so
-        // it is *permitted* here — `check_expr` rejects sequence literals
-        // in every other position (T0063, the binding-value-only rule).
-        // Missing name or value means the parser already reported the
-        // recovery; we still walk what's parseable to keep diagnostics
-        // flowing.
-        let rhs_ty = match &value {
+        let bound_ty = self.check_binding_rhs(declared, &name, &value, stmt_syntax, kw, scope);
+
+        if let Some(name_tok) = &name {
+            // A `var` declaration is itself a mutable occurrence — mark it so
+            // the editor underlines the binding site, not just its uses.
+            if origin == BindingOrigin::Var {
+                self.mutable_spans.push(self.token_span(name_tok));
+            }
+            scope.insert(
+                name_tok.text().to_string(),
+                bound_ty,
+                self.token_span(name_tok),
+                origin,
+            );
+        }
+    }
+
+    /// Infer a binding's RHS type against an optional declared annotation and
+    /// enforce conformance — the shared core of statement bindings
+    /// (`check_binding`) and module-level `let`s (`check_module_let`).
+    ///
+    /// A sequence literal is checked specially so it can take its element
+    /// type from `declared` when empty and so it is *permitted* here —
+    /// `check_expr` rejects sequence literals in every other position
+    /// (T0063, the binding-value-only rule). An empty `Relation {}` takes
+    /// its heading from a `Relation { H }` annotation (a headed empty
+    /// relation); with no annotation it is relfalse. A tuple literal bound
+    /// with a `Tuple` annotation propagates the annotation's field types (so
+    /// an empty relation field infers). When the annotation is present it is
+    /// authoritative: the RHS must conform (T0010) and lookups see the
+    /// declared type; otherwise the inferred type binds *and* surfaces as an
+    /// inlay hint after the name token — that's what the editor renders.
+    fn check_binding_rhs(
+        &mut self,
+        declared: Option<Type>,
+        name: &Option<SyntaxToken>,
+        value: &Option<Expr>,
+        stmt_syntax: &SyntaxNode,
+        kw: &str,
+        scope: &mut Scope,
+    ) -> Type {
+        let rhs_ty = match value {
             Some(Expr::SequenceLit(s)) => {
                 let expected_elem = match &declared {
                     Some(Type::Sequence(e)) => Some((**e).clone()),
@@ -2655,19 +2931,12 @@ impl TypeChecker {
                 self.check_sequence_lit(s, scope, expected_elem)
             }
             Some(Expr::RelationLit(r)) => {
-                // An empty `Relation {}` takes its heading from a `Relation { H }`
-                // annotation (a headed empty relation); with no annotation it is
-                // relfalse. A non-empty literal ignores the expected heading and
-                // infers from its tuples (the annotation conformance is checked
-                // below, T0010).
                 let expected_heading = match &declared {
                     Some(Type::Relation(h)) => Some(h.clone()),
                     _ => None,
                 };
                 self.check_relation_lit(r, scope, expected_heading)
             }
-            // A tuple literal bound with a `Tuple` annotation propagates the
-            // annotation's field types (so an empty relation field infers).
             Some(Expr::TupleLit(t)) if matches!(&declared, Some(Type::Tuple(_))) => {
                 let Some(Type::Tuple(h)) = &declared else {
                     unreachable!("guarded by the match arm")
@@ -2678,12 +2947,7 @@ impl TypeChecker {
             None => Type::Unknown,
         };
 
-        // If the binding carries an explicit annotation, the
-        // annotation is authoritative: the RHS must conform, and
-        // subsequent lookups see the declared type, not the inferred
-        // one. Otherwise the inferred type is bound *and* surfaced as
-        // an inlay hint — that's what the editor renders.
-        let bound_ty = match declared {
+        match declared {
             Some(declared) => {
                 if !rhs_ty.assignable_to(&declared) {
                     let span = value
@@ -2701,10 +2965,7 @@ impl TypeChecker {
                 declared
             }
             None => {
-                if let Some(name_tok) = &name {
-                    // Render the hint immediately after the binding
-                    // name token — that's where the user would have
-                    // typed `: Type`.
+                if let Some(name_tok) = name {
                     let r = name_tok.text_range();
                     self.hints.push(TypeHint {
                         span: Span::new(self.file, r.end().into(), r.end().into()),
@@ -2714,20 +2975,6 @@ impl TypeChecker {
                 }
                 rhs_ty
             }
-        };
-
-        if let Some(name_tok) = &name {
-            // A `var` declaration is itself a mutable occurrence — mark it so
-            // the editor underlines the binding site, not just its uses.
-            if origin == BindingOrigin::Var {
-                self.mutable_spans.push(self.token_span(name_tok));
-            }
-            scope.insert(
-                name_tok.text().to_string(),
-                bound_ty,
-                self.token_span(name_tok),
-                origin,
-            );
         }
     }
 
@@ -2799,8 +3046,35 @@ impl TypeChecker {
                     }
                     return ty;
                 }
-                // Not in scope. If it's an opt-in stdlib builtin relvar, point
-                // at the import rather than reporting a plain unresolved name.
+                // Not in the local scope: a module-level `let` (constant
+                // binding) resolves next — locals shadow it, it shadows
+                // imports.
+                if let Some(ty) = self.module_lets.get(name) {
+                    return ty.clone();
+                }
+                // Then module lets imported via `use module`. Two imports
+                // exporting the same name coexist until it is used — the
+                // same ambiguity rule imported opers follow (T0092).
+                if let Some(candidates) = self.imported_lets.get(name) {
+                    if candidates.len() > 1 {
+                        let owners: Vec<String> =
+                            candidates.iter().map(|(m, _)| m.to_string()).collect();
+                        self.error(
+                            self.token_span(&ident),
+                            "T0092",
+                            format!(
+                                "`{name}` is exported by more than one imported module ({})",
+                                owners.join(", ")
+                            ),
+                        );
+                        return Type::Unknown;
+                    }
+                    if let Some((_, ty)) = candidates.first() {
+                        return ty.clone();
+                    }
+                }
+                // If it's an opt-in stdlib builtin relvar, point at the
+                // import rather than reporting a plain unresolved name.
                 if let Some(module) = self.stdlib_relvar_owner.get(name).cloned() {
                     self.error(
                         self.token_span(&ident),
@@ -9097,6 +9371,100 @@ mod tests {
         assert!(!c.contains(&"T0003"), "{:?}", c);
     }
 
+    // ── Module-level `let` (constant bindings) ────────────────────────────
+
+    #[test]
+    fn module_let_binds_and_resolves_in_bodies() {
+        // A module-position `let` is a constant binding: annotated or
+        // inferred, visible in every oper body.
+        let src = "program p;\n\
+                   let limit = 2 + 1;\n\
+                   let greeting: Text = \"hi\";\n\
+                   oper main {} [\n\
+                       write_line { message: greeting };\n\
+                       let x = limit + 1;\n\
+                       write_line { message: format { template: f\"{x}\", args: { x: x } } };\n\
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn module_let_forward_reference_resolves_no_t0001() {
+        // Order-independent like opers (the module-let sibling of
+        // `user_oper_forward_reference_resolves_no_t0001`): `a` references
+        // `b`, declared later.
+        let src = "program p; let a = b + 1; let b = 2; oper main {} [ let _x = a; ];";
+        let c = codes(src);
+        assert!(!c.contains(&"T0001"), "{c:?}");
+        assert!(!c.contains(&"T0097"), "{c:?}");
+    }
+
+    #[test]
+    fn module_let_cycle_diagnoses_t0097() {
+        let src = "program p; let a = b; let b = a; oper main {} [];";
+        let c = codes(src);
+        assert!(c.contains(&"T0097"), "{c:?}");
+    }
+
+    #[test]
+    fn module_let_requires_constant_expression_t0098() {
+        // A call is not a constant expression (purity derivation isn't
+        // built yet) …
+        let src = "program p; let x = to_text { self: 1 }; oper main {} [];";
+        assert!(codes(src).contains(&"T0098"), "{:?}", codes(src));
+        // … and a transaction (a relvar read) never is.
+        let src2 = "program p;\n\
+                    database d;\n\
+                    public relvar R { a: Integer } key { a };\n\
+                    let y = transaction [ R ];\n\
+                    oper main {} [];";
+        assert!(codes(src2).contains(&"T0098"), "{:?}", codes(src2));
+    }
+
+    #[test]
+    fn module_let_missing_initializer_t0098() {
+        let src = "program p; let x: Integer; oper main {} [];";
+        assert!(codes(src).contains(&"T0098"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn module_let_annotation_mismatch_t0010() {
+        let src = "program p; let x: Integer = \"hi\"; oper main {} [];";
+        assert!(codes(src).contains(&"T0010"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn module_let_annotated_empty_relation_checks() {
+        // The annotation supplies the heading an empty `Relation {}` can't
+        // infer — `check_binding`'s discipline at module scope.
+        let src = "program p;\n\
+                   let none: Relation { a: Integer } = Relation {};\n\
+                   oper main {} [ let _r = none; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn module_let_duplicate_name_t0060() {
+        // One namespace per module: another let, or an oper, collides.
+        let src = "program p; let x = 1; let x = 2; oper main {} [];";
+        assert!(codes(src).contains(&"T0060"), "{:?}", codes(src));
+        let src2 = "program p; oper f {} []; let f = 1; oper main {} [];";
+        assert!(codes(src2).contains(&"T0060"), "{:?}", codes(src2));
+    }
+
+    #[test]
+    fn oper_local_shadows_module_let() {
+        // Scope lookup runs first, so a body-local `let x` shadows the
+        // module binding — consistent with no-reserved-words.
+        let src = "program p;\n\
+                   let x = 1;\n\
+                   oper main {} [ let x = \"hi\"; write_line { message: x }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
     // ── Multi-unit checking (userspace module imports) ───────────────────
 
     fn program_codes(units: &[CheckUnit]) -> Vec<&'static str> {
@@ -9211,6 +9579,55 @@ mod tests {
         let foo = "module foo;\noper hello {} [ ];\n";
         let bar = "module bar;\noper hello {} [ ];\n";
         let app = "program app;\nuse module foo;\nuse module bar;\noper main {} [ hello {}; ];\n";
+        let units = [
+            CheckUnit {
+                module: Some(ModulePath::parse("foo")),
+                source: foo,
+                file: FileId(1),
+            },
+            CheckUnit {
+                module: Some(ModulePath::parse("bar")),
+                source: bar,
+                file: FileId(2),
+            },
+            CheckUnit {
+                module: None,
+                source: app,
+                file: FileId(0),
+            },
+        ];
+        assert!(program_codes(&units).contains(&"T0092"));
+    }
+
+    #[test]
+    fn imported_module_let_resolves() {
+        let config = "module config;\nlet limit = 40 + 2;\n";
+        let app = "program app;\nuse module config;\noper main {} [ let _x = limit + 1; ];\n";
+        let units = [
+            CheckUnit {
+                module: Some(ModulePath::parse("config")),
+                source: config,
+                file: FileId(1),
+            },
+            CheckUnit {
+                module: None,
+                source: app,
+                file: FileId(0),
+            },
+        ];
+        let c = program_codes(&units);
+        assert!(
+            !c.contains(&"T0001"),
+            "limit must resolve via import: {c:?}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_imported_module_let_diagnoses_t0092() {
+        let foo = "module foo;\nlet limit = 1;\n";
+        let bar = "module bar;\nlet limit = 2;\n";
+        let app =
+            "program app;\nuse module foo;\nuse module bar;\noper main {} [ let _x = limit; ];\n";
         let units = [
             CheckUnit {
                 module: Some(ModulePath::parse("foo")),

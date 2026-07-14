@@ -283,6 +283,48 @@ modules). The single-file `check` entry point is `check_program` with one entry
 unit and no imports, so unit-test fragments and the LSP's single-buffer path are
 unchanged.
 
+### Module-level `let` (constant bindings)
+
+A `let` at module position is a **constant binding** — the same production as
+the statement form (name, optional `: <type-ref>` annotation, `=`
+initializer), with the module-scope rules carried by the *position*, not a
+keyword. (`var` at module position is rejected at parse time, P0086 —
+module-level mutable state is a relvar.)
+
+- **Initializers are constant expressions**: literals,
+  tuple/relation/sequence literals, built-in operators over them, and
+  references to other module lets. Calls (until purity derivation),
+  `transaction` blocks, relvar reads, field access, `if`, and indexing are
+  **T0098**. A missing initializer is T0098 too.
+- **Order-independent**, like every other module item (the sibling of the
+  operator forward-reference rule): a syntactic prepass collects the names,
+  the initializer reference graph is topologically ordered, and bindings
+  check (and later fold / materialize) in dependency order — purity is what
+  makes dependency order the only observable order. A reference cycle is
+  **T0097**. Cross-module references follow the (already acyclic) module DAG.
+- **The binding discipline is `check_binding`'s, at module scope**
+  (`check_binding_rhs` is the shared core): an annotation is authoritative
+  (T0010 on mismatch) and feeds empty constructor literals — a
+  `let none: Relation { a: Integer } = Relation {};` is the headed empty
+  relation; an unannotated empty `Relation {}` is relfalse; an empty
+  `Sequence []` still requires the annotation (T0061).
+- **Resolution order**: oper-locals shadow module lets (no-reserved-words
+  discipline); module lets shadow imports; two imports exporting the same
+  name coexist until used (**T0092**, the imported-oper rule). A module-let
+  name may not reuse another module-level name (T0060).
+- **Evaluation is once, never per use**: the lowerer folds scalar-typed
+  bindings at **compile time** (checked Integer arithmetic, the runtime's
+  Rational reduce/narrow rules — a folding failure is a T0098 compile error,
+  never a silent wrap), so each use is one constant and a
+  `where col = CONST` predicate pushes with the folded value; relation-typed
+  bindings materialize once at startup into a slot riding the private-relvar
+  machinery (stored by the synthesized `__coddl_module_lets_init`, released
+  at shutdown), shared by importers. Under purity, *when* evaluation happens
+  is unobservable. Lowerer v1 limits (both T0098): a tuple- or
+  sequence-typed binding, and a relation-typed binding whose heading is
+  neither annotated nor inferable from a direct relation-literal / module-let
+  reference initializer.
+
 ### UFCS method calls
 
 Any operator with a parameter literally named `self` — built-in or
@@ -834,8 +876,10 @@ check script enforces that.
 | T0089 | a `use module <path>;` names a module that does not exist under the reserved `coddl::` root |
 | T0090 | a `builtin relvar` from an opt-in stdlib module is referenced without importing it — add `use module <path>;` (e.g. `Environment` needs `use module coddl::env;`) |
 | T0091 | a possrep-scalar declaration `type Name { … }` has other than exactly one component — multi-component possreps are not yet supported (single-component tier) |
-| T0092 | a call names an operator exported by **more than one** imported userspace module (ambiguous import) — define a local `oper` of that name to disambiguate |
+| T0092 | a name (an operator call, or a module-level `let` use) is exported by **more than one** imported userspace module (ambiguous import) — define it locally to disambiguate |
 | T0093 | a `return` sits lexically inside a `transaction [...]` — its early exit would skip the transaction's commit, so it is rejected until real BEGIN/COMMIT lands (hoist the `return` out of the transaction, or restructure) |
 | T0094 | `matching` / `not matching` operands have **identical** headings — the semijoin/antijoin matches on every attribute, which is a set intersection / difference; suggests `intersect` (matching) / `minus` (not matching) |
 | T0095 | `matching` / `not matching` operands are **disjoint** (share no attribute) — a semijoin has no key to match on and degenerates to an existence guard on the left operand; rejected (like `join`/`compose`, the operands must partially overlap) |
 | T0096 | a `Relation { … }` literal element is not a tuple — the relation selector's elements are tuple-typed expressions (a tuple literal `{a:1}`, or a tuple-valued name/call), and a relation is a set of tuples |
+| T0097 | module-level `let` bindings form a reference cycle (bindings are order-independent; their initializers must form a DAG) |
+| T0098 | module-level `let` initializer is missing or not a constant expression (calls, `transaction`, relvar reads, field access, `if`, and indexing are excluded until purity derivation / compile-time evaluation widen) |

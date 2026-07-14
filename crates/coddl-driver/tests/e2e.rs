@@ -7905,6 +7905,125 @@ fn load_from_db_relvar_pushes_order_by_both_directions() {
 }
 
 /// Userspace module import, end-to-end on both backends. A `program` imports a
+/// Module-level `let` bindings (constants): scalars fold at compile time,
+/// relation-typed bindings materialize once into a slot at startup, and an
+/// annotated empty `Relation {}` takes its heading from the annotation. Run
+/// under the leak gate, so a slot init/release imbalance also fails.
+#[test]
+fn module_level_let_binds_constants_on_both_backends() {
+    let src = "\
+program modlets;
+
+let limit = 40 + 2;
+let greeting: Text = \"hello, \" || \"consts\";
+let seed = Relation { { a: 1 }, { a: 2 } };
+let none: Relation { a: Integer } = Relation {};
+let alias = seed;
+
+oper main {} [
+    write_line { message: greeting };
+    let x = limit + 1;
+    write_line { message: format { template: f\"{x}\", args: { x: x } } };
+    write_relation { rel: seed };
+    write_relation { rel: alias };
+    let empty_is_sub = none < seed;
+    let same = alias = seed;
+    write_line { message: format { template: f\"{empty_is_sub} {same}\", args: { empty_is_sub: empty_is_sub, same: same } } };
+];
+";
+    run_both_backends_expect(
+        src,
+        "modlets.cd",
+        b"hello, consts\n43\n{a: 1}\n{a: 2}\n{a: 1}\n{a: 2}\ntrue true\n",
+    );
+}
+
+/// A scalar module let in a `where` predicate pushes with its **folded**
+/// value — `limit` is an expression (`1 + 1`), so the audit line proves
+/// compile-time folding, not literal pass-through. Values still bind as
+/// parameters (the audit's inlined `2` is trace expansion).
+fn assert_module_let_folds_into_pushed_where(backend: &str) {
+    let (stdout, audit) = run_parts_program(
+        backend,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         public relvar Shipments { pno: Integer, sno: Integer } key { pno, sno };\n\
+         let limit = 1 + 1;\n\
+         oper main {} [\n\
+             let hit = transaction [ Suppliers where sno = limit ];\n\
+             write_relation { rel: hit };\n\
+         ];\n",
+        true,
+    );
+    assert_eq!(
+        tuple_lines(&stdout),
+        sorted_tuples(&["{sname: \"Jones\", sno: 2}"]),
+        "backend={backend}"
+    );
+    assert!(
+        audit.lines().any(|l| l.contains(r#""sno" = 2"#)),
+        "expected the folded constant in the pushed WHERE; audit:\n{audit}"
+    );
+}
+
+#[test]
+fn module_let_folds_into_pushed_where_llvm() {
+    assert_module_let_folds_into_pushed_where("llvm");
+}
+
+#[test]
+fn module_let_folds_into_pushed_where_cranelift() {
+    assert_module_let_folds_into_pushed_where("cranelift");
+}
+
+/// Module lets cross `use module` imports: a scalar crosses as its folded
+/// value, a relation-typed binding as its (module-mangled) slot — one slot,
+/// read by the importer.
+#[test]
+fn imported_module_lets_run_on_both_backends() {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        tmp.path().join("config.cd"),
+        "module config;\n\
+         let limit = 40 + 2;\n\
+         let seed = Relation { { a: 7 } };\n",
+    )
+    .expect("write config.cd");
+    std::fs::write(
+        tmp.path().join("app.cd"),
+        "program app;\n\
+         use module config;\n\
+         oper main {} [\n\
+             let x = limit;\n\
+             write_line { message: format { template: f\"{x}\", args: { x: x } } };\n\
+             write_relation { rel: seed };\n\
+         ];\n",
+    )
+    .expect("write app.cd");
+    let app = tmp.path().join("app.cd");
+
+    for backend in ["llvm", "cranelift"] {
+        let out = coddl()
+            .args(["run", &format!("--backend={backend}")])
+            .arg(&app)
+            .output()
+            .unwrap_or_else(|e| panic!("spawn coddl run --backend={backend}: {e}"));
+        assert!(
+            out.status.success(),
+            "{backend} run failed: stderr=\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            out.stdout,
+            b"42\n{a: 7}\n",
+            "backend={backend}: {:?}",
+            String::from_utf8_lossy(&out.stdout),
+        );
+    }
+}
+
 /// `module` and calls one of its operators; the module operator in turn calls
 /// its *own* `helper`, which shares a name with the program's own `helper`. The
 /// two same-named helpers must stay distinct symbols (module-scoped mangling),

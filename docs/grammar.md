@@ -374,7 +374,20 @@ function that implements it.
                   | <oper-decl>
                   | <type-decl>
                   | <use-decl>
+                  | <let-stmt>
                   | <unknown-item> ;                          -- parse_item
+                  -- A module-position `<let-stmt>` is a **constant binding**:
+                  -- the same production as the statement form (name, optional
+                  -- `: <type-ref>` annotation, `=` initializer), reused at
+                  -- item level. The position carries the module-scope rules,
+                  -- enforced by the typechecker, not the parser: the
+                  -- initializer is mandatory and must be a constant
+                  -- expression (T0022), bindings are order-independent like
+                  -- every other item (reference cycles are T0097), and the
+                  -- binding is evaluated once (scalars fold at compile time;
+                  -- compound values materialize once at startup). A
+                  -- module-position `var` parses for recovery and rejects
+                  -- with P0086 — module-level mutable state is a relvar.
 
 <file-header>   ::= ( 'program' | 'library' | 'module' )
                       <identifier> ';' ;                        -- parse_file_header
@@ -1095,6 +1108,7 @@ enforces that.
 | P0083 | Expected `module` after `use`                           |
 | P0084 | Expected module name (leading, or after `::`)           |
 | P0085 | Expected `;` after `use module <path>`                  |
+| P0086 | Module-level `var` — module-level mutable state is a relvar; use `let` for a constant binding |
 
 Note: missing-type-after-`:` (let annotation), missing-type-after-`->`
 (operator return clause), and missing-element-after-`Sequence` all

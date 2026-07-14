@@ -102,6 +102,11 @@ pub enum Item {
     OperDecl(OperDecl),
     TypeDecl(TypeDecl),
     UseDecl(UseDecl),
+    /// A module-position `let` — a **constant binding** (same `LET_STMT`
+    /// production as the statement form; the position carries the
+    /// module-scope rules: constant-expression initializer, mandatory value,
+    /// order-independence).
+    LetBinding(LetStmt),
 }
 
 impl Item {
@@ -127,6 +132,7 @@ impl Item {
             SyntaxKind::OPER_DECL => Item::OperDecl(OperDecl { syntax }),
             SyntaxKind::TYPE_DECL => Item::TypeDecl(TypeDecl { syntax }),
             SyntaxKind::USE_DECL => Item::UseDecl(UseDecl { syntax }),
+            SyntaxKind::LET_STMT => Item::LetBinding(LetStmt { syntax }),
             _ => return None,
         })
     }
@@ -143,6 +149,7 @@ impl Item {
             Item::OperDecl(d) => d.syntax(),
             Item::TypeDecl(d) => d.syntax(),
             Item::UseDecl(d) => d.syntax(),
+            Item::LetBinding(d) => d.syntax(),
         }
     }
 }
@@ -1595,9 +1602,41 @@ mod tests {
                 Item::OperDecl(_) => "oper",
                 Item::TypeDecl(_) => "type",
                 Item::UseDecl(_) => "use",
+                Item::LetBinding(_) => "let",
             })
             .collect();
         assert_eq!(kinds, vec!["program", "database", "oper"]);
+    }
+
+    #[test]
+    fn module_level_let_parses_as_an_item() {
+        // A module-position `let` is the statement production at item level:
+        // name, optional `: <type-ref>` annotation, initializer.
+        let root = ast("program p; let limit: Integer = 2 + 1; oper f {} [];");
+        let Some(Item::LetBinding(binding)) = root.items().nth(1) else {
+            panic!("expected a module-level let item");
+        };
+        assert_eq!(binding.name().unwrap().text(), "limit");
+        assert!(binding.type_ref().is_some());
+        assert!(binding.value().is_some());
+        // Without the annotation, the TypeRef is simply absent.
+        let root = ast("program p; let greeting = \"hi\";");
+        let Some(Item::LetBinding(binding)) = root.items().nth(1) else {
+            panic!("expected a module-level let item");
+        };
+        assert!(binding.type_ref().is_none());
+    }
+
+    #[test]
+    fn module_level_var_diagnoses_p0086() {
+        // Module-level mutable state is a relvar; `var` at item position
+        // parses (for recovery) and rejects with P0086.
+        let out = parse("program p; var counter := 0;", FileId(0), FileKind::Cd);
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0086"),
+            "diagnostics: {:?}",
+            out.diagnostics
+        );
     }
 
     #[test]

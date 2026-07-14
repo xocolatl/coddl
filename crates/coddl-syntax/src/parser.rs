@@ -330,6 +330,22 @@ impl<'a> Parser<'a> {
             self.parse_type_decl();
         } else if self.at_keyword("use") {
             self.parse_use_decl();
+        } else if self.at_keyword("let") {
+            // A module-position `let` is a **constant binding** — the same
+            // production as the statement form (name, optional `: <type-ref>`
+            // annotation, initializer); the typechecker applies the
+            // module-scope rules (constant-expression initializer, mandatory
+            // value, order-independence).
+            self.parse_let_stmt();
+        } else if self.at_keyword("var") {
+            // Module-level mutable state is a relvar; parse the statement for
+            // recovery, then reject the position.
+            self.error(
+                "P0086",
+                "module-level mutable state is a relvar; use `let` for a \
+                 constant binding",
+            );
+            self.parse_var_stmt();
         } else {
             self.parse_unknown_item();
         }

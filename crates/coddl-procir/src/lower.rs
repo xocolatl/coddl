@@ -256,8 +256,12 @@ fn lower_impl(source: &str, file: FileId, plan: Option<&Plan>, collect_relir: bo
     // Lower each imported module's operator bodies (dependency-first) into the
     // shared function list, mangled by the module's `$`-prefix, building a
     // catalog of each module's exports so a later unit's imports resolve to the
-    // correct mangled symbol.
+    // correct mangled symbol. Module-level `let` exports ride a parallel
+    // catalog: folded scalar constants cross units as values; relation-typed
+    // bindings cross as their (mangled) slot — one slot per binding, shared by
+    // every importer (all units lower into one Module, RM Pre 8 aside).
     let mut catalog: HashMap<String, HashMap<String, UserOpSig>> = HashMap::new();
+    let mut let_catalog: HashMap<String, LetExports> = HashMap::new();
     for m in &modules {
         let prefix = m.path.segments().join("$");
         let Some(mroot) = Root::cast(parse(&m.source, file, coddl_syntax::FileKind::Cd).tree)
@@ -265,13 +269,19 @@ fn lower_impl(source: &str, file: FileId, plan: Option<&Plan>, collect_relir: bo
             continue;
         };
         let imported = build_imported(&mroot, &catalog);
+        let (imported_consts, imported_slots) = build_imported_lets(&mroot, &let_catalog);
+        let let_exports =
+            lowerer.absorb_module_lets(&mroot, Some(&prefix), imported_consts, imported_slots);
         let exports = lowerer.lower_module_unit(&mroot, prefix.clone(), imported);
-        catalog.insert(prefix, exports);
+        catalog.insert(prefix.clone(), exports);
+        let_catalog.insert(prefix, let_exports);
     }
 
     // Lower the entry unit (full: main prologue, relvars), with its imports set.
     lowerer.current_module = None;
     lowerer.imported_opers = build_imported(&root, &catalog);
+    let (imported_consts, imported_slots) = build_imported_lets(&root, &let_catalog);
+    lowerer.absorb_module_lets(&root, None, imported_consts, imported_slots);
     let module = lowerer.lower_root(&root);
     let relir = std::mem::take(&mut lowerer.relir);
     // Merge in any diagnostics the lowerer itself emitted (e.g.
@@ -293,6 +303,40 @@ fn lower_impl(source: &str, file: FileId, plan: Option<&Plan>, collect_relir: bo
 /// `(exporting-module prefix, signature)`. Stdlib (`coddl::*`) imports aren't in
 /// the catalog and are skipped. The typechecker already rejected ambiguity
 /// (T0092), so on a clean program each name maps to a single module.
+/// One module's exported module-level `let`s: the folded scalar constants and
+/// the relation-typed slot bindings.
+type LetExports = (
+    HashMap<String, RelLiteral>,
+    HashMap<String, (String, HeadingId)>,
+);
+
+/// Build the current unit's imported module-let tables from its `use module`
+/// imports — the let sibling of [`build_imported`]. The typechecker already
+/// rejected ambiguity (T0092), so plain inserts are unambiguous on a clean
+/// program.
+fn build_imported_lets(
+    root: &Root,
+    let_catalog: &HashMap<String, LetExports>,
+) -> (
+    HashMap<String, RelLiteral>,
+    HashMap<String, (String, HeadingId)>,
+) {
+    let mut consts: HashMap<String, RelLiteral> = HashMap::new();
+    let mut slots: HashMap<String, (String, HeadingId)> = HashMap::new();
+    for item in root.items() {
+        let Item::UseDecl(u) = item else { continue };
+        let segs: Vec<String> = u.segments().map(|t| t.text().to_string()).collect();
+        if segs.is_empty() {
+            continue;
+        }
+        if let Some((c, s)) = let_catalog.get(&segs.join("$")) {
+            consts.extend(c.iter().map(|(k, v)| (k.clone(), v.clone())));
+            slots.extend(s.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+    }
+    (consts, slots)
+}
+
 fn build_imported(
     root: &Root,
     catalog: &HashMap<String, HashMap<String, UserOpSig>>,
@@ -312,6 +356,20 @@ fn build_imported(
         }
     }
     imported
+}
+
+/// One deferred module-let slot initialization: the initializer expression is
+/// lowered into the synthesized `__coddl_module_lets_init` only after every
+/// unit is absorbed, under the defining unit's name tables (snapshotted here —
+/// an initializer may reference that unit's other module lets or its
+/// imports). Rowan nodes hold the tree alive, so the `Expr` stays valid.
+struct ModuleLetInit {
+    /// Slot symbol (`<module>$<name>`, bare in the entry unit).
+    slot: String,
+    heading_id: HeadingId,
+    value: Expr,
+    consts: HashMap<String, RelLiteral>,
+    slots: HashMap<String, (String, HeadingId)>,
 }
 
 /// A deferred heap release (see [`Lowerer::deferred_relation_releases`]). Two
@@ -505,6 +563,23 @@ struct Lowerer {
     /// Private relvars actually read or assigned; only these get a slot
     /// init/release in `main`.
     used_private_relvars: HashSet<String>,
+    /// Module-level `let` bindings (constants), the scalar half: each
+    /// in-scope name (this unit's own, or imported) → its **compile-time
+    /// folded** value. One `Inst::Const` per use; `literal_value` looks
+    /// through these so a `where col = CONST` predicate pushes with the
+    /// folded literal. Per-unit, reset like `imported_opers`.
+    module_let_consts: HashMap<String, RelLiteral>,
+    /// The compound (relation-typed) half: each in-scope name → its slot
+    /// symbol (`<module>$<name>`; bare in the entry unit) + heading. The slot
+    /// itself rides the private-relvar machinery (`private_relvars` holds the
+    /// slot symbol, so slot init/release, `RelvarRead`, `MaterializedRelvar`
+    /// building, and in-process consumption all reuse); the value is stored
+    /// once by the synthesized `__coddl_module_lets_init`. Per-unit map.
+    module_let_slots: HashMap<String, (String, HeadingId)>,
+    /// Deferred slot initializations, in cross-unit dependency order —
+    /// lowered into `__coddl_module_lets_init` once every unit is absorbed
+    /// (each under its defining unit's name tables).
+    module_let_inits: Vec<ModuleLetInit>,
     /// `builtin` relvars in scope: surface name → interned heading id. Absorbed
     /// from an imported stdlib module's relvar table. Unlike private relvars,
     /// they have no in-memory slot — a read calls the module's runtime snapshot
@@ -633,6 +708,9 @@ impl Lowerer {
             next_plan_id: 0,
             legacy_used_relvars: HashSet::new(),
             private_relvars: HashMap::new(),
+            module_let_consts: HashMap::new(),
+            module_let_slots: HashMap::new(),
+            module_let_inits: Vec::new(),
             private_relvar_order: Vec::new(),
             used_private_relvars: HashSet::new(),
             builtin_relvars: HashMap::new(),
@@ -717,6 +795,243 @@ impl Lowerer {
             }
         }
         resolve_type_ref_quiet(tr)
+    }
+
+    /// Absorb one unit's module-level `let` bindings (constants), with the
+    /// `imported_*` tables seeded from the let-catalog for the unit's
+    /// `use module` imports. Bindings resolve in initializer-dependency
+    /// order — the same order-independence the checker enforces (a cycle was
+    /// already diagnosed there as T0097, so a back edge here just stops).
+    /// Scalar-typed bindings **fold at compile time** into
+    /// `module_let_consts`; relation-typed ones register a slot riding the
+    /// private-relvar machinery, with the store deferred to the synthesized
+    /// `__coddl_module_lets_init`. Returns the unit's **own** exports
+    /// (imports are not re-exported).
+    fn absorb_module_lets(
+        &mut self,
+        root: &Root,
+        prefix: Option<&str>,
+        imported_consts: HashMap<String, RelLiteral>,
+        imported_slots: HashMap<String, (String, HeadingId)>,
+    ) -> (
+        HashMap<String, RelLiteral>,
+        HashMap<String, (String, HeadingId)>,
+    ) {
+        self.module_let_consts = imported_consts;
+        self.module_let_slots = imported_slots;
+        let bindings: Vec<LetStmt> = root
+            .items()
+            .filter_map(|item| match item {
+                Item::LetBinding(b) => Some(b),
+                _ => None,
+            })
+            .collect();
+        let mut own_consts: HashMap<String, RelLiteral> = HashMap::new();
+        let mut own_slots: HashMap<String, (String, HeadingId)> = HashMap::new();
+        if bindings.is_empty() {
+            return (own_consts, own_slots);
+        }
+        // Initializer-dependency order (the checker's sibling walk — purity
+        // forbids binding forms inside initializers, so a syntactic NAME_REF
+        // walk is exact).
+        let mut index: HashMap<String, usize> = HashMap::new();
+        for (i, b) in bindings.iter().enumerate() {
+            if let Some(tok) = b.name() {
+                index.entry(tok.text().to_string()).or_insert(i);
+            }
+        }
+        let edges: Vec<Vec<usize>> = bindings
+            .iter()
+            .map(|b| {
+                let Some(value) = b.value() else {
+                    return Vec::new();
+                };
+                let mut deps: Vec<usize> = value
+                    .syntax()
+                    .descendants_with_tokens()
+                    .filter_map(|el| el.into_node())
+                    .filter(|n| n.kind() == SyntaxKind::NAME_REF)
+                    .filter_map(|n| NameRef::cast(n)?.ident())
+                    .filter_map(|tok| index.get(tok.text()).copied())
+                    .collect();
+                deps.sort_unstable();
+                deps.dedup();
+                deps
+            })
+            .collect();
+        fn visit(i: usize, edges: &[Vec<usize>], state: &mut [u8], order: &mut Vec<usize>) {
+            if state[i] != 0 {
+                return; // done, or a cycle the checker already diagnosed
+            }
+            state[i] = 1;
+            for &dep in &edges[i] {
+                visit(dep, edges, state, order);
+            }
+            state[i] = 2;
+            order.push(i);
+        }
+        let mut state = vec![0u8; bindings.len()];
+        let mut order: Vec<usize> = Vec::new();
+        for i in 0..bindings.len() {
+            visit(i, &edges, &mut state, &mut order);
+        }
+        for i in order {
+            let b = &bindings[i];
+            let (Some(name_tok), Some(value)) = (b.name(), b.value()) else {
+                continue; // the checker already diagnosed the missing piece
+            };
+            let name = name_tok.text().to_string();
+            match self.fold_const_expr(&value) {
+                Ok(Some(lit)) => {
+                    self.module_let_consts.insert(name.clone(), lit.clone());
+                    own_consts.insert(name, lit);
+                }
+                Ok(None) => {
+                    if let Some(entry) = self.absorb_module_let_slot(&name, b, value, prefix) {
+                        own_slots.insert(name, entry);
+                    }
+                }
+                Err(msg) => {
+                    self.diagnostics.push(Diagnostic::error(
+                        self.node_span(b.syntax()),
+                        "T0098",
+                        format!("module-level `let {name}` initializer {msg}"),
+                    ));
+                }
+            }
+        }
+        (own_consts, own_slots)
+    }
+
+    /// Register one relation-typed module let as a slot. The heading comes
+    /// from the annotation when present, else is inferred from a direct
+    /// relation-literal initializer (empty literal → the nullary heading,
+    /// matching the checker's relfalse default; otherwise the first tuple
+    /// element's fields must fold to scalars). Anything else needs the
+    /// annotation — an honest v1 limit (T0098). The slot rides the
+    /// private-relvar machinery — init/release in the prologue,
+    /// `RelvarRead` at use sites, `MaterializedRelvar` in relational builds
+    /// — with its store deferred to `__coddl_module_lets_init`. Assignment
+    /// is impossible: to the typechecker the binding is not a relvar, so
+    /// `X := …` already fails T0033 there.
+    fn absorb_module_let_slot(
+        &mut self,
+        name: &str,
+        binding: &LetStmt,
+        value: Expr,
+        prefix: Option<&str>,
+    ) -> Option<(String, HeadingId)> {
+        let heading = binding
+            .type_ref()
+            .and_then(|tr| match self.resolve_type_ref_aliased(&tr) {
+                Type::Relation(h) => Some(h),
+                _ => None,
+            })
+            .or_else(|| self.infer_relation_lit_heading(&value))
+            .or_else(|| match &value {
+                // A bare reference to another module let carries its heading.
+                Expr::NameRef(n) => n.ident().and_then(|t| {
+                    self.module_let_slots
+                        .get(t.text())
+                        .map(|(_, hid)| self.headings[hid.0 as usize].clone())
+                }),
+                _ => None,
+            });
+        let Some(heading) = heading else {
+            self.diagnostics.push(Diagnostic::error(
+                self.node_span(binding.syntax()),
+                "T0098",
+                format!(
+                    "module-level `let {name}` needs a `Relation {{ … }}` type annotation — \
+                     only scalar- and relation-typed bindings lower today, and this \
+                     initializer's heading isn't inferable"
+                ),
+            ));
+            return None;
+        };
+        let heading_id = self.intern_heading(&heading);
+        let slot = match prefix {
+            Some(p) => format!("{p}${name}"),
+            None => name.to_string(),
+        };
+        self.private_relvars.insert(slot.clone(), heading_id);
+        self.private_relvar_order.push(slot.clone());
+        // Always initialized (the store below runs unconditionally), so the
+        // slot init/release loops must always cover it.
+        self.used_private_relvars.insert(slot.clone());
+        self.module_let_slots
+            .insert(name.to_string(), (slot.clone(), heading_id));
+        self.module_let_inits.push(ModuleLetInit {
+            slot: slot.clone(),
+            heading_id,
+            value,
+            consts: self.module_let_consts.clone(),
+            slots: self.module_let_slots.clone(),
+        });
+        Some((slot, heading_id))
+    }
+
+    /// Infer the heading of a direct `Relation { … }` literal initializer.
+    fn infer_relation_lit_heading(&self, value: &Expr) -> Option<Heading> {
+        let Expr::RelationLit(r) = value else {
+            return None;
+        };
+        let mut elements = r.elements();
+        let Some(first) = elements.next() else {
+            // The empty literal: the nullary heading (relfalse), the same
+            // default the checker applies without an annotation.
+            return Some(Heading::empty());
+        };
+        let Expr::TupleLit(t) = first else {
+            return None;
+        };
+        let mut fields: Vec<(String, Type)> = Vec::new();
+        for field in t.fields() {
+            let name = field.name()?.text().to_string();
+            let lit = self.fold_const_expr(&field.value()?).ok()??;
+            fields.push((name, literal_type(&lit)));
+        }
+        Some(Heading::new(fields))
+    }
+
+    /// Fold a module-let initializer to a compile-time scalar constant.
+    /// `Ok(Some)` — a scalar constant (semantics mirror the runtime ops
+    /// exactly: checked Integer arithmetic, i128-intermediate Rational
+    /// arithmetic with the same reduce/narrow rules, canonical-bit
+    /// Approximate equality, content Text comparison). `Ok(None)` — not a
+    /// scalar expression (a relation literal / relational operator / slot
+    /// reference: the slot path handles it). `Err` — a scalar constant whose
+    /// value doesn't exist (overflow, division by zero): a compile error,
+    /// never a silent wrap.
+    fn fold_const_expr(&self, expr: &Expr) -> Result<Option<RelLiteral>, String> {
+        if let Some(lit) = self.literal_value(expr) {
+            return Ok(Some(lit));
+        }
+        match expr {
+            Expr::NameRef(n) => Ok(n
+                .ident()
+                .and_then(|t| self.module_let_consts.get(t.text()).cloned())),
+            Expr::Unary(u) if u.op_kind() == Some(UnaryOp::Not) => {
+                let Some(operand) = u.operand() else {
+                    return Ok(None);
+                };
+                match self.fold_const_expr(&operand)? {
+                    Some(RelLiteral::Boolean(b)) => Ok(Some(RelLiteral::Boolean(!b))),
+                    _ => Ok(None),
+                }
+            }
+            Expr::Binary(b) => {
+                let (Some(le), Some(re)) = (b.lhs(), b.rhs()) else {
+                    return Ok(None);
+                };
+                let (Some(l), Some(r)) = (self.fold_const_expr(&le)?, self.fold_const_expr(&re)?)
+                else {
+                    return Ok(None);
+                };
+                fold_binary_const(b.op_kind(), l, r)
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Absorb `builtin` relvars from the typechecker's relvar table: intern each
@@ -1575,8 +1890,16 @@ impl Lowerer {
                     // (T0091); the real stdlib relvars come from imported
                     // modules, not the lowered file's items. Nothing to lower.
                 }
+                Item::LetBinding(_) => {
+                    // Module lets are absorbed before this walk (folded
+                    // scalars / registered slots); their stores lower in
+                    // `build_module_lets_init` below.
+                }
             }
         }
+        // Lower the deferred module-let slot initializers into their
+        // synthesized function, now that every unit's bindings are absorbed.
+        self.build_module_lets_init();
         // Now that every function is lowered (so `plans` and
         // `legacy_used_relvars` are final), patch `main`'s prologue:
         // register the database + pushed plans, and emit slot init/release
@@ -1634,6 +1957,8 @@ impl Lowerer {
             }
         }
         // Private (in-memory) relvars: init an empty slot for each used one.
+        // Module-let slots ride the same order/used tables, so this loop
+        // covers them too.
         for name in &self.private_relvar_order {
             if self.used_private_relvars.contains(name) {
                 let heading_id = self.private_relvars[name];
@@ -1642,6 +1967,21 @@ impl Lowerer {
                     heading_id,
                 });
             }
+        }
+        // Module-level `let` slots are stored once at startup: after the
+        // empty slot inits, call the synthesized initializer (built in
+        // `build_module_lets_init` before this runs).
+        if self
+            .functions
+            .iter()
+            .any(|f| f.name == "__coddl_module_lets_init")
+        {
+            prologue.push(Inst::Call {
+                dst: None,
+                callee: "__coddl_module_lets_init".to_string(),
+                args: Vec::new(),
+                return_type: ProcType::Unit,
+            });
         }
         let mut releases: Vec<Inst> = self
             .public_relvar_order
@@ -1760,6 +2100,57 @@ impl Lowerer {
         self.functions.push(Function {
             name: "__coddl_app_shutdown".to_string(),
             linkage_name: "coddl_app_shutdown".to_string(),
+            params: Vec::new(),
+            return_type: ProcType::Unit,
+            blocks,
+        });
+    }
+
+    /// Build `__coddl_module_lets_init`: every deferred module-let slot
+    /// store, in cross-unit dependency order, each initializer lowered under
+    /// its defining unit's name tables. The prologue (or `coddl_app_init`)
+    /// calls it right after the slots are initialized empty; the store takes
+    /// ownership of each fresh value (move semantics), so nothing further
+    /// releases here. No function is emitted when there are no slot lets.
+    fn build_module_lets_init(&mut self) {
+        if self.module_let_inits.is_empty() {
+            return;
+        }
+        let inits = std::mem::take(&mut self.module_let_inits);
+        let saved_consts = std::mem::take(&mut self.module_let_consts);
+        let saved_slots = std::mem::take(&mut self.module_let_slots);
+        self.reset_function_state();
+        self.begin_function_body();
+        for init in inits {
+            self.module_let_consts = init.consts;
+            self.module_let_slots = init.slots;
+            // An empty `Relation {}` initializer has no heading of its own —
+            // the binding's (annotation-derived) heading is authoritative,
+            // exactly as the checker treated it (the expected-type rule).
+            let v = match &init.value {
+                Expr::RelationLit(r) if r.elements().next().is_none() => {
+                    let heading = self.headings[init.heading_id.0 as usize].clone();
+                    self.lower_empty_relation_lit(heading)
+                }
+                v => self.lower_expr(v),
+            };
+            debug_assert!(
+                matches!(self.value_type(v), ProcType::Relation(h) if h == init.heading_id),
+                "module-let `{}` initializer lowered to a different heading",
+                init.slot,
+            );
+            self.insts.push(Inst::RelvarSlotStore {
+                name: init.slot,
+                value: v,
+            });
+        }
+        self.module_let_consts = saved_consts;
+        self.module_let_slots = saved_slots;
+        self.finish_block(Terminator::Return(None));
+        let blocks = std::mem::take(&mut self.blocks);
+        self.functions.push(Function {
+            name: "__coddl_module_lets_init".to_string(),
+            linkage_name: "__coddl_module_lets_init".to_string(),
             params: Vec::new(),
             return_type: ProcType::Unit,
             blocks,
@@ -4589,6 +4980,17 @@ impl Lowerer {
                 if self.lookup_local(name).is_some() {
                     return None;
                 }
+                // A relation-typed module-level `let`: its slot is a
+                // materialized leaf under the slot symbol — the same
+                // in-memory shape as a private relvar, so a mixed query
+                // collapses it to a shipped rel-param and an in-process
+                // consumer reads its slot.
+                if let Some((slot, heading_id)) = self.module_let_slots.get(name) {
+                    return Some(RelExpr::MaterializedRelvar {
+                        name: slot.clone(),
+                        heading: self.headings[heading_id.0 as usize].clone(),
+                    });
+                }
                 // A `private` relvar is the in-memory (materialized) leaf.
                 if let Some(&heading_id) = self.private_relvars.get(name) {
                     return Some(RelExpr::MaterializedRelvar {
@@ -5000,6 +5402,20 @@ impl Lowerer {
                 }
             }
             Expr::BoolLit(b) => b.value().map(RelLiteral::Boolean),
+            // A scalar module-level `let` is a compile-time constant — look
+            // through the name to its folded literal, so `where col = CONST`
+            // pushes with the value bound (never inlined into the text). A
+            // same-named local shadows it (that name binds as a `Param`); a
+            // heading attribute never reaches here (`build_predicate`
+            // classifies the attribute side before consulting values).
+            Expr::NameRef(n) => {
+                let name = n.ident()?;
+                let name = name.text();
+                if self.lookup_local(name).is_some() {
+                    return None;
+                }
+                self.module_let_consts.get(name).cloned()
+            }
             // Exact `/` of two Integer literals is a compile-time Rational
             // constant. Fold it locally so a `where a = 2/3` predicate can push
             // (bound as `'2/3'` TEXT) — the division can never be a SQL op (the
@@ -5334,6 +5750,28 @@ impl Lowerer {
             );
             if let Some((v, _ty)) = self.lookup_local(name) {
                 return v;
+            }
+            // A module-level `let` (constant binding). Scalars were folded at
+            // compile time — one `Inst::Const` per use, immortal like any
+            // literal. Relation-typed bindings read their slot (a
+            // `RelvarRead`, i.e. slot load + retain — the consumer releases,
+            // exactly as for a private relvar).
+            if let Some(lit) = self.module_let_consts.get(name).cloned() {
+                let (value, ty) = const_of_literal(&lit);
+                let dst = self.fresh_value();
+                self.record_type(dst, ty.clone());
+                self.insts.push(Inst::Const { dst, value, ty });
+                return dst;
+            }
+            if let Some((slot, heading_id)) = self.module_let_slots.get(name).cloned() {
+                let dst = self.fresh_value();
+                self.record_type(dst, ProcType::Relation(heading_id));
+                self.insts.push(Inst::RelvarRead {
+                    dst,
+                    name: slot,
+                    heading_id,
+                });
+                return dst;
             }
             // Builtin (FFI-backed) relvar reference: read it by calling the
             // module's runtime snapshot symbol, which returns a fresh RC
@@ -7826,6 +8264,168 @@ fn gcd_i128(mut a: i128, mut b: i128) -> i128 {
 /// not a rational) and on a reduced component that exceeds `i64` (a literal past
 /// the bounded type's range). Every compile-time `Rational` funnels through
 /// this; the runtime mirror (`reduce_to_i64`) handles the same narrowing.
+/// A folded scalar constant as an `Inst::Const` payload (one per use site).
+fn const_of_literal(lit: &RelLiteral) -> (Const, ProcType) {
+    match lit {
+        RelLiteral::Integer(n) => (Const::Integer(*n), ProcType::Integer),
+        RelLiteral::Text(s) => (Const::Text(s.clone().into_bytes()), ProcType::Text),
+        RelLiteral::Character(cp) => (Const::Character(*cp), ProcType::Character),
+        RelLiteral::Approximate(bits) => (Const::Approximate(*bits), ProcType::Approximate),
+        RelLiteral::Rational(n, d) => (Const::Rational(*n, *d), ProcType::Rational),
+        RelLiteral::Boolean(b) => (Const::Boolean(*b), ProcType::Boolean),
+    }
+}
+
+/// The `Type` of a folded scalar constant (for inferring a heading from a
+/// relation-literal initializer's folded fields).
+fn literal_type(lit: &RelLiteral) -> Type {
+    match lit {
+        RelLiteral::Integer(_) => Type::Integer,
+        RelLiteral::Text(_) => Type::Text,
+        RelLiteral::Character(_) => Type::Character,
+        RelLiteral::Approximate(_) => Type::Approximate,
+        RelLiteral::Rational(..) => Type::Rational,
+        RelLiteral::Boolean(_) => Type::Boolean,
+    }
+}
+
+/// `reduce_rational` with a graceful narrow: `Err` when the reduced
+/// component exceeds `i64` — the compile-time mirror of the runtime's
+/// narrowing trap, surfaced as a diagnostic instead of a panic.
+fn try_reduce_rational(n: i128, d: i128) -> Result<(i64, i64), String> {
+    if d == 0 {
+        return Err("divides by zero".to_string());
+    }
+    if n == 0 {
+        return Ok((0, 1));
+    }
+    let g = gcd_i128(n, d);
+    let (mut n, mut d) = (n / g, d / g);
+    if d < 0 {
+        n = -n;
+        d = -d;
+    }
+    let narrow =
+        |v: i128| i64::try_from(v).map_err(|_| "overflows Rational (i64 component)".to_string());
+    Ok((narrow(n)?, narrow(d)?))
+}
+
+/// Evaluate one built-in binary operator over two folded scalar constants —
+/// the compile-time mirror of the runtime `ScalarOp` semantics (checked
+/// Integer arithmetic; exact `/` to Rational; i128-intermediate Rational
+/// arithmetic with the runtime's reduce/narrow rules; cross-multiply
+/// Rational ordering; content Text equality; canonical-bit Approximate
+/// equality; `||` over Text/Character). `Ok(None)` for a shape the folder
+/// doesn't cover (relational operators, `where`, mixed kinds the checker
+/// would have rejected); `Err` when the value doesn't exist (overflow,
+/// division by zero) — a compile error, never a silent wrap.
+fn fold_binary_const(
+    op: Option<BinaryOp>,
+    l: RelLiteral,
+    r: RelLiteral,
+) -> Result<Option<RelLiteral>, String> {
+    use RelLiteral as L;
+    let out = match (op, l, r) {
+        (Some(BinaryOp::Add), L::Integer(a), L::Integer(b)) => {
+            L::Integer(a.checked_add(b).ok_or("`+` overflows Integer")?)
+        }
+        (Some(BinaryOp::Sub), L::Integer(a), L::Integer(b)) => {
+            L::Integer(a.checked_sub(b).ok_or("`-` overflows Integer")?)
+        }
+        (Some(BinaryOp::Mul), L::Integer(a), L::Integer(b)) => {
+            L::Integer(a.checked_mul(b).ok_or("`*` overflows Integer")?)
+        }
+        (Some(BinaryOp::IntDiv), L::Integer(a), L::Integer(b)) => {
+            if b == 0 {
+                return Err("`div` divides by zero".to_string());
+            }
+            L::Integer(a.checked_div(b).ok_or("`div` overflows Integer")?)
+        }
+        // Exact `/`: Integer × Integer → Rational.
+        (Some(BinaryOp::Div), L::Integer(a), L::Integer(b)) => {
+            let (n, d) =
+                try_reduce_rational(a as i128, b as i128).map_err(|e| format!("`/` {e}"))?;
+            L::Rational(n, d)
+        }
+        // Rational arithmetic: i128 intermediates never wrap before the
+        // reduce; the narrow mirrors the runtime trap.
+        (Some(BinaryOp::Add), L::Rational(an, ad), L::Rational(bn, bd)) => {
+            let n = an as i128 * bd as i128 + bn as i128 * ad as i128;
+            let (n, d) =
+                try_reduce_rational(n, ad as i128 * bd as i128).map_err(|e| format!("`+` {e}"))?;
+            L::Rational(n, d)
+        }
+        (Some(BinaryOp::Sub), L::Rational(an, ad), L::Rational(bn, bd)) => {
+            let n = an as i128 * bd as i128 - bn as i128 * ad as i128;
+            let (n, d) =
+                try_reduce_rational(n, ad as i128 * bd as i128).map_err(|e| format!("`-` {e}"))?;
+            L::Rational(n, d)
+        }
+        (Some(BinaryOp::Mul), L::Rational(an, ad), L::Rational(bn, bd)) => {
+            let (n, d) = try_reduce_rational(an as i128 * bn as i128, ad as i128 * bd as i128)
+                .map_err(|e| format!("`*` {e}"))?;
+            L::Rational(n, d)
+        }
+        (Some(BinaryOp::Div), L::Rational(an, ad), L::Rational(bn, bd)) => {
+            if bn == 0 {
+                return Err("`/` divides by zero".to_string());
+            }
+            let (n, d) = try_reduce_rational(an as i128 * bd as i128, ad as i128 * bn as i128)
+                .map_err(|e| format!("`/` {e}"))?;
+            L::Rational(n, d)
+        }
+        (Some(BinaryOp::And), L::Boolean(a), L::Boolean(b)) => L::Boolean(a && b),
+        (Some(BinaryOp::Or), L::Boolean(a), L::Boolean(b)) => L::Boolean(a || b),
+        (Some(op @ (BinaryOp::Eq | BinaryOp::NotEq)), l, r) => {
+            // Same-kind operands (typechecked). Reduced Rational pairs and
+            // canonical Approximate bits make structural equality
+            // value-equality — the same rule the runtime cells follow.
+            let eq = match (&l, &r) {
+                (L::Integer(a), L::Integer(b)) => a == b,
+                (L::Text(a), L::Text(b)) => a == b,
+                (L::Character(a), L::Character(b)) => a == b,
+                (L::Approximate(a), L::Approximate(b)) => a == b,
+                (L::Rational(an, ad), L::Rational(bn, bd)) => an == bn && ad == bd,
+                (L::Boolean(a), L::Boolean(b)) => a == b,
+                _ => return Ok(None),
+            };
+            L::Boolean(if op == BinaryOp::Eq { eq } else { !eq })
+        }
+        (Some(op @ (BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq)), l, r) => {
+            // Ordering is Integer/Rational only (typechecked); Rational
+            // compares by cross-multiplication (denominators positive).
+            let ord = match (&l, &r) {
+                (L::Integer(a), L::Integer(b)) => a.cmp(b),
+                (L::Rational(an, ad), L::Rational(bn, bd)) => {
+                    (*an as i128 * *bd as i128).cmp(&(*bn as i128 * *ad as i128))
+                }
+                _ => return Ok(None),
+            };
+            L::Boolean(match op {
+                BinaryOp::Lt => ord.is_lt(),
+                BinaryOp::Gt => ord.is_gt(),
+                BinaryOp::LtEq => ord.is_le(),
+                _ => ord.is_ge(),
+            })
+        }
+        (Some(BinaryOp::Concat), l, r) => {
+            let text_of = |v: &L| -> Option<String> {
+                match v {
+                    L::Text(s) => Some(s.clone()),
+                    L::Character(cp) => char::from_u32(*cp).map(String::from),
+                    _ => None,
+                }
+            };
+            match (text_of(&l), text_of(&r)) {
+                (Some(a), Some(b)) => L::Text(a + &b),
+                _ => return Ok(None),
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(out))
+}
+
 fn reduce_rational(n: i128, d: i128) -> (i64, i64) {
     assert!(d != 0, "rational with zero denominator");
     if n == 0 {
