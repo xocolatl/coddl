@@ -11,6 +11,12 @@ module core;
 // — this file is the SIGNATURE source, not the full metadata source. See
 // docs/prelude.md.
 //
+// Core also carries **value vocabulary**: ordinary module-level `let`
+// bindings (constants), defined here in Coddl rather than as compiler
+// intrinsics. Stdlib lets are annotated by convention — the annotation is
+// their signature, the way a `builtin oper` carries its full heading. A user
+// binding of the same name shadows core's (no reserved words).
+//
 // Deliberately NOT declared here (stay compiler-registered, cannot be spelled
 // in Coddl yet):
 //   * format         — variadic FormatText template; a checker intrinsic with
@@ -37,3 +43,13 @@ builtin oper to_text{ self: Boolean } -> Text;
 
 builtin oper to_approximate{ self: Rational } -> Approximate;
 builtin oper to_rational{ self: Integer } -> Rational;
+
+// ---- Relational truth values ----------------------------------------------
+// The nullary relations (degree 0): the only inhabitants of `Relation {}`,
+// the multiplicative identity and zero of the join family — `R times reltrue
+// = R`, `R times relfalse` is empty (TTM's TABLE_DEE / TABLE_DUM, under names
+// that say what they mean). Ordinary module-level `let`s, not compiler
+// intrinsics: `reltrue` holds the one empty tuple, `relfalse` holds none.
+
+let reltrue: Relation {} = Relation { {} };
+let relfalse: Relation {} = Relation {};

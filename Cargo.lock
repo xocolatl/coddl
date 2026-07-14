@@ -271,6 +271,7 @@ dependencies = [
  "coddl-plan",
  "coddl-relir",
  "coddl-sqlemit",
+ "coddl-stdlib",
  "coddl-syntax",
  "coddl-types",
 ]

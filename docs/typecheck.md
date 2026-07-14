@@ -62,6 +62,8 @@ In terms of the type generators, the literal forms decode as:
 
 The `Relation { … }` syntax is contextual: in **type** position it's the type generator with a heading; in **value** position it's a relation literal whose body is a comma-list of tuple-valued expressions. The empty form `Relation {}` is the value form. The empty tuple `{}` may also be written `Tuple {}` in expression position — the `Tuple` constructor and the bare braced literal are equivalent for tuple values.
 
+The names `reltrue` and `relfalse` themselves are **not compiler intrinsics**: they are ordinary module-level `let` bindings defined in the always-in-scope `coddl::core` (see [prelude.md](prelude.md) "Modules") — `let reltrue: Relation {} = Relation { {} };` and `let relfalse: Relation {} = Relation {};` — bare-available like `true`, shadowable by user bindings like any other name.
+
 ## Relations are fully first-class
 
 Relations can be bound to variables, passed to and returned from operators, stored in tuples, nested inside other relations, used as function arguments and results everywhere a scalar can — subject to the lazy-evaluation semantics in [runtime.md](runtime.md). The calling convention treats them uniformly.
@@ -311,7 +313,11 @@ module-level mutable state is a relvar.)
 - **Resolution order**: oper-locals shadow module lets (no-reserved-words
   discipline); module lets shadow imports; two imports exporting the same
   name coexist until used (**T0092**, the imported-oper rule). A module-let
-  name may not reuse another module-level name (T0060).
+  name may not reuse another module-level name (T0060). Last in the chain
+  come the **always-in-scope stdlib lets** (`coddl::core`'s
+  `reltrue`/`relfalse`): annotated by convention (the checker reads only the
+  annotation — their signature, like a `builtin oper`'s heading), shadowable
+  by any user binding, never consulted by the duplicate check.
 - **Evaluation is once, never per use**: the lowerer folds scalar-typed
   bindings at **compile time** (checked Integer arithmetic, the runtime's
   Rational reduce/narrow rules — a folding failure is a T0098 compile error,

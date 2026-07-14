@@ -262,6 +262,35 @@ fn lower_impl(source: &str, file: FileId, plan: Option<&Plan>, collect_relir: bo
     // every importer (all units lower into one Module, RM Pre 8 aside).
     let mut catalog: HashMap<String, HashMap<String, UserOpSig>> = HashMap::new();
     let mut let_catalog: HashMap<String, LetExports> = HashMap::new();
+
+    // The always-in-scope stdlib's module lets (`coddl::core` —
+    // reltrue/relfalse) absorb first, under the `coddl$core` slot prefix;
+    // their exports seed every unit's baseline, and user bindings shadow
+    // them by ordinary map overwrite (core ← imports ← own — the same
+    // precedence the checker resolves with).
+    let core_lets: LetExports = {
+        let core = coddl_stdlib::resolve(&coddl_stdlib::ModulePath::parse("coddl::core"))
+            .expect("coddl::core is always embedded in coddl-stdlib");
+        match Root::cast(parse(core.source(), file, coddl_syntax::FileKind::Cd).tree) {
+            Some(core_root) => lowerer.absorb_module_lets(
+                &core_root,
+                Some("coddl$core"),
+                HashMap::new(),
+                HashMap::new(),
+            ),
+            None => (HashMap::new(), HashMap::new()),
+        }
+    };
+    let seed_core = |consts: &mut HashMap<String, RelLiteral>,
+                     slots: &mut HashMap<String, (String, HeadingId)>| {
+        for (k, v) in &core_lets.0 {
+            consts.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        for (k, v) in &core_lets.1 {
+            slots.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    };
+
     for m in &modules {
         let prefix = m.path.segments().join("$");
         let Some(mroot) = Root::cast(parse(&m.source, file, coddl_syntax::FileKind::Cd).tree)
@@ -269,7 +298,8 @@ fn lower_impl(source: &str, file: FileId, plan: Option<&Plan>, collect_relir: bo
             continue;
         };
         let imported = build_imported(&mroot, &catalog);
-        let (imported_consts, imported_slots) = build_imported_lets(&mroot, &let_catalog);
+        let (mut imported_consts, mut imported_slots) = build_imported_lets(&mroot, &let_catalog);
+        seed_core(&mut imported_consts, &mut imported_slots);
         let let_exports =
             lowerer.absorb_module_lets(&mroot, Some(&prefix), imported_consts, imported_slots);
         let exports = lowerer.lower_module_unit(&mroot, prefix.clone(), imported);
@@ -280,7 +310,8 @@ fn lower_impl(source: &str, file: FileId, plan: Option<&Plan>, collect_relir: bo
     // Lower the entry unit (full: main prologue, relvars), with its imports set.
     lowerer.current_module = None;
     lowerer.imported_opers = build_imported(&root, &catalog);
-    let (imported_consts, imported_slots) = build_imported_lets(&root, &let_catalog);
+    let (mut imported_consts, mut imported_slots) = build_imported_lets(&root, &let_catalog);
+    seed_core(&mut imported_consts, &mut imported_slots);
     lowerer.absorb_module_lets(&root, None, imported_consts, imported_slots);
     let module = lowerer.lower_root(&root);
     let relir = std::mem::take(&mut lowerer.relir);
@@ -956,9 +987,11 @@ impl Lowerer {
         };
         self.private_relvars.insert(slot.clone(), heading_id);
         self.private_relvar_order.push(slot.clone());
-        // Always initialized (the store below runs unconditionally), so the
-        // slot init/release loops must always cover it.
-        self.used_private_relvars.insert(slot.clone());
+        // Demand-driven like private relvars: the slot is marked used at its
+        // references (`lower_name_ref`, the in-process MaterializedRelvar
+        // read), and `build_module_lets_init` propagates demand through
+        // initializer references — an unused binding (e.g. core's constants
+        // in a program that never mentions them) costs nothing at startup.
         self.module_let_slots
             .insert(name.to_string(), (slot.clone(), heading_id));
         self.module_let_inits.push(ModuleLetInit {
@@ -2116,7 +2149,32 @@ impl Lowerer {
         if self.module_let_inits.is_empty() {
             return;
         }
-        let inits = std::mem::take(&mut self.module_let_inits);
+        let mut inits = std::mem::take(&mut self.module_let_inits);
+        // Demand-driven: keep only bindings some lowered body referenced,
+        // plus their transitive initializer dependencies. The list is in
+        // topo order (dependencies first), so one reverse pass propagates
+        // demand from dependents to the slots their initializers read.
+        for i in (0..inits.len()).rev() {
+            if !self.used_private_relvars.contains(&inits[i].slot) {
+                continue;
+            }
+            let deps: Vec<String> = inits[i]
+                .value
+                .syntax()
+                .descendants_with_tokens()
+                .filter_map(|el| el.into_node())
+                .filter(|n| n.kind() == SyntaxKind::NAME_REF)
+                .filter_map(|n| NameRef::cast(n)?.ident())
+                .filter_map(|tok| inits[i].slots.get(tok.text()).map(|(s, _)| s.clone()))
+                .collect();
+            for dep in deps {
+                self.used_private_relvars.insert(dep);
+            }
+        }
+        inits.retain(|init| self.used_private_relvars.contains(&init.slot));
+        if inits.is_empty() {
+            return;
+        }
         let saved_consts = std::mem::take(&mut self.module_let_consts);
         let saved_slots = std::mem::take(&mut self.module_let_slots);
         self.reset_function_state();
@@ -5764,6 +5822,9 @@ impl Lowerer {
                 return dst;
             }
             if let Some((slot, heading_id)) = self.module_let_slots.get(name).cloned() {
+                // Demand-marks the slot: only referenced module lets
+                // materialize at startup.
+                self.used_private_relvars.insert(slot.clone());
                 let dst = self.fresh_value();
                 self.record_type(dst, ProcType::Relation(heading_id));
                 self.insts.push(Inst::RelvarRead {

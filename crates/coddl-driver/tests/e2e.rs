@@ -7977,6 +7977,54 @@ fn module_let_folds_into_pushed_where_cranelift() {
     assert_module_let_folds_into_pushed_where("cranelift");
 }
 
+/// `reltrue`/`relfalse` are module-level `let`s in the always-in-scope
+/// `coddl::core` — bare-available with no import, like `true`. The nullary
+/// gate pattern works in both branches, printing renders the empty tuple,
+/// and — the RM Pro 3 regression the nullary seal fix restores —
+/// `reltrue union reltrue` and `Relation { {}, {} }` both hold exactly one
+/// tuple (every zero-width record is the same empty tuple).
+#[test]
+fn core_reltrue_relfalse_run_on_both_backends() {
+    let src = "\
+program core_truth;
+oper main {} [
+    let r = Relation { { a: 1 } };
+    let none = r where a = 99;
+    let gate_on = reltrue minus (none project {});
+    let kept = Relation { { b: 5 } } times gate_on;
+    write_relation { rel: kept };
+    let gate_off = reltrue minus (r project {});
+    let gone = Relation { { b: 6 } } times gate_off;
+    write_relation { rel: gone };
+    write_relation { rel: reltrue };
+    let u = reltrue union reltrue;
+    let c1 = u.cardinality{};
+    let dup = Relation { {}, {} };
+    let c2 = dup.cardinality{};
+    let t1 = relfalse < reltrue;
+    let t2 = reltrue = relfalse;
+    let message = format { template: f\"{c1} {c2} {t1} {t2}\", args: { c1: c1, c2: c2, t1: t1, t2: t2 } };
+    write_line { message };
+];
+";
+    run_both_backends_expect(src, "core-truth.cd", b"{b: 5}\n{}\n1 1 true false\n");
+}
+
+/// A user binding named `reltrue` shadows core's (no reserved words) —
+/// locals and user module lets both win over the stdlib vocabulary.
+#[test]
+fn user_binding_shadows_core_reltrue_on_both_backends() {
+    let src = "\
+program shadow_core;
+let reltrue = 41;
+oper main {} [
+    let x = reltrue + 1;
+    write_line { message: format { template: f\"{x}\", args: { x: x } } };
+];
+";
+    run_both_backends_expect(src, "shadow-core.cd", b"42\n");
+}
+
 /// Module lets cross `use module` imports: a scalar crosses as its folded
 /// value, a relation-typed binding as its (module-mangled) slot — one slot,
 /// read by the importer.

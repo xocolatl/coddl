@@ -132,7 +132,15 @@ pub unsafe extern "C" fn coddl_relation_seal(ptr: *mut u8, desc: *const CoddlHea
     let header = ptr.sub(HEADER_SIZE) as *mut CoddlRcHeader;
     let record_size = (*desc).record_size as usize;
     let count = (*header).length as usize;
-    if count <= 1 || record_size == 0 {
+    if record_size == 0 {
+        // Every zero-width record is the one empty tuple, so a sealed
+        // nullary relation holds at most one (RM Pro 3) — `reltrue union
+        // reltrue` is `reltrue`, and `Relation { {}, {} }` is one tuple.
+        // Nothing to sort, no cells to release.
+        (*header).length = count.min(1) as u32;
+        return;
+    }
+    if count <= 1 {
         return;
     }
 
@@ -2045,6 +2053,43 @@ mod tests {
             assert_eq!(std::ptr::read(slot(0)), 1);
             assert_eq!(std::ptr::read(slot(1)), 2);
             coddl_rc_release(payload);
+        }
+    }
+
+    #[test]
+    fn seal_collapses_nullary_records_to_at_most_one() {
+        // Every zero-width record is the same empty tuple: sealing a
+        // degree-0 relation collapses to cardinality ≤ 1 (RM Pro 3 —
+        // `reltrue union reltrue` must be `reltrue`), and an empty one
+        // stays empty.
+        let desc = CoddlHeadingDesc {
+            attr_count: 0,
+            record_size: 0,
+            attrs: std::ptr::null(),
+        };
+        unsafe {
+            let payload = coddl_rc_alloc(
+                0,
+                3,
+                CoddlKind::Relation as u32,
+                &desc as *const CoddlHeadingDesc,
+            );
+            assert!(!payload.is_null());
+            coddl_relation_seal(payload, &desc as *const CoddlHeadingDesc);
+            let header = payload.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*header).length, 1, "three empty tuples seal to one");
+            coddl_rc_release(payload);
+
+            let empty = coddl_rc_alloc(
+                0,
+                0,
+                CoddlKind::Relation as u32,
+                &desc as *const CoddlHeadingDesc,
+            );
+            coddl_relation_seal(empty, &desc as *const CoddlHeadingDesc);
+            let header = empty.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*header).length, 0, "relfalse stays empty");
+            coddl_rc_release(empty);
         }
     }
 

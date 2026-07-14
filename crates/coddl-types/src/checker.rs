@@ -383,6 +383,7 @@ fn check_inner(
         imported_opers,
         module_lets: HashMap::new(),
         imported_lets,
+        stdlib_lets: HashMap::new(),
         type_aliases: HashMap::new(),
         nominal_scalars: HashMap::new(),
         active_modules: HashSet::new(),
@@ -687,6 +688,14 @@ struct TypeChecker {
     /// shadow imports, and two modules exporting the same name coexist until
     /// the name is actually used (then **T0092**).
     imported_lets: HashMap<String, Vec<(ModulePath, Type)>>,
+    /// Module-level `let`s of the always-in-scope stdlib (`coddl::core` —
+    /// `reltrue`/`relfalse`), name → annotated type. Stdlib lets are
+    /// annotated by convention (the annotation is their signature, like a
+    /// `builtin oper`'s heading). Consulted **last** among the let tables
+    /// (locals → own module lets → imports → these), so any user binding
+    /// shadows core's — the no-reserved-words discipline; the module-let
+    /// duplicate check never consults this table.
+    stdlib_lets: HashMap<String, Type>,
     /// User-defined type aliases (`type Name = <type-ref>;`), collected in a
     /// pre-pass so a later type reference resolves regardless of declaration
     /// order. Consulted by `resolve_type_name` after the built-in type names.
@@ -842,6 +851,11 @@ impl TypeChecker {
                 self.register_user_oper(&o);
             }
         }
+        // Pre-pass: the always-in-scope stdlib's module-level `let`s
+        // (`coddl::core` — reltrue/relfalse). Registered before the user
+        // prepass but consulted *after* every user table, so user bindings
+        // shadow core's.
+        self.absorb_stdlib_lets();
         // Pre-pass: module-level `let` bindings (constants), checked in
         // initializer-dependency order so they are order-independent like
         // every other item (the sibling of the operator forward-reference
@@ -885,6 +899,37 @@ impl TypeChecker {
                     // above (dependency order, not source order).
                 }
             }
+        }
+    }
+
+    /// Register the always-in-scope stdlib's module-level `let`s
+    /// (`coddl::core`'s `reltrue`/`relfalse`) into `stdlib_lets`. Stdlib
+    /// lets are **annotated by convention** — the annotation is their
+    /// signature, exactly as a `builtin oper` declaration carries its full
+    /// heading — so the type comes from `resolve_type_ref_quiet` with no
+    /// diagnostics against the embedded source (core is ours; a missing
+    /// annotation there is a compiler bug, debug-asserted). The lowerer
+    /// independently lowers the real initializers.
+    fn absorb_stdlib_lets(&mut self) {
+        let core = coddl_stdlib::resolve(&ModulePath::parse("coddl::core"))
+            .expect("coddl::core is always embedded in coddl-stdlib");
+        let out = parse(core.source(), FileId(0), FileKind::Cd);
+        let Some(root) = Root::cast(out.tree) else {
+            return;
+        };
+        for item in root.items() {
+            let Item::LetBinding(b) = item else { continue };
+            let Some(name_tok) = b.name() else { continue };
+            let ty = b
+                .type_ref()
+                .map(|tr| resolve_type_ref_quiet(&tr))
+                .unwrap_or(Type::Unknown);
+            debug_assert!(
+                !matches!(ty, Type::Unknown),
+                "stdlib module-level `let {}` must carry a type annotation",
+                name_tok.text(),
+            );
+            self.stdlib_lets.insert(name_tok.text().to_string(), ty);
         }
     }
 
@@ -3072,6 +3117,11 @@ impl TypeChecker {
                     if let Some((_, ty)) = candidates.first() {
                         return ty.clone();
                     }
+                }
+                // The always-in-scope stdlib's module lets (coddl::core —
+                // reltrue/relfalse), shadowed by everything above.
+                if let Some(ty) = self.stdlib_lets.get(name) {
+                    return ty.clone();
                 }
                 // If it's an opt-in stdlib builtin relvar, point at the
                 // import rather than reporting a plain unresolved name.
@@ -9463,6 +9513,37 @@ mod tests {
                    oper main {} [ let x = \"hi\"; write_line { message: x }; ];";
         let diags = diagnostics(src);
         assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn reltrue_relfalse_resolve_bare_from_core() {
+        // coddl::core is always in scope, so its module-level `let`s need no
+        // import: reltrue/relfalse type as Relation {} and feed the nullary
+        // algebra (times gating, minus, comparisons).
+        let src = "program p;\n\
+                   oper main {} [\n\
+                       let r = Relation { { a: 1 } };\n\
+                       let gate = reltrue minus (r project {});\n\
+                       let _kept = r times gate;\n\
+                       let _t = relfalse < reltrue;\n\
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn user_binding_shadows_core_let() {
+        // No reserved words: a user module let (or local) named `reltrue`
+        // shadows core's — no T0060, and the user's type wins.
+        let src = "program p;\n\
+                   let reltrue = 1;\n\
+                   oper main {} [ let _x = reltrue + 1; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+        let src2 = "program p;\n\
+                    oper main {} [ let reltrue = \"hi\"; write_line { message: reltrue }; ];";
+        let diags2 = diagnostics(src2);
+        assert!(diags2.is_empty(), "{diags2:?}");
     }
 
     // ── Multi-unit checking (userspace module imports) ───────────────────

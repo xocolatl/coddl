@@ -105,7 +105,20 @@ build error instead of a silent lie. (This closed-set check is not yet wired —
 ## Modules
 
 The core conversions / `to_text` / arithmetic are `coddl::core`, always in scope; library-specific surfaces
-live in **opt-in** modules a file brings in with `use module <path>;`. Live today:
+live in **opt-in** modules a file brings in with `use module <path>;`.
+
+Core also carries **value vocabulary** as ordinary module-level `let` bindings (constants) — not compiler
+intrinsics. Live today: **`reltrue`** and **`relfalse`**, the two nullary relations (`Relation {}` — the
+join family's multiplicative identity and zero), defined in core.cd as
+`let reltrue: Relation {} = Relation { {} };` and `let relfalse: Relation {} = Relation {};`. Stdlib lets
+are **annotated by convention** — the annotation is their signature, the way a `builtin oper` declaration
+carries its full heading (the checker reads only the annotation; the lowerer lowers the real initializer
+through the ordinary module-let machinery, slots `coddl$core$<name>`). Resolution order puts them **last**
+among the let tables (locals → the unit's own module lets → imports → core), so any user binding named
+`reltrue` shadows core's — the same no-reserved-words discipline that lets a user `oper` share a builtin's
+name.
+
+Live opt-in modules today:
 
 - **`coddl::web`** — the `Request` / `Response` vocabulary the web host marshals across the C ABI
   ([webhost.md](webhost.md)). A CLI program that never imports it does not have `Request` in scope.
