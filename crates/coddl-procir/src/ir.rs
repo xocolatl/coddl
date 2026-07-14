@@ -482,6 +482,20 @@ pub enum Inst {
         src: ValueId,
         heading_id: HeadingId,
     },
+    /// Compare two same-heading relations (typechecked), producing a Boolean
+    /// `dst`. Observational (RM Pre 8): content-aware record comparison —
+    /// indifferent to seal state and physical row order, never a pointer or
+    /// payload compare. Backends emit a call to `coddl_relation_eq(lhs, rhs,
+    /// &descriptor)` or `coddl_relation_subset(lhs, rhs, &descriptor,
+    /// proper)`. Only three shapes reach codegen: the lowerer handles `<>`
+    /// (negate `Eq`) and `>=`/`>` (swap the operands of `Subset`).
+    RelCompare {
+        dst: ValueId,
+        op: RelCmpOp,
+        lhs: ValueId,
+        rhs: ValueId,
+        heading_id: HeadingId,
+    },
     /// Collapse a single-row relation to a tuple (TTM RM Pre 10).
     /// Backends emit a call to `coddl_extract_check_cardinality(src,
     /// &descriptor)` which aborts if cardinality ≠ 1, then read each
@@ -592,6 +606,17 @@ pub enum Inst {
         src: ValueId,
         heading_id: HeadingId,
     },
+}
+
+/// The relation-comparison kinds `Inst::RelCompare` carries. `Eq` is
+/// observational set equality (surface `=`); `Subset` is the subset test
+/// (surface `<=`; `proper: true` for the strict `<`). The negated and
+/// swapped surface spellings (`<>`, `>=`, `>`) never reach codegen — the
+/// lowerer negates `Eq` and swaps `Subset`'s operands.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RelCmpOp {
+    Eq,
+    Subset { proper: bool },
 }
 
 /// Scalar binary operator kinds. The comparison ops (`Eq`…`GtEq`) and the
@@ -984,6 +1009,20 @@ impl fmt::Display for Inst {
                 src,
                 heading_id,
             } => write!(f, "{dst} = tclose {src} -> heading_{}", heading_id.0),
+            Inst::RelCompare {
+                dst,
+                op,
+                lhs,
+                rhs,
+                heading_id,
+            } => {
+                let name = match op {
+                    RelCmpOp::Eq => "rel_eq",
+                    RelCmpOp::Subset { proper: false } => "rel_subset",
+                    RelCmpOp::Subset { proper: true } => "rel_proper_subset",
+                };
+                write!(f, "{dst} = {name} {lhs} {rhs} @ heading_{}", heading_id.0)
+            }
             Inst::Extract {
                 dst,
                 src,

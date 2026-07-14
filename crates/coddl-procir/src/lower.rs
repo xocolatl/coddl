@@ -38,7 +38,7 @@ use coddl_sqlemit::{
 
 use crate::ir::{
     BasicBlock, BlockId, Const, Function, HeadingId, Inst, Module, PlanEntry, ProcType,
-    PublicRelvarBinding, RelParamReg, ScalarOp, Terminator, ValueId,
+    PublicRelvarBinding, RelCmpOp, RelParamReg, ScalarOp, Terminator, ValueId,
 };
 
 /// Surface name → C-ABI linkage name for each runtime extern. The
@@ -3940,8 +3940,22 @@ impl Lowerer {
                     | BinaryOp::Matching
                     | BinaryOp::NotMatching,
                 ) => b.lhs().into_iter().chain(b.rhs()).collect(),
-                // A scalar binary (arithmetic / comparison / logical) is not a
-                // relational operator — nothing to guard.
+                // A comparison over *relations* (observational `=`, the
+                // subset family) consumes both whole relations in-process —
+                // guard them like any relational operator's operands. A
+                // scalar comparison's operands don't build as `RelExpr`s and
+                // fall through the `continue` below, so this arm costs
+                // scalars nothing.
+                Some(
+                    BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::Gt
+                    | BinaryOp::LtEq
+                    | BinaryOp::GtEq,
+                ) => b.lhs().into_iter().chain(b.rhs()).collect(),
+                // A scalar binary (arithmetic / logical) is not a relational
+                // operator — nothing to guard.
                 _ => return,
             },
             Expr::Project(p) => p.input().into_iter().collect(),
@@ -5437,6 +5451,22 @@ impl Lowerer {
             .rhs()
             .map(|e| self.lower_expr(&e))
             .unwrap_or_else(|| self.fresh_value());
+        // Relation-typed comparison operands take the set overloads —
+        // observational `=`/`<>` (RM Pre 8) and the subset family — never the
+        // scalar `ScalarOp` mapping below, whose codegen would compare the
+        // payload *pointers*.
+        if matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::Gt
+                | BinaryOp::LtEq
+                | BinaryOp::GtEq
+        ) && matches!(self.value_type(lhs), ProcType::Relation(_))
+        {
+            return self.lower_relation_compare(op, lhs, rhs);
+        }
         let rat = matches!(self.value_type(lhs), ProcType::Rational);
         // comparison/logical compare arbitrary scalars → Boolean; `+ - *` are
         // Integer→Integer or Rational→Rational; `/` is exact (Integer→Rational,
@@ -5517,6 +5547,57 @@ impl Lowerer {
         }
         self.release_text_temp(lhs);
         self.release_text_temp(rhs);
+        dst
+    }
+
+    /// Lower a comparison whose operands are relations: `=` is observational
+    /// set equality (RM Pre 8), `<=`/`<` the (proper) subset test. The
+    /// negated and swapped surface spellings normalize here so codegen sees
+    /// only two shapes — `<>` negates `Eq`, `>=`/`>` swap `Subset`'s
+    /// operands. The comparison borrows its operands; temps are released
+    /// once compared (a bare local is left alone).
+    fn lower_relation_compare(&mut self, op: BinaryOp, lhs: ValueId, rhs: ValueId) -> ValueId {
+        let heading_id = match (self.value_type(lhs), self.value_type(rhs)) {
+            (ProcType::Relation(l), ProcType::Relation(r)) if l == r => l,
+            (l, r) => {
+                unreachable!("relation comparison on `{l}` vs `{r}` survived typecheck")
+            }
+        };
+        let (rel_op, l, r, negate) = match op {
+            BinaryOp::Eq => (RelCmpOp::Eq, lhs, rhs, false),
+            BinaryOp::NotEq => (RelCmpOp::Eq, lhs, rhs, true),
+            BinaryOp::LtEq => (RelCmpOp::Subset { proper: false }, lhs, rhs, false),
+            BinaryOp::Lt => (RelCmpOp::Subset { proper: true }, lhs, rhs, false),
+            BinaryOp::GtEq => (RelCmpOp::Subset { proper: false }, rhs, lhs, false),
+            BinaryOp::Gt => (RelCmpOp::Subset { proper: true }, rhs, lhs, false),
+            other => unreachable!("`{other:?}` is not a comparison operator"),
+        };
+        let cmp = self.fresh_value();
+        self.record_type(cmp, ProcType::Boolean);
+        self.insts.push(Inst::RelCompare {
+            dst: cmp,
+            op: rel_op,
+            lhs: l,
+            rhs: r,
+            heading_id,
+        });
+        self.release_call_arg_temp(lhs);
+        self.release_call_arg_temp(rhs);
+        if !negate {
+            return cmp;
+        }
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Boolean);
+        // `Inst::ScalarOp` is binary-shaped; `Not` is unary, so pass a dummy
+        // `rhs = lhs` the codegen arms ignore (the `lower_unary_expr`
+        // pattern).
+        self.insts.push(Inst::ScalarOp {
+            dst,
+            op: ScalarOp::Not,
+            operand_type: ProcType::Boolean,
+            lhs: cmp,
+            rhs: cmp,
+        });
         dst
     }
 

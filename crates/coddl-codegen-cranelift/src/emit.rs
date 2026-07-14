@@ -443,6 +443,33 @@ fn declare_runtime_rc_externs(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert("coddl_relation_minus".into(), id);
     }
+    // Relation comparisons (observational, RM Pre 8):
+    // coddl_relation_eq(lhs, rhs, desc) -> i8 and
+    // coddl_relation_subset(lhs, rhs, desc, proper: i32) -> i8.
+    // Identical headings ⇒ one desc.
+    {
+        let mut sig = obj.make_signature();
+        for _ in 0..3 {
+            sig.params.push(AbiParam::new(ptr_ty));
+        }
+        sig.returns.push(AbiParam::new(types::I8));
+        let id = obj
+            .declare_function("coddl_relation_eq", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_relation_eq".into(), id);
+    }
+    {
+        let mut sig = obj.make_signature();
+        for _ in 0..3 {
+            sig.params.push(AbiParam::new(ptr_ty));
+        }
+        sig.params.push(AbiParam::new(types::I32));
+        sig.returns.push(AbiParam::new(types::I8));
+        let id = obj
+            .declare_function("coddl_relation_subset", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_relation_subset".into(), id);
+    }
     // coddl_relation_tclose(src, desc) -> ptr. Result heading == operand
     // heading ⇒ one desc.
     {
@@ -2426,6 +2453,46 @@ fn emit_inst(
             let tclose_local = obj.declare_func_in_func(tclose_id, builder.func);
             let call = builder.ins().call(tclose_local, &[src_v, desc_val]);
             let result = builder.inst_results(call)[0];
+            values.insert(*dst, ValueRepr::Scalar(result));
+            Ok(())
+        }
+        Inst::RelCompare {
+            dst,
+            op,
+            lhs,
+            rhs,
+            heading_id,
+        } => {
+            // A call to the runtime comparator (i8: 1 = holds), then
+            // `icmp_imm != 0` into the Boolean — the `coddl_text_eq` return
+            // convention. The lowerer already normalized the six surface
+            // spellings to these shapes.
+            use cranelift_codegen::ir::condcodes::IntCC;
+            let lhs_v = scalar_value(values, lhs)?;
+            let rhs_v = scalar_value(values, rhs)?;
+            let ptr_ty = obj.target_config().pointer_type();
+            let desc_gv =
+                obj.declare_data_in_func(heading_desc_ids[heading_id.0 as usize], builder.func);
+            let desc_val = builder.ins().symbol_value(ptr_ty, desc_gv);
+            let call = match op {
+                coddl_procir::RelCmpOp::Eq => {
+                    let eq_id = funcs["coddl_relation_eq"];
+                    let eq_local = obj.declare_func_in_func(eq_id, builder.func);
+                    builder.ins().call(eq_local, &[lhs_v, rhs_v, desc_val])
+                }
+                coddl_procir::RelCmpOp::Subset { proper } => {
+                    let sub_id = funcs["coddl_relation_subset"];
+                    let sub_local = obj.declare_func_in_func(sub_id, builder.func);
+                    let proper_v = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(u32::from(*proper)));
+                    builder
+                        .ins()
+                        .call(sub_local, &[lhs_v, rhs_v, desc_val, proper_v])
+                }
+            };
+            let raw = builder.inst_results(call)[0];
+            let result = builder.ins().icmp_imm(IntCC::NotEqual, raw, 0);
             values.insert(*dst, ValueRepr::Scalar(result));
             Ok(())
         }

@@ -2863,6 +2863,69 @@ oper main {} [
 }
 
 #[test]
+fn relation_equality_is_observational() {
+    // `=` on relations compares heading + tuple set (RM Pre 8), never
+    // construction order or payload bytes: literals written in opposite
+    // orders are equal; `<>` inverts; a Text heading compares cell content
+    // (distinct allocations, equal strings).
+    let src = "\
+program rel_eq;
+oper main {} [
+    let r = Relation { { a: 1 }, { a: 2 } };
+    let r_rev = Relation { { a: 2 }, { a: 1 } };
+    let t = Relation { { a: 1 }, { a: 3 } };
+    let eq = r = r_rev;
+    let ne = r <> t;
+    let same_ne = r <> r_rev;
+    let names = Relation { { name: \"Ada\" }, { name: \"Grace\" } } = Relation { { name: \"Grace\" }, { name: \"Ada\" } };
+    let message = format { template: f\"{eq} {ne} {same_ne} {names}\", args: { eq: eq, ne: ne, same_ne: same_ne, names: names } };
+    write_line { message };
+];
+";
+    run_both_backends_expect(src, "rel-eq.cd", b"true true false true\n");
+}
+
+#[test]
+fn relation_subset_family_compares_sets() {
+    // `<=` subset, `<` proper subset, `>=`/`>` the superset spellings —
+    // a set is a subset but never a *proper* subset of itself, and a
+    // derived-empty relation is a proper subset of anything nonempty.
+    let src = "\
+program rel_subset;
+oper main {} [
+    let r = Relation { { a: 1 }, { a: 2 } };
+    let s = Relation { { a: 2 } };
+    let t = Relation { { a: 1 }, { a: 3 } };
+    let le = s <= r;
+    let lt = s < r;
+    let self_le = r <= r;
+    let self_lt = r < r;
+    let ge = r >= s;
+    let gt = r > s;
+    let not_sub = t <= r;
+    let none = r where a = 99;
+    let empty_lt = none < s;
+    let empty_eq = none = (t where a = 99);
+    let first = format {
+        template: f\"{le} {lt} {self_le} {self_lt} {ge}\",
+        args: { le: le, lt: lt, self_le: self_le, self_lt: self_lt, ge: ge }
+    };
+    write_line { message: first };
+    let second = format {
+        template: f\"{gt} {not_sub} {empty_lt} {empty_eq}\",
+        args: { gt: gt, not_sub: not_sub, empty_lt: empty_lt, empty_eq: empty_eq }
+    };
+    write_line { message: second };
+];
+";
+    run_both_backends_expect(
+        src,
+        "rel-subset.cd",
+        b"true true true false true\ntrue false true true\n",
+    );
+}
+
+#[test]
 fn rational_ordering_compares_by_value() {
     // `< > <= >=` on Rationals route through the runtime cross-multiply
     // comparator (`a/b ⋛ c/d ⟺ a·d ⋛ c·b`), not lexicographic text order.
@@ -4066,6 +4129,46 @@ fn mixed_origin_card1_dispatch_llvm() {
 #[test]
 fn mixed_origin_card1_dispatch_cranelift() {
     assert_mixed_origin_card1_dispatch("cranelift");
+}
+
+/// Observational equality across ORIGINS: a pushed-query result — an
+/// unsealed, backend-ordered payload fetched from SQLite, whose Text cells
+/// live in fresh allocations — compares equal to a sealed in-process literal
+/// holding the same tuple set. RM Pre 8: equality is heading + tuple set,
+/// regardless of how the relation was built; a representational compare
+/// (payload bytes, cell pointers) would fail every one of these.
+fn assert_relation_compare_crosses_origins(backend: &str) {
+    let stdout = run_parts_stdout(
+        backend,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         public relvar Shipments { pno: Integer, sno: Integer } key { pno, sno };\n\
+         oper main {} [\n\
+             let one = transaction [ Suppliers where sno = 1 project { sno } ];\n\
+             let hit = one = Relation { { sno: 1 } };\n\
+             let all = transaction [ Suppliers project { sno } ];\n\
+             let sub = Relation { { sno: 1 }, { sno: 3 } } < all;\n\
+             let text_eq = transaction [ Suppliers where sno = 2 project { sname } ] = Relation { { sname: \"Jones\" } };\n\
+             let message = format { template: f\"{hit} {sub} {text_eq}\", args: { hit: hit, sub: sub, text_eq: text_eq } };\n\
+             write_line { message };\n\
+         ];\n",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "true true true\n",
+        "backend={backend}"
+    );
+}
+
+#[test]
+fn relation_compare_crosses_origins_llvm() {
+    assert_relation_compare_crosses_origins("llvm");
+}
+
+#[test]
+fn relation_compare_crosses_origins_cranelift() {
+    assert_relation_compare_crosses_origins("cranelift");
 }
 
 /// Two semijoins in one query: the general nested-`EXISTS` plan pushes, and

@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 
 use coddl_procir::{
     record_layout, BasicBlock, BlockId, Codegen, Const, Function, HeadingId, Inst, Module,
-    ProcType, RecordLayout, ScalarOp, Terminator, Type, ValueId,
+    ProcType, RecordLayout, RelCmpOp, ScalarOp, Terminator, Type, ValueId,
 };
 
 use crate::error::LlvmEmitError;
@@ -349,6 +349,14 @@ impl Emitter {
         writeln!(
             self.body,
             "declare ptr @coddl_relation_minus(ptr, ptr, ptr)"
+        )
+        .unwrap();
+        // Relation comparisons (observational, RM Pre 8): `=` and the subset
+        // test (`proper != 0` for `<`). Identical headings ⇒ one desc.
+        writeln!(self.body, "declare i8 @coddl_relation_eq(ptr, ptr, ptr)").unwrap();
+        writeln!(
+            self.body,
+            "declare i8 @coddl_relation_subset(ptr, ptr, ptr, i32)"
         )
         .unwrap();
         // `tclose`: (src, desc) -> rc=1 ptr. Result heading == operand heading
@@ -1223,6 +1231,13 @@ impl Emitter {
                 src,
                 heading_id,
             } => self.lower_tclose_inst(*dst, src, *heading_id),
+            Inst::RelCompare {
+                dst,
+                op,
+                lhs,
+                rhs,
+                heading_id,
+            } => self.lower_rel_compare_inst(*dst, *op, lhs, rhs, *heading_id),
             Inst::Extract {
                 dst,
                 src,
@@ -2299,6 +2314,48 @@ impl Emitter {
             dst,
             ValueRepr::Scalar {
                 ty: "ptr".to_string(),
+                op: name,
+            },
+        );
+        Ok(())
+    }
+
+    /// Emit `Inst::RelCompare`: a call to `coddl_relation_eq` /
+    /// `coddl_relation_subset` (i8: 1 = holds), then `icmp ne … 0` into the
+    /// Boolean `i1` — the same return convention `coddl_text_eq` uses. The
+    /// lowerer already normalized the six surface spellings to these shapes.
+    fn lower_rel_compare_inst(
+        &mut self,
+        dst: ValueId,
+        op: RelCmpOp,
+        lhs: &ValueId,
+        rhs: &ValueId,
+        heading_id: HeadingId,
+    ) -> Result<(), LlvmEmitError> {
+        let lhs_op = self.scalar_op(lhs)?;
+        let rhs_op = self.scalar_op(rhs)?;
+        let raw = format!("%v{}.rel", dst.0);
+        match op {
+            RelCmpOp::Eq => writeln!(
+                self.body,
+                "    {raw} = call i8 @coddl_relation_eq(ptr {lhs_op}, ptr {rhs_op}, ptr @.heading.{})",
+                heading_id.0,
+            )
+            .unwrap(),
+            RelCmpOp::Subset { proper } => writeln!(
+                self.body,
+                "    {raw} = call i8 @coddl_relation_subset(ptr {lhs_op}, ptr {rhs_op}, ptr @.heading.{}, i32 {})",
+                heading_id.0,
+                u32::from(proper),
+            )
+            .unwrap(),
+        }
+        let name = format!("%v{}", dst.0);
+        writeln!(self.body, "    {name} = icmp ne i8 {raw}, 0").unwrap();
+        self.values.insert(
+            dst,
+            ValueRepr::Scalar {
+                ty: "i1".to_string(),
                 op: name,
             },
         );

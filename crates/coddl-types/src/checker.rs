@@ -4446,9 +4446,11 @@ impl TypeChecker {
         Type::Boolean
     }
 
-    /// `lhs = rhs` / `lhs <> rhs` — operands must share a scalar type
-    /// (Integer, Text, Character, Approximate, Rational, or Boolean for v1).
-    /// Result is Boolean.
+    /// `lhs = rhs` / `lhs <> rhs` — polymorphic: on scalars, operands must
+    /// share a scalar type (Integer, Text, Character, Approximate, Rational,
+    /// or Boolean for v1); on relations, observational set equality
+    /// (RM Pre 8) over identical headings (T0038 otherwise, like
+    /// `union`/`minus`). Result is Boolean.
     fn check_equality_op(&mut self, bin: &BinaryExpr, op: BinaryOp, scope: &mut Scope) -> Type {
         let lhs_ty = match bin.lhs() {
             Some(e) => self.check_expr(&e, scope),
@@ -4458,6 +4460,13 @@ impl TypeChecker {
             Some(e) => self.check_expr(&e, scope),
             None => Type::Unknown,
         };
+        // The relation overload: heading + tuple set, however the operands
+        // were built or fetched — never a representation compare.
+        if let (Type::Relation(lhs_h), Type::Relation(rhs_h)) = (&lhs_ty, &rhs_ty) {
+            let (lhs_h, rhs_h) = (lhs_h.clone(), rhs_h.clone());
+            self.identical_headings(bin, &lhs_h, &rhs_h, op_display(op));
+            return Type::Boolean;
+        }
         let supported = |t: &Type| {
             matches!(
                 t,
@@ -4476,7 +4485,7 @@ impl TypeChecker {
                 self.node_span(bin.syntax()),
                 "T0021",
                 format!(
-                    "`{opname}` operands must share a scalar type (Integer, Text, Character, Approximate, Rational, or Boolean); got {lhs_ty} vs {rhs_ty}"
+                    "`{opname}` operands must share a scalar type (Integer, Text, Character, Approximate, Rational, or Boolean) or both be relations with identical headings; got {lhs_ty} vs {rhs_ty}"
                 ),
             );
         }
@@ -4484,7 +4493,10 @@ impl TypeChecker {
     }
 
     /// `lhs < rhs` / `lhs > rhs` / `lhs <= rhs` / `lhs >= rhs` —
-    /// operands must both be Integer (Phase 20). Result is Boolean.
+    /// polymorphic: scalar ordering on two Integers or two Rationals (no
+    /// mixing), **subset / superset** on two relations with identical
+    /// headings (`<`/`>` are the strict forms; T0038 on a heading mismatch,
+    /// like `union`/`minus`). Result is Boolean.
     fn check_ordering_op(&mut self, bin: &BinaryExpr, op: BinaryOp, scope: &mut Scope) -> Type {
         let lhs_ty = match bin.lhs() {
             Some(e) => self.check_expr(&e, scope),
@@ -4494,7 +4506,14 @@ impl TypeChecker {
             Some(e) => self.check_expr(&e, scope),
             None => Type::Unknown,
         };
-        // Ordering is defined on Integer and Rational scalars (no mixing).
+        // The relation overload: `<=` is the subset test — there is no
+        // separate `subset` keyword (docs/grammar.md "Symbolic").
+        if let (Type::Relation(lhs_h), Type::Relation(rhs_h)) = (&lhs_ty, &rhs_ty) {
+            let (lhs_h, rhs_h) = (lhs_h.clone(), rhs_h.clone());
+            self.identical_headings(bin, &lhs_h, &rhs_h, op_display(op));
+            return Type::Boolean;
+        }
+        // Scalar ordering is defined on Integer and Rational (no mixing).
         // Rational compares via the runtime's cross-multiply comparator; both
         // must be the same scalar type.
         let supported = |t: &Type| matches!(t, Type::Integer | Type::Rational | Type::Unknown);
@@ -4510,7 +4529,7 @@ impl TypeChecker {
             self.error(
                 self.node_span(bin.syntax()),
                 "T0021",
-                format!("`{opname}` requires two Integer or two Rational operands; got {lhs_ty} vs {rhs_ty}"),
+                format!("`{opname}` requires two Integer or two Rational operands, or two relations with identical headings (subset/superset); got {lhs_ty} vs {rhs_ty}"),
             );
         }
         Type::Boolean
@@ -7445,6 +7464,60 @@ mod tests {
         // `1 < 3.4` mixes Integer with Rational — ordering forbids the mix.
         let src = "oper main {} [ let _b = 1 < 3.4; ];";
         assert!(codes(src).contains(&"T0021"));
+    }
+
+    #[test]
+    fn relation_equality_and_subset_typecheck() {
+        // The relation overloads: `=`/`<>` are observational set equality
+        // (RM Pre 8), `<= >= < >` the subset family — all Boolean-valued,
+        // identical headings required. No T0021, no T0038.
+        let src = "oper main {} [ \
+             let r = Relation { { a: 1 }, { a: 2 } }; \
+             let s = Relation { { a: 2 } }; \
+             let _eq = r = s; \
+             let _ne = r <> s; \
+             let _le = s <= r; \
+             let _ge = r >= s; \
+             let _lt = s < r; \
+             let _gt = r > s; \
+         ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn relation_comparison_heading_mismatch_diagnoses_t0038() {
+        // Different headings can't compare — the same rule (and code) as
+        // `union`/`minus`, naming the differing attribute.
+        let src = "oper main {} [ \
+             let r = Relation { { a: 1 } }; \
+             let s = Relation { { b: 1 } }; \
+             let _eq = r = s; \
+             let _le = r <= s; \
+         ];";
+        let cs = codes(src);
+        assert_eq!(
+            cs.iter().filter(|c| **c == "T0038").count(),
+            2,
+            "both comparisons diagnose T0038: {cs:?}"
+        );
+        assert!(!cs.contains(&"T0021"), "{cs:?}");
+    }
+
+    #[test]
+    fn relation_scalar_mix_diagnoses_t0021() {
+        // A relation against a scalar is neither overload.
+        let src = "oper main {} [ \
+             let r = Relation { { a: 1 } }; \
+             let _b = r = 1; \
+             let _c = r <= 1; \
+         ];";
+        let cs = codes(src);
+        assert_eq!(
+            cs.iter().filter(|c| **c == "T0021").count(),
+            2,
+            "both mixes diagnose T0021: {cs:?}"
+        );
     }
 
     #[test]

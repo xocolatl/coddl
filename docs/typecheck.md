@@ -505,18 +505,36 @@ each `parse_<x>` has a corresponding `check_<x>`.
   the lowerer's `value_types` map and into the backend via
   `Inst::WriteRelation`'s `heading_id` field.
 - **`check_binary_expr`** — dispatches on the parsed `BinaryOp`:
-  - **Comparison (`=`, `<>`)**: operands must share a scalar type
-    (Integer, Text, Character, Approximate, Rational, or Boolean for
-    v1). Result is `Boolean`. T0021 on mismatch. `Approximate` `=` is
-    canonicalized bit-equality (NaN → one value, `−0.0` = `+0.0`), not
-    IEEE `oeq` — so it stays reflexive for dedup/keys (RM Pro 3).
-    `Rational` `=` compares the reduced `(numer, denom)` pair (canonical
-    lowest-terms form ⇒ value-equality).
-  - **Ordering (`<`, `>`, `<=`, `>=`)**: both operands must be the same
-    scalar type — two Integer or two Rational (no mixing). Result is
-    `Boolean`. T0021 otherwise. `Rational` ordering routes through the
+  - **Comparison (`=`, `<>`)**: polymorphic (static overloading, above).
+    On scalars, operands must share a scalar type (Integer, Text,
+    Character, Approximate, Rational, or Boolean for v1); T0021 on
+    mismatch. `Approximate` `=` is canonicalized bit-equality (NaN → one
+    value, `−0.0` = `+0.0`), not IEEE `oeq` — so it stays reflexive for
+    dedup/keys (RM Pro 3). `Rational` `=` compares the reduced
+    `(numer, denom)` pair (canonical lowest-terms form ⇒ value-equality).
+    On **relations**, `=` is observational set equality (RM Pre 8:
+    heading + tuple set, however the operands were built or fetched —
+    never a payload/pointer compare); identical headings required, T0038
+    (the `union`/`minus` rule) on a mismatch. Lowering: the runtime
+    comparator checks cardinalities off the RC headers (free), then a
+    content-aware membership walk (`record_cmp` — the same cell
+    comparators seal/dedup use, so Text compares bytes, tuples recurse) —
+    two equal-size duplicate-free sets with one containing the other are
+    the same set. Result is `Boolean`.
+  - **Ordering (`<`, `>`, `<=`, `>=`)**: polymorphic. On scalars, both
+    operands must be the same scalar type — two Integer or two Rational
+    (no mixing); T0021 otherwise. `Rational` ordering routes through the
     runtime's cross-multiply comparator (`a/b ⋛ c/d ⟺ a·d ⋛ c·b`, both
-    products fitting the i128 intermediate), never lexicographic text order.
+    products fitting the i128 intermediate), never lexicographic text
+    order. On **relations**, `<=`/`>=` are subset/superset and `<`/`>`
+    the strict forms (identical headings required, T0038) — there is no
+    separate `subset` keyword. A proper subset must be strictly smaller,
+    so both forms reject on cardinality before reading a record. Result
+    is `Boolean`. In-process only for now: a comparison over pushable
+    operands forces each as its own query, then compares — the
+    Boolean-result pushdown channel (`NOT EXISTS (… EXCEPT …)`) is
+    future work, and a *bare* public-relvar operand trips the S1
+    full-pull guard rather than silently hydrating the table.
   - **Logical (`and`, `or`)**: both operands must be Boolean.
     Result is `Boolean`. T0021 otherwise. (Prefix `not` is the unary
     sibling — see `check_unary_expr` below, same T0021.)
@@ -745,7 +763,7 @@ check script enforces that.
 | T0018 | a `return` value's type doesn't match the enclosing operator's declared return type (a bare `return;` requires a Unit-returning oper). *(Reused: formerly gated a `Tuple`/`Relation` heading in an operator signature — that shape now lowers, so the code was retired and re-allocated here.)* |
 | T0019 | Tuple heading mismatch in relation literal                |
 | T0020 | `where` predicate must be Boolean                         |
-| T0021 | Scalar operator operand type mismatch                     |
+| T0021 | Comparison/logical operand type mismatch (scalars must share a type; comparisons alternatively take two same-heading relations) |
 | T0022 | Captured identifier in `where` predicate not yet supported |
 | T0023 | `where` / `project` / `replace` left operand is not a relation |
 | T0024 | `extract` operand is not a relation                       |
@@ -762,7 +780,7 @@ check script enforces that.
 | T0035 | `join`/`compose` operands share no attribute (disjoint headings) — suggest `times` |
 | T0036 | `join`/`compose`/`matching`/`not matching` shared attribute has different types on each side |
 | T0037 | `times` operands share an attribute (overlapping headings) — suggest `join` |
-| T0038 | `union`/`intersect`/`minus` operands must have identical headings |
+| T0038 | `union`/`intersect`/`minus` — and the relation comparisons `=`/`<>`/`<=`/`>=`/`<`/`>` — operands must have identical headings |
 | T0039 | `join` operands have identical headings (the join is a set intersection) — suggest `intersect` |
 | T0040 | `compose` operands have identical headings (every attribute removed, result always nullary) — suggest `intersect` |
 | T0041 | `tclose` operand must be a relation of exactly two attributes of the same type (binary graph relation) |

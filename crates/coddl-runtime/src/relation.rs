@@ -504,6 +504,114 @@ pub unsafe extern "C" fn coddl_relation_minus(
     out
 }
 
+/// Row count of a relation payload — a null pointer is the empty relation
+/// (the same convention `coddl_rc_length` and the query boundary use).
+///
+/// # Safety
+/// A non-null `p` must be a valid RC payload.
+unsafe fn payload_len(p: *const u8) -> usize {
+    if p.is_null() {
+        return 0;
+    }
+    (*(p.sub(HEADER_SIZE) as *const CoddlRcHeader)).length as usize
+}
+
+/// True iff every `lhs` record appears in `rhs` — the shared membership core
+/// of the relation comparators. Content-aware (`record_cmp`), so it is
+/// indifferent to seal state and physical row order: an unsealed SQL-fetched
+/// payload compares equal to a sealed literal holding the same tuple set
+/// (RM Pre 8 — observational, never a payload memcmp). O(n·m), the same
+/// discipline `coddl_relation_minus` uses, but allocation-free and
+/// short-circuiting on the first missing record.
+///
+/// # Safety
+/// Both payloads must be valid for their header lengths and share the `desc`
+/// layout; callers have already handled the zero-length cases, so `desc` is
+/// dereferenced unconditionally.
+unsafe fn relation_subset_core(
+    lhs: *const u8,
+    lhs_count: usize,
+    rhs: *const u8,
+    rhs_count: usize,
+    desc: *const CoddlHeadingDesc,
+) -> bool {
+    let rec = (*desc).record_size as usize;
+    let attrs = std::slice::from_raw_parts((*desc).attrs, (*desc).attr_count as usize);
+    (0..lhs_count).all(|li| {
+        let lrec = std::slice::from_raw_parts(lhs.add(li * rec), rec);
+        (0..rhs_count).any(|ri| {
+            let rrec = std::slice::from_raw_parts(rhs.add(ri * rec), rec);
+            record_cmp(lrec, rrec, attrs) == std::cmp::Ordering::Equal
+        })
+    })
+}
+
+/// Observational equality of two same-heading relations (surface `=` on
+/// relations, RM Pre 8): equal cardinalities and every `lhs` tuple present
+/// in `rhs` — two duplicate-free sets of equal size, one containing the
+/// other, are the same set. The cardinalities come free from the RC headers,
+/// so unequal sizes never scan a record. A null payload is the empty
+/// relation.
+///
+/// # Safety
+/// Non-null payloads must be valid relations sharing the `desc` layout;
+/// `desc` must be a runtime/static heading descriptor.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_relation_eq(
+    lhs: *const u8,
+    rhs: *const u8,
+    desc: *const CoddlHeadingDesc,
+) -> i8 {
+    let lhs_count = payload_len(lhs);
+    let rhs_count = payload_len(rhs);
+    if lhs_count != rhs_count {
+        return 0;
+    }
+    if lhs_count == 0 {
+        return 1;
+    }
+    if desc.is_null() {
+        eprintln!("coddl: relation `=`: null heading descriptor");
+        std::process::abort();
+    }
+    relation_subset_core(lhs, lhs_count, rhs, rhs_count, desc) as i8
+}
+
+/// Subset test on two same-heading relations (surface `<=` on relations;
+/// `proper != 0` for `<`, the strict form). A proper subset must be strictly
+/// smaller — for duplicate-free sets, `A ⊆ B ∧ |A| = |B|` already means
+/// `A = B` — so both forms reject on cardinality before any record is read.
+/// The superset spellings (`>=`, `>`) are the same call with the operands
+/// swapped by the lowerer. A null payload is the empty relation.
+///
+/// # Safety
+/// Non-null payloads must be valid relations sharing the `desc` layout;
+/// `desc` must be a runtime/static heading descriptor.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_relation_subset(
+    lhs: *const u8,
+    rhs: *const u8,
+    desc: *const CoddlHeadingDesc,
+    proper: u32,
+) -> i8 {
+    let lhs_count = payload_len(lhs);
+    let rhs_count = payload_len(rhs);
+    if proper != 0 && lhs_count >= rhs_count {
+        return 0;
+    }
+    if lhs_count > rhs_count {
+        return 0;
+    }
+    if lhs_count == 0 {
+        return 1;
+    }
+    if desc.is_null() {
+        eprintln!("coddl: relation `<=`: null heading descriptor");
+        std::process::abort();
+    }
+    relation_subset_core(lhs, lhs_count, rhs, rhs_count, desc) as i8
+}
+
 /// Transitive closure of a binary relation (surface `tclose`, Algebra-A
 /// ◄TCLOSE►) — the one genuinely irreducible relational operator. The operand
 /// is a relation of exactly two identically-typed attributes (typechecked);
@@ -1982,6 +2090,127 @@ mod tests {
             let (ptr, len) = read_text_cell(payload, 0);
             assert_eq!(std::slice::from_raw_parts(ptr, len), b"Grace");
             coddl_rc_release(payload);
+        }
+    }
+
+    #[test]
+    fn relation_eq_is_observational_not_positional() {
+        // Same tuple set, opposite physical row order, neither sealed —
+        // equality must hold (RM Pre 8): the comparison walks content, never
+        // payload bytes. Heading {a: Integer}, record_size 8.
+        let attrs = [CoddlAttrDesc {
+            name: b"a".as_ptr(),
+            name_len: 1,
+            kind: CoddlAttrKind::Integer as u32,
+            offset: 0,
+            sub: std::ptr::null(),
+        }];
+        let desc = CoddlHeadingDesc {
+            attr_count: 1,
+            record_size: 8,
+            attrs: attrs.as_ptr(),
+        };
+        unsafe {
+            let build = |vals: &[i64]| -> *mut u8 {
+                let p = coddl_rc_alloc(
+                    vals.len() * 8,
+                    vals.len() as u32,
+                    CoddlKind::Relation as u32,
+                    &desc as *const CoddlHeadingDesc,
+                );
+                for (i, v) in vals.iter().enumerate() {
+                    std::ptr::write(p.add(i * 8) as *mut i64, *v);
+                }
+                p
+            };
+            let fwd = build(&[1, 2, 3]);
+            let rev = build(&[3, 2, 1]);
+            let sub = build(&[3, 1]);
+            let other = build(&[1, 2, 4]);
+            let d = &desc as *const CoddlHeadingDesc;
+            assert_eq!(coddl_relation_eq(fwd, rev, d), 1, "order-insensitive");
+            assert_eq!(coddl_relation_eq(fwd, sub, d), 0, "cardinality fast-path");
+            assert_eq!(
+                coddl_relation_eq(fwd, other, d),
+                0,
+                "same size, different set"
+            );
+            // Subset family: {3,1} ⊆ {1,2,3}, properly; a set is a subset
+            // but never a proper subset of itself.
+            assert_eq!(coddl_relation_subset(sub, fwd, d, 0), 1);
+            assert_eq!(coddl_relation_subset(sub, fwd, d, 1), 1);
+            assert_eq!(coddl_relation_subset(fwd, rev, d, 0), 1);
+            assert_eq!(
+                coddl_relation_subset(fwd, rev, d, 1),
+                0,
+                "equal sets are not proper"
+            );
+            assert_eq!(
+                coddl_relation_subset(fwd, sub, d, 0),
+                0,
+                "larger can't be subset"
+            );
+            assert_eq!(coddl_relation_subset(other, fwd, d, 0), 0, "4 is missing");
+            // Null payloads are the empty relation: {} = {}, {} ⊆ R, {} ⊂ R
+            // (nonempty R), R ⊄ {} — and {} ⊄ {}.
+            let null = std::ptr::null();
+            assert_eq!(coddl_relation_eq(null, null, d), 1);
+            assert_eq!(coddl_relation_subset(null, fwd, d, 0), 1);
+            assert_eq!(coddl_relation_subset(null, fwd, d, 1), 1);
+            assert_eq!(coddl_relation_subset(fwd, null, d, 0), 0);
+            assert_eq!(coddl_relation_subset(null, null, d, 1), 0);
+            for p in [fwd, rev, sub, other] {
+                coddl_rc_release(p);
+            }
+        }
+    }
+
+    #[test]
+    fn relation_eq_compares_text_cells_by_content() {
+        // Equal tuple sets whose Text cells live in distinct allocations —
+        // a fat-pointer compare would call them different. Heading
+        // {name: Text}: (ptr@0, len@8), record_size 16.
+        let attrs = [CoddlAttrDesc {
+            name: b"name".as_ptr(),
+            name_len: 4,
+            kind: CoddlAttrKind::Text as u32,
+            offset: 0,
+            sub: std::ptr::null(),
+        }];
+        let desc = CoddlHeadingDesc {
+            attr_count: 1,
+            record_size: 16,
+            attrs: attrs.as_ptr(),
+        };
+        unsafe {
+            let build = |names: &[&[u8]]| -> *mut u8 {
+                let p = coddl_rc_alloc(
+                    names.len() * 16,
+                    names.len() as u32,
+                    CoddlKind::Relation as u32,
+                    &desc as *const CoddlHeadingDesc,
+                );
+                for (i, s) in names.iter().enumerate() {
+                    let rec = p.add(i * 16);
+                    std::ptr::write(rec as *mut usize, immortal_text(s) as usize);
+                    std::ptr::write(rec.add(8) as *mut usize, s.len());
+                }
+                p
+            };
+            let a = build(&[b"Ada", b"Grace"]);
+            let b = build(&[b"Grace", b"Ada"]); // distinct pointers, reversed order
+            let c = build(&[b"Ada", b"Zoe"]);
+            let d = &desc as *const CoddlHeadingDesc;
+            assert_eq!(coddl_relation_eq(a, b, d), 1, "content-equal Text cells");
+            assert_eq!(coddl_relation_eq(a, c, d), 0);
+            assert_eq!(
+                coddl_relation_subset(a, b, d, 1),
+                0,
+                "equal sets are not proper"
+            );
+            for p in [a, b, c] {
+                coddl_rc_release(p);
+            }
         }
     }
 
