@@ -36,6 +36,20 @@
 //! unspecified.) The SQL path does **not** seal: the backend already
 //! returns a duplicate-free set (see `sqlite::finalize_relation`).
 //!
+//! ## Relation-valued cells: the seal invariant
+//!
+//! Every relation payload stored into a **cell** (a `Relation`-kind
+//! attribute) is sealed — canonical `record_cmp`-sorted, duplicate-free —
+//! at construction. [`cmp_cell`]'s `Relation` arm relies on it: it compares
+//! two nested payloads record-by-record in stored order (cardinality
+//! first), which is a total order agreeing with observational set equality
+//! (RM Pre 8) *only* when both payloads are canonical. Construction sites:
+//! [`coddl_relation_group`] seals each nested payload it builds; cell
+//! copies (project / join / restructure / ungroup survivors) move the
+//! pointer, preserving the invariant; the web host seals the `Request`
+//! relations it hand-builds. Any future path that stores a relation into a
+//! cell (e.g. an SQL result) must seal at the store boundary.
+//!
 //! ## Printer
 //!
 //! [`coddl_write_relation`] prints one tuple per line as
@@ -847,7 +861,14 @@ unsafe fn print_nested_relation<W: Write>(w: &mut W, ptr: *const u8) {
     }
     let count = (*header).length as usize;
     let record_size = (*desc).record_size as usize;
-    let attrs = std::slice::from_raw_parts((*desc).attrs, (*desc).attr_count as usize);
+    // A nullary nested relation (a reltrue/relfalse cell, e.g. from
+    // `group { g: {} }`) may carry a null `attrs` pointer; its records are
+    // zero-width empty tuples, which `print_record` renders as `{}`.
+    let attrs = if (*desc).attr_count == 0 || (*desc).attrs.is_null() {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts((*desc).attrs, (*desc).attr_count as usize)
+    };
     let payload = std::slice::from_raw_parts(ptr, count * record_size);
     let _ = w.write_all(b"{");
     for record_idx in 0..count {
@@ -1351,6 +1372,12 @@ unsafe fn retain_text_cells(payload: *mut u8, count: usize, desc: *const CoddlHe
     if payload.is_null() || desc.is_null() {
         return;
     }
+    // A nullary heading (`Relation {}`) has no cells to retain — and its
+    // descriptor may carry a null `attrs` pointer, which `from_raw_parts`
+    // rejects even at length 0.
+    if (*desc).attr_count == 0 || (*desc).attrs.is_null() {
+        return;
+    }
     let record_size = (*desc).record_size as usize;
     let attrs = std::slice::from_raw_parts((*desc).attrs, (*desc).attr_count as usize);
     for i in 0..count {
@@ -1378,9 +1405,10 @@ unsafe fn release_record_text_cells(rec: *mut u8, attrs: &[CoddlAttrDesc]) {
 /// *content* (not the `(ptr, len)` fat pointer); scalars by their fixed-width
 /// bytes; a `Tuple` cell recurses over its inline sub-region's components,
 /// advancing each side's offset (so two tuple cells with equal Text content but
-/// different pointers compare `Equal`). Unifies the equality logic for
-/// `record_cmp` (same offset both sides), `join` (shared key at differing
-/// offsets), and `tclose` (edge match).
+/// different pointers compare `Equal`); a `Relation` cell compares its nested
+/// payload's content via [`cmp_nested_relation`] (never the payload pointer).
+/// Unifies the equality logic for `record_cmp` (same offset both sides), `join`
+/// (shared key at differing offsets), and `tclose` (edge match).
 ///
 /// # Safety
 /// `ra`/`rb` must hold a record whose layout matches `attr` (and its `sub`) at
@@ -1421,10 +1449,72 @@ unsafe fn cmp_cell(
             }
         }
         Ordering::Equal
+    } else if attr.kind == CoddlAttrKind::Relation as u32 {
+        // A relation-valued cell compares by nested *content*, never by its
+        // payload pointer — two cells holding equal sets built from different
+        // sources must compare `Equal` (RM Pre 8), or seal/dedup/join over
+        // RVA-bearing records is wrong.
+        let pa = read_ptr_cell(ra.as_ptr(), off_a);
+        let pb = read_ptr_cell(rb.as_ptr(), off_b);
+        cmp_nested_relation(pa, pb)
     } else {
         let w = cell_width(attr.kind);
         ra[off_a..off_a + w].cmp(&rb[off_b..off_b + w])
     }
+}
+
+/// Total order on two relation-valued cells (nested payload pointers):
+/// cardinality first, then record-by-record `record_cmp` in stored order.
+/// Both payloads are **sealed** (canonical order — the cell seal invariant,
+/// see the module header), so lexicographic comparison agrees with
+/// observational set equality: equal sets are byte-identical record
+/// sequences up to `Text`/nested pointers, which `record_cmp` chases by
+/// content. Recurses through arbitrarily deep nesting (a nested record's own
+/// `Relation` cells come back through [`cmp_cell`]). A null payload is the
+/// empty relation (the `payload_len` convention), so null and a zero-length
+/// payload compare `Equal`. The layout comes from the first payload's RC
+/// header (self-describing, like [`print_nested_relation`]); the two descs
+/// may be distinct pointers but describe the same heading, since the cells
+/// share an attribute type.
+///
+/// # Safety
+/// Non-null pointers must be live relation payloads whose RC headers hold a
+/// valid `desc` matching the shared attribute type.
+unsafe fn cmp_nested_relation(pa: *const u8, pb: *const u8) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if pa == pb {
+        return Ordering::Equal;
+    }
+    let la = payload_len(pa);
+    let lb = payload_len(pb);
+    let ord = la.cmp(&lb);
+    if ord != Ordering::Equal {
+        return ord;
+    }
+    if la == 0 {
+        return Ordering::Equal;
+    }
+    let header = pa.sub(HEADER_SIZE) as *const CoddlRcHeader;
+    let desc = (*header).desc;
+    if desc.is_null() {
+        // Descriptor-less payloads are opaque; treat as equal defensively.
+        return Ordering::Equal;
+    }
+    let rec = (*desc).record_size as usize;
+    if rec == 0 {
+        // Nullary relations of equal cardinality are the same relation.
+        return Ordering::Equal;
+    }
+    let attrs = std::slice::from_raw_parts((*desc).attrs, (*desc).attr_count as usize);
+    for i in 0..la {
+        let ra = std::slice::from_raw_parts(pa.add(i * rec), rec);
+        let rb = std::slice::from_raw_parts(pb.add(i * rec), rec);
+        let ord = record_cmp(ra, rb, attrs);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
 }
 
 /// Total order on two records (`ra`, `rb`, same `attrs` layout) by walking
@@ -1865,6 +1955,419 @@ pub unsafe extern "C" fn coddl_relation_restructure(
         let out_header = out.sub(HEADER_SIZE) as *mut CoddlRcHeader;
         (*out_header).length = u32::from(count > 0);
     } else {
+        coddl_relation_seal(out, dst_desc);
+    }
+    out
+}
+
+/// Nest a relation (surface `group` — TTM GROUP, RM Pre 7's relational
+/// "nest"). The attributes consumed into each new relation-valued attribute
+/// are `dst_desc`'s attrs at `rva_idx[j]` (their component headings are
+/// `inner_descs[j]`); the *other* `dst_desc` attrs — the survivors — partition
+/// `src`. The result holds one record per distinct survivor combination, its
+/// `j`-th RVA cell a fresh **sealed** nested payload of that partition's
+/// component sub-tuples (the cell seal invariant, see the module header).
+/// Multi-pair `group` is simultaneous: one partition by the common survivors,
+/// each pair nesting its own components — a pair's nested payload is a
+/// *projection* of the partition, so its seal genuinely dedups. Returns a
+/// fresh RC-managed relation (rc=1); `src` is unchanged.
+///
+/// The RVA attrs are named by **index** (`rva_idx` into `dst_desc.attrs`),
+/// not by name-diffing the descriptors — a new RVA may shadow a consumed
+/// attribute's name (`R group { pq: { pq } }`), which a name diff cannot
+/// distinguish. Survivors and components resolve to their `src` offsets by
+/// name (unique within a heading, and never shadowed once the RVA attrs are
+/// excluded by index).
+///
+/// No top-level seal: the output is distinct by construction (one record per
+/// distinct survivor combination). Its record order — survivor-sorted — is an
+/// implementation byproduct, not meaningful (RM Pro 1). Zero survivors
+/// (`group` consuming every attribute) yields one run, so cardinality ≤ 1
+/// falls out; an empty component list makes each nested payload collapse to
+/// `reltrue` under its zero-width seal.
+///
+/// # Safety
+/// `src` must point to a `Relation` payload from `coddl_rc_alloc` whose header
+/// carries `src_desc`. All descriptors, `rva_idx`, and `inner_descs` (each of
+/// length `rva_count`) must outlive the returned relation (read-only data
+/// symbols the codegen emitted — a nested payload's RC header keeps its
+/// `inner_descs[j]` pointer).
+#[no_mangle]
+pub unsafe extern "C" fn coddl_relation_group(
+    src: *const u8,
+    src_desc: *const CoddlHeadingDesc,
+    dst_desc: *const CoddlHeadingDesc,
+    rva_idx: *const u32,
+    inner_descs: *const *const CoddlHeadingDesc,
+    rva_count: usize,
+) -> *mut u8 {
+    if src.is_null() || src_desc.is_null() || dst_desc.is_null() {
+        return std::ptr::null_mut();
+    }
+    if rva_count > 0 && (rva_idx.is_null() || inner_descs.is_null()) {
+        return std::ptr::null_mut();
+    }
+    let header = src.sub(HEADER_SIZE) as *const CoddlRcHeader;
+    let count = (*header).length as usize;
+    let src_record_size = (*src_desc).record_size as usize;
+    let dst_record_size = (*dst_desc).record_size as usize;
+
+    let src_attrs = std::slice::from_raw_parts((*src_desc).attrs, (*src_desc).attr_count as usize);
+    let dst_attrs = std::slice::from_raw_parts((*dst_desc).attrs, (*dst_desc).attr_count as usize);
+    let rva_idx = std::slice::from_raw_parts(rva_idx, rva_count);
+    let inner_descs = std::slice::from_raw_parts(inner_descs, rva_count);
+    if rva_idx.iter().any(|&i| (i as usize) >= dst_attrs.len()) {
+        return std::ptr::null_mut();
+    }
+
+    let find_src = |name: *const u8, len: u32| {
+        let n = std::slice::from_raw_parts(name, len as usize);
+        src_attrs
+            .iter()
+            .find(|s| std::slice::from_raw_parts(s.name, s.name_len as usize) == n)
+    };
+
+    // Survivors: every dst attr not named an RVA by `rva_idx`. Each resolves
+    // to its src twin by name — `(src_attr, src_off, dst_off, width)`; the
+    // src-side descriptor drives the partition sort (`cmp_cell` needs the
+    // operand's offsets and sub-layout).
+    let mut survivors: Vec<(&CoddlAttrDesc, usize, usize, usize)> = Vec::new();
+    for (di, d) in dst_attrs.iter().enumerate() {
+        if rva_idx.contains(&(di as u32)) {
+            continue;
+        }
+        // A well-typed group always finds the survivor in src; skip
+        // defensively if a malformed descriptor set ever doesn't.
+        if let Some(s) = find_src(d.name, d.name_len) {
+            survivors.push((s, s.offset as usize, d.offset as usize, cell_width_desc(d)));
+        }
+    }
+
+    // Per pair `j`: the component moves `(src_off, inner_off, width)` and the
+    // nested record size.
+    let mut pairs: Vec<(usize, Vec<(usize, usize, usize)>)> = Vec::with_capacity(rva_count);
+    for &inner in inner_descs {
+        // An empty component list (`group { g: {} }`) has no attrs to walk —
+        // and `from_raw_parts` requires a non-null pointer even at length 0.
+        if inner.is_null() || (*inner).attr_count == 0 || (*inner).attrs.is_null() {
+            pairs.push((
+                inner.as_ref().map_or(0, |d| d.record_size as usize),
+                Vec::new(),
+            ));
+            continue;
+        }
+        let inner_attrs = std::slice::from_raw_parts((*inner).attrs, (*inner).attr_count as usize);
+        let mut moves: Vec<(usize, usize, usize)> = Vec::with_capacity(inner_attrs.len());
+        for c in inner_attrs {
+            if let Some(s) = find_src(c.name, c.name_len) {
+                moves.push((s.offset as usize, c.offset as usize, cell_width_desc(c)));
+            }
+        }
+        pairs.push(((*inner).record_size as usize, moves));
+    }
+
+    // Sort record indices by the survivor cells only — the partition order.
+    // Content-aware (`cmp_cell`), so Text survivors partition by string
+    // content and RVA survivors (a chained group) by nested content.
+    let mut indices: Vec<usize> = (0..count).collect();
+    indices.sort_by(|&a, &b| {
+        let ra = std::slice::from_raw_parts(src.add(a * src_record_size), src_record_size);
+        let rb = std::slice::from_raw_parts(src.add(b * src_record_size), src_record_size);
+        for &(s, s_off, _, _) in &survivors {
+            let ord = cmp_cell(ra, s_off, rb, s_off, s);
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+
+    // Worst-case output (`count` runs); the header length is trimmed after.
+    let out = crate::rc::coddl_rc_alloc(
+        dst_record_size * count,
+        count as u32,
+        crate::rc::CoddlKind::Relation as u32,
+        dst_desc,
+    );
+    if out.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    let survivors_equal = |a: usize, b: usize| {
+        let ra = std::slice::from_raw_parts(src.add(a * src_record_size), src_record_size);
+        let rb = std::slice::from_raw_parts(src.add(b * src_record_size), src_record_size);
+        survivors
+            .iter()
+            .all(|&(s, s_off, _, _)| cmp_cell(ra, s_off, rb, s_off, s) == std::cmp::Ordering::Equal)
+    };
+
+    let mut run_count = 0usize;
+    let mut run_start = 0usize;
+    while run_start < count {
+        let mut run_end = run_start + 1;
+        while run_end < count && survivors_equal(indices[run_start], indices[run_end]) {
+            run_end += 1;
+        }
+        let m = run_end - run_start;
+        let dst_rec = out.add(run_count * dst_record_size);
+
+        // Survivor cells: copy from the run's representative record, then
+        // retain each survivor attr individually — the RVA cells written next
+        // are moved in (rc = 1), and a whole-record retain would double-count
+        // them.
+        let rep = src.add(indices[run_start] * src_record_size);
+        for &(_, s_off, d_off, w) in &survivors {
+            std::ptr::copy_nonoverlapping(rep.add(s_off), dst_rec.add(d_off), w);
+        }
+        for (di, d) in dst_attrs.iter().enumerate() {
+            if rva_idx.contains(&(di as u32)) {
+                continue;
+            }
+            // Walk one survivor cell at a time (a single-attr view at its dst
+            // offset): recurses Tuple sub-regions, hands Text / Relation
+            // pointers to retain.
+            walk_text_cells(dst_rec, std::slice::from_ref(d), 0, &mut |p| {
+                crate::rc::coddl_rc_retain(p)
+            });
+        }
+
+        // Per pair: build the run's nested payload, retain its copied cells,
+        // seal it (canonical order — the cell invariant — and a real dedup:
+        // the pair's components are a projection of the partition), and move
+        // the pointer in.
+        for (j, &(inner_rec, ref moves)) in pairs.iter().enumerate() {
+            let inner_desc = inner_descs[j];
+            let cell = dst_rec.add(dst_attrs[rva_idx[j] as usize].offset as usize) as *mut *mut u8;
+            let inner = crate::rc::coddl_rc_alloc(
+                inner_rec * m,
+                m as u32,
+                crate::rc::CoddlKind::Relation as u32,
+                inner_desc,
+            );
+            if inner.is_null() {
+                // Allocation failure: the payload is uninitialized memory, so
+                // the cell must not be left as garbage for the drop walker —
+                // null is the empty relation.
+                cell.write(std::ptr::null_mut());
+                continue;
+            }
+            for (k, &si) in indices[run_start..run_end].iter().enumerate() {
+                let src_rec = src.add(si * src_record_size);
+                let inner_out = inner.add(k * inner_rec);
+                for &(s_off, i_off, w) in moves {
+                    std::ptr::copy_nonoverlapping(src_rec.add(s_off), inner_out.add(i_off), w);
+                }
+            }
+            retain_text_cells(inner, m, inner_desc);
+            if inner_rec == 0 {
+                // Empty component list: every sub-record is the empty tuple, so
+                // the payload collapses to `reltrue` (seal can't dedup
+                // zero-width records).
+                let inner_header = inner.sub(HEADER_SIZE) as *mut CoddlRcHeader;
+                (*inner_header).length = u32::from(m > 0);
+            } else {
+                coddl_relation_seal(inner, inner_desc);
+            }
+            cell.write(inner);
+        }
+
+        run_count += 1;
+        run_start = run_end;
+    }
+
+    let out_header = out.sub(HEADER_SIZE) as *mut CoddlRcHeader;
+    (*out_header).length = run_count as u32;
+    out
+}
+
+/// Unnest a relation (surface `ungroup` — TTM UNGROUP, RM Pre 7's relational
+/// "unnest"). The relation-valued attributes at `rva_idx` (indices into
+/// `src_desc.attrs` — by index, not name diff, for the same shadowing reason
+/// as [`coddl_relation_group`]) are consumed: each src record contributes one
+/// output record per combination of tuples drawn from its RVA cells (a
+/// per-record cartesian product for the multi-name form, so `ungroup {a, b}`
+/// ≡ `ungroup {a} ungroup {b}` in either order), alongside its surviving
+/// cells. A record whose RVA cell is empty (or null) contributes nothing —
+/// TTM's empty-RVA rule. Returns a fresh RC-managed **sealed** relation
+/// (rc=1); `src` is unchanged.
+///
+/// The seal is mandatory: two src records equal on the survivors with
+/// overlapping nested sets produce genuine duplicates. Nested payloads are
+/// read through their own RC-header descriptors (self-describing); records of
+/// one relation type share their layout (`record_layout` is deterministic),
+/// so the per-RVA move lists are computed once, from the first non-empty
+/// payload.
+///
+/// # Safety
+/// `src` must point to a `Relation` payload from `coddl_rc_alloc` whose
+/// header carries `src_desc`; every RVA cell must hold null or a live
+/// relation payload. Descriptors and `rva_idx` (length `rva_count`) must
+/// outlive this call.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_relation_ungroup(
+    src: *const u8,
+    src_desc: *const CoddlHeadingDesc,
+    dst_desc: *const CoddlHeadingDesc,
+    rva_idx: *const u32,
+    rva_count: usize,
+) -> *mut u8 {
+    if src.is_null() || src_desc.is_null() || dst_desc.is_null() {
+        return std::ptr::null_mut();
+    }
+    if rva_count > 0 && rva_idx.is_null() {
+        return std::ptr::null_mut();
+    }
+    let header = src.sub(HEADER_SIZE) as *const CoddlRcHeader;
+    let count = (*header).length as usize;
+    let src_record_size = (*src_desc).record_size as usize;
+    let dst_record_size = (*dst_desc).record_size as usize;
+
+    let src_attrs = std::slice::from_raw_parts((*src_desc).attrs, (*src_desc).attr_count as usize);
+    let dst_attrs = std::slice::from_raw_parts((*dst_desc).attrs, (*dst_desc).attr_count as usize);
+    let rva_idx = std::slice::from_raw_parts(rva_idx, rva_count);
+    if rva_idx.iter().any(|&i| (i as usize) >= src_attrs.len()) {
+        return std::ptr::null_mut();
+    }
+
+    let find_dst = |name: *const u8, len: u32| {
+        let n = std::slice::from_raw_parts(name, len as usize);
+        dst_attrs
+            .iter()
+            .find(|d| std::slice::from_raw_parts(d.name, d.name_len as usize) == n)
+    };
+
+    // Survivor moves `(src_off, dst_off, width)`: every src attr not consumed
+    // by `rva_idx`, resolved to dst by name.
+    let mut survivor_moves: Vec<(usize, usize, usize)> = Vec::new();
+    for (si, s) in src_attrs.iter().enumerate() {
+        if rva_idx.contains(&(si as u32)) {
+            continue;
+        }
+        if let Some(d) = find_dst(s.name, s.name_len) {
+            survivor_moves.push((s.offset as usize, d.offset as usize, cell_width_desc(d)));
+        }
+    }
+
+    // The RVA cells' record offsets, and per-RVA inner state filled lazily
+    // from the first non-empty payload: `(inner_record_size, inner moves
+    // (payload_off, dst_off, width))`.
+    let rva_offs: Vec<usize> = rva_idx
+        .iter()
+        .map(|&i| src_attrs[i as usize].offset as usize)
+        .collect();
+    let mut inner: Vec<Option<(usize, Vec<(usize, usize, usize)>)>> = vec![None; rva_count];
+
+    // Sizing pass: each record contributes the product of its RVA cell
+    // cardinalities (an empty or null cell zeroes it — the TTM rule).
+    let mut total = 0usize;
+    for i in 0..count {
+        let rec = src.add(i * src_record_size);
+        let mut contrib = 1usize;
+        for (j, &off) in rva_offs.iter().enumerate() {
+            let p = read_ptr_cell(rec, off);
+            let n = payload_len(p);
+            contrib *= n;
+            if n > 0 && inner[j].is_none() {
+                let ph = p.sub(HEADER_SIZE) as *const CoddlRcHeader;
+                let pdesc = (*ph).desc;
+                if pdesc.is_null() {
+                    // A descriptor-less payload is opaque; drop the record
+                    // defensively (well-typed code never builds one).
+                    contrib = 0;
+                } else {
+                    let pattrs =
+                        std::slice::from_raw_parts((*pdesc).attrs, (*pdesc).attr_count as usize);
+                    let mut moves: Vec<(usize, usize, usize)> = Vec::with_capacity(pattrs.len());
+                    for a in pattrs {
+                        if let Some(d) = find_dst(a.name, a.name_len) {
+                            moves.push((a.offset as usize, d.offset as usize, cell_width_desc(d)));
+                        }
+                    }
+                    inner[j] = Some(((*pdesc).record_size as usize, moves));
+                }
+            }
+            if contrib == 0 {
+                break;
+            }
+        }
+        total += contrib;
+    }
+
+    let out = crate::rc::coddl_rc_alloc(
+        dst_record_size * total,
+        total as u32,
+        crate::rc::CoddlKind::Relation as u32,
+        dst_desc,
+    );
+    if out.is_null() {
+        return std::ptr::null_mut();
+    }
+    if total == 0 {
+        return out;
+    }
+
+    // Fill pass: odometer over the RVA cells' record indices.
+    let mut written = 0usize;
+    let mut cursor: Vec<usize> = vec![0; rva_count];
+    let mut payloads: Vec<(*const u8, usize)> = Vec::with_capacity(rva_count);
+    for i in 0..count {
+        let rec = src.add(i * src_record_size);
+        payloads.clear();
+        payloads.extend(rva_offs.iter().map(|&off| {
+            let p = read_ptr_cell(rec, off);
+            (p as *const u8, payload_len(p))
+        }));
+        if payloads.iter().any(|&(_, n)| n == 0) {
+            continue;
+        }
+        cursor.iter_mut().for_each(|c| *c = 0);
+        loop {
+            let dst_rec = out.add(written * dst_record_size);
+            for &(s_off, d_off, w) in &survivor_moves {
+                std::ptr::copy_nonoverlapping(rec.add(s_off), dst_rec.add(d_off), w);
+            }
+            for (j, &(p, _)) in payloads.iter().enumerate() {
+                if let Some((prec, ref moves)) = inner[j] {
+                    let prow = p.add(cursor[j] * prec);
+                    for &(p_off, d_off, w) in moves {
+                        std::ptr::copy_nonoverlapping(prow.add(p_off), dst_rec.add(d_off), w);
+                    }
+                }
+            }
+            written += 1;
+
+            // Advance the odometer; done when it wraps.
+            let mut j = 0;
+            loop {
+                if j == rva_count {
+                    break;
+                }
+                cursor[j] += 1;
+                if cursor[j] < payloads[j].1 {
+                    break;
+                }
+                cursor[j] = 0;
+                j += 1;
+            }
+            if j == rva_count {
+                break;
+            }
+        }
+    }
+
+    // Every copied cell — survivor and inner-sourced alike — is a borrow, so
+    // the uniform whole-record retain is correct here (contrast `group`, which
+    // moves fresh payloads in).
+    retain_text_cells(out, written, dst_desc);
+
+    if dst_record_size == 0 {
+        // Unnesting to an empty heading: collapse to reltrue/relfalse (seal
+        // can't dedup zero-width records).
+        let out_header = out.sub(HEADER_SIZE) as *mut CoddlRcHeader;
+        (*out_header).length = u32::from(written > 0);
+    } else {
+        let out_header = out.sub(HEADER_SIZE) as *mut CoddlRcHeader;
+        (*out_header).length = written as u32;
         coddl_relation_seal(out, dst_desc);
     }
     out
@@ -3833,6 +4336,535 @@ mod tests {
             coddl_rc_release(rel);
             coddl_rc_release(seq);
             coddl_rc_release(src);
+        }
+    }
+
+    // ── group / ungroup (relation-valued attributes) ──────────────────
+
+    /// Integer attr at `offset`, named by a static byte string.
+    fn int_attr(name: &'static [u8], offset: u32) -> CoddlAttrDesc {
+        CoddlAttrDesc {
+            name: name.as_ptr(),
+            name_len: name.len() as u32,
+            kind: CoddlAttrKind::Integer as u32,
+            offset,
+            sub: std::ptr::null(),
+        }
+    }
+
+    /// Relation attr (RVA cell) at `offset` — `sub` is null by invariant.
+    fn rel_attr(name: &'static [u8], offset: u32) -> CoddlAttrDesc {
+        CoddlAttrDesc {
+            name: name.as_ptr(),
+            name_len: name.len() as u32,
+            kind: CoddlAttrKind::Relation as u32,
+            offset,
+            sub: std::ptr::null(),
+        }
+    }
+
+    /// Text attr at `offset`.
+    fn text_attr(name: &'static [u8], offset: u32) -> CoddlAttrDesc {
+        CoddlAttrDesc {
+            name: name.as_ptr(),
+            name_len: name.len() as u32,
+            kind: CoddlAttrKind::Text as u32,
+            offset,
+            sub: std::ptr::null(),
+        }
+    }
+
+    /// Allocate a `{k, x, y}` (3 × Integer, record 24) relation from rows.
+    unsafe fn kxy_src(rows: &[(i64, i64, i64)], desc: *const CoddlHeadingDesc) -> *mut u8 {
+        let p = coddl_rc_alloc(
+            rows.len() * 24,
+            rows.len() as u32,
+            CoddlKind::Relation as u32,
+            desc,
+        );
+        for (i, &(k, x, y)) in rows.iter().enumerate() {
+            std::ptr::write(p.add(i * 24) as *mut i64, k);
+            std::ptr::write(p.add(i * 24 + 8) as *mut i64, x);
+            std::ptr::write(p.add(i * 24 + 16) as *mut i64, y);
+        }
+        p
+    }
+
+    /// Render every record of a relation payload as one string per record.
+    unsafe fn render(rel: *const u8, desc: *const CoddlHeadingDesc) -> Vec<String> {
+        let count = (*(rel.sub(HEADER_SIZE) as *const CoddlRcHeader)).length as usize;
+        let rec = (*desc).record_size as usize;
+        let attrs = std::slice::from_raw_parts((*desc).attrs, (*desc).attr_count as usize);
+        (0..count)
+            .map(|i| {
+                let mut buf: Vec<u8> = Vec::new();
+                let record = std::slice::from_raw_parts(rel.add(i * rec), rec);
+                print_record(&mut buf, attrs, record);
+                String::from_utf8(buf).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cmp_cell_relation_compares_nested_content_not_pointer() {
+        use std::cmp::Ordering;
+        unsafe {
+            // Two pointer-distinct payloads with equal content compare Equal…
+            let (p1, d1, _a1) = inner_relation();
+            let (p2, d2, _a2) = inner_relation();
+            assert_ne!(p1, p2);
+            assert_eq!(cmp_nested_relation(p1, p2), Ordering::Equal);
+
+            // …and a differing record orders consistently (antisymmetric).
+            std::ptr::write(p2.add(8) as *mut i64, 9); // {1, 2} vs {1, 9}
+            let ord = cmp_nested_relation(p1, p2);
+            assert_eq!(ord, Ordering::Less);
+            assert_eq!(cmp_nested_relation(p2, p1), Ordering::Greater);
+
+            // Cardinality decides before any record is read.
+            let empty = coddl_rc_alloc(0, 0, CoddlKind::Relation as u32, &*d1);
+            assert_eq!(cmp_nested_relation(p1, empty), Ordering::Greater);
+
+            // Null is the empty relation: null vs zero-length compare Equal.
+            assert_eq!(
+                cmp_nested_relation(std::ptr::null(), empty),
+                Ordering::Equal
+            );
+
+            // Through the `cmp_cell` dispatch (the arm the seal sort uses).
+            let (cell1, attr) = relation_cell(p1);
+            let (cell2, _) = relation_cell(p2);
+            assert_ne!(
+                cmp_cell(&cell1, 0, &cell2, 0, &attr),
+                Ordering::Equal,
+                "differing nested content must not compare Equal"
+            );
+
+            coddl_rc_release(empty);
+            coddl_rc_release(p1);
+            coddl_rc_release(p2);
+            drop((d1, d2));
+        }
+    }
+
+    #[test]
+    fn seal_dedups_records_equal_up_to_nested_payload_pointer() {
+        // Two records whose only difference is *which* payload their RVA cell
+        // points at — same nested content. A pointer compare would keep both;
+        // the content-aware Relation arm must dedup to one.
+        unsafe {
+            let (p1, d1, _a1) = inner_relation();
+            let (p2, d2, _a2) = inner_relation();
+            let outer_attrs = [rel_attr(b"items", 0)];
+            let outer_desc = CoddlHeadingDesc {
+                attr_count: 1,
+                record_size: 8,
+                attrs: outer_attrs.as_ptr(),
+            };
+            let rel = coddl_rc_alloc(2 * 8, 2, CoddlKind::Relation as u32, &outer_desc);
+            // Move both payloads in (rc = 1 each); dedup releases the loser's.
+            (rel as *mut *mut u8).write(p1);
+            (rel.add(8) as *mut *mut u8).write(p2);
+            coddl_relation_seal(rel, &outer_desc);
+            let header = rel.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*header).length, 1, "content-equal RVA records dedup");
+            coddl_rc_release(rel);
+            drop((d1, d2));
+        }
+    }
+
+    #[test]
+    fn group_partitions_by_survivors_and_seals_nested_payloads() {
+        let src_attrs = [int_attr(b"k", 0), int_attr(b"x", 8), int_attr(b"y", 16)];
+        let src_desc = CoddlHeadingDesc {
+            attr_count: 3,
+            record_size: 24,
+            attrs: src_attrs.as_ptr(),
+        };
+        // dst `{k, pq}` name-sorted: k@0 (Integer), pq@8 (Relation); rva_idx=[1].
+        let dst_attrs = [int_attr(b"k", 0), rel_attr(b"pq", 8)];
+        let dst_desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 16,
+            attrs: dst_attrs.as_ptr(),
+        };
+        let inner_attrs = [int_attr(b"x", 0), int_attr(b"y", 8)];
+        let inner_desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 16,
+            attrs: inner_attrs.as_ptr(),
+        };
+        unsafe {
+            // Rows deliberately out of partition order.
+            let src = kxy_src(&[(2, 50, 60), (1, 30, 40), (1, 10, 20)], &src_desc);
+            let out = coddl_relation_group(
+                src,
+                &src_desc,
+                &dst_desc,
+                [1u32].as_ptr(),
+                [&inner_desc as *const CoddlHeadingDesc].as_ptr(),
+                1,
+            );
+            assert!(!out.is_null());
+            assert_eq!(
+                render(out, &dst_desc),
+                [
+                    "{k: 1, pq: {{x: 10, y: 20}, {x: 30, y: 40}}}",
+                    "{k: 2, pq: {{x: 50, y: 60}}}",
+                ],
+                "one record per distinct survivor, nested payloads sealed"
+            );
+            coddl_rc_release(out);
+            coddl_rc_release(src);
+        }
+    }
+
+    #[test]
+    fn group_consuming_every_attribute_yields_at_most_one_tuple() {
+        let src_attrs = [int_attr(b"k", 0), int_attr(b"x", 8), int_attr(b"y", 16)];
+        let src_desc = CoddlHeadingDesc {
+            attr_count: 3,
+            record_size: 24,
+            attrs: src_attrs.as_ptr(),
+        };
+        let dst_attrs = [rel_attr(b"g", 0)];
+        let dst_desc = CoddlHeadingDesc {
+            attr_count: 1,
+            record_size: 8,
+            attrs: dst_attrs.as_ptr(),
+        };
+        unsafe {
+            let src = kxy_src(&[(1, 10, 20), (2, 50, 60)], &src_desc);
+            let out = coddl_relation_group(
+                src,
+                &src_desc,
+                &dst_desc,
+                [0u32].as_ptr(),
+                [&src_desc as *const CoddlHeadingDesc].as_ptr(),
+                1,
+            );
+            assert_eq!(
+                render(out, &dst_desc),
+                ["{g: {{k: 1, x: 10, y: 20}, {k: 2, x: 50, y: 60}}}"],
+                "no survivors → a single tuple holding the whole relation"
+            );
+            coddl_rc_release(out);
+            coddl_rc_release(src);
+
+            // …and of an empty relation, the empty relation (not one tuple).
+            let empty = kxy_src(&[], &src_desc);
+            let out = coddl_relation_group(
+                empty,
+                &src_desc,
+                &dst_desc,
+                [0u32].as_ptr(),
+                [&src_desc as *const CoddlHeadingDesc].as_ptr(),
+                1,
+            );
+            assert_eq!((*(out.sub(HEADER_SIZE) as *const CoddlRcHeader)).length, 0);
+            coddl_rc_release(out);
+            coddl_rc_release(empty);
+        }
+    }
+
+    #[test]
+    fn group_with_empty_component_list_yields_reltrue_cells() {
+        // TTM exercise 2.34: `group { g: {} }` — every attribute survives, each
+        // record's `g` is reltrue (the zero-width nested payload collapses).
+        let src_attrs = [int_attr(b"k", 0), int_attr(b"x", 8), int_attr(b"y", 16)];
+        let src_desc = CoddlHeadingDesc {
+            attr_count: 3,
+            record_size: 24,
+            attrs: src_attrs.as_ptr(),
+        };
+        let dst_attrs = [
+            rel_attr(b"g", 0),
+            int_attr(b"k", 8),
+            int_attr(b"x", 16),
+            int_attr(b"y", 24),
+        ];
+        let dst_desc = CoddlHeadingDesc {
+            attr_count: 4,
+            record_size: 32,
+            attrs: dst_attrs.as_ptr(),
+        };
+        let inner_desc = CoddlHeadingDesc {
+            attr_count: 0,
+            record_size: 0,
+            attrs: std::ptr::null(),
+        };
+        unsafe {
+            let src = kxy_src(&[(1, 10, 20), (2, 50, 60)], &src_desc);
+            let out = coddl_relation_group(
+                src,
+                &src_desc,
+                &dst_desc,
+                [0u32].as_ptr(),
+                [&inner_desc as *const CoddlHeadingDesc].as_ptr(),
+                1,
+            );
+            assert_eq!(
+                render(out, &dst_desc),
+                [
+                    "{g: {{}}, k: 1, x: 10, y: 20}",
+                    "{g: {{}}, k: 2, x: 50, y: 60}",
+                ],
+                "each record keeps its attributes and gains g = reltrue"
+            );
+            coddl_rc_release(out);
+            coddl_rc_release(src);
+        }
+    }
+
+    #[test]
+    fn group_multi_pair_is_simultaneous() {
+        // `group { a: {x}, b: {y} }`: ONE partition by the common survivors
+        // (k), each pair nesting its own projection — so `a` genuinely dedups
+        // while `b` keeps both values.
+        let src_attrs = [int_attr(b"k", 0), int_attr(b"x", 8), int_attr(b"y", 16)];
+        let src_desc = CoddlHeadingDesc {
+            attr_count: 3,
+            record_size: 24,
+            attrs: src_attrs.as_ptr(),
+        };
+        let dst_attrs = [rel_attr(b"a", 0), rel_attr(b"b", 8), int_attr(b"k", 16)];
+        let dst_desc = CoddlHeadingDesc {
+            attr_count: 3,
+            record_size: 24,
+            attrs: dst_attrs.as_ptr(),
+        };
+        let a_inner = [int_attr(b"x", 0)];
+        let a_desc = CoddlHeadingDesc {
+            attr_count: 1,
+            record_size: 8,
+            attrs: a_inner.as_ptr(),
+        };
+        let b_inner = [int_attr(b"y", 0)];
+        let b_desc = CoddlHeadingDesc {
+            attr_count: 1,
+            record_size: 8,
+            attrs: b_inner.as_ptr(),
+        };
+        unsafe {
+            let src = kxy_src(&[(1, 7, 7), (1, 7, 8)], &src_desc);
+            let out = coddl_relation_group(
+                src,
+                &src_desc,
+                &dst_desc,
+                [0u32, 1].as_ptr(),
+                [
+                    &a_desc as *const CoddlHeadingDesc,
+                    &b_desc as *const CoddlHeadingDesc,
+                ]
+                .as_ptr(),
+                2,
+            );
+            assert_eq!(
+                render(out, &dst_desc),
+                ["{a: {{x: 7}}, b: {{y: 7}, {y: 8}}, k: 1}"],
+                "a's projection dedups; b's keeps both"
+            );
+            coddl_rc_release(out);
+            coddl_rc_release(src);
+        }
+    }
+
+    #[test]
+    fn ungroup_inverts_group() {
+        let src_attrs = [int_attr(b"k", 0), int_attr(b"x", 8), int_attr(b"y", 16)];
+        let src_desc = CoddlHeadingDesc {
+            attr_count: 3,
+            record_size: 24,
+            attrs: src_attrs.as_ptr(),
+        };
+        let mid_attrs = [int_attr(b"k", 0), rel_attr(b"pq", 8)];
+        let mid_desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 16,
+            attrs: mid_attrs.as_ptr(),
+        };
+        let inner_attrs = [int_attr(b"x", 0), int_attr(b"y", 8)];
+        let inner_desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 16,
+            attrs: inner_attrs.as_ptr(),
+        };
+        unsafe {
+            let src = kxy_src(&[(1, 10, 20), (1, 30, 40), (2, 50, 60)], &src_desc);
+            let grouped = coddl_relation_group(
+                src,
+                &src_desc,
+                &mid_desc,
+                [1u32].as_ptr(),
+                [&inner_desc as *const CoddlHeadingDesc].as_ptr(),
+                1,
+            );
+            let back = coddl_relation_ungroup(grouped, &mid_desc, &src_desc, [1u32].as_ptr(), 1);
+            assert_eq!(
+                coddl_relation_eq(back, src, &src_desc),
+                1,
+                "group then ungroup is the identity (RM Pre 8)"
+            );
+            coddl_rc_release(back);
+            coddl_rc_release(grouped);
+            coddl_rc_release(src);
+        }
+    }
+
+    #[test]
+    fn ungroup_drops_empty_rva_records() {
+        // TTM ch. 2 p. 44: a tuple whose RVA is empty contributes nothing.
+        let src_attrs = [int_attr(b"k", 0), rel_attr(b"pq", 8)];
+        let src_desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 16,
+            attrs: src_attrs.as_ptr(),
+        };
+        let flat_attrs = [int_attr(b"a", 0), int_attr(b"k", 8)];
+        let flat_desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 16,
+            attrs: flat_attrs.as_ptr(),
+        };
+        unsafe {
+            let (inner, inner_desc, _ia) = inner_relation(); // {a: 1}, {a: 2}
+            let empty = coddl_rc_alloc(0, 0, CoddlKind::Relation as u32, &*inner_desc);
+            let src = coddl_rc_alloc(2 * 16, 2, CoddlKind::Relation as u32, &src_desc);
+            std::ptr::write(src as *mut i64, 1);
+            (src.add(8) as *mut *mut u8).write(inner);
+            std::ptr::write(src.add(16) as *mut i64, 2);
+            (src.add(24) as *mut *mut u8).write(empty);
+
+            let out = coddl_relation_ungroup(src, &src_desc, &flat_desc, [1u32].as_ptr(), 1);
+            assert_eq!(
+                render(out, &flat_desc),
+                ["{a: 1, k: 1}", "{a: 2, k: 1}"],
+                "k = 2 (empty pq) contributes no tuples"
+            );
+            coddl_rc_release(out);
+            coddl_rc_release(src);
+            drop(inner_desc);
+        }
+    }
+
+    #[test]
+    fn ungroup_dedups_overlapping_partitions() {
+        // Two records equal on the survivor with overlapping nested sets:
+        // unnesting produces a genuine duplicate, which the seal removes.
+        let src_attrs = [int_attr(b"k", 0), rel_attr(b"vs", 8)];
+        let src_desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 16,
+            attrs: src_attrs.as_ptr(),
+        };
+        let flat_attrs = [int_attr(b"a", 0), int_attr(b"k", 8)];
+        let flat_desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 16,
+            attrs: flat_attrs.as_ptr(),
+        };
+        unsafe {
+            let (both, inner_desc, _ia) = inner_relation(); // {a: 1}, {a: 2}
+            let just_one = coddl_rc_alloc(8, 1, CoddlKind::Relation as u32, &*inner_desc);
+            std::ptr::write(just_one as *mut i64, 1); // {a: 1}
+            let src = coddl_rc_alloc(2 * 16, 2, CoddlKind::Relation as u32, &src_desc);
+            std::ptr::write(src as *mut i64, 1);
+            (src.add(8) as *mut *mut u8).write(just_one);
+            std::ptr::write(src.add(16) as *mut i64, 1);
+            (src.add(24) as *mut *mut u8).write(both);
+
+            let out = coddl_relation_ungroup(src, &src_desc, &flat_desc, [1u32].as_ptr(), 1);
+            assert_eq!(
+                render(out, &flat_desc),
+                ["{a: 1, k: 1}", "{a: 2, k: 1}"],
+                "(1, 1) appears once, not twice"
+            );
+            coddl_rc_release(out);
+            coddl_rc_release(src);
+            drop(inner_desc);
+        }
+    }
+
+    #[test]
+    fn group_and_ungroup_retain_text_cells_they_copy() {
+        // Heap (rc-managed) Text cells on BOTH paths: `n` survives (per-attr
+        // survivor retain), `t` is consumed (nested-payload retain). Releasing
+        // each stage's input before reading its output proves every copy is
+        // co-owned — a missed retain would leave the render reading freed cells.
+        let src_attrs = [text_attr(b"n", 0), text_attr(b"t", 16)];
+        let src_desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 32,
+            attrs: src_attrs.as_ptr(),
+        };
+        let dst_attrs = [text_attr(b"n", 0), rel_attr(b"pq", 16)];
+        let dst_desc = CoddlHeadingDesc {
+            attr_count: 2,
+            record_size: 24,
+            attrs: dst_attrs.as_ptr(),
+        };
+        let inner_attrs = [text_attr(b"t", 0)];
+        let inner_desc = CoddlHeadingDesc {
+            attr_count: 1,
+            record_size: 16,
+            attrs: inner_attrs.as_ptr(),
+        };
+        unsafe {
+            let heap_text = |bytes: &[u8]| -> *mut u8 {
+                let p = coddl_rc_alloc(
+                    bytes.len(),
+                    bytes.len() as u32,
+                    CoddlKind::Text as u32,
+                    std::ptr::null(),
+                );
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+                p
+            };
+            let write_text = |cell: *mut u8, bytes: &[u8]| {
+                (cell as *mut *mut u8).write(heap_text(bytes));
+                (cell.add(8) as *mut u64).write(bytes.len() as u64);
+            };
+            let src = coddl_rc_alloc(3 * 32, 3, CoddlKind::Relation as u32, &src_desc);
+            let rows: [(&[u8], &[u8]); 3] =
+                [(b"s1", b"beta"), (b"s1", b"alpha"), (b"s2", b"alpha")];
+            for (i, &(n, t)) in rows.iter().enumerate() {
+                let rec = src.add(i * 32);
+                write_text(rec, n);
+                write_text(rec.add(16), t);
+            }
+
+            let out = coddl_relation_group(
+                src,
+                &src_desc,
+                &dst_desc,
+                [1u32].as_ptr(),
+                [&inner_desc as *const CoddlHeadingDesc].as_ptr(),
+                1,
+            );
+            coddl_rc_release(src); // the grouped relation must survive this
+            assert_eq!(
+                render(out, &dst_desc),
+                [
+                    "{n: \"s1\", pq: {{t: \"alpha\"}, {t: \"beta\"}}}",
+                    "{n: \"s2\", pq: {{t: \"alpha\"}}}",
+                ],
+                "Text partitions by content and stays live after the source drops"
+            );
+
+            // Round-trip through ungroup with the grouped relation as the only
+            // owner: its release must leave the unnested copy intact.
+            let back = coddl_relation_ungroup(out, &dst_desc, &src_desc, [1u32].as_ptr(), 1);
+            coddl_rc_release(out);
+            assert_eq!(
+                render(back, &src_desc),
+                [
+                    "{n: \"s1\", t: \"alpha\"}",
+                    "{n: \"s1\", t: \"beta\"}",
+                    "{n: \"s2\", t: \"alpha\"}",
+                ],
+                "ungroup's copies are retained before its input drops"
+            );
+            coddl_rc_release(back);
         }
     }
 }

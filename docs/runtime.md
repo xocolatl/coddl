@@ -20,7 +20,7 @@ LLVM IR calls these exports as plain C functions. The runtime is where SQLite vs
 The runtime hosts two execution engines side-by-side:
 
 - **SQL backend** — runs any subplan rooted in relvars. Subplans become SQL strings via [`coddl-sqlemit`](sqlemit.md) (at compile time for static plans, loaded as a library at runtime for dynamic ones).
-- **In-process runtime library** — compiled relational primitives (`coddl_relation_where`, `coddl_relation_extend`, `coddl_relation_join`, `coddl_relation_project`, `coddl_relation_restructure` (surface `wrap`/`unwrap`), …) operating over materialized relations. Tight specialized loops; volcano-style where it pays off (hash joins, sort-merge). Tests and the REPL exercise the same primitives the compiled binary does.
+- **In-process runtime library** — compiled relational primitives (`coddl_relation_where`, `coddl_relation_extend`, `coddl_relation_join`, `coddl_relation_project`, `coddl_relation_restructure` (surface `wrap`/`unwrap`), `coddl_relation_group` / `coddl_relation_ungroup` (surface `group`/`ungroup`), …) operating over materialized relations. Tight specialized loops; volcano-style where it pays off (hash joins, sort-merge). Tests and the REPL exercise the same primitives the compiled binary does.
 
 The RelIR optimizer draws the cut between them as close to the leaves as possible: push everything that touches a relvar into SQL, do the rest in-process. See [relir.md](relir.md) "The cut: SQL vs in-process."
 
@@ -196,7 +196,10 @@ at production. The producers:
 - **retain-on-copy** — each relation operator that copies cells from its
   input(s) calls `retain_text_cells` over its output *before* any
   `coddl_relation_seal` (`where` / `project` / `rename` / `join` /
-  `union` / `minus` / `restructure` / `tclose`);
+  `union` / `minus` / `restructure` / `tclose` / `ungroup`); `group`
+  retains its nested payloads whole but its output records **per
+  survivor attribute** — the RVA cells it writes are moved in fresh
+  (rc = 1), and a whole-record retain would double-count them;
 - **move-in** — a cell produced fresh at rc=1 (an `extend`-computed
   concat, a marshaled SQLite text) is stored without a retain.
 
@@ -241,6 +244,7 @@ struct CoddlHeadingDesc {
 | 4     | `Approximate` | 8                | IEEE-754 double, canonical bits (NaN → one pattern, `−0` → `+0`); SQL binds/stores/reads as `REAL`, with SQLite `NULL` as the encoding of `NaN` (retrieval decodes `NULL`→`NaN`) |
 | 5     | `Rational`  | 32                 | reduced `(i128 numer, i128 denom)` (num @ 0, den @ 16); canonical ⇒ byte-compare is value-equality; SQL binds/stores/reads as canonical `TEXT "n/d"` |
 | 10    | `Tuple`     | Σ components       | inline sub-region; `sub` → nested descriptor (0-based offsets) |
+| 11    | `Relation`  | 8                  | RC payload pointer stored inline; the record co-owns it (retain-on-store, drop-walker release). `sub` is **null** — the nested relation is self-describing via its own RC-header `desc` |
 
 A `Tuple` cell is an **inline nested cell**: its components occupy a
 contiguous sub-region whose width is the sum of their widths, and the
@@ -264,8 +268,54 @@ cells, accumulating the base offset) and writes the i-th SQL column into
 the i-th leaf's offset — the same depth-first leaf order `record_layout`
 and the pushed SELECT use, so the positional mapping reconstructs the
 inline nested cell directly. Sub-word packing
-(Boolean → 1 bit, Byte → 1 byte) is deferred. Relation-as-cell (kind 11)
-is reserved but not yet emitted.
+(Boolean → 1 bit, Byte → 1 byte) is deferred.
+
+### Relation-valued cells: the seal invariant
+
+A `Relation` cell (kind 11) is a single RC payload pointer — not a
+sub-region — so unlike a `Tuple` cell its nesting is by reference: the
+nested relation's own RC header carries its descriptor and length
+(self-describing), its own drop is driven by its own header, and the
+attribute's `sub` stays null. `walk_text_cells` hands the pointer to
+retain/release exactly like a `Text` pointer; `print_cell` recurses into
+the payload; and `cmp_cell`'s `Relation` arm compares two cells by nested
+**content** (`cmp_nested_relation`: cardinality first, then
+record-by-record `record_cmp` in stored order), never by pointer.
+
+That comparison is a total order agreeing with observational set
+equality (RM Pre 8) only when both payloads are canonical — hence the
+**cell seal invariant**: every relation payload stored into a cell is
+sealed at construction. `coddl_relation_group` seals each nested payload
+it builds; cell *copies* (project / join / restructure / ungroup
+survivors) move the pointer, preserving the invariant; the web host
+seals the `Request` relations it hand-builds. Any future path that
+stores a relation into a cell (e.g. a marshaled SQL result) must seal at
+the store boundary.
+
+### `group` / `ungroup`
+
+Surface `group`/`ungroup` (TTM GROUP/UNGROUP) are **cardinality-changing**,
+so they get their own primitives — `coddl_relation_restructure`'s
+same-leaf-cells premise doesn't hold:
+
+- `coddl_relation_group(src, src_desc, dst_desc, rva_idx, inner_descs,
+  rva_count)` — sorts the source by the surviving attributes
+  (content-aware `cmp_cell`, so Text and nested-relation survivors
+  partition correctly), then walks runs: one output record per distinct
+  survivor combination, each new RVA cell a fresh *sealed* nested payload
+  of that run's component cells. Multi-pair `group` is simultaneous (one
+  partition, each pair nesting its own projection — the nested seal is a
+  genuine dedup). No top-level seal: the output is distinct by
+  construction. The RVA attributes are named by **index** into
+  `dst_desc.attrs`, not by name-diffing — a new RVA may shadow a consumed
+  attribute's name (`R group { pq: { pq } }`).
+- `coddl_relation_ungroup(src, src_desc, dst_desc, rva_idx, rva_count)` —
+  per source record, emits one output record per combination of tuples
+  drawn from its RVA cells (survivors alongside); an empty or null RVA
+  cell contributes nothing (TTM's empty-RVA rule). Inner layouts are read
+  from the payloads' own RC headers (no `inner_descs` parameter). The
+  output **must seal**: records equal on the survivors with overlapping
+  nested sets unnest to genuine duplicates.
 
 The `coddl-procir::layout` module owns the layout computation that
 backends consume. Both backends and the runtime must agree on:

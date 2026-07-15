@@ -80,6 +80,7 @@ A recent docs audit flagged several questions worth tracking here once they hard
 - **Approximate IEEE-754 strictness**: which arithmetic guarantees does `Approximate` give? Coddl-defined or backend-defined?
 - **Sum-type scalar mechanics**: the doc mentions sum-type scalars as "permitted but not recommended" for missing information (vertical decomposition preferred). The actual selector + accessor + matching mechanism for sums isn't designed yet.
 - **`oper` declaration surface**: used in examples and method-call sugar, but the production isn't fully spelled out in [grammar.md](grammar.md) yet.
+- **Sealed-flag bit for relation cells**: the cell seal invariant (every relation payload stored into a `Relation` cell is sealed — see [runtime.md](runtime.md)) is enforced by convention at each construction site. If construction sites multiply (e.g. marshaled SQL results stored into cells) or a hot path wants to skip redundant seals, a sealed bit in `CoddlRcHeader` would make the invariant checkable/skippable at zero width cost (the header has padding). Not built — convention suffices while the sites are few.
 
 These are tracked here so they don't slip out of view. Move them into properly-scoped risks (with decide-before triggers) when one of them becomes a near-term concern.
 

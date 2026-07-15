@@ -33,8 +33,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 use coddl_runtime::{
-    coddl_rc_alloc, coddl_rc_release, CoddlAttrDesc, CoddlAttrKind, CoddlHeadingDesc, CoddlKind,
-    CoddlRcHeader, HEADER_SIZE,
+    coddl_rc_alloc, coddl_rc_release, coddl_relation_seal, CoddlAttrDesc, CoddlAttrKind,
+    CoddlHeadingDesc, CoddlKind, CoddlRcHeader, HEADER_SIZE,
 };
 
 // ── Hand-written heading descriptors (FFI layout mirror, risks.md #8) ──────
@@ -240,6 +240,11 @@ unsafe fn build_headers(pairs: &[(Vec<u8>, Vec<u8>)]) -> *mut u8 {
         (rec.add(16) as *mut i64).write(i as i64); // ordinality @16
         write_text_cell(rec.add(24), value); // value @24
     }
+    // Cell seal invariant (relation.rs module header): this relation is stored
+    // into a `Relation` cell, so it must be canonical. Distinct `ordinality`
+    // keeps every record — the seal only reorders (wire order stays readable
+    // through `ordinality`, RM Pro 1).
+    coddl_relation_seal(rel, headers_desc());
     rel
 }
 
@@ -260,6 +265,10 @@ unsafe fn build_path_segments(segs: &[Vec<u8>]) -> *mut u8 {
         (rec as *mut i64).write(i as i64); // ordinality @0
         write_text_cell(rec.add(8), seg); // segment @8
     }
+    // Cell seal invariant: ascending `ordinality` @0 already IS the canonical
+    // order, so this is an O(n) no-op sort — kept so the invariant is explicit
+    // rather than coincidental.
+    coddl_relation_seal(rel, path_segments_desc());
     rel
 }
 
@@ -365,8 +374,10 @@ unsafe fn read_response(rec: *mut u8) -> (i64, Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>)
 
 /// Copy an `OrderedNameValues` relation's records into owned `(name, value)`
 /// pairs. Record count is the payload's `CoddlRcHeader.length`; each record is
-/// 40 B, `name` cell @0, `value` cell @24 (`ordinality` @16 is skipped — the
-/// handler's relation-literal order is preserved as record order here).
+/// 40 B, `name` cell @0, `value` cell @24 (`ordinality` @16 is skipped as a
+/// sort key but still shapes the order: the relation is sealed — canonical
+/// `(name, ordinality, value)` order — so duplicate-name headers emit in
+/// ascending `ordinality`, name groups in name order).
 unsafe fn read_headers_relation(rel: *const u8) -> Vec<(Vec<u8>, Vec<u8>)> {
     if rel.is_null() {
         return Vec::new();
