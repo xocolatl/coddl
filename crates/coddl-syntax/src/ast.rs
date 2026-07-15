@@ -807,6 +807,8 @@ pub enum Expr {
     Rename(RenameExpr),
     Wrap(WrapExpr),
     Unwrap(UnwrapExpr),
+    Group(GroupExpr),
+    Ungroup(UngroupExpr),
     Index(IndexExpr),
     If(IfExpr),
 }
@@ -832,6 +834,8 @@ impl Expr {
             SyntaxKind::RENAME_EXPR => Expr::Rename(RenameExpr { syntax }),
             SyntaxKind::WRAP_EXPR => Expr::Wrap(WrapExpr { syntax }),
             SyntaxKind::UNWRAP_EXPR => Expr::Unwrap(UnwrapExpr { syntax }),
+            SyntaxKind::GROUP_EXPR => Expr::Group(GroupExpr { syntax }),
+            SyntaxKind::UNGROUP_EXPR => Expr::Ungroup(UngroupExpr { syntax }),
             SyntaxKind::INDEX_EXPR => Expr::Index(IndexExpr { syntax }),
             SyntaxKind::IF_EXPR => Expr::If(IfExpr { syntax }),
             // Parenthesized expressions are transparent — recurse to
@@ -862,6 +866,8 @@ impl Expr {
             Expr::Rename(r) => r.syntax(),
             Expr::Wrap(w) => w.syntax(),
             Expr::Unwrap(u) => u.syntax(),
+            Expr::Group(g) => g.syntax(),
+            Expr::Ungroup(u) => u.syntax(),
             Expr::Index(i) => i.syntax(),
             Expr::If(i) => i.syntax(),
         }
@@ -1436,6 +1442,83 @@ impl UnwrapExpr {
 
     /// The tuple-valued attribute names to expand, in source order — the IDENT
     /// tokens after the `{` (same shape as `ProjectExpr::attrs`).
+    pub fn attrs(&self) -> impl Iterator<Item = SyntaxToken> + '_ {
+        let mut after_brace = false;
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .filter_map(move |t| {
+                if t.kind() == SyntaxKind::L_BRACE {
+                    after_brace = true;
+                    None
+                } else if after_brace && t.kind() == SyntaxKind::IDENT {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+    }
+}
+
+ast_node!(pub GroupExpr, GROUP_EXPR);
+
+impl GroupExpr {
+    /// The relation operand being grouped — the single `Expr` child (the
+    /// `new: { … }` pairs are `GROUP_PAIR` nodes, not `Expr`s).
+    pub fn input(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// The `new: { a, b }` pairs in source order.
+    pub fn pairs(&self) -> impl Iterator<Item = GroupPair> + '_ {
+        children(&self.syntax)
+    }
+}
+
+ast_node!(pub GroupPair, GROUP_PAIR);
+
+impl GroupPair {
+    /// The new relation-valued attribute name — the IDENT token before the `{`.
+    pub fn name(&self) -> Option<SyntaxToken> {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .take_while(|t| t.kind() != SyntaxKind::L_BRACE)
+            .find(|t| t.kind() == SyntaxKind::IDENT)
+    }
+
+    /// The existing attribute names to consume into the relation-valued
+    /// attribute — the IDENT tokens after the `{` (same shape as
+    /// `WrapPair::wrapped`).
+    pub fn grouped(&self) -> impl Iterator<Item = SyntaxToken> + '_ {
+        let mut after_brace = false;
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .filter_map(move |t| {
+                if t.kind() == SyntaxKind::L_BRACE {
+                    after_brace = true;
+                    None
+                } else if after_brace && t.kind() == SyntaxKind::IDENT {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+    }
+}
+
+ast_node!(pub UngroupExpr, UNGROUP_EXPR);
+
+impl UngroupExpr {
+    /// The relation operand being ungrouped — the single `Expr` child (the
+    /// attribute names are bare tokens, not child nodes).
+    pub fn input(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+
+    /// The relation-valued attribute names to unnest, in source order — the
+    /// IDENT tokens after the `{` (same shape as `UnwrapExpr::attrs`).
     pub fn attrs(&self) -> impl Iterator<Item = SyntaxToken> + '_ {
         let mut after_brace = false;
         self.syntax

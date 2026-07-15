@@ -121,11 +121,58 @@ runtime's materialization marshals each cell via
 (`docs/runtime.md`).
 
 Rational, Approximate, Character defer until the runtime adds per-cell
-codec entries. Nested **Tuple** cells are now representable in relation
-*values* (query results / intermediates) as inline sub-regions — see the
-heading-descriptor `sub` pointer in `docs/runtime.md` — but a tuple-valued
-*public-relvar column* stays out of scope (a SQL-backed base table has no
-composite column). Nested Relation cells remain out of scope for v1.
+codec entries. Nested **Tuple** and **Relation** cells are fully
+representable in relation *values* (query results / intermediates — the
+inline sub-region and the RC-pointer cell respectively, see
+`docs/runtime.md`), but neither is a legal *storage-backed column*: the
+typechecker rejects a relation- or tuple-valued attribute in a `public`
+(`.cd`) or `base` (`.cddb`) relvar heading with **T0101** at check time
+(a `private` relvar is in-process state and takes any heading). The
+designed endpoint for persisting them is decomposition, below.
+
+## Nested attributes: the decomposition endpoint (designed, not built)
+
+TTM requires relation-valued attributes in database relvars (RM Pre 7;
+the ch. 6 `SPQ` relvar with constraint DBC7 is a base relvar), so T0101
+is a staging gate, not a policy. The designed answer keeps the honest
+heading in the conceptual layer and decomposes in the **`.cdstore`**
+(conceptual → physical) mapping — never a serialized blob/JSON column,
+which would be opaque to pushdown and backend-specific
+([principles.md](principles.md) §1):
+
+- The `.cddb` declares the real heading:
+  `base relvar R { a: Integer, b: Relation { x: Text } } key { a };`.
+- The `.cdstore` maps the RVA to a **child table** rather than a column:
+  the parent table holds the scalar attributes; the child table holds
+  the parent's key columns plus the nested heading's columns, primary
+  key = all columns (it stores a set). A name collision between a
+  parent-key column and a nested column (`b: Relation { a: … }` under a
+  parent keyed by `a`) is resolved in the *physical* namespace by the
+  column map (`parent: { a: "parent_a" }`) — that mapping layer exists
+  precisely so conceptual and physical names diverge.
+- **Absence of child rows = the empty nested relation** — the same
+  "absence of a fact is absence of a tuple" principle as the no-nulls
+  missing-information answer. No `NULL`s, no outer joins; the runtime's
+  null-pointer cell *is* the empty relation, so reconstruction patches
+  empty-`b` parents for free.
+- Reads reconstruct via `coddl_relation_group` over the parent/child
+  fetch; writes decompose through the surgical-write engine (one parent
+  write plus child writes — write-side batching is allowed). The
+  physical form **is** the ungrouped form, so `R ungroup { b }` pushes
+  as a plain parent⋈child join (a negative-cost ungroup), and
+  predicates over `b` (emptiness, membership) push as
+  `EXISTS`/`NOT EXISTS` against the child table — the semijoin
+  machinery sqlemit already emits.
+- A tuple-valued column is the easy sibling (fixed width — flat leaf
+  columns in the same table, the query-side `wrap` trick applied to
+  storage); it stays behind T0101 until the mapping syntax lands.
+
+**Decide before** building: the child-table `.cdstore` grammar (a
+`rva <attr>: table "…" { parent: { … }, columns: { … } }` clause or
+similar) and whether reconstruction happens in the marshaller (grouped
+fetch) or the planner (rewrite `R` at the cut to
+`(parent join child) group {…}` unioned with the empty-`b` patch for
+parents with no child rows — no outer join, RM Pro 4).
 
 ## Write policy
 

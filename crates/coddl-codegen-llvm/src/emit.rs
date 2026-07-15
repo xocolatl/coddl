@@ -374,6 +374,18 @@ impl Emitter {
             "declare ptr @coddl_relation_rename(ptr, ptr, ptr, ptr, i64)"
         )
         .unwrap();
+        // `group`: (src, src_desc, result_desc, rva_idx, inner_descs, k) -> rc=1 ptr.
+        writeln!(
+            self.body,
+            "declare ptr @coddl_relation_group(ptr, ptr, ptr, ptr, ptr, i64)"
+        )
+        .unwrap();
+        // `ungroup`: (src, src_desc, result_desc, rva_idx, k) -> rc=1 ptr.
+        writeln!(
+            self.body,
+            "declare ptr @coddl_relation_ungroup(ptr, ptr, ptr, ptr, i64)"
+        )
+        .unwrap();
         // `load`: (src, src_desc, keys, key_count) -> rc=1 Sequence ptr.
         writeln!(
             self.body,
@@ -1187,6 +1199,30 @@ impl Emitter {
                 src_heading_id,
                 result_heading_id,
             } => self.lower_restructure_inst(*dst, src, *src_heading_id, *result_heading_id),
+            Inst::Group {
+                dst,
+                src,
+                src_heading_id,
+                result_heading_id,
+                rva_indices,
+                inner_heading_ids,
+            } => self.lower_group_inst(
+                *dst,
+                src,
+                *src_heading_id,
+                *result_heading_id,
+                rva_indices,
+                inner_heading_ids,
+            ),
+            Inst::Ungroup {
+                dst,
+                src,
+                src_heading_id,
+                result_heading_id,
+                rva_indices,
+            } => {
+                self.lower_ungroup_inst(*dst, src, *src_heading_id, *result_heading_id, rva_indices)
+            }
             Inst::Rename {
                 dst,
                 src,
@@ -2451,6 +2487,122 @@ impl Emitter {
             self.body,
             "    {name} = call ptr @coddl_relation_tclose(ptr {src_op}, ptr @.heading.{})",
             heading_id.0,
+        )
+        .unwrap();
+        self.values.insert(
+            dst,
+            ValueRepr::Scalar {
+                ty: "ptr".to_string(),
+                op: name,
+            },
+        );
+        Ok(())
+    }
+
+    /// Bake a `u32` index array as read-only data under a module-unique name
+    /// with the given prefix (`perm` / `rva` / `keys` shape), returning its id.
+    /// Empty arrays emit `zeroinitializer` (the callee sees count 0 and never
+    /// reads the pointer).
+    fn bake_u32_array(&mut self, prefix: &str, values: &[u32]) -> u32 {
+        let id = self.next_str;
+        self.next_str += 1;
+        if values.is_empty() {
+            writeln!(
+                self.globals,
+                "@.{prefix}.{id} = private unnamed_addr constant [0 x i32] zeroinitializer"
+            )
+            .unwrap();
+            return id;
+        }
+        write!(
+            self.globals,
+            "@.{prefix}.{id} = private unnamed_addr constant [{} x i32] [",
+            values.len()
+        )
+        .unwrap();
+        for (i, v) in values.iter().enumerate() {
+            if i > 0 {
+                self.globals.push_str(", ");
+            }
+            write!(self.globals, "i32 {v}").unwrap();
+        }
+        writeln!(self.globals, "]").unwrap();
+        id
+    }
+
+    /// Emit `Inst::Group`: bake the RVA index array and the inner-descriptor
+    /// pointer array (`[k x ptr]` of `@.heading.<id>` symbols — the `perm`
+    /// precedent, at pointer width), then
+    /// `call ptr @coddl_relation_group(src, &src_desc, &result_desc, rva, descs, k)`.
+    fn lower_group_inst(
+        &mut self,
+        dst: ValueId,
+        src: &ValueId,
+        src_heading_id: HeadingId,
+        result_heading_id: HeadingId,
+        rva_indices: &[u32],
+        inner_heading_ids: &[HeadingId],
+    ) -> Result<(), LlvmEmitError> {
+        let src_op = self.scalar_op(src)?;
+        let rva_id = self.bake_u32_array("rva", rva_indices);
+        let descs_id = self.next_str;
+        self.next_str += 1;
+        if inner_heading_ids.is_empty() {
+            writeln!(
+                self.globals,
+                "@.descs.{descs_id} = private unnamed_addr constant [0 x ptr] zeroinitializer"
+            )
+            .unwrap();
+        } else {
+            write!(
+                self.globals,
+                "@.descs.{descs_id} = private unnamed_addr constant [{} x ptr] [",
+                inner_heading_ids.len()
+            )
+            .unwrap();
+            for (i, h) in inner_heading_ids.iter().enumerate() {
+                if i > 0 {
+                    self.globals.push_str(", ");
+                }
+                write!(self.globals, "ptr @.heading.{}", h.0).unwrap();
+            }
+            writeln!(self.globals, "]").unwrap();
+        }
+        let name = format!("%v{}", dst.0);
+        writeln!(
+            self.body,
+            "    {name} = call ptr @coddl_relation_group(ptr {src_op}, ptr @.heading.{}, ptr @.heading.{}, ptr @.rva.{rva_id}, ptr @.descs.{descs_id}, i64 {})",
+            src_heading_id.0, result_heading_id.0, rva_indices.len(),
+        )
+        .unwrap();
+        self.values.insert(
+            dst,
+            ValueRepr::Scalar {
+                ty: "ptr".to_string(),
+                op: name,
+            },
+        );
+        Ok(())
+    }
+
+    /// Emit `Inst::Ungroup`: bake the RVA index array, then
+    /// `call ptr @coddl_relation_ungroup(src, &src_desc, &result_desc, rva, k)`
+    /// (the nested payloads are self-describing — no inner-descriptor array).
+    fn lower_ungroup_inst(
+        &mut self,
+        dst: ValueId,
+        src: &ValueId,
+        src_heading_id: HeadingId,
+        result_heading_id: HeadingId,
+        rva_indices: &[u32],
+    ) -> Result<(), LlvmEmitError> {
+        let src_op = self.scalar_op(src)?;
+        let rva_id = self.bake_u32_array("rva", rva_indices);
+        let name = format!("%v{}", dst.0);
+        writeln!(
+            self.body,
+            "    {name} = call ptr @coddl_relation_ungroup(ptr {src_op}, ptr @.heading.{}, ptr @.heading.{}, ptr @.rva.{rva_id}, i64 {})",
+            src_heading_id.0, result_heading_id.0, rva_indices.len(),
         )
         .unwrap();
         self.values.insert(

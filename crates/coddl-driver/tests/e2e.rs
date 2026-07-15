@@ -7966,6 +7966,152 @@ fn wrap_pushdown_cranelift() {
     assert_wrap_pushdown("cranelift");
 }
 
+// ── group / ungroup (relation-valued attributes, in-process nest) ──────
+
+/// `group` consumes attributes into a relation-valued attribute (the survivors
+/// partition); `ungroup` unnests one. Exercises: group (prints nested sets),
+/// the group∘ungroup round-trip (= the original), group-over-every-attribute
+/// (single tuple), `project { pq }` dedup of content-equal pointer-distinct
+/// RVA cells (pins the `cmp_cell` Relation arm), and a duplicate-producing
+/// `ungroup` over a `union` of grouped relations (the mandatory output seal).
+const GROUP_UNGROUP_SRC: &str = "\
+program group_ungroup;
+oper main {} [
+    let r = Relation {
+        {s: \"S1\", p: \"P1\", q: 300},
+        {s: \"S1\", p: \"P2\", q: 200},
+        {s: \"S2\", p: \"P1\", q: 100},
+    };
+    write_relation { rel: r group { pq: {p, q} } };
+    write_relation { rel: r group { pq: {p, q} } ungroup { pq } };
+    write_relation { rel: r group { all: {s, p, q} } };
+    let d = Relation { {s: \"A\", p: \"P1\", q: 1}, {s: \"B\", p: \"P1\", q: 1} };
+    write_relation { rel: d group { pq: {p, q} } project { pq } };
+    let a = Relation { {k: 1, v: 10} };
+    let b = Relation { {k: 1, v: 10}, {k: 1, v: 20} };
+    write_relation { rel: ((a group {vs: {v}}) union (b group {vs: {v}})) ungroup { vs } };
+];
+";
+
+fn run_group_ungroup(backend: &str) -> Vec<u8> {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let src = tmp.path().join("group-ungroup.cd");
+    std::fs::write(&src, GROUP_UNGROUP_SRC).expect("write src");
+    let out = coddl()
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&src)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "group/ungroup on {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+#[test]
+fn group_ungroup_nests_and_composes() {
+    let expected = sorted_tuples(&[
+        // group: `p`/`q` consumed into `pq`, `s` survives and partitions
+        // (nested sets sealed → canonical inner order).
+        r#"{pq: {{p: "P1", q: 300}, {p: "P2", q: 200}}, s: "S1"}"#,
+        r#"{pq: {{p: "P1", q: 100}}, s: "S2"}"#,
+        // group ∘ ungroup = the original.
+        r#"{p: "P1", q: 300, s: "S1"}"#,
+        r#"{p: "P2", q: 200, s: "S1"}"#,
+        r#"{p: "P1", q: 100, s: "S2"}"#,
+        // group over every attribute: no survivors → one tuple. (The nested
+        // print order is the seal's byte-wise sort — little-endian Integers,
+        // so 300 lands before 100 — deterministic but not meaningful.)
+        r#"{all: {{p: "P1", q: 300, s: "S1"}, {p: "P1", q: 100, s: "S2"}, {p: "P2", q: 200, s: "S1"}}}"#,
+        // A/B share the same {p, q} set: project { pq } dedups the two
+        // pointer-distinct, content-equal relation cells to ONE row.
+        r#"{pq: {{p: "P1", q: 1}}}"#,
+        // union keeps the two tuples (equal `k`, different `vs` — content
+        // comparison again); ungroup unnests to 3 rows and seals to 2
+        // ((1, 10) appears in both partitions).
+        r#"{k: 1, v: 10}"#,
+        r#"{k: 1, v: 20}"#,
+    ]);
+    for backend in ["llvm", "cranelift"] {
+        assert_eq!(
+            tuple_lines(&run_group_ungroup(backend)),
+            expected,
+            "group/ungroup output on {backend}"
+        );
+    }
+}
+
+#[test]
+fn group_ungroup_byte_identical_across_backends() {
+    assert_eq!(run_group_ungroup("llvm"), run_group_ungroup("cranelift"));
+}
+
+// ── group over a public relvar (operand pushes, the nest runs in-process) ──
+
+/// A relvar-rooted `group` never pushes (a relation-valued cell has no SQL
+/// column form — `resolve` declines). The in-process recursion pushes the
+/// *operand* fetch at its own root; the audit log shows that plain SELECT and
+/// nothing else — and no full-relvar-pull panic fires (the guard deliberately
+/// exempts group/ungroup: the fetch IS the maximal push).
+fn assert_group_operand_pushdown(backend: &str) {
+    ensure_runtime_built();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = seed_greetings_fixtures(tmp.path());
+    let cd = tmp.path().join("gp.cd");
+    std::fs::write(
+        &cd,
+        "program gp;\n\
+         database greetings;\n\
+         public relvar Greetings { id: Integer, message: Text } key { id };\n\
+         oper main {} [ let g = transaction [ Greetings group { m: {message} } ]; write_relation { rel: g }; ];\n",
+    )
+    .expect("write gp.cd");
+    let log = tmp.path().join("audit.log");
+    let out = coddl()
+        .env("CODDL_GREETINGS_FILE", &db)
+        .env("CODDL_AUDIT_LOG", &log)
+        .args(["run", &format!("--backend={backend}")])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "relvar-rooted group on {backend} failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        tuple_lines(&out.stdout),
+        sorted_tuples(&[r#"{id: 1, m: {{message: "hello world"}}}"#]),
+        "grouped relvar output on {backend}",
+    );
+    // The operand fetch pushed as a plain SELECT (no DISTINCT — the relvar
+    // key survives); the group itself ran in-process, so no other query.
+    let contents = std::fs::read_to_string(&log).expect("read audit log");
+    let sqls: Vec<&str> = contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| audit_sql(l).unwrap_or_else(|| panic!("malformed audit line ({backend}): {l:?}")))
+        .collect();
+    assert!(
+        sqls.iter()
+            .any(|s| *s == r#"SELECT "id", "message" FROM "greetings""#),
+        "audit log on {backend} missing the pushed operand fetch; got:\n{sqls:#?}",
+    );
+}
+
+#[test]
+fn group_operand_pushdown_llvm() {
+    assert_group_operand_pushdown("llvm");
+}
+
+#[test]
+fn group_operand_pushdown_cranelift() {
+    assert_group_operand_pushdown("cranelift");
+}
+
 // ── load … order → Sequence iteration (Chunk 4) ───────────────────────
 
 #[test]

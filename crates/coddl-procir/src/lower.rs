@@ -16,11 +16,11 @@ use coddl_diagnostics::{Diagnostic, FileId, Severity, Span};
 use coddl_plan::{Plan, ResolvedModule, WritePolicy};
 use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, BoolLit, CallExpr, DeleteStmt, DoWhileStmt,
-    Expr, ExprStmt, ExtendExpr, FieldAccess, ForStmt, IfExpr, IndexExpr, InsertStmt, Item, LetStmt,
-    Literal, LoadStmt, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr, RelationLit,
-    RenameExpr, ReplaceExpr, ReturnStmt, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr,
-    TruncateStmt, TupleLit, TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt,
-    WhileStmt, WrapExpr,
+    Expr, ExprStmt, ExtendExpr, FieldAccess, ForStmt, GroupExpr, IfExpr, IndexExpr, InsertStmt,
+    Item, LetStmt, Literal, LoadStmt, NameRef, NamedArg, OperDecl, ProgramDecl, ProjectExpr,
+    RelationLit, RenameExpr, ReplaceExpr, ReturnStmt, Root, SequenceLit, Stmt, TcloseExpr,
+    TransactionExpr, TruncateStmt, TupleLit, TypeRef, UnaryExpr, UnaryOp, UngroupExpr, UnwrapExpr,
+    UpdateStmt, VarStmt, WhileStmt, WrapExpr,
 };
 use coddl_syntax::{parse, parse_format_template, SyntaxKind, TemplateChunk};
 use coddl_types::{
@@ -3373,6 +3373,8 @@ impl Lowerer {
             Expr::Rename(r) => self.lower_rename_expr(r),
             Expr::Wrap(w) => self.lower_wrap_expr(w),
             Expr::Unwrap(u) => self.lower_unwrap_expr(u),
+            Expr::Group(g) => self.lower_group_expr(g),
+            Expr::Ungroup(u) => self.lower_ungroup_expr(u),
             Expr::Extend(e) => self.lower_extend_expr(e),
             Expr::Tclose(t) => self.lower_tclose_expr(t),
             Expr::Index(i) => self.lower_index_expr(i),
@@ -4488,6 +4490,11 @@ impl Lowerer {
             Expr::Unwrap(u) => u.input().into_iter().collect(),
             Expr::Extend(e) => e.input().into_iter().collect(),
             Expr::Tclose(t) => t.input().into_iter().collect(),
+            // `group`/`ungroup` are DELIBERATELY absent (they fall to the
+            // catch-all below): they have no SQL form at all, so the operand
+            // fetch IS the maximal push — reading the relvar to nest it is the
+            // operator's semantics (like `load … from R`), not an avoidable
+            // pull. Listing them here would panic every relvar-rooted `group`.
             _ => return,
         };
         for operand in operands {
@@ -4663,6 +4670,52 @@ impl Lowerer {
         dst
     }
 
+    /// Lower a `group` — never pushable (a relation-valued cell has no SQL
+    /// form), so the operand recursion pushes what it can and the nest runs
+    /// in-process via one `Inst::Group`.
+    fn lower_group_expr(&mut self, ge: &GroupExpr) -> ValueId {
+        let src = ge
+            .input()
+            .map(|e| self.lower_expr(&e))
+            .expect("typechecked group has a relation operand");
+        let in_heading = self.relation_heading(src, "group");
+        let groups = group_spec(&in_heading, ge);
+        // Reuse `RelExpr::Group::heading()` as the single source of truth for
+        // the result heading (a dummy materialized input supplies `in_heading`).
+        let dst_heading = RelExpr::Group {
+            input: Box::new(RelExpr::MaterializedRelvar {
+                name: String::new(),
+                heading: in_heading,
+            }),
+            groups: groups.clone(),
+        }
+        .heading();
+        let dst = self.emit_group(src, dst_heading, &groups);
+        self.release_if_unowned(src);
+        dst
+    }
+
+    /// Lower an `ungroup` — never pushable, like `group`; one `Inst::Ungroup`.
+    fn lower_ungroup_expr(&mut self, ue: &UngroupExpr) -> ValueId {
+        let src = ue
+            .input()
+            .map(|e| self.lower_expr(&e))
+            .expect("typechecked ungroup has a relation operand");
+        let in_heading = self.relation_heading(src, "ungroup");
+        let names: Vec<String> = ue.attrs().map(|t| t.text().to_string()).collect();
+        let dst_heading = RelExpr::Ungroup {
+            input: Box::new(RelExpr::MaterializedRelvar {
+                name: String::new(),
+                heading: in_heading,
+            }),
+            names: names.clone(),
+        }
+        .heading();
+        let dst = self.emit_ungroup(src, dst_heading, &names);
+        self.release_if_unowned(src);
+        dst
+    }
+
     /// The heading of an already-lowered relation value.
     fn relation_heading(&self, src: ValueId, op: &str) -> Heading {
         match self.value_type(src) {
@@ -4687,6 +4740,86 @@ impl Lowerer {
             src,
             src_heading_id,
             result_heading_id,
+        });
+        dst
+    }
+
+    /// Nest an already-lowered relation `src` into `dst_heading` per the
+    /// `(new, components)` pairs and emit `Inst::Group`. `rva_indices[j]` is
+    /// the canonical index of `groups[j]`'s new attribute in the *result*
+    /// heading (the runtime identifies RVAs by index, never by name-diff — a
+    /// new RVA may shadow a consumed attribute's name); `inner_heading_ids[j]`
+    /// is its interned component heading, so the backend emits and references
+    /// a static descriptor for each nested payload. Mint-and-return: the
+    /// caller releases `src`. Shared by the AST and in-process RelExpr paths.
+    fn emit_group(
+        &mut self,
+        src: ValueId,
+        dst_heading: Heading,
+        groups: &[(String, Heading)],
+    ) -> ValueId {
+        let src_heading_id = match self.value_type(src) {
+            ProcType::Relation(id) => id,
+            other => unreachable!("group on non-relation `{other}` survived typecheck"),
+        };
+        let rva_indices: Vec<u32> = groups
+            .iter()
+            .map(|(new, _)| {
+                dst_heading
+                    .attrs()
+                    .iter()
+                    .position(|(n, _)| n == new)
+                    .expect("group result heading contains each new RVA") as u32
+            })
+            .collect();
+        let inner_heading_ids: Vec<HeadingId> =
+            groups.iter().map(|(_, h)| self.intern_heading(h)).collect();
+        let result_heading_id = self.intern_heading(&dst_heading);
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Relation(result_heading_id));
+        self.insts.push(Inst::Group {
+            dst,
+            src,
+            src_heading_id,
+            result_heading_id,
+            rva_indices,
+            inner_heading_ids,
+        });
+        dst
+    }
+
+    /// Unnest an already-lowered relation `src` into `dst_heading` per the
+    /// named relation-valued attributes and emit `Inst::Ungroup`.
+    /// `rva_indices[j]` is the canonical index of `names[j]` in the *source*
+    /// heading; the nested payloads are self-describing (their RC headers
+    /// carry the inner descriptors), so no inner heading ids are needed.
+    /// Mint-and-return: the caller releases `src`.
+    fn emit_ungroup(&mut self, src: ValueId, dst_heading: Heading, names: &[String]) -> ValueId {
+        let src_heading_id = match self.value_type(src) {
+            ProcType::Relation(id) => id,
+            other => unreachable!("ungroup on non-relation `{other}` survived typecheck"),
+        };
+        let src_heading = self.headings[src_heading_id.0 as usize].clone();
+        let rva_indices: Vec<u32> = names
+            .iter()
+            .map(|name| {
+                src_heading
+                    .attrs()
+                    .iter()
+                    .position(|(n, _)| n == name)
+                    .expect("typechecked ungroup names exist in the operand heading")
+                    as u32
+            })
+            .collect();
+        let result_heading_id = self.intern_heading(&dst_heading);
+        let dst = self.fresh_value();
+        self.record_type(dst, ProcType::Relation(result_heading_id));
+        self.insts.push(Inst::Ungroup {
+            dst,
+            src,
+            src_heading_id,
+            result_heading_id,
+            rva_indices,
         });
         dst
     }
@@ -5289,6 +5422,27 @@ impl Lowerer {
                 let input = self.build_rel_expr(&u.input()?, tables)?;
                 let names: Vec<String> = u.attrs().map(|t| t.text().to_string()).collect();
                 Some(RelExpr::Unwrap {
+                    input: Box::new(input),
+                    names,
+                })
+            }
+            Expr::Group(g) => {
+                // Build the operand + the `(new, components)` spec. `group`
+                // never pushes (sqlemit's `resolve` declines — a relation-
+                // valued cell has no SQL form), so a relvar-rooted group
+                // declines the push and nests in-process; building the RelExpr
+                // lets `explain` render it and origin tracking see through it.
+                let input = self.build_rel_expr(&g.input()?, tables)?;
+                let groups = group_spec(&input.heading(), g);
+                Some(RelExpr::Group {
+                    input: Box::new(input),
+                    groups,
+                })
+            }
+            Expr::Ungroup(u) => {
+                let input = self.build_rel_expr(&u.input()?, tables)?;
+                let names: Vec<String> = u.attrs().map(|t| t.text().to_string()).collect();
+                Some(RelExpr::Ungroup {
                     input: Box::new(input),
                     names,
                 })
@@ -6735,6 +6889,20 @@ impl Lowerer {
                 self.release_call_arg_temp(src);
                 Some(dst)
             }
+            RelExpr::Group { input, groups } => {
+                let src = self.lower_relexpr_inprocess(input, slots)?;
+                let dst_heading = rel.heading();
+                let dst = self.emit_group(src, dst_heading, groups);
+                self.release_call_arg_temp(src);
+                Some(dst)
+            }
+            RelExpr::Ungroup { input, names } => {
+                let src = self.lower_relexpr_inprocess(input, slots)?;
+                let dst_heading = rel.heading();
+                let dst = self.emit_ungroup(src, dst_heading, names);
+                self.release_call_arg_temp(src);
+                Some(dst)
+            }
             _ => None,
         }
     }
@@ -8162,7 +8330,9 @@ fn contains_restrict(rel: &RelExpr) -> bool {
         | RelExpr::Extend { input, .. }
         | RelExpr::TClose { input }
         | RelExpr::Wrap { input, .. }
-        | RelExpr::Unwrap { input, .. } => contains_restrict(input),
+        | RelExpr::Unwrap { input, .. }
+        | RelExpr::Group { input, .. }
+        | RelExpr::Ungroup { input, .. } => contains_restrict(input),
         RelExpr::And { lhs, rhs }
         | RelExpr::Or { lhs, rhs }
         | RelExpr::Minus { lhs, rhs }
@@ -8188,7 +8358,9 @@ fn contains_gate(rel: &RelExpr) -> bool {
         | RelExpr::Extend { input, .. }
         | RelExpr::TClose { input }
         | RelExpr::Wrap { input, .. }
-        | RelExpr::Unwrap { input, .. } => contains_gate(input),
+        | RelExpr::Unwrap { input, .. }
+        | RelExpr::Group { input, .. }
+        | RelExpr::Ungroup { input, .. } => contains_gate(input),
         RelExpr::And { lhs, rhs }
         | RelExpr::Or { lhs, rhs }
         | RelExpr::Minus { lhs, rhs }
@@ -8211,7 +8383,9 @@ fn relvar_root_name(rel: &RelExpr) -> Option<&str> {
         | RelExpr::Extend { input, .. }
         | RelExpr::TClose { input }
         | RelExpr::Wrap { input, .. }
-        | RelExpr::Unwrap { input, .. } => relvar_root_name(input),
+        | RelExpr::Unwrap { input, .. }
+        | RelExpr::Group { input, .. }
+        | RelExpr::Ungroup { input, .. } => relvar_root_name(input),
         RelExpr::And { lhs, .. }
         | RelExpr::Or { lhs, .. }
         | RelExpr::Minus { lhs, .. }
@@ -8394,6 +8568,24 @@ fn wrap_spec(in_heading: &Heading, we: &WrapExpr) -> Vec<(String, Heading)> {
             let new = pair.name()?.text().to_string();
             let comps: Vec<(String, Type)> = pair
                 .wrapped()
+                .filter_map(|t| {
+                    let n = t.text().to_string();
+                    in_heading.lookup(&n).map(|ty| (n, ty.clone()))
+                })
+                .collect();
+            Some((new, Heading::new(comps)))
+        })
+        .collect()
+}
+
+/// Build the `(new_name, components_heading)` pairs of a `group` from its AST
+/// pairs and the operand heading — `wrap_spec`'s shape, over `GroupPair`s.
+fn group_spec(in_heading: &Heading, ge: &GroupExpr) -> Vec<(String, Heading)> {
+    ge.pairs()
+        .filter_map(|pair| {
+            let new = pair.name()?.text().to_string();
+            let comps: Vec<(String, Type)> = pair
+                .grouped()
                 .filter_map(|t| {
                     let n = t.text().to_string();
                     in_heading.lookup(&n).map(|ty| (n, ty.clone()))

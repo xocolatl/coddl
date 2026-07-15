@@ -288,6 +288,27 @@ pub enum SyntaxKind {
     /// discriminants stable.
     BUILTIN_RELVAR_DECL,
 
+    /// `<relExpr> group { pq: { a, b }, … }` — relational group (TTM GROUP:
+    /// consume attributes into a relation-valued attribute; the unnamed
+    /// attributes survive and partition the relation). A postfix expression
+    /// node wrapping its relation operand; each `GROUP_PAIR` follows the
+    /// `group` keyword. Placed at the end of the enum to keep existing
+    /// discriminants stable.
+    GROUP_EXPR,
+
+    /// One `new: { a, b }` pair inside a `GROUP_EXPR`: the new relation-valued
+    /// attribute name (an `IDENT`) and the unordered brace-list of existing
+    /// attribute names to consume into it (bare `IDENT` tokens after `{`).
+    GROUP_PAIR,
+
+    /// `<relExpr> ungroup { pq, … }` — relational ungroup (TTM UNGROUP: unnest
+    /// relation-valued attributes back to top level, one tuple per outer ×
+    /// inner combination). A postfix expression node wrapping its relation
+    /// operand; the unordered brace-list of relation-valued attribute names
+    /// follows the `ungroup` keyword. Placed at the end of the enum to keep
+    /// existing discriminants stable.
+    UNGROUP_EXPR,
+
     /// A range of source whose intended structure couldn't be
     /// recovered. The parser still wraps the tokens so the tree stays
     /// well-formed and downstream passes can keep going.
@@ -452,6 +473,9 @@ mod tests {
             SyntaxKind::USE_DECL,
             SyntaxKind::MODULE_PATH,
             SyntaxKind::BUILTIN_RELVAR_DECL,
+            SyntaxKind::GROUP_EXPR,
+            SyntaxKind::GROUP_PAIR,
+            SyntaxKind::UNGROUP_EXPR,
             SyntaxKind::PARSE_ERROR,
         ] {
             assert!(!sk.is_token(), "{sk:?} should be a node kind");

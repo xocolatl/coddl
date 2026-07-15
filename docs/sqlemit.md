@@ -88,6 +88,26 @@ In every drift case the two handle differently, `USING` either stays correct or 
 
 `wrap`/`unwrap` are pure **heading** restructures — they group attributes into a tuple-valued attribute (an inline nested cell — see [runtime.md](runtime.md)) or expand one — but the underlying SQL columns are always the flat **leaf** columns. SQLite has no composite column, so a pushed wrap emits no `$`-mangled aliases and no `JSON`: it selects the plain leaf columns, and the nesting lives entirely in the **result descriptor** (which the runtime reconstructs at materialization). `resolve` passes a `Wrap`/`Unwrap` straight through to its input (the `attr → column` map is keyed by the stable leaf names; the restructure changes only `expr.heading()`). `emit_select`'s column-list builder then **flattens** each `Tuple` attribute of the result heading to its component leaf columns, recursing depth-first in the sub-heading's canonical order — which is exactly `record_layout`'s leaf order, so the runtime's positional column→cell mapping reconstructs the inline nested cell. Net SQL for `Greetings wrap { t: {id, message} }`: `SELECT DISTINCT "id", "message" FROM "greetings"` — the wrap is invisible in the SQL; the result heading `{t: Tuple{id, message}}` and its (nested) descriptor carry it. A `wrap … unwrap` round-trip pushes as the plain flat select of the surviving columns.
 
+### `group` / `ungroup`: never push — the operand fetch is the maximal push
+
+`group`/`ungroup` (TTM GROUP/UNGROUP — the relation-valued-attribute pair) get
+no SQL emission at all, root or nested. Unlike `wrap`, a relation-valued
+attribute is **not** a fixed set of flat leaf columns — its cardinality is
+per-row-variable, `push_leaf_cols` has no expansion for it, and the query
+marshaller has no cell form for kind `Relation` — and unlike `tclose` there is
+no special root form either. `resolve` declines both nodes unconditionally, the
+cut returns `None`, and the in-process lowering recursion pushes the **operand**
+at its own root: `Shipments group { pq: {part, qty} }` runs as the plain pushed
+`SELECT "part", "qty", "supplier" FROM "shipments"` followed by the in-process
+nest (`coddl_relation_group`). The full-relvar-pull guard deliberately exempts
+`group`/`ungroup` operands — with no SQL form, fetching the operand *is* the
+maximal push (the `load … from R` precedent), not an avoidable pull. Note the
+key inference still pays off in-process: the survivor set is a candidate key of
+a `group` result ([relir.md](relir.md)), and `group` builds its output distinct
+by construction — no output seal. A future storage-side design gives a *stored*
+RVA an ungrouped physical form (a child table), at which point `Relvar ungroup`
+pushes as a plain join — see [storage.md](storage.md) "Nested attributes".
+
 ### Ordered `load` pushdown: trailing `ORDER BY`
 
 `load … from <src> order [ … ]` is the one place ordering enters SQL. Relations

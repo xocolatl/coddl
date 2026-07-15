@@ -126,6 +126,22 @@ runtime flattens both descriptors to leaf cells, matches them by name,
 and permutes each record into the destination layout — a leaf moving
 into or out of a tuple sub-region lands at its new offset.
 
+`Inst::Group` (surface `group`) bakes two read-only arrays — the RVA
+index array (`rva_indices`, a `u32` array like `Rename`'s `perm`: the
+canonical index of each new relation-valued attribute in the *result*
+heading) and the inner-descriptor pointer array (`[k x ptr]` of
+`@.heading.<id>` addresses, one per pair's component heading; Cranelift
+uses per-element data-addr relocations, the same mechanism the heading
+descriptors use for their `attrs` pointers) — then emits
+`call coddl_relation_group(src, &src_desc, &result_desc, rva, descs, k)`.
+`Inst::Ungroup` (surface `ungroup`) bakes only the RVA index array
+(indices into the *source* heading; the nested payloads are
+self-describing via their RC-header descriptors) and emits
+`call coddl_relation_ungroup(src, &src_desc, &result_desc, rva, k)`.
+Both results are fresh `Relation`s (rc = 1). The inner headings are
+interned like any other, so their `@.heading.<id>` descriptors emit
+through the ordinary per-module heading table.
+
 The `Inst::RelationLit` lowering, in both backends, has the same
 three-step shape:
 

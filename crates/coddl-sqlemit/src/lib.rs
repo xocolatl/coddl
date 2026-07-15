@@ -240,7 +240,9 @@ fn rel_params_of(expr: &RelExpr) -> Vec<RelParamSpec> {
             | RelExpr::Extend { input, .. }
             | RelExpr::TClose { input }
             | RelExpr::Wrap { input, .. }
-            | RelExpr::Unwrap { input, .. } => walk(input, out),
+            | RelExpr::Unwrap { input, .. }
+            | RelExpr::Group { input, .. }
+            | RelExpr::Ungroup { input, .. } => walk(input, out),
             RelExpr::And { lhs, rhs }
             | RelExpr::Or { lhs, rhs }
             | RelExpr::Minus { lhs, rhs }
@@ -285,7 +287,11 @@ fn annotate_absorbs(expr: &RelExpr, specs: &mut [RelParamSpec]) {
             | RelExpr::Extend { input, .. }
             | RelExpr::TClose { input }
             | RelExpr::Wrap { input, .. }
-            | RelExpr::Unwrap { input, .. } => walk(input, absorbs, specs),
+            | RelExpr::Unwrap { input, .. }
+            // An empty operand groups/ungroups to the empty relation, so
+            // emptiness propagates.
+            | RelExpr::Group { input, .. }
+            | RelExpr::Ungroup { input, .. } => walk(input, absorbs, specs),
             RelExpr::And { lhs, rhs } => {
                 walk(lhs, absorbs, specs);
                 walk(rhs, absorbs, specs);
@@ -1457,6 +1463,16 @@ fn resolve(
         // `expr.heading()` and flattens its Tuple attrs to leaf columns, and the
         // result descriptor carries the nesting for the runtime to reconstruct.
         RelExpr::Wrap { input, .. } | RelExpr::Unwrap { input, .. } => resolve(input, wheres),
+        // group/ungroup NEVER push — unlike wrap, a relation-valued attribute
+        // is not a fixed set of flat leaf columns (its cardinality is
+        // per-row-variable, and `marshal_rows` has no cell form for it), and
+        // unlike tclose there is no root emission either. Declining here makes
+        // the whole push fail, after which the in-process lowering recursion
+        // pushes the *operand* at its own root and nests/unnests via
+        // `coddl_relation_group`/`_ungroup`.
+        RelExpr::Group { .. } | RelExpr::Ungroup { .. } => Err(BackendError::Other(
+            "group/ungroup (relation-valued attributes) does not push to SQL".to_string(),
+        )),
         // Never reached: a materialized leaf fails the cut's origin gate before
         // SQL emission (in a mixed tree the lowerer collapses every
         // materialized subtree to a `RelParam`). Defensive only.

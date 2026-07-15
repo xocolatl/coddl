@@ -165,6 +165,29 @@ pub enum RelExpr {
         /// The tuple-valued attribute names to expand.
         names: Vec<String>,
     },
+    /// Group (surface `group` — TTM GROUP). **Unary.** Each `(new, components)`
+    /// consumes the component attributes into `new : Relation(components)`; the
+    /// attributes named in NO pair survive and partition the operand (one
+    /// result tuple per distinct survivor combination — the survivor set is a
+    /// candidate key of the result). Cardinality-**changing** (unlike `Wrap`),
+    /// so it never pushes to SQL: a relation-valued cell has no flat-column
+    /// form, and `resolve` declines it — a relvar-rooted `group` fetches its
+    /// operand via SQL then nests in-process (`coddl_relation_group`).
+    Group {
+        input: Box<RelExpr>,
+        /// `(new_name, components_heading)` pairs, in source order.
+        groups: Vec<(String, Heading)>,
+    },
+    /// Ungroup (surface `ungroup` — TTM UNGROUP). **Unary.** Unnests the named
+    /// relation-valued attributes: one result tuple per combination of an outer
+    /// tuple and one tuple from each named RVA (an empty RVA contributes
+    /// nothing). Cardinality-changing like `TClose`; same SQL decline as
+    /// `Group` — in-process via `coddl_relation_ungroup`.
+    Ungroup {
+        input: Box<RelExpr>,
+        /// The relation-valued attribute names to unnest.
+        names: Vec<String>,
+    },
     /// An in-memory (`private`) relvar read — the materialized counterpart of
     /// the relvar-rooted `RelvarRef` leaf. No SQL source, so any subtree
     /// containing it is `Materialized` and lowers in-process.
@@ -513,6 +536,45 @@ impl RelExpr {
                 }
                 Heading::new(attrs)
             }
+            // Survivors (attributes not consumed by any pair) plus each new
+            // `Relation(components)`; `Heading::new` re-canonicalizes. Same
+            // shape as `Wrap` — only the added attribute's type differs.
+            RelExpr::Group { input, groups } => {
+                let consumed: std::collections::HashSet<&str> = groups
+                    .iter()
+                    .flat_map(|(_, h)| h.attrs().iter().map(|(n, _)| n.as_str()))
+                    .collect();
+                let mut attrs: Vec<(String, Type)> = input
+                    .heading()
+                    .attrs()
+                    .iter()
+                    .filter(|(n, _)| !consumed.contains(n.as_str()))
+                    .cloned()
+                    .collect();
+                attrs.extend(
+                    groups
+                        .iter()
+                        .map(|(new, h)| (new.clone(), Type::Relation(h.clone()))),
+                );
+                Heading::new(attrs)
+            }
+            // Survivors (attributes not ungrouped) plus each ungrouped
+            // relation's attributes lifted to top level.
+            RelExpr::Ungroup { input, names } => {
+                let in_heading = input.heading();
+                let mut attrs: Vec<(String, Type)> = in_heading
+                    .attrs()
+                    .iter()
+                    .filter(|(n, _)| !names.contains(n))
+                    .cloned()
+                    .collect();
+                for name in names {
+                    if let Some(Type::Relation(sub)) = in_heading.lookup(name) {
+                        attrs.extend(sub.attrs().iter().cloned());
+                    }
+                }
+                Heading::new(attrs)
+            }
             RelExpr::MaterializedRelvar { heading, .. } => heading.clone(),
             RelExpr::RelParam { heading, .. } => heading.clone(),
         }
@@ -547,6 +609,12 @@ impl RelExpr {
             // the push (sqlemit errs) and restructures in-process.
             RelExpr::Wrap { input, .. } => input.origin(),
             RelExpr::Unwrap { input, .. } => input.origin(),
+            // Group/ungroup inherit like TClose. They NEVER push (a
+            // relation-valued cell has no flat-column SQL form — `resolve`
+            // declines), so a relvar-rooted one fetches its operand via SQL
+            // then nests/unnests in-process.
+            RelExpr::Group { input, .. } => input.origin(),
+            RelExpr::Ungroup { input, .. } => input.origin(),
             RelExpr::MaterializedRelvar { .. } => StorageOrigin::Materialized,
             // A relation value lives in the process; what makes it *pushable*
             // anyway is the rel-param shipping, decided at the cut, not here.
@@ -662,6 +730,27 @@ impl RelExpr {
                 let _ = writeln!(out, "{pad}Unwrap {{ {} }}", names.join(", "));
                 input.render_into(out, depth + 1);
             }
+            RelExpr::Group { input, groups } => {
+                let pairs = groups
+                    .iter()
+                    .map(|(new, h)| {
+                        let comps = h
+                            .attrs()
+                            .iter()
+                            .map(|(n, _)| n.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("{new}: {{ {comps} }}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(out, "{pad}Group {{ {pairs} }}");
+                input.render_into(out, depth + 1);
+            }
+            RelExpr::Ungroup { input, names } => {
+                let _ = writeln!(out, "{pad}Ungroup {{ {} }}", names.join(", "));
+                input.render_into(out, depth + 1);
+            }
             RelExpr::RelParam { slot, heading } => {
                 let attrs = heading
                     .attrs()
@@ -775,6 +864,60 @@ impl RelExpr {
             // them is deferred; keyless.
             RelExpr::Wrap { .. } => Vec::new(),
             RelExpr::Unwrap { .. } => Vec::new(),
+            // Group yields exactly one tuple per distinct survivor combination,
+            // so the survivor set is a genuine candidate key — the empty key
+            // for a group that consumes every attribute is exactly right
+            // (cardinality ≤ 1, like a nullary rel-param). Any input key made
+            // of survivors also survives: it pins one input tuple, hence one
+            // survivor combination.
+            RelExpr::Group { input, groups } => {
+                let consumed: std::collections::HashSet<&str> = groups
+                    .iter()
+                    .flat_map(|(_, h)| h.attrs().iter().map(|(n, _)| n.as_str()))
+                    .collect();
+                let survivors: Vec<String> = input
+                    .heading()
+                    .attrs()
+                    .iter()
+                    .filter(|(n, _)| !consumed.contains(n.as_str()))
+                    .map(|(n, _)| n.clone())
+                    .collect();
+                let mut out = vec![survivors.clone()];
+                for k in input.surviving_keys() {
+                    if k.iter().all(|a| survivors.contains(a)) && !out.contains(&k) {
+                        out.push(k);
+                    }
+                }
+                out
+            }
+            // The DBC7 superkey shape (TTM ch. 6): an input key `k` made of
+            // survivors pins one input tuple; that tuple's fan-out rows are
+            // distinguished by the lifted attributes — so `k ∪ lifted` is a
+            // superkey of the result (superkeys are sound here, see above).
+            // No survivor-contained input key → keyless (unnesting can
+            // produce duplicates; the runtime seals).
+            RelExpr::Ungroup { input, names } => {
+                let in_heading = input.heading();
+                let mut lifted: Vec<String> = Vec::new();
+                for name in names {
+                    if let Some(Type::Relation(sub)) = in_heading.lookup(name) {
+                        lifted.extend(sub.attrs().iter().map(|(n, _)| n.clone()));
+                    }
+                }
+                input
+                    .surviving_keys()
+                    .into_iter()
+                    .filter(|k| k.iter().all(|a| !names.contains(a)))
+                    .map(|mut k| {
+                        for a in &lifted {
+                            if !k.contains(a) {
+                                k.push(a.clone());
+                            }
+                        }
+                        k
+                    })
+                    .collect()
+            }
             RelExpr::MaterializedRelvar { .. } => Vec::new(),
             // Every relation value is a set (RM Pro 3 — the in-process seal
             // enforces it), so the full heading is a trivially-true superkey.
@@ -831,6 +974,25 @@ impl RelExpr {
             // wrap/unwrap are cardinality-preserving (one tuple → one tuple).
             RelExpr::Wrap { input, .. } => input.card_le_one(),
             RelExpr::Unwrap { input, .. } => input.card_le_one(),
+            // Group never *increases* cardinality (one tuple per distinct
+            // survivor combination), so ≤ 1 input tuple → ≤ 1 output; and a
+            // group that consumes every attribute has at most one output
+            // tuple regardless of input size.
+            RelExpr::Group { input, groups } => {
+                input.card_le_one() || {
+                    let consumed: std::collections::HashSet<&str> = groups
+                        .iter()
+                        .flat_map(|(_, h)| h.attrs().iter().map(|(n, _)| n.as_str()))
+                        .collect();
+                    input
+                        .heading()
+                        .attrs()
+                        .iter()
+                        .all(|(n, _)| consumed.contains(n.as_str()))
+                }
+            }
+            // Unnesting multiplies cardinality (like TClose introduces tuples).
+            RelExpr::Ungroup { .. } => false,
             RelExpr::MaterializedRelvar { .. } => false,
             RelExpr::RelParam { .. } => false,
         }
@@ -861,7 +1023,9 @@ impl RelExpr {
             | RelExpr::Extend { input, .. }
             | RelExpr::TClose { input }
             | RelExpr::Wrap { input, .. }
-            | RelExpr::Unwrap { input, .. } => input.references_table(table),
+            | RelExpr::Unwrap { input, .. }
+            | RelExpr::Group { input, .. }
+            | RelExpr::Ungroup { input, .. } => input.references_table(table),
             RelExpr::And { lhs, rhs }
             | RelExpr::Or { lhs, rhs }
             | RelExpr::Minus { lhs, rhs }
@@ -884,7 +1048,9 @@ impl RelExpr {
             | RelExpr::Extend { input, .. }
             | RelExpr::TClose { input }
             | RelExpr::Wrap { input, .. }
-            | RelExpr::Unwrap { input, .. } => input.rel_param_count(),
+            | RelExpr::Unwrap { input, .. }
+            | RelExpr::Group { input, .. }
+            | RelExpr::Ungroup { input, .. } => input.rel_param_count(),
             RelExpr::And { lhs, rhs }
             | RelExpr::Or { lhs, rhs }
             | RelExpr::Minus { lhs, rhs }

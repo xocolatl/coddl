@@ -686,6 +686,32 @@ each `parse_<x>` has a corresponding `check_<x>`.
   component colliding with a survivor or another lifted component is T0031.
   Result heading = the survivors plus each unwrapped tuple's components. Same
   in-process lowering as `wrap`.
+- **`check_group_expr`** — `R group { pq: { a, b }, … }` — TTM GROUP: consume
+  attributes into relation-valued attributes; the attributes named in NO pair
+  survive and partition the relation (one result tuple per distinct survivor
+  combination). The operand must be `Type::Relation(H)` (T0023). Each consumed
+  attribute must exist in `H` (T0027) and be consumed at most once across all
+  pairs (T0028); each new name must be fresh vs. survivors and other new names
+  (T0031). Multi-pair `group` is **simultaneous** — one partition by the common
+  survivors, each pair nesting its own components (`{…}` is unordered, so
+  Tutorial D's sequential commalist is out; chain `group {…} group {…}` for
+  sequential). Result heading = the survivors plus each
+  `new : Relation(<components with their H types>)`. (`group { g: {} }` →
+  `g = reltrue` per tuple — TTM exercise 2.34 — is allowed.) `group` never
+  pushes to SQL (a relation-valued cell has no flat-column form): the operand
+  fetch pushes at its own root and the nest runs in-process via `Inst::Group` →
+  `coddl_relation_group`.
+- **`check_ungroup_expr`** — `R ungroup { pq, … }` — TTM UNGROUP: unnest
+  relation-valued attributes back to top level, one result tuple per
+  combination of an outer tuple and one tuple from each named RVA (an empty
+  RVA contributes nothing). The operand must be `Type::Relation(H)` (T0023).
+  Each named attribute must exist (T0027), be listed once (T0028), and be
+  `Type::Relation(_)` (**T0100** — the RVA analogue of unwrap's T0048); a
+  lifted attribute colliding with a survivor or another lifted attribute is
+  T0031 (rename before ungrouping). Result heading = the survivors plus each
+  ungrouped relation's attributes. Same never-pushes lowering as `group`, via
+  `Inst::Ungroup` → `coddl_relation_ungroup` (the output seals — unnesting can
+  produce duplicates).
 - **`check_extend_expr`** — `R extend { c: e, … }`. Adds each new attribute `c`
   bound to the computed value `e`, keeping every operand attribute (the dual of
   `replace`). The operand must be `Type::Relation(H)` (T0023). Each value `e` is
@@ -909,3 +935,5 @@ check script enforces that.
 | T0097 | module-level `let` bindings form a reference cycle (bindings are order-independent; their initializers must form a DAG) |
 | T0098 | module-level `let` initializer is missing or not a constant expression (calls, `transaction`, relvar reads, field access, `if`, and indexing are excluded until purity derivation / compile-time evaluation widen) |
 | T0099 | `when` condition discipline: the condition must be `Boolean` (a relation-typed condition suggests `times`), and an unresolved name in it that is an attribute of the left operand hints at `where` — attributes are deliberately not in scope in a `when` condition |
+| T0100 | `ungroup` target is not a relation-valued attribute (the RVA analogue of T0048) |
+| T0101 | a storage-backed relvar (`public`/`base`) declares a relation- or tuple-valued attribute — no SQL column form yet; decompose into a side relvar (see [storage.md](storage.md) "Nested attributes") |

@@ -435,6 +435,37 @@ pub enum Inst {
         src_heading_id: HeadingId,
         result_heading_id: HeadingId,
     },
+    /// Nest a relation (surface `group` — TTM GROUP). Backends emit a call to
+    /// `coddl_relation_group(src, &src_desc, &result_desc, rva_idx, inner_descs,
+    /// k)`, which partitions `src` by the surviving attributes and builds one
+    /// sealed nested payload per partition per pair. `rva_indices[j]` is the
+    /// canonical index into the *result* heading of the `j`-th new
+    /// relation-valued attribute; `inner_heading_ids[j]` is its component
+    /// heading (interned, so the backend emits and references its static
+    /// descriptor). `dst` carries the grouped heading at `result_heading_id`.
+    Group {
+        dst: ValueId,
+        src: ValueId,
+        src_heading_id: HeadingId,
+        result_heading_id: HeadingId,
+        rva_indices: Vec<u32>,
+        inner_heading_ids: Vec<HeadingId>,
+    },
+    /// Unnest a relation (surface `ungroup` — TTM UNGROUP). Backends emit a
+    /// call to `coddl_relation_ungroup(src, &src_desc, &result_desc, rva_idx,
+    /// k)`, which emits one record per outer × nested-tuple combination and
+    /// seals (unnesting can produce duplicates). `rva_indices[j]` is the
+    /// canonical index into the *source* heading of the `j`-th relation-valued
+    /// attribute to unnest; the nested payloads are self-describing (their RC
+    /// headers carry the inner descriptors), so no inner heading ids are
+    /// needed. `dst` carries the unnested heading at `result_heading_id`.
+    Ungroup {
+        dst: ValueId,
+        src: ValueId,
+        src_heading_id: HeadingId,
+        result_heading_id: HeadingId,
+        rva_indices: Vec<u32>,
+    },
     /// Natural join two in-memory relations (surface `join`, Algebra-A AND).
     /// Backends emit a call to `coddl_relation_join(lhs, &lhs_descriptor, rhs,
     /// &rhs_descriptor, &result_descriptor)`, which matches records on the
@@ -1004,6 +1035,31 @@ impl fmt::Display for Inst {
             } => write!(
                 f,
                 "{dst} = restructure {src} heading_{} -> heading_{}",
+                src_heading_id.0, result_heading_id.0
+            ),
+            Inst::Group {
+                dst,
+                src,
+                src_heading_id,
+                result_heading_id,
+                rva_indices,
+                inner_heading_ids,
+            } => write!(
+                f,
+                "{dst} = group {src} heading_{} -> heading_{} rva{rva_indices:?} inner{:?}",
+                src_heading_id.0,
+                result_heading_id.0,
+                inner_heading_ids.iter().map(|h| h.0).collect::<Vec<_>>()
+            ),
+            Inst::Ungroup {
+                dst,
+                src,
+                src_heading_id,
+                result_heading_id,
+                rva_indices,
+            } => write!(
+                f,
+                "{dst} = ungroup {src} heading_{} -> heading_{} rva{rva_indices:?}",
                 src_heading_id.0, result_heading_id.0
             ),
             Inst::Join {

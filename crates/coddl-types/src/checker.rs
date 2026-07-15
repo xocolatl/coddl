@@ -15,11 +15,12 @@ use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_stdlib::ModulePath;
 use coddl_syntax::ast::{
     AssignStmt, AstNode, BinaryExpr, BinaryOp, Block, CallExpr, DeleteStmt, DoWhileStmt, Expr,
-    ExprStmt, ExtendExpr, FieldAccess, ForStmt, Heading as AstHeading, IfExpr, IndexExpr,
-    InsertStmt, Item, KeyClause, LetStmt, LoadStmt, NameRef, NamedArg, OperDecl, PrivateRelvarDecl,
-    ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr, ReplaceExpr, ReturnStmt,
-    Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt, TupleLit, TypeDecl,
-    TypeRef, UnaryExpr, UnaryOp, UnwrapExpr, UpdateStmt, VarStmt, WhileStmt, WrapExpr,
+    ExprStmt, ExtendExpr, FieldAccess, ForStmt, GroupExpr, Heading as AstHeading, IfExpr,
+    IndexExpr, InsertStmt, Item, KeyClause, LetStmt, LoadStmt, NameRef, NamedArg, OperDecl,
+    PrivateRelvarDecl, ProgramDecl, ProjectExpr, PublicRelvarDecl, RelationLit, RenameExpr,
+    ReplaceExpr, ReturnStmt, Root, SequenceLit, Stmt, TcloseExpr, TransactionExpr, TruncateStmt,
+    TupleLit, TypeDecl, TypeRef, UnaryExpr, UnaryOp, UngroupExpr, UnwrapExpr, UpdateStmt, VarStmt,
+    WhileStmt, WrapExpr,
 };
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
@@ -1247,10 +1248,42 @@ impl TypeChecker {
         // Resolve the heading. Duplicate attribute names within the
         // heading reuse T0007 (the same per-attribute uniqueness
         // diagnostic that applies to `oper` headings).
-        let heading = match heading_ast {
-            Some(h) => self.resolve_heading(&h),
+        let heading = match &heading_ast {
+            Some(h) => self.resolve_heading(h),
             None => Heading::empty(),
         };
+
+        // A storage-backed relvar (public in `.cd`, base in `.cddb`) cannot
+        // yet persist a relation- or tuple-valued attribute — an SQL base
+        // table has no composite or nested-set column (T0101). The designed
+        // endpoint is vertical decomposition in the `.cdstore` mapping layer
+        // (an RVA maps to a child table keyed by the parent key; see
+        // docs/storage.md "Nested attributes"); until that lands, reject at
+        // check time rather than aborting in the runtime marshaller. Private
+        // relvars are in-process state and take any heading.
+        if matches!(kind, RelvarKind::Public | RelvarKind::Base) {
+            if let Some(h) = &heading_ast {
+                for param in h.params() {
+                    let Some(ptok) = param.name() else { continue };
+                    let shape = match heading.lookup(ptok.text()) {
+                        Some(Type::Relation(_)) => "a relation-valued",
+                        Some(Type::Tuple(_)) => "a tuple-valued",
+                        _ => continue,
+                    };
+                    self.error(
+                        self.token_span(&ptok),
+                        "T0101",
+                        format!(
+                            "attribute `{}` of {} relvar `{name}` is {shape} attribute, \
+                             which cannot be stored yet — decompose it into a side relvar \
+                             keyed by `{name}`'s key",
+                            ptok.text(),
+                            kind.keyword(),
+                        ),
+                    );
+                }
+            }
+        }
 
         // Walk every key clause; v1 typechecks every key's attributes
         // (they're cheap to validate), even though downstream only
@@ -3191,6 +3224,8 @@ impl TypeChecker {
             Expr::Rename(r) => self.check_rename_expr(r, scope),
             Expr::Wrap(w) => self.check_wrap_expr(w, scope),
             Expr::Unwrap(u) => self.check_unwrap_expr(u, scope),
+            Expr::Group(g) => self.check_group_expr(g, scope),
+            Expr::Ungroup(u) => self.check_ungroup_expr(u, scope),
             Expr::Index(i) => self.check_index_expr(i, scope),
             Expr::If(i) => self.check_if_expr(i, scope),
         }
@@ -3574,6 +3609,184 @@ impl TypeChecker {
                     self.node_span(ue.syntax()),
                     "T0031",
                     format!("unwrap produces a duplicate attribute `{name}`"),
+                );
+            }
+            result.push((name, ty));
+        }
+        Type::Relation(Heading::new(result))
+    }
+
+    /// Walk `R group { pq: { a, b }, … }` — TTM GROUP: consume attributes into
+    /// relation-valued attributes; the attributes named in NO pair survive and
+    /// partition the relation (one result tuple per distinct survivor
+    /// combination). The operand must be `Relation H` (T0023). Each consumed
+    /// attr must exist (T0027) and be consumed once across all pairs (T0028).
+    /// Multi-pair `group` is simultaneous — a single partition by the common
+    /// survivors, each pair nesting its own components (`{…}` is unordered, so
+    /// Tutorial D's sequential-commalist semantics is out; chain `group {…}
+    /// group {…}` for that). Result heading = survivors + each `(new,
+    /// Relation(components))`; a collision is T0031.
+    fn check_group_expr(&mut self, ge: &GroupExpr, scope: &mut Scope) -> Type {
+        let input_ty = match ge.input() {
+            Some(e) => self.check_expr(&e, scope),
+            None => return Type::Unknown,
+        };
+        let heading = match &input_ty {
+            Type::Relation(h) => h.clone(),
+            Type::Unknown => return Type::Unknown,
+            other => {
+                let span = ge
+                    .input()
+                    .map(|e| self.node_span(e.syntax()))
+                    .unwrap_or_else(|| self.node_span(ge.syntax()));
+                self.error(
+                    span,
+                    "T0023",
+                    format!("`group` expects a Relation on the left, got {other}"),
+                );
+                return Type::Unknown;
+            }
+        };
+        // Collect each pair's new name + its consumed components (as an RVA),
+        // and the set of all consumed attributes.
+        let mut consumed: HashSet<String> = HashSet::new();
+        let mut added: Vec<(String, Type)> = Vec::new();
+        for pair in ge.pairs() {
+            let Some(new_tok) = pair.name() else { continue };
+            let new = new_tok.text();
+            let mut components: Vec<(String, Type)> = Vec::new();
+            for tok in pair.grouped() {
+                let name = tok.text();
+                let Some(ty) = heading.lookup(name).cloned() else {
+                    self.error(
+                        self.token_span(&tok),
+                        "T0027",
+                        format!("unknown attribute `{name}` in group of {heading}"),
+                    );
+                    continue;
+                };
+                if !consumed.insert(name.to_string()) {
+                    self.error(
+                        self.token_span(&tok),
+                        "T0028",
+                        format!("attribute `{name}` is grouped more than once"),
+                    );
+                    continue;
+                }
+                components.push((name.to_string(), ty));
+            }
+            added.push((new.to_string(), Type::Relation(Heading::new(components))));
+        }
+        // Result = surviving (non-consumed) attributes + the new RVAs; a new
+        // name colliding with a survivor or another new name is T0031.
+        let mut result: Vec<(String, Type)> = Vec::new();
+        let mut result_names: HashSet<String> = HashSet::new();
+        for (name, ty) in heading.attrs() {
+            if consumed.contains(name) {
+                continue;
+            }
+            result_names.insert(name.clone());
+            result.push((name.clone(), ty.clone()));
+        }
+        for (name, ty) in added {
+            if !result_names.insert(name.clone()) {
+                self.error(
+                    self.node_span(ge.syntax()),
+                    "T0031",
+                    format!("group produces a duplicate attribute `{name}`"),
+                );
+            }
+            result.push((name, ty));
+        }
+        Type::Relation(Heading::new(result))
+    }
+
+    /// Walk `R ungroup { pq, … }` — TTM UNGROUP: unnest relation-valued
+    /// attributes back to top level, one result tuple per combination of an
+    /// outer tuple and one tuple from each named RVA (an empty RVA contributes
+    /// nothing). The operand must be `Relation H` (T0023). Each named attr must
+    /// exist (T0027), be listed once (T0028), and be `Type::Relation(_)`
+    /// (T0100 — the RVA analogue of unwrap's T0048). Result heading = the
+    /// attributes not ungrouped, plus each ungrouped relation's attributes; a
+    /// lifted attribute colliding with a survivor or another lifted attribute
+    /// is T0031 (rename before ungrouping).
+    fn check_ungroup_expr(&mut self, ue: &UngroupExpr, scope: &mut Scope) -> Type {
+        let input_ty = match ue.input() {
+            Some(e) => self.check_expr(&e, scope),
+            None => return Type::Unknown,
+        };
+        let heading = match &input_ty {
+            Type::Relation(h) => h.clone(),
+            Type::Unknown => return Type::Unknown,
+            other => {
+                let span = ue
+                    .input()
+                    .map(|e| self.node_span(e.syntax()))
+                    .unwrap_or_else(|| self.node_span(ue.syntax()));
+                self.error(
+                    span,
+                    "T0023",
+                    format!("`ungroup` expects a Relation on the left, got {other}"),
+                );
+                return Type::Unknown;
+            }
+        };
+        // Each listed name: exists (T0027), unique in the list (T0028), and is
+        // a relation-valued attribute (T0100). Collect the ungrouped set + the
+        // lifted attributes.
+        let mut ungrouped: HashSet<String> = HashSet::new();
+        let mut lifted: Vec<(String, Type)> = Vec::new();
+        for tok in ue.attrs() {
+            let name = tok.text();
+            let Some(ty) = heading.lookup(name).cloned() else {
+                self.error(
+                    self.token_span(&tok),
+                    "T0027",
+                    format!("unknown attribute `{name}` in ungroup of {heading}"),
+                );
+                continue;
+            };
+            if !ungrouped.insert(name.to_string()) {
+                self.error(
+                    self.token_span(&tok),
+                    "T0028",
+                    format!("duplicate attribute `{name}` in ungroup list"),
+                );
+                continue;
+            }
+            match ty {
+                Type::Relation(sub) => {
+                    for (cn, ct) in sub.attrs() {
+                        lifted.push((cn.clone(), ct.clone()));
+                    }
+                }
+                other => self.error(
+                    self.token_span(&tok),
+                    "T0100",
+                    format!(
+                        "`ungroup` target `{name}` is not a relation-valued attribute (got {other})"
+                    ),
+                ),
+            }
+        }
+        // Result = surviving (non-ungrouped) attributes + the lifted
+        // attributes; a collision (lifted vs survivor or vs another lifted) is
+        // T0031.
+        let mut result: Vec<(String, Type)> = Vec::new();
+        let mut result_names: HashSet<String> = HashSet::new();
+        for (name, ty) in heading.attrs() {
+            if ungrouped.contains(name) {
+                continue;
+            }
+            result_names.insert(name.clone());
+            result.push((name.clone(), ty.clone()));
+        }
+        for (name, ty) in lifted {
+            if !result_names.insert(name.clone()) {
+                self.error(
+                    self.node_span(ue.syntax()),
+                    "T0031",
+                    format!("ungroup produces a duplicate attribute `{name}`"),
                 );
             }
             result.push((name, ty));
@@ -8534,6 +8747,138 @@ mod tests {
     fn unwrap_non_relation_diagnoses_t0023() {
         let src = "oper main {} [ let s = 1 unwrap {t}; ];";
         assert!(codes(src).contains(&"T0023"));
+    }
+
+    // ── group / ungroup ─────────────────────────────────────────────────
+
+    #[test]
+    fn group_consumes_attrs_into_a_relation_valued_attribute() {
+        // {a, b, c} group {pq: {a, b}}: `pq` is accessible (a relation), `a`/`b`
+        // are gone (consumed), `c` survives and partitions.
+        let ok = "oper main {} [ \
+                  let r = Relation { {a: 1, b: 2, c: 3} }; \
+                  let s = r group {pq: {a, b}}; \
+                  let u = extract s; let _pq = u.pq; let _c = u.c; \
+                  ];";
+        assert!(diagnostics(ok).is_empty(), "{:?}", diagnostics(ok));
+        let gone = "oper main {} [ \
+                    let r = Relation { {a: 1, b: 2, c: 3} }; \
+                    let s = r group {pq: {a, b}}; \
+                    let u = extract s; let _a = u.a; \
+                    ];";
+        assert!(codes(gone).contains(&"T0017"));
+    }
+
+    #[test]
+    fn group_of_every_attribute_types_as_single_rva() {
+        // Consuming the whole heading leaves only the RVA — legal (the result
+        // has 0 or 1 tuples).
+        let ok = "oper main {} [ \
+                  let r = Relation { {a: 1, b: 2} }; \
+                  let s = r group {all: {a, b}}; \
+                  let u = extract s; let _all = u.all; \
+                  ];";
+        assert!(diagnostics(ok).is_empty(), "{:?}", diagnostics(ok));
+    }
+
+    #[test]
+    fn group_unknown_attr_diagnoses_t0027() {
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1} }; \
+                   let s = r group {pq: {nope}}; \
+                   ];";
+        assert!(codes(src).contains(&"T0027"));
+    }
+
+    #[test]
+    fn group_same_attr_twice_diagnoses_t0028() {
+        // Across pairs too — multi-pair group is simultaneous, so an attribute
+        // is consumed at most once.
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1, b: 2} }; \
+                   let s = r group {pq: {a}, r2: {a}}; \
+                   ];";
+        assert!(codes(src).contains(&"T0028"));
+    }
+
+    #[test]
+    fn group_new_name_collides_diagnoses_t0031() {
+        // new name `c` collides with the surviving attribute `c`.
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1, b: 2, c: 3} }; \
+                   let s = r group {c: {a, b}}; \
+                   ];";
+        assert!(codes(src).contains(&"T0031"));
+    }
+
+    #[test]
+    fn ungroup_inverts_group_typing() {
+        // group then ungroup round-trips: `a`/`b` are back, `pq` gone.
+        let ok = "oper main {} [ \
+                  let r = Relation { {a: 1, b: 2, c: 3} }; \
+                  let s = r group {pq: {a, b}} ungroup {pq}; \
+                  let u = extract s; let _a = u.a; let _b = u.b; let _c = u.c; \
+                  ];";
+        assert!(diagnostics(ok).is_empty(), "{:?}", diagnostics(ok));
+    }
+
+    #[test]
+    fn ungroup_non_rva_diagnoses_t0100() {
+        // A scalar target and a tuple-valued target are both T0100 — only a
+        // relation-valued attribute unnests.
+        let scalar = "oper main {} [ \
+                      let r = Relation { {a: 1, b: 2} }; \
+                      let s = r ungroup {a}; \
+                      ];";
+        assert!(codes(scalar).contains(&"T0100"));
+        let tuple = "oper main {} [ \
+                     let r = Relation { {a: 1, t: {x: 1, y: 2}} }; \
+                     let s = r ungroup {t}; \
+                     ];";
+        assert!(codes(tuple).contains(&"T0100"));
+    }
+
+    #[test]
+    fn ungroup_lifted_collision_diagnoses_t0031() {
+        // {a, pq: Relation{a}} ungroup {pq}: lifting `a` collides with the
+        // surviving top-level `a` — rename before ungrouping.
+        let src = "oper main {} [ \
+                   let r = Relation { {a: 1, b: 2} }; \
+                   let s = r group {pq: {b}} rename {b: a} ungroup {pq};\
+                   ];";
+        assert!(codes(src).contains(&"T0031"));
+    }
+
+    #[test]
+    fn group_non_relation_diagnoses_t0023() {
+        let src = "oper main {} [ let s = 1 group {pq: {a}}; ];";
+        assert!(codes(src).contains(&"T0023"));
+    }
+
+    #[test]
+    fn ungroup_non_relation_diagnoses_t0023() {
+        let src = "oper main {} [ let s = 1 ungroup {pq}; ];";
+        assert!(codes(src).contains(&"T0023"));
+    }
+
+    #[test]
+    fn storage_backed_rva_or_tva_attribute_diagnoses_t0101() {
+        // A public relvar cannot persist a relation- or tuple-valued attribute
+        // (no SQL column form yet; the designed endpoint is decomposition in
+        // the `.cdstore` layer). A private relvar is in-process state and may
+        // hold either.
+        let rva = "database d;\n\
+                   public relvar Bad { a: Integer, b: Relation { x: Text } } key { a };";
+        assert!(codes(rva).contains(&"T0101"));
+        let tva = "database d;\n\
+                   public relvar Bad { a: Integer, t: Tuple { x: Text } } key { a };";
+        assert!(codes(tva).contains(&"T0101"));
+        let private_ok = "private relvar Fine { a: Integer, b: Relation { x: Text } } key { a };";
+        assert!(
+            !codes(private_ok).contains(&"T0101"),
+            "{:?}",
+            diagnostics(private_ok)
+        );
     }
 
     // ── extend ────────────────────────────────────────────────────────

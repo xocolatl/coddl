@@ -1325,6 +1325,18 @@ impl<'a> Parser<'a> {
                 self.finish_node();
                 continue;
             }
+            if min_prec == 0 && self.at_keyword("group") {
+                self.start_node_at(cp, SyntaxKind::GROUP_EXPR);
+                self.parse_group_suffix();
+                self.finish_node();
+                continue;
+            }
+            if min_prec == 0 && self.at_keyword("ungroup") {
+                self.start_node_at(cp, SyntaxKind::UNGROUP_EXPR);
+                self.parse_ungroup_suffix();
+                self.finish_node();
+                continue;
+            }
             let Some(prec) = self.peek_infix_prec() else {
                 break;
             };
@@ -2022,6 +2034,76 @@ impl<'a> Parser<'a> {
             ("P0051", "expected `{` to start unwrap list"),
             ("P0052", "expected attribute name in unwrap list"),
             ("P0053", "expected `}` to close unwrap list"),
+        );
+    }
+
+    /// `group { pq: { a, b }, … }` — relational group suffix (TTM GROUP). The
+    /// enclosing `GROUP_EXPR` node (wrapping the operand) is opened by the
+    /// caller, so this consumes the `group` keyword and the `{ new: { idents } }`
+    /// pair list. Each pair is a `GROUP_PAIR` node: the new relation-valued
+    /// attribute name, a colon, then an unordered brace-list of the existing
+    /// attribute names to CONSUME into it (NOT an expression) — the attributes
+    /// *not* named in any pair survive and partition the relation. Same
+    /// production shape as `wrap`; the semantics differ (cardinality-changing
+    /// nest vs. heading rewrite).
+    ///
+    /// Diagnostics: P0032 (no outer `{`), P0092 (no outer `}`); per pair P0087
+    /// (no new name), P0088 (no `:`); the inner brace-list emits P0089 (no `{`),
+    /// P0090 (no attribute name), P0091 (no `}`).
+    pub(crate) fn parse_group_suffix(&mut self) {
+        debug_assert!(self.at_keyword("group"));
+        self.bump_trivia();
+        self.bump(); // `group`
+        if !self.eat(SyntaxKind::L_BRACE) {
+            self.error("P0032", "expected `{` to start group list");
+            return;
+        }
+        if self.eat(SyntaxKind::R_BRACE) {
+            return;
+        }
+        loop {
+            self.bump_trivia();
+            self.start_node(SyntaxKind::GROUP_PAIR);
+            if !self.eat(SyntaxKind::IDENT) {
+                self.error("P0087", "expected new attribute name in group");
+            }
+            if !self.eat(SyntaxKind::COLON) {
+                self.error("P0088", "expected `:` after group attribute name");
+            }
+            self.parse_ident_brace_list(
+                ("P0089", "expected `{` to start grouped-attribute list"),
+                ("P0090", "expected attribute name in grouped-attribute list"),
+                ("P0091", "expected `}` to close grouped-attribute list"),
+            );
+            self.finish_node();
+            if !self.eat(SyntaxKind::COMMA) {
+                break;
+            }
+            // Trailing comma ok.
+            if self.at(SyntaxKind::R_BRACE) {
+                break;
+            }
+        }
+        if !self.eat(SyntaxKind::R_BRACE) {
+            self.error("P0092", "expected `}` to close group list");
+        }
+    }
+
+    /// `ungroup { pq, … }` — relational ungroup suffix (TTM UNGROUP). The
+    /// enclosing `UNGROUP_EXPR` node (wrapping the operand) is opened by the
+    /// caller, so this consumes the `ungroup` keyword and the unordered
+    /// brace-list of relation-valued attribute names to unnest. Reuses
+    /// `parse_ident_brace_list` (the same shape as `unwrap`).
+    ///
+    /// Diagnostics: P0093 (no `{`), P0094 (no attribute name), P0095 (no `}`).
+    pub(crate) fn parse_ungroup_suffix(&mut self) {
+        debug_assert!(self.at_keyword("ungroup"));
+        self.bump_trivia();
+        self.bump(); // `ungroup`
+        self.parse_ident_brace_list(
+            ("P0093", "expected `{` to start ungroup list"),
+            ("P0094", "expected attribute name in ungroup list"),
+            ("P0095", "expected `}` to close ungroup list"),
         );
     }
 
@@ -5460,6 +5542,108 @@ mod tests {
     fn wrap_unwrap_are_contextual_not_reserved() {
         let out = parse_str(
             "oper f {} [ let wrap = 1; let unwrap = 2; let s = R where wrap = unwrap; ];",
+        );
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+    }
+
+    // ── group / ungroup ───────────────────────────────────────────────
+
+    #[test]
+    fn group_parses_as_group_expr_with_pairs() {
+        let out = parse_str("oper f {} [ let s = R group {pq: {a, b}, r: {c}}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let ge = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::GROUP_EXPR)
+            .expect("GROUP_EXPR in tree");
+        assert!(ge.children().any(|n| n.kind() == SyntaxKind::NAME_REF));
+        let pairs = ge
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::GROUP_PAIR)
+            .count();
+        assert_eq!(pairs, 2, "two GROUP_PAIR nodes");
+    }
+
+    #[test]
+    fn ungroup_parses_as_ungroup_expr() {
+        let out = parse_str("oper f {} [ let s = R ungroup {pq, r}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let ue = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::UNGROUP_EXPR)
+            .expect("UNGROUP_EXPR in tree");
+        assert!(ue.children().any(|n| n.kind() == SyntaxKind::NAME_REF));
+    }
+
+    #[test]
+    fn ungroup_interleaves_with_group() {
+        // `R group {pq: {a, b}} ungroup {pq}` nests left: UNGROUP(GROUP(R)).
+        let out = parse_str("oper f {} [ let s = R group {pq: {a, b}} ungroup {pq}; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let ue = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::UNGROUP_EXPR)
+            .expect("UNGROUP_EXPR at the top");
+        assert!(ue.children().any(|n| n.kind() == SyntaxKind::GROUP_EXPR));
+    }
+
+    #[test]
+    fn group_missing_outer_brace_diagnoses_p0032() {
+        let out = parse_str("oper f {} [ let s = R group a; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0032"),
+            "expected P0032, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn group_missing_pair_name_diagnoses_p0087() {
+        let out = parse_str("oper f {} [ let s = R group {: {a}}; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0087"),
+            "expected P0087, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn group_missing_colon_diagnoses_p0088() {
+        let out = parse_str("oper f {} [ let s = R group {pq {a}}; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0088"),
+            "expected P0088, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn group_missing_inner_brace_diagnoses_p0089() {
+        let out = parse_str("oper f {} [ let s = R group {pq: a}; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0089"),
+            "expected P0089, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn ungroup_missing_brace_diagnoses_p0093() {
+        let out = parse_str("oper f {} [ let s = R ungroup pq; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0093"),
+            "expected P0093, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    #[test]
+    fn group_ungroup_are_contextual_not_reserved() {
+        let out = parse_str(
+            "oper f {} [ let group = 1; let ungroup = 2; let s = R where group = ungroup; ];",
         );
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }

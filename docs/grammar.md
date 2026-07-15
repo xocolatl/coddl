@@ -62,7 +62,7 @@ Reason: the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-
 
 Both remain ordinary identifiers everywhere else (no reserved words — `when` and `otherwise` are fine attribute or local names). Lowering: see [relir.md](relir.md) (the `Gate` restrict conjunct, the `Inst::Gate`/`Inst::Otherwise` in-process forms) and [sqlemit.md](sqlemit.md) (a relvar-rooted gate pushes as a `?N = 1` conjunct).
 
-**`project` (projection) is a *postfix* operator, not infix.** `R project { a, b }` narrows the relation's heading to the named attributes — the right operand is a brace-list of bare attribute names (structurally identical to a `key { … }` clause), not another expression, so it doesn't fit the infix `<lhs> op <rhs>` shape. It is parsed as a postfix suffix at *pipeline precedence* — the same altitude as `where`, and gated to the top level so it binds to the whole pipeline rather than to a higher-precedence operand such as a `where` predicate. `R where p project { a }` reads as `(R where p) project { a }`; the reverse order `R project { a } where p` also parses, nesting left. It is the first postfix relational operator; later ones (`replace`, `extend`, `rename`, `tclose`, `wrap`, `unwrap`, and future `summarize`) reuse the same pipeline slot. `project` remains a contextual keyword — a valid identifier everywhere else (no reserved words).
+**`project` (projection) is a *postfix* operator, not infix.** `R project { a, b }` narrows the relation's heading to the named attributes — the right operand is a brace-list of bare attribute names (structurally identical to a `key { … }` clause), not another expression, so it doesn't fit the infix `<lhs> op <rhs>` shape. It is parsed as a postfix suffix at *pipeline precedence* — the same altitude as `where`, and gated to the top level so it binds to the whole pipeline rather than to a higher-precedence operand such as a `where` predicate. `R where p project { a }` reads as `(R where p) project { a }`; the reverse order `R project { a } where p` also parses, nesting left. It is the first postfix relational operator; later ones (`replace`, `extend`, `rename`, `tclose`, `wrap`, `unwrap`, `group`, `ungroup`, and future `summarize`) reuse the same pipeline slot. `project` remains a contextual keyword — a valid identifier everywhere else (no reserved words).
 
 ### Named-prefix with braces — the only call form
 
@@ -731,14 +731,16 @@ function that implements it.
                     { <infix-op> <expr-prec> | <project-suffix>
                       | <replace-suffix> | <tclose-suffix>
                       | <extend-suffix> | <rename-suffix>
-                      | <wrap-suffix> | <unwrap-suffix> } ;
+                      | <wrap-suffix> | <unwrap-suffix>
+                      | <group-suffix> | <ungroup-suffix> } ;
                                                                -- parse_expr_prec
                     -- Pratt precedence ladder; left-associative.
                     -- min_prec drives which operators may be
                     -- consumed; the parser recurses with `prec + 1`
                     -- for each rhs. The <project-suffix> / <replace-suffix>
                     -- / <tclose-suffix> / <extend-suffix> / <rename-suffix> /
-                    -- <wrap-suffix> / <unwrap-suffix> postfix forms are
+                    -- <wrap-suffix> / <unwrap-suffix> / <group-suffix> /
+                    -- <ungroup-suffix> postfix forms are
                     -- consumed only at pipeline level (min_prec 0),
                     -- interleaved with infix ops, so they bind to the whole
                     -- pipeline.
@@ -926,6 +928,41 @@ function that implements it.
                     -- lifted component colliding with a survivor is T0031. P0051
                     -- on a missing `{`, P0052 on a missing name, P0053 on a
                     -- missing `}`. v1 declines the SQL push. Contextual keyword.
+<group-suffix>  ::= 'group' '{' <group-pair> { ',' <group-pair> } '}' ; -- parse_group_suffix
+<group-pair>    ::= <identifier> ':' <ident-brace-list> ;       -- (a GROUP_PAIR node)
+                    -- Relational group (TTM GROUP — consume attributes into a
+                    -- relation-valued attribute; the attributes named in NO
+                    -- pair survive and partition the relation, one result
+                    -- tuple per distinct survivor combination). Postfix at
+                    -- pipeline precedence; wraps the operand in GROUP_EXPR.
+                    -- Same production shape as <wrap-suffix>; the semantics
+                    -- differ (cardinality-changing nest vs. heading rewrite).
+                    -- Multi-pair group is SIMULTANEOUS — one partition by the
+                    -- common survivors, each pair nesting its own components
+                    -- (`{…}` is unordered, so Tutorial D's sequential
+                    -- commalist is out; chain `group {…} group {…}` for that).
+                    -- Each consumed attribute must exist (T0027) and be
+                    -- consumed at most once across all pairs (T0028); each new
+                    -- name must be fresh (T0031). P0032 on a missing outer
+                    -- `{`, P0087 on a missing new name, P0088 on a missing
+                    -- `:`, P0089/P0090/P0091 on the inner brace-list's
+                    -- `{`/name/`}`, P0092 on a missing outer `}`. Never pushes
+                    -- to SQL (a relation-valued cell has no flat-column form);
+                    -- the operand fetch pushes, the nest runs in-process.
+                    -- `group` is a contextual keyword (no reserved words).
+<ungroup-suffix> ::= 'ungroup' <ident-brace-list> ;            -- parse_ungroup_suffix
+                    -- Relational ungroup (TTM UNGROUP — unnest relation-valued
+                    -- attributes back to top level: one result tuple per
+                    -- combination of an outer tuple and one tuple from each
+                    -- named RVA; an empty RVA contributes nothing). Postfix at
+                    -- pipeline precedence; wraps the operand in UNGROUP_EXPR.
+                    -- The unordered brace-list names the relation-valued
+                    -- attributes to unnest: each must exist (T0027), be listed
+                    -- once (T0028), and be relation-valued (T0100); a lifted
+                    -- attribute colliding with a survivor is T0031 (rename
+                    -- first). P0093 on a missing `{`, P0094 on a missing name,
+                    -- P0095 on a missing `}`. Never pushes to SQL (like
+                    -- `group`). Contextual keyword.
 <transaction-expr> ::= 'transaction' <block> ;                 -- parse_transaction_expr
 <if-expr>       ::= 'if' <expr> 'then' <block>
                     [ 'else' <block> ] ;                       -- parse_if_expr (IF_EXPR)
@@ -1067,7 +1104,7 @@ enforces that.
 | P0029 | Expected `}` to close tuple literal                     |
 | P0030 | Expected field name after `.`                           |
 | P0031 | Expected `{` after `Relation`                           |
-| P0032 | *(retired)* — relation-literal elements are now arbitrary expressions (`parse_relation_lit_body`); a non-tuple element is rejected in typecheck (T0096), not here |
+| P0032 | Expected `{` to start group list (code reused: the original P0032 — relation-literal element check — retired to typecheck T0096) |
 | P0033 | Expected `}` to close relation literal                  |
 | P0034 | Expected `{` to start rename list                       |
 | P0035 | Expected `)` to close parenthesized expression          |
@@ -1122,6 +1159,15 @@ enforces that.
 | P0084 | Expected module name (leading, or after `::`)           |
 | P0085 | Expected `;` after `use module <path>`                  |
 | P0086 | Module-level `var` — module-level mutable state is a relvar; use `let` for a constant binding |
+| P0087 | Expected new attribute name in group                     |
+| P0088 | Expected `:` after group attribute name                  |
+| P0089 | Expected `{` to start grouped-attribute list             |
+| P0090 | Expected attribute name in grouped-attribute list        |
+| P0091 | Expected `}` to close grouped-attribute list             |
+| P0092 | Expected `}` to close group list                         |
+| P0093 | Expected `{` to start ungroup list                       |
+| P0094 | Expected attribute name in ungroup list                  |
+| P0095 | Expected `}` to close ungroup list                       |
 
 Note: missing-type-after-`:` (let annotation), missing-type-after-`->`
 (operator return clause), and missing-element-after-`Sequence` all

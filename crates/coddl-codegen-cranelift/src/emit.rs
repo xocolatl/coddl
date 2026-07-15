@@ -358,6 +358,34 @@ fn declare_runtime_rc_externs(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert("coddl_relation_rename".into(), id);
     }
+    // coddl_relation_group(src, src_desc, result_desc, rva_idx: ptr,
+    //                      inner_descs: ptr, rva_count: usize) -> ptr
+    {
+        let mut sig = obj.make_signature();
+        for _ in 0..5 {
+            sig.params.push(AbiParam::new(ptr_ty));
+        }
+        sig.params.push(AbiParam::new(ptr_ty)); // usize rva_count
+        sig.returns.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_relation_group", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_relation_group".into(), id);
+    }
+    // coddl_relation_ungroup(src, src_desc, result_desc, rva_idx: ptr,
+    //                        rva_count: usize) -> ptr
+    {
+        let mut sig = obj.make_signature();
+        for _ in 0..4 {
+            sig.params.push(AbiParam::new(ptr_ty));
+        }
+        sig.params.push(AbiParam::new(ptr_ty)); // usize rva_count
+        sig.returns.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_relation_ungroup", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_relation_ungroup".into(), id);
+    }
     // coddl_load_ordered(src, src_desc, keys: ptr, key_count: usize) -> ptr
     {
         let mut sig = obj.make_signature();
@@ -930,6 +958,37 @@ fn declare_byte_constant(
 /// Declare + define an anonymous read-only `u32` array (little-endian) — the
 /// rename permutation. Anonymous so each `Inst::Rename` gets a fresh symbol
 /// with no name-collision bookkeeping.
+/// Bake a `[k x ptr]` array of heading-descriptor addresses (a `group`'s
+/// per-pair inner descriptors) as anonymous read-only data with one data-addr
+/// relocation per element — the same shape the heading descriptors themselves
+/// use for their `attrs` pointers.
+fn declare_desc_ptr_array(
+    obj: &mut ObjectModule,
+    heading_desc_ids: &[DataId],
+    inner_heading_ids: &[coddl_procir::HeadingId],
+) -> Result<DataId, CraneliftEmitError> {
+    let ptr_bytes = obj.target_config().pointer_bytes() as usize;
+    let id = obj
+        .declare_anonymous_data(false, false)
+        .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+    let mut dd = DataDescription::new();
+    dd.set_align(ptr_bytes as u64);
+    if inner_heading_ids.is_empty() {
+        // DataDescription rejects zero-length payloads; the runtime treats
+        // rva_count == 0 as empty and never reads the pointer.
+        dd.define(vec![0u8].into_boxed_slice());
+    } else {
+        dd.define(vec![0u8; inner_heading_ids.len() * ptr_bytes].into_boxed_slice());
+        for (i, h) in inner_heading_ids.iter().enumerate() {
+            let gv = obj.declare_data_in_data(heading_desc_ids[h.0 as usize], &mut dd);
+            dd.write_data_addr((i * ptr_bytes) as u32, gv, 0);
+        }
+    }
+    obj.define_data(id, &dd)
+        .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+    Ok(id)
+}
+
 fn declare_perm_data(obj: &mut ObjectModule, perm: &[u32]) -> Result<DataId, CraneliftEmitError> {
     let id = obj
         .declare_anonymous_data(false, false)
@@ -2393,6 +2452,75 @@ fn emit_inst(
             let call = builder
                 .ins()
                 .call(restructure_local, &[src_v, src_desc_val, res_desc_val]);
+            let result = builder.inst_results(call)[0];
+            values.insert(*dst, ValueRepr::Scalar(result));
+            Ok(())
+        }
+        Inst::Group {
+            dst,
+            src,
+            src_heading_id,
+            result_heading_id,
+            rva_indices,
+            inner_heading_ids,
+        } => {
+            let src_v = scalar_value(values, src)?;
+            let ptr_ty = obj.target_config().pointer_type();
+            let src_desc_gv =
+                obj.declare_data_in_func(heading_desc_ids[src_heading_id.0 as usize], builder.func);
+            let src_desc_val = builder.ins().symbol_value(ptr_ty, src_desc_gv);
+            let res_desc_gv = obj
+                .declare_data_in_func(heading_desc_ids[result_heading_id.0 as usize], builder.func);
+            let res_desc_val = builder.ins().symbol_value(ptr_ty, res_desc_gv);
+            let rva_id = declare_perm_data(obj, rva_indices)?;
+            let rva_gv = obj.declare_data_in_func(rva_id, builder.func);
+            let rva_val = builder.ins().symbol_value(ptr_ty, rva_gv);
+            let descs_id = declare_desc_ptr_array(obj, heading_desc_ids, inner_heading_ids)?;
+            let descs_gv = obj.declare_data_in_func(descs_id, builder.func);
+            let descs_val = builder.ins().symbol_value(ptr_ty, descs_gv);
+            let count_val = builder.ins().iconst(ptr_ty, rva_indices.len() as i64);
+            let group_id = funcs["coddl_relation_group"];
+            let group_local = obj.declare_func_in_func(group_id, builder.func);
+            let call = builder.ins().call(
+                group_local,
+                &[
+                    src_v,
+                    src_desc_val,
+                    res_desc_val,
+                    rva_val,
+                    descs_val,
+                    count_val,
+                ],
+            );
+            let result = builder.inst_results(call)[0];
+            values.insert(*dst, ValueRepr::Scalar(result));
+            Ok(())
+        }
+        Inst::Ungroup {
+            dst,
+            src,
+            src_heading_id,
+            result_heading_id,
+            rva_indices,
+        } => {
+            let src_v = scalar_value(values, src)?;
+            let ptr_ty = obj.target_config().pointer_type();
+            let src_desc_gv =
+                obj.declare_data_in_func(heading_desc_ids[src_heading_id.0 as usize], builder.func);
+            let src_desc_val = builder.ins().symbol_value(ptr_ty, src_desc_gv);
+            let res_desc_gv = obj
+                .declare_data_in_func(heading_desc_ids[result_heading_id.0 as usize], builder.func);
+            let res_desc_val = builder.ins().symbol_value(ptr_ty, res_desc_gv);
+            let rva_id = declare_perm_data(obj, rva_indices)?;
+            let rva_gv = obj.declare_data_in_func(rva_id, builder.func);
+            let rva_val = builder.ins().symbol_value(ptr_ty, rva_gv);
+            let count_val = builder.ins().iconst(ptr_ty, rva_indices.len() as i64);
+            let ungroup_id = funcs["coddl_relation_ungroup"];
+            let ungroup_local = obj.declare_func_in_func(ungroup_id, builder.func);
+            let call = builder.ins().call(
+                ungroup_local,
+                &[src_v, src_desc_val, res_desc_val, rva_val, count_val],
+            );
             let result = builder.inst_results(call)[0];
             values.insert(*dst, ValueRepr::Scalar(result));
             Ok(())
