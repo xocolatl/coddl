@@ -1057,6 +1057,18 @@ pub enum BinaryOp {
     /// tuples with **no** match in the right operand (`r minus (r matching s)`).
     /// Result heading = the left operand's. Same heading discipline as `Matching`.
     NotMatching,
+    /// Gate (surface `when`) — `Relation H × Boolean → Relation H`: the left
+    /// operand when the condition holds, the empty relation with the same
+    /// heading when it doesn't (`R times ⟨c⟩` — the condition lifted to
+    /// reltrue/relfalse in the IR). The condition is checked in the
+    /// **enclosing** scope — no heading injection; that's the contract with
+    /// `where`, which filters per-tuple with the heading in scope.
+    When,
+    /// Relational COALESCE (surface `otherwise`) — the left operand if it is
+    /// nonempty, else the right (`R union (D times (reltrue minus
+    /// (R project {})))`; arms exclusive by construction). Identical headings
+    /// required, like `union`.
+    Otherwise,
     /// Scalar arithmetic: `Integer × Integer → Integer`. The symbolic `-`
     /// (token `MINUS`) is `Sub`, distinct from the relational `minus`
     /// keyword (`Minus`).
@@ -1121,6 +1133,8 @@ impl BinaryExpr {
                                 | "union"
                                 | "minus"
                                 | "matching"
+                                | "when"
+                                | "otherwise"
                                 | "div"
                                 // Unicode glyph synonyms (lexed as IDENT).
                                 | "⋈"
@@ -1177,6 +1191,8 @@ impl BinaryExpr {
                 "matching" | "⋉" if self.has_not_prefix() => BinaryOp::NotMatching,
                 "matching" | "⋉" => BinaryOp::Matching,
                 "▷" => BinaryOp::NotMatching,
+                "when" => BinaryOp::When,
+                "otherwise" => BinaryOp::Otherwise,
                 "div" => BinaryOp::IntDiv,
                 _ => return None,
             },

@@ -20,13 +20,54 @@ This doc describes the **target** RelIR. The code implements a thin slice of it;
 - An **in-process path** for non-pushable subtrees — currently lowered to ProcIR within `coddl-procir` itself (not yet through `coddl-execlocal`).
 - Restriction predicates are an `attr <cmp> value` comparison
   (`Predicate::AttrCmp { attr, op: CmpOp, value: RestrictValue }`), where `<cmp>`
-  is `=`/`<>` (Integer/Text/Boolean) or `<`/`<=`/`>`/`>=` (Integer). Only `=`
-  pins a value, so only it bounds cardinality for `DISTINCT`-elision. A **bare
-  Boolean attribute** predicate `R where flag` is the equality `flag = true` (a
-  Boolean-valued attribute is itself a proposition) and pushes as
+  is `=`/`<>` (Integer/Text/Boolean) or `<`/`<=`/`>`/`>=` (Integer), **or** the
+  tuple-independent gate `Predicate::Gate(RestrictValue)` (surface `when` —
+  `R times ⟨c⟩` in restrict clothing). Only `=` pins a value, so only it bounds
+  cardinality for `DISTINCT`-elision (a gate pins nothing — `card_le_one`
+  contributes `false`). A **bare Boolean attribute** predicate `R where flag`
+  is the equality `flag = true` (a Boolean-valued attribute is itself a
+  proposition) and pushes as
   `Predicate::AttrCmp { attr, Eq, Lit(Boolean(true)) }` → `WHERE "flag" = ?` —
   the formatter canonicalizes `flag = true` to the bare form, so both surface
   spellings must push identically.
+- **The gate conjunct (`when`).** `R when c` builds as `Restrict { pred:
+  Gate(value) }` and inherits the restrict machinery wholesale — keys pass
+  through `surviving_keys` untouched, absorption holds (`annotate_absorbs`
+  walks through `Restrict`; gate-of-empty is empty). The value is a
+  `RestrictValue::Param`: a **bare in-scope Boolean local** binds under its own
+  name (the same discipline as a comparison's `Param`); any other condition
+  expression rides the build's `conds` side table (`BuildTables` — truncated in
+  lockstep with `slots` at every collapse point) and binds as the
+  compiler-internal `__when_<k>` once the push commits, lowered exactly once in
+  `try_lower_pushed_ordered`. SQL renders it `?N = 1` (see
+  [sqlemit.md](sqlemit.md)). A gate over a **materialized** input never reaches
+  SQL: the operand-collapse rule swallows the whole `when` into its `RelParam`
+  slot and the slot's AST re-lowers in-process through `Inst::Gate`
+  (`coddl_relation_when` — retain-or-fresh-empty, O(1); a necessity, not an
+  optimization: the in-process RelExpr consumer has no `Restrict` arm, and the
+  per-tuple `where`-helper path can't capture an enclosing condition, T0022).
+  Note `contains_restrict` counts a gate as "filtered", muting the S1
+  full-pull guard for gated-relvar operand shapes — sound, because those
+  shapes push. Deferred-alias hygiene: a `let`-alias declines an RHS whose
+  build produced `conds` entries (a `__when_<k>` name must not cross builds);
+  a bare-local gate aliases fine. The DML recognizers likewise decline a
+  gate-bearing value tree (no cond-lowering step on the write path) — it
+  routes to the row-shipping paths, whose reads bind the gate properly.
+- **`otherwise` (relational COALESCE) has no RelIR node in v1.** `R otherwise
+  D` ≡ `R union (D times (reltrue minus (R project {})))`, but nothing ever
+  builds that tree: the arms are exclusive by construction, so the lowerer
+  emits one `Inst::Otherwise` (`coddl_relation_otherwise` — a header length
+  check plus a retain of the winner, O(1); the result is already sealed
+  because it *is* one of the operands). Operands lower to relation values
+  first, so an embedded pushed plan fires at the `otherwise` site — post-fire
+  empty-result substitution. Inside a larger relational op, the whole
+  `otherwise` **self-collapses to one `RelParam` slot** (the same precedent as
+  a non-pushable `where` over a materialized input), so `(A otherwise B) join
+  Relvar` ships the coalesced rows and never kills the enclosing build.
+  Tracked residue (`.local/tracking/optimizations.md`): a proper
+  `RelExpr::Otherwise` node would buy relvar-rooted pushdown (the
+  `UNION`/`NOT EXISTS` form) and exclusive-arms cardinality inference; today a
+  relvar-rooted *fallback*'s plan fires even when the primary is nonempty.
 - The value is a `RestrictValue`: a compile-time `Lit(Literal)`, a
   **bound parameter** `Param(name)` — the surface name of an in-scope
   local/parameter whose runtime value binds at query time — or a

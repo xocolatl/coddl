@@ -512,6 +512,57 @@ pub unsafe extern "C" fn coddl_relation_minus(
     out
 }
 
+/// Gate a relation by a Boolean (surface `when`, IR-level `R times ⟨c⟩` with
+/// the condition lifted to reltrue/relfalse). `cond ≠ 0` retains and returns
+/// the operand itself; `cond = 0` returns a fresh empty relation with the same
+/// heading. O(1) either way — no copy, no per-tuple work, no re-seal (the
+/// result *is* the sealed operand or empty). Borrows the operand and returns
+/// an owned (+1) payload like the other relation operators; the caller
+/// releases its operand temps as usual.
+///
+/// # Safety
+/// `desc` must be a valid descriptor outliving the call; a non-null `rel`
+/// must be a valid RC payload sharing the `desc` layout.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_relation_when(
+    rel: *const u8,
+    cond: i8,
+    desc: *const CoddlHeadingDesc,
+) -> *mut u8 {
+    if cond != 0 {
+        crate::rc::coddl_rc_retain(rel as *mut u8);
+        return rel as *mut u8;
+    }
+    if desc.is_null() {
+        return std::ptr::null_mut();
+    }
+    crate::rc::coddl_rc_alloc(0, 0, crate::rc::CoddlKind::Relation as u32, desc)
+}
+
+/// Relational COALESCE (surface `otherwise`): the primary if it is nonempty,
+/// else the fallback (IR-level `R union (D times (reltrue minus
+/// (R project {})))` — the arms are exclusive, so no union/dedup ever needs to
+/// run). Identical headings are enforced by the typechecker. O(1): a header
+/// length check, then retain-and-return the winner — the result is already a
+/// sealed set because it *is* one of the operands. Borrows both operands and
+/// returns an owned (+1) payload; the caller releases its operand temps.
+///
+/// # Safety
+/// Non-null pointers must be valid RC payloads sharing one heading layout.
+#[no_mangle]
+pub unsafe extern "C" fn coddl_relation_otherwise(
+    primary: *const u8,
+    fallback: *const u8,
+) -> *mut u8 {
+    let winner = if payload_len(primary) > 0 {
+        primary
+    } else {
+        fallback
+    };
+    crate::rc::coddl_rc_retain(winner as *mut u8);
+    winner as *mut u8
+}
+
 /// Row count of a relation payload — a null pointer is the empty relation
 /// (the same convention `coddl_rc_length` and the query boundary use).
 ///
@@ -2090,6 +2141,113 @@ mod tests {
             let header = empty.sub(HEADER_SIZE) as *const CoddlRcHeader;
             assert_eq!((*header).length, 0, "relfalse stays empty");
             coddl_rc_release(empty);
+        }
+    }
+
+    /// Build a sealed single-Integer-attribute relation holding `values`,
+    /// against the given descriptor (which must be the 1×Integer layout).
+    /// Returns an rc=1 payload.
+    unsafe fn int_relation(values: &[i64], desc: *const CoddlHeadingDesc) -> *mut u8 {
+        let payload = coddl_rc_alloc(
+            values.len() * 8,
+            values.len() as u32,
+            CoddlKind::Relation as u32,
+            desc,
+        );
+        assert!(!payload.is_null());
+        for (i, v) in values.iter().enumerate() {
+            std::ptr::write(payload.add(i * 8) as *mut i64, *v);
+        }
+        coddl_relation_seal(payload, desc);
+        payload
+    }
+
+    /// The 1×Integer heading descriptor the gate/otherwise tests share.
+    /// Leaked for the test's lifetime (descriptors are static in production).
+    fn int_desc() -> *const CoddlHeadingDesc {
+        let attrs = Box::leak(Box::new([CoddlAttrDesc {
+            name: b"a".as_ptr(),
+            name_len: 1,
+            kind: CoddlAttrKind::Integer as u32,
+            offset: 0,
+            sub: std::ptr::null(),
+        }]));
+        Box::leak(Box::new(CoddlHeadingDesc {
+            attr_count: 1,
+            record_size: 8,
+            attrs: attrs.as_ptr(),
+        }))
+    }
+
+    #[test]
+    fn when_true_retains_and_returns_the_operand() {
+        // A true gate is O(1): the result IS the operand, retained — no copy.
+        let desc = int_desc();
+        unsafe {
+            let rel = int_relation(&[1, 2], desc);
+            let out = coddl_relation_when(rel, 1, desc);
+            assert_eq!(out, rel, "true gate returns the operand itself");
+            let header = rel.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*header).rc, 2, "the survivor is retained");
+            assert_eq!((*header).length, 2, "contents untouched");
+            coddl_rc_release(out);
+            assert_eq!((*header).rc, 1);
+            coddl_rc_release(rel);
+        }
+    }
+
+    #[test]
+    fn when_false_returns_a_fresh_empty_with_the_operand_heading() {
+        let desc = int_desc();
+        unsafe {
+            let rel = int_relation(&[1, 2], desc);
+            let out = coddl_relation_when(rel, 0, desc);
+            assert!(!out.is_null());
+            assert_ne!(out, rel, "false gate allocates fresh — operand untouched");
+            let out_header = out.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*out_header).length, 0, "the empty relation");
+            assert_eq!((*out_header).desc, desc, "same heading as the operand");
+            let rel_header = rel.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*rel_header).rc, 1, "operand rc unchanged");
+            assert_eq!((*rel_header).length, 2, "operand contents unchanged");
+            coddl_rc_release(out);
+            coddl_rc_release(rel);
+        }
+    }
+
+    #[test]
+    fn otherwise_picks_the_nonempty_primary() {
+        let desc = int_desc();
+        unsafe {
+            let primary = int_relation(&[7], desc);
+            let fallback = int_relation(&[404], desc);
+            let out = coddl_relation_otherwise(primary, fallback);
+            assert_eq!(out, primary, "nonempty primary wins");
+            let p_header = primary.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            let f_header = fallback.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*p_header).rc, 2, "winner retained");
+            assert_eq!((*f_header).rc, 1, "loser untouched");
+            coddl_rc_release(out);
+            coddl_rc_release(primary);
+            coddl_rc_release(fallback);
+        }
+    }
+
+    #[test]
+    fn otherwise_picks_the_fallback_when_primary_is_empty() {
+        let desc = int_desc();
+        unsafe {
+            let primary = int_relation(&[], desc);
+            let fallback = int_relation(&[404], desc);
+            let out = coddl_relation_otherwise(primary, fallback);
+            assert_eq!(out, fallback, "empty primary yields the fallback");
+            let p_header = primary.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            let f_header = fallback.sub(HEADER_SIZE) as *const CoddlRcHeader;
+            assert_eq!((*f_header).rc, 2, "winner retained");
+            assert_eq!((*p_header).rc, 1, "loser untouched");
+            coddl_rc_release(out);
+            coddl_rc_release(primary);
+            coddl_rc_release(fallback);
         }
     }
 

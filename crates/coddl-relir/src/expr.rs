@@ -204,12 +204,14 @@ fn apply_rename(renames: &[(String, String)], name: &str) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
-/// Render a restriction predicate for `RelExpr::render` (e.g. `id <> 1`).
+/// Render a restriction predicate for `RelExpr::render` (e.g. `id <> 1`;
+/// a gate renders as `when <value>` — it has no attribute side).
 fn render_predicate(pred: &Predicate) -> String {
     match pred {
         Predicate::AttrCmp { attr, op, value } => {
             format!("{attr} {} {}", op.sql(), render_value(value))
         }
+        Predicate::Gate(value) => format!("when {}", render_value(value)),
     }
 }
 
@@ -238,9 +240,9 @@ fn render_literal(lit: &Literal) -> String {
     }
 }
 
-/// A restriction predicate: a single `<attr> <cmp> <value>` test. This grows
-/// to conjunction/disjunction and attribute-vs-attribute tests as the surface
-/// `where` support grows.
+/// A restriction predicate: a single `<attr> <cmp> <value>` test, or a
+/// tuple-independent gate. This grows to conjunction/disjunction and
+/// attribute-vs-attribute tests as the surface `where` support grows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Predicate {
     /// `<attr> <op> <value>`.
@@ -249,6 +251,15 @@ pub enum Predicate {
         op: CmpOp,
         value: RestrictValue,
     },
+    /// A tuple-independent Boolean gate (surface `when` — `R times ⟨c⟩` with
+    /// the condition lifted to reltrue/relfalse). Reads no attribute: every
+    /// tuple survives or none does. As a `Restrict` conjunct it inherits the
+    /// restrict machinery wholesale — keys pass through, absorption holds
+    /// (gate-of-empty is empty) — and SQL emission renders it `<placeholder>
+    /// = 1` (never a bare truthy integer, which is SQLite-only). Note it
+    /// counts as "filtered" to `contains_restrict`, muting the S1 pull guard
+    /// for gated-relvar shapes — sound, because those shapes push.
+    Gate(RestrictValue),
 }
 
 /// The right-hand side of a pushable restriction: either a compile-time
@@ -792,13 +803,18 @@ impl RelExpr {
             RelExpr::Restrict { input, pred } => {
                 input.card_le_one() || {
                     // Only equality *pins* an attribute to a single value; a
-                    // range/exclusion (`<>`, `<`, `>`, …) bounds nothing.
-                    let Predicate::AttrCmp { attr, op, .. } = pred;
-                    *op == CmpOp::Eq
-                        && input
-                            .surviving_keys()
-                            .iter()
-                            .any(|k| k.len() == 1 && &k[0] == attr)
+                    // range/exclusion (`<>`, `<`, `>`, …) bounds nothing, and
+                    // a gate reads no attribute at all.
+                    match pred {
+                        Predicate::AttrCmp { attr, op, .. } => {
+                            *op == CmpOp::Eq
+                                && input
+                                    .surviving_keys()
+                                    .iter()
+                                    .any(|k| k.len() == 1 && &k[0] == attr)
+                        }
+                        Predicate::Gate(_) => false,
+                    }
                 }
             }
             RelExpr::Project { input, .. } => input.card_le_one(),

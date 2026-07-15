@@ -471,6 +471,32 @@ pub enum Inst {
         rhs: ValueId,
         heading_id: HeadingId,
     },
+    /// Gate an in-memory relation by a Boolean (surface `when`, the IR-level
+    /// `R times ⟨c⟩` with the condition lifted to reltrue/relfalse). Backends
+    /// emit a call to `coddl_relation_when(src, cond, &descriptor)`: `cond ≠ 0`
+    /// retains and returns `src` itself, `cond = 0` returns a fresh empty
+    /// relation with the same heading — O(1), no copy, no re-seal. `cond` is a
+    /// Boolean value; `heading_id` describes both operand and result.
+    Gate {
+        dst: ValueId,
+        src: ValueId,
+        cond: ValueId,
+        heading_id: HeadingId,
+    },
+    /// Relational COALESCE of two in-memory relations with identical headings
+    /// (surface `otherwise`): the primary if it is nonempty, else the fallback
+    /// (the IR-level `R union (D times (reltrue minus (R project {})))` — arms
+    /// exclusive, so no union/dedup ever runs). Backends emit a call to
+    /// `coddl_relation_otherwise(primary, fallback)` — a header length check
+    /// plus a retain of the winner, O(1); the result is already a sealed set
+    /// because it *is* one of the operands. No descriptor is needed at run
+    /// time, so the instruction carries none; `dst`'s heading is recorded by
+    /// the lowerer like every other value.
+    Otherwise {
+        dst: ValueId,
+        primary: ValueId,
+        fallback: ValueId,
+    },
     /// Transitive closure of a binary relation (surface `tclose`, Algebra-A
     /// `◄TCLOSE►`). Backends emit a call to `coddl_relation_tclose(src,
     /// &descriptor)`, which iterates a naive fixpoint (compose the result with
@@ -1004,6 +1030,21 @@ impl fmt::Display for Inst {
                 rhs,
                 heading_id,
             } => write!(f, "{dst} = minus {lhs} {rhs} -> heading_{}", heading_id.0),
+            Inst::Gate {
+                dst,
+                src,
+                cond,
+                heading_id,
+            } => write!(
+                f,
+                "{dst} = gate {src} by {cond} -> heading_{}",
+                heading_id.0
+            ),
+            Inst::Otherwise {
+                dst,
+                primary,
+                fallback,
+            } => write!(f, "{dst} = otherwise {primary} {fallback}"),
             Inst::TClose {
                 dst,
                 src,

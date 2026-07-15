@@ -443,6 +443,32 @@ fn declare_runtime_rc_externs(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert("coddl_relation_minus".into(), id);
     }
+    // coddl_relation_when(rel, cond: i8, desc) -> owned ptr (the retained
+    // operand, or a fresh empty with the operand's heading on a false gate).
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I8));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.returns.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_relation_when", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_relation_when".into(), id);
+    }
+    // coddl_relation_otherwise(primary, fallback) -> owned ptr (the retained
+    // nonempty winner; no descriptor — a length check plus a retain).
+    {
+        let mut sig = obj.make_signature();
+        for _ in 0..2 {
+            sig.params.push(AbiParam::new(ptr_ty));
+        }
+        sig.returns.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_relation_otherwise", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_relation_otherwise".into(), id);
+    }
     // Relation comparisons (observational, RM Pre 8):
     // coddl_relation_eq(lhs, rhs, desc) -> i8 and
     // coddl_relation_subset(lhs, rhs, desc, proper: i32) -> i8.
@@ -2435,6 +2461,42 @@ fn emit_inst(
             let minus_id = funcs["coddl_relation_minus"];
             let minus_local = obj.declare_func_in_func(minus_id, builder.func);
             let call = builder.ins().call(minus_local, &[lhs_v, rhs_v, desc_val]);
+            let result = builder.inst_results(call)[0];
+            values.insert(*dst, ValueRepr::Scalar(result));
+            Ok(())
+        }
+        Inst::Gate {
+            dst,
+            src,
+            cond,
+            heading_id,
+        } => {
+            let src_v = scalar_value(values, src)?;
+            // `ProcType::Boolean` is already the C-ABI `i8` in this backend.
+            let cond_v = scalar_value(values, cond)?;
+            let ptr_ty = obj.target_config().pointer_type();
+            let desc_gv =
+                obj.declare_data_in_func(heading_desc_ids[heading_id.0 as usize], builder.func);
+            let desc_val = builder.ins().symbol_value(ptr_ty, desc_gv);
+            let when_id = funcs["coddl_relation_when"];
+            let when_local = obj.declare_func_in_func(when_id, builder.func);
+            let call = builder.ins().call(when_local, &[src_v, cond_v, desc_val]);
+            let result = builder.inst_results(call)[0];
+            values.insert(*dst, ValueRepr::Scalar(result));
+            Ok(())
+        }
+        Inst::Otherwise {
+            dst,
+            primary,
+            fallback,
+        } => {
+            let primary_v = scalar_value(values, primary)?;
+            let fallback_v = scalar_value(values, fallback)?;
+            let otherwise_id = funcs["coddl_relation_otherwise"];
+            let otherwise_local = obj.declare_func_in_func(otherwise_id, builder.func);
+            let call = builder
+                .ins()
+                .call(otherwise_local, &[primary_v, fallback_v]);
             let result = builder.inst_results(call)[0];
             values.insert(*dst, ValueRepr::Scalar(result));
             Ok(())

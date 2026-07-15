@@ -9,27 +9,62 @@ library wiki;
 // **userspace router** (F1) — the host stays at one `handle` symbol; routing
 // lives here in Coddl.
 //
-// Routes (F1 — method + path dispatch, a small explicit match, not F7's route
-// table):
-//   GET /            -> the home page
-//   GET /wiki/{slug} -> the matching Pages row, or 404 (F2)
+// Routes (F1 — method + path dispatch):
+//   GET /            -> the "home" page
+//   GET /wiki/{slug} -> the matching Pages row
 //   anything else    -> 404
 //
-// Dispatch is a relational query over `req.path` — no Text primitives needed (H1
-// already split + percent-decoded the path). Bodies are interpolated raw; HTML
-// escaping (F4's `escape_html`) lands with L1 Text primitives and the seed data
-// here is trusted. Public-relvar reads sit inside a `transaction [...]`
-// (OO Pre 4 / T0025).
+// ── The router below is **one relational expression**: control flow is
+// the join semiring, spelled with the two relational-control operators.
+// Both are pure sugar over the existing algebra — no new primitives
+// (docs/principles.md §4) and no new truth-value system: conditions are
+// ordinary Booleans (`is_empty{}`, comparisons, `not`/`and`/`or`); the
+// degree-0 relations (reltrue/relfalse, the semiring's 1 and 0) stay where
+// they belong, as the *desugaring target* in the IR.
 //
-// Note on shape: the router is a flat sequence of guarded early `return`s —
-// each route hands its `RawResponse` back directly, so no branch merges a
-// response into a shared local. The value routes (`/`, `/wiki/{slug}`) build a
-// `{ status, body }` and wrap it inline with `html_response{ … }`; the 404
-// cases (non-GET, an unmatched path) `return html_response_404{}`. Every path
-// returns, so falling out of the end of the body is unreachable — the trailing
-// `return html_response_404{}` is the catch-all. Each `extract` sits behind a
-// `not …is_empty{}` guard, so a missing row is skipped rather than fed to a
-// bare `extract` (which aborts on 0 rows).
+//   R when c       ≡  R times ⟨c⟩        (c: Boolean, lifted to reltrue /
+//       Gate a whole relation:            relfalse by the lowerer)
+//       keep R when c holds, annihilate it when it doesn't. The contract
+//       against its sibling: `where` filters per-tuple with the heading in
+//       scope; `when` gates the whole relation with a condition from the
+//       enclosing scope.
+//
+//   R otherwise D  ≡  R union (D times (reltrue minus (R project {})))
+//       Union-with-default — D answers exactly when R didn't (`R project {}`
+//       is the algebra's EXISTS). The relational COALESCE. Requires
+//       identical headings, like `union`.
+//
+// `when` and `otherwise` sit at the bottom of the precedence ladder with
+// `where` and interleave left-associatively, so a pipeline reads top to
+// bottom without parentheses; dispatch is a `union` of `when`-gated,
+// mutually exclusive arms — the algebra's case expression.
+//
+// So `handle` has no `if`, no `var`, no early returns: derive the requested
+// slug relationally, look it up, render, fall back — one pipeline, one
+// `return`. A deliberate behavior change from the imperative router: a
+// missing "home" row is now a plain 404 like any other missing page —
+// uniformity is the point.
+//
+// Everything this file needed has landed: relational `=` (RM Pre 8
+// observational equality as an operator), relation-returning user opers
+// (`not_found_page`), the nullary algebra beneath the sugar (`times` by
+// reltrue/relfalse, `project {}` — IR-level, never surface syntax), and
+// the `when`/`otherwise` operators themselves (2026-07-15).
+//
+// Why this spelling is the *fast* one, not just the pretty one: `requested`
+// is an in-process relation, so `Pages matching requested` pushes as one
+// plan with `requested` shipped as a relation-valued parameter, and the
+// force point dispatches on its cardinality. An unmatched route (non-GET,
+// unknown path, `/wiki` alone) leaves `requested` empty — the empty slot
+// absorbs and **no statement fires**: 404s never touch SQLite. A matched
+// route holds exactly one slug — the cardinality-1 sibling plan fires:
+// `SELECT "body", "title" FROM "pages" WHERE "slug" = ?1`, the direct PK
+// lookup. Every request is served by either zero statements or one keyed
+// read. (`when` extends the same story to scalar gates directly on a
+// relvar: a false gate can skip the statement — the Boolean sibling of the
+// empty-slot short-circuit, tracked as A5 in .local/tracking; this file's
+// gates sit on the local side, where the empty-slot path already covers
+// them.)
 //
 // The .cd-family (storage stays out of D — RM Pro 6):
 //   wiki.cd       — this library: the external schema + the router
@@ -37,17 +72,18 @@ library wiki;
 //   wiki.cdstore  — conceptual -> physical (SQLite) binding
 //   seed-db.sh    — recreates wiki.sqlite with the demo pages
 //
-// Run it end-to-end (there is no `main` — a handler library is compiled mainless):
+// Run it end-to-end (once the pieces above land; there is no `main` — a
+// handler library is compiled mainless):
 //
 //   sh examples/wiki/seed-db.sh
 //   coddl emit-obj examples/wiki/wiki.cd -o /tmp/wiki.o
 //   CODDL_APP_OBJ=/tmp/wiki.o \
 //     CODDL_WIKI_FILE=$PWD/examples/wiki/wiki.sqlite \
 //     cargo run -p coddl-web
-//   curl -si localhost:8000/             # => 200, text/html, the Home page
-//   curl -si localhost:8000/wiki/about   # => 200, the About page
-//   curl -si localhost:8000/wiki/missing # => 404 Not Found (no such slug)
-//   curl -si localhost:8000/bogus        # => 404 Not Found
+//   curl -si localhost:8000/             # => 200, the Home page (one keyed read)
+//   curl -si localhost:8000/wiki/about   # => 200, the About page (one keyed read)
+//   curl -si localhost:8000/wiki/missing # => 404 (one keyed read, zero rows)
+//   curl -si localhost:8000/bogus        # => 404 (no statement at all)
 use module coddl::web;
 
 database wiki;
@@ -58,10 +94,30 @@ public relvar Pages {
     body: Text,
 } key { slug };
 
-// A `text/html` response with the given status and body. The one response
-// builder F1 needs; the rest of the F3 family (text_response, redirect) lands
-// when a route needs it. Called by each value route to wrap its
-// `{ status, body }`, and reused by `html_response_404`.
+// The 404 page as a *row*, not a code path: `otherwise` below makes it the
+// answer exactly when no route produced one.
+oper not_found_page{} -> Relation { status: Integer, html: Text } [
+    return Relation {
+        {
+            status: 404,
+            html: "<!doctype html>\n<html>\n<head><title>Not Found</title></head>\n<body>\n<h1>404 Not Found</h1>\n</body>\n</html>\n"
+        }
+    };
+];
+
+// Render a page (title + body) into the shared HTML shell — used by every
+// found row via `replace` below. Bodies are interpolated raw; HTML escaping
+// (F4's `escape_html`) lands with L1 Text primitives and the seed data here
+// is trusted.
+oper page_html{ title: Text, body: Text } -> Text [
+    format{
+        template: f"<!doctype html>\n<html>\n<head><title>{title}</title></head>\n<body>\n<h1>{title}</h1>\n<div>{body}</div>\n</body>\n</html>\n",
+        args: { title: title, body: body }
+    }
+];
+
+// A `text/html` response with the given status and body — the one seam
+// between the relational pipeline and the host's RawResponse.
 oper html_response{ status: Integer, body: Text } -> RawResponse [
     {
         status,
@@ -70,79 +126,44 @@ oper html_response{ status: Integer, body: Text } -> RawResponse [
     }
 ];
 
-oper html_response_404{} -> RawResponse [
-    html_response{
-        status: 404,
-        body: "<!doctype html>\n<html>\n<head><title>Not Found</title></head>\n<body>\n<h1>404 Not Found</h1>\n</body>\n</html>\n"
-    }
-];
-
-// Render a page (title + body) into the shared HTML shell. Shared by the home
-// page and the /wiki/{slug} route (F2) so both render through one template; the
-// 404 has its own fixed HTML (in `html_response_404`) and doesn't use this.
-// Bodies are interpolated raw — the seed data is trusted; HTML escaping (F4's
-// `escape_html`) lands with L1 Text primitives.
-oper page_html{ title: Text, body: Text } -> Text [
-    format{
-        template: f"<!doctype html>\n<html>\n<head><title>{title}</title></head>\n<body>\n<h1>{title}</h1>\n<div>{body}</div>\n</body>\n</html>\n",
-        args: { title: title, body: body }
-    }
-];
-
-// The router (F1). Reads `req.method` + the cooked `req.path` relation and
-// returns a `RawResponse` per route via an early `return`: `/` decodes to the
-// empty path relation (cardinality 0); any `/wiki/...` has first segment "wiki".
-// Everything else — including non-GET — is a 404. A generic route table is F7;
-// this stays a small explicit match.
+// The router (F1): one relational expression from `req` to the response row.
 oper handle{ req: Request } -> RawResponse [
-    if req.method <> "GET" then [
-        return html_response_404{};
+    // `/` is the empty path.
+    let no_path = req.path.is_empty{};
+
+    // The path names a wiki page iff it *is exactly* the "wiki" prefix plus
+    // one more segment — a relation equality (RM Pre 8), not a cardinality
+    // count. (`/wiki` alone fails only the slug arm below; it still 404s,
+    // because that arm contributes no tuple.)
+    let wiki_path = req.path = (
+        Relation { { ordinality: 0, segment: "wiki" } } union (req.path where ordinality = 1)
+    );
+
+    // The slug the request names — at most one tuple, because the arms'
+    // guards are mutually exclusive (an empty path has no second segment).
+    // A non-GET or unmatched request leaves this empty.
+    let requested = (
+        (Relation { { slug: "home" } } when no_path) union (
+            (
+                (req.path where ordinality = 1) rename { slug: segment } project { slug }
+            ) when wiki_path
+        )
+    ) when req.method = "GET";
+
+    // One query for every route (OO Pre 4 / T0025). Empty `requested` never
+    // fires a statement; a single slug is the direct keyed lookup.
+    let found = transaction [
+        Pages matching requested project { title, body }
     ];
 
-    if req.path.is_empty{} then [
-        // GET / — serve the single "home" page. The read is pushed to SQL in a
-        // transaction; the `not home.is_empty{}` guard makes a *missing* "home"
-        // row leave `body` empty (no error — unlike a bare `extract`, which
-        // aborts on 0 rows). `extract` reads the one row (the `key { slug }`
-        // guarantees at most one) and `format` copies its cells into `body`.
-        // Reassigning the heap `body` across this `if` lowers via the
-        // if-carried-`Text` lift (the sibling of the loop-carried-`Text` case).
-        // (A2 grows `/` into a page index.)
-        var body := "";
-        let home = transaction [
-            Pages where slug = "home" project { title, body }
-        ];
+    // Render relationally: `replace` consumes title+body into the rendered
+    // html (compute-and-consume), `extend` pins the success status, and
+    // `otherwise` fills the gap with the 404 row if nothing was found. The
+    // result has exactly one tuple (found ≤ 1 by the `slug` key; the default
+    // answers only when found didn't), so `extract` cannot abort.
+    let page = extract (
+        found replace { html: page_html{ title, body } } extend { status: 200 } otherwise not_found_page{}
+    );
 
-        if not home.is_empty{} then [
-            let info = extract home;
-            body := page_html{ title: info.title, body: info.body };
-        ];
-
-        return html_response{ status: 200, body };
-    ];
-
-    let wiki_seg = req.path where ordinality = 0 and segment = "wiki";
-    let path_card = req.path.cardinality{};
-
-    if wiki_seg.cardinality{} = 1 and path_card = 2 then [
-        // GET /wiki/{slug} (F2) — extract the slug at path position 1 and
-        // render the matching `Pages` row, or 404 if there is none. The slug
-        // is bound to a `Text` local, so `Pages where slug = slug_text`
-        // pushes to SQL as `WHERE "slug" = ?` (dynamic-parameter pushdown) —
-        // one filtered read, not a whole-table scan. `status`/`body` are
-        // carried across the then-only `if` (the proven two-carried-var shape,
-        // like the home route's `body`); a missing slug leaves the 404 default.
-        let slug_text = (extract (req.path where ordinality = 1 project { segment })).segment;
-        let page = transaction [
-            Pages where slug = slug_text project { title, body }
-        ];
-        if page.is_empty{} then [
-            return html_response_404{};
-        ];
-
-        let info = extract page;
-        return html_response{ status: 200, body: page_html{ title: info.title, body: info.body } };
-    ];
-
-    return html_response_404{};
+    html_response{ status: page.status, body: page.html }
 ];

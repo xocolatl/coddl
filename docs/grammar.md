@@ -33,7 +33,7 @@ Three operator-shape categories, with deliberate exceptions:
 ### Infix for binary operators (symbolic *and* textual)
 
 - **Symbolic**: `=`, `<>`, `<`, `>`, `<=`, `>=`, `+`, `-`, `*`, `/`. The comparison operators `<=` and `>=` are polymorphic: scalar comparison on scalars (as ever); **subset** and **superset** on relations (`R <= S` iff every tuple in `R` appears in `S`; `S >= R` iff `R <= S`). `<` and `>` give strict subset / superset analogously. Identical headings are required for the relation overload — checked at compile time. There's no separate `subset` keyword; `<=` covers it.
-- **Textual relational**: `join`, `times`, `intersect`, `compose`, `union`, `minus`, `matching`, `not matching`, `where`.
+- **Textual relational**: `join`, `times`, `intersect`, `compose`, `union`, `minus`, `matching`, `not matching`, `where`, `when`, `otherwise`.
 - **Textual logical**: `and`, `or` (infix, both `Boolean × Boolean → Boolean`) and `not` (prefix, `Boolean → Boolean`). Precedence ladder `or` (1) < `and` (2) < `not` < comparison (3): `not` is a prefix operator whose operand parses at comparison level, so `not a and b` reads as `(not a) and b` and `not a = b` as `not (a = b)`. `not` also has the Unicode glyph `¬` (see "Unicode operator glyphs").
 - **Textual arithmetic**: `div` (truncating integer division, toward zero), and the planned `mod` (remainder). `div` is `Integer × Integer → Integer` and binds at multiplicative precedence, alongside `*` and `/`. **The symbolic `/` is *exact* division**: `Integer × Integer → Rational` — `7 / 2` is the rational `7/2`, whereas `7 div 2` is the integer `3`. (`div` is the recognized keyword; `mod` is documented here but not yet wired.)
 
@@ -55,11 +55,18 @@ Reason: the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-
 - **Scope injection.** Identifiers in the predicate resolve against the left operand's heading first, the enclosing scope second. `SP where s# = supplier` reads as: `s#` is the `SP` attribute; `supplier` is a parameter from the enclosing `oper`. The parser and typechecker inject the left operand's heading into the predicate's name-resolution scope automatically. This is the first construct with a non-uniform scoping rule; every later construct that takes a predicate (`extend`, `summarize`'s aggregate expressions, possrep constraints) reuses the same machinery.
 - **Precedence.** `where` binds looser than `=`, `<`, `+`, `and`, `or` — the predicate is expected to be a full scalar expression. `R where x = 1 and y > 0` parses as `R where ((x = 1) and (y > 0))` without parentheses. Practically `where` sits at the bottom of the infix precedence ladder, alongside `union`/`minus`. Full precedence table lands when the parser does — exact order is deferred until then.
 
+**`when` (gate) and `otherwise` (relational COALESCE) are the relational-control pair.** Both are infix at pipeline precedence (prec 0, with `where`), left-associative, pure sugar over the existing algebra — no new primitives:
+
+- **`R when c`** ≡ `R times ⟨c⟩` — gates a **whole relation** by a scalar Boolean: `R` when `c` holds, the empty relation with `R`'s heading when it doesn't (the condition lifts to reltrue/relfalse — the join family's 1 and 0 — in the IR only, never at the surface). The deliberate contract with its sibling: **`where` filters per-tuple with the heading in scope; `when` gates the whole relation with a condition from the *enclosing* scope** — no heading injection, so an attribute name in a `when` condition is unresolved (T0099 hints at `where`). The condition is an ordinary strict scalar: it evaluates once, eagerly, even though relations are lazy. Chaining is AND (`R when a when b` ≡ `R when (a and b)`, by `times` associativity). Typing: `Relation H × Boolean → Relation H`; a relation-typed condition is rejected with a `times` suggestion (gating by a relation is what `times` already does). This is **not** a coercion in TTM's sense (ch. 3, p. 74 — coercion is *implicit* conversion of a wrongly-typed operand): the operand is required-Boolean and is-Boolean; a named operation "with operands that are explicitly defined to be of different types" is the Manifesto's own sanctioned crossing (the LOAD note, ch. 5, p. 123 — the same pattern Coddl's `load` already follows).
+- **`R otherwise D`** ≡ `R union (D times (reltrue minus (R project {})))` — union-with-default: `R` if it is nonempty, else `D` (`R project {}` is the algebra's EXISTS; the arms are exclusive by construction, so nothing ever dedups). The relational COALESCE — the no-nulls answer to "if missing". Identical headings required, like `union` (T0038). `A when c otherwise D` reads left-to-right: `(A when c) otherwise D`.
+
+Both remain ordinary identifiers everywhere else (no reserved words — `when` and `otherwise` are fine attribute or local names). Lowering: see [relir.md](relir.md) (the `Gate` restrict conjunct, the `Inst::Gate`/`Inst::Otherwise` in-process forms) and [sqlemit.md](sqlemit.md) (a relvar-rooted gate pushes as a `?N = 1` conjunct).
+
 **`project` (projection) is a *postfix* operator, not infix.** `R project { a, b }` narrows the relation's heading to the named attributes — the right operand is a brace-list of bare attribute names (structurally identical to a `key { … }` clause), not another expression, so it doesn't fit the infix `<lhs> op <rhs>` shape. It is parsed as a postfix suffix at *pipeline precedence* — the same altitude as `where`, and gated to the top level so it binds to the whole pipeline rather than to a higher-precedence operand such as a `where` predicate. `R where p project { a }` reads as `(R where p) project { a }`; the reverse order `R project { a } where p` also parses, nesting left. It is the first postfix relational operator; later ones (`replace`, `extend`, `rename`, `tclose`, `wrap`, `unwrap`, and future `summarize`) reuse the same pipeline slot. `project` remains a contextual keyword — a valid identifier everywhere else (no reserved words).
 
 ### Named-prefix with braces — the only call form
 
-Every operator invocation is `name { … }` (or its dot-method sugar `R.method { … }`, see "Method-style call syntax"): selectors, `oper` calls, `extend`, `summarize`, `replace`, `group`, `ungroup`, `wrap`, `unwrap`, and so on. **There is no positional call form** — Coddl has no `f(x)` syntax; parentheses are for expression grouping only (see "Brackets vs braces encode ordering"). Arguments are named (`name: expr`); a brace may instead hold a bare list of attribute *names* where that is the operand shape (`project { a, b }`, `key { a, b }`). The binary relational operators — `join`, `times`, `intersect`, `compose`, `union`, `minus`, `matching`, `not matching`, `where` — are **infix only**; there is no named-prefix brace variant for them.
+Every operator invocation is `name { … }` (or its dot-method sugar `R.method { … }`, see "Method-style call syntax"): selectors, `oper` calls, `extend`, `summarize`, `replace`, `group`, `ungroup`, `wrap`, `unwrap`, and so on. **There is no positional call form** — Coddl has no `f(x)` syntax; parentheses are for expression grouping only (see "Brackets vs braces encode ordering"). Arguments are named (`name: expr`); a brace may instead hold a bare list of attribute *names* where that is the operand shape (`project { a, b }`, `key { a, b }`). The binary relational operators — `join`, `times`, `intersect`, `compose`, `union`, `minus`, `matching`, `not matching`, `where`, `when`, `otherwise` — are **infix only**; there is no named-prefix brace variant for them.
 
 This eliminates the relational-algebra/scalar-op syntactic distinction the authors regret, and matches RM Pro 1 (no ordinal-position semantics) at the surface where it's easiest to enforce.
 
@@ -736,6 +743,8 @@ function that implements it.
                     -- interleaved with infix ops, so they bind to the whole
                     -- pipeline.
 <infix-op>      ::= 'where'                                    -- prec 0
+                  | 'when'                                     -- prec 0
+                  | 'otherwise'                                -- prec 0
                   | 'join'                                     -- prec 0
                   | 'times'                                    -- prec 0
                   | 'compose'                                  -- prec 0
@@ -749,29 +758,33 @@ function that implements it.
                   | '=' | '<>' | '<' | '>' | '<=' | '>='       -- prec 3
                   | '+' | '-' | '||'                           -- prec 4
                   | '*' | '/' ;                                -- prec 5
-                    -- `where`, `and`, `or` are contextual
-                    -- keywords; the symbolic forms are token kinds
-                    -- already lexed (Eq, Lt, Gt, LtEq, GtEq,
-                    -- NotEq, Plus, Minus, Star, Slash, PipePipe).
-                    -- Arithmetic binds tighter than comparison:
-                    -- additive `+`/`-` and concatenation `||` at
-                    -- prec 4, multiplicative `*`/`/` at prec 5.
-                    -- `||` shares prec 4 with `+`/`-`; its rank
-                    -- there is immaterial since its operands
-                    -- (Text/Character) never mix with arithmetic.
-                    -- The relational ops `join`/`times`/`compose`/
-                    -- `intersect`/`union`/`minus`/`matching`/
-                    -- `not matching` are also contextual keywords.
-                    -- (Symbolic `-` is `Sub`; the keyword `minus` is
-                    -- the relational set-difference op.) `matching`
-                    -- (semijoin) is one token; `not matching`
-                    -- (antijoin) is two — the parser peeks `not`+
-                    -- `matching` and bumps both. `join`/`union`/
-                    -- `intersect`/`minus`/`matching`/`not matching`
-                    -- also accept their glyph synonyms
-                    -- `⋈`/`∪`/`∩`/`∖`/`⋉`/`▷` (§ Unicode operator
-                    -- glyphs; `▷` is a one-token `not matching`);
-                    -- `times`/`compose` have none.
+                    -- `where`, `when`, `otherwise`, `and`, `or`
+                    -- are contextual keywords; the symbolic forms
+                    -- are token kinds already lexed (Eq, Lt, Gt,
+                    -- LtEq, GtEq, NotEq, Plus, Minus, Star, Slash,
+                    -- PipePipe). Arithmetic binds tighter than
+                    -- comparison: additive `+`/`-` and
+                    -- concatenation `||` at prec 4, multiplicative
+                    -- `*`/`/` at prec 5. `||` shares prec 4 with
+                    -- `+`/`-`; its rank there is immaterial since
+                    -- its operands (Text/Character) never mix with
+                    -- arithmetic. The relational ops `join`/`times`/
+                    -- `compose`/`intersect`/`union`/`minus`/
+                    -- `matching`/`not matching` are also contextual
+                    -- keywords. (Symbolic `-` is `Sub`; the keyword
+                    -- `minus` is the relational set-difference op.)
+                    -- `matching` (semijoin) is one token; `not
+                    -- matching` (antijoin) is two — the parser peeks
+                    -- `not`+`matching` and bumps both. `join`/
+                    -- `union`/`intersect`/`minus`/`matching`/
+                    -- `not matching` also accept their glyph
+                    -- synonyms `⋈`/`∪`/`∩`/`∖`/`⋉`/`▷` (§ Unicode
+                    -- operator glyphs; `▷` is a one-token `not
+                    -- matching`); `times`/`compose`/`when`/
+                    -- `otherwise` have none. `when` (gate) and
+                    -- `otherwise` (relational COALESCE) sit at the
+                    -- pipeline bottom with `where` — see
+                    -- § Relational control: `when` and `otherwise`.
 <postfix>       ::= <arg-list>                                 -- call: CALL_EXPR
                   | <field-access-tail>                        -- field access: FIELD_ACCESS
                   | <index-tail> ;                             -- index: INDEX_EXPR

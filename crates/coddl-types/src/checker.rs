@@ -4348,6 +4348,8 @@ impl TypeChecker {
             BinaryOp::Matching | BinaryOp::NotMatching => {
                 self.check_matching_binary(bin, op, scope)
             }
+            BinaryOp::When => self.check_when_binary(bin, scope),
+            BinaryOp::Otherwise => self.check_otherwise_binary(bin, scope),
             BinaryOp::And | BinaryOp::Or => self.check_logical_op(bin, op, scope),
             BinaryOp::Eq | BinaryOp::NotEq => self.check_equality_op(bin, op, scope),
             BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq => {
@@ -4414,6 +4416,89 @@ impl TypeChecker {
             );
         }
         Type::Relation(heading)
+    }
+
+    /// `R when c` — gate: `Relation H × Boolean → Relation H`. The left
+    /// operand survives when the condition holds and is replaced by the empty
+    /// relation with the same heading when it doesn't (IR-level `R times ⟨c⟩`,
+    /// the condition lifted to reltrue/relfalse). The condition typechecks in
+    /// the **enclosing** scope — deliberately no heading injection: `where`
+    /// filters per-tuple with the heading in scope, `when` gates the whole
+    /// relation from outside it. Not a coercion (TTM ch. 3, p. 74 — coercion
+    /// is *implicit* conversion of a wrongly-typed operand): the operand is
+    /// required-Boolean and is-Boolean, an operation "with operands that are
+    /// explicitly defined to be of different types" (the LOAD pattern,
+    /// ch. 5, p. 123). A non-Boolean condition is T0099; a relation-typed
+    /// condition gets the `times` suggestion, and a condition naming an
+    /// attribute of the left operand gets the `where` suggestion.
+    fn check_when_binary(&mut self, bin: &BinaryExpr, scope: &mut Scope) -> Type {
+        let lhs_h = self.relation_operand(bin.lhs(), "when", scope);
+        // No scope.push(): the condition sees exactly what the enclosing
+        // expression sees.
+        let rhs_ty = match bin.rhs() {
+            Some(e) => self.check_expr(&e, scope),
+            None => Type::Unknown,
+        };
+        if !matches!(rhs_ty, Type::Boolean | Type::Unknown) {
+            let span = bin
+                .rhs()
+                .map(|e| self.node_span(e.syntax()))
+                .unwrap_or_else(|| self.node_span(bin.syntax()));
+            let msg = match &rhs_ty {
+                Type::Relation(_) => format!(
+                    "`when` condition must be Boolean, got {rhs_ty} — to gate by a \
+                     relation, use `times`"
+                ),
+                _ => format!("`when` condition must be Boolean, got {rhs_ty}"),
+            };
+            self.error(span, "T0099", msg);
+        }
+        // A condition that names an attribute of the left operand is the
+        // where/when confusion: attributes are deliberately not in scope
+        // here. Point at `where` instead of leaving a bare unknown-name.
+        if let (Some(h), Some(rhs)) = (&lhs_h, bin.rhs()) {
+            let mut names = HashSet::new();
+            attr_refs(&rhs, &mut names);
+            for name in names {
+                let resolves_outside = scope.lookup(&name).is_some()
+                    || self.module_lets.contains_key(&name)
+                    || self.imported_lets.contains_key(&name)
+                    || self.stdlib_lets.contains_key(&name);
+                if !resolves_outside && h.attrs().iter().any(|(n, _)| n == &name) {
+                    self.error(
+                        self.node_span(rhs.syntax()),
+                        "T0099",
+                        format!(
+                            "`{name}` is an attribute of the left operand — attributes \
+                             are not in scope in a `when` condition; use `where` to \
+                             filter per-tuple"
+                        ),
+                    );
+                }
+            }
+        }
+        match lhs_h {
+            Some(h) => Type::Relation(h),
+            None => Type::Unknown,
+        }
+    }
+
+    /// `R otherwise D` — relational COALESCE: the left operand if it is
+    /// nonempty, else the right (IR-level `R union (D times (reltrue minus
+    /// (R project {})))`; the arms are exclusive by construction). Both
+    /// operands must be relations with the **same** heading, like `union`;
+    /// mismatched headings → T0038. Result: that shared heading.
+    fn check_otherwise_binary(&mut self, bin: &BinaryExpr, scope: &mut Scope) -> Type {
+        // Check both operands first so each surfaces its own diagnostics.
+        let lhs_h = self.relation_operand(bin.lhs(), "otherwise", scope);
+        let rhs_h = self.relation_operand(bin.rhs(), "otherwise", scope);
+        let (Some(lhs_h), Some(rhs_h)) = (lhs_h, rhs_h) else {
+            return Type::Unknown;
+        };
+        match self.identical_headings(bin, &lhs_h, &rhs_h, "otherwise") {
+            Some(h) => Type::Relation(h),
+            None => Type::Unknown,
+        }
     }
 
     /// Type-check one relational operand of a binary op: returns its heading,
@@ -5745,14 +5830,26 @@ fn param_kind_accepts(kind: &crate::builtins::ParamKind, ty: &Type) -> bool {
 
 /// Collect the attribute names a scalar expression references into `into` — the
 /// "removed set" of a general-expression `replace`. Walks `NameRef` (a leaf
-/// attribute ref), `Binary` (both operands), and `Unary` (its operand); other
-/// shapes contribute nothing. Names not in the operand heading are filtered by
-/// the caller.
+/// attribute ref), `Binary` (both operands), `Unary` (its operand), and `Call`
+/// (each argument value — `replace { html: page_html{ title, body } }` reads
+/// `title` and `body`); other shapes contribute nothing. Names not in the
+/// operand heading are filtered by the caller. Kept in step with the lowerer's
+/// `ast_attr_refs`, so the removed set the checker reports is the one the
+/// desugar removes.
 fn attr_refs(expr: &Expr, into: &mut HashSet<String>) {
     match expr {
         Expr::NameRef(n) => {
             if let Some(tok) = n.ident() {
                 into.insert(tok.text().to_string());
+            }
+        }
+        Expr::Call(c) => {
+            if let Some(list) = c.args() {
+                for arg in list.args() {
+                    if let Some(v) = arg.value() {
+                        attr_refs(&v, into);
+                    }
+                }
             }
         }
         Expr::Binary(b) => {
@@ -5793,6 +5890,8 @@ fn op_display(op: BinaryOp) -> &'static str {
         BinaryOp::Minus => "minus",
         BinaryOp::Matching => "matching",
         BinaryOp::NotMatching => "not matching",
+        BinaryOp::When => "when",
+        BinaryOp::Otherwise => "otherwise",
         BinaryOp::Add => "+",
         BinaryOp::Sub => "-",
         BinaryOp::Mul => "*",
@@ -6435,6 +6534,102 @@ mod tests {
                    private relvar S { a: Text, c: Text } key { a }; \
                    oper main {} [ write_relation { rel: R matching S }; ];";
         assert!(codes(src).contains(&"T0036"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn when_gate_checks_clean_and_keeps_left_heading() {
+        // `R when c` — c is an enclosing-scope Boolean; the result keeps R's
+        // heading (`(R when c) union R` typechecks clean only then).
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   oper main {} [ let c = true; \
+                   write_relation { rel: (R when c) union R }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn when_condition_may_be_any_boolean_expression() {
+        let src = "program p; \
+                   private relvar R { a: Integer } key { a }; \
+                   oper main {} [ let m = \"GET\"; \
+                   write_relation { rel: R when m = \"GET\" and 1 < 2 }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn when_non_boolean_condition_diagnoses_t0099() {
+        let src = "program p; \
+                   private relvar R { a: Integer } key { a }; \
+                   oper main {} [ write_relation { rel: R when 42 }; ];";
+        assert!(codes(src).contains(&"T0099"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn when_relation_condition_suggests_times() {
+        // Gating by a relation is what `times` already does — T0099 with the
+        // `times` pointer.
+        let src = "program p; \
+                   private relvar R { a: Integer } key { a }; \
+                   private relvar S { b: Integer } key { b }; \
+                   oper main {} [ write_relation { rel: R when S }; ];";
+        let diags = diagnostics(src);
+        let t99 = diags.iter().find(|d| d.code == "T0099").expect("T0099");
+        assert!(t99.message.contains("times"), "{}", t99.message);
+    }
+
+    #[test]
+    fn when_condition_gets_no_heading_injection() {
+        // `where` injects R's attributes into the predicate scope; `when`
+        // deliberately does not — an attribute name in the condition is
+        // unresolved, and the hint points at `where`.
+        let src = "program p; \
+                   private relvar R { a: Integer, flag: Boolean } key { a }; \
+                   oper main {} [ write_relation { rel: R when flag }; ];";
+        let diags = diagnostics(src);
+        let hint = diags.iter().find(|d| d.code == "T0099").expect("T0099");
+        assert!(hint.message.contains("where"), "{}", hint.message);
+    }
+
+    #[test]
+    fn when_condition_sees_enclosing_locals_over_nothing() {
+        // The condition resolves in the enclosing scope even when the name
+        // collides with an attribute of the left operand — the local wins
+        // (there is no injection to compete with).
+        let src = "program p; \
+                   private relvar R { a: Integer, flag: Boolean } key { a }; \
+                   oper main {} [ let flag = true; \
+                   write_relation { rel: R when flag }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn otherwise_checks_clean_with_identical_headings() {
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   private relvar D { a: Integer, b: Text } key { a }; \
+                   oper main {} [ write_relation { rel: R otherwise D }; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn otherwise_heading_mismatch_diagnoses_t0038() {
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Text } key { a }; \
+                   private relvar D { a: Integer, c: Text } key { a }; \
+                   oper main {} [ write_relation { rel: R otherwise D }; ];";
+        assert!(codes(src).contains(&"T0038"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn otherwise_non_relation_operand_diagnoses_t0023() {
+        let src = "program p; \
+                   private relvar R { a: Integer } key { a }; \
+                   oper main {} [ write_relation { rel: R otherwise 42 }; ];";
+        assert!(codes(src).contains(&"T0023"), "{:?}", codes(src));
     }
 
     #[test]

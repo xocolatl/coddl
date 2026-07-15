@@ -351,6 +351,12 @@ impl Emitter {
             "declare ptr @coddl_relation_minus(ptr, ptr, ptr)"
         )
         .unwrap();
+        // `when` gate: (rel, cond, desc) -> owned ptr (retained operand, or a
+        // fresh empty with the operand's heading when the gate is false).
+        writeln!(self.body, "declare ptr @coddl_relation_when(ptr, i8, ptr)").unwrap();
+        // `otherwise`: (primary, fallback) -> owned ptr (the retained winner;
+        // no descriptor needed — a length check plus a retain).
+        writeln!(self.body, "declare ptr @coddl_relation_otherwise(ptr, ptr)").unwrap();
         // Relation comparisons (observational, RM Pre 8): `=` and the subset
         // test (`proper != 0` for `<`). Identical headings ⇒ one desc.
         writeln!(self.body, "declare i8 @coddl_relation_eq(ptr, ptr, ptr)").unwrap();
@@ -1226,6 +1232,17 @@ impl Emitter {
                 rhs,
                 heading_id,
             } => self.lower_minus_inst(*dst, lhs, rhs, *heading_id),
+            Inst::Gate {
+                dst,
+                src,
+                cond,
+                heading_id,
+            } => self.lower_gate_inst(*dst, src, cond, *heading_id),
+            Inst::Otherwise {
+                dst,
+                primary,
+                fallback,
+            } => self.lower_otherwise_inst(*dst, primary, fallback),
             Inst::TClose {
                 dst,
                 src,
@@ -2308,6 +2325,64 @@ impl Emitter {
             self.body,
             "    {name} = call ptr @coddl_relation_minus(ptr {lhs_op}, ptr {rhs_op}, ptr @.heading.{})",
             heading_id.0,
+        )
+        .unwrap();
+        self.values.insert(
+            dst,
+            ValueRepr::Scalar {
+                ty: "ptr".to_string(),
+                op: name,
+            },
+        );
+        Ok(())
+    }
+
+    /// Emit `Inst::Gate`: widen the Boolean condition to the C-ABI `i8`, then
+    /// `call ptr @coddl_relation_when(src, cond, &desc)` — the runtime retains
+    /// the operand (gate true) or allocates a fresh empty with the same
+    /// heading (gate false).
+    fn lower_gate_inst(
+        &mut self,
+        dst: ValueId,
+        src: &ValueId,
+        cond: &ValueId,
+        heading_id: HeadingId,
+    ) -> Result<(), LlvmEmitError> {
+        let src_op = self.scalar_op(src)?;
+        let cond_op = self.scalar_op(cond)?;
+        let widened = format!("%v{}.cond", dst.0);
+        writeln!(self.body, "    {widened} = zext i1 {cond_op} to i8").unwrap();
+        let name = format!("%v{}", dst.0);
+        writeln!(
+            self.body,
+            "    {name} = call ptr @coddl_relation_when(ptr {src_op}, i8 {widened}, ptr @.heading.{})",
+            heading_id.0,
+        )
+        .unwrap();
+        self.values.insert(
+            dst,
+            ValueRepr::Scalar {
+                ty: "ptr".to_string(),
+                op: name,
+            },
+        );
+        Ok(())
+    }
+
+    /// Emit `Inst::Otherwise`: `call ptr @coddl_relation_otherwise(primary,
+    /// fallback)` — the runtime retains and returns the nonempty winner.
+    fn lower_otherwise_inst(
+        &mut self,
+        dst: ValueId,
+        primary: &ValueId,
+        fallback: &ValueId,
+    ) -> Result<(), LlvmEmitError> {
+        let primary_op = self.scalar_op(primary)?;
+        let fallback_op = self.scalar_op(fallback)?;
+        let name = format!("%v{}", dst.0);
+        writeln!(
+            self.body,
+            "    {name} = call ptr @coddl_relation_otherwise(ptr {primary_op}, ptr {fallback_op})",
         )
         .unwrap();
         self.values.insert(

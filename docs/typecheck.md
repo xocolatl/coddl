@@ -33,6 +33,14 @@ The split matches Rust's `String` / `char` distinction and TTM's Appendix-A "sca
 
 Distinct named scalar types are disjoint; `Integer` and `Rational` cannot be silently mixed. Equality `=` is type-monomorphic per RM Pre 8 ("indistinguishable for all operators on T").
 
+**No coercions — TTM's rule, applied.** The Manifesto defines coercion as the *implicit* invocation of a conversion operator to repair a wrongly-typed operand ("operands must always be of the appropriate types, not merely coercible to those types" — ch. 3, p. 74), and Coddl adopts the prohibition wholesale. What it does **not** prohibit is an operator whose *declared* signature mixes type categories — the Manifesto's own escape hatch: faced with the relation↔array crossing, Tutorial D's authors "prefer to define a new operation (LOAD), **with operands that are explicitly defined to be of different types**, instead of relying on conventional assignment plus coercion" (ch. 5, p. 123). Coddl's `load … from …` *is* that operation, and `when : Relation H × Boolean → Relation H` follows the same pattern (see [grammar.md](grammar.md)): its condition is required-Boolean and is-Boolean; the degree-0 relation in its semantics is IR-internal, never a converted operand. The discipline this pins down: **values never convert between `Boolean` and `Relation {}`** — the proscribed shapes stay hard type errors:
+
+- `R times c` with a Boolean `c` is T0023, never auto-lifted to `R times ⟨c⟩` (that would be the ch. 3 `S# = 'S2'` shape verbatim);
+- `c = reltrue` is a type error (comparands must be of the same type — same page);
+- a `Boolean` never assigns to or passes as a `Relation {}`, nor vice versa.
+
+Crossings between the two truth systems go only through operators declared across the boundary: `is_empty{}` and the relational comparisons one way, `when` the other.
+
 **Static operator overloading is permitted.** A few comparison operators resolve to distinct underlying operators depending on the operand type family — most notably, `<=` and `>=` are scalar comparison on scalars and **subset** / **superset** on relations (`<` and `>` give strict subset / superset). The same identifier names two operators; the type checker picks which based on operand types at compile time. RM Pre 8 monomorphism is preserved because each underlying operator is type-monomorphic; the surface `<=` is just a shared spelling, the same way `+` can be spelled by `Integer` addition and `Rational` addition without violating RM Pre 8. The registry expresses this directly: a built-in name maps to a *list* of signatures, and the checker resolves a call by the static argument types — `to_text` (see [Built-in operator registry](#built-in-operator-registry)) is the first such overloaded builtin.
 
 ### No nulls
@@ -597,6 +605,17 @@ each `parse_<x>` has a corresponding `check_<x>`.
     bindings, then the rhs (predicate) is checked; the predicate
     must be `Boolean` (T0020 otherwise). The scope is popped after
     the predicate. Result is `Relation H` (lhs's type unchanged).
+  - **`when`** (`check_when_binary`): lhs must be `Relation H` (T0023).
+    The condition is checked in the **ordinary enclosing scope** — no
+    heading injection, the deliberate contract with `where` — and must
+    be `Boolean` (T0099 otherwise; a relation-typed condition gets the
+    `times` suggestion). If the condition names an unresolved identifier
+    that *is* an attribute of `H`, a second T0099 points at `where` —
+    the where/when confusion caught at its source. Result is
+    `Relation H`.
+  - **`otherwise`** (`check_otherwise_binary`): both operands must be
+    relations (T0023) with **identical headings** (T0038, the
+    `union`/`minus` rule). Result is `Relation H` — the shared heading.
 - **Capture deferral (T0022)** — Phase 20 deferred capture support
   for `where` predicates. The typechecker's scope lookup walks
   innermost-first so an outer let binding would technically
@@ -813,7 +832,7 @@ check script enforces that.
 | T0020 | `where` predicate must be Boolean                         |
 | T0021 | Comparison/logical operand type mismatch (scalars must share a type; comparisons alternatively take two same-heading relations) |
 | T0022 | Captured identifier in `where` predicate not yet supported |
-| T0023 | `where` / `project` / `replace` left operand is not a relation |
+| T0023 | `where` / `when` / `otherwise` / `project` / `replace` left operand is not a relation (`otherwise` checks both operands) |
 | T0024 | `extract` operand is not a relation                       |
 | T0025 | Public relvar referenced outside any `transaction [...]`  |
 | T0026 | Side-effecting operator called inside `transaction [...]` |
@@ -828,7 +847,7 @@ check script enforces that.
 | T0035 | `join`/`compose` operands share no attribute (disjoint headings) — suggest `times` |
 | T0036 | `join`/`compose`/`matching`/`not matching` shared attribute has different types on each side |
 | T0037 | `times` operands share an attribute (overlapping headings) — suggest `join` |
-| T0038 | `union`/`intersect`/`minus` — and the relation comparisons `=`/`<>`/`<=`/`>=`/`<`/`>` — operands must have identical headings |
+| T0038 | `union`/`intersect`/`minus`/`otherwise` — and the relation comparisons `=`/`<>`/`<=`/`>=`/`<`/`>` — operands must have identical headings |
 | T0039 | `join` operands have identical headings (the join is a set intersection) — suggest `intersect` |
 | T0040 | `compose` operands have identical headings (every attribute removed, result always nullary) — suggest `intersect` |
 | T0041 | `tclose` operand must be a relation of exactly two attributes of the same type (binary graph relation) |
@@ -889,3 +908,4 @@ check script enforces that.
 | T0096 | a `Relation { … }` literal element is not a tuple — the relation selector's elements are tuple-typed expressions (a tuple literal `{a:1}`, or a tuple-valued name/call), and a relation is a set of tuples |
 | T0097 | module-level `let` bindings form a reference cycle (bindings are order-independent; their initializers must form a DAG) |
 | T0098 | module-level `let` initializer is missing or not a constant expression (calls, `transaction`, relvar reads, field access, `if`, and indexing are excluded until purity derivation / compile-time evaluation widen) |
+| T0099 | `when` condition discipline: the condition must be `Boolean` (a relation-typed condition suggests `times`), and an unresolved name in it that is an attribute of the left operand hints at `where` — attributes are deliberately not in scope in a `when` condition |

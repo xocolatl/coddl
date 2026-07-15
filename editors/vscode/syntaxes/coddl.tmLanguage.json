@@ -138,8 +138,14 @@
                     "match": "\\b(load|array|from|order|asc|desc|by)\\b"
                 },
                 {
+                    "comment": "Infix relational operators (join/times/compose/intersect/union/minus/matching/where/when/otherwise — `not matching` gets `not` from the logical group), the postfix pipeline suffixes (project/replace/extend/rename/wrap/unwrap/tclose), prefix `extract`, and the designed-but-unbuilt sugar (summarize/group/ungroup).",
                     "name": "keyword.other.relational.coddl",
-                    "match": "\\b(join|times|union|intersect|minus|where|extend|summarize|replace|rename|project|group|ungroup|wrap|unwrap|semijoin|semiminus|tclose)\\b"
+                    "match": "\\b(join|times|compose|union|intersect|minus|matching|where|when|otherwise|extract|extend|summarize|replace|rename|project|group|ungroup|wrap|unwrap|tclose)\\b"
+                },
+                {
+                    "comment": "Unicode operator glyph synonyms (grammar.md § Unicode operator glyphs): ⋈ join, ∪ union, ∩ intersect, ∖ minus, ⋉ matching, ▷ not-matching, ¬ not. Lexed as IDENTs, so no \\b anchors (word boundaries misfire next to symbols).",
+                    "name": "keyword.other.relational.coddl",
+                    "match": "⋈|∪|∩|∖|⋉|▷|¬"
                 },
                 {
                     "comment": "`all but` projection-away, matched as a pair so a lone identifier named `all` or `but` (e.g. inside the brace list) stays uncolored",
@@ -154,6 +160,11 @@
                 {
                     "name": "keyword.operator.logical.coddl",
                     "match": "\\b(and|or|not)\\b"
+                },
+                {
+                    "comment": "Textual arithmetic: `div` (truncating integer division) and the designed `mod`.",
+                    "name": "keyword.operator.arithmetic.coddl",
+                    "match": "\\b(div|mod)\\b"
                 },
                 {
                     "name": "keyword.other.transaction.coddl",

@@ -451,7 +451,7 @@ fn emit_delete(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
             "delete operand does not resolve to a single base relvar".to_string(),
         ));
     }
-    let mut wheres: Vec<(String, CmpOp, RestrictValue)> = Vec::new();
+    let mut wheres: Vec<WhereConjunct> = Vec::new();
     let (from_clause, _cols) = resolve(expr, &mut wheres)?;
     let mut params: Vec<ParamSource> = Vec::new();
     let where_sql = render_where_clause(&wheres, dialect, 0, &mut params)?;
@@ -521,8 +521,11 @@ pub fn emit_assignment(target: &RelExpr, rhs: &RelExpr, dialect: Dialect) -> Res
         // `t := t where p` — keep the matching rows = delete the complement
         // (`DELETE FROM t WHERE ¬p`). Only a single restriction over the bare
         // target; a deeper chain's negation is a disjunction the single-predicate
-        // model can't push, so it declines.
-        RelExpr::Restrict { input, pred } if is_target(input) => {
+        // model can't push, so it declines — as does a gated keep (`t := t when
+        // c`; a `Gate` has no negated comparison form).
+        RelExpr::Restrict { input, pred }
+            if is_target(input) && matches!(pred, Predicate::AttrCmp { .. }) =>
+        {
             let complement = RelExpr::Restrict {
                 input: input.clone(),
                 pred: negate_predicate(pred),
@@ -702,16 +705,28 @@ fn emit_update(target: &RelExpr, rhs: &RelExpr, dialect: Dialect) -> Result<SqlQ
                 ));
             }
             // `q` must be `¬p`: same attribute and value, negated operator.
+            // (A `Gate` predicate has no complement pair here — the update
+            // sugar only ever generates attribute comparisons; decline.)
             let Predicate::AttrCmp {
                 attr: pa,
                 op: po,
                 value: pv,
-            } = p;
+            } = p
+            else {
+                return Err(BackendError::Other(
+                    "update: changed-rows predicate is not an attribute comparison".to_string(),
+                ));
+            };
             let Predicate::AttrCmp {
                 attr: qa,
                 op: qo,
                 value: qv,
-            } = q;
+            } = q
+            else {
+                return Err(BackendError::Other(
+                    "update: unchanged-rows predicate is not an attribute comparison".to_string(),
+                ));
+            };
             if pa != qa || pv != qv || *qo != po.negate() {
                 return Err(BackendError::Other(
                     "update: the union operand is not the complement of the changed rows"
@@ -739,7 +754,7 @@ fn emit_update(target: &RelExpr, rhs: &RelExpr, dialect: Dialect) -> Result<SqlQ
 
     // Resolve the inner to its table + column map, collecting the WHERE predicate
     // (`p`, or none for update-all).
-    let mut wheres: Vec<(String, CmpOp, RestrictValue)> = Vec::new();
+    let mut wheres: Vec<WhereConjunct> = Vec::new();
     let (from_clause, cols) = resolve(inner, &mut wheres)?;
 
     let mut set_sql = Vec::with_capacity(sets.len());
@@ -905,13 +920,16 @@ fn emit_anti_join_delete(
 
 /// `NOT p` for a single comparison predicate — same attribute and value, the
 /// negated operator. Used by the `t := t where p` keep-filter to delete the
-/// complement.
+/// complement. A `Gate` has no negated `CmpOp` form; its one caller guards it
+/// out (a gated keep-filter declines to the ship path).
 fn negate_predicate(pred: &Predicate) -> Predicate {
-    let Predicate::AttrCmp { attr, op, value } = pred;
-    Predicate::AttrCmp {
-        attr: attr.clone(),
-        op: op.negate(),
-        value: value.clone(),
+    match pred {
+        Predicate::AttrCmp { attr, op, value } => Predicate::AttrCmp {
+            attr: attr.clone(),
+            op: op.negate(),
+            value: value.clone(),
+        },
+        Predicate::Gate(_) => unreachable!("gated keep-filter is guarded out by the caller"),
     }
 }
 
@@ -1172,7 +1190,7 @@ fn emit_select_offset(
     // Resolve the core to its physical table and output `(attr, column)` map —
     // renames remap the attr side, projects narrow it — collecting each
     // restriction as a resolved `(column, value)` conjunct along the way.
-    let mut wheres: Vec<(String, CmpOp, RestrictValue)> = Vec::new();
+    let mut wheres: Vec<WhereConjunct> = Vec::new();
     let (from_clause, mut output_cols) = resolve(core, &mut wheres)?;
 
     // Computed columns: each extend value rendered to SQL against the resolved
@@ -1297,6 +1315,20 @@ fn emit_select_offset(
     })
 }
 
+/// One collected `WHERE` conjunct: an attribute comparison resolved to its
+/// SQL column, or a tuple-independent gate (`Predicate::Gate` — surface
+/// `when`). The gate renders `<placeholder> = 1`: a Boolean binds as integer
+/// 0/1, and a bare truthy placeholder would be valid SQLite but a type error
+/// as `$N` on Postgres.
+enum WhereConjunct {
+    Cmp {
+        col: String,
+        op: CmpOp,
+        value: RestrictValue,
+    },
+    Gate(RestrictValue),
+}
+
 /// Post-order walk returning the node's **FROM expression** (a quoted table,
 /// or a composed `… INNER JOIN …`) and its output `(attribute, sql_column)`
 /// map. `Rename` remaps the attribute side; `Project` narrows it; `Restrict`
@@ -1305,7 +1337,7 @@ fn emit_select_offset(
 /// `(column, value)` onto `wheres`; `And` joins two FROM expressions.
 fn resolve(
     expr: &RelExpr,
-    wheres: &mut Vec<(String, CmpOp, RestrictValue)>,
+    wheres: &mut Vec<WhereConjunct>,
 ) -> Result<(String, Vec<(String, String)>)> {
     match expr {
         RelExpr::RelvarRef {
@@ -1315,9 +1347,19 @@ fn resolve(
         } => Ok((quote_ident(table_name), columns.clone())),
         RelExpr::Restrict { input, pred } => {
             let (from, cols) = resolve(input, wheres)?;
-            let Predicate::AttrCmp { attr, op, value } = pred;
-            let col = column_for(&cols, attr)?.to_string();
-            wheres.push((col, *op, value.clone()));
+            match pred {
+                Predicate::AttrCmp { attr, op, value } => {
+                    let col = column_for(&cols, attr)?.to_string();
+                    wheres.push(WhereConjunct::Cmp {
+                        col,
+                        op: *op,
+                        value: value.clone(),
+                    });
+                }
+                // A gate reads no attribute, so it needs no column
+                // resolution — it conjuncts at whatever level it appears.
+                Predicate::Gate(value) => wheres.push(WhereConjunct::Gate(value.clone())),
+            }
             Ok((from, cols))
         }
         RelExpr::Project { input, keep } => {
@@ -1533,7 +1575,7 @@ fn column_for<'a>(columns: &'a [(String, String)], attr: &str) -> Result<&'a str
 /// caller can unconditionally append the result. Shared by `emit_select_offset`
 /// (SELECT) and `emit_delete` (DELETE); the conjunction shape is identical.
 fn render_where_clause(
-    wheres: &[(String, CmpOp, RestrictValue)],
+    wheres: &[WhereConjunct],
     dialect: Dialect,
     param_offset: u32,
     params: &mut Vec<ParamSource>,
@@ -1542,7 +1584,7 @@ fn render_where_clause(
         return Ok(String::new());
     }
     let mut conjuncts = Vec::with_capacity(wheres.len());
-    for (col, op, value) in wheres {
+    for conjunct in wheres {
         // Numbered placeholders on both dialects (`?N` / `$N`), same absolute
         // index. Numbering (rather than SQLite's bare `?`) keeps every bind
         // site's index independent of its position in the text — which is what
@@ -1554,25 +1596,37 @@ fn render_where_clause(
             Dialect::SQLite => format!("?{index}"),
             Dialect::Postgres => format!("${index}"),
         };
-        // A `Rational` *ordering* restriction (`< <= > >=`) compares canonical
-        // `"n/d"` TEXT, which sorts lexicographically — wrong for rationals. Sort
-        // by numeric value via the `coddl_rational` collation. Equality (`= <>`)
-        // needs no collation (canonical text `=` already is value-equality).
-        // Only a *literal* value can be a `Rational` here — the dynamic-parameter
-        // path excludes `Rational` (the literal path pre-serializes `n/d` to
-        // canonical text at compile time; a runtime value cannot), so a `Param`
-        // never needs the collation.
-        let collate =
-            if matches!(value, RestrictValue::Lit(Literal::Rational(..))) && is_ordering(*op) {
-                rational_order_collation(dialect)?
-            } else {
-                ""
-            };
-        conjuncts.push(format!(
-            "{} {} {placeholder}{collate}",
-            quote_ident(col),
-            op.sql()
-        ));
+        let value = match conjunct {
+            WhereConjunct::Cmp { col, op, value } => {
+                // A `Rational` *ordering* restriction (`< <= > >=`) compares canonical
+                // `"n/d"` TEXT, which sorts lexicographically — wrong for rationals. Sort
+                // by numeric value via the `coddl_rational` collation. Equality (`= <>`)
+                // needs no collation (canonical text `=` already is value-equality).
+                // Only a *literal* value can be a `Rational` here — the dynamic-parameter
+                // path excludes `Rational` (the literal path pre-serializes `n/d` to
+                // canonical text at compile time; a runtime value cannot), so a `Param`
+                // never needs the collation.
+                let collate = if matches!(value, RestrictValue::Lit(Literal::Rational(..)))
+                    && is_ordering(*op)
+                {
+                    rational_order_collation(dialect)?
+                } else {
+                    ""
+                };
+                conjuncts.push(format!(
+                    "{} {} {placeholder}{collate}",
+                    quote_ident(col),
+                    op.sql()
+                ));
+                value
+            }
+            // The gate conjunct: a Boolean bound as integer 0/1, tested
+            // against 1 (a bare truthy placeholder is SQLite-only).
+            WhereConjunct::Gate(value) => {
+                conjuncts.push(format!("{placeholder} = 1"));
+                value
+            }
+        };
         // Every form occupies one positional placeholder in `wheres` order, so
         // the pushed `ParamSource` list lines up with the emitted `?`/`$n`
         // sequence. A `SlotCell` renders like any other bind; only who fills

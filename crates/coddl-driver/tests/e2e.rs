@@ -4359,6 +4359,238 @@ fn mixed_origin_field_access_cranelift() {
     assert_mixed_origin_field_access("cranelift");
 }
 
+// ── `when` (gate) and `otherwise` (relational COALESCE) ───────────────
+
+/// In-process gating: `R when c` keeps R when the condition holds and
+/// annihilates it when it doesn't (`Inst::Gate` — retain-or-empty, O(1)); a
+/// union of exclusively-gated arms is the router shape; chaining is AND.
+fn assert_when_gate_inprocess(backend: &str) {
+    let stdout = run_parts_stdout(
+        backend,
+        "program parts;\n\
+         database parts;\n\
+         oper main {} [\n\
+             let yes = true;\n\
+             let no = false;\n\
+             let home = Relation { { slug: \"home\" } };\n\
+             let wiki = Relation { { slug: \"wiki\" } };\n\
+             let routed = (home when no) union (wiki when yes);\n\
+             write_relation { rel: routed };\n\
+             let nothing = (home when no) union (wiki when no);\n\
+             write_relation { rel: nothing };\n\
+             let chained = home when yes when yes;\n\
+             write_relation { rel: chained };\n\
+             let cut = home when yes when no;\n\
+             write_relation { rel: cut };\n\
+         ];\n",
+    );
+    assert_eq!(
+        tuple_lines(&stdout),
+        sorted_tuples(&["{slug: \"wiki\"}", "{slug: \"home\"}"]),
+        "backend={backend}: got {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+}
+
+#[test]
+fn when_gate_inprocess_llvm() {
+    assert_when_gate_inprocess("llvm");
+}
+
+#[test]
+fn when_gate_inprocess_cranelift() {
+    assert_when_gate_inprocess("cranelift");
+}
+
+/// A relvar-rooted gate pushes as the `?N = 1` conjunct — evaluated by SQLite,
+/// never a pull of the relvar to gate in-process. The condition may be a bare
+/// local (bound under its own name) or a computed expression (bound via the
+/// cond side table); a false gate yields the empty result.
+fn assert_when_gate_pushdown(backend: &str) {
+    let (stdout, audit) = run_parts_program(
+        backend,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         oper main {} [\n\
+             let method = \"GET\";\n\
+             let on = transaction [ (Suppliers when method = \"GET\") where sno = 2 ];\n\
+             write_relation { rel: on };\n\
+             let no = false;\n\
+             let off = transaction [ Suppliers when no ];\n\
+             write_relation { rel: off };\n\
+         ];\n",
+        true,
+    );
+    assert_eq!(
+        tuple_lines(&stdout),
+        sorted_tuples(&["{sname: \"Jones\", sno: 2}"]),
+        "backend={backend}: got {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+    // Both gates run their statement in v1 (the force-time statement skip is
+    // the tracked follow-up); the gate conjunct rides the pushed WHERE.
+    let selects: Vec<&str> = audit.lines().filter(|l| l.contains("SELECT")).collect();
+    assert_eq!(
+        selects.len(),
+        2,
+        "expected both gated SELECTs in the audit; audit:\n{audit}"
+    );
+}
+
+#[test]
+fn when_gate_pushdown_llvm() {
+    assert_when_gate_pushdown("llvm");
+}
+
+#[test]
+fn when_gate_pushdown_cranelift() {
+    assert_when_gate_pushdown("cranelift");
+}
+
+/// The wiki-router promise: a gated in-process relation feeding `matching`
+/// dispatches at the force point — a false gate leaves the shipped slot empty,
+/// the absorbing position short-circuits, and **no statement fires**; a true
+/// gate with a single row fires the cardinality-1 sibling (a direct keyed
+/// lookup — no EXISTS, no VALUES).
+fn assert_when_gate_feeds_semijoin_dispatch(backend: &str) {
+    let (stdout, audit) = run_parts_program(
+        backend,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         oper main {} [\n\
+             let no = false;\n\
+             let yes = true;\n\
+             let off = Relation { { sno: 1, ordinality: 0 } } when no;\n\
+             let nothing = transaction [ Suppliers matching off ];\n\
+             write_relation { rel: nothing };\n\
+             let on = Relation { { sno: 2, ordinality: 0 } } when yes;\n\
+             let found = transaction [ Suppliers matching on ];\n\
+             write_relation { rel: found };\n\
+         ];\n",
+        true,
+    );
+    assert_eq!(
+        tuple_lines(&stdout),
+        sorted_tuples(&["{sname: \"Jones\", sno: 2}"]),
+        "backend={backend}: got {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+    let selects: Vec<&str> = audit.lines().filter(|l| l.contains("SELECT")).collect();
+    assert!(
+        selects.len() == 1 && selects[0].contains(r#""sno" = 2"#),
+        "expected exactly the card-1 sibling SELECT (the false gate's empty \
+         slot short-circuits without a statement); audit:\n{audit}"
+    );
+    assert!(
+        !selects[0].contains("EXISTS") && !selects[0].contains("VALUES"),
+        "expected the single-row gated slot to dispatch to the sibling plan, \
+         got: {}",
+        selects[0]
+    );
+}
+
+#[test]
+fn when_gate_feeds_semijoin_dispatch_llvm() {
+    assert_when_gate_feeds_semijoin_dispatch("llvm");
+}
+
+#[test]
+fn when_gate_feeds_semijoin_dispatch_cranelift() {
+    assert_when_gate_feeds_semijoin_dispatch("cranelift");
+}
+
+/// `R otherwise D` — the relational COALESCE: R when nonempty, else D
+/// (post-fire empty-result substitution for a pushed primary), and the
+/// `extract (… otherwise …)` shape that makes a keyed lookup total.
+fn assert_otherwise_coalesce(backend: &str) {
+    let stdout = run_parts_stdout(
+        backend,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         oper main {} [\n\
+             let fallback = Relation { { sno: 0, sname: \"nobody\" } };\n\
+             let found = transaction [ Suppliers where sno = 2 ] otherwise fallback;\n\
+             write_relation { rel: found };\n\
+             let missing = transaction [ Suppliers where sno = 42 ] otherwise fallback;\n\
+             write_relation { rel: missing };\n\
+             let page = extract (\n\
+                 transaction [ Suppliers where sno = 42 project { sname } ]\n\
+                     otherwise Relation { { sname: \"404\" } }\n\
+             );\n\
+             write_line { message: page.sname };\n\
+         ];\n",
+    );
+    assert_eq!(
+        tuple_lines(&stdout),
+        sorted_tuples(&[
+            "{sname: \"Jones\", sno: 2}",
+            "{sname: \"nobody\", sno: 0}",
+            "404",
+        ]),
+        "backend={backend}: got {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+}
+
+#[test]
+fn otherwise_coalesce_llvm() {
+    assert_otherwise_coalesce("llvm");
+}
+
+#[test]
+fn otherwise_coalesce_cranelift() {
+    assert_otherwise_coalesce("cranelift");
+}
+
+/// An `otherwise` result is an ordinary relation value: as an operand of a
+/// further mixed-origin op it ships as a relation-valued parameter (the
+/// self-collapsed `RelParam` slot), so the enclosing op still pushes.
+fn assert_otherwise_result_feeds_semijoin(backend: &str) {
+    let (stdout, audit) = run_parts_program(
+        backend,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         oper main {} [\n\
+             let empty = Relation { { sno: 1, ordinality: 0 } } where sno = 99;\n\
+             let fallback = Relation { { sno: 3, ordinality: 0 } };\n\
+             let wanted = empty otherwise fallback;\n\
+             let found = transaction [ Suppliers matching wanted ];\n\
+             write_relation { rel: found };\n\
+         ];\n",
+        true,
+    );
+    assert_eq!(
+        tuple_lines(&stdout),
+        sorted_tuples(&["{sname: \"Blake\", sno: 3}"]),
+        "backend={backend}: got {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+    // The coalesced single row dispatches like any 1-row slot: the sibling
+    // keyed lookup, not the EXISTS/VALUES general form.
+    let line = audit
+        .lines()
+        .find(|l| l.contains(r#""sno" = 3"#))
+        .unwrap_or_else(|| panic!("no keyed statement for the coalesced slot; audit:\n{audit}"));
+    assert!(
+        !line.contains("EXISTS") && !line.contains("VALUES"),
+        "expected the coalesced 1-row slot to dispatch to the sibling plan, got: {line}"
+    );
+}
+
+#[test]
+fn otherwise_result_feeds_semijoin_llvm() {
+    assert_otherwise_result_feeds_semijoin("llvm");
+}
+
+#[test]
+fn otherwise_result_feeds_semijoin_cranelift() {
+    assert_otherwise_result_feeds_semijoin("cranelift");
+}
+
 // ── Boolean `not` (prefix negation) ───────────────────────────────────
 
 /// `not` lowers to `ScalarOp::Not` in ProcIR and evaluates on both backends,

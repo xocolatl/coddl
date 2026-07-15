@@ -1390,6 +1390,12 @@ impl<'a> Parser<'a> {
             SyntaxKind::IDENT if self.at_keyword("not") && self.nth_at_keyword(1, "matching") => {
                 Some(0)
             }
+            // Relational-control ops (prec 0): `when` gates a whole relation by
+            // an enclosing-scope Boolean; `otherwise` is the relational
+            // COALESCE. Same altitude as `where`, so a pipeline reads top to
+            // bottom and `A when c otherwise D` nests left.
+            SyntaxKind::IDENT if self.at_keyword("when") => Some(0),
+            SyntaxKind::IDENT if self.at_keyword("otherwise") => Some(0),
             _ => None,
         }
     }
@@ -3446,6 +3452,95 @@ mod tests {
         // Both `not` and `matching` are captured as operator tokens, so the
         // node text round-trips the two-word spelling.
         assert!(bin.syntax().text().to_string().contains("not matching"));
+    }
+
+    /// The root BINARY_EXPR of a parsed oper body, with its resolved op kind.
+    fn root_binary(src: &str) -> (crate::ast::BinaryExpr, Option<crate::ast::BinaryOp>) {
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        // The outermost (first in preorder) BINARY_EXPR is the root of the
+        // expression — precedence tests read its operator.
+        let bin = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .and_then(<crate::ast::BinaryExpr as crate::ast::AstNode>::cast)
+            .expect("a BINARY_EXPR");
+        let op = bin.op_kind();
+        (bin, op)
+    }
+
+    #[test]
+    fn when_infix_parses() {
+        let (_, op) = root_binary("oper main {} [ R when c ];");
+        assert_eq!(op, Some(crate::ast::BinaryOp::When));
+    }
+
+    #[test]
+    fn otherwise_infix_parses() {
+        let (_, op) = root_binary("oper main {} [ R otherwise D ];");
+        assert_eq!(op, Some(crate::ast::BinaryOp::Otherwise));
+    }
+
+    #[test]
+    fn when_chain_with_otherwise_nests_left() {
+        use crate::ast::AstNode;
+        // Same pipeline altitude, left-associative:
+        // `A when c otherwise D` = `(A when c) otherwise D`.
+        let (root, op) = root_binary("oper main {} [ A when c otherwise D ];");
+        assert_eq!(op, Some(crate::ast::BinaryOp::Otherwise));
+        let inner = root
+            .syntax()
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .and_then(<crate::ast::BinaryExpr as crate::ast::AstNode>::cast)
+            .expect("inner BINARY_EXPR");
+        assert_eq!(inner.op_kind(), Some(crate::ast::BinaryOp::When));
+    }
+
+    #[test]
+    fn where_then_when_groups_the_restriction_first() {
+        use crate::ast::AstNode;
+        // `R where x = 1 when c` = `(R where x = 1) when c`: the `where`
+        // predicate parses at prec 1, so the prec-0 `when` terminates it and
+        // wraps the whole restriction.
+        let (root, op) = root_binary("oper main {} [ R where x = 1 when c ];");
+        assert_eq!(op, Some(crate::ast::BinaryOp::When));
+        let inner = root
+            .syntax()
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .and_then(<crate::ast::BinaryExpr as crate::ast::AstNode>::cast)
+            .expect("inner BINARY_EXPR");
+        assert_eq!(inner.op_kind(), Some(crate::ast::BinaryOp::Where));
+    }
+
+    #[test]
+    fn when_condition_binds_comparisons_without_parens() {
+        use crate::ast::AstNode;
+        // The rhs parses at prec 1, so `=` (prec 3) binds inside the
+        // condition: `R when m = "GET"` = `R when (m = "GET")`.
+        let (root, op) = root_binary("oper main {} [ R when m = \"GET\" ];");
+        assert_eq!(op, Some(crate::ast::BinaryOp::When));
+        let inner = root
+            .syntax()
+            .children()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .and_then(<crate::ast::BinaryExpr as crate::ast::AstNode>::cast)
+            .expect("condition BINARY_EXPR");
+        assert_eq!(inner.op_kind(), Some(crate::ast::BinaryOp::Eq));
+    }
+
+    #[test]
+    fn when_and_otherwise_stay_ordinary_identifiers() {
+        // No reserved words: both operators are contextual — in name
+        // positions (`let` bindings, named args, attribute names) they are
+        // plain identifiers.
+        let out = parse_str(
+            "oper main {} [ let when = 1; let otherwise = 2; \
+             let r = Relation { { when: 1, otherwise: 2 } }; ];",
+        );
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }
 
     #[test]
