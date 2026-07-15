@@ -1,0 +1,14 @@
+// shipments.cddb
+//
+// Conceptual schema for the `shipments` database — the SQL-backed twin of the
+// in-process group/ungroup example. Database-side `base relvar` declaration;
+// the heading mirrors the `public relvar Shipments` in group-ungroup-db.cd.
+
+database shipments;
+
+base relvar Shipments {
+    supplier: Text,
+    part: Text,
+    qty: Integer,
+}
+key { supplier, part };

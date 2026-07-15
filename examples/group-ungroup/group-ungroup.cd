@@ -1,0 +1,53 @@
+// group-ungroup.cd
+//
+// `group` and `ungroup` — the relation-valued-attribute operators (TTM's
+// GROUP/UNGROUP). `group` consumes the named attributes into a single
+// relation-valued attribute; the *remaining* attributes survive and partition
+// the relation — note the inversion of SQL's GROUP BY, which names the
+// survivors. `ungroup` unnests one back. Unlike `wrap`/`unwrap` (heading
+// rewrites), they change cardinality: one grouped tuple per distinct survivor
+// combination, and `R group { pq: {a, b} } ungroup { pq }` is `R` again.
+//
+//   R group   { pq: {a, b} }   consume `a`, `b` into a relation-valued `pq`
+//   R ungroup { pq }           unnest `pq` back to top level
+//
+// A relation-valued attribute is a first-class nested relation cell: it prints
+// nested and flows through the other operators (here, `project`) intact,
+// compared by content (RM Pre 8), never by reference. `group` never produces
+// an empty `pq` — a supplier with no shipments simply has no tuple. A
+// `private` relvar is local program state (RM Pre 14), populated by relational
+// assignment — no transaction needed. A relation is a set, so the printed
+// tuple order is unspecified.
+
+program group_ungroup;
+
+private relvar Shipments {
+    supplier: Text,
+    part: Text,
+    qty: Integer,
+} key { supplier, part };
+
+oper main{} [
+    Shipments := Relation {
+        { supplier: "S1", part: "P1", qty: 300 },
+        { supplier: "S1", part: "P2", qty: 200 },
+        { supplier: "S2", part: "P1", qty: 100 },
+    };
+
+    // group: consume `part` and `qty` into a relation-valued attribute `pq`.
+    // `supplier` survives and partitions — one tuple per supplier, each `pq`
+    // holding that supplier's {part, qty} set, printed nested.
+    let grouped = Shipments group { pq: { part, qty } };
+    write_relation{ rel: grouped };
+
+    // round-trip: `ungroup` unnests every (supplier × pq-tuple) combination —
+    // `group` then `ungroup` of the same attribute is the identity.
+    let back = Shipments group { pq: { part, qty } } ungroup { pq };
+    write_relation{ rel: back };
+
+    // the relation-valued attribute flows through `project` intact, and its
+    // dedup compares nested *content*: S1 and S2 keep distinct `pq` sets here,
+    // so both rows survive.
+    let just_pq = Shipments group { pq: { part, qty } } project { pq };
+    write_relation{ rel: just_pq };
+];
