@@ -1104,6 +1104,34 @@ fn ensure_runtime_built() {
     );
 }
 
+/// Seed (or mutate) a fixture SQLite database in-process, through the same
+/// bundled SQLite the runtime links — no `sqlite3` CLI on PATH, no version
+/// skew between the fixture writer and the program that reads it, and no
+/// subprocess fork per seed.
+fn seed_db(path: &std::path::Path, sql: &str) {
+    let conn = rusqlite::Connection::open(path).expect("open fixture db");
+    conn.execute_batch(sql).expect("seed fixture db");
+}
+
+/// Read rows back for a persistence assertion, reproducing the `sqlite3`
+/// CLI's output shape the existing expectations were written against: one
+/// text column per row, each row newline-terminated; an empty result is the
+/// empty string.
+fn query_lines(path: &std::path::Path, sql: &str) -> String {
+    let conn = rusqlite::Connection::open(path).expect("open fixture db");
+    let mut stmt = conn.prepare(sql).expect("prepare read-back");
+    let rows: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("run read-back")
+        .collect::<Result<_, _>>()
+        .expect("collect read-back rows");
+    if rows.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", rows.join("\n"))
+    }
+}
+
 fn coddl() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_coddl"));
     // Leak-check every program this suite runs: the debug runtime reports a
@@ -1242,6 +1270,10 @@ fn coddl_run_llvm_writes_env_builtin_relvar() {
     let out = coddl()
         .args(["run", "--backend=llvm"])
         .arg(fixture_path("env-write"))
+        // The fixture asserts CODDL_OUT is absent at program start; pin
+        // that against ambient shell environment (the harness owns the
+        // env its programs see, like it owns their fixtures).
+        .env_remove("CODDL_OUT")
         .output()
         .expect("spawn coddl");
     assert!(
@@ -1258,6 +1290,8 @@ fn coddl_run_cranelift_writes_env_builtin_relvar() {
     let out = coddl()
         .args(["run", "--backend=cranelift"])
         .arg(fixture_path("env-write"))
+        // Same ambient-environment pin as the llvm twin.
+        .env_remove("CODDL_OUT")
         .output()
         .expect("spawn coddl");
     assert!(
@@ -2086,15 +2120,10 @@ fn app_init_drives_a_mainless_public_relvar_sql_query() {
     )
     .expect("write users.cdstore");
     let db = tmp.path().join("users.sqlite");
-    let seed = Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "sqlite3 '{}' \"CREATE TABLE users (id INTEGER NOT NULL, name TEXT NOT NULL, email TEXT NOT NULL, active INTEGER NOT NULL, PRIMARY KEY (id)); INSERT INTO users (id, name, email, active) VALUES (1,'Alice','alice@example.com',1),(2,'Bob','bob@example.com',0),(3,'Carol','carol@example.com',1);\"",
-            db.display()
-        ))
-        .status()
-        .expect("invoke sqlite3");
-    assert!(seed.success(), "users fixture seed failed");
+    seed_db(
+        &db,
+        "CREATE TABLE users (id INTEGER NOT NULL, name TEXT NOT NULL, email TEXT NOT NULL, active INTEGER NOT NULL, PRIMARY KEY (id)); INSERT INTO users (id, name, email, active) VALUES (1,'Alice','alice@example.com',1),(2,'Bob','bob@example.com',0),(3,'Carol','carol@example.com',1);",
+    );
 
     // 3. Emit the mainless object, link it with the runtime staticlib + the C host.
     let obj = tmp.path().join("query.o");
@@ -3271,15 +3300,10 @@ fn greetings_env_var_override_picks_alternate_path() {
     let (cd, _default_db) = write_pushdown_fixtures(tmp.path()); // default: "hello world"
 
     let alt = tmp.path().join("alt.sqlite");
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "sqlite3 '{}' \"CREATE TABLE greetings (id INTEGER PRIMARY KEY, message TEXT NOT NULL); INSERT INTO greetings (id, message) VALUES (1, 'override hello');\"",
-            alt.display()
-        ))
-        .status()
-        .expect("invoke sqlite3");
-    assert!(status.success(), "alt SQLite seed failed");
+    seed_db(
+        &alt,
+        "CREATE TABLE greetings (id INTEGER PRIMARY KEY, message TEXT NOT NULL); INSERT INTO greetings (id, message) VALUES (1, 'override hello');",
+    );
 
     let out = coddl()
         .env("CODDL_GREETINGS_FILE", &alt)
@@ -3375,15 +3399,10 @@ fn seed_greetings_fixtures(dir: &Path) -> PathBuf {
     .expect("write greetings.cdstore");
 
     let db = dir.join("greetings.sqlite");
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "sqlite3 '{}' \"CREATE TABLE greetings (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); INSERT INTO greetings (id, message) VALUES (1, 'hello world');\"",
-            db.display()
-        ))
-        .status()
-        .expect("invoke sqlite3");
-    assert!(status.success(), "greetings fixture seed failed");
+    seed_db(
+        &db,
+        "CREATE TABLE greetings (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); INSERT INTO greetings (id, message) VALUES (1, 'hello world');",
+    );
     db
 }
 
@@ -3752,15 +3771,11 @@ fn run_greetings_stdout(backend: &str, program: &str) -> Vec<u8> {
     )
     .expect("write greetings.cdstore");
     let db = dir.join("greetings.sqlite");
-    let seed = Command::new("sqlite3")
-        .arg(&db)
-        .arg(
-            "CREATE TABLE greetings (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
-             INSERT INTO greetings (id, message) VALUES (1, 'hello world'), (2, 'goodbye');",
-        )
-        .status()
-        .expect("invoke sqlite3");
-    assert!(seed.success(), "greetings fixture seed failed");
+    seed_db(
+        &db,
+        "CREATE TABLE greetings (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
+         INSERT INTO greetings (id, message) VALUES (1, 'hello world'), (2, 'goodbye');",
+    );
 
     let cd = dir.join("sel.cd");
     std::fs::write(&cd, program).expect("write sel.cd");
@@ -3885,17 +3900,13 @@ fn run_parts_program(backend: &str, program: &str, want_audit: bool) -> (Vec<u8>
     )
     .expect("write parts.cdstore");
     let db = dir.join("parts.sqlite");
-    let seed = Command::new("sqlite3")
-        .arg(&db)
-        .arg(
-            "CREATE TABLE suppliers (sno INTEGER NOT NULL, sname TEXT NOT NULL, PRIMARY KEY (sno)); \
-             CREATE TABLE shipments (pno INTEGER NOT NULL, sno INTEGER NOT NULL, PRIMARY KEY (pno, sno)); \
-             INSERT INTO suppliers (sno, sname) VALUES (1,'Smith'),(2,'Jones'),(3,'Blake'); \
-             INSERT INTO shipments (pno, sno) VALUES (100,1),(200,1),(100,2);",
-        )
-        .status()
-        .expect("invoke sqlite3");
-    assert!(seed.success(), "parts fixture seed failed");
+    seed_db(
+        &db,
+        "CREATE TABLE suppliers (sno INTEGER NOT NULL, sname TEXT NOT NULL, PRIMARY KEY (sno)); \
+         CREATE TABLE shipments (pno INTEGER NOT NULL, sno INTEGER NOT NULL, PRIMARY KEY (pno, sno)); \
+         INSERT INTO suppliers (sno, sname) VALUES (1,'Smith'),(2,'Jones'),(3,'Blake'); \
+         INSERT INTO shipments (pno, sno) VALUES (100,1),(200,1),(100,2);",
+    );
 
     let cd = dir.join("sel.cd");
     std::fs::write(&cd, program).expect("write sel.cd");
@@ -5162,9 +5173,10 @@ fn is_empty_cranelift() {
 /// Seed a fresh two-row `greetings` db + its `.cddb`/`.cdstore` companions,
 /// compile and run `program` on `backend`, then return the rows left in the
 /// table afterwards as `"id|message"` lines sorted by id. Querying the
-/// persisted file directly (via the `sqlite3` CLI) proves the write reached the
-/// table, independent of any in-process read path. The suite owns its source —
-/// it never reads `examples/`.
+/// persisted file directly (a separate `rusqlite` connection, not the program
+/// under test) proves the write reached the table, independent of any
+/// in-process read path. The suite owns its source — it never reads
+/// `examples/`.
 fn run_greetings_dml(backend: &str, program: &str) -> Vec<String> {
     ensure_runtime_built();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -5183,15 +5195,11 @@ fn run_greetings_dml(backend: &str, program: &str) -> Vec<String> {
     )
     .expect("write greetings.cdstore");
     let db = dir.join("greetings.sqlite");
-    let seed = Command::new("sqlite3")
-        .arg(&db)
-        .arg(
-            "CREATE TABLE greetings (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
-             INSERT INTO greetings (id, message) VALUES (1, 'hello world'), (2, 'goodbye');",
-        )
-        .status()
-        .expect("invoke sqlite3");
-    assert!(seed.success(), "greetings DML fixture seed failed");
+    seed_db(
+        &db,
+        "CREATE TABLE greetings (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
+         INSERT INTO greetings (id, message) VALUES (1, 'hello world'), (2, 'goodbye');",
+    );
 
     let cd = dir.join("dml.cd");
     std::fs::write(&cd, program).expect("write dml.cd");
@@ -5209,20 +5217,13 @@ fn run_greetings_dml(backend: &str, program: &str) -> Vec<String> {
         String::from_utf8_lossy(&out.stderr),
     );
 
-    let q = Command::new("sqlite3")
-        .arg(&db)
-        .arg("SELECT id || '|' || message FROM greetings ORDER BY id")
-        .output()
-        .expect("sqlite3 read-back");
-    assert!(
-        q.status.success(),
-        "sqlite3 read-back failed: {}",
-        String::from_utf8_lossy(&q.stderr)
-    );
-    String::from_utf8_lossy(&q.stdout)
-        .lines()
-        .map(|l| l.to_string())
-        .collect()
+    query_lines(
+        &db,
+        "SELECT id || '|' || message FROM greetings ORDER BY id",
+    )
+    .lines()
+    .map(|l| l.to_string())
+    .collect()
 }
 
 /// `R := R minus (R where id = 1)` inside a transaction emits a surgical
@@ -5483,18 +5484,14 @@ fn run_two_relvar_dml(backend: &str, program: &str) -> Vec<String> {
     )
     .expect("write greetings.cdstore");
     let db = dir.join("greetings.sqlite");
-    let seed = Command::new("sqlite3")
-        .arg(&db)
-        .arg(
-            "CREATE TABLE greetings (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
-             CREATE TABLE stale (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
-             INSERT INTO greetings (id, message) VALUES \
-               (1, 'hello world'), (2, 'goodbye'), (3, 'farewell'), (4, 'so long'); \
-             INSERT INTO stale (id, message) VALUES (2, 'goodbye'), (3, 'farewell');",
-        )
-        .status()
-        .expect("invoke sqlite3");
-    assert!(seed.success(), "two-relvar DML fixture seed failed");
+    seed_db(
+        &db,
+        "CREATE TABLE greetings (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
+         CREATE TABLE stale (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
+         INSERT INTO greetings (id, message) VALUES \
+           (1, 'hello world'), (2, 'goodbye'), (3, 'farewell'), (4, 'so long'); \
+         INSERT INTO stale (id, message) VALUES (2, 'goodbye'), (3, 'farewell');",
+    );
 
     let cd = dir.join("dml.cd");
     std::fs::write(&cd, program).expect("write dml.cd");
@@ -5512,20 +5509,13 @@ fn run_two_relvar_dml(backend: &str, program: &str) -> Vec<String> {
         String::from_utf8_lossy(&out.stderr),
     );
 
-    let q = Command::new("sqlite3")
-        .arg(&db)
-        .arg("SELECT id || '|' || message FROM greetings ORDER BY id")
-        .output()
-        .expect("sqlite3 read-back");
-    assert!(
-        q.status.success(),
-        "sqlite3 read-back failed: {}",
-        String::from_utf8_lossy(&q.stderr)
-    );
-    String::from_utf8_lossy(&q.stdout)
-        .lines()
-        .map(|l| l.to_string())
-        .collect()
+    query_lines(
+        &db,
+        "SELECT id || '|' || message FROM greetings ORDER BY id",
+    )
+    .lines()
+    .map(|l| l.to_string())
+    .collect()
 }
 
 /// `R := R minus S` (two same-heading relvars) emits an anti-join
@@ -5582,17 +5572,13 @@ fn run_union_dml(backend: &str, program: &str) -> Vec<String> {
     )
     .expect("write greetings.cdstore");
     let db = dir.join("greetings.sqlite");
-    let seed = Command::new("sqlite3")
-        .arg(&db)
-        .arg(
-            "CREATE TABLE greetings (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
-             CREATE TABLE new_arrivals (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
-             INSERT INTO greetings (id, message) VALUES (1, 'hello world'), (2, 'goodbye'); \
-             INSERT INTO new_arrivals (id, message) VALUES (2, 'goodbye'), (3, 'farewell');",
-        )
-        .status()
-        .expect("invoke sqlite3");
-    assert!(seed.success(), "union DML fixture seed failed");
+    seed_db(
+        &db,
+        "CREATE TABLE greetings (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
+         CREATE TABLE new_arrivals (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
+         INSERT INTO greetings (id, message) VALUES (1, 'hello world'), (2, 'goodbye'); \
+         INSERT INTO new_arrivals (id, message) VALUES (2, 'goodbye'), (3, 'farewell');",
+    );
 
     let cd = dir.join("dml.cd");
     std::fs::write(&cd, program).expect("write dml.cd");
@@ -5610,16 +5596,13 @@ fn run_union_dml(backend: &str, program: &str) -> Vec<String> {
         String::from_utf8_lossy(&out.stderr),
     );
 
-    let q = Command::new("sqlite3")
-        .arg(&db)
-        .arg("SELECT id || '|' || message FROM greetings ORDER BY id")
-        .output()
-        .expect("sqlite3 read-back");
-    assert!(q.status.success(), "sqlite3 read-back failed");
-    String::from_utf8_lossy(&q.stdout)
-        .lines()
-        .map(|l| l.to_string())
-        .collect()
+    query_lines(
+        &db,
+        "SELECT id || '|' || message FROM greetings ORDER BY id",
+    )
+    .lines()
+    .map(|l| l.to_string())
+    .collect()
 }
 
 /// `R := R union S` emits an idempotent `INSERT … WHERE NOT EXISTS`: the new
@@ -5710,12 +5693,10 @@ fn assert_comparison_pushes(backend: &str, pred: &str, expect_msg: &str, expect_
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
     let db = seed_greetings_fixtures(dir); // companions + (1, 'hello world')
-    let add = Command::new("sqlite3")
-        .arg(&db)
-        .arg("INSERT INTO greetings (id, message) VALUES (2, 'goodbye');")
-        .status()
-        .expect("invoke sqlite3");
-    assert!(add.success(), "add second greetings row");
+    seed_db(
+        &db,
+        "INSERT INTO greetings (id, message) VALUES (2, 'goodbye');",
+    );
 
     let cd = dir.join("cmp.cd");
     std::fs::write(
@@ -5997,15 +5978,10 @@ fn seed_sales_fixtures(dir: &Path) -> PathBuf {
     .expect("write sales.cdstore");
 
     let db = dir.join("sales.sqlite");
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "sqlite3 '{}' \"CREATE TABLE sales (id INTEGER NOT NULL, customer TEXT NOT NULL, item TEXT NOT NULL, unit_cents INTEGER NOT NULL, qty INTEGER NOT NULL, PRIMARY KEY (id)); INSERT INTO sales (id, customer, item, unit_cents, qty) VALUES (1, 'ada', 'widget', 500, 3), (2, 'bo', 'gadget', 800, 2);\"",
-            db.display()
-        ))
-        .status()
-        .expect("invoke sqlite3");
-    assert!(status.success(), "sales fixture seed failed");
+    seed_db(
+        &db,
+        "CREATE TABLE sales (id INTEGER NOT NULL, customer TEXT NOT NULL, item TEXT NOT NULL, unit_cents INTEGER NOT NULL, qty INTEGER NOT NULL, PRIMARY KEY (id)); INSERT INTO sales (id, customer, item, unit_cents, qty) VALUES (1, 'ada', 'widget', 500, 3), (2, 'bo', 'gadget', 800, 2);",
+    );
     db
 }
 
@@ -6709,15 +6685,10 @@ fn seed_grades_fixtures(dir: &Path) -> PathBuf {
     .expect("write grades.cdstore");
 
     let db = dir.join("grades.sqlite");
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "sqlite3 '{}' \"CREATE TABLE grades (id INTEGER NOT NULL, grade INTEGER NOT NULL, PRIMARY KEY (id)); INSERT INTO grades (id, grade) VALUES (1, 97), (2, 98);\"",
-            db.display()
-        ))
-        .status()
-        .expect("invoke sqlite3");
-    assert!(status.success(), "grades fixture seed failed");
+    seed_db(
+        &db,
+        "CREATE TABLE grades (id INTEGER NOT NULL, grade INTEGER NOT NULL, PRIMARY KEY (id)); INSERT INTO grades (id, grade) VALUES (1, 97), (2, 98);",
+    );
     db
 }
 
@@ -6781,15 +6752,10 @@ fn seed_prices_fixtures(dir: &Path) -> PathBuf {
     .expect("write prices.cdstore");
 
     let db = dir.join("prices.sqlite");
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "sqlite3 '{}' \"CREATE TABLE prices (id INTEGER NOT NULL, price REAL NOT NULL, PRIMARY KEY (id)); INSERT INTO prices (id, price) VALUES (1, 1.5), (2, 2.5);\"",
-            db.display()
-        ))
-        .status()
-        .expect("invoke sqlite3");
-    assert!(status.success(), "prices fixture seed failed");
+    seed_db(
+        &db,
+        "CREATE TABLE prices (id INTEGER NOT NULL, price REAL NOT NULL, PRIMARY KEY (id)); INSERT INTO prices (id, price) VALUES (1, 1.5), (2, 2.5);",
+    );
     db
 }
 
@@ -6861,15 +6827,10 @@ fn approximate_null_reads_back_as_nan_and_is_reflexive() {
         )
         .expect("write prices.cdstore");
         let db = tmp.path().join("prices.sqlite");
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "sqlite3 '{}' \"CREATE TABLE prices (id INTEGER NOT NULL, price REAL, PRIMARY KEY (id)); INSERT INTO prices (id, price) VALUES (3, NULL);\"",
-                db.display()
-            ))
-            .status()
-            .expect("invoke sqlite3");
-        assert!(status.success(), "prices NaN fixture seed failed");
+        seed_db(
+            &db,
+            "CREATE TABLE prices (id INTEGER NOT NULL, price REAL, PRIMARY KEY (id)); INSERT INTO prices (id, price) VALUES (3, NULL);",
+        );
 
         let cd = tmp.path().join("anan.cd");
         std::fs::write(
@@ -6915,15 +6876,10 @@ fn seed_rats_fixtures(dir: &Path) -> PathBuf {
     )
     .expect("write rats.cdstore");
     let db = dir.join("rats.sqlite");
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "sqlite3 '{}' \"CREATE TABLE rats (id INTEGER NOT NULL, r TEXT NOT NULL, PRIMARY KEY (id)); INSERT INTO rats (id, r) VALUES (1, '17/5'), (2, '3/2');\"",
-            db.display()
-        ))
-        .status()
-        .expect("invoke sqlite3");
-    assert!(status.success(), "rats fixture seed failed");
+    seed_db(
+        &db,
+        "CREATE TABLE rats (id INTEGER NOT NULL, r TEXT NOT NULL, PRIMARY KEY (id)); INSERT INTO rats (id, r) VALUES (1, '17/5'), (2, '3/2');",
+    );
     db
 }
 
@@ -8069,18 +8025,13 @@ fn seed_tclose_fixtures(dir: &Path) -> PathBuf {
     .expect("write tclose.cdstore");
 
     let db = dir.join("tclose.sqlite");
-    // Pass the SQL as a single sqlite3 argument (no shell), so the quoted
-    // `"from"`/`"to"` identifiers need no extra escaping.
-    let sql = "CREATE TABLE edges (\"from\" INTEGER NOT NULL, \"to\" INTEGER NOT NULL, PRIMARY KEY (\"from\", \"to\")); \
-               CREATE TABLE contains (major INTEGER NOT NULL, minor INTEGER NOT NULL, qty INTEGER NOT NULL, PRIMARY KEY (major, minor)); \
-               INSERT INTO edges (\"from\", \"to\") VALUES (1,2),(2,3),(3,4); \
-               INSERT INTO contains (major, minor, qty) VALUES (1,2,2),(1,3,1),(2,4,32),(3,5,1);";
-    let status = Command::new("sqlite3")
-        .arg(&db)
-        .arg(sql)
-        .status()
-        .expect("invoke sqlite3");
-    assert!(status.success(), "tclose fixture seed failed");
+    seed_db(
+        &db,
+        "CREATE TABLE edges (\"from\" INTEGER NOT NULL, \"to\" INTEGER NOT NULL, PRIMARY KEY (\"from\", \"to\")); \
+         CREATE TABLE contains (major INTEGER NOT NULL, minor INTEGER NOT NULL, qty INTEGER NOT NULL, PRIMARY KEY (major, minor)); \
+         INSERT INTO edges (\"from\", \"to\") VALUES (1,2),(2,3),(3,4); \
+         INSERT INTO contains (major, minor, qty) VALUES (1,2,2),(1,3,1),(2,4,32),(3,5,1);",
+    );
     db
 }
 
@@ -8625,15 +8576,10 @@ fn seed_greetings_multirow(dir: &Path) -> PathBuf {
     )
     .expect("write greetings.cdstore");
     let db = dir.join("greetings.sqlite");
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "sqlite3 '{}' \"CREATE TABLE greetings (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); INSERT INTO greetings (id, message) VALUES (1, 'charlie'), (2, 'alice'), (3, 'bob');\"",
-            db.display()
-        ))
-        .status()
-        .expect("invoke sqlite3");
-    assert!(status.success(), "greetings multirow fixture seed failed");
+    seed_db(
+        &db,
+        "CREATE TABLE greetings (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); INSERT INTO greetings (id, message) VALUES (1, 'charlie'), (2, 'alice'), (3, 'bob');",
+    );
     db
 }
 

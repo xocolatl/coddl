@@ -72,5 +72,17 @@ codegen-units = 1
 panic = "abort"
 strip = "debuginfo"
 
+# Dev/test builds trim debuginfo for build-and-link speed: workspace crates
+# keep line tables (backtraces still resolve to file:line; lldb variable
+# inspection degrades — flip back to `debug = true` locally when digging),
+# and dependencies carry none at all. The `package."*"` override is what
+# shrinks `libcoddl_runtime.a`: it strips the DWARF from the bundled
+# libsqlite3 C objects and the rusqlite stack that every compiled Coddl
+# program's `clang`/`cc` link ingests. `debug-assertions` is a separate key
+# and stays default-on, so the debug runtime's leak oracle is unaffected.
 [profile.dev]
 opt-level = 0
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

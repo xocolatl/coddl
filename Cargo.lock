@@ -219,6 +219,7 @@ dependencies = [
  "coddl-sqlemit",
  "coddl-syntax",
  "coddl-types",
+ "rusqlite",
  "tempfile",
 ]
 

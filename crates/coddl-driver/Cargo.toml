@@ -28,3 +28,6 @@ tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Fixture seeding runs in-process through the same bundled SQLite the
+# runtime links — no `sqlite3` CLI on PATH, no writer/reader version skew.
+rusqlite.workspace = true

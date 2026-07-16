@@ -117,6 +117,33 @@ check-grammar) gates every commit; nothing about validation
 shortcuts it.
 
 
+## Running the suite fast (macOS)
+
+The e2e suite compiles-links-executes a **fresh binary per test cycle**
+(~500 per full run, both backends). Measured cost anatomy (2026-07-16):
+the compiler work is trivial — frontend 0.01s, codegen + `clang`/`cc`
+link 0.07–0.09s — but **macOS assesses every newly created executable
+on its first exec** (Gatekeeper/XProtect via `syspolicyd`), at a
+measured 0.3–2.7s *per fresh binary*, size-independent (a 17 KB C
+binary pays the same), partially serialized system-wide. That
+assessment, not the toolchain, is the suite's wall time: ~3 min at
+~55% CPU without mitigation.
+
+The fix is a one-time, per-machine setting: add the terminal (or IDE)
+that runs the tests to **System Settings → Privacy & Security →
+Developer Tools** ("allow the apps below to run software locally that
+does not meet the system's security policy"). If the pane is missing,
+`sudo spctl developer-mode enable-terminal` surfaces it. Processes
+spawned from an exempted app skip the first-exec assessment.
+
+Repo-side, the suite already avoids the avoidable: fixture databases
+are seeded **in-process** through the same bundled SQLite the runtime
+links (`seed_db`/`query_lines` in the e2e harness — no `sqlite3` CLI on
+PATH, no writer/reader version skew, no subprocess forks), and the
+dev/test profile trims debuginfo (`Cargo.toml` `[profile.dev]`) so the
+runtime staticlib and test binaries build and link lean.
+
+
 ## What this validation *does not* prove
 
 - **Performance equivalence.** Both backends produce the same stdout,
