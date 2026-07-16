@@ -46,6 +46,10 @@ fn parse_database_decl(p: &mut Parser) {
     p.start_node(SyntaxKind::DATABASE_DECL);
     p.bump(); // `database`
 
+    // Reserved-name check under this dialect's own code (PB0012); relvar
+    // *attributes* funnel through the shared `parse_heading`/`parse_param`
+    // and emit the core P0096 instead.
+    p.check_reserved_decl_name("PB0012");
     if !p.eat(SyntaxKind::IDENT) {
         p.error("PB0002", "expected database name");
     }
@@ -101,6 +105,7 @@ pub(crate) fn parse_base_relvar_decl(p: &mut Parser) {
         p.bump(); // `relvar`
     }
 
+    p.check_reserved_decl_name("PB0012");
     if !p.eat(SyntaxKind::IDENT) {
         p.error("PB0006", "expected relvar name");
     }
@@ -138,6 +143,7 @@ pub(crate) fn parse_virtual_relvar_decl(p: &mut Parser) {
         p.bump();
     }
 
+    p.check_reserved_decl_name("PB0012");
     if !p.eat(SyntaxKind::IDENT) {
         p.error("PB0010", "expected relvar name");
     }
@@ -191,6 +197,39 @@ mod tests {
     fn missing_header_diagnoses_pb0001() {
         let out = parse_str("base relvar X {} key { x };");
         assert!(out.diagnostics.iter().any(|d| d.code == "PB0001"));
+    }
+
+    #[test]
+    fn reserved_name_diagnosed_at_cddb_decl_sites() {
+        // The `.cddb` decl sites emit this dialect's own PB0012 for a
+        // reserved database or relvar name.
+        for src in [
+            "database if;",
+            "database d; base relvar true { a: Integer } key { a };",
+            "database d; virtual relvar not = rhs;",
+        ] {
+            let out = parse_str(src);
+            assert!(
+                out.diagnostics.iter().any(|d| d.code == "PB0012"),
+                "src={src}: expected PB0012, got {:?}",
+                out.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_attribute_in_cddb_heading_emits_shared_p0096() {
+        // Relvar *attributes* funnel through the shared `parse_heading` /
+        // `parse_param` machinery, so their reserved-name check is the core
+        // parser's P0096 — even inside a `.cddb` file. Pinned deliberately:
+        // shared machinery, shared code.
+        let out = parse_str("database d; base relvar R { if: Integer } key { if };");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0096"),
+            "diagnostics: {:?}",
+            out.diagnostics
+        );
+        assert!(!out.diagnostics.iter().any(|d| d.code == "PB0012"));
     }
 
     #[test]

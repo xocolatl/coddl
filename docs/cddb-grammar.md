@@ -69,8 +69,13 @@ denotes "all tokens up to the next top-level `;` at bracket-depth
 zero" — the same recovery shape as `<unknown-item>`.
 
 `database`, `base`, `relvar`, `virtual`, `key` are **contextual
-keywords**, recognized only in their respective positions. Coddl has
-no hard-reserved words.
+keywords**, recognized only in their respective positions. The five
+reserved words and the word-operator glyphs (see `grammar.md`
+"Reserved words") are rejected as declared names here too: the
+database and relvar names emit this dialect's **PB0012**; relvar
+*attributes* funnel through the shared heading parser and emit the
+core **P0096**. Both are soft — the name still binds and parsing
+continues.
 
 
 ## Parser diagnostics
@@ -88,3 +93,4 @@ no hard-reserved words.
 | PB0009 | Expected `relvar` after `virtual`                      |
 | PB0010 | Expected relvar name (after `virtual relvar`)          |
 | PB0011 | Expected `=` after virtual relvar name                 |
+| PB0012 | Reserved word used as an identifier (database or relvar name; soft — the name still binds). Relvar attributes emit the shared core's P0096 instead. |

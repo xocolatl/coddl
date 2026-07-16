@@ -29,22 +29,29 @@
 use crate::ast::{BinaryOp, UnaryOp};
 use crate::syntax_kind::SyntaxKind;
 
-/// The five irreducibly claimed words — Tier 1 of the grammar.md taxonomy.
+/// The five reserved words — Tier 1 of the grammar.md taxonomy.
 ///
 /// Each is claimed at an expression head with no delimiter to narrow on
 /// (`true`/`false` are the bare word; `if`/`not`/`extract` are followed by
-/// an arbitrary expression), so no lookahead can free them. A user binding
-/// under one of these names is unreachable or misparses at every bare
-/// reference. Declaring them is accepted without diagnostic today; the
-/// declaration-time reservation diagnostic (P0096) is planned — see
-/// `.local/active/reserved-words.md`.
+/// an arbitrary expression), so no lookahead can free them, and a binding
+/// under one of these names would be unreachable or misparse at every bare
+/// reference. Declaring one is therefore rejected at the declaration site
+/// (P0096; PB0012 from the `.cddb` parser) via [`is_reserved`] — softly:
+/// the diagnostic is emitted, the name still binds, parsing continues.
 pub const RESERVED: &[&str] = &["true", "false", "if", "not", "extract"];
 
 /// The word-operator glyphs, which lex as `IDENT` with the glyph text
-/// (`lex_word_glyph`) and are therefore declarable exactly like [`RESERVED`]
-/// words. Every glyph here is an operator spelling in [`INFIX_OPS`] /
-/// [`UNARY_OPS`] (asserted by test).
+/// (`lex_word_glyph`) and would therefore be declarable exactly like
+/// [`RESERVED`] words — so [`is_reserved`] rejects them at declaration
+/// sites the same way. Every glyph here is an operator spelling in
+/// [`INFIX_OPS`] / [`UNARY_OPS`] (asserted by test).
 pub const RESERVED_GLYPHS: &[&str] = &["¬", "⋈", "∪", "∩", "∖", "⋉", "▷"];
+
+/// Whether `text` is a reserved word or a reserved word-operator glyph —
+/// the declaration-name check's predicate (`Parser::check_decl_name`).
+pub fn is_reserved(text: &str) -> bool {
+    RESERVED.contains(&text) || RESERVED_GLYPHS.contains(&text)
+}
 
 /// One textual infix operator: its keyword, optional glyph synonym,
 /// binding power, and AST operator. The parser's `peek_infix_prec` and the

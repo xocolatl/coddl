@@ -100,7 +100,7 @@ User code is not *required* to follow PascalCase for types and relvars — that'
 
 At the lexer level there is no `KEYWORD` token type — every alphanumeric/underscore/`#` token is an `IDENT` — and the parser recognizes specific identifiers as keywords in specific syntactic positions. That much is unchanged. The honest statement of what it buys is a **taxonomy**, published in full below (the tables render `crates/coddl-syntax/src/keywords.rs`, the single source of truth both the parser's operator table and the AST's operator resolution consume; mechanical doc↔source sync is planned):
 
-- **Tier 1 — reserved in effect (five words + the operator glyphs).** `true`, `false`, `if`, `not`, `extract` are claimed at an expression head with nothing to narrow on: `true`/`false` are the bare word, and `if`/`not`/`extract` are followed by an arbitrary expression, so no lookahead can ever free them. A binding declared under one of these names is accepted **without diagnostic today** — and is then silently unreachable (`let true = 1; let x = true;` binds `x` to the Boolean literal) or misparses at every bare reference (`let if = 2;` makes each `if` an if-expression). There is no quoting escape hatch (no Coddl analogue of SQL's `"order"`). The declaration-time reservation diagnostic (P0096, planned) makes this honest; the fix is tracked in `.local/active/reserved-words.md`. The seven word-operator glyphs (`¬ ⋈ ∪ ∩ ∖ ⋉ ▷`) lex as `IDENT` and are declarable the same way, with the same trap.
+- **Tier 1 — reserved (five words + the operator glyphs).** `true`, `false`, `if`, `not`, `extract` are claimed at an expression head with nothing to narrow on: `true`/`false` are the bare word, and `if`/`not`/`extract` are followed by an arbitrary expression, so no lookahead can ever free them — a binding under one of these names would be silently unreachable (`let true = 1; let x = true;` binds `x` to the Boolean literal) or misparse at every bare reference, and there is no quoting escape hatch (no Coddl analogue of SQL's `"order"`). So a declaration naming one is **rejected at the declaration site with P0096** — softly, on the E0007 model: the diagnostic is emitted, the name still binds, and parsing continues (LSP discipline; the trap is loud, not fatal). The check fires at every `.cd` name-declaring position — bindings, params and every heading attribute, oper/type/relvar names, loop and `load` binders, module-path segments, the file header, `database` bindings — and at every attribute-*creating* position: tuple/relation literal fields, `extend`/`replace`/`rename` new names, `wrap`/`group` new names. Reference positions (call-argument names, `update` clauses, `project` lists, dot access) are deliberately unchecked: a reference either resolves against an already-checked declaration or fails in the typechecker. The seven word-operator glyphs (`¬ ⋈ ∪ ∩ ∖ ⋉ ▷`) lex as `IDENT` and are rejected the same way. The `.cddb` parser's own decl sites (database and relvar names) emit its namespace sibling **PB0012**; `.cddb` relvar *attributes* funnel through the shared heading parser and emit P0096.
 - **Tier 2 — positional claims with known traps (narrowing planned).** `Relation` / `Sequence` / `transaction` are claimed unconditionally at an expression head, so a bare reference to a same-named binding errs at the *use site* (P0031/P0055/P0019); the eleven statement heads are claimed unconditionally at a statement boundary, so assigning to a same-named variable misparses (`delete := 2;` dispatches into the DELETE statement). Each needs only one token of lookahead to free the bare word (the word's delimiter; next-token-isn't-`:=` for statement heads) — the narrowing pattern already proven in-tree by `asc`/`desc` (recognized only when followed by another IDENT) and `builtin` (two-token `builtin relvar` vs `builtin oper`).
 - **Tier 3 — vacuous claims (genuinely free).** Everything else is recognized in a position where a bare identifier is never a legal continuation — infix/postfix operator position, clause position after an introducing construct, item-head position, type position — so the claim shadows nothing. These are the words that keep the identifier space unfettered for real domains (`name`, `type`, `from`, `to`, `order`, `value`, `key`, `and` as attribute names all work).
 - **Tier 4 — not keywords at all.** `reltrue` / `relfalse` are **not** parser-recognized: they are module-level `let`s in `coddl::core` (always in scope, resolved *after* everything else, deliberately user-shadowable — tests pin it). This is the model: vocabulary lives in the registry/stdlib and stays shadowable; the parser claims a word only when its *grammar* is special. The reserved set grows with syntax, never with library.
@@ -109,13 +109,13 @@ At the lexer level there is no `KEYWORD` token type — every alphanumeric/under
 
 | Word | Glyph | Position | Notes |
 |---|---|---|---|
-| `true` | — | expression head (Boolean literal) | bare-word claim; a same-named binding is silently never referenced |
+| `true` | — | expression head (Boolean literal) | bare-word claim; a same-named binding could never be referenced — declaring one is P0096 |
 | `false` | — | expression head (Boolean literal) | same |
-| `if` | — | expression head (`if … then … else`) | followed by an arbitrary expression — unnarrowable |
-| `not` | `¬` | prefix operator; first token of `not matching` | unnarrowable |
-| `extract` | — | prefix operator (relation → tuple) | unnarrowable |
+| `if` | — | expression head (`if … then … else`) | followed by an arbitrary expression — unnarrowable; P0096 at declaration |
+| `not` | `¬` | prefix operator; first token of `not matching` | unnarrowable; P0096 at declaration |
+| `extract` | — | prefix operator (relation → tuple) | unnarrowable; P0096 at declaration |
 
-The glyphs `⋈ ∪ ∩ ∖ ⋉ ▷` (operator rows below) and `¬` belong to this tier as declarables: they lex as `IDENT` with the glyph text. The symbolic glyphs `≤ ≥ ≠ ⊂ ⊃ ⊆ ⊇` lex as operator *tokens*, never as identifiers — no declaration-site exposure.
+The glyphs `⋈ ∪ ∩ ∖ ⋉ ▷` (operator rows below) and `¬` belong to this tier: they lex as `IDENT` with the glyph text, so declaring one is rejected exactly like the five words. The symbolic glyphs `≤ ≥ ≠ ⊂ ⊃ ⊆ ⊇` lex as operator *tokens*, never as identifiers — no declaration-site exposure.
 
 ### Tier 2 — claimed unconditionally today, lookahead narrowing planned
 
@@ -1097,8 +1097,9 @@ function that implements it.
 `program`, `oper`, `let`, and `transaction` are **contextual
 keywords** — the parser identifies them by lexeme at specific
 syntactic positions; outside those positions they are regular
-identifiers. Coddl has no hard-reserved words — see the "Reserved
-words: none" section above.
+identifiers. Only the five Tier-1 words (and the word-operator
+glyphs) are reserved outright, rejected at declaration sites with
+P0096 — see the "Reserved words" section above.
 
 ### Deliberately not yet in the grammar
 
@@ -1226,6 +1227,7 @@ enforces that.
 | P0093 | Expected `{` to start ungroup list                       |
 | P0094 | Expected attribute name in ungroup list                  |
 | P0095 | Expected `}` to close ungroup list                       |
+| P0096 | Reserved word used as an identifier — a declaration names one of the five reserved words or a word-operator glyph (soft: the diagnostic is emitted, the name still binds, parsing continues) |
 
 Note: missing-type-after-`:` (let annotation), missing-type-after-`->`
 (operator return clause), and missing-element-after-`Sequence` all

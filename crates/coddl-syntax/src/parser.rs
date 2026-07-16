@@ -237,6 +237,31 @@ impl<'a> Parser<'a> {
             .push(Diagnostic::error(self.current_span(), code, message));
     }
 
+    /// Declaration-name reservation check: diagnose when the cursor sits on
+    /// an IDENT whose text is a reserved word or word-operator glyph
+    /// (`keywords::is_reserved`). Called immediately **before** a
+    /// declaration site's `eat(IDENT)`, while the cursor is still on the
+    /// name, so the diagnostic's span points at it. Soft, on the E0007
+    /// model: the caller's eat proceeds, the name still binds, and parsing
+    /// continues. Self-guarding — `current_ident_text()` is `None` off an
+    /// IDENT, so a missing name stays the site's own diagnostic. The code
+    /// is a parameter so the `.cddb` parser can emit its namespace's
+    /// sibling (PB0012) for the decl sites it owns.
+    pub(crate) fn check_reserved_decl_name(&mut self, code: &'static str) {
+        if let Some(text) = self.current_ident_text() {
+            if crate::keywords::is_reserved(text) {
+                let message =
+                    format!("`{text}` is a reserved word and cannot be used as an identifier");
+                self.error(code, message);
+            }
+        }
+    }
+
+    /// [`Self::check_reserved_decl_name`] with the `.cd` parser's code.
+    pub(crate) fn check_decl_name(&mut self) {
+        self.check_reserved_decl_name("P0096");
+    }
+
     pub(crate) fn finish(self) -> ParseOutput {
         ParseOutput {
             tree: self.builder.finish(),
@@ -369,6 +394,7 @@ impl<'a> Parser<'a> {
         self.start_node(SyntaxKind::DATABASE_BINDING);
         self.bump(); // `database`
 
+        self.check_decl_name();
         if !self.eat(SyntaxKind::IDENT) {
             self.error("P0020", "expected database name");
         }
@@ -395,6 +421,7 @@ impl<'a> Parser<'a> {
         self.start_node(SyntaxKind::PROGRAM_DECL);
         self.bump(); // "program" | "library" | "module"
 
+        self.check_decl_name();
         if !self.eat(SyntaxKind::IDENT) {
             self.error(
                 "P0002",
@@ -423,6 +450,7 @@ impl<'a> Parser<'a> {
         self.start_node(SyntaxKind::TYPE_DECL);
         self.bump(); // "type"
 
+        self.check_decl_name();
         if !self.eat(SyntaxKind::IDENT) {
             self.error("P0080", "expected type name after `type`");
         }
@@ -474,11 +502,15 @@ impl<'a> Parser<'a> {
     /// `::`) is P0084.
     fn parse_module_path(&mut self) {
         self.start_node(SyntaxKind::MODULE_PATH);
+        self.check_decl_name();
         if !self.eat(SyntaxKind::IDENT) {
             self.error("P0084", "expected module name");
         }
+        // Inside the loop, every path segment is name-checked, so a
+        // reserved segment anywhere in the path diagnoses.
         while self.at(SyntaxKind::COLON_COLON) {
             self.bump(); // "::"
+            self.check_decl_name();
             if !self.eat(SyntaxKind::IDENT) {
                 self.error("P0084", "expected module name after `::`");
             }
@@ -511,6 +543,7 @@ impl<'a> Parser<'a> {
             self.bump(); // "oper"
         }
 
+        self.check_decl_name();
         if !self.eat(SyntaxKind::IDENT) {
             self.error("P0004", "expected operator name");
         }
@@ -586,6 +619,10 @@ impl<'a> Parser<'a> {
         self.bump_trivia();
         self.start_node(SyntaxKind::PARAM);
 
+        // Every heading funnels here (oper params, relvar attributes,
+        // possrep components, Tuple/Relation generator headings — .cddb
+        // relvar attributes included), so this one check covers them all.
+        self.check_decl_name();
         if !self.eat(SyntaxKind::IDENT) {
             self.error("P0009", "expected parameter name");
         }
@@ -699,6 +736,7 @@ impl<'a> Parser<'a> {
         self.bump(); // `let`
 
         self.bump_trivia();
+        self.check_decl_name();
         if !self.eat(SyntaxKind::IDENT) {
             self.error("P0018", "expected binding name in `let`");
         }
@@ -742,6 +780,7 @@ impl<'a> Parser<'a> {
         self.bump(); // `var`
 
         self.bump_trivia();
+        self.check_decl_name();
         if !self.eat(SyntaxKind::IDENT) {
             self.error("P0018", "expected binding name in `var`");
         }
@@ -790,6 +829,7 @@ impl<'a> Parser<'a> {
         self.start_node(SyntaxKind::FOR_STMT);
         self.bump(); // `for`
 
+        self.check_decl_name();
         if !self.eat(SyntaxKind::IDENT) {
             self.error("P0062", "expected a loop variable name after `for`");
             self.finish_node();
@@ -911,6 +951,7 @@ impl<'a> Parser<'a> {
         self.bump(); // `load`
 
         self.bump_trivia();
+        self.check_decl_name();
         if !self.eat(SyntaxKind::IDENT) {
             self.error("P0073", "expected a target name after `load`");
         }
@@ -1094,9 +1135,10 @@ impl<'a> Parser<'a> {
             self.error("P0014", "expected relvar name after `update`");
         }
 
-        // The `{ c: e, … }` clause.
+        // The `{ c: e, … }` clause — names *reference* existing attributes
+        // (no reserved-name check; the decl sites already reject them).
         if self.at(SyntaxKind::L_BRACE) {
-            self.parse_arg_list(false);
+            self.parse_arg_list(false, false);
         } else {
             self.error("P0054", "expected `{ … }` clause after the `update` target");
         }
@@ -1244,7 +1286,9 @@ impl<'a> Parser<'a> {
             match self.current() {
                 SyntaxKind::L_BRACE if allow_brace_call => {
                     self.start_node_at(cp, SyntaxKind::CALL_EXPR);
-                    self.parse_arg_list(true); // operator calls allow field-init shorthand
+                    // Argument names *reference* the callee's params (no
+                    // reserved-name check; param decls already reject them).
+                    self.parse_arg_list(true, false); // calls allow field-init shorthand
                     self.finish_node();
                 }
                 SyntaxKind::DOT => {
@@ -1511,7 +1555,9 @@ impl<'a> Parser<'a> {
         }
 
         loop {
-            self.parse_named_arg(true);
+            // Literal fields *declare* the tuple's heading — reserved names
+            // are rejected like any attribute declaration.
+            self.parse_named_arg(true, true);
             if !self.eat(SyntaxKind::COMMA) {
                 break;
             }
@@ -1731,8 +1777,11 @@ impl<'a> Parser<'a> {
     }
 
     /// `{ <named_arg>, … }` — the call-site argument list. Empty and
-    /// trailing-comma forms are both accepted.
-    fn parse_arg_list(&mut self, allow_shorthand: bool) {
+    /// trailing-comma forms are both accepted. `check_decl` marks the
+    /// callers whose names *declare* attributes (`extend`/`replace`/`rename`
+    /// new names) rather than referencing existing ones (call arguments,
+    /// `update` clauses) — see `parse_named_arg`.
+    fn parse_arg_list(&mut self, allow_shorthand: bool, check_decl: bool) {
         debug_assert!(self.at(SyntaxKind::L_BRACE));
         self.start_node(SyntaxKind::ARG_LIST);
         self.bump(); // {
@@ -1743,7 +1792,7 @@ impl<'a> Parser<'a> {
         }
 
         loop {
-            self.parse_named_arg(allow_shorthand);
+            self.parse_named_arg(allow_shorthand, check_decl);
             if !self.eat(SyntaxKind::COMMA) {
                 break;
             }
@@ -1767,10 +1816,20 @@ impl<'a> Parser<'a> {
     /// byte-lossless. `allow_shorthand` is `false` in replace position, where
     /// the colon stays required (a shorthand `replace { x }` would bind the new
     /// attribute `x` to itself — the no-op identity `x -> x`).
-    fn parse_named_arg(&mut self, allow_shorthand: bool) {
+    ///
+    /// `check_decl` runs the reserved-name check (P0096) on the name: set by
+    /// the callers whose names **declare** an attribute — tuple/relation
+    /// literal fields and `extend`/`replace`/`rename` new names — and unset
+    /// where the name **references** an existing parameter or attribute
+    /// (operator call arguments, the `update` clause), which either resolves
+    /// against an already-checked declaration or fails in the typechecker.
+    fn parse_named_arg(&mut self, allow_shorthand: bool, check_decl: bool) {
         self.bump_trivia();
         self.start_node(SyntaxKind::NAMED_ARG);
         let cp = self.checkpoint();
+        if check_decl {
+            self.check_decl_name();
+        }
         let has_name = self.eat(SyntaxKind::IDENT);
         if !has_name {
             self.error("P0016", "expected argument name");
@@ -1843,6 +1902,7 @@ impl<'a> Parser<'a> {
             self.bump(); // `relvar`
         }
 
+        self.check_decl_name();
         if !self.eat(SyntaxKind::IDENT) {
             self.error("P0026", "expected relvar name");
         }
@@ -1932,7 +1992,8 @@ impl<'a> Parser<'a> {
         self.bump_trivia();
         self.bump(); // `replace`
         if self.at(SyntaxKind::L_BRACE) {
-            self.parse_arg_list(false); // replace keeps the colon required (no shorthand)
+            // New-attribute names: reserved names rejected (check_decl).
+            self.parse_arg_list(false, true); // replace keeps the colon required (no shorthand)
         } else {
             self.error("P0040", "expected `{` to start replace list");
         }
@@ -1954,7 +2015,8 @@ impl<'a> Parser<'a> {
         self.bump_trivia();
         self.bump(); // `rename`
         if self.at(SyntaxKind::L_BRACE) {
-            self.parse_arg_list(false); // rename keeps the colon required (no shorthand)
+            // New-attribute names: reserved names rejected (check_decl).
+            self.parse_arg_list(false, true); // rename keeps the colon required (no shorthand)
         } else {
             self.error("P0034", "expected `{` to start rename list");
         }
@@ -1984,6 +2046,7 @@ impl<'a> Parser<'a> {
         loop {
             self.bump_trivia();
             self.start_node(SyntaxKind::WRAP_PAIR);
+            self.check_decl_name();
             if !self.eat(SyntaxKind::IDENT) {
                 self.error("P0045", "expected new attribute name in wrap");
             }
@@ -2054,6 +2117,7 @@ impl<'a> Parser<'a> {
         loop {
             self.bump_trivia();
             self.start_node(SyntaxKind::GROUP_PAIR);
+            self.check_decl_name();
             if !self.eat(SyntaxKind::IDENT) {
                 self.error("P0087", "expected new attribute name in group");
             }
@@ -2112,7 +2176,8 @@ impl<'a> Parser<'a> {
         self.bump_trivia();
         self.bump(); // `extend`
         if self.at(SyntaxKind::L_BRACE) {
-            self.parse_arg_list(false); // colon required (no shorthand)
+            // New-attribute names: reserved names rejected (check_decl).
+            self.parse_arg_list(false, true); // colon required (no shorthand)
         } else {
             self.error("P0043", "expected `{` to start extend list");
         }
@@ -2323,6 +2388,85 @@ mod tests {
                 .and_then(<crate::ast::BinaryExpr as crate::ast::AstNode>::cast)
                 .unwrap_or_else(|| panic!("src={src}: expected a BINARY_EXPR"));
             assert_eq!(bin.op_kind(), Some(op), "src={src}");
+        }
+    }
+
+    #[test]
+    fn reserved_name_diagnosed_at_every_decl_site() {
+        // P0096 fires wherever a reserved word (or word-operator glyph)
+        // would *declare* a name — one case per declaration-site kind.
+        let cases: &[&str] = &[
+            // file header / database / type / module path (both segments)
+            "program not;",
+            "program p; database extract;",
+            "program p; type false = Integer;",
+            "program p; use module if::core;",
+            "program p; use module coddl::if;",
+            // oper name / param / relvar attribute (the heading funnel) /
+            // relvar name
+            "program p; oper extract {} [ ];",
+            "program p; oper f { if: Integer } [ ];",
+            "program p; public relvar R { not: Integer } key { not };",
+            "program p; public relvar if { a: Integer } key { a };",
+            // statement binders
+            "program p; oper main {} [ let true = 1; ];",
+            "program p; oper main {} [ var false := 1; ];",
+            "program p; oper main {} [ for if := 0 to 2 do [ 1; ]; ];",
+            "program p; oper main {} [ load if from r; ];",
+            // a word-operator glyph is declarable-shaped and equally reserved
+            "program p; oper main {} [ let ⋈ = 1; ];",
+            // attribute creators: literal fields, extend/replace/rename new
+            // names, wrap/group new names
+            "program p; oper main {} [ let t = { if: 1 }; ];",
+            "program p; oper main {} [ let x = r extend { true: 1 }; ];",
+            "program p; oper main {} [ let x = r replace { false: a + 1 }; ];",
+            "program p; oper main {} [ let x = r rename { extract: a }; ];",
+            "program p; oper main {} [ let x = r wrap { if: { a } }; ];",
+            "program p; oper main {} [ let x = r group { not: { a } }; ];",
+        ];
+        for src in cases {
+            let out = parse_str(src);
+            assert!(
+                out.diagnostics.iter().any(|d| d.code == "P0096"),
+                "src={src}: expected P0096, got {:?}",
+                out.diagnostics
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_name_check_is_soft_and_parsing_continues() {
+        // The E0007 model: the diagnostic is emitted, the name still binds
+        // (its LET_STMT is built), and the rest of the block parses.
+        let out = parse_str("program p; oper main {} [ let if = 2; let y = 3; ];");
+        assert!(out.diagnostics.iter().any(|d| d.code == "P0096"));
+        let lets = out
+            .tree
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::LET_STMT)
+            .count();
+        assert_eq!(lets, 2, "both bindings still parse");
+    }
+
+    #[test]
+    fn reserved_name_check_skips_reference_positions() {
+        // Call-argument names reference the callee's params and `update`
+        // clause names reference existing attributes — neither declares, so
+        // neither is checked (the decl sites already reject reserved names;
+        // an unresolvable reference is the typechecker's to report).
+        for src in [
+            "program p; oper main {} [ f { if: 1 }; ];",
+            "program p; oper main {} [ update R { if: 1 }; ];",
+            // Brace-list and dot references to attributes are likewise free.
+            "program p; oper main {} [ let x = r project { if }; ];",
+            "program p; oper main {} [ let x = t.if; ];",
+        ] {
+            let out = parse_str(src);
+            assert!(
+                !out.diagnostics.iter().any(|d| d.code == "P0096"),
+                "src={src}: reference position must not fire P0096, got {:?}",
+                out.diagnostics
+            );
         }
     }
 
