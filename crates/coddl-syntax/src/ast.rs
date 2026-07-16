@@ -681,7 +681,7 @@ impl SortItem {
             .filter_map(|el| el.into_token())
             .filter(|t| t.kind() == SyntaxKind::IDENT)
             .collect();
-        idents.len() >= 2 && idents[0].text() == "desc"
+        idents.len() >= 2 && idents[0].text() == crate::keywords::DESC
     }
 }
 
@@ -1020,11 +1020,7 @@ impl BoolLit {
             .children_with_tokens()
             .filter_map(|el| el.into_token())
             .find(|t| t.kind() == SyntaxKind::IDENT)?;
-        match tok.text() {
-            "true" => Some(true),
-            "false" => Some(false),
-            _ => None,
-        }
+        crate::keywords::bool_word(tok.text())
     }
 }
 
@@ -1126,36 +1122,15 @@ impl BinaryExpr {
                     | SyntaxKind::STAR
                     | SyntaxKind::SLASH
                     | SyntaxKind::PIPE_PIPE => return Some(tok),
-                    SyntaxKind::IDENT
-                        if matches!(
-                            tok.text(),
-                            "and"
-                                | "or"
-                                | "where"
-                                | "join"
-                                | "times"
-                                | "compose"
-                                | "intersect"
-                                | "union"
-                                | "minus"
-                                | "matching"
-                                | "when"
-                                | "otherwise"
-                                | "div"
-                                // Unicode glyph synonyms (lexed as IDENT).
-                                | "⋈"
-                                | "∪"
-                                | "∩"
-                                | "∖"
-                                | "⋉"
-                                | "▷"
-                        ) =>
-                    {
-                        // `not` is deliberately *not* recognized here: for the
-                        // two-word `not matching`, the loop skips the leading
-                        // `not` IDENT and returns the `matching` token;
-                        // `op_kind` then spots the sibling `not` to pick
-                        // `NotMatching`. The `▷` glyph is a one-token synonym.
+                    // Keyword and glyph operators resolve through the shared
+                    // `keywords::INFIX_OPS` table — the same table the
+                    // parser's `peek_infix_prec` uses, so the two sites
+                    // cannot drift. `not` is deliberately absent from the
+                    // table: for the two-word `not matching`, the loop skips
+                    // the leading `not` IDENT and returns the `matching`
+                    // token; `op_kind` then spots the sibling `not` to pick
+                    // `NotMatching`. The `▷` glyph is a one-token synonym.
+                    SyntaxKind::IDENT if crate::keywords::infix(tok.text()).is_some() => {
                         return Some(tok);
                     }
                     _ => {}
@@ -1181,26 +1156,13 @@ impl BinaryExpr {
             SyntaxKind::STAR => BinaryOp::Mul,
             SyntaxKind::SLASH => BinaryOp::Div,
             SyntaxKind::PIPE_PIPE => BinaryOp::Concat,
-            SyntaxKind::IDENT => match tok.text() {
-                "and" => BinaryOp::And,
-                "or" => BinaryOp::Or,
-                "where" => BinaryOp::Where,
-                "join" | "⋈" => BinaryOp::Join,
-                "times" => BinaryOp::Times,
-                "compose" => BinaryOp::Compose,
-                "intersect" | "∩" => BinaryOp::Intersect,
-                "union" | "∪" => BinaryOp::Union,
-                "minus" | "∖" => BinaryOp::Minus,
+            SyntaxKind::IDENT => match crate::keywords::infix(tok.text())?.op {
                 // `matching` (and its `⋉` glyph) is the semijoin; the two-word
                 // `not matching` prefixes a sibling `not` IDENT, which promotes
-                // it to the antijoin. `▷` is the one-token antijoin glyph.
-                "matching" | "⋉" if self.has_not_prefix() => BinaryOp::NotMatching,
-                "matching" | "⋉" => BinaryOp::Matching,
-                "▷" => BinaryOp::NotMatching,
-                "when" => BinaryOp::When,
-                "otherwise" => BinaryOp::Otherwise,
-                "div" => BinaryOp::IntDiv,
-                _ => return None,
+                // it to the antijoin. (`▷`, the one-token antijoin glyph, maps
+                // to `NotMatching` directly from its table entry.)
+                BinaryOp::Matching if self.has_not_prefix() => BinaryOp::NotMatching,
+                op => op,
             },
             _ => return None,
         })
@@ -1243,8 +1205,7 @@ impl UnaryExpr {
     pub fn op_token(&self) -> Option<SyntaxToken> {
         for el in self.syntax.children_with_tokens() {
             if let Some(tok) = el.into_token() {
-                if tok.kind() == SyntaxKind::IDENT && matches!(tok.text(), "extract" | "not" | "¬")
-                {
+                if tok.kind() == SyntaxKind::IDENT && crate::keywords::unary(tok.text()).is_some() {
                     return Some(tok);
                 }
             }
@@ -1256,11 +1217,7 @@ impl UnaryExpr {
     /// parse-recovery edge case (no recognized prefix token).
     pub fn op_kind(&self) -> Option<UnaryOp> {
         let tok = self.op_token()?;
-        Some(match tok.text() {
-            "extract" => UnaryOp::Extract,
-            "not" | "¬" => UnaryOp::Not,
-            _ => return None,
-        })
+        crate::keywords::unary(tok.text())
     }
 }
 
@@ -1281,7 +1238,7 @@ impl ProjectExpr {
             .children_with_tokens()
             .filter_map(|el| el.into_token())
             .take_while(|t| t.kind() != SyntaxKind::L_BRACE)
-            .any(|t| t.kind() == SyntaxKind::IDENT && t.text() == "all")
+            .any(|t| t.kind() == SyntaxKind::IDENT && t.text() == crate::keywords::ALL)
     }
 
     /// The attribute names listed in the braces, in source order. These are

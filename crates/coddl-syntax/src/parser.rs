@@ -120,15 +120,23 @@ impl<'a> Parser<'a> {
     /// is `lexeme`. Used for contextual keyword recognition (Coddl has
     /// no reserved words; every keyword is contextual).
     pub(crate) fn at_keyword(&self, lexeme: &str) -> bool {
+        self.current_ident_text() == Some(lexeme)
+    }
+
+    /// The lexeme of the next non-trivia token when it is an identifier,
+    /// else `None`. The table-lookup sibling of [`at_keyword`]: where a
+    /// site resolves the current word against a `keywords` table (the
+    /// infix-operator lookup) rather than testing one candidate lexeme.
+    pub(crate) fn current_ident_text(&self) -> Option<&str> {
         if !self.at(SyntaxKind::IDENT) {
-            return false;
+            return None;
         }
         let mut i = self.pos;
         while i < self.tokens.len() && self.tokens[i].kind.is_trivia() {
             i += 1;
         }
         let span = self.tokens[i].span;
-        &self.source[span.start as usize..span.end as usize] == lexeme
+        Some(&self.source[span.start as usize..span.end as usize])
     }
 
     /// Peek the kind of the `n`-th non-trivia token from the cursor
@@ -952,7 +960,7 @@ impl<'a> Parser<'a> {
     fn parse_sort_item(&mut self) {
         self.bump_trivia();
         self.start_node(SyntaxKind::SORT_ITEM);
-        if (self.at_keyword("asc") || self.at_keyword("desc"))
+        if (self.at_keyword(crate::keywords::ASC) || self.at_keyword(crate::keywords::DESC))
             && self.nth_kind(1) == SyntaxKind::IDENT
         {
             self.bump(); // direction keyword
@@ -1363,15 +1371,16 @@ impl<'a> Parser<'a> {
     /// Peek the next infix operator's precedence. Returns `None` if
     /// the cursor isn't on a recognized infix operator. Operators
     /// recognized by token kind: `*`, `/` (5); `+`, `-`, `||` (4);
-    /// `=`, `<>`, `<`, `>`, `<=`, `>=` (all at prec 3). Operators
-    /// recognized by contextual-keyword IDENT: `and` (2), `or` (1),
-    /// `where` (0) (and the relational ops, also at 0).
+    /// `=`, `<>`, `<`, `>`, `<=`, `>=` (all at prec 3). Textual operators
+    /// (keyword or glyph IDENT — a glyph lexes as an IDENT whose text is
+    /// the glyph) resolve through the shared [`keywords::INFIX_OPS`]
+    /// table, the same table the AST view's `op_token`/`op_kind` use, so
+    /// the parser and the AST cannot disagree on the operator inventory.
     fn peek_infix_prec(&self) -> Option<u8> {
         match self.current() {
-            // Multiplicative — binds tightest among infix ops. `div` (truncating
-            // integer division) is a textual infix keyword at this level.
+            // Multiplicative — binds tightest among infix ops (`div` rides
+            // the keyword table at this level).
             SyntaxKind::STAR | SyntaxKind::SLASH => Some(5),
-            SyntaxKind::IDENT if self.at_keyword("div") => Some(5),
             // Additive, plus text/character concatenation (`||`). Disjoint
             // operand types, so `||`'s rank among level-4 ops is immaterial.
             SyntaxKind::PLUS | SyntaxKind::MINUS | SyntaxKind::PIPE_PIPE => Some(4),
@@ -1381,33 +1390,14 @@ impl<'a> Parser<'a> {
             | SyntaxKind::GT
             | SyntaxKind::LT_EQ
             | SyntaxKind::GT_EQ => Some(3),
-            SyntaxKind::IDENT if self.at_keyword("and") => Some(2),
-            SyntaxKind::IDENT if self.at_keyword("or") => Some(1),
-            SyntaxKind::IDENT if self.at_keyword("where") => Some(0),
-            // Relational ops (prec 0). Each with a Unicode glyph synonym —
-            // lexed as an IDENT whose text is the glyph, matched by
-            // `at_keyword` directly (a raw source-text compare), the same way
-            // `not`/`¬` is recognized. `times`/`compose` have no glyph.
-            SyntaxKind::IDENT if self.at_keyword("join") || self.at_keyword("⋈") => Some(0),
-            SyntaxKind::IDENT if self.at_keyword("times") => Some(0),
-            SyntaxKind::IDENT if self.at_keyword("compose") => Some(0),
-            SyntaxKind::IDENT if self.at_keyword("intersect") || self.at_keyword("∩") => Some(0),
-            SyntaxKind::IDENT if self.at_keyword("union") || self.at_keyword("∪") => Some(0),
-            SyntaxKind::IDENT if self.at_keyword("minus") || self.at_keyword("∖") => Some(0),
-            // Semijoin `matching`/`⋉` and antijoin `▷` are single-token infix
-            // ops; the two-word `not matching` is recognized by a two-token
-            // peek (`not` then `matching`) and bumps both tokens in the loop.
-            SyntaxKind::IDENT if self.at_keyword("matching") || self.at_keyword("⋉") => Some(0),
-            SyntaxKind::IDENT if self.at_keyword("▷") => Some(0),
+            // The two-word `not matching` antijoin is the one operator the
+            // table can't see from a single token: recognized by a two-token
+            // peek (`not` then `matching`), both bumped in the loop. Its
+            // one-token glyph `▷` resolves through the table like the rest.
             SyntaxKind::IDENT if self.at_keyword("not") && self.nth_at_keyword(1, "matching") => {
                 Some(0)
             }
-            // Relational-control ops (prec 0): `when` gates a whole relation by
-            // an enclosing-scope Boolean; `otherwise` is the relational
-            // COALESCE. Same altitude as `where`, so a pipeline reads top to
-            // bottom and `A when c otherwise D` nests left.
-            SyntaxKind::IDENT if self.at_keyword("when") => Some(0),
-            SyntaxKind::IDENT if self.at_keyword("otherwise") => Some(0),
+            SyntaxKind::IDENT => crate::keywords::infix(self.current_ident_text()?).map(|e| e.prec),
             _ => None,
         }
     }
@@ -1911,9 +1901,9 @@ impl<'a> Parser<'a> {
                      // (keep the complement). `all`/`but` are contextual keywords: in this
                      // position before the `{` they're the operator; inside the braces, or
                      // anywhere else, they remain ordinary identifiers.
-        if self.at_keyword("all") {
+        if self.at_keyword(crate::keywords::ALL) {
             self.bump(); // `all`
-            if self.at_keyword("but") {
+            if self.at_keyword(crate::keywords::BUT) {
                 self.bump(); // `but`
             } else {
                 self.error("P0039", "expected `but` after `all` in project");
@@ -2301,6 +2291,38 @@ mod tests {
                 .and_then(<crate::ast::UnaryExpr as crate::ast::AstNode>::cast)
                 .unwrap_or_else(|| panic!("src={src}: expected a UNARY_EXPR"));
             assert_eq!(unary.op_kind(), Some(crate::ast::UnaryOp::Not), "src={src}");
+        }
+    }
+
+    #[test]
+    fn every_infix_table_entry_parses_to_its_op() {
+        // The parser↔AST↔table consistency proof: every `keywords::INFIX_OPS`
+        // spelling (word and glyph) parses as a BINARY_EXPR whose `op_kind`
+        // is the entry's operator. An entry recognized by the parser but
+        // unresolvable by the AST (or vice versa) fails here — the drift
+        // this table exists to prevent. The two-token `not matching` word
+        // form (a space, never a single token) is exercised separately below.
+        let spellings = crate::keywords::INFIX_OPS.iter().flat_map(|e| {
+            let word = (!e.word.contains(' ')).then_some((e.word, e.op));
+            let glyph = e.glyph.map(|g| (g, e.op));
+            word.into_iter().chain(glyph)
+        });
+        for (spelling, op) in spellings.chain([("not matching", crate::ast::BinaryOp::NotMatching)])
+        {
+            let src = format!("program p; oper main {{}} [ let x = a {spelling} b; ];");
+            let out = parse_str(&src);
+            assert!(
+                out.diagnostics.is_empty(),
+                "src={src}: {:?}",
+                out.diagnostics
+            );
+            let bin = out
+                .tree
+                .descendants()
+                .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+                .and_then(<crate::ast::BinaryExpr as crate::ast::AstNode>::cast)
+                .unwrap_or_else(|| panic!("src={src}: expected a BINARY_EXPR"));
+            assert_eq!(bin.op_kind(), Some(op), "src={src}");
         }
     }
 

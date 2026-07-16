@@ -19,6 +19,7 @@ pub mod ast_cdstore;
 pub mod cst;
 pub mod file_kind;
 pub mod format_template;
+pub mod keywords;
 pub mod lexer;
 pub mod parser;
 pub mod parser_cddb;

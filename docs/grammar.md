@@ -96,13 +96,71 @@ User code is not *required* to follow PascalCase for types and relvars — that'
 - **Bare `_`** is the wildcard / "don't care" pattern. Reserved as a single-character form for (planned) pattern matching's catch-all branch.
 - **Leading `__` (double underscore) is reserved for compiler-internal use** and rejected from user identifiers. This gives the desugarer, optimizer, and runtime a private namespace (`__plan_42`, `__tmp_join_lhs`, `__coddl_runtime_call`) that cannot ever shadow user code. snake_case with internal underscores (`foo_bar`, `write_line`, `_unused`) is unaffected — the rule is purely a leading-prefix check.
 
-## Reserved words: none
+## Reserved words
 
-Coddl has no hard-reserved identifiers. At the lexer level there is no `KEYWORD` token type — every alphanumeric/underscore/`#` token is an `IDENT`. The parser recognizes specific identifiers as keywords in specific syntactic positions (`program` at the start of a file, `oper` at a statement boundary, PascalCase identifiers in type position resolving against the type table, the built-in constants `true` / `false` / `reltrue` / `relfalse` in expression position, etc.).
+At the lexer level there is no `KEYWORD` token type — every alphanumeric/underscore/`#` token is an `IDENT` — and the parser recognizes specific identifiers as keywords in specific syntactic positions. That much is unchanged. The honest statement of what it buys is a **taxonomy**, published in full below (the tables render `crates/coddl-syntax/src/keywords.rs`, the single source of truth both the parser's operator table and the AST's operator resolution consume; mechanical doc↔source sync is planned):
 
-This is a deliberate ergonomic choice for a relational language whose users will model real domains with attribute names like `name`, `type`, `from`, `to`, `order`, `value`, `with`, `by`, `and`. Hard-reserving any of those is a tax we don't want to pay. The cost is the prefix-only constraint on textual operators noted above — `and`, `or`, `not` are recognized in expression position contextually, not as reserved tokens.
+- **Tier 1 — reserved in effect (five words + the operator glyphs).** `true`, `false`, `if`, `not`, `extract` are claimed at an expression head with nothing to narrow on: `true`/`false` are the bare word, and `if`/`not`/`extract` are followed by an arbitrary expression, so no lookahead can ever free them. A binding declared under one of these names is accepted **without diagnostic today** — and is then silently unreachable (`let true = 1; let x = true;` binds `x` to the Boolean literal) or misparses at every bare reference (`let if = 2;` makes each `if` an if-expression). There is no quoting escape hatch (no Coddl analogue of SQL's `"order"`). The declaration-time reservation diagnostic (P0096, planned) makes this honest; the fix is tracked in `.local/active/reserved-words.md`. The seven word-operator glyphs (`¬ ⋈ ∪ ∩ ∖ ⋉ ▷`) lex as `IDENT` and are declarable the same way, with the same trap.
+- **Tier 2 — positional claims with known traps (narrowing planned).** `Relation` / `Sequence` / `transaction` are claimed unconditionally at an expression head, so a bare reference to a same-named binding errs at the *use site* (P0031/P0055/P0019); the eleven statement heads are claimed unconditionally at a statement boundary, so assigning to a same-named variable misparses (`delete := 2;` dispatches into the DELETE statement). Each needs only one token of lookahead to free the bare word (the word's delimiter; next-token-isn't-`:=` for statement heads) — the narrowing pattern already proven in-tree by `asc`/`desc` (recognized only when followed by another IDENT) and `builtin` (two-token `builtin relvar` vs `builtin oper`).
+- **Tier 3 — vacuous claims (genuinely free).** Everything else is recognized in a position where a bare identifier is never a legal continuation — infix/postfix operator position, clause position after an introducing construct, item-head position, type position — so the claim shadows nothing. These are the words that keep the identifier space unfettered for real domains (`name`, `type`, `from`, `to`, `order`, `value`, `key`, `and` as attribute names all work).
+- **Tier 4 — not keywords at all.** `reltrue` / `relfalse` are **not** parser-recognized: they are module-level `let`s in `coddl::core` (always in scope, resolved *after* everything else, deliberately user-shadowable — tests pin it). This is the model: vocabulary lives in the registry/stdlib and stays shadowable; the parser claims a word only when its *grammar* is special. The reserved set grows with syntax, never with library.
 
-The TextMate grammar still pattern-highlights these words at the lexical level (highlighting is a UX hint, not a lex check); the [LSP](lsp.md)'s semantic tokens correct mis-highlightings later where a user has used such a word as an identifier.
+### Tier 1 — reserved
+
+| Word | Glyph | Position | Notes |
+|---|---|---|---|
+| `true` | — | expression head (Boolean literal) | bare-word claim; a same-named binding is silently never referenced |
+| `false` | — | expression head (Boolean literal) | same |
+| `if` | — | expression head (`if … then … else`) | followed by an arbitrary expression — unnarrowable |
+| `not` | `¬` | prefix operator; first token of `not matching` | unnarrowable |
+| `extract` | — | prefix operator (relation → tuple) | unnarrowable |
+
+The glyphs `⋈ ∪ ∩ ∖ ⋉ ▷` (operator rows below) and `¬` belong to this tier as declarables: they lex as `IDENT` with the glyph text. The symbolic glyphs `≤ ≥ ≠ ⊂ ⊃ ⊆ ⊇` lex as operator *tokens*, never as identifiers — no declaration-site exposure.
+
+### Tier 2 — claimed unconditionally today, lookahead narrowing planned
+
+| Word | Position | Delimiter that would narrow it | Trap today |
+|---|---|---|---|
+| `Relation` | expression head (relation literal); also a type generator | `{` | bare reference → P0031; a relvar named `Relation` is declarable but unusable |
+| `Sequence` | expression head (sequence literal); also a type generator | `[` | bare reference → P0055 (bioinformatics wants relvar `Sequence`) |
+| `transaction` | expression head | `[` | bare reference → P0019 (finance wants attribute `transaction`) |
+| `let` `var` `truncate` `delete` `insert` `update` `for` `while` `do` `load` `return` | statement head | next token ≠ `:=` | `X := e;` for a variable named after any head misparses into that statement |
+
+Residual traps that survive even the planned narrowing (documented, accepted): indexing a `Sequence`-typed variable named `transaction` (`transaction [i]` is the transaction-expression claim); a *bare-reference* expression statement of a statement-head-named variable (`while;` — useless anyway); prefix-calling an oper named after a narrowed word (`Relation { … }` is claimed — UFCS `x.Relation { … }` is the escape hatch).
+
+### Tier 3 — vacuous claims
+
+**Infix operators** (operator position only; precedence on the shared ladder with the symbolic operators — `* / div` 5, `+ - ||` 4, comparisons 3):
+
+| Word | Glyph | Prec | | Word | Glyph | Prec |
+|---|---|---|---|---|---|---|
+| `div` | — | 5 | | `union` | `∪` | 0 |
+| `and` | — | 2 | | `minus` | `∖` | 0 |
+| `or` | — | 1 | | `matching` | `⋉` | 0 |
+| `where` | — | 0 | | `not matching` | `▷` | 0 |
+| `join` | `⋈` | 0 | | `when` | — | 0 |
+| `times` | — | 0 | | `otherwise` | — | 0 |
+| `compose` | — | 0 | | `intersect` | `∩` | 0 |
+
+There is **no `mod`** — `div` (truncating integer division) is the only textual arithmetic keyword.
+
+**Postfix pipeline suffixes** (pipeline operator position only): `project` `replace` `tclose` `extend` `rename` `wrap` `unwrap` `group` `ungroup` — plus `all` / `but` inside `project`'s brace form.
+
+**Clause words** (each recognized only after its introducing construct): `then` `else` (if-expression) · `in` `to` (for-loop) · `from` `order` (load) · `asc` `desc` (sort item — already lookahead-narrowed: only when followed by another IDENT, so `[asc]` is an attribute) · `key` (relvar declaration).
+
+**Item heads** (top level; no expression can start there): `program` `library` `module` `database` `public` `private` `base` `virtual` `builtin` `oper` `type` `use` `let` `var`. `builtin` is two-token narrowed (`builtin relvar` vs `builtin oper`); `relvar` and `key` are decl-interior words, not item heads.
+
+**Type position** (`parse_type_ref`): `Relation` and `Sequence` as generators (their expression-head claims are the Tier-2 rows above). **`Tuple` is type-position only — it never claims expression space**; a variable, attribute, or oper named `Tuple` is fully usable.
+
+**Sidecar dialects** (separate parsers, separate diagnostic namespaces): `.cddb` — `database` `base` `virtual` `public` `private` `relvar` `key`; `.cdstore` — `store` `for` `backend` `relvar` `table` `columns` `env` `default`; `.cdmap` — `map` `to`.
+
+### Tier 4 — library vocabulary, not keywords
+
+`reltrue` / `relfalse` are module-level `let`s in `coddl::core`, absorbed into every program's scope and resolved **last** in name lookup — shadowed by any user binding of the same name (this is tested behavior, including shadowing with a different type). Keep this as the model for growing the language's vocabulary: nothing about a library name is special to the parser.
+
+The ergonomic goal stands: users model real domains with attribute names like `name`, `type`, `from`, `to`, `order`, `value`, `with`, `by`, `and` — every one of those is Tier 3 or entirely unclaimed, and hard-reserving them remains a tax Coddl refuses to pay. The cost is the prefix-only constraint on textual operators noted above, plus the five Tier-1 words whose expression-head grammar genuinely cannot share.
+
+The TextMate grammar still pattern-highlights keywords at the lexical level (highlighting is a UX hint, not a lex check); the [LSP](lsp.md)'s semantic tokens correct mis-highlightings later where a user has used such a word as an identifier.
 
 ## Unicode operator glyphs
 
