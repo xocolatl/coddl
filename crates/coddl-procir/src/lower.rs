@@ -167,11 +167,24 @@ pub struct LowerOutput {
 pub struct ExplainEntry {
     pub expr: RelExpr,
     pub sql: String,
+    /// The dense per-module plan id registered for `sql` — the id
+    /// `Inst::Query` names and runtime messages ("plan N") reference.
+    /// Entries sharing `sql` share it (the text-stable dedup).
+    pub plan_id: u32,
     /// The cardinality-1 sibling plan's SQL, when one was baked (a root
     /// `matching` over a shipped relation): the specialized keyed lookup the
     /// runtime fires instead of `sql` when the shipped relation holds exactly
     /// one row.
     pub card1_sql: Option<String>,
+    /// The sibling's own dense plan id (an ordinary registered entry no
+    /// `Inst::Query` names); `Some` exactly when `card1_sql` is.
+    pub card1_plan_id: Option<u32>,
+    /// Source span of the pushed expression — where in the program this
+    /// query is forced. Identical SQL under one dialect registers one plan
+    /// (the text-stable dedup), so several entries may share `sql`; the
+    /// driver groups them and renders each span as a usage site of the
+    /// shared plan.
+    pub span: Span,
 }
 
 /// Tokenize, parse, type-check, and lower `source` to ProcIR.
@@ -5197,13 +5210,20 @@ impl Lowerer {
         );
         // For `coddl explain`: a successful push is a clean RelExpr root (the
         // caller returns here, so no nested sub-expression is captured twice).
-        if self.collect_relir {
-            self.relir.push(ExplainEntry {
-                expr: rel.clone(),
-                sql: plan.query.sql.text.clone(),
-                card1_sql: plan.card1_alt.as_ref().map(|(alt, _)| alt.sql.text.clone()),
-            });
-        }
+        // The tree, texts, and text-stable hashes are saved before
+        // `emit_query` consumes the plan; the entry is pushed after it, once
+        // the dense plan ids exist in `plan_ids`.
+        let explain = self.collect_relir.then(|| {
+            (
+                rel.clone(),
+                plan.query.sql.text.clone(),
+                plan.query.plan_id.0,
+                plan.card1_alt
+                    .as_ref()
+                    .map(|(alt, _)| (alt.sql.text.clone(), alt.plan_id.0)),
+                self.node_span(expr.syntax()),
+            )
+        });
         // The push is committed — evaluate each `when`-gate condition once,
         // binding it under its `__when_<k>` name so `emit_params` resolves the
         // plan's `Param("__when_<k>")` sources like any user local. Conditions
@@ -5214,7 +5234,34 @@ impl Lowerer {
             let reg = self.lower_expr(&cond);
             self.bind_local(format!("__when_{k}"), reg, ProcType::Boolean);
         }
-        Some(self.emit_query(plan, &tables.slots))
+        let dst = self.emit_query(plan, &tables.slots);
+        if let Some((expr_rel, sql, hash, card1, span)) = explain {
+            let plan_id = *self
+                .plan_ids
+                .get(&hash)
+                .expect("plan registered by emit_query");
+            let (card1_sql, card1_plan_id) = match card1 {
+                Some((text, alt_hash)) => (
+                    Some(text),
+                    Some(
+                        *self
+                            .plan_ids
+                            .get(&alt_hash)
+                            .expect("card-1 sibling registered by emit_query"),
+                    ),
+                ),
+                None => (None, None),
+            };
+            self.relir.push(ExplainEntry {
+                expr: expr_rel,
+                sql,
+                plan_id,
+                card1_sql,
+                card1_plan_id,
+                span,
+            });
+        }
+        Some(dst)
     }
 
     /// Build a `coddl-relir` expression from a relational AST subtree, or

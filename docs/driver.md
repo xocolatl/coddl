@@ -15,7 +15,7 @@ The driver is the user's first contact with Coddl. It calls into the frontend cr
 | `parse <file>`      | file or `-`   | rust-analyzer-style CST dump → stdout      | —                              |
 | `check <file>`      | file or `-`   | diagnostics → stderr                       | —                              |
 | `lower <file>`      | file or `-`   | ProcIR module's `Display` form → stdout    | —                              |
-| `explain <file>`    | file or `-`   | as-lowered RelIR + SQL per pushed query → stdout | —                        |
+| `explain <file>`    | file or `-`   | as-lowered RelIR + SQL + usage sites per pushed plan → stdout | —           |
 | `emit-llvm <file>`  | file or `-`   | LLVM IR text → stdout                      | —                              |
 | `emit-obj <file>`   | file or `-`   | Cranelift object bytes → stdout (or `-o`)  | `-o <path>` optional           |
 | `compile <file>`    | file (or `-` with `-o`) | native binary at `<output>`     | `--backend=llvm`, `-o <basename>` |
@@ -37,18 +37,31 @@ cleanly, and are mutually exclusive.
 ## `explain`
 
 `explain` runs the pipeline through RelIR lowering and prints, for each
-relational expression the cut pushes to SQL, the **as-lowered RelIR tree**
-paired with the SQL it lowered to:
+**plan** the cut pushes to SQL, the **as-lowered RelIR tree** paired with the
+SQL it lowered to and the source line of every expression that uses it:
 
 ```text
-query 1:
+plan 0:
   RelIR:
     Project { keep: message }
       Restrict { id = 1 }
         RelvarRef Greetings { db: greetings, table: greetings }
   SQL:
-    SELECT "message" FROM "greetings" WHERE "id" = ?
+    SELECT "message" FROM "greetings" WHERE "id" = ?1
+  used at:
+    hello.cd:7
 ```
+
+Expressions are grouped by SQL text — the same identity the runtime dedups
+plans by (one `PlanId`, one prepared statement) — so two expressions that
+lower to identical SQL print as one entry with two `used at:` sites, and the
+list shown is exactly the program's registered statement set. Each entry is
+labeled by the dense id the compiled program registers — the same "plan N"
+runtime messages reference. Ids need not be contiguous here: DML write plans
+share the same sequence but only reads are shown, and a plan with a baked
+cardinality-1 sibling additionally prints it as
+`SQL (card-1 dispatch, plan M):` — the sibling is a registered plan of its
+own (and registers first, so its id typically precedes the general form's).
 
 It is the *logical* (RelIR) view of a program's queries — what
 [`coddl-sqlemit`](sqlemit.md) consumes — not an optimized query plan. Two

@@ -87,6 +87,17 @@ fn read_input(args: &[String], cmd: &str) -> Option<(String, FileKind)> {
     }
 }
 
+/// 1-based line number of byte offset `at` in `source` (clamped to the
+/// source length). `coddl explain` renders a plan's usage sites as
+/// `path:line`.
+fn line_of(source: &str, at: u32) -> usize {
+    let at = (at as usize).min(source.len());
+    1 + source.as_bytes()[..at]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+}
+
 /// Reject input that isn't `.cd`. Used by every subcommand whose
 /// downstream pipeline (typecheck / lower / emit / compile / run /
 /// fmt) is `.cd`-only today; the dialect-aware pipeline lands in
@@ -369,11 +380,15 @@ fn cmd_lower(args: &[String]) -> ExitCode {
     }
 }
 
-/// `coddl explain <file>` — dump the as-lowered RelIR for each relational
-/// expression the cut pushes to SQL, paired with the SQL it became. This is the
-/// logical (RelIR) view of the program's queries, not an optimized plan: there
-/// is no optimizer yet, and the tree is the hybrid A-core + sugar form, not
-/// minimal Algebra A. In-process relational evaluation is not covered.
+/// `coddl explain <file>` — dump the as-lowered RelIR for each **plan** the
+/// cut pushes to SQL, paired with the SQL it became and the source site of
+/// every expression that uses it. Identical SQL under one dialect registers
+/// one plan (the runtime's text-stable dedup), so expressions are grouped by
+/// their SQL text: the plan list shown here is exactly the program's
+/// registered statement set. This is the logical (RelIR) view, not an
+/// optimized plan: there is no optimizer yet, and the tree is the hybrid
+/// A-core + sugar form, not minimal Algebra A. In-process relational
+/// evaluation is not covered.
 fn cmd_explain(args: &[String]) -> ExitCode {
     let Some((source, kind)) = read_input(args, "explain") else {
         return ExitCode::from(1);
@@ -392,14 +407,39 @@ fn cmd_explain(args: &[String]) -> ExitCode {
         if out.relir.is_empty() {
             let _ = writeln!(w, "no relational expressions were pushed to SQL");
         } else {
+            // Group the per-expression entries by SQL text — the same
+            // identity the runtime dedups plans by — preserving first-seen
+            // order. Each group prints one plan with every usage site.
+            let mut groups: Vec<Vec<usize>> = Vec::new();
+            for (i, entry) in out.relir.iter().enumerate() {
+                match groups
+                    .iter_mut()
+                    .find(|uses| out.relir[uses[0]].sql == entry.sql)
+                {
+                    Some(uses) => uses.push(i),
+                    None => groups.push(vec![i]),
+                }
+            }
+            // The input name for usage sites, matching `read_input`'s
+            // path-vs-stdin decision.
+            let input_name = match args.first().map(String::as_str) {
+                Some("-") | None => "<stdin>",
+                Some(path) => path,
+            };
             let _ = writeln!(
                 w,
-                "as-lowered RelIR for {} relational expression(s) pushed to SQL:",
-                out.relir.len()
+                "as-lowered RelIR for {} relational expression(s) pushed to SQL as {} plan(s):",
+                out.relir.len(),
+                groups.len()
             );
-            for (i, entry) in out.relir.iter().enumerate() {
+            for uses in &groups {
+                let entry = &out.relir[uses[0]];
                 let _ = writeln!(w);
-                let _ = writeln!(w, "query {}:", i + 1);
+                // Entries are labeled by the dense plan id the compiled
+                // program registers — the "plan N" runtime messages
+                // reference. Grouping is 1:1 with plan identity, so no
+                // separate ordinal is needed.
+                let _ = writeln!(w, "plan {}:", entry.plan_id);
                 let _ = writeln!(w, "  RelIR:");
                 for line in entry.expr.render().lines() {
                     let _ = writeln!(w, "    {line}");
@@ -408,10 +448,20 @@ fn cmd_explain(args: &[String]) -> ExitCode {
                 let _ = writeln!(w, "    {}", entry.sql);
                 // A root `matching` over a shipped relation bakes a second
                 // plan: the runtime fires this specialized form instead when
-                // the shipped relation holds exactly one row.
-                if let Some(card1) = &entry.card1_sql {
-                    let _ = writeln!(w, "  SQL (card-1 dispatch):");
+                // the shipped relation holds exactly one row. The sibling is
+                // a registered plan of its own, so it shows its own id.
+                if let (Some(card1), Some(card1_id)) = (&entry.card1_sql, entry.card1_plan_id) {
+                    let _ = writeln!(w, "  SQL (card-1 dispatch, plan {card1_id}):");
                     let _ = writeln!(w, "    {card1}");
+                }
+                let _ = writeln!(w, "  used at:");
+                for &u in uses {
+                    let span = out.relir[u].span;
+                    if span.file == FileId(0) {
+                        let _ = writeln!(w, "    {input_name}:{}", line_of(&source, span.start));
+                    } else {
+                        let _ = writeln!(w, "    (imported module)");
+                    }
                 }
             }
         }

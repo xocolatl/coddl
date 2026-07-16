@@ -3439,6 +3439,73 @@ fn explain_dumps_relir_tree_paired_with_its_sql() {
     }
 }
 
+/// Identical SQL under one dialect registers one plan (the text-stable
+/// dedup), and `coddl explain` groups its output the same way: two
+/// expressions lowering to the same text print as **one** query with both
+/// source sites listed under `used at:`.
+#[test]
+fn explain_groups_identical_plans_with_usage_sites() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        tmp.path().join("parts.cddb"),
+        "database parts;\n\
+         base relvar Suppliers { sno: Integer, sname: Text } key { sno };\n",
+    )
+    .expect("write parts.cddb");
+    std::fs::write(
+        tmp.path().join("parts.cdstore"),
+        "store for parts;\n\
+         backend sqlite { file: \"parts.sqlite\" };\n\
+         relvar Suppliers: table \"suppliers\" { columns: { sno: \"sno\", sname: \"sname\" } };\n",
+    )
+    .expect("write parts.cdstore");
+    let cd = tmp.path().join("twice.cd");
+    std::fs::write(
+        &cd,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         oper main {} [\n\
+             let a = transaction [ Suppliers where sno = 2 ];\n\
+             write_relation { rel: a };\n\
+             let b = transaction [ Suppliers where sno = 2 ];\n\
+             write_relation { rel: b };\n\
+         ];\n",
+    )
+    .expect("write twice.cd");
+
+    let out = coddl()
+        .args(["explain"])
+        .arg(&cd)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl explain {:?} failed: stderr=\n{}",
+        cd,
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let cd_str = cd.display().to_string();
+    for needle in [
+        "2 relational expression(s) pushed to SQL as 1 plan(s)",
+        // The one deduped plan is labeled by its dense registered id.
+        "plan 0:",
+        // The two forces sit on lines 5 and 7 of twice.cd.
+        &format!("{cd_str}:5"),
+        &format!("{cd_str}:7"),
+    ] {
+        assert!(
+            stdout.contains(needle),
+            "explain output missing {needle:?}; got:\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("plan 1:"),
+        "identical SQL must group into one plan entry; got:\n{stdout}"
+    );
+}
+
 /// Author a two-public-relvar pushdown program (`Suppliers`, `Shipments`, sharing
 /// `sno`) with its `parts.cddb` / `parts.cdstore` companions into `dir`, for the
 /// semijoin explain test. No SQLite db is seeded — `explain` is compile-time only
@@ -3564,7 +3631,7 @@ fn explain_dumps_mixed_semijoin_with_rel_param() {
         r#"WHERE EXISTS (SELECT 1 FROM"#,
         r#"coddl_l."sno" = coddl_r."sno""#,
         // The cardinality-1 sibling is baked alongside the general plan.
-        "SQL (card-1 dispatch):",
+        "SQL (card-1 dispatch, plan ",
         r#"SELECT "sname" FROM "suppliers" WHERE "sno" = ?1"#,
     ] {
         assert!(
