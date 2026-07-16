@@ -5198,7 +5198,13 @@ impl Lowerer {
     ) -> Option<ValueId> {
         let dialect = self.dialect?;
         let mut tables = BuildTables::default();
-        let rel = self.build_rel_expr(expr, &mut tables)?;
+        // A root `otherwise` builds structurally (the only position where the
+        // `RelExpr::Otherwise` node exists — its emission is root-only);
+        // everything else, including a *nested* `otherwise`, goes through the
+        // ordinary build.
+        let rel = self
+            .build_rel_otherwise_root(expr, &mut tables)
+            .or_else(|| self.build_rel_expr(expr, &mut tables))?;
         let plan = crate::cut::try_push_ordered(&rel, dialect, order)?;
         // The emitted rel-params are exactly the build's slot table (the
         // collapse invariant) — both pure, so nothing was emitted if either
@@ -6581,14 +6587,17 @@ impl Lowerer {
                     pred: Predicate::Gate(value),
                 })
             }
-            // `R otherwise D` self-collapses to one shipped slot: the whole
-            // COALESCE computes in-process (`Inst::Otherwise` — post-fire
+            // A nested `R otherwise D` self-collapses to one shipped slot: the
+            // whole COALESCE computes in-process (`Inst::Otherwise` — post-fire
             // empty-result substitution) and only its *result rows* enter the
             // enclosing pushed query, exactly like any other materialized
-            // operand. The heading comes from whichever operand builds
-            // (identical headings, typechecked); if neither side is buildable
-            // the whole arm declines and the enclosing op falls back — the
-            // same treatment any non-buildable operand gets today.
+            // operand — so an enclosing push is never broken by the node's
+            // root-only emission. (A *root* `otherwise` builds structurally in
+            // `build_rel_otherwise_root` before the ordinary build runs.) The
+            // heading comes from whichever operand builds (identical headings,
+            // typechecked); if neither side is buildable the whole arm declines
+            // and the enclosing op falls back — the same treatment any
+            // non-buildable operand gets today.
             Some(BinaryOp::Otherwise) => {
                 let mark = tables.mark();
                 let heading = match self.build_rel_expr(&b.lhs()?, tables) {
@@ -6657,6 +6666,55 @@ impl Lowerer {
                 input: Box::new(other),
                 keep: shared,
             },
+        }
+    }
+
+    /// Build a **root** `otherwise` structurally — the only position where the
+    /// [`RelExpr::Otherwise`] node exists, matching its root-only SQL emission
+    /// (a compound `WITH`-prefixed statement can't sit under another op). In
+    /// any nested position the whole `otherwise` still self-collapses to one
+    /// shipped `RelParam` slot (`build_rel_binary`'s arm — the settled
+    /// invariant), so an enclosing push is never broken by this node.
+    ///
+    /// Structural is further gated on the **fallback** building with a
+    /// non-`Materialized` origin. A local fallback beside a relvar-rooted
+    /// primary is already optimal on the fallback path: the primary pushes
+    /// alone — keeping its cardinality-1 sibling dispatch, which is root-shape
+    /// only — and the O(1) `Inst::Otherwise` pick ships nothing. A
+    /// relvar-rooted fallback is exactly the shape whose always-fired
+    /// statement the one-plan `UNION ALL`/`NOT EXISTS` form retires; a *local
+    /// primary* beside it ships up as a `VALUES` slot (the settled
+    /// mixed-origin rule) so the fallback scan is probed, not forced. `None`
+    /// (tables truncated clean) falls back to the ordinary build →
+    /// self-collapse → `lower_otherwise_expr`.
+    fn build_rel_otherwise_root(&self, expr: &Expr, tables: &mut BuildTables) -> Option<RelExpr> {
+        let Expr::Binary(b) = expr else {
+            return None;
+        };
+        if !matches!(b.op_kind(), Some(BinaryOp::Otherwise)) {
+            return None;
+        }
+        let lhs_e = b.lhs()?;
+        let rhs_e = b.rhs()?;
+        let mark = tables.mark();
+        // Primary before fallback: slot allocation is DFS order, which the
+        // emitted rel-param list's strictly-increasing invariant relies on.
+        let primary = self.build_rel_operand(&lhs_e, tables);
+        let fallback = match primary {
+            Some(_) => self.build_rel_operand(&rhs_e, tables),
+            None => None,
+        };
+        match (primary, fallback) {
+            (Some(primary), Some(fallback)) if fallback.origin() != StorageOrigin::Materialized => {
+                Some(RelExpr::Otherwise {
+                    primary: Box::new(primary),
+                    fallback: Box::new(fallback),
+                })
+            }
+            _ => {
+                tables.truncate(mark);
+                None
+            }
         }
     }
 
@@ -6780,8 +6838,13 @@ impl Lowerer {
     /// `Inst::Otherwise` (`coddl_relation_otherwise`: header length check,
     /// retain the winner, O(1)). Both operands lower to relation values first,
     /// so an embedded pushed plan fires *here* — post-fire empty-result
-    /// substitution. v1 residue (tracked in `.local/tracking/optimizations.md`):
-    /// a relvar-rooted fallback's plan fires even when the primary is nonempty.
+    /// substitution. This is the fallback path: a root `otherwise` whose
+    /// fallback is relvar-rooted pushes as one `UNION ALL`/`NOT EXISTS`
+    /// statement instead (`build_rel_otherwise_root`); what reaches here is
+    /// the local-fallback shape (the primary pushes alone, the pick ships
+    /// nothing — already optimal) and the shapes whose emission declines,
+    /// where the eager both-sides force still stands (tracked in
+    /// `.local/tracking/optimizations.md`).
     fn lower_otherwise_expr(&mut self, bin: &BinaryExpr) -> ValueId {
         if let (Some(lhs_e), Some(rhs_e)) = (bin.lhs(), bin.rhs()) {
             let primary = self.lower_expr(&lhs_e);
@@ -8395,7 +8458,11 @@ fn contains_restrict(rel: &RelExpr) -> bool {
         RelExpr::And { lhs, rhs }
         | RelExpr::Or { lhs, rhs }
         | RelExpr::Minus { lhs, rhs }
-        | RelExpr::Semijoin { lhs, rhs, .. } => contains_restrict(lhs) || contains_restrict(rhs),
+        | RelExpr::Semijoin { lhs, rhs, .. }
+        | RelExpr::Otherwise {
+            primary: lhs,
+            fallback: rhs,
+        } => contains_restrict(lhs) || contains_restrict(rhs),
         RelExpr::RelvarRef { .. }
         | RelExpr::MaterializedRelvar { .. }
         | RelExpr::RelParam { .. } => false,
@@ -8423,7 +8490,11 @@ fn contains_gate(rel: &RelExpr) -> bool {
         RelExpr::And { lhs, rhs }
         | RelExpr::Or { lhs, rhs }
         | RelExpr::Minus { lhs, rhs }
-        | RelExpr::Semijoin { lhs, rhs, .. } => contains_gate(lhs) || contains_gate(rhs),
+        | RelExpr::Semijoin { lhs, rhs, .. }
+        | RelExpr::Otherwise {
+            primary: lhs,
+            fallback: rhs,
+        } => contains_gate(lhs) || contains_gate(rhs),
         RelExpr::RelvarRef { .. }
         | RelExpr::MaterializedRelvar { .. }
         | RelExpr::RelParam { .. } => false,
@@ -8448,7 +8519,8 @@ fn relvar_root_name(rel: &RelExpr) -> Option<&str> {
         RelExpr::And { lhs, .. }
         | RelExpr::Or { lhs, .. }
         | RelExpr::Minus { lhs, .. }
-        | RelExpr::Semijoin { lhs, .. } => relvar_root_name(lhs),
+        | RelExpr::Semijoin { lhs, .. }
+        | RelExpr::Otherwise { primary: lhs, .. } => relvar_root_name(lhs),
         RelExpr::MaterializedRelvar { .. } | RelExpr::RelParam { .. } => None,
     }
 }

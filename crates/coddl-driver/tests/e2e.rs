@@ -4751,6 +4751,251 @@ fn otherwise_result_feeds_semijoin_cranelift() {
     assert_otherwise_result_feeds_semijoin("cranelift");
 }
 
+/// A fully relvar-rooted `R otherwise D` at the pushed root emits **one**
+/// compound statement (primary CTE + `UNION ALL` + `NOT EXISTS`) instead of
+/// firing both arms' plans — the DB picks the arm, whichever way it goes.
+fn assert_otherwise_relvar_rooted_pushes(backend: &str) {
+    let (stdout, audit) = run_parts_program(
+        backend,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         oper main {} [\n\
+             let missing = transaction [\n\
+                 (Suppliers where sno = 42) otherwise (Suppliers where sno = 3)\n\
+             ];\n\
+             write_relation { rel: missing };\n\
+             let found = transaction [\n\
+                 (Suppliers where sno = 2) otherwise (Suppliers where sno = 3)\n\
+             ];\n\
+             write_relation { rel: found };\n\
+         ];\n",
+        true,
+    );
+    assert_eq!(
+        tuple_lines(&stdout),
+        sorted_tuples(&["{sname: \"Blake\", sno: 3}", "{sname: \"Jones\", sno: 2}"]),
+        "backend={backend}: got {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+    let selects: Vec<&str> = audit.lines().filter(|l| l.contains("SELECT")).collect();
+    assert_eq!(
+        selects.len(),
+        2,
+        "each otherwise force point fires exactly one statement; audit:\n{audit}"
+    );
+    for line in &selects {
+        assert!(
+            line.contains("UNION ALL") && line.contains("NOT EXISTS"),
+            "expected the compound one-plan form, got: {line}"
+        );
+    }
+}
+
+#[test]
+fn otherwise_relvar_rooted_pushes_llvm() {
+    assert_otherwise_relvar_rooted_pushes("llvm");
+}
+
+#[test]
+fn otherwise_relvar_rooted_pushes_cranelift() {
+    assert_otherwise_relvar_rooted_pushes("cranelift");
+}
+
+/// `local otherwise Relvar` — the mixed shape: the local primary ships up as
+/// a VALUES slot (the settled ship-up rule) and the relvar fallback rides the
+/// same single statement behind the `NOT EXISTS` probe, instead of its plan
+/// firing unconditionally. The **empty**-primary case proves the slot is not
+/// absorbing: the statement must still fire so the probe picks the fallback.
+fn assert_otherwise_mixed_local_primary_pushes(backend: &str) {
+    let (stdout, audit) = run_parts_program(
+        backend,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         oper main {} [\n\
+             let hint = Relation { { sno: 9, sname: \"ghost\" } };\n\
+             let kept = transaction [ hint otherwise (Suppliers where sno = 3) ];\n\
+             write_relation { rel: kept };\n\
+             let nothing = hint where sno = 0;\n\
+             let fell = transaction [ nothing otherwise (Suppliers where sno = 3) ];\n\
+             write_relation { rel: fell };\n\
+         ];\n",
+        true,
+    );
+    assert_eq!(
+        tuple_lines(&stdout),
+        sorted_tuples(&["{sname: \"ghost\", sno: 9}", "{sname: \"Blake\", sno: 3}"]),
+        "backend={backend}: got {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+    let selects: Vec<&str> = audit.lines().filter(|l| l.contains("SELECT")).collect();
+    assert_eq!(
+        selects.len(),
+        2,
+        "both force points fire exactly one statement each — the empty \
+         primary slot is NOT absorbing (the fallback needs the probe); \
+         audit:\n{audit}"
+    );
+    for line in &selects {
+        assert!(
+            line.contains("UNION ALL") && line.contains("NOT EXISTS"),
+            "expected the compound one-plan form, got: {line}"
+        );
+    }
+}
+
+#[test]
+fn otherwise_mixed_local_primary_pushes_llvm() {
+    assert_otherwise_mixed_local_primary_pushes("llvm");
+}
+
+#[test]
+fn otherwise_mixed_local_primary_pushes_cranelift() {
+    assert_otherwise_mixed_local_primary_pushes("cranelift");
+}
+
+/// A `when` gate inside an otherwise **primary** is not in absorbing position:
+/// a false gate empties the primary *arm*, which is what selects the fallback
+/// — the statement must fire (no A5-style skip), and the fallback's rows come
+/// back from the same single compound statement.
+fn assert_otherwise_gated_primary_does_not_skip(backend: &str) {
+    let (stdout, audit) = run_parts_program(
+        backend,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         oper main {} [\n\
+             let no = false;\n\
+             let got = transaction [\n\
+                 (Suppliers when no) otherwise (Suppliers where sno = 3)\n\
+             ];\n\
+             write_relation { rel: got };\n\
+         ];\n",
+        true,
+    );
+    assert_eq!(
+        tuple_lines(&stdout),
+        sorted_tuples(&["{sname: \"Blake\", sno: 3}"]),
+        "backend={backend}: got {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+    let selects: Vec<&str> = audit.lines().filter(|l| l.contains("SELECT")).collect();
+    assert!(
+        selects.len() == 1 && selects[0].contains("UNION ALL"),
+        "the gated-primary otherwise fires its one compound statement (a \
+         false gate must not skip it); audit:\n{audit}"
+    );
+}
+
+#[test]
+fn otherwise_gated_primary_does_not_skip_llvm() {
+    assert_otherwise_gated_primary_does_not_skip("llvm");
+}
+
+#[test]
+fn otherwise_gated_primary_does_not_skip_cranelift() {
+    assert_otherwise_gated_primary_does_not_skip("cranelift");
+}
+
+/// A semijoin **primary** with a relvar fallback pushes as the one compound
+/// statement in its *general* EXISTS+VALUES form — the cardinality-1 sibling
+/// is root-shape-only, so it does not bake under an `Otherwise` root (the
+/// pinned trade: one statement instead of a keyed lookup plus an always-fired
+/// fallback plan; tracked residue in `.local/tracking/optimizations.md`).
+fn assert_otherwise_semijoin_primary_pushes_general(backend: &str) {
+    let (stdout, audit) = run_parts_program(
+        backend,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         oper main {} [\n\
+             let one = Relation { { sno: 2, ordinality: 0 } };\n\
+             let got = transaction [\n\
+                 (Suppliers matching one) otherwise (Suppliers where sno = 3)\n\
+             ];\n\
+             write_relation { rel: got };\n\
+         ];\n",
+        true,
+    );
+    assert_eq!(
+        tuple_lines(&stdout),
+        sorted_tuples(&["{sname: \"Jones\", sno: 2}"]),
+        "backend={backend}: got {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+    let selects: Vec<&str> = audit.lines().filter(|l| l.contains("SELECT")).collect();
+    assert!(
+        selects.len() == 1
+            && selects[0].contains("UNION ALL")
+            && selects[0].contains("EXISTS")
+            && selects[0].contains("VALUES"),
+        "expected one compound statement with the general EXISTS+VALUES \
+         semijoin arm (no card-1 sibling under an otherwise root); \
+         audit:\n{audit}"
+    );
+}
+
+#[test]
+fn otherwise_semijoin_primary_pushes_general_llvm() {
+    assert_otherwise_semijoin_primary_pushes_general("llvm");
+}
+
+#[test]
+fn otherwise_semijoin_primary_pushes_general_cranelift() {
+    assert_otherwise_semijoin_primary_pushes_general("cranelift");
+}
+
+/// The local-fallback shape stays on the already-optimal path: the primary
+/// pushes **alone** (no compound form, nothing shipped for the fallback) and
+/// the O(1) in-process pick fills the gap — structural build is gated on a
+/// relvar-rooted fallback precisely so this shape is untouched.
+fn assert_otherwise_local_fallback_keeps_primary_only_plan(backend: &str) {
+    let (stdout, audit) = run_parts_program(
+        backend,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         oper main {} [\n\
+             let fallback = Relation { { sno: 0, sname: \"nobody\" } };\n\
+             let found = transaction [ (Suppliers where sno = 2) otherwise fallback ];\n\
+             write_relation { rel: found };\n\
+             let missing = transaction [ (Suppliers where sno = 42) otherwise fallback ];\n\
+             write_relation { rel: missing };\n\
+         ];\n",
+        true,
+    );
+    assert_eq!(
+        tuple_lines(&stdout),
+        sorted_tuples(&["{sname: \"Jones\", sno: 2}", "{sname: \"nobody\", sno: 0}"]),
+        "backend={backend}: got {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+    let selects: Vec<&str> = audit.lines().filter(|l| l.contains("SELECT")).collect();
+    assert_eq!(
+        selects.len(),
+        2,
+        "each force point fires the primary's own plan; audit:\n{audit}"
+    );
+    for line in &selects {
+        assert!(
+            !line.contains("UNION ALL") && !line.contains("VALUES"),
+            "a local fallback must not turn the primary's plan into the \
+             compound form or ship anything, got: {line}"
+        );
+    }
+}
+
+#[test]
+fn otherwise_local_fallback_keeps_primary_only_plan_llvm() {
+    assert_otherwise_local_fallback_keeps_primary_only_plan("llvm");
+}
+
+#[test]
+fn otherwise_local_fallback_keeps_primary_only_plan_cranelift() {
+    assert_otherwise_local_fallback_keeps_primary_only_plan("cranelift");
+}
+
 // ── Boolean `not` (prefix negation) ───────────────────────────────────
 
 /// `not` lowers to `ScalarOp::Not` in ProcIR and evaluates on both backends,

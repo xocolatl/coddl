@@ -287,6 +287,35 @@ mod tests {
     }
 
     #[test]
+    fn pushes_relvar_rooted_otherwise_as_one_plan() {
+        // `Greetings otherwise Greetings` (both arms relvar-rooted) passes the
+        // origin gate and emits the compound CTE + UNION ALL + NOT EXISTS form
+        // as ONE ordinary plan — no card-1 sibling (the rewrite is
+        // semijoin-root-only), no gate skips, nothing shipped.
+        let expr = RelExpr::Otherwise {
+            primary: Box::new(RelExpr::Restrict {
+                input: Box::new(greetings()),
+                pred: Predicate::AttrCmp {
+                    attr: "id".to_string(),
+                    op: CmpOp::Eq,
+                    value: RestrictValue::Lit(Literal::Integer(1)),
+                },
+            }),
+            fallback: Box::new(greetings()),
+        };
+        let plan = try_push(&expr, Dialect::SQLite).expect("relvar-rooted otherwise pushes");
+        assert!(plan.query.sql.text.starts_with("WITH coddl_ow_p"));
+        assert!(plan.query.sql.text.contains("UNION ALL"));
+        assert!(plan.query.sql.text.contains("NOT EXISTS"));
+        assert!(plan.card1_alt.is_none());
+        assert!(plan.query.gate_params.is_empty());
+        assert!(plan.query.rel_params.is_empty());
+        // The ordered form declines (a trailing ORDER BY can't attach to the
+        // compound) — the caller sorts in-process.
+        assert!(try_push_ordered(&expr, Dialect::SQLite, &[("id".to_string(), false)]).is_none());
+    }
+
+    #[test]
     fn ordered_push_declines_setop_root() {
         // A root `union` can't carry a trailing ORDER BY in v1 → decline, so the
         // caller sorts in-process. Unordered, the same union still pushes.

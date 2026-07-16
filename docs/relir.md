@@ -53,21 +53,37 @@ This doc describes the **target** RelIR. The code implements a thin slice of it;
   a bare-local gate aliases fine. The DML recognizers likewise decline a
   gate-bearing value tree (no cond-lowering step on the write path) — it
   routes to the row-shipping paths, whose reads bind the gate properly.
-- **`otherwise` (relational COALESCE) has no RelIR node in v1.** `R otherwise
-  D` ≡ `R union (D times (reltrue minus (R project {})))`, but nothing ever
-  builds that tree: the arms are exclusive by construction, so the lowerer
-  emits one `Inst::Otherwise` (`coddl_relation_otherwise` — a header length
-  check plus a retain of the winner, O(1); the result is already sealed
-  because it *is* one of the operands). Operands lower to relation values
-  first, so an embedded pushed plan fires at the `otherwise` site — post-fire
-  empty-result substitution. Inside a larger relational op, the whole
-  `otherwise` **self-collapses to one `RelParam` slot** (the same precedent as
-  a non-pushable `where` over a materialized input), so `(A otherwise B) join
-  Relvar` ships the coalesced rows and never kills the enclosing build.
-  Tracked residue (`.local/tracking/optimizations.md`): a proper
-  `RelExpr::Otherwise` node would buy relvar-rooted pushdown (the
-  `UNION`/`NOT EXISTS` form) and exclusive-arms cardinality inference; today a
-  relvar-rooted *fallback*'s plan fires even when the primary is nonempty.
+- **`otherwise` (relational COALESCE) is the `Otherwise { primary, fallback }`
+  node — built at the pushed root only.** `R otherwise D` ≡ `R union (D times
+  (reltrue minus (R project {})))`, but nothing ever builds that tree: the
+  arms are exclusive by construction. A **root** `otherwise` whose fallback
+  builds relvar-rooted/mixed goes structural (`build_rel_otherwise_root`,
+  tried before the ordinary build in `try_lower_pushed_ordered`) and pushes
+  as **one statement** — primary CTE + `UNION ALL` + uncorrelated
+  `NOT EXISTS` probe (see [sqlemit.md](sqlemit.md)); a *local primary* beside
+  a relvar fallback ships up as a `VALUES` slot (the settled mixed-origin
+  rule), and the fallback scan is probed, never force-fired. Emission is
+  root-only (a `WITH`-prefixed compound can't sit under another op; `resolve`
+  declines it nested), which is why the build is root-only too. Inside a
+  larger relational op, the whole `otherwise` still **self-collapses to one
+  `RelParam` slot** (the same precedent as a non-pushable `where` over a
+  materialized input), so `(A otherwise B) join Relvar` ships the coalesced
+  rows and never kills the enclosing build — the settled invariant; the
+  collapsed slot's own force then re-enters the push at the `otherwise` root.
+  A **local fallback** stays on the v1 path deliberately — it is already
+  optimal: the primary pushes alone (keeping its cardinality-1 sibling
+  dispatch, which is root-shape-only) and the lowerer emits one
+  `Inst::Otherwise` (`coddl_relation_otherwise` — a header length check plus
+  a retain of the winner, O(1); the result is already sealed because it *is*
+  one of the operands), shipping nothing. Analyses: `heading` = the primary's
+  (identical, typechecked); `card_le_one` = both arms' (exclusive arms);
+  `surviving_keys` = the `And`-style composite `k_primary ∪ k_fallback` (a
+  superkey of both arms is a superkey of whichever fires); absorption:
+  **neither** child absorbs (an empty/false-gated primary selects the
+  fallback — the statement must fire). Tracked residue
+  (`.local/tracking/optimizations.md`): no cardinality-1 sibling under an
+  `Otherwise` root, and the eager both-sides force persists on the
+  non-pushable shapes.
 - The value is a `RestrictValue`: a compile-time `Lit(Literal)`, a
   **bound parameter** `Param(name)` — the surface name of an in-scope
   local/parameter whose runtime value binds at query time — or a
@@ -96,9 +112,9 @@ This doc describes the **target** RelIR. The code implements a thin slice of it;
 **Designed, not yet built**
 
 - The remaining **A-core nodes** (`AND`, `OR`, `NOT`, `TCLOSE`) and the **sugar → A-core desugaring**. The four nodes above are consumed as-is; nothing is rewritten into A-core form yet. (`REMOVE` and `RENAME` already exist, as `Project` and `Rename`.)
-- The rest of the **sugar layer**: `Summarize`. (`Join`/`Union`/`Minus`/`Intersect`/`Compose`/`Extend`/`Rename`/`Wrap`/`Unwrap`/`Semijoin`/`Group`/`Ungroup` are built. `Wrap`/`Unwrap` lower to `Inst::Restructure` → `coddl_relation_restructure`, in-process, SQL push landed for the leaf-column form. `Group`/`Ungroup` (TTM GROUP/UNGROUP, the relation-valued-attribute pair) lower to `Inst::Group`/`Inst::Ungroup` → `coddl_relation_group`/`_ungroup` and **never push** — a relation-valued cell has no flat-column SQL form, so sqlemit's `resolve` declines and the operand fetch pushes at its own root. `Group`'s `surviving_keys` is the survivor set (one tuple per distinct survivor combination — a genuine candidate key, the empty key when every attribute is consumed) plus any survivor-contained input key; `Ungroup`'s is the DBC7 superkey shape (`k ∪ lifted` for each survivor-contained input key `k`), else keyless. `Semijoin { lhs, rhs, negated }` is the one node covering both surface `matching` (semijoin) and `not matching` (antijoin) — see the Sugar layer section below.)
+- The rest of the **sugar layer**: `Summarize`. (`Join`/`Union`/`Minus`/`Intersect`/`Compose`/`Extend`/`Rename`/`Wrap`/`Unwrap`/`Semijoin`/`Group`/`Ungroup`/`Otherwise` are built. `Wrap`/`Unwrap` lower to `Inst::Restructure` → `coddl_relation_restructure`, in-process, SQL push landed for the leaf-column form. `Group`/`Ungroup` (TTM GROUP/UNGROUP, the relation-valued-attribute pair) lower to `Inst::Group`/`Inst::Ungroup` → `coddl_relation_group`/`_ungroup` and **never push** — a relation-valued cell has no flat-column SQL form, so sqlemit's `resolve` declines and the operand fetch pushes at its own root. `Group`'s `surviving_keys` is the survivor set (one tuple per distinct survivor combination — a genuine candidate key, the empty key when every attribute is consumed) plus any survivor-contained input key; `Ungroup`'s is the DBC7 superkey shape (`k ∪ lifted` for each survivor-contained input key `k`), else keyless. `Semijoin { lhs, rhs, negated }` is the one node covering both surface `matching` (semijoin) and `not matching` (antijoin) — see the Sugar layer section below.)
 - The **optimizer** and **cost model**. Mixed-origin handling is built in its default form (`RelParam` shipping, above); a cost model would refine *which* side crosses the boundary for large local relations (temp tables — see [sqlemit.md](sqlemit.md)), not reopen the ship-up default.
-- The per-node **FD set** and **constraint set** (only heading, origin, and leaf keys exist today). **Key inference through the binary nodes** now covers `And` (`join`/`times`/`intersect`/`compose`), `Minus`, and `Semijoin` — `surviving_keys()` propagates keys via the cover + composite rules so those stop emitting a redundant `DISTINCT`, per the "our optimizer does all the work" rule ([principles.md](principles.md) §1). Soundness rules and the running catalog live in [sqlemit.md](sqlemit.md) ("`DISTINCT` elision"). Still open: `Or` (`union`) stays keyless without a disjointness proof (keyless by nature, not a gap), and the in-process **seal** — the ProcIR analogue of `DISTINCT` — is not yet driven by `surviving_keys()`.
+- The per-node **FD set** and **constraint set** (only heading, origin, and leaf keys exist today). **Key inference through the binary nodes** now covers `And` (`join`/`times`/`intersect`/`compose`), `Minus`, `Semijoin`, and `Otherwise` (the exclusive-arms composite `k_primary ∪ k_fallback`) — `surviving_keys()` propagates keys via the cover + composite rules so those stop emitting a redundant `DISTINCT`, per the "our optimizer does all the work" rule ([principles.md](principles.md) §1). Soundness rules and the running catalog live in [sqlemit.md](sqlemit.md) ("`DISTINCT` elision"). Still open: `Or` (`union`) stays keyless without a disjointness proof (keyless by nature, not a gap), and the in-process **seal** — the ProcIR analogue of `DISTINCT` — is not yet driven by `surviving_keys()`.
 - `coddl-execlocal` (an empty stub) as the RelIR→ProcIR consumer, and the runtime RelIR interpreter (the dynamic path).
 - Pushdown / predicate surface beyond `attr <cmp> literal` comparisons and their conjunctions — disjunction, attribute-vs-attribute, arithmetic in predicates, subset/superset. (Scalar comparisons `=`/`<>`/`<`/`<=`/`>`/`>=` and `and`-chains of them already push.)
 

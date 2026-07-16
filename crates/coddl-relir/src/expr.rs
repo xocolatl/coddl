@@ -135,6 +135,25 @@ pub enum RelExpr {
         rhs: Box<RelExpr>,
         negated: bool,
     },
+    /// Relational COALESCE (surface `otherwise`) — the `primary` if it is
+    /// nonempty, else the `fallback`; identical operand headings (typechecked),
+    /// so the result heading is either's. A **sugar node**: algebraically
+    /// `R otherwise D ≡ R union (D times (reltrue minus (R project {})))`, but
+    /// keeping it explicit lets the SQL emitter push the pair as one statement
+    /// — a primary CTE, `UNION ALL` (the arms are exclusive by construction,
+    /// so no dedup is ever owed), and an uncorrelated `WHERE NOT EXISTS`
+    /// emptiness probe on the fallback arm — instead of firing two plans and
+    /// picking the winner in-process. Emission is **root-only** (a compound
+    /// `WITH`-prefixed statement can't sit under another op; `resolve`
+    /// declines it nested), and the lowerer builds the node only when the
+    /// `otherwise` is itself the pushed root — in any nested position the
+    /// whole `otherwise` still self-collapses to one shipped [`RelParam`]
+    /// slot, the settled invariant (`docs/relir.md`). Origin combines like
+    /// the other binary nodes.
+    Otherwise {
+        primary: Box<RelExpr>,
+        fallback: Box<RelExpr>,
+    },
     /// Transitive closure (surface `tclose`) — the Algebra-A `◄TCLOSE►` core,
     /// the one genuinely irreducible operator (transitive closure is not
     /// first-order expressible, so it cannot be built from finite AND/OR/NOT
@@ -485,6 +504,8 @@ impl RelExpr {
             RelExpr::Minus { lhs, .. } => lhs.heading(),
             // Semijoin/antijoin filter `lhs`, so the result heading is `lhs`'s.
             RelExpr::Semijoin { lhs, .. } => lhs.heading(),
+            // Identical operand headings (typechecked) — either is the result.
+            RelExpr::Otherwise { primary, .. } => primary.heading(),
             // Closure preserves the (binary) operand heading.
             RelExpr::TClose { input } => input.heading(),
             // Input attributes plus each computed `(name, type)`; `Heading::new`
@@ -597,6 +618,9 @@ impl RelExpr {
             RelExpr::Or { lhs, rhs } => combine_origin(lhs.origin(), rhs.origin()),
             RelExpr::Minus { lhs, rhs } => combine_origin(lhs.origin(), rhs.origin()),
             RelExpr::Semijoin { lhs, rhs, .. } => combine_origin(lhs.origin(), rhs.origin()),
+            RelExpr::Otherwise { primary, fallback } => {
+                combine_origin(primary.origin(), fallback.origin())
+            }
             // A unary node inherits its input's origin (like Restrict/Project).
             // Note v1 has no `tclose` SQL emission, so a relvar-rooted closure
             // still declines the push (sqlemit errs) and runs in-process — the
@@ -695,6 +719,11 @@ impl RelExpr {
                 );
                 lhs.render_into(out, depth + 1);
                 rhs.render_into(out, depth + 1);
+            }
+            RelExpr::Otherwise { primary, fallback } => {
+                let _ = writeln!(out, "{pad}Otherwise");
+                primary.render_into(out, depth + 1);
+                fallback.render_into(out, depth + 1);
             }
             RelExpr::TClose { input } => {
                 let _ = writeln!(out, "{pad}TClose");
@@ -852,6 +881,31 @@ impl RelExpr {
             // every `lhs` candidate key still uniquely identifies a result tuple
             // — the result is already a set, no `DISTINCT` needed.
             RelExpr::Semijoin { lhs, .. } => lhs.surviving_keys(),
+            // The result is *exactly one* arm's rows (the arms are exclusive),
+            // so any attribute set that is a superkey of both arms is a
+            // superkey of the result: `k_primary ∪ k_fallback` — the same
+            // composite rule as `And`. (Superkeys are sound here; see the
+            // method doc.) Equal keys on both sides degenerate to the key
+            // itself, so a shared candidate key survives outright.
+            RelExpr::Otherwise { primary, fallback } => {
+                let primary_keys = primary.surviving_keys();
+                let fallback_keys = fallback.surviving_keys();
+                let mut out: Vec<Vec<String>> = Vec::new();
+                for kp in &primary_keys {
+                    for kf in &fallback_keys {
+                        let mut composite = kp.clone();
+                        for a in kf {
+                            if !composite.contains(a) {
+                                composite.push(a.clone());
+                            }
+                        }
+                        if !out.contains(&composite) {
+                            out.push(composite);
+                        }
+                    }
+                }
+                out
+            }
             // Closure introduces new tuples, so the operand's keys need not
             // survive; conservatively keyless.
             RelExpr::TClose { .. } => Vec::new(),
@@ -968,6 +1022,11 @@ impl RelExpr {
             RelExpr::Minus { .. } => false,
             // A subset of `lhs`: if `lhs` has ≤ 1 tuple, so does the filtered result.
             RelExpr::Semijoin { lhs, .. } => lhs.card_le_one(),
+            // Exclusive arms: the result is exactly one arm's rows, so it has
+            // ≤ 1 tuple when both arms do.
+            RelExpr::Otherwise { primary, fallback } => {
+                primary.card_le_one() && fallback.card_le_one()
+            }
             RelExpr::TClose { .. } => false,
             // Extend is cardinality-preserving (one input tuple → one output).
             RelExpr::Extend { input, .. } => input.card_le_one(),
@@ -1029,9 +1088,11 @@ impl RelExpr {
             RelExpr::And { lhs, rhs }
             | RelExpr::Or { lhs, rhs }
             | RelExpr::Minus { lhs, rhs }
-            | RelExpr::Semijoin { lhs, rhs, .. } => {
-                lhs.references_table(table) || rhs.references_table(table)
-            }
+            | RelExpr::Semijoin { lhs, rhs, .. }
+            | RelExpr::Otherwise {
+                primary: lhs,
+                fallback: rhs,
+            } => lhs.references_table(table) || rhs.references_table(table),
             RelExpr::MaterializedRelvar { .. } => false,
             // A relation value carries rows, not a table reference.
             RelExpr::RelParam { .. } => false,
@@ -1054,7 +1115,11 @@ impl RelExpr {
             RelExpr::And { lhs, rhs }
             | RelExpr::Or { lhs, rhs }
             | RelExpr::Minus { lhs, rhs }
-            | RelExpr::Semijoin { lhs, rhs, .. } => lhs.rel_param_count() + rhs.rel_param_count(),
+            | RelExpr::Semijoin { lhs, rhs, .. }
+            | RelExpr::Otherwise {
+                primary: lhs,
+                fallback: rhs,
+            } => lhs.rel_param_count() + rhs.rel_param_count(),
             RelExpr::RelvarRef { .. } | RelExpr::MaterializedRelvar { .. } => 0,
         }
     }
@@ -1215,6 +1280,93 @@ mod tests {
             op: CmpOp::Eq,
             value: RestrictValue::Lit(Literal::Integer(1)),
         }
+    }
+
+    /// A same-heading sibling of `greetings` keyed on `message` instead of
+    /// `id` — exercises the `otherwise` composite-key rule with distinct
+    /// per-arm keys.
+    fn farewells() -> RelExpr {
+        RelExpr::RelvarRef {
+            name: "Farewells".to_string(),
+            database: "greetings".to_string(),
+            heading: greetings_heading(),
+            table_name: "farewells".to_string(),
+            columns: vec![
+                ("id".to_string(), "id".to_string()),
+                ("message".to_string(), "message".to_string()),
+            ],
+            keys: vec![vec!["message".to_string()]],
+        }
+    }
+
+    #[test]
+    fn otherwise_reports_heading_and_combined_origin() {
+        // Identical operand headings (typechecked) — either is the result.
+        // Origin combines like the other binary nodes.
+        let both_rooted = RelExpr::Otherwise {
+            primary: Box::new(greetings()),
+            fallback: Box::new(farewells()),
+        };
+        assert_eq!(both_rooted.heading(), greetings_heading());
+        assert_eq!(both_rooted.origin(), StorageOrigin::RelvarRooted);
+        let mixed = RelExpr::Otherwise {
+            primary: Box::new(RelExpr::RelParam {
+                slot: 0,
+                heading: greetings_heading(),
+            }),
+            fallback: Box::new(greetings()),
+        };
+        assert_eq!(mixed.origin(), StorageOrigin::Mixed);
+    }
+
+    #[test]
+    fn otherwise_surviving_keys_compose_across_the_arms() {
+        // The result is exactly one arm's rows, so `k_primary ∪ k_fallback`
+        // is a superkey of the result whichever arm fires (the `And`
+        // composite rule). Shared keys degenerate to the key itself.
+        let same_key = RelExpr::Otherwise {
+            primary: Box::new(greetings()),
+            fallback: Box::new(greetings()),
+        };
+        assert_eq!(same_key.surviving_keys(), vec![vec!["id".to_string()]]);
+        let different_keys = RelExpr::Otherwise {
+            primary: Box::new(greetings()),
+            fallback: Box::new(farewells()),
+        };
+        assert_eq!(
+            different_keys.surviving_keys(),
+            vec![vec!["id".to_string(), "message".to_string()]]
+        );
+        assert!(!different_keys.needs_distinct());
+        // A keyless arm poisons every composite: no keys survive.
+        let keyless_fallback = RelExpr::Otherwise {
+            primary: Box::new(greetings()),
+            fallback: Box::new(RelExpr::MaterializedRelvar {
+                name: "Local".to_string(),
+                heading: greetings_heading(),
+            }),
+        };
+        assert!(keyless_fallback.surviving_keys().is_empty());
+    }
+
+    #[test]
+    fn otherwise_card_le_one_requires_both_arms() {
+        // Exclusive arms: the result is one arm's rows, so ≤ 1 holds only
+        // when it holds for both.
+        let pinned = |input: RelExpr| RelExpr::Restrict {
+            input: Box::new(input),
+            pred: id_eq_1(),
+        };
+        let both_pinned = RelExpr::Otherwise {
+            primary: Box::new(pinned(greetings())),
+            fallback: Box::new(pinned(greetings())),
+        };
+        assert!(both_pinned.card_le_one());
+        let fallback_unbounded = RelExpr::Otherwise {
+            primary: Box::new(pinned(greetings())),
+            fallback: Box::new(greetings()),
+        };
+        assert!(!fallback_unbounded.card_le_one());
     }
 
     #[test]

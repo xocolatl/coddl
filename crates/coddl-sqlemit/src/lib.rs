@@ -261,7 +261,11 @@ fn rel_params_of(expr: &RelExpr) -> Vec<RelParamSpec> {
             RelExpr::And { lhs, rhs }
             | RelExpr::Or { lhs, rhs }
             | RelExpr::Minus { lhs, rhs }
-            | RelExpr::Semijoin { lhs, rhs, .. } => {
+            | RelExpr::Semijoin { lhs, rhs, .. }
+            | RelExpr::Otherwise {
+                primary: lhs,
+                fallback: rhs,
+            } => {
                 walk(lhs, out);
                 walk(rhs, out);
             }
@@ -334,6 +338,16 @@ fn annotate_absorbs(expr: &RelExpr, specs: &mut [RelParamSpec]) -> Vec<String> {
                 walk(lhs, absorbs, specs, gates);
                 walk(rhs, absorbs && !negated, specs, gates);
             }
+            // Neither side of an `otherwise` absorbs: an empty primary yields
+            // the fallback's rows (the whole point of the operator), and an
+            // empty fallback still yields the primary's. In particular a
+            // false gate in the primary must NOT skip the statement (the
+            // fallback must fire), and an empty shipped primary slot must
+            // still fire so the `NOT EXISTS` probe picks the fallback arm.
+            RelExpr::Otherwise { primary, fallback } => {
+                walk(primary, false, specs, gates);
+                walk(fallback, false, specs, gates);
+            }
             RelExpr::RelvarRef { .. } | RelExpr::MaterializedRelvar { .. } => {}
         }
     }
@@ -366,6 +380,13 @@ fn gate_param_indices(params: &[ParamSource], absorbing: &[String]) -> Vec<u32> 
 const TCLOSE_RESULT_CTE: &str = "coddl_tc";
 const TCLOSE_OPERAND_CTE: &str = "coddl_tc_op";
 
+/// CTE / derived-table names for the `otherwise` emission: `coddl_ow_p` holds
+/// the primary once (it is referenced twice — the first arm and the emptiness
+/// probe — but its bind parameters must appear once); `coddl_ow_f` aliases the
+/// fallback's inline derived table. Same clash discipline as `coddl_tc*`.
+const OTHERWISE_PRIMARY_CTE: &str = "coddl_ow_p";
+const OTHERWISE_FALLBACK_ALIAS: &str = "coddl_ow_f";
+
 /// Emit one relvar-rooted relational expression as a backend `SELECT`.
 ///
 /// The expression bottoms out in a `RelvarRef`, optionally wrapped in
@@ -376,16 +397,17 @@ const TCLOSE_OPERAND_CTE: &str = "coddl_tc_op";
 /// heading, so an author-written projection narrows the `SELECT` faithfully.
 /// `DISTINCT` is emitted unless the result is provably a set.
 pub fn emit_select(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
-    // Root transitive closure → a `WITH RECURSIVE` query. Handled here at the
-    // true statement root, NOT in `emit_select_offset`: a `WITH`-prefixed query
-    // cannot be a compound-`UNION`/`EXCEPT` operand (invalid SQL, and SQLite
-    // rejects parenthesizing it), so a `TClose` reached as a set-op operand
-    // goes through `emit_select_offset` → `resolve`'s Err arm, declines the
-    // push, and decomposes in-process instead.
-    let mut query = if let RelExpr::TClose { input } = expr {
-        emit_tclose(input, dialect)?
-    } else {
-        emit_select_offset(expr, dialect, 0, &[], false)?
+    // Root transitive closure → a `WITH RECURSIVE` query; root `otherwise` →
+    // a `WITH` + `UNION ALL` + `NOT EXISTS` query. Both handled here at the
+    // true statement root, NOT in `emit_select_offset`: a `WITH`-prefixed
+    // query cannot be a compound-`UNION`/`EXCEPT` operand (invalid SQL, and
+    // SQLite rejects parenthesizing it), so either node reached as a set-op
+    // operand goes through `emit_select_offset` → `resolve`'s Err arm,
+    // declines the push, and decomposes in-process instead.
+    let mut query = match expr {
+        RelExpr::TClose { input } => emit_tclose(input, dialect)?,
+        RelExpr::Otherwise { primary, fallback } => emit_otherwise(primary, fallback, dialect)?,
+        _ => emit_select_offset(expr, dialect, 0, &[], false)?,
     };
     // The absorption flags and gate skip indices describe the whole
     // statement, so they are computed here at the true root, not in the
@@ -420,11 +442,14 @@ pub fn emit_select_ordered(
     }
     if matches!(
         expr,
-        RelExpr::Or { .. } | RelExpr::Minus { .. } | RelExpr::TClose { .. }
+        RelExpr::Or { .. }
+            | RelExpr::Minus { .. }
+            | RelExpr::TClose { .. }
+            | RelExpr::Otherwise { .. }
     ) {
         return Err(BackendError::Other(
-            "order pushdown: a trailing ORDER BY cannot attach to a set-op or \
-             transitive-closure source"
+            "order pushdown: a trailing ORDER BY cannot attach to a set-op, \
+             transitive-closure, or otherwise source"
                 .to_string(),
         ));
     }
@@ -483,6 +508,70 @@ fn emit_tclose(input: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
         params: op.params,
         result_heading: heading,
         rel_params: op.rel_params,
+        gate_params: Vec::new(),
+        plan_id,
+    })
+}
+
+/// Emit a root `Otherwise` (surface `otherwise` — relational COALESCE) as one
+/// backend statement: the primary's rows if it is nonempty, else the
+/// fallback's.
+///
+/// The primary is defined **once** as a non-recursive CTE (it is referenced
+/// twice — the first arm and the uncorrelated `NOT EXISTS` emptiness probe —
+/// but its bind parameters must appear once); the fallback is referenced once,
+/// so it stays an inline derived table, which also keeps the appended `WHERE`
+/// unambiguous when the fallback text is itself a compound. The arms combine
+/// with `UNION ALL` — the one deliberate exception to the never-`… ALL` set-op
+/// rule: the arms are **exclusive by construction** (the second is guarded by
+/// the first's emptiness), so no dedup is ever owed, and each arm's
+/// sub-emission already enforces its own set-ness. Both arms emit
+/// canonical-sorted, attribute-named output columns over the identical
+/// (typechecked) heading, so the positional CTE column list and the two arm
+/// SELECT lists line up by construction.
+fn emit_otherwise(primary: &RelExpr, fallback: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
+    let heading = primary.heading();
+    // SQL has no zero-column CTE column list or SELECT list, so a nullary
+    // `otherwise` declines to the in-process path (like a nullary rel-param).
+    if heading.attrs().is_empty() {
+        return Err(BackendError::Other(
+            "a nullary otherwise does not push to SQL".to_string(),
+        ));
+    }
+    // The shared column list: leaf names for a Tuple-valued attribute
+    // (depth-first, canonical order — matching what each arm's SELECT list
+    // emits and what `record_layout` expects positionally).
+    let mut cols = Vec::new();
+    for (attr, ty) in heading.attrs() {
+        push_unqualified_leaf_cols(attr, ty, &mut cols);
+    }
+    let col_list = cols.join(", ");
+    // Operand SELECTs — params concatenate primary then fallback, the
+    // fallback's placeholders starting after the primary's.
+    let p = emit_select_offset(primary, dialect, 0, &[], false)?;
+    let f = emit_select_offset(fallback, dialect, p.sql.param_count, &[], false)?;
+    let cte = OTHERWISE_PRIMARY_CTE;
+    let text = format!(
+        "WITH {cte}({col_list}) AS ({}) \
+         SELECT {col_list} FROM {cte} \
+         UNION ALL \
+         SELECT {col_list} FROM ({}) AS {OTHERWISE_FALLBACK_ALIAS} \
+         WHERE NOT EXISTS (SELECT 1 FROM {cte})",
+        p.sql.text, f.sql.text,
+    );
+    let mut params = p.params;
+    params.extend(f.params);
+    let mut rel_params = p.rel_params;
+    rel_params.extend(f.rel_params);
+    let plan_id = PlanId(fnv1a(dialect, &text));
+    Ok(SqlQuery {
+        sql: SqlString {
+            param_count: params.len() as u32,
+            text,
+        },
+        params,
+        result_heading: heading,
+        rel_params,
         gate_params: Vec::new(),
         plan_id,
     })
@@ -1495,6 +1584,15 @@ fn resolve(
         RelExpr::Semijoin { .. } => Err(BackendError::Other(
             "semijoin nested under a relational operator does not push to SQL".to_string(),
         )),
+        // An `otherwise` reached here is non-root; its compound `WITH`-prefixed
+        // statement can't be a FROM table-expression, so decline. Defensive in
+        // practice: the lowerer only builds the node at the pushed root — in
+        // any nested position the whole `otherwise` self-collapses to a shipped
+        // `RelParam` slot instead. A *root* `Otherwise` is handled in
+        // `emit_select` (like `TClose`).
+        RelExpr::Otherwise { .. } => Err(BackendError::Other(
+            "otherwise nested under a relational operator does not push to SQL".to_string(),
+        )),
         // A `TClose` reached *here* (via `resolve`) is non-root — nested under a
         // relational op (`(R tclose) where p`), or a set-op operand
         // (`(R tclose) union S`). A `WITH RECURSIVE` query can't be a `FROM`
@@ -1771,6 +1869,23 @@ fn push_leaf_cols(
             }
             Ok(())
         }
+    }
+}
+
+/// Push the output column name(s) for one result attribute, unqualified —
+/// leaf names for a `Tuple`-valued attribute, flattened depth-first in the
+/// sub-heading's canonical order (matching `record_layout`, like
+/// [`push_leaf_cols`]). Used where the columns are already attribute-named
+/// outputs of a single table expression (the `otherwise` CTE column list and
+/// arm SELECT lists), so neither aliasing nor qualification is needed.
+fn push_unqualified_leaf_cols(attr: &str, ty: &Type, out: &mut Vec<String>) {
+    match ty {
+        Type::Tuple(sub) => {
+            for (name, sub_ty) in sub.attrs() {
+                push_unqualified_leaf_cols(name, sub_ty, out);
+            }
+        }
+        _ => out.push(quote_ident(attr)),
     }
 }
 
@@ -3665,6 +3780,199 @@ mod tests {
         assert!(
             emit_select(&expr, Dialect::SQLite).is_err(),
             "a tclose as a set-op operand must not push as one query"
+        );
+    }
+
+    // ── otherwise (WITH + UNION ALL + NOT EXISTS) ────────────────────────
+
+    #[test]
+    fn otherwise_emits_cte_union_all_not_exists() {
+        // `Morning otherwise Evening` → the primary once as a CTE, the arms
+        // combined with UNION ALL (exclusive by construction — the fallback
+        // arm is guarded by the primary's emptiness probe — so no dedup is
+        // owed), the fallback as an inline derived table.
+        let expr = RelExpr::Otherwise {
+            primary: Box::new(morning()),
+            fallback: Box::new(evening()),
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"WITH coddl_ow_p("id", "name") AS (SELECT "id", "name" FROM "morning") SELECT "id", "name" FROM coddl_ow_p UNION ALL SELECT "id", "name" FROM (SELECT "id", "name" FROM "evening") AS coddl_ow_f WHERE NOT EXISTS (SELECT 1 FROM coddl_ow_p)"#
+        );
+        assert_eq!(q.sql.param_count, 0);
+        assert!(q.params.is_empty());
+        assert_eq!(
+            q.result_heading,
+            Heading::new(vec![
+                ("id".to_string(), Type::Integer),
+                ("name".to_string(), Type::Text),
+            ])
+        );
+    }
+
+    #[test]
+    fn otherwise_primary_param_appears_once() {
+        // `(Morning where id = 1) otherwise Evening` — the primary is
+        // referenced twice (first arm + emptiness probe) but defined once in
+        // the CTE, so its bind parameter appears exactly once.
+        let expr = RelExpr::Otherwise {
+            primary: Box::new(where_id_1(morning())),
+            fallback: Box::new(evening()),
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(q.sql.param_count, 1);
+        assert_eq!(q.params, vec![ParamSource::Lit(Value::Integer(1))]);
+        assert_eq!(
+            q.sql.text.matches('?').count(),
+            1,
+            "the primary CTE holds the only `?`: {}",
+            q.sql.text
+        );
+    }
+
+    #[test]
+    fn otherwise_postgres_offsets_fallback_params() {
+        // Postgres `$N` placeholders are statement-global: the primary's bind
+        // is `$1` (in the CTE), the fallback's numbers after it as `$2`.
+        let expr = RelExpr::Otherwise {
+            primary: Box::new(where_id_1(morning())),
+            fallback: Box::new(where_id_1(evening())),
+        };
+        let q = emit_select(&expr, Dialect::Postgres).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"WITH coddl_ow_p("id", "name") AS (SELECT "id", "name" FROM "morning" WHERE "id" = $1) SELECT "id", "name" FROM coddl_ow_p UNION ALL SELECT "id", "name" FROM (SELECT "id", "name" FROM "evening" WHERE "id" = $2) AS coddl_ow_f WHERE NOT EXISTS (SELECT 1 FROM coddl_ow_p)"#
+        );
+        assert_eq!(q.sql.param_count, 2);
+    }
+
+    #[test]
+    fn otherwise_arms_keep_their_own_distinct() {
+        // Each arm's sub-emission makes its own DISTINCT decision: projecting
+        // away the key forces `SELECT DISTINCT` inside both the CTE and the
+        // fallback derived table; the compound level adds none (UNION ALL —
+        // the arms are exclusive and each is already a set).
+        let expr = RelExpr::Otherwise {
+            primary: Box::new(RelExpr::Project {
+                input: Box::new(morning()),
+                keep: vec!["name".to_string()],
+            }),
+            fallback: Box::new(RelExpr::Project {
+                input: Box::new(evening()),
+                keep: vec!["name".to_string()],
+            }),
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"WITH coddl_ow_p("name") AS (SELECT DISTINCT "name" FROM "morning") SELECT "name" FROM coddl_ow_p UNION ALL SELECT "name" FROM (SELECT DISTINCT "name" FROM "evening") AS coddl_ow_f WHERE NOT EXISTS (SELECT 1 FROM coddl_ow_p)"#
+        );
+    }
+
+    #[test]
+    fn otherwise_nested_under_restrict_declines() {
+        // `(Morning otherwise Evening) where id = 1` — a compound
+        // `WITH`-prefixed statement can't be a FROM table-expression, so the
+        // nested node errs in `resolve` and the whole push declines.
+        let expr = where_id_1(RelExpr::Otherwise {
+            primary: Box::new(morning()),
+            fallback: Box::new(evening()),
+        });
+        assert!(
+            emit_select(&expr, Dialect::SQLite).is_err(),
+            "a nested otherwise must not push as part of a larger query"
+        );
+    }
+
+    #[test]
+    fn otherwise_as_setop_operand_does_not_push() {
+        // `(Morning otherwise Evening) union Evening` — same decline as a
+        // tclose operand: a WITH-prefixed query can't be a compound operand.
+        let expr = RelExpr::Or {
+            lhs: Box::new(RelExpr::Otherwise {
+                primary: Box::new(morning()),
+                fallback: Box::new(evening()),
+            }),
+            rhs: Box::new(evening()),
+        };
+        assert!(
+            emit_select(&expr, Dialect::SQLite).is_err(),
+            "an otherwise as a set-op operand must not push as one query"
+        );
+    }
+
+    #[test]
+    fn otherwise_nullary_heading_declines() {
+        // SQL has no zero-column CTE column list, so a nullary otherwise
+        // declines (falls back to the in-process `Inst::Otherwise` path).
+        let expr = RelExpr::Otherwise {
+            primary: Box::new(RelExpr::Project {
+                input: Box::new(morning()),
+                keep: Vec::new(),
+            }),
+            fallback: Box::new(RelExpr::Project {
+                input: Box::new(evening()),
+                keep: Vec::new(),
+            }),
+        };
+        assert!(
+            emit_select(&expr, Dialect::SQLite).is_err(),
+            "a nullary otherwise must decline the push"
+        );
+    }
+
+    #[test]
+    fn otherwise_rel_param_primary_is_not_absorbing() {
+        // A shipped local primary (`local otherwise Relvar`) must NOT absorb:
+        // an empty primary slot has to fire the statement so the NOT EXISTS
+        // probe picks the fallback arm — the opposite of the join-family
+        // multiplicative zero.
+        let heading = Heading::new(vec![("id".to_string(), Type::Integer)]);
+        let expr = RelExpr::Otherwise {
+            primary: Box::new(RelExpr::RelParam { slot: 0, heading }),
+            fallback: Box::new(RelExpr::Project {
+                input: Box::new(evening()),
+                keep: vec!["id".to_string()],
+            }),
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(q.rel_params.len(), 1);
+        assert!(
+            !q.rel_params[0].absorbs_empty,
+            "an otherwise primary slot must not be marked absorbing"
+        );
+    }
+
+    #[test]
+    fn gate_in_otherwise_primary_is_not_skip_eligible() {
+        // `(Morning when c) otherwise Evening` — a false gate empties the
+        // *primary*, which selects the fallback; it must not skip the whole
+        // statement, so the gate's bind is not marked skip-eligible.
+        let expr = RelExpr::Otherwise {
+            primary: Box::new(gate(morning(), "c")),
+            fallback: Box::new(evening()),
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(q.params, vec![ParamSource::Gate("c".to_string())]);
+        assert!(
+            q.gate_params.is_empty(),
+            "a gate inside an otherwise arm is not in absorbing position"
+        );
+    }
+
+    #[test]
+    fn load_order_declines_otherwise_root() {
+        // A trailing ORDER BY can't attach to the compound form; the ordered
+        // load falls back to the in-process sort over the (separately pushed)
+        // unordered result.
+        let expr = RelExpr::Otherwise {
+            primary: Box::new(morning()),
+            fallback: Box::new(evening()),
+        };
+        assert!(
+            emit_select_ordered(&expr, Dialect::SQLite, &[("id".to_string(), false)]).is_err(),
+            "an ordered otherwise root must decline the push"
         );
     }
 
