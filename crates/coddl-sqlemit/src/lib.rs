@@ -66,6 +66,15 @@ pub struct SqlQuery {
     /// cells bind numbered after the scalar `params`. Empty for a query with
     /// no shipped relation.
     pub rel_params: Vec<RelParamSpec>,
+    /// The 0-based indices into `params` of the `when`-gate binds whose false
+    /// value makes the whole result provably empty — every gate conjunct on
+    /// the **absorbing spine** (same walk as [`RelParamSpec::absorbs_empty`]).
+    /// The runtime checks these binds before preparing and returns a fresh
+    /// empty relation with no statement when any is 0 (the false-gate
+    /// statement skip, the Boolean sibling of the empty-slot short-circuit).
+    /// Empty for a query with no absorbing gate; filled only at the read
+    /// emission roots.
+    pub gate_params: Vec<u32>,
     pub plan_id: PlanId,
 }
 
@@ -122,6 +131,12 @@ pub fn rel_param_marker(slot: usize) -> String {
 pub enum ParamSource {
     Lit(Value),
     Param(String),
+    /// A `when`-gate's Boolean bind (the `?N = 1` conjunct). Resolved to a
+    /// runtime value exactly like [`ParamSource::Param`], but kept
+    /// distinguishable so the emission root can compute the skip-eligible
+    /// bind indices ([`SqlQuery::gate_params`]) positionally from the
+    /// finished `params` list.
+    Gate(String),
     /// A cell of the dispatch slot's single shipped row (see
     /// `RestrictValue::SlotCell`). Never a lowerer bind argument: the runtime
     /// fills it from the relation it is already holding when it selects the
@@ -263,26 +278,37 @@ fn rel_params_of(expr: &RelExpr) -> Vec<RelParamSpec> {
 }
 
 /// Mark each rel-param spec whose emptiness **absorbs** — makes the whole
-/// query result provably empty. Top-down from the query root: emptiness
-/// propagates through every unary heading op, both operands of `And`
-/// (join/times/intersect — the empty relation is the join family's
-/// multiplicative zero), both sides of a semijoin, and the `Minus` /
-/// antijoin **lhs**. It does *not* propagate through an `Or` operand (the
-/// empty relation is union's additive identity), a `Minus` rhs, or a
-/// `not matching` rhs (an empty rhs means everything survives — the typed
-/// zero-row `SELECT … WHERE 0` form stays correct and must still fire).
-/// Called once per read-side emission root so the flags describe the whole
-/// statement, not a subquery.
-fn annotate_absorbs(expr: &RelExpr, specs: &mut [RelParamSpec]) {
-    fn walk(e: &RelExpr, absorbs: bool, specs: &mut [RelParamSpec]) {
+/// query result provably empty — and collect the bind names of the
+/// `when`-gate conjuncts sitting in absorbing position (a false gate there
+/// annihilates the result the same way an empty absorbing slot does).
+/// Top-down from the query root: absorption propagates through every unary
+/// heading op, both operands of `And` (join/times/intersect — the empty
+/// relation is the join family's multiplicative zero), both sides of a
+/// semijoin, and the `Minus` / antijoin **lhs**. It does *not* propagate
+/// through an `Or` operand (the empty relation is union's additive
+/// identity), a `Minus` rhs, or a `not matching` rhs (an empty rhs means
+/// everything survives — the typed zero-row `SELECT … WHERE 0` form stays
+/// correct and must still fire). One walk for both features so the
+/// absorption rules can never drift between them. Called once per read-side
+/// emission root so the results describe the whole statement, not a
+/// subquery.
+fn annotate_absorbs(expr: &RelExpr, specs: &mut [RelParamSpec]) -> Vec<String> {
+    fn walk(e: &RelExpr, absorbs: bool, specs: &mut [RelParamSpec], gates: &mut Vec<String>) {
         match e {
             RelExpr::RelParam { slot, .. } => {
                 if let Some(spec) = specs.iter_mut().find(|s| s.slot == *slot) {
                     spec.absorbs_empty = absorbs;
                 }
             }
-            RelExpr::Restrict { input, .. }
-            | RelExpr::Project { input, .. }
+            RelExpr::Restrict { input, pred } => {
+                if absorbs {
+                    if let Predicate::Gate(RestrictValue::Param(name)) = pred {
+                        gates.push(name.clone());
+                    }
+                }
+                walk(input, absorbs, specs, gates);
+            }
+            RelExpr::Project { input, .. }
             | RelExpr::Rename { input, .. }
             | RelExpr::Extend { input, .. }
             | RelExpr::TClose { input }
@@ -291,27 +317,45 @@ fn annotate_absorbs(expr: &RelExpr, specs: &mut [RelParamSpec]) {
             // An empty operand groups/ungroups to the empty relation, so
             // emptiness propagates.
             | RelExpr::Group { input, .. }
-            | RelExpr::Ungroup { input, .. } => walk(input, absorbs, specs),
+            | RelExpr::Ungroup { input, .. } => walk(input, absorbs, specs, gates),
             RelExpr::And { lhs, rhs } => {
-                walk(lhs, absorbs, specs);
-                walk(rhs, absorbs, specs);
+                walk(lhs, absorbs, specs, gates);
+                walk(rhs, absorbs, specs, gates);
             }
             RelExpr::Or { lhs, rhs } => {
-                walk(lhs, false, specs);
-                walk(rhs, false, specs);
+                walk(lhs, false, specs, gates);
+                walk(rhs, false, specs, gates);
             }
             RelExpr::Minus { lhs, rhs } => {
-                walk(lhs, absorbs, specs);
-                walk(rhs, false, specs);
+                walk(lhs, absorbs, specs, gates);
+                walk(rhs, false, specs, gates);
             }
             RelExpr::Semijoin { lhs, rhs, negated } => {
-                walk(lhs, absorbs, specs);
-                walk(rhs, absorbs && !negated, specs);
+                walk(lhs, absorbs, specs, gates);
+                walk(rhs, absorbs && !negated, specs, gates);
             }
             RelExpr::RelvarRef { .. } | RelExpr::MaterializedRelvar { .. } => {}
         }
     }
-    walk(expr, true, specs);
+    let mut gates = Vec::new();
+    walk(expr, true, specs, &mut gates);
+    gates
+}
+
+/// The 0-based bind indices of the gate params whose name is in the
+/// absorbing set — [`SqlQuery::gate_params`]. Position in `params` *is* the
+/// bind index (the list lines up with the `?N` sequence). Matching by name
+/// marks every occurrence of an absorbing gate's bind, which is sound: the
+/// same name is the same local, so every occurrence binds the same runtime
+/// Boolean, and one absorbing occurrence is enough for false to annihilate
+/// the whole result.
+fn gate_param_indices(params: &[ParamSource], absorbing: &[String]) -> Vec<u32> {
+    params
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| matches!(p, ParamSource::Gate(name) if absorbing.contains(name)))
+        .map(|(i, _)| i as u32)
+        .collect()
 }
 
 /// CTE names for the `WITH RECURSIVE` transitive-closure emission: `coddl_tc`
@@ -343,9 +387,11 @@ pub fn emit_select(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
     } else {
         emit_select_offset(expr, dialect, 0, &[], false)?
     };
-    // The absorption flags describe the whole statement, so they are computed
-    // here at the true root, not in the sub-emission recursion.
-    annotate_absorbs(expr, &mut query.rel_params);
+    // The absorption flags and gate skip indices describe the whole
+    // statement, so they are computed here at the true root, not in the
+    // sub-emission recursion.
+    let absorbing_gates = annotate_absorbs(expr, &mut query.rel_params);
+    query.gate_params = gate_param_indices(&query.params, &absorbing_gates);
     Ok(query)
 }
 
@@ -383,7 +429,8 @@ pub fn emit_select_ordered(
         ));
     }
     let mut query = emit_select_offset(expr, dialect, 0, order, false)?;
-    annotate_absorbs(expr, &mut query.rel_params);
+    let absorbing_gates = annotate_absorbs(expr, &mut query.rel_params);
+    query.gate_params = gate_param_indices(&query.params, &absorbing_gates);
     Ok(query)
 }
 
@@ -436,6 +483,7 @@ fn emit_tclose(input: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
         params: op.params,
         result_heading: heading,
         rel_params: op.rel_params,
+        gate_params: Vec::new(),
         plan_id,
     })
 }
@@ -473,6 +521,7 @@ fn emit_delete(expr: &RelExpr, dialect: Dialect) -> Result<SqlQuery> {
         // honest descriptor of what was matched.
         result_heading: expr.heading(),
         rel_params: rel_params_of(expr),
+        gate_params: Vec::new(),
         plan_id,
     })
 }
@@ -620,6 +669,7 @@ fn emit_idempotent_insert(target: &RelExpr, e: &RelExpr, dialect: Dialect) -> Re
         params: src.params,
         result_heading: target.heading(),
         rel_params: src.rel_params,
+        gate_params: Vec::new(),
         plan_id,
     })
 }
@@ -787,6 +837,7 @@ fn emit_update(target: &RelExpr, rhs: &RelExpr, dialect: Dialect) -> Result<SqlQ
         params,
         result_heading: target.heading(),
         rel_params: rel_params_of(rhs),
+        gate_params: Vec::new(),
         plan_id,
     })
 }
@@ -857,6 +908,7 @@ pub fn emit_insert_template(target: &RelExpr, dialect: Dialect) -> Result<SqlQue
             // zero batches).
             absorbs_empty: false,
         }],
+        gate_params: Vec::new(),
         plan_id,
     })
 }
@@ -920,6 +972,7 @@ fn emit_anti_join_delete(
         params: sub.params,
         result_heading: target.heading(),
         rel_params: sub.rel_params,
+        gate_params: Vec::new(),
         plan_id,
     })
 }
@@ -983,6 +1036,7 @@ pub fn emit_replace_insert(target: &RelExpr, x: &RelExpr, dialect: Dialect) -> R
         params: src.params,
         result_heading: target.heading(),
         rel_params: src.rel_params,
+        gate_params: Vec::new(),
         plan_id,
     })
 }
@@ -1111,6 +1165,7 @@ fn emit_select_offset(
             params,
             result_heading: heading,
             rel_params,
+            gate_params: Vec::new(),
             plan_id,
         });
     }
@@ -1154,6 +1209,7 @@ fn emit_select_offset(
             // result is the lhs's rows. Either way the lhs heading is correct.
             result_heading: l.result_heading,
             rel_params,
+            gate_params: Vec::new(),
             plan_id,
         });
     }
@@ -1317,6 +1373,7 @@ fn emit_select_offset(
         params,
         result_heading: heading,
         rel_params: rel_params_of(expr),
+        gate_params: Vec::new(),
         plan_id,
     })
 }
@@ -1612,7 +1669,11 @@ fn render_where_clause(
             Dialect::SQLite => format!("?{index}"),
             Dialect::Postgres => format!("${index}"),
         };
-        let value = match conjunct {
+        // Every form occupies one positional placeholder in `wheres` order,
+        // so the pushed `ParamSource` list lines up with the emitted `?`/`$n`
+        // sequence. A `SlotCell` renders like any other bind; only who fills
+        // it differs (the runtime, from the dispatch slot's single row).
+        let source = match conjunct {
             WhereConjunct::Cmp { col, op, value } => {
                 // A `Rational` *ordering* restriction (`< <= > >=`) compares canonical
                 // `"n/d"` TEXT, which sorts lexicographically — wrong for rationals. Sort
@@ -1634,27 +1695,34 @@ fn render_where_clause(
                     quote_ident(col),
                     op.sql()
                 ));
-                value
+                match value {
+                    RestrictValue::Lit(lit) => ParamSource::Lit(Value::from(lit.clone())),
+                    RestrictValue::Param(name) => ParamSource::Param(name.clone()),
+                    RestrictValue::SlotCell { slot, cell } => ParamSource::SlotCell {
+                        slot: *slot,
+                        cell: *cell,
+                    },
+                }
             }
             // The gate conjunct: a Boolean bound as integer 0/1, tested
-            // against 1 (a bare truthy placeholder is SQLite-only).
+            // against 1 (a bare truthy placeholder is SQLite-only). The bind
+            // stays a distinguishable `ParamSource::Gate` so the emission
+            // root can mark the skip-eligible indices.
             WhereConjunct::Gate(value) => {
                 conjuncts.push(format!("{placeholder} = 1"));
-                value
+                match value {
+                    RestrictValue::Param(name) => ParamSource::Gate(name.clone()),
+                    // A literal gate would be skip-ineligible but correct;
+                    // the lowerer never builds one today (a literal condition
+                    // rides the cond side table as `__when_<k>`).
+                    RestrictValue::Lit(lit) => ParamSource::Lit(Value::from(lit.clone())),
+                    RestrictValue::SlotCell { .. } => {
+                        unreachable!("a gate never binds a slot cell")
+                    }
+                }
             }
         };
-        // Every form occupies one positional placeholder in `wheres` order, so
-        // the pushed `ParamSource` list lines up with the emitted `?`/`$n`
-        // sequence. A `SlotCell` renders like any other bind; only who fills
-        // it differs (the runtime, from the dispatch slot's single row).
-        params.push(match value {
-            RestrictValue::Lit(lit) => ParamSource::Lit(Value::from(lit.clone())),
-            RestrictValue::Param(name) => ParamSource::Param(name.clone()),
-            RestrictValue::SlotCell { slot, cell } => ParamSource::SlotCell {
-                slot: *slot,
-                cell: *cell,
-            },
-        });
+        params.push(source);
     }
     Ok(format!(" WHERE {}", conjuncts.join(" AND ")))
 }
@@ -1889,6 +1957,83 @@ mod tests {
                 vec![ParamSource::Lit(Value::Integer(3))],
                 "op {op:?}"
             );
+        }
+    }
+
+    /// `input when <name>` — a gate conjunct bound under `name`.
+    fn gate(input: RelExpr, name: &str) -> RelExpr {
+        RelExpr::Restrict {
+            input: Box::new(input),
+            pred: Predicate::Gate(RestrictValue::Param(name.to_string())),
+        }
+    }
+
+    #[test]
+    fn gate_at_root_is_skip_eligible() {
+        // A root gate sits on the absorbing spine: its bind is recorded as a
+        // `ParamSource::Gate` and its index marked skip-eligible, so the
+        // force point can return the empty result without a statement when
+        // it binds false.
+        let q = emit_select(&gate(greetings(), "c"), Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id", "message" FROM "greetings" WHERE ?1 = 1"#
+        );
+        assert_eq!(q.params, vec![ParamSource::Gate("c".to_string())]);
+        assert_eq!(q.gate_params, vec![0]);
+    }
+
+    #[test]
+    fn gate_over_restriction_marks_its_own_index() {
+        // `(Greetings where id = 1) when c` — the comparison bind is ?1, the
+        // gate bind ?2; only the gate's (0-based) index is skip-eligible.
+        let q = emit_select(&gate(where_id_1(greetings()), "c"), Dialect::SQLite).unwrap();
+        assert_eq!(
+            q.sql.text,
+            r#"SELECT "id", "message" FROM "greetings" WHERE "id" = ?1 AND ?2 = 1"#
+        );
+        assert_eq!(
+            q.params,
+            vec![
+                ParamSource::Lit(Value::Integer(1)),
+                ParamSource::Gate("c".to_string()),
+            ]
+        );
+        assert_eq!(q.gate_params, vec![1]);
+    }
+
+    #[test]
+    fn gate_under_union_arm_is_not_skip_eligible() {
+        // A gate inside a `union` arm does not absorb (the empty relation is
+        // union's additive identity — a false gate empties one arm, not the
+        // result), so no skip index is marked and the statement always fires.
+        let expr = RelExpr::Or {
+            lhs: Box::new(gate(greetings(), "c")),
+            rhs: Box::new(greetings()),
+        };
+        let q = emit_select(&expr, Dialect::SQLite).unwrap();
+        assert_eq!(q.params, vec![ParamSource::Gate("c".to_string())]);
+        assert!(q.gate_params.is_empty());
+    }
+
+    #[test]
+    fn gate_in_semijoin_rhs_is_skip_eligible() {
+        // A `matching` rhs absorbs (either side empty → result empty), so a
+        // gate there is skip-eligible; on the `not matching` rhs it is not
+        // (empty rhs → everything survives).
+        for (negated, want) in [(false, vec![0u32]), (true, Vec::new())] {
+            let expr = RelExpr::Semijoin {
+                lhs: Box::new(greetings()),
+                rhs: Box::new(gate(mentions(), "c")),
+                negated,
+            };
+            let q = emit_select(&expr, Dialect::SQLite).unwrap();
+            assert_eq!(
+                q.params,
+                vec![ParamSource::Gate("c".to_string())],
+                "negated {negated}"
+            );
+            assert_eq!(q.gate_params, want, "negated {negated}");
         }
     }
 

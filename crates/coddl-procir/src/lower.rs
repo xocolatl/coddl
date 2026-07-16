@@ -5785,6 +5785,7 @@ impl Lowerer {
                         absorbs_empty: s.absorbs_empty,
                     })
                     .collect(),
+                gate_params: query.gate_params.clone(),
                 result_heading_id,
                 card1_alt: card1_alt.map(|(alt, _)| alt),
                 dispatch_slot: card1_alt.map(|(_, slot)| slot as u32).unwrap_or(0),
@@ -5838,6 +5839,17 @@ impl Lowerer {
                     let (vid, ty) = self
                         .lookup_local(name)
                         .expect("bound-param local resolved at build_predicate");
+                    params.push((vid, ty));
+                }
+                // A gate's Boolean bind resolves exactly like a bound local
+                // (a bare Boolean binds under its own name; a computed
+                // condition was lowered and bound as `__when_<k>` before the
+                // params are emitted). The variant exists so the emission
+                // root can mark the skip-eligible indices.
+                ParamSource::Gate(name) => {
+                    let (vid, ty) = self
+                        .lookup_local(name)
+                        .expect("gate-condition local bound before params are emitted");
                     params.push((vid, ty));
                 }
                 // A slot cell is never a lowerer bind argument: it appears

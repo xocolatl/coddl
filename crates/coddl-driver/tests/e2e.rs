@@ -4405,7 +4405,8 @@ fn when_gate_inprocess_cranelift() {
 /// A relvar-rooted gate pushes as the `?N = 1` conjunct — evaluated by SQLite,
 /// never a pull of the relvar to gate in-process. The condition may be a bare
 /// local (bound under its own name) or a computed expression (bound via the
-/// cond side table); a false gate yields the empty result.
+/// cond side table); a false gate yields the empty result without firing the
+/// statement (the force point checks the gate binds before preparing).
 fn assert_when_gate_pushdown(backend: &str) {
     let (stdout, audit) = run_parts_program(
         backend,
@@ -4428,13 +4429,15 @@ fn assert_when_gate_pushdown(backend: &str) {
         "backend={backend}: got {:?}",
         String::from_utf8_lossy(&stdout)
     );
-    // Both gates run their statement in v1 (the force-time statement skip is
-    // the tracked follow-up); the gate conjunct rides the pushed WHERE.
+    // The true gate's statement fires with the gate conjunct riding the
+    // pushed WHERE; the false gate short-circuits at the force point — the
+    // statement never fires (the false-gate statement skip, the Boolean
+    // sibling of the empty-slot short-circuit).
     let selects: Vec<&str> = audit.lines().filter(|l| l.contains("SELECT")).collect();
-    assert_eq!(
-        selects.len(),
-        2,
-        "expected both gated SELECTs in the audit; audit:\n{audit}"
+    assert!(
+        selects.len() == 1 && selects[0].contains(r#""sno" = 2"#),
+        "expected only the true gate's SELECT (a false gate skips its \
+         statement); audit:\n{audit}"
     );
 }
 
@@ -4446,6 +4449,96 @@ fn when_gate_pushdown_llvm() {
 #[test]
 fn when_gate_pushdown_cranelift() {
     assert_when_gate_pushdown("cranelift");
+}
+
+/// A gate inside a `union` arm is **not** skip-eligible: the empty relation
+/// is union's additive identity, so a false gate empties one arm, not the
+/// whole result — the compound statement must still fire and return the
+/// other arm's rows.
+fn assert_when_gate_union_arm_fires(backend: &str) {
+    let (stdout, audit) = run_parts_program(
+        backend,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         oper main {} [\n\
+             let no = false;\n\
+             let r = transaction [ (Suppliers when no) union (Suppliers where sno = 2) ];\n\
+             write_relation { rel: r };\n\
+         ];\n",
+        true,
+    );
+    assert_eq!(
+        tuple_lines(&stdout),
+        sorted_tuples(&["{sname: \"Jones\", sno: 2}"]),
+        "backend={backend}: got {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+    let selects: Vec<&str> = audit.lines().filter(|l| l.contains("SELECT")).collect();
+    assert!(
+        selects.len() == 1 && selects[0].contains("UNION"),
+        "expected the compound SELECT to fire (a union-arm gate does not \
+         absorb, so it never skips the statement); audit:\n{audit}"
+    );
+}
+
+#[test]
+fn when_gate_union_arm_fires_llvm() {
+    assert_when_gate_union_arm_fires("llvm");
+}
+
+#[test]
+fn when_gate_union_arm_fires_cranelift() {
+    assert_when_gate_union_arm_fires("cranelift");
+}
+
+/// A gate on the relvar side of a **mixed-origin** plan (`(Suppliers when c)
+/// matching local` — the gate under the semijoin lhs is absorbing) rides the
+/// same plan as the shipped slot. False: the force point skips the statement
+/// before the cardinality dispatch, even though the slot holds a
+/// dispatchable single row. True: the cardinality-1 sibling fires with the
+/// gate conjunct riding its WHERE.
+fn assert_when_gate_over_mixed_skips(backend: &str) {
+    let (stdout, audit) = run_parts_program(
+        backend,
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers { sno: Integer, sname: Text } key { sno };\n\
+         oper main {} [\n\
+             let no = false;\n\
+             let wanted = Relation { { sno: 1, ordinality: 0 } };\n\
+             let nothing = transaction [ (Suppliers when no) matching wanted ];\n\
+             write_relation { rel: nothing };\n\
+             let yes = true;\n\
+             let single = Relation { { sno: 2, ordinality: 0 } };\n\
+             let found = transaction [ (Suppliers when yes) matching single ];\n\
+             write_relation { rel: found };\n\
+         ];\n",
+        true,
+    );
+    assert_eq!(
+        tuple_lines(&stdout),
+        // The false-gated semijoin is empty — only the true-gated row prints.
+        sorted_tuples(&["{sname: \"Jones\", sno: 2}"]),
+        "backend={backend}: got {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+    let selects: Vec<&str> = audit.lines().filter(|l| l.contains("SELECT")).collect();
+    assert!(
+        selects.len() == 1 && selects[0].contains(r#""sno" = 2"#),
+        "expected only the true gate's SELECT (the false gate skips before \
+         the cardinality dispatch); audit:\n{audit}"
+    );
+}
+
+#[test]
+fn when_gate_over_mixed_skips_llvm() {
+    assert_when_gate_over_mixed_skips("llvm");
+}
+
+#[test]
+fn when_gate_over_mixed_skips_cranelift() {
+    assert_when_gate_over_mixed_skips("cranelift");
 }
 
 /// The wiki-router promise: a gated in-process relation feeding `matching`

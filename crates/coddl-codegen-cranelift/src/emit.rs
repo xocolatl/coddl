@@ -648,7 +648,8 @@ fn declare_runtime_plan_externs(
     // coddl_register_plan(plan_id: i32, db_name: ptr, db_name_len: i64,
     //                     sql: ptr, sql_len: i64, param_count: i32,
     //                     rel_specs: ptr, n_rels: i64, desc: ptr,
-    //                     card1_alt: i64, dispatch_slot: i32) -> i32
+    //                     card1_alt: i64, dispatch_slot: i32,
+    //                     gate_params: ptr, n_gates: i64) -> i32
     {
         let mut sig = obj.make_signature();
         sig.params.push(AbiParam::new(types::I32));
@@ -662,6 +663,8 @@ fn declare_runtime_plan_externs(
         sig.params.push(AbiParam::new(ptr_ty));
         sig.params.push(AbiParam::new(types::I64));
         sig.params.push(AbiParam::new(types::I32));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
         sig.returns.push(AbiParam::new(types::I32));
         let id = obj
             .declare_function("coddl_register_plan", Linkage::Import, &sig)
@@ -721,8 +724,9 @@ struct DbDataIds {
 }
 
 /// Per-plan data symbols: the SQL text, the logical database name, (for a
-/// mixed-origin plan) the relation-parameter spec array, and the
-/// cardinality-1 sibling linkage.
+/// mixed-origin plan) the relation-parameter spec array, (for a gated plan)
+/// the skip-eligible gate bind indices, and the cardinality-1 sibling
+/// linkage.
 struct PlanDataIds {
     db_name: DataId,
     db_name_len: i64,
@@ -734,6 +738,10 @@ struct PlanDataIds {
     /// absorbs_empty); `None` when the plan ships no relation.
     rel_specs: Option<DataId>,
     n_rels: i64,
+    /// The `u32` array of skip-eligible gate bind indices (0-based into the
+    /// scalar params); `None` when the plan has no absorbing gate.
+    gate_params: Option<DataId>,
+    n_gates: i64,
     /// Index into the module's `heading_desc_ids` for the result heading.
     result_heading_id: usize,
     /// Dense plan id of the cardinality-1 sibling; −1 = none.
@@ -803,6 +811,25 @@ fn emit_plan_data(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         Some(id)
     };
+    let gate_params = if p.gate_params.is_empty() {
+        None
+    } else {
+        let id = obj
+            .declare_data(
+                &format!(".plan.{}.gate_params", p.plan_id),
+                Linkage::Local,
+                false,
+                false,
+            )
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        let mut dd = DataDescription::new();
+        dd.set_align(4);
+        let bytes: Vec<u8> = p.gate_params.iter().flat_map(|i| i.to_ne_bytes()).collect();
+        dd.define(bytes.into_boxed_slice());
+        obj.define_data(id, &dd)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        Some(id)
+    };
     Ok(PlanDataIds {
         db_name: dbn,
         db_name_len: p.db_name.len() as i64,
@@ -811,6 +838,8 @@ fn emit_plan_data(
         param_count: p.param_count as i32,
         rel_specs,
         n_rels: p.rel_params.len() as i64,
+        gate_params,
+        n_gates: p.gate_params.len() as i64,
         result_heading_id: p.result_heading_id.0 as usize,
         card1_alt: p.card1_alt.map(i64::from).unwrap_or(-1),
         dispatch_slot: p.dispatch_slot as i32,
@@ -3002,6 +3031,14 @@ fn emit_inst(
                 None => builder.ins().iconst(ptr_ty, 0),
             };
             let n_rels_v = builder.ins().iconst(types::I64, p.n_rels);
+            let gates_addr = match p.gate_params {
+                Some(id) => {
+                    let gv = obj.declare_data_in_func(id, builder.func);
+                    builder.ins().symbol_value(ptr_ty, gv)
+                }
+                None => builder.ins().iconst(ptr_ty, 0),
+            };
+            let n_gates_v = builder.ins().iconst(types::I64, p.n_gates);
             let desc_id = heading_desc_ids[p.result_heading_id];
             let desc_gv = obj.declare_data_in_func(desc_id, builder.func);
             let desc_addr = builder.ins().symbol_value(ptr_ty, desc_gv);
@@ -3022,6 +3059,8 @@ fn emit_inst(
                     desc_addr,
                     card1_alt_v,
                     dispatch_slot_v,
+                    gates_addr,
+                    n_gates_v,
                 ],
             );
             Ok(())

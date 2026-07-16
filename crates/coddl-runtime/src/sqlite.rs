@@ -88,6 +88,12 @@ struct PlanEntry {
     sql: String,
     param_count: u32,
     rel_specs: Vec<RelSpec>,
+    /// The 0-based indices of the scalar binds that are `when`-gate
+    /// conditions on the absorbing spine — a false bind at any of them makes
+    /// the result provably empty, so [`coddl_query`] returns a fresh empty
+    /// relation without firing a statement (the false-gate statement skip).
+    /// Validated `< param_count` at registration.
+    gate_params: Vec<u32>,
     desc: usize,
     /// Plan id of the cardinality-1 sibling — the specialized `WHERE shared
     /// = ?N…` form [`coddl_query`] fires instead of this plan when the
@@ -816,7 +822,9 @@ pub unsafe extern "C" fn coddl_register_database(
 /// `result_desc` must point to a heading descriptor that lives for the
 /// program's lifetime (a codegen-emitted static). The (ptr, len) pairs must
 /// describe valid UTF-8; `rel_specs` must be valid for `2 * n_rels` `u32`
-/// reads (interleaved `[arity, flags]` pairs, flags bit 0 = absorbs_empty).
+/// reads (interleaved `[arity, flags]` pairs, flags bit 0 = absorbs_empty);
+/// `gate_params` must be valid for `n_gates` `u32` reads (0-based indices of
+/// the skip-eligible gate binds; null when `n_gates == 0`).
 /// `card1_alt` is the sibling's dense plan id, or −1 for none.
 #[no_mangle]
 pub unsafe extern "C" fn coddl_register_plan(
@@ -831,6 +839,8 @@ pub unsafe extern "C" fn coddl_register_plan(
     result_desc: *const CoddlHeadingDesc,
     card1_alt: i64,
     dispatch_slot: u32,
+    gate_params: *const u32,
+    n_gates: usize,
 ) -> CoddlStatus {
     if result_desc.is_null() {
         eprintln!(
@@ -852,6 +862,21 @@ pub unsafe extern "C" fn coddl_register_plan(
             })
             .collect()
     };
+    let gate_params: Vec<u32> = if gate_params.is_null() || n_gates == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(gate_params, n_gates).to_vec()
+    };
+    // A gate index names one of the plan's scalar binds; out of range is a
+    // codegen bug, and validating here lets `coddl_query` index unchecked.
+    if let Some(bad) = gate_params.iter().find(|&&i| i >= param_count) {
+        eprintln!(
+            "coddl: register_plan: plan {} gate index {bad} out of range \
+             ({param_count} scalar param(s))",
+            plan_id.0
+        );
+        std::process::abort();
+    }
     let card1_alt = match card1_alt {
         -1 => None,
         id if id >= 0 && id <= u32::MAX as i64 => Some(id as u32),
@@ -878,6 +903,7 @@ pub unsafe extern "C" fn coddl_register_plan(
             sql: sql.to_string(),
             param_count,
             rel_specs,
+            gate_params,
             desc: result_desc as usize,
             card1_alt,
             dispatch_slot,
@@ -923,7 +949,7 @@ pub unsafe extern "C" fn coddl_query(
 ) -> *mut u8 {
     // Look up the plan; clone what we need and drop the registry lock before
     // taking any other lock (no lock-order coupling).
-    let (db_name, sql, param_count, rel_specs, desc_addr, card1_alt, dispatch_slot) = {
+    let (db_name, sql, param_count, rel_specs, gate_params, desc_addr, card1_alt, dispatch_slot) = {
         let registry = plan_registry().lock().expect("plan registry poisoned");
         match registry.get(&plan_id.0) {
             Some(entry) => (
@@ -931,6 +957,7 @@ pub unsafe extern "C" fn coddl_query(
                 entry.sql.clone(),
                 entry.param_count,
                 entry.rel_specs.clone(),
+                entry.gate_params.clone(),
                 entry.desc,
                 entry.card1_alt,
                 entry.dispatch_slot,
@@ -959,6 +986,11 @@ pub unsafe extern "C" fn coddl_query(
         std::process::abort();
     }
 
+    let param_slice: &[CoddlParam] = if params.is_null() || n == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(params, n)
+    };
     let rel_slice: &[CoddlRelParam] = if rels.is_null() || n_rels == 0 {
         &[]
     } else {
@@ -1007,6 +1039,25 @@ pub unsafe extern "C" fn coddl_query(
         return finalize_relation(&[], record_size, desc, &ctx);
     }
 
+    // False-gate short-circuit — the Boolean sibling of the check above: a
+    // `when`-gate conjunct on the absorbing spine binding false makes the
+    // WHERE unsatisfiable, so the result is provably empty and the statement
+    // never fires. Indices were validated `< param_count` at registration;
+    // a non-Boolean bind at a gate index is a codegen bug.
+    for &i in &gate_params {
+        let p = &param_slice[i as usize];
+        if p.kind != CoddlAttrKind::Boolean as u32 {
+            eprintln!(
+                "coddl: query: plan {}: gate param {i} has kind {}, expected Boolean",
+                plan_id.0, p.kind
+            );
+            std::process::abort();
+        }
+        if p.i == 0 {
+            return finalize_relation(&[], record_size, desc, &ctx);
+        }
+    }
+
     // Resolve the plan's logical database to its connection path.
     let path = {
         let registry = database_registry()
@@ -1030,11 +1081,6 @@ pub unsafe extern "C" fn coddl_query(
 
     // Bind parameters: CoddlParam -> owned rusqlite Value. Text bytes are
     // copied, so nothing borrows the caller's array past this point.
-    let param_slice: &[CoddlParam] = if params.is_null() || n == 0 {
-        &[]
-    } else {
-        std::slice::from_raw_parts(params, n)
-    };
     let mut bindings: Vec<rusqlite::types::Value> = param_slice
         .iter()
         .map(|p| param_to_sqlite(p, plan_id.0))
@@ -1779,6 +1825,8 @@ mod tests {
                     &desc,
                     -1,
                     0,
+                    ptr::null(),
+                    0,
                 ),
                 CoddlStatus::Ok
             );
@@ -1794,6 +1842,8 @@ mod tests {
                     0,
                     &desc,
                     -1,
+                    0,
+                    ptr::null(),
                     0,
                 ),
                 CoddlStatus::Ok
@@ -1955,6 +2005,8 @@ mod tests {
                     &desc,
                     -1,
                     0,
+                    ptr::null(),
+                    0,
                 ),
                 CoddlStatus::Ok
             );
@@ -2024,6 +2076,8 @@ mod tests {
                 &desc,
                 -1,
                 0,
+                ptr::null(),
+                0,
             );
 
             // No row has id = 99 → an empty (length-0) relation, not an abort.
@@ -2071,6 +2125,8 @@ mod tests {
                 0,
                 &desc,
                 -1,
+                0,
+                ptr::null(),
                 0,
             );
 

@@ -144,13 +144,15 @@ struct Emitter {
 
 /// One pushed plan's registration metadata: bind count, result heading id,
 /// the number of relation-valued parameters (whose `[arity, flags]` pairs
-/// live in the `@.plan.<id>.rel_specs` static this count sizes), and the
-/// cardinality-1 sibling linkage.
+/// live in the `@.plan.<id>.rel_specs` static this count sizes), the number
+/// of skip-eligible gate binds (whose indices live in the
+/// `@.plan.<id>.gate_params` static), and the cardinality-1 sibling linkage.
 #[derive(Clone)]
 struct PlanMeta {
     param_count: u32,
     result_heading_id: u32,
     n_rels: usize,
+    n_gates: usize,
     card1_alt: Option<u32>,
     dispatch_slot: u32,
 }
@@ -446,7 +448,7 @@ impl Emitter {
         .unwrap();
         writeln!(
             self.body,
-            "declare i32 @coddl_register_plan(i32, ptr, i64, ptr, i64, i32, ptr, i64, ptr, i64, i32)"
+            "declare i32 @coddl_register_plan(i32, ptr, i64, ptr, i64, i32, ptr, i64, ptr, i64, i32, ptr, i64)"
         )
         .unwrap();
         writeln!(
@@ -499,12 +501,28 @@ impl Emitter {
                 )
                 .unwrap();
             }
+            // The skip-eligible gate bind indices ride their own static i32
+            // array (0-based indices into the scalar params); a plan with no
+            // absorbing gate passes a null pointer instead.
+            if !p.gate_params.is_empty() {
+                let entries: Vec<String> =
+                    p.gate_params.iter().map(|i| format!("i32 {i}")).collect();
+                writeln!(
+                    self.globals,
+                    "@.plan.{}.gate_params = private unnamed_addr constant [{} x i32] [{}]",
+                    p.plan_id,
+                    p.gate_params.len(),
+                    entries.join(", "),
+                )
+                .unwrap();
+            }
             self.plan_meta.insert(
                 p.plan_id,
                 PlanMeta {
                     param_count: p.param_count,
                     result_heading_id: p.result_heading_id.0,
                     n_rels: p.rel_params.len(),
+                    n_gates: p.gate_params.len(),
                     card1_alt: p.card1_alt,
                     dispatch_slot: p.dispatch_slot,
                 },
@@ -1380,17 +1398,23 @@ impl Emitter {
         } else {
             format!("ptr @.plan.{plan_id}.rel_specs")
         };
+        let gates_arg = if meta.n_gates == 0 {
+            "ptr null".to_string()
+        } else {
+            format!("ptr @.plan.{plan_id}.gate_params")
+        };
         // −1 = no sibling; a dense plan id otherwise (0 is a valid id).
         let card1_alt = meta.card1_alt.map(i64::from).unwrap_or(-1);
         writeln!(
             self.body,
-            "    call i32 @coddl_register_plan(i32 {plan_id}, ptr @.plan.{plan_id}.db_name, i64 {db_len}, ptr @.plan.{plan_id}.sql, i64 {sql_len}, i32 {param_count}, {specs_arg}, i64 {n_rels}, ptr @.heading.{hid}, i64 {card1_alt}, i32 {dispatch_slot})",
+            "    call i32 @coddl_register_plan(i32 {plan_id}, ptr @.plan.{plan_id}.db_name, i64 {db_len}, ptr @.plan.{plan_id}.sql, i64 {sql_len}, i32 {param_count}, {specs_arg}, i64 {n_rels}, ptr @.heading.{hid}, i64 {card1_alt}, i32 {dispatch_slot}, {gates_arg}, i64 {n_gates})",
             db_len = self.const_byte_len(&format!("@.plan.{plan_id}.db_name")),
             sql_len = self.const_byte_len(&format!("@.plan.{plan_id}.sql")),
             param_count = meta.param_count,
             n_rels = meta.n_rels,
             hid = meta.result_heading_id,
             dispatch_slot = meta.dispatch_slot,
+            n_gates = meta.n_gates,
         )
         .unwrap();
         Ok(())

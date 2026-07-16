@@ -128,6 +128,13 @@ pub struct PlanEntry {
     /// `Inst::Query`'s bound relations against these before expanding the
     /// markers. Empty for a plan with no shipped relation.
     pub rel_params: Vec<RelParamReg>,
+    /// The 0-based scalar-bind indices of the `when`-gate conjuncts on the
+    /// absorbing spine — a false bind at any of them makes the result
+    /// provably empty, so the runtime returns a fresh empty relation without
+    /// firing a statement (the false-gate statement skip, the Boolean
+    /// sibling of the empty-slot short-circuit). Empty for a plan with no
+    /// absorbing gate.
+    pub gate_params: Vec<u32>,
     /// Heading id (into `Module::headings`) of the rows the plan returns.
     pub result_heading_id: HeadingId,
     /// Dense plan id of this plan's cardinality-1 sibling, when one was

@@ -61,10 +61,9 @@ library wiki;
 // `SELECT "body", "title" FROM "pages" WHERE "slug" = ?1`, the direct PK
 // lookup. Every request is served by either zero statements or one keyed
 // read. (`when` extends the same story to scalar gates directly on a
-// relvar: a false gate can skip the statement — the Boolean sibling of the
-// empty-slot short-circuit, tracked as A5 in .local/tracking; this file's
-// gates sit on the local side, where the empty-slot path already covers
-// them.)
+// relvar: a false gate skips the statement — the Boolean sibling of the
+// empty-slot short-circuit; this file's gates sit on the local side, where
+// the empty-slot path already covers them.)
 //
 // The .cd-family (storage stays out of D — RM Pro 6):
 //   wiki.cd       — this library: the external schema + the router
