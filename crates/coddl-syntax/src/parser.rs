@@ -42,8 +42,8 @@ use crate::ParseOutput;
 /// - [`FileKind::Cdmap`]   → external→conceptual adapter (`map`, identity)
 /// - [`FileKind::Cdstore`] → conceptual→physical binding (`store for`, …)
 ///
-/// The lexer is shared across all kinds (Coddl has no reserved words);
-/// only the parser dispatch differs.
+/// The lexer is shared across all kinds (there is no keyword token type;
+/// every word lexes as `IDENT`); only the parser dispatch differs.
 pub fn parse(source: &str, file: FileId, kind: FileKind) -> ParseOutput {
     let lex_out = lex(source, file);
     let mut p = Parser::new(source, file, lex_out);
@@ -117,8 +117,8 @@ impl<'a> Parser<'a> {
     }
 
     /// True iff the next non-trivia token is an identifier whose lexeme
-    /// is `lexeme`. Used for contextual keyword recognition (Coddl has
-    /// no reserved words; every keyword is contextual).
+    /// is `lexeme`. Used for contextual keyword recognition (every word
+    /// lexes as IDENT; the parser recognizes keywords positionally).
     pub(crate) fn at_keyword(&self, lexeme: &str) -> bool {
         self.current_ident_text() == Some(lexeme)
     }
@@ -188,6 +188,18 @@ impl<'a> Parser<'a> {
     /// the ASSIGN_STMT fallback instead of misparsing into the statement.
     fn at_stmt_head(&self, word: &str) -> bool {
         self.at_keyword(word) && self.nth_kind(1) != SyntaxKind::ASSIGN
+    }
+
+    /// Expression-head guard for the delimiter-narrowed heads
+    /// ([`keywords::EXPR_HEAD_NARROWED`](crate::keywords::EXPR_HEAD_NARROWED)):
+    /// the word is claimed only when the next token is its delimiter
+    /// (`Relation {`, `Sequence [`, `transaction [`), so the bare word falls
+    /// through to the IDENT branch and stays an ordinary NAME_REF.
+    fn at_expr_head(&self, word: &str) -> bool {
+        self.at_keyword(word)
+            && crate::keywords::EXPR_HEAD_NARROWED
+                .iter()
+                .any(|(w, delim)| *w == word && self.nth_kind(1) == *delim)
     }
 
     /// Emit every trivia token at the cursor into the current node.
@@ -708,8 +720,8 @@ impl<'a> Parser<'a> {
     /// The value is optional: `return;` is legal only for a `Unit`-returning
     /// oper, and a present value is checked against the declared return type —
     /// both enforced in typecheck (T0018). `return` is a contextual keyword,
-    /// recognized only here in statement position, so it never reserves the
-    /// identifier `return` elsewhere (Coddl has no reserved words).
+    /// recognized only here in statement position, so the identifier
+    /// `return` stays usable everywhere else.
     fn parse_return_stmt(&mut self) {
         debug_assert!(self.at_keyword("return"));
         self.start_node(SyntaxKind::RETURN_STMT);
@@ -1005,7 +1017,7 @@ impl<'a> Parser<'a> {
     /// list. The direction is an optional contextual keyword, recognized only
     /// when an attribute `IDENT` follows it; a bare attribute defaults to `asc`,
     /// so an attribute literally named `asc` / `desc` still parses as the order
-    /// key (no reserved words). Builds `SORT_ITEM`.
+    /// key (the direction words are contextual). Builds `SORT_ITEM`.
     fn parse_sort_item(&mut self) {
         self.bump_trivia();
         self.start_node(SyntaxKind::SORT_ITEM);
@@ -1459,9 +1471,12 @@ impl<'a> Parser<'a> {
     }
 
     /// A primary expression — the atomic forms an expression can start
-    /// with. Returns `true` if anything was consumed.
+    /// with. Returns `true` if anything was consumed. The
+    /// `transaction`/`Relation`/`Sequence` heads are narrowed via
+    /// [`at_expr_head`](Self::at_expr_head) — claimed only together with
+    /// their delimiter, so the bare word is an ordinary NAME_REF.
     fn parse_primary_expr(&mut self) -> bool {
-        if self.at_keyword("transaction") {
+        if self.at_expr_head("transaction") {
             self.parse_transaction_expr();
             return true;
         }
@@ -1469,11 +1484,11 @@ impl<'a> Parser<'a> {
             self.parse_if_expr();
             return true;
         }
-        if self.at_keyword("Relation") {
+        if self.at_expr_head("Relation") {
             self.parse_relation_lit();
             return true;
         }
-        if self.at_keyword("Sequence") {
+        if self.at_expr_head("Sequence") {
             self.parse_sequence_lit();
             return true;
         }
@@ -1592,19 +1607,15 @@ impl<'a> Parser<'a> {
     /// tuple-valued name / call / field-access is any other expression, so
     /// `Relation { req }` works too. Trailing comma allowed. Empty `Relation {}`
     /// parses cleanly (typechecked to `relfalse` absent an annotation). Symmetric
-    /// with `Sequence [ … ]` (`parse_sequence_lit`).
+    /// with `Sequence [ … ]` (`parse_sequence_lit`). The head is claimed only
+    /// together with its `{` (`at_expr_head`), so both tokens are guaranteed
+    /// here and a bare `Relation` is an ordinary NAME_REF.
     fn parse_relation_lit(&mut self) {
-        debug_assert!(self.at_keyword("Relation"));
+        debug_assert!(self.at_keyword("Relation") && self.nth_kind(1) == SyntaxKind::L_BRACE);
         self.bump_trivia();
         self.start_node(SyntaxKind::RELATION_LIT);
         self.bump(); // `Relation`
-
-        if !self.at(SyntaxKind::L_BRACE) {
-            self.error("P0031", "expected `{` after `Relation`");
-            self.finish_node();
-            return;
-        }
-        self.bump(); // {
+        self.bump(); // `{`
 
         self.parse_relation_lit_body();
         self.finish_node();
@@ -1648,19 +1659,16 @@ impl<'a> Parser<'a> {
     /// `Sequence []` parses cleanly (the typechecker resolves its element
     /// type from a `let` annotation, else T0061). Trailing comma is
     /// accepted. This is *syntactically* a primary expression; the
-    /// typechecker restricts it to `let`-binding values (T0063).
+    /// typechecker restricts it to `let`-binding values (T0063). The head
+    /// is claimed only together with its `[` (`at_expr_head`), so both
+    /// tokens are guaranteed here and a bare `Sequence` is an ordinary
+    /// NAME_REF.
     fn parse_sequence_lit(&mut self) {
-        debug_assert!(self.at_keyword("Sequence"));
+        debug_assert!(self.at_keyword("Sequence") && self.nth_kind(1) == SyntaxKind::L_BRACKET);
         self.bump_trivia();
         self.start_node(SyntaxKind::SEQUENCE_LIT);
         self.bump(); // `Sequence`
-
-        if !self.at(SyntaxKind::L_BRACKET) {
-            self.error("P0055", "expected `[` after `Sequence`");
-            self.finish_node();
-            return;
-        }
-        self.bump(); // [
+        self.bump(); // `[`
 
         if self.eat(SyntaxKind::R_BRACKET) {
             self.finish_node();
@@ -1728,17 +1736,14 @@ impl<'a> Parser<'a> {
     /// `transaction [ ... ]` — a block expression. The body parses
     /// as a normal block (statements + optional tail expression);
     /// `transaction` itself contributes no runtime semantics today.
+    /// The head is claimed only together with its `[` (`at_expr_head`),
+    /// so the block is guaranteed here and a bare `transaction` is an
+    /// ordinary NAME_REF.
     fn parse_transaction_expr(&mut self) {
-        debug_assert!(self.at_keyword("transaction"));
+        debug_assert!(self.at_keyword("transaction") && self.nth_kind(1) == SyntaxKind::L_BRACKET);
         self.bump_trivia();
         self.start_node(SyntaxKind::TRANSACTION_EXPR);
         self.bump(); // `transaction`
-
-        if !self.at(SyntaxKind::L_BRACKET) {
-            self.error("P0019", "expected `[` after `transaction`");
-            self.finish_node();
-            return;
-        }
         self.parse_block();
         self.finish_node();
     }
@@ -3845,7 +3850,7 @@ mod tests {
 
     #[test]
     fn when_and_otherwise_stay_ordinary_identifiers() {
-        // No reserved words: both operators are contextual — in name
+        // Both operators are contextual keywords — in name
         // positions (`let` bindings, named args, attribute names) they are
         // plain identifiers.
         let out = parse_str(
@@ -3891,13 +3896,24 @@ mod tests {
     }
 
     #[test]
-    fn transaction_missing_bracket_diagnoses_p0019() {
-        let out = parse_str("oper f {} [ let x = transaction \"oops\"; ];");
+    fn bare_transaction_is_a_name_ref() {
+        // `transaction` is claimed only together with its `[` — a binding
+        // named `transaction` (finance wants the attribute name) is
+        // declarable and referenceable in expressions.
+        let out = parse_str("oper f {} [ let transaction = 5; let y = transaction + 1; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
         assert!(
-            out.diagnostics.iter().any(|d| d.code == "P0019"),
-            "expected P0019, got {:?}",
-            out.diagnostics
+            out.tree
+                .descendants()
+                .all(|n| n.kind() != SyntaxKind::TRANSACTION_EXPR),
+            "bare `transaction` must not parse as TRANSACTION_EXPR"
         );
+        let refs = out
+            .tree
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::NAME_REF && n.text() == "transaction")
+            .count();
+        assert_eq!(refs, 1, "the reference parses as a NAME_REF");
     }
 
     #[test]
@@ -4851,7 +4867,7 @@ mod tests {
 
     #[test]
     fn load_stmt_attr_named_asc_still_parses() {
-        // No reserved words: an attribute literally named `asc` is the order key
+        // `asc` is contextual: an attribute literally named `asc` is the order key
         // (a direction is recognized only when another attribute IDENT follows).
         let src = "oper f {} [ load s from r order [asc]; ];";
         let out = parse_str(src);
@@ -5008,12 +5024,22 @@ mod tests {
     }
 
     #[test]
-    fn relation_literal_missing_lbrace_diagnoses_p0031() {
-        let out = parse_str("oper f {} [ let r = Relation ; ];");
+    fn bare_relation_is_a_name_ref() {
+        // `Relation` is claimed only together with its `{` — a bare
+        // reference (here a join operand) is an ordinary NAME_REF.
+        let out = parse_str("oper f {} [ let r = Relation join S; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
         assert!(
-            out.diagnostics.iter().any(|d| d.code == "P0031"),
-            "expected P0031, got {:?}",
-            out.diagnostics
+            out.tree
+                .descendants()
+                .all(|n| n.kind() != SyntaxKind::RELATION_LIT),
+            "bare `Relation` must not parse as RELATION_LIT"
+        );
+        assert!(
+            out.tree
+                .descendants()
+                .any(|n| n.kind() == SyntaxKind::NAME_REF && n.text() == "Relation"),
+            "expected a NAME_REF `Relation`"
         );
     }
 
@@ -5103,12 +5129,25 @@ mod tests {
     }
 
     #[test]
-    fn sequence_literal_missing_lbracket_diagnoses_p0055() {
-        let out = parse_str("oper f {} [ let s = Sequence ; ];");
+    fn relvar_named_sequence_is_queryable() {
+        // The bioinformatics case: a relvar named `Sequence`, declared and
+        // queried. `Sequence` is claimed only together with its `[`, so the
+        // bare reference under `where` is a NAME_REF, not a sequence literal.
+        let src = "private relvar Sequence { id: Integer, bases: Text };\n\
+                   oper f {} [ let q = Sequence where id = 1; ];";
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
         assert!(
-            out.diagnostics.iter().any(|d| d.code == "P0055"),
-            "expected P0055, got {:?}",
-            out.diagnostics
+            out.tree
+                .descendants()
+                .all(|n| n.kind() != SyntaxKind::SEQUENCE_LIT),
+            "bare `Sequence` must not parse as SEQUENCE_LIT"
+        );
+        assert!(
+            out.tree
+                .descendants()
+                .any(|n| n.kind() == SyntaxKind::NAME_REF && n.text() == "Sequence"),
+            "expected a NAME_REF `Sequence`"
         );
     }
 
@@ -6062,7 +6101,7 @@ mod tests {
 
     #[test]
     fn tclose_is_contextual_not_reserved() {
-        // `tclose` remains a valid identifier elsewhere (no reserved words).
+        // `tclose` is contextual — a valid identifier everywhere else.
         let out = parse_str("oper f {} [ let tclose = 1; let s = R where tclose = 2; ];");
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }

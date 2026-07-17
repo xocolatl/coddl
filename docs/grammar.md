@@ -2,7 +2,7 @@
 
 The authoritative spec for Coddl's surface syntax — the precise form of the language the parser currently accepts, plus the design rationale behind every choice that doesn't immediately follow from TTM (see [conformance.md](conformance.md)).
 
-This doc has two parts: **rationale** (the design decisions — why prefix-named-args, why no reserved words, why brackets-vs-braces, etc.) and the **productions** (the EBNF the parser implements, lexical and syntactic).
+This doc has two parts: **rationale** (the design decisions — why prefix-named-args, why only five reserved words, why brackets-vs-braces, etc.) and the **productions** (the EBNF the parser implements, lexical and syntactic).
 
 **Last sync:** `94dfa9f`. Every commit that adds, removes, or changes a production, token, or diagnostic code updates this file in the same commit; `tools/check-grammar.sh` enforces it from the hygiene gate.
 
@@ -60,9 +60,9 @@ Reason: the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-
 - **`R when c`** ≡ `R times ⟨c⟩` — gates a **whole relation** by a scalar Boolean: `R` when `c` holds, the empty relation with `R`'s heading when it doesn't (the condition lifts to reltrue/relfalse — the join family's 1 and 0 — in the IR only, never at the surface). The deliberate contract with its sibling: **`where` filters per-tuple with the heading in scope; `when` gates the whole relation with a condition from the *enclosing* scope** — no heading injection, so an attribute name in a `when` condition is unresolved (T0099 hints at `where`). The condition is an ordinary strict scalar: it evaluates once, eagerly, even though relations are lazy. Chaining is AND (`R when a when b` ≡ `R when (a and b)`, by `times` associativity). Typing: `Relation H × Boolean → Relation H`; a relation-typed condition is rejected with a `times` suggestion (gating by a relation is what `times` already does). This is **not** a coercion in TTM's sense (ch. 3, p. 74 — coercion is *implicit* conversion of a wrongly-typed operand): the operand is required-Boolean and is-Boolean; a named operation "with operands that are explicitly defined to be of different types" is the Manifesto's own sanctioned crossing (the LOAD note, ch. 5, p. 123 — the same pattern Coddl's `load` already follows).
 - **`R otherwise D`** ≡ `R union (D times (reltrue minus (R project {})))` — union-with-default: `R` if it is nonempty, else `D` (`R project {}` is the algebra's EXISTS; the arms are exclusive by construction, so nothing ever dedups). The relational COALESCE — the no-nulls answer to "if missing". Identical headings required, like `union` (T0038). `A when c otherwise D` reads left-to-right: `(A when c) otherwise D`.
 
-Both remain ordinary identifiers everywhere else (no reserved words — `when` and `otherwise` are fine attribute or local names). Lowering: see [relir.md](relir.md) (the `Gate` restrict conjunct, the `Inst::Gate`/`Inst::Otherwise` in-process forms) and [sqlemit.md](sqlemit.md) (a relvar-rooted gate pushes as a `?N = 1` conjunct).
+Both remain ordinary identifiers everywhere else (`when` and `otherwise` are contextual — fine attribute or local names). Lowering: see [relir.md](relir.md) (the `Gate` restrict conjunct, the `Inst::Gate`/`Inst::Otherwise` in-process forms) and [sqlemit.md](sqlemit.md) (a relvar-rooted gate pushes as a `?N = 1` conjunct).
 
-**`project` (projection) is a *postfix* operator, not infix.** `R project { a, b }` narrows the relation's heading to the named attributes — the right operand is a brace-list of bare attribute names (structurally identical to a `key { … }` clause), not another expression, so it doesn't fit the infix `<lhs> op <rhs>` shape. It is parsed as a postfix suffix at *pipeline precedence* — the same altitude as `where`, and gated to the top level so it binds to the whole pipeline rather than to a higher-precedence operand such as a `where` predicate. `R where p project { a }` reads as `(R where p) project { a }`; the reverse order `R project { a } where p` also parses, nesting left. It is the first postfix relational operator; later ones (`replace`, `extend`, `rename`, `tclose`, `wrap`, `unwrap`, `group`, `ungroup`, and future `summarize`) reuse the same pipeline slot. `project` remains a contextual keyword — a valid identifier everywhere else (no reserved words).
+**`project` (projection) is a *postfix* operator, not infix.** `R project { a, b }` narrows the relation's heading to the named attributes — the right operand is a brace-list of bare attribute names (structurally identical to a `key { … }` clause), not another expression, so it doesn't fit the infix `<lhs> op <rhs>` shape. It is parsed as a postfix suffix at *pipeline precedence* — the same altitude as `where`, and gated to the top level so it binds to the whole pipeline rather than to a higher-precedence operand such as a `where` predicate. `R where p project { a }` reads as `(R where p) project { a }`; the reverse order `R project { a } where p` also parses, nesting left. It is the first postfix relational operator; later ones (`replace`, `extend`, `rename`, `tclose`, `wrap`, `unwrap`, `group`, `ungroup`, and future `summarize`) reuse the same pipeline slot. `project` remains a contextual keyword — a valid identifier everywhere else.
 
 ### Named-prefix with braces — the only call form
 
@@ -101,7 +101,7 @@ User code is not *required* to follow PascalCase for types and relvars — that'
 At the lexer level there is no `KEYWORD` token type — every alphanumeric/underscore/`#` token is an `IDENT` — and the parser recognizes specific identifiers as keywords in specific syntactic positions. That much is unchanged. The honest statement of what it buys is a **taxonomy**, published in full below (the tables render `crates/coddl-syntax/src/keywords.rs`, the single source of truth both the parser's operator table and the AST's operator resolution consume; mechanical doc↔source sync is planned):
 
 - **Tier 1 — reserved (five words + the operator glyphs).** `true`, `false`, `if`, `not`, `extract` are claimed at an expression head with nothing to narrow on: `true`/`false` are the bare word, and `if`/`not`/`extract` are followed by an arbitrary expression, so no lookahead can ever free them — a binding under one of these names would be silently unreachable (`let true = 1; let x = true;` binds `x` to the Boolean literal) or misparse at every bare reference, and there is no quoting escape hatch (no Coddl analogue of SQL's `"order"`). So a declaration naming one is **rejected at the declaration site with P0096** — softly, on the E0007 model: the diagnostic is emitted, the name still binds, and parsing continues (LSP discipline; the trap is loud, not fatal). The check fires at every `.cd` name-declaring position — bindings, params and every heading attribute, oper/type/relvar names, loop and `load` binders, module-path segments, the file header, `database` bindings — and at every attribute-*creating* position: tuple/relation literal fields, `extend`/`replace`/`rename` new names, `wrap`/`group` new names. Reference positions (call-argument names, `update` clauses, `project` lists, dot access) are deliberately unchecked: a reference either resolves against an already-checked declaration or fails in the typechecker. The seven word-operator glyphs (`¬ ⋈ ∪ ∩ ∖ ⋉ ▷`) lex as `IDENT` and are rejected the same way. The `.cddb` parser's own decl sites (database and relvar names) emit its namespace sibling **PB0012**; `.cddb` relvar *attributes* funnel through the shared heading parser and emit P0096.
-- **Tier 2 — positional claims narrowed by lookahead (three still pending).** The eleven statement heads are **narrowed**: a head is claimed at a statement boundary only when the next token is not `:=`, so a variable named after any head stays assignable — `var delete := 1; delete := 2;` parses as a declaration and an ordinary assignment. The same pattern already frees `asc`/`desc` (recognized only when followed by another IDENT) and `builtin` (two-token `builtin relvar` vs `builtin oper`). `Relation` / `Sequence` / `transaction` are still claimed unconditionally at an expression head, so a bare reference to a same-named binding errs at the *use site* (P0031/P0055/P0019); each needs only its delimiter token of lookahead — narrowing planned.
+- **Tier 2 — positional claims narrowed by lookahead.** Every Tier-2 word is claimed only together with one token of lookahead, so the bare word is an ordinary identifier. The eleven statement heads are claimed at a statement boundary only when the next token is not `:=` — a variable named after any head stays assignable (`var delete := 1; delete := 2;` parses as a declaration and an ordinary assignment). The three expression heads `Relation` / `Sequence` / `transaction` are claimed only together with their delimiter (`{` / `[` / `[`) — a bare reference to a same-named binding is a NAME_REF, so a relvar named `Sequence` is queryable and an attribute named `transaction` usable. The same pattern frees `asc`/`desc` (recognized only when followed by another IDENT) and `builtin` (two-token `builtin relvar` vs `builtin oper`).
 - **Tier 3 — vacuous claims (genuinely free).** Everything else is recognized in a position where a bare identifier is never a legal continuation — infix/postfix operator position, clause position after an introducing construct, item-head position, type position — so the claim shadows nothing. These are the words that keep the identifier space unfettered for real domains (`name`, `type`, `from`, `to`, `order`, `value`, `key`, `and` as attribute names all work).
 - **Tier 4 — not keywords at all.** `reltrue` / `relfalse` are **not** parser-recognized: they are module-level `let`s in `coddl::core` (always in scope, resolved *after* everything else, deliberately user-shadowable — tests pin it). This is the model: vocabulary lives in the registry/stdlib and stays shadowable; the parser claims a word only when its *grammar* is special. The reserved set grows with syntax, never with library.
 
@@ -119,21 +119,16 @@ The glyphs `⋈ ∪ ∩ ∖ ⋉ ▷` (operator rows below) and `¬` belong to th
 
 ### Tier 2 — positional claims, narrowed by lookahead
 
-Narrowed — the bare word is an ordinary identifier:
+The bare word is an ordinary identifier in every case:
 
 | Word | Position | Lookahead rule | What it frees |
 |---|---|---|---|
 | `let` `var` `truncate` `delete` `insert` `update` `for` `while` `do` `load` `return` | statement head | claimed only when the next token ≠ `:=` | assignment to a same-named variable — `delete := 2;` reaches `<assign-stmt>` |
+| `Relation` | expression head (relation literal); also a type generator | claimed only with `{` | a bare reference (a relvar/binding named `Relation`) is a NAME_REF |
+| `Sequence` | expression head (sequence literal); also a type generator | claimed only with `[` | a relvar named `Sequence` is declarable and queryable (the bioinformatics case) |
+| `transaction` | expression head | claimed only with `[` | an attribute/binding named `transaction` is usable in expressions (the finance case) |
 
-Still claimed unconditionally — narrowing planned:
-
-| Word | Position | Delimiter that would narrow it | Trap today |
-|---|---|---|---|
-| `Relation` | expression head (relation literal); also a type generator | `{` | bare reference → P0031; a relvar named `Relation` is declarable but unusable |
-| `Sequence` | expression head (sequence literal); also a type generator | `[` | bare reference → P0055 (bioinformatics wants relvar `Sequence`) |
-| `transaction` | expression head | `[` | bare reference → P0019 (finance wants attribute `transaction`) |
-
-Residual traps that survive the narrowing, done or planned (documented, accepted): indexing a `Sequence`-typed variable named `transaction` (`transaction [i]` is the transaction-expression claim); a *bare-reference* expression statement of a statement-head-named variable (`while;` — useless anyway); prefix-calling an oper named after a narrowed word (`Relation { … }` is claimed — UFCS `x.Relation { … }` is the escape hatch). One diagnostic trade came with the statement-head narrowing: the missing-loop-variable typo `for := 0 to 2 do [ … ];` now parses as an assignment to a variable named `for` and diagnoses generically at the assignment tail (P0013 at `to`) rather than with the targeted P0062.
+Residual traps that survive the narrowing (documented, accepted): a variable named `transaction` or `Sequence` cannot be *indexed* — `transaction [i]` is the transaction-expression claim and `Sequence [i]` parses as a one-element sequence literal; a *bare-reference* expression statement of a statement-head-named variable (`while;` — useless anyway); prefix-calling an oper named after a narrowed word (`Relation { … }` is claimed — UFCS `x.Relation { … }` is the escape hatch). One diagnostic trade came with the statement-head narrowing: the missing-loop-variable typo `for := 0 to 2 do [ … ];` now parses as an assignment to a variable named `for` and diagnoses generically at the assignment tail (P0013 at `to`) rather than with the targeted P0062. The expression-head narrowing retired P0019/P0031/P0055 (a bare head is no longer a parse error — it is a name; an unresolved one fails in typecheck).
 
 ### Tier 3 — vacuous claims
 
@@ -635,7 +630,7 @@ function that implements it.
                     -- transaction for a public relvar (T0025). `truncate` is a
                     -- contextual keyword recognized only as the leading token
                     -- of a statement (the `let` precedent) — it stays a usable
-                    -- identifier everywhere else (no reserved words).
+                    -- identifier everywhere else.
 <delete-stmt>   ::= 'delete' <expr> ';' ;                      -- parse_delete_stmt
                     -- Remove the matching tuples from a relvar — sugar for the
                     -- relational assignment `R := R minus (R where p)` (the
@@ -949,7 +944,7 @@ function that implements it.
                     -- mandatory); the bare form is not an error. P0041 on a
                     -- missing attribute name inside the braces, P0042 on a
                     -- missing closing `}`. `tclose` is a contextual keyword,
-                    -- a valid identifier elsewhere (no reserved words).
+                    -- a valid identifier elsewhere.
 <extend-suffix> ::= 'extend' <arg-list> ;                     -- parse_extend_suffix
                     -- Relational extend. Postfix at pipeline precedence (like
                     -- <replace-suffix>); wraps the operand in EXTEND_EXPR. Each
@@ -961,7 +956,7 @@ function that implements it.
                     -- is required (P0017 on `extend { new }`), since a shorthand
                     -- would be the no-op identity `new: new`. P0043 on a missing
                     -- `{`. `extend` is a contextual keyword, a valid identifier
-                    -- elsewhere (no reserved words).
+                    -- elsewhere.
 <rename-suffix> ::= 'rename' <arg-list> ;                     -- parse_rename_suffix
                     -- Relational rename (relabel). Postfix at pipeline
                     -- precedence (like <replace-suffix>); wraps the operand in
@@ -974,7 +969,7 @@ function that implements it.
                     -- (P0017 on `rename { new }`). `old` must exist (T0029) and
                     -- the result must stay a bijection (T0031). P0034 on a
                     -- missing `{`. `rename` is a contextual keyword, a valid
-                    -- identifier elsewhere (no reserved words).
+                    -- identifier elsewhere.
 <wrap-suffix>   ::= 'wrap' '{' <wrap-pair> { ',' <wrap-pair> } '}' ; -- parse_wrap_suffix
 <wrap-pair>     ::= <identifier> ':' <ident-brace-list> ;       -- (a WRAP_PAIR node)
                     -- Relational wrap (group attributes into tuple-valued
@@ -990,7 +985,7 @@ function that implements it.
                     -- missing `:`, P0047/P0048/P0049 on the inner brace-list's
                     -- `{`/name/`}`, P0050 on a missing outer `}`. v1 declines the
                     -- SQL push (restructures in-process). `wrap` is a contextual
-                    -- keyword (no reserved words).
+                    -- keyword.
 <unwrap-suffix> ::= 'unwrap' <ident-brace-list> ;              -- parse_unwrap_suffix
                     -- Relational unwrap (expand tuple-valued attributes back to
                     -- their components, lifted to top level — the inverse of
@@ -1022,7 +1017,7 @@ function that implements it.
                     -- `{`/name/`}`, P0092 on a missing outer `}`. Never pushes
                     -- to SQL (a relation-valued cell has no flat-column form);
                     -- the operand fetch pushes, the nest runs in-process.
-                    -- `group` is a contextual keyword (no reserved words).
+                    -- `group` is a contextual keyword.
 <ungroup-suffix> ::= 'ungroup' <ident-brace-list> ;            -- parse_ungroup_suffix
                     -- Relational ungroup (TTM UNGROUP — unnest relation-valued
                     -- attributes back to top level: one result tuple per
@@ -1037,6 +1032,9 @@ function that implements it.
                     -- P0095 on a missing `}`. Never pushes to SQL (like
                     -- `group`). Contextual keyword.
 <transaction-expr> ::= 'transaction' <block> ;                 -- parse_transaction_expr
+                    -- `transaction` is claimed only together with its
+                    -- `[` (one token of lookahead); a bare `transaction`
+                    -- is an ordinary NAME_REF.
 <if-expr>       ::= 'if' <expr> 'then' <block>
                     [ 'else' <block> ] ;                       -- parse_if_expr (IF_EXPR)
                     -- `if`/`then`/`else` are contextual keywords. `then`
@@ -1074,9 +1072,10 @@ function that implements it.
                     -- Field-init shorthand applies (e.g. `{a}` ≡ `{a: a}`).
                     -- Empty '{}' is the unit value, type Tuple {}.
 <relation-lit>  ::= 'Relation' '{' <relation-lit-body> ;    -- parse_relation_lit
-                    -- 'Relation' is a contextual keyword; recognized
-                    -- by name in primary-expr position. Its sibling
-                    -- `reltrue` is the one-empty-tuple literal
+                    -- 'Relation' is a contextual keyword, claimed in
+                    -- primary-expr position only together with its `{`;
+                    -- a bare `Relation` is an ordinary NAME_REF. Its
+                    -- sibling `reltrue` is the one-empty-tuple literal
                     -- `Relation { {} }`.
 <relation-lit-body> ::= [ <expr> commalist ] '}' ;         -- parse_relation_lit_body
                     -- The '{' is already consumed; the body is a
@@ -1091,11 +1090,12 @@ function that implements it.
                     -- heading, zero tuples; the zero of the join
                     -- semiring). Shared with <tuple-set>.
 <sequence-lit>  ::= 'Sequence' '[' [ <expr> commalist ] ']' ;     -- parse_sequence_lit
-                    -- 'Sequence' is a contextual keyword; recognized
-                    -- by name in primary-expr position. The body is a
-                    -- comma-separated list of element expressions,
-                    -- trailing comma allowed (P0055 on a missing `[`,
-                    -- P0056 if unterminated). Empty `Sequence []`
+                    -- 'Sequence' is a contextual keyword, claimed in
+                    -- primary-expr position only together with its `[`;
+                    -- a bare `Sequence` is an ordinary NAME_REF. The
+                    -- body is a comma-separated list of element
+                    -- expressions, trailing comma allowed (P0056 if
+                    -- unterminated). Empty `Sequence []`
                     -- parses cleanly. *Syntactically* a primary
                     -- expression, but the typechecker permits it only
                     -- as a `let` binding value (T0063 elsewhere); an
@@ -1165,7 +1165,7 @@ enforces that.
 | P0016 | Expected argument name                                  |
 | P0017 | Expected `:` after argument name                        |
 | P0018 | `let`/`var` binding is malformed (missing name, operator, or RHS) |
-| P0019 | `transaction` not followed by `[`                       |
+| P0019 | *Retired* (was: `transaction` not followed by `[`) — unreachable since the expression-head narrowing made a bare `transaction` a NAME_REF; reusable |
 | P0020 | Expected database name (in `database <Name>;`)          |
 | P0021 | Expected `;` after `database <Name>`                    |
 | P0022 | Expected `{` to start key clause                        |
@@ -1177,7 +1177,7 @@ enforces that.
 | P0028 | Expected `;` after relvar declaration                   |
 | P0029 | Expected `}` to close tuple literal                     |
 | P0030 | Expected field name after `.`                           |
-| P0031 | Expected `{` after `Relation`                           |
+| P0031 | *Retired* (was: expected `{` after `Relation`) — unreachable since the expression-head narrowing made a bare `Relation` a NAME_REF; reusable |
 | P0032 | Expected `{` to start group list (code reused: the original P0032 — relation-literal element check — retired to typecheck T0096) |
 | P0033 | Expected `}` to close relation literal                  |
 | P0034 | Expected `{` to start rename list                       |
@@ -1201,7 +1201,7 @@ enforces that.
 | P0052 | Expected attribute name in unwrap list                  |
 | P0053 | Expected `}` to close unwrap list                       |
 | P0054 | Expected `{ … }` clause after the `update` target        |
-| P0055 | Expected `[` after `Sequence`                           |
+| P0055 | *Retired* (was: expected `[` after `Sequence`) — unreachable since the expression-head narrowing made a bare `Sequence` a NAME_REF; reusable |
 | P0056 | Expected `]` to close sequence literal                  |
 | P0057 | Expected `]` to close index expression                  |
 | P0058 | Expected index expression                               |

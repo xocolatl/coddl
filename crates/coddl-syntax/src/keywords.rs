@@ -12,16 +12,14 @@
 //!
 //! Two kinds of groups live here:
 //!
-//! - **Consumed** groups back multiple match sites in code ([`INFIX_OPS`],
-//!   [`UNARY_OPS`], [`BOOL_WORDS`], the single-word consts) — changing an
-//!   entry changes parser and AST together.
+//! - **Consumed** groups are mechanically matched in code ([`INFIX_OPS`],
+//!   [`UNARY_OPS`], [`BOOL_WORDS`], [`EXPR_HEAD_NARROWED`], the
+//!   single-word consts) — changing an entry changes the parser (and, for
+//!   the operator tables, the AST) with it.
 //! - **Inventory** groups ([`STMT_HEADS`], [`POSTFIX_SUFFIXES`],
-//!   [`CLAUSE_WORDS`], [`ITEM_HEADS`], [`TYPE_GENERATORS`],
-//!   [`EXPR_HEAD_NARROWED`], the dialect sets) each have exactly one match
-//!   site in the parser today; they are published for the grammar.md
-//!   keyword table and for the remaining lookahead work — the
-//!   expression-head narrowing, which will consume
-//!   [`EXPR_HEAD_NARROWED`].
+//!   [`CLAUSE_WORDS`], [`ITEM_HEADS`], [`TYPE_GENERATORS`], the dialect
+//!   sets) each have exactly one hand-written match site in the parser
+//!   today; they are published for the grammar.md keyword table.
 //!
 //! Symbolic operators (`= <> < > <= >= + - * / ||`) and the comparison
 //! glyphs (`≤ ≥ ≠ ⊂ ⊃ ⊆ ⊇`) are lexer token kinds, not identifiers — they
@@ -204,10 +202,10 @@ pub const ASC: &str = "asc";
 pub const DESC: &str = "desc";
 
 /// Expression-head words that are special **only together with their
-/// delimiter** — Tier 2 of the taxonomy. Claimed unconditionally today
-/// (the bare word errs at the use site: P0031/P0055/P0019); the planned
-/// narrowing recognizes the word only when the next token is the listed
-/// delimiter, so the bare word falls through to an ordinary `NAME_REF`.
+/// delimiter** — Tier 2 of the taxonomy. `Parser::at_expr_head` claims a
+/// word only when the next token is its delimiter from this table, so the
+/// bare word falls through to an ordinary `NAME_REF` (a relvar named
+/// `Sequence` or an attribute named `transaction` is fully usable).
 pub const EXPR_HEAD_NARROWED: &[(&str, SyntaxKind)] = &[
     ("Relation", SyntaxKind::L_BRACE),
     ("Sequence", SyntaxKind::L_BRACKET),
