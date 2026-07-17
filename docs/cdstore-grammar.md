@@ -95,8 +95,8 @@ consumed by codegen and baked into the compiled binary. Field values
 under operational keys (`file:`, `dsn:`, pool size, …) are
 **operational** — late-bound from environment variables at startup
 with the declared value as a fallback. The grammar doesn't enforce
-this split; it's a runtime convention (see `.local/phases.md` Phase
-21).
+this split; it's a runtime convention (see [storage.md](storage.md),
+"Path resolution" and the environment-override rules).
 
 
 ## Parser diagnostics

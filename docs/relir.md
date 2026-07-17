@@ -80,10 +80,9 @@ This doc describes the **target** RelIR. The code implements a thin slice of it;
   `surviving_keys` = the `And`-style composite `k_primary ∪ k_fallback` (a
   superkey of both arms is a superkey of whichever fires); absorption:
   **neither** child absorbs (an empty/false-gated primary selects the
-  fallback — the statement must fire). Tracked residue
-  (`.local/tracking/optimizations.md`): no cardinality-1 sibling under an
-  `Otherwise` root, and the eager both-sides force persists on the
-  non-pushable shapes.
+  fallback — the statement must fire). Tracked residue: no cardinality-1
+  sibling under an `Otherwise` root, and the eager both-sides force
+  persists on the non-pushable shapes.
 - The value is a `RestrictValue`: a compile-time `Lit(Literal)`, a
   **bound parameter** `Param(name)` — the surface name of an in-scope
   local/parameter whose runtime value binds at query time — or a

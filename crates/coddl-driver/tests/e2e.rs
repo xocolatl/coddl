@@ -4913,7 +4913,7 @@ fn otherwise_gated_primary_does_not_skip_cranelift() {
 /// statement in its *general* EXISTS+VALUES form — the cardinality-1 sibling
 /// is root-shape-only, so it does not bake under an `Otherwise` root (the
 /// pinned trade: one statement instead of a keyed lookup plus an always-fired
-/// fallback plan; tracked residue in `.local/tracking/optimizations.md`).
+/// fallback plan).
 fn assert_otherwise_semijoin_primary_pushes_general(backend: &str) {
     let (stdout, audit) = run_parts_program(
         backend,

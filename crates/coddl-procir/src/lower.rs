@@ -4437,7 +4437,7 @@ impl Lowerer {
         }
     }
 
-    /// Development tripwire for the scalability gap S1 in `.local/optimizations.md`.
+    /// Development tripwire for the S1 scalability gap (the full-relvar pull).
     ///
     /// `expr` is a relational expression the cut just *declined* to push (we're
     /// past the `try_lower_pushed` miss). If one of its relational operands is an
@@ -4519,8 +4519,7 @@ impl Lowerer {
                     "pushdown gap (S1): an in-process relational operator would pull the \
                      whole public relvar `{}` into memory (an unfiltered `SELECT … FROM` \
                      feeding in-process work). The cut could not push this subtree — it \
-                     needs pushdown / partial-materialization work. See \
-                     .local/optimizations.md S1.",
+                     needs pushdown / partial-materialization work.",
                     relvar_root_name(&rel).unwrap_or("?"),
                 );
             }
@@ -6843,8 +6842,7 @@ impl Lowerer {
     /// statement instead (`build_rel_otherwise_root`); what reaches here is
     /// the local-fallback shape (the primary pushes alone, the pick ships
     /// nothing — already optimal) and the shapes whose emission declines,
-    /// where the eager both-sides force still stands (tracked in
-    /// `.local/tracking/optimizations.md`).
+    /// where the eager both-sides force still stands (tracked residue).
     fn lower_otherwise_expr(&mut self, bin: &BinaryExpr) -> ValueId {
         if let (Some(lhs_e), Some(rhs_e)) = (bin.lhs(), bin.rhs()) {
             let primary = self.lower_expr(&lhs_e);
