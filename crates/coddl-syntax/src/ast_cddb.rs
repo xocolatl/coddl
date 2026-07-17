@@ -6,7 +6,7 @@
 //! and virtual relvar declarations); [`BaseRelvarDecl`] and
 //! [`VirtualRelvarDecl`] are the typed views over those.
 
-use crate::ast::{self, AstNode, Heading, KeyClause};
+use crate::ast::{self, AstNode, Expr, Heading, KeyClause};
 use crate::ast_node;
 use crate::cst::{SyntaxNode, SyntaxToken};
 use crate::syntax_kind::SyntaxKind;
@@ -37,18 +37,22 @@ impl DatabaseDecl {
     }
 }
 
-/// A catalog item: a base or virtual relvar declaration.
+/// A catalog item: a base or virtual relvar declaration, or a base-relvar
+/// INIT value (`<Name> := <expr>;`).
 #[derive(Debug, Clone)]
 pub enum CddbItem {
     BaseRelvar(BaseRelvarDecl),
     VirtualRelvar(VirtualRelvarDecl),
+    RelvarInit(RelvarInit),
 }
 
 impl AstNode for CddbItem {
     fn can_cast(kind: SyntaxKind) -> bool {
         matches!(
             kind,
-            SyntaxKind::BASE_RELVAR_DECL | SyntaxKind::VIRTUAL_RELVAR_DECL
+            SyntaxKind::BASE_RELVAR_DECL
+                | SyntaxKind::VIRTUAL_RELVAR_DECL
+                | SyntaxKind::RELVAR_INIT
         )
     }
 
@@ -58,6 +62,7 @@ impl AstNode for CddbItem {
             SyntaxKind::VIRTUAL_RELVAR_DECL => {
                 VirtualRelvarDecl::cast(syntax).map(CddbItem::VirtualRelvar)
             }
+            SyntaxKind::RELVAR_INIT => RelvarInit::cast(syntax).map(CddbItem::RelvarInit),
             _ => None,
         }
     }
@@ -66,6 +71,7 @@ impl AstNode for CddbItem {
         match self {
             CddbItem::BaseRelvar(decl) => decl.syntax(),
             CddbItem::VirtualRelvar(decl) => decl.syntax(),
+            CddbItem::RelvarInit(init) => init.syntax(),
         }
     }
 }
@@ -100,6 +106,25 @@ impl VirtualRelvarDecl {
     /// third.
     pub fn name(&self) -> Option<SyntaxToken> {
         ast::nth_token(&self.syntax, SyntaxKind::IDENT, 2)
+    }
+}
+
+ast_node!(pub RelvarInit, RELVAR_INIT);
+
+impl RelvarInit {
+    /// The target base-relvar name (LHS of `:=`). There is no leading
+    /// keyword, so the name is the first IDENT token (slot 0), and it is
+    /// a direct child token — the `Relation`/attribute IDENTs live nested
+    /// inside the RHS expression node, not as direct children here.
+    pub fn name(&self) -> Option<SyntaxToken> {
+        ast::nth_token(&self.syntax, SyntaxKind::IDENT, 0)
+    }
+
+    /// The initializer expression (RHS of `:=`). Parsed permissively as a
+    /// general expression; the typechecker requires it to be a ground
+    /// relation literal.
+    pub fn rhs(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
     }
 }
 
@@ -180,5 +205,23 @@ mod tests {
         let root = ast(src);
         let item = root.items().next().expect("item");
         assert!(matches!(item, CddbItem::VirtualRelvar(_)));
+    }
+
+    #[test]
+    fn relvar_init_walks_to_name_and_rhs() {
+        let src = "database d;\n\
+                   base relvar S { sno: Text } key { sno };\n\
+                   S := Relation { { sno: \"S1\" } };\n";
+        let root = ast(src);
+        let init = root
+            .items()
+            .find_map(|it| match it {
+                CddbItem::RelvarInit(i) => Some(i),
+                _ => None,
+            })
+            .expect("RelvarInit item");
+        assert_eq!(init.name().expect("name").text(), "S");
+        // The RHS is a relation literal, exposed as a shared `.cd` Expr.
+        assert!(matches!(init.rhs(), Some(Expr::RelationLit(_))));
     }
 }

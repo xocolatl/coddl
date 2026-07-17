@@ -1134,6 +1134,11 @@ impl TypeChecker {
             match item {
                 CddbItem::BaseRelvar(d) => self.check_base_relvar_decl(&d),
                 CddbItem::VirtualRelvar(d) => self.check_virtual_relvar_decl(&d),
+                // Base-relvar INIT values (`S := Relation { … };`) parse
+                // here but are not yet validated — resolving the LHS to a
+                // base relvar and checking the RHS is a ground relation
+                // literal lands in the provision roadmap's typecheck chunk.
+                CddbItem::RelvarInit(_) => {}
             }
         }
         // Walk the raw tree for any PUBLIC/PRIVATE_RELVAR_DECL nodes

@@ -309,6 +309,14 @@ pub enum SyntaxKind {
     /// existing discriminants stable.
     UNGROUP_EXPR,
 
+    /// `<Name> := <expr>;` — a base-relvar INIT value in a `.cddb`
+    /// catalog (the TTM initial value applied at `coddl provision`). The
+    /// LHS is a bare relvar name; the RHS is a general expression node
+    /// (a ground relation literal, enforced by the typechecker). A
+    /// `.cddb`-only node placed at the end of the enum to keep existing
+    /// discriminants stable.
+    RELVAR_INIT,
+
     /// A range of source whose intended structure couldn't be
     /// recovered. The parser still wraps the tokens so the tree stays
     /// well-formed and downstream passes can keep going.
@@ -476,6 +484,7 @@ mod tests {
             SyntaxKind::GROUP_EXPR,
             SyntaxKind::GROUP_PAIR,
             SyntaxKind::UNGROUP_EXPR,
+            SyntaxKind::RELVAR_INIT,
             SyntaxKind::PARSE_ERROR,
         ] {
             assert!(!sk.is_token(), "{sk:?} should be a node kind");

@@ -8,12 +8,14 @@
 //! <database-decl>        ::= 'database' IDENT ';'
 //! <cddb-item>            ::= <base-relvar-decl>
 //!                          | <virtual-relvar-decl>
+//!                          | <relvar-init>
 //! <base-relvar-decl>     ::= 'base' 'relvar' IDENT <heading> <key-clause>? ';'
 //! <virtual-relvar-decl>  ::= 'virtual' 'relvar' IDENT '=' <unknown-body> ';'
+//! <relvar-init>          ::= IDENT ':=' <expr> ';'
 //! ```
 //!
-//! `<heading>` and `<key-clause>` are shared with `.cd` via the
-//! corresponding `Parser` methods. `<unknown-body>` is parsed by
+//! `<heading>`, `<key-clause>`, and `<expr>` are shared with `.cd` via
+//! the corresponding `Parser` methods. `<unknown-body>` is parsed by
 //! consuming tokens to the next top-level `;` — virtual relvar RHS
 //! semantics land in Phase 16.
 
@@ -67,7 +69,14 @@ fn parse_database_decl(p: &mut Parser) {
 /// emit T0014 (relvar kind not legal for this dialect) on the
 /// resulting tree rather than producing a generic PB0004 parse error.
 fn parse_cddb_item(p: &mut Parser) {
-    if p.at_keyword("base") {
+    if p.at(SyntaxKind::IDENT) && p.nth_kind(1) == SyntaxKind::ASSIGN {
+        // A base-relvar INIT value (`<Name> := <expr>;`). Checked first so
+        // the trailing `:=` disambiguates an INIT from a keyword item — the
+        // same `:=`-wins convention as the `.cd` parser's `at_stmt_head`,
+        // which lets even a relvar legally named `base`/`virtual`/etc.
+        // receive an initializer.
+        parse_relvar_init(p);
+    } else if p.at_keyword("base") {
         parse_base_relvar_decl(p);
     } else if p.at_keyword("virtual") {
         parse_virtual_relvar_decl(p);
@@ -155,6 +164,31 @@ pub(crate) fn parse_virtual_relvar_decl(p: &mut Parser) {
     // RHS body — recover at the next top-level `;`. The `;` itself is
     // consumed by `skip_to_top_level_anchor`.
     p.skip_to_top_level_anchor();
+
+    p.finish_node();
+}
+
+/// `<Name> := <expr>;` — a base-relvar INIT value (the TTM initial value
+/// applied at `coddl provision`). The LHS names an existing base relvar; the
+/// RHS is parsed as a general expression (parser-permissive). Resolving the
+/// LHS to a base relvar and requiring the RHS to be a ground relation literal
+/// is the typechecker's job (Phase 15), not the parser's.
+fn parse_relvar_init(p: &mut Parser) {
+    debug_assert!(p.at(SyntaxKind::IDENT) && p.nth_kind(1) == SyntaxKind::ASSIGN);
+    p.bump_trivia();
+    p.start_node(SyntaxKind::RELVAR_INIT);
+    p.bump(); // relvar name (IDENT) — a reference, so no reserved-name check
+    p.bump(); // `:=` (ASSIGN — guaranteed by the dispatch guard)
+
+    if p.at(SyntaxKind::SEMICOLON) || p.current() == SyntaxKind::EOF {
+        p.error("PB0013", "expected expression after `:=`");
+    } else {
+        p.parse_expr();
+    }
+
+    if !p.eat(SyntaxKind::SEMICOLON) {
+        p.error("PB0014", "expected `;` after relvar initializer");
+    }
 
     p.finish_node();
 }
@@ -354,6 +388,67 @@ mod tests {
                        message: Text,\n\
                    }\n\
                    key { id };\n";
+        let out = parse_str(src);
+        assert_eq!(out.tree.text(), src);
+    }
+
+    #[test]
+    fn relvar_init_parses_as_item() {
+        let src = "database d;\n\
+                   base relvar S { sno: Text } key { sno };\n\
+                   S := Relation { { sno: \"S1\" } };\n";
+        let out = parse_str(src);
+        assert_eq!(
+            out.diagnostics.len(),
+            0,
+            "diagnostics: {:?}",
+            out.diagnostics
+        );
+        let kinds: Vec<_> = out.tree.children().map(|n| n.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                SyntaxKind::DATABASE_DECL,
+                SyntaxKind::BASE_RELVAR_DECL,
+                SyntaxKind::RELVAR_INIT,
+            ]
+        );
+    }
+
+    #[test]
+    fn relvar_init_empty_rhs_diagnoses_pb0013() {
+        let out = parse_str("database d; S := ;");
+        assert!(out.diagnostics.iter().any(|d| d.code == "PB0013"));
+    }
+
+    #[test]
+    fn relvar_init_missing_semicolon_diagnoses_pb0014() {
+        let out = parse_str("database d; S := Relation {}");
+        assert!(out.diagnostics.iter().any(|d| d.code == "PB0014"));
+    }
+
+    #[test]
+    fn relvar_init_dispatch_beats_keyword_named_base() {
+        // `base := …` is an INIT of a relvar *named* `base`, not a
+        // malformed `base relvar` decl — the `:=` lookahead wins, mirroring
+        // the `.cd` parser's `at_stmt_head` convention.
+        let src = "database d; base := Relation {};";
+        let out = parse_str(src);
+        let kinds: Vec<_> = out.tree.children().map(|n| n.kind()).collect();
+        assert_eq!(
+            kinds,
+            vec![SyntaxKind::DATABASE_DECL, SyntaxKind::RELVAR_INIT]
+        );
+    }
+
+    #[test]
+    fn relvar_init_round_trips_source_bytes() {
+        let src = "database d;\n\
+                   base relvar S { sno: Text } key { sno };\n\
+                   S := Relation {\n\
+                       { sno: \"S1\" },\n\
+                       { sno: \"S2\" },\n\
+                   };\n";
         let out = parse_str(src);
         assert_eq!(out.tree.text(), src);
     }

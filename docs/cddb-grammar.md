@@ -11,9 +11,9 @@ whitespace, identifiers, literals, and punctuation are **shared with
 `.cd`** — see `docs/grammar.md`. This document covers only the
 syntactic productions specific to `.cddb`.
 
-**Last sync:** unreleased — Phase 14. Every commit that adds, removes,
-or changes a production or diagnostic code in `parser_cddb.rs` updates
-this file in the same commit.
+**Last sync:** unreleased — Phase 14 + relvar-init (`<Name> := <expr>;`).
+Every commit that adds, removes, or changes a production or diagnostic
+code in `parser_cddb.rs` updates this file in the same commit.
 
 
 ## Notation
@@ -25,7 +25,8 @@ Same EBNF dialect as `docs/grammar.md`.
 
 A `.cddb` document begins with a required `database <Name>;` header
 followed by zero or more catalog items: base relvars (persistent
-catalog state) and virtual relvars (views).
+catalog state), virtual relvars (views), and base-relvar INIT values
+(the initial value seeded at `coddl provision`).
 
 ```
 <cddb-root>            ::= [ <database-decl> ] { <cddb-item> } ;        -- parse_cddb_root
@@ -36,6 +37,7 @@ catalog state) and virtual relvars (views).
 
 <cddb-item>            ::= <base-relvar-decl>
                          | <virtual-relvar-decl>
+                         | <relvar-init>
                          | <public-relvar-decl>
                          | <private-relvar-decl>
                          | <unknown-item> ;
@@ -56,6 +58,18 @@ catalog state) and virtual relvars (views).
                            -- actual relational-expression grammar
                            -- lands in Phase 16.
 
+<relvar-init>          ::= <identifier> ':=' <expr> ';' ;                -- parse_relvar_init
+                           -- A base-relvar INIT value (the TTM initial
+                           -- value applied at `coddl provision`). Keyed
+                           -- off a leading identifier followed by `:=`
+                           -- (checked before the keyword items so `:=`
+                           -- disambiguates). The LHS names an existing
+                           -- base relvar; the RHS is parsed as a general
+                           -- <expr> (parser-permissive). The typechecker
+                           -- resolves the LHS to a base relvar and
+                           -- requires the RHS to be a ground relation
+                           -- literal.
+
 -- `public relvar` and `private relvar` parse here via the shared
 -- `parse_public_relvar_decl` / `parse_private_relvar_decl` (see
 -- docs/grammar.md); the typechecker emits T0014 because those
@@ -63,7 +77,7 @@ catalog state) and virtual relvars (views).
 -- side, which similarly accepts `base` / `virtual`.
 ```
 
-The shared `<heading>`, `<key-clause>`, and `<unknown-item>`
+The shared `<heading>`, `<key-clause>`, `<expr>`, and `<unknown-item>`
 productions are documented in `docs/grammar.md`. `<unknown-body>`
 denotes "all tokens up to the next top-level `;` at bracket-depth
 zero" — the same recovery shape as `<unknown-item>`.
@@ -94,3 +108,5 @@ continues.
 | PB0010 | Expected relvar name (after `virtual relvar`)          |
 | PB0011 | Expected `=` after virtual relvar name                 |
 | PB0012 | Reserved word used as an identifier (database or relvar name; soft — the name still binds). Relvar attributes emit the shared core's P0096 instead. |
+| PB0013 | Expected an expression after `:=` in a relvar initializer      |
+| PB0014 | Expected `;` after a relvar initializer                        |

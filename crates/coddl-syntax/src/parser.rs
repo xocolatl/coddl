@@ -1278,7 +1278,7 @@ impl<'a> Parser<'a> {
     /// ladder from lowest to highest is `where`(0) < `or`(1) < `and`(2)
     /// < comparison(3) < additive `+`/`-`/`||`(4) < multiplicative
     /// `*`/`/`(5). All infix operators are left-associative.
-    fn parse_expr(&mut self) {
+    pub(crate) fn parse_expr(&mut self) {
         self.parse_expr_prec(0, true);
     }
 
