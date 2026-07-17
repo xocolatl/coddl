@@ -22,6 +22,10 @@ use coddl_syntax::ast::{
     TransactionExpr, TruncateStmt, TupleLit, TypeRef, UnaryExpr, UnaryOp, UngroupExpr, UnwrapExpr,
     UpdateStmt, VarStmt, WhileStmt, WrapExpr,
 };
+use coddl_syntax::literal_decode::{
+    decode_approximate_literal, decode_char_literal, decode_rational_literal,
+    decode_string_literal, gcd_i128, parse_integer_literal, reduce_rational,
+};
 use coddl_syntax::{parse, parse_format_template, SyntaxKind, TemplateChunk};
 use coddl_types::{
     check_program, resolve_type_ref_quiet, CheckUnit, Heading, RelvarKind, RelvarTable, Type,
@@ -8692,54 +8696,6 @@ fn type_from_proc(pt: &ProcType) -> Type {
     }
 }
 
-/// Decode the body of a `STRING_LIT` token (with surrounding `"`s) to
-/// raw UTF-8 bytes. Recognizes the escape set spelled out in
-/// `docs/grammar.md`: `\n`, `\r`, `\t`, `\"`, `\\`, `\u{...}`.
-fn decode_string_literal(text: &str) -> Vec<u8> {
-    let inner = text
-        .strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .unwrap_or(text);
-    let mut out = Vec::with_capacity(inner.len());
-    let mut chars = inner.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-            continue;
-        }
-        let Some(esc) = chars.next() else { break };
-        match esc {
-            'n' => out.push(b'\n'),
-            'r' => out.push(b'\r'),
-            't' => out.push(b'\t'),
-            '"' => out.push(b'"'),
-            '\\' => out.push(b'\\'),
-            'u' => {
-                // `\u{XXXX}` — the lexer already validated the form.
-                if chars.next() != Some('{') {
-                    break;
-                }
-                let mut hex = String::new();
-                for h in chars.by_ref() {
-                    if h == '}' {
-                        break;
-                    }
-                    hex.push(h);
-                }
-                if let Ok(cp) = u32::from_str_radix(&hex, 16) {
-                    if let Some(ch) = char::from_u32(cp) {
-                        let mut buf = [0u8; 4];
-                        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                    }
-                }
-            }
-            _ => unreachable!("unknown escape `\\{esc}` survived lexing"),
-        }
-    }
-    out
-}
-
 /// The result type of an `extend` value, mirroring the typechecker's rule:
 /// arithmetic is `Integer`, concatenation is `Text`, an attribute reference
 /// takes the operand heading's type, and a literal takes its own type. The
@@ -8853,94 +8809,6 @@ fn scalar_result_type(e: &ScalarExpr, heading: &Heading) -> Type {
     }
 }
 
-/// Decode the body of a `CHAR_LIT` token (with surrounding `'`s) to its
-/// Unicode scalar value. The lexer guarantees exactly one codepoint and the
-/// same escape set as `STRING_LIT` (`\n`, `\r`, `\t`, `\"`, `\\`, `\u{...}`).
-fn decode_char_literal(text: &str) -> u32 {
-    let inner = text
-        .strip_prefix('\'')
-        .and_then(|s| s.strip_suffix('\''))
-        .unwrap_or(text);
-    let mut chars = inner.chars();
-    let c = chars.next().expect("lexer rejects empty char literal");
-    if c != '\\' {
-        return c as u32;
-    }
-    match chars.next().expect("lexer rejects a lone backslash") {
-        'n' => '\n' as u32,
-        'r' => '\r' as u32,
-        't' => '\t' as u32,
-        '"' => '"' as u32,
-        '\'' => '\'' as u32,
-        '\\' => '\\' as u32,
-        'u' => {
-            // `\u{XXXX}` — the lexer already validated the form.
-            debug_assert_eq!(chars.next(), Some('{'));
-            let hex: String = chars.by_ref().take_while(|h| *h != '}').collect();
-            u32::from_str_radix(&hex, 16).expect("lexer validated the codepoint")
-        }
-        esc => unreachable!("unknown escape `\\{esc}` survived lexing"),
-    }
-}
-
-/// Parse an `INTEGER_LIT` lexeme into its `i64` value. Handles the
-/// four bases the lexer recognizes (`0x`, `0b`, `0o`, `0d`) plus the
-/// default decimal form. Underscores between digits are stripped.
-fn parse_integer_literal(text: &str) -> i64 {
-    let cleaned: String = text.chars().filter(|c| *c != '_').collect();
-    let (radix, digits) = if let Some(rest) = cleaned
-        .strip_prefix("0x")
-        .or_else(|| cleaned.strip_prefix("0X"))
-    {
-        (16, rest)
-    } else if let Some(rest) = cleaned
-        .strip_prefix("0b")
-        .or_else(|| cleaned.strip_prefix("0B"))
-    {
-        (2, rest)
-    } else if let Some(rest) = cleaned
-        .strip_prefix("0o")
-        .or_else(|| cleaned.strip_prefix("0O"))
-    {
-        (8, rest)
-    } else if let Some(rest) = cleaned
-        .strip_prefix("0d")
-        .or_else(|| cleaned.strip_prefix("0D"))
-    {
-        (10, rest)
-    } else {
-        (10, cleaned.as_str())
-    };
-    i64::from_str_radix(digits, radix).expect("lexer validated the digits")
-}
-
-/// Collapse an `f64` to the canonical IEEE-754 bit pattern for its Coddl
-/// `Approximate` *value*: all NaNs → one quiet-NaN pattern, `−0.0` → `+0.0`,
-/// everything else its own bits. This is what makes bitwise equality a proper
-/// (reflexive) equality — the same rule the runtime applies on SQL read-back.
-/// Mirror this rule anywhere else an `Approximate` enters the system.
-fn canonical_approx_bits(x: f64) -> u64 {
-    if x.is_nan() {
-        f64::NAN.to_bits()
-    } else if x == 0.0 {
-        // `x == 0.0` is true for both `+0.0` and `−0.0`; collapse to `+0.0`.
-        0
-    } else {
-        x.to_bits()
-    }
-}
-
-/// Decode an `Approximate` literal (`42e0`, `4.2e1`, `1e-9`) to its canonical
-/// bit pattern. Underscores are decoration (stripped like `parse_integer_literal`);
-/// the lexer already validated the mantissa/exponent shape.
-fn decode_approximate_literal(text: &str) -> u64 {
-    let cleaned: String = text.chars().filter(|c| *c != '_').collect();
-    let value: f64 = cleaned
-        .parse()
-        .expect("lexer validated the approximate literal");
-    canonical_approx_bits(value)
-}
-
 /// If `expr` is an integer literal, its `i64` value; else `None`.
 /// Used to constant-fold `<int> / <int>` rational constants in the pushdown path.
 fn int_literal_i64(expr: &Expr) -> Option<i64> {
@@ -8953,24 +8821,6 @@ fn int_literal_i64(expr: &Expr) -> Option<i64> {
     None
 }
 
-/// Greatest common divisor of two `i128` magnitudes (Euclid). `gcd(0, x) = |x|`.
-fn gcd_i128(mut a: i128, mut b: i128) -> i128 {
-    a = a.abs();
-    b = b.abs();
-    while b != 0 {
-        let t = a % b;
-        a = b;
-        b = t;
-    }
-    a
-}
-
-/// Reduce `(n, d)` to the canonical `i64` `Rational`: `gcd(|n|, d) = 1`,
-/// `d > 0`, `0 → (0, 1)`. Reduces in `i128` (so decode's `10^k` intermediate
-/// can't wrap) then narrows to `i64`. Panics on `d == 0` (division by zero is
-/// not a rational) and on a reduced component that exceeds `i64` (a literal past
-/// the bounded type's range). Every compile-time `Rational` funnels through
-/// this; the runtime mirror (`reduce_to_i64`) handles the same narrowing.
 /// A folded scalar constant as an `Inst::Const` payload (one per use site).
 fn const_of_literal(lit: &RelLiteral) -> (Const, ProcType) {
     match lit {
@@ -9131,41 +8981,6 @@ fn fold_binary_const(
         _ => return Ok(None),
     };
     Ok(Some(out))
-}
-
-fn reduce_rational(n: i128, d: i128) -> (i64, i64) {
-    assert!(d != 0, "rational with zero denominator");
-    if n == 0 {
-        return (0, 1);
-    }
-    let g = gcd_i128(n, d);
-    let (mut n, mut d) = (n / g, d / g);
-    if d < 0 {
-        n = -n;
-        d = -d;
-    }
-    let narrow = |v: i128| i64::try_from(v).expect("rational component exceeds i64");
-    (narrow(n), narrow(d))
-}
-
-/// Decode a `Rational` literal (`3.4`, `42.0`, `3.1415926`) — the lexer's
-/// `digits . digits` form — to its reduced `(numer, denom)` pair. `d.ffff` with
-/// `k` fractional digits → `(all_digits, 10^k)`, reduced. Underscores are
-/// decoration. A literal whose reduced form exceeds `i64` (≳19 digits) traps.
-fn decode_rational_literal(text: &str) -> (i64, i64) {
-    let cleaned: String = text.chars().filter(|c| *c != '_').collect();
-    let (int_part, frac_part) = match cleaned.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (cleaned.as_str(), ""),
-    };
-    let digits: String = format!("{int_part}{frac_part}");
-    let numer: i128 = digits
-        .parse()
-        .expect("rational literal numerator exceeds i128");
-    let denom: i128 = 10i128
-        .checked_pow(frac_part.len() as u32)
-        .expect("rational literal denominator exceeds i128");
-    reduce_rational(numer, denom)
 }
 
 #[cfg(test)]
@@ -10285,17 +10100,6 @@ oper main {}\n\
             ),
             "char literal lowers to Const::Character"
         );
-    }
-
-    #[test]
-    fn rational_literal_decodes_to_reduced_pair() {
-        assert_eq!(decode_rational_literal("3.4"), (17, 5));
-        assert_eq!(decode_rational_literal("42.0"), (42, 1));
-        assert_eq!(decode_rational_literal("0.5"), (1, 2));
-        assert_eq!(decode_rational_literal("3.1415926"), (15707963, 5000000));
-        assert_eq!(decode_rational_literal("1_000.0"), (1000, 1));
-        // gcd/normalize edge: already-canonical stays; zero is (0,1).
-        assert_eq!(decode_rational_literal("0.0"), (0, 1));
     }
 
     #[test]
@@ -11634,15 +11438,6 @@ oper main {} [
             }
             other => panic!("entry should end in Br, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn integer_literal_decodes_decimal_and_hex() {
-        assert_eq!(parse_integer_literal("42"), 42);
-        assert_eq!(parse_integer_literal("0x2a"), 42);
-        assert_eq!(parse_integer_literal("0b101010"), 42);
-        assert_eq!(parse_integer_literal("0o52"), 42);
-        assert_eq!(parse_integer_literal("1_000"), 1000);
     }
 
     // ── Tuple lit + field access (Phase 18) ──────────────────────────

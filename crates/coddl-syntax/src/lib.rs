@@ -21,6 +21,7 @@ pub mod file_kind;
 pub mod format_template;
 pub mod keywords;
 pub mod lexer;
+pub mod literal_decode;
 pub mod parser;
 pub mod parser_cddb;
 pub mod parser_cdmap;
