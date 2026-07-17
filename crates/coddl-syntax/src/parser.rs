@@ -1558,6 +1558,14 @@ impl<'a> Parser<'a> {
                 self.finish_node();
                 true
             }
+            // `+ <expr>` / `- <expr>` — unary sign in prefix position. Only
+            // reached at an expression head or infix rhs; a binary `a - b` is
+            // consumed by the infix loop in `parse_expr_prec`, so there is no
+            // ambiguity here.
+            SyntaxKind::PLUS | SyntaxKind::MINUS => {
+                self.parse_sign_expr();
+                true
+            }
             _ => {
                 self.error("P0014", "expected expression");
                 false
@@ -1730,6 +1738,23 @@ impl<'a> Parser<'a> {
         self.start_node(SyntaxKind::UNARY_EXPR);
         self.bump(); // `not` / `¬`
         self.parse_expr_prec(3, true);
+        self.finish_node();
+    }
+
+    /// `- <expr>` / `+ <expr>` — unary sign negation / identity. Parsed as a
+    /// `UNARY_EXPR` with one operand (typechecked to be Integer or Rational).
+    /// The operand parses at precedence 6 — one above the tightest infix
+    /// level (multiplicative, 5) — so the sign binds tighter than every
+    /// binary operator: `-a * b` reads as `(-a) * b`, `-a + b` as `(-a) + b`,
+    /// and `2 - -3` as `2 - (-3)`. Postfix suffixes (`.name`, `{…}`, `[i]`)
+    /// still bind tighter, so `-a.b` is `-(a.b)`; nested `- -3` falls out
+    /// naturally.
+    fn parse_sign_expr(&mut self) {
+        debug_assert!(self.at(SyntaxKind::PLUS) || self.at(SyntaxKind::MINUS));
+        self.bump_trivia();
+        self.start_node(SyntaxKind::UNARY_EXPR);
+        self.bump(); // `+` / `-`
+        self.parse_expr_prec(6, true);
         self.finish_node();
     }
 
@@ -5404,6 +5429,114 @@ mod tests {
             .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
             .expect("inner BINARY_EXPR (the `b * c` product)");
         assert_eq!(inner.text().to_string().trim(), "b * c");
+    }
+
+    // ── unary sign `+` / `-` ─────────────────────────────────────────
+
+    #[test]
+    fn unary_sign_parses_to_unary_expr() {
+        for (src, want) in [
+            ("oper f {} [ let x = -5; ];", crate::ast::UnaryOp::Neg),
+            ("oper f {} [ let x = +5; ];", crate::ast::UnaryOp::Pos),
+        ] {
+            let out = parse_str(src);
+            assert!(
+                out.diagnostics.is_empty(),
+                "src={src}: {:?}",
+                out.diagnostics
+            );
+            let ue = out
+                .tree
+                .descendants()
+                .find(|n| n.kind() == SyntaxKind::UNARY_EXPR)
+                .and_then(<crate::ast::UnaryExpr as crate::ast::AstNode>::cast)
+                .unwrap_or_else(|| panic!("src={src}: expected a UNARY_EXPR"));
+            assert_eq!(ue.op_kind(), Some(want), "src={src}");
+        }
+    }
+
+    #[test]
+    fn unary_minus_binds_tighter_than_multiplicative() {
+        // `-a * b` parses as `(-a) * b`: outer `*`, its lhs is UNARY_EXPR `-a`.
+        let out = parse_str("oper f {} [ let x = -a * b; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let outer = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("outer BINARY_EXPR");
+        assert!(
+            outer.text().to_string().contains(" * "),
+            "outer is `*`: {}",
+            outer.text()
+        );
+        let lhs = outer
+            .children()
+            .find(|n| n.kind() == SyntaxKind::UNARY_EXPR)
+            .expect("lhs UNARY_EXPR (`-a`)");
+        assert_eq!(lhs.text().to_string().trim(), "-a");
+    }
+
+    #[test]
+    fn unary_minus_binds_tighter_than_additive() {
+        // `-a + b` parses as `(-a) + b`: outer `+`, its lhs is UNARY_EXPR `-a`.
+        let out = parse_str("oper f {} [ let x = -a + b; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let outer = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("outer BINARY_EXPR");
+        assert!(outer.text().to_string().contains(" + "), "outer is `+`");
+        let lhs = outer
+            .children()
+            .find(|n| n.kind() == SyntaxKind::UNARY_EXPR)
+            .expect("lhs UNARY_EXPR (`-a`)");
+        assert_eq!(lhs.text().to_string().trim(), "-a");
+    }
+
+    #[test]
+    fn binary_minus_with_unary_minus_rhs() {
+        // `2 - -3`: an outer binary `-` whose rhs is a UNARY_EXPR `-3`.
+        let out = parse_str("oper f {} [ let x = 2 - -3; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let outer = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .expect("outer BINARY_EXPR");
+        let rhs = outer
+            .children()
+            .find(|n| n.kind() == SyntaxKind::UNARY_EXPR)
+            .expect("rhs UNARY_EXPR (`-3`)");
+        assert_eq!(rhs.text().to_string().trim(), "-3");
+    }
+
+    #[test]
+    fn double_unary_minus_nests() {
+        // `- -3`: a UNARY_EXPR whose operand is itself a UNARY_EXPR.
+        let out = parse_str("oper f {} [ let x = - -3; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let outer = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::UNARY_EXPR)
+            .expect("outer UNARY_EXPR");
+        let inner = outer
+            .children()
+            .find(|n| n.kind() == SyntaxKind::UNARY_EXPR)
+            .expect("inner UNARY_EXPR (`-3`)");
+        assert_eq!(inner.text().to_string().trim(), "-3");
+    }
+
+    #[test]
+    fn unary_sign_missing_operand_diagnoses_p0014() {
+        let out = parse_str("oper f {} [ let x = -; ];");
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0014"),
+            "expected P0014, got {:?}",
+            out.diagnostics
+        );
     }
 
     // ── extract (Phase 21) ───────────────────────────────────────────

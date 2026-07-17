@@ -1105,6 +1105,30 @@ impl Lowerer {
                     _ => Ok(None),
                 }
             }
+            Expr::Unary(u) if matches!(u.op_kind(), Some(UnaryOp::Pos | UnaryOp::Neg)) => {
+                let Some(operand) = u.operand() else {
+                    return Ok(None);
+                };
+                let Some(lit) = self.fold_const_expr(&operand)? else {
+                    return Ok(None);
+                };
+                // `+x` is the identity; `-x` folds as `0 - x` — the same
+                // overflow/reduce semantics as the runtime and the lowering
+                // desugar (Rational stays canonical: den > 0, sign on numerator).
+                match (u.op_kind(), lit) {
+                    (
+                        Some(UnaryOp::Pos),
+                        l @ (RelLiteral::Integer(_) | RelLiteral::Rational(..)),
+                    ) => Ok(Some(l)),
+                    (Some(UnaryOp::Neg), l @ RelLiteral::Integer(_)) => {
+                        fold_binary_const(Some(BinaryOp::Sub), RelLiteral::Integer(0), l)
+                    }
+                    (Some(UnaryOp::Neg), l @ RelLiteral::Rational(..)) => {
+                        fold_binary_const(Some(BinaryOp::Sub), RelLiteral::Rational(0, 1), l)
+                    }
+                    _ => Ok(None),
+                }
+            }
             Expr::Binary(b) => {
                 let (Some(le), Some(re)) = (b.lhs(), b.rhs()) else {
                     return Ok(None);
@@ -6033,11 +6057,12 @@ impl Lowerer {
         self.insts.push(Inst::Dml { plan_id, params });
     }
 
-    /// Lower a unary prefix expression. Phase 21 handles `Extract`:
-    /// emit `Inst::Extract` with the source's heading id. If the
-    /// source isn't bound to any local (i.e., it's a temporary —
-    /// e.g., a freshly-allocated `R where p`), emit `Inst::Release`
-    /// after extract so the heap payload is freed.
+    /// Lower a unary prefix expression. `Extract` emits `Inst::Extract`
+    /// (with a deferred release of a temporary source). `Not` is a scalar
+    /// `xor`. `Pos` is the identity. `Neg` desugars to `0 - x`, reusing the
+    /// existing integer/rational subtract — so no new instruction, and the
+    /// Rational result stays canonical (`coddl_rational_sub` reduces to
+    /// denominator > 0, sign on the numerator).
     fn lower_unary_expr(&mut self, ue: &UnaryExpr) -> ValueId {
         let op = ue.op_kind().expect("typechecked unary expr has an op");
         match op {
@@ -6094,6 +6119,40 @@ impl Lowerer {
                         kind: DeferredKind::ExtractSource,
                     });
                 }
+                dst
+            }
+            UnaryOp::Pos => {
+                // Unary plus is the identity — return the operand unchanged.
+                let operand_expr = ue.operand().expect("typechecked unary + has an operand");
+                self.lower_expr(&operand_expr)
+            }
+            UnaryOp::Neg => {
+                // Desugar `-x` to `0 - x`, reusing the subtract op. Typecheck
+                // guarantees an Integer or Rational operand; the Rational
+                // subtract canonicalizes (den > 0, sign on numerator).
+                let operand_expr = ue.operand().expect("typechecked unary - has an operand");
+                let val = self.lower_expr(&operand_expr);
+                let ty = self.value_type(val);
+                let (zero, sub) = match ty {
+                    ProcType::Rational => (Const::Rational(0, 1), ScalarOp::RationalSub),
+                    _ => (Const::Integer(0), ScalarOp::Sub),
+                };
+                let zero_val = self.fresh_value();
+                self.record_type(zero_val, ty.clone());
+                self.insts.push(Inst::Const {
+                    dst: zero_val,
+                    value: zero,
+                    ty: ty.clone(),
+                });
+                let dst = self.fresh_value();
+                self.record_type(dst, ty.clone());
+                self.insts.push(Inst::ScalarOp {
+                    dst,
+                    op: sub,
+                    operand_type: ty,
+                    lhs: zero_val,
+                    rhs: val,
+                });
                 dst
             }
         }

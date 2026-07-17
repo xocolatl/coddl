@@ -1180,8 +1180,10 @@ impl BinaryExpr {
     }
 }
 
-/// Unary prefix operator kinds — `Extract` and Boolean `Not`
-/// (future unary ops, e.g. unary `-`, slot in here).
+/// Unary prefix operator kinds — the word operators `Extract` and Boolean
+/// `Not` (matched via their IDENT lexeme through the `keywords` table), and
+/// the symbol sign operators `Pos`/`Neg` (matched by `PLUS`/`MINUS` token
+/// kind, so they stay out of the keyword table).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
     /// `extract <relexpr>` — TTM RM Pre 10 cardinality-checked
@@ -1190,6 +1192,10 @@ pub enum UnaryOp {
     /// `not <boolexpr>` (or its `¬` glyph) — Boolean prefix negation
     /// (`Boolean → Boolean`).
     Not,
+    /// `+ <numexpr>` — unary plus (identity on Integer / Rational).
+    Pos,
+    /// `- <numexpr>` — unary minus / negation (Integer / Rational).
+    Neg,
 }
 
 ast_node!(pub UnaryExpr, UNARY_EXPR);
@@ -1200,12 +1206,17 @@ impl UnaryExpr {
         self.syntax.children().find_map(Expr::cast)
     }
 
-    /// The operator's keyword token, recognized via its IDENT lexeme:
-    /// `extract`, `not`, or the `¬` glyph (also lexed as an IDENT).
+    /// The operator token: a `PLUS`/`MINUS` symbol (`+`/`-`), or the IDENT
+    /// lexeme of a word operator (`extract`, `not`, or the `¬` glyph — all
+    /// lexed as IDENTs). Symbols are matched by token kind so they need no
+    /// entry in the `keywords` table.
     pub fn op_token(&self) -> Option<SyntaxToken> {
         for el in self.syntax.children_with_tokens() {
             if let Some(tok) = el.into_token() {
-                if tok.kind() == SyntaxKind::IDENT && crate::keywords::unary(tok.text()).is_some() {
+                let is_op = matches!(tok.kind(), SyntaxKind::PLUS | SyntaxKind::MINUS)
+                    || (tok.kind() == SyntaxKind::IDENT
+                        && crate::keywords::unary(tok.text()).is_some());
+                if is_op {
                     return Some(tok);
                 }
             }
@@ -1217,7 +1228,11 @@ impl UnaryExpr {
     /// parse-recovery edge case (no recognized prefix token).
     pub fn op_kind(&self) -> Option<UnaryOp> {
         let tok = self.op_token()?;
-        crate::keywords::unary(tok.text())
+        match tok.kind() {
+            SyntaxKind::PLUS => Some(UnaryOp::Pos),
+            SyntaxKind::MINUS => Some(UnaryOp::Neg),
+            _ => crate::keywords::unary(tok.text()),
+        }
     }
 }
 

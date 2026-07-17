@@ -4440,6 +4440,9 @@ impl TypeChecker {
     /// `Extract`: operand must be `Relation H`; result is `Tuple H`
     /// (T0024 on mismatch). `Not`: operand must be `Boolean`; result
     /// is `Boolean` (T0021 on mismatch — shared with `and`/`or`).
+    /// `Pos`/`Neg` (unary `+`/`-`): operand must be `Integer` or `Rational`;
+    /// result is the operand type (T0109 on mismatch — Approximate is not yet
+    /// supported).
     fn check_unary_expr(&mut self, ue: &UnaryExpr, scope: &mut Scope) -> Type {
         let op = match ue.op_kind() {
             Some(op) => op,
@@ -4484,6 +4487,36 @@ impl TypeChecker {
                             span,
                             "T0024",
                             format!("`extract` expects a Relation, got {other}"),
+                        );
+                        Type::Unknown
+                    }
+                }
+            }
+            UnaryOp::Pos | UnaryOp::Neg => {
+                let operand_ty = match ue.operand() {
+                    Some(e) => self.check_expr(&e, scope),
+                    None => return Type::Unknown,
+                };
+                let opname = if matches!(op, UnaryOp::Neg) { "-" } else { "+" };
+                match operand_ty {
+                    // Result is the operand's type; `+` is identity, `-`
+                    // negates. Rational stays canonical (den > 0) — the
+                    // lowerer desugars `-x` to `0 - x`, so the runtime's
+                    // rational subtract does the reduction.
+                    Type::Integer => Type::Integer,
+                    Type::Rational => Type::Rational,
+                    Type::Unknown => Type::Unknown,
+                    other => {
+                        let span = ue
+                            .operand()
+                            .map(|e| self.node_span(e.syntax()))
+                            .unwrap_or_else(|| self.node_span(ue.syntax()));
+                        self.error(
+                            span,
+                            "T0109",
+                            format!(
+                                "unary `{opname}` requires an Integer or Rational operand (Approximate is not yet supported), got {other}"
+                            ),
                         );
                         Type::Unknown
                     }
@@ -8778,6 +8811,60 @@ mod tests {
     fn arithmetic_on_non_integer_diagnoses_t0043() {
         let src = "oper main {} [ let b = 1 + \"x\"; ];";
         assert!(codes(src).contains(&"T0043"));
+    }
+
+    #[test]
+    fn unary_sign_on_integer_and_rational_typecheck_clean() {
+        let src = "oper main {} [ \
+                   let _a = -5; \
+                   let _b = +5; \
+                   let _c = -(1/2); \
+                   let _d = -2.0; \
+                   let _e = - -3; \
+                   ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn unary_sign_result_type_matches_operand() {
+        // `-5` is Integer, `-2.0` is Rational — each compares to a same-type
+        // literal without a mismatch.
+        let src = "oper main {} [ let _a = -5 = 3; let _b = -2.0 = 0.5; ];";
+        let diags = diagnostics(src);
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
+    fn unary_sign_on_approximate_diagnoses_t0109() {
+        let src = "oper main {} [ let _a = -2e0; ];";
+        assert!(codes(src).contains(&"T0109"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn unary_sign_on_boolean_diagnoses_t0109() {
+        let src = "oper main {} [ let _a = -true; ];";
+        assert!(codes(src).contains(&"T0109"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn unary_sign_on_text_diagnoses_t0109() {
+        let src = "oper main {} [ let _a = -\"x\"; ];";
+        assert!(codes(src).contains(&"T0109"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn cddb_init_allows_negative_rational_seed() {
+        // Unary `-` closes the provision negative-Rational-weight seed gap:
+        // `weight: -12.0` is now a valid constant INIT value.
+        let src = "database d;\n\
+                   base relvar P { pno: Text, weight: Rational } key { pno };\n\
+                   P := Relation { { pno: \"P1\", weight: -12.0 } };\n";
+        assert!(
+            diagnostics_cddb(src).is_empty(),
+            "unexpected: {:?}",
+            diagnostics_cddb(src)
+        );
     }
 
     #[test]

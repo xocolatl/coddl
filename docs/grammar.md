@@ -884,6 +884,7 @@ function that implements it.
                   | <sequence-lit>
                   | <extract-expr>
                   | <not-expr>
+                  | <sign-expr>
                   | <paren-expr> ;                             -- parse_primary_expr
 <bool-lit>      ::= 'true' | 'false' ;                         -- BOOL_LITERAL
 <extract-expr>  ::= 'extract' <expr-prec> ;                    -- parse_extract_expr
@@ -903,6 +904,18 @@ function that implements it.
                     -- `¬` is the glyph synonym (lexed as an IDENT,
                     -- matched at the same recognition site). T0021
                     -- if the operand isn't Boolean.
+<sign-expr>     ::= ( '+' | '-' ) <expr-prec> ;                 -- parse_sign_expr
+                    -- Unary sign: `+` identity, `-` negation
+                    -- (Integer / Rational; Approximate is T0109 for
+                    -- now). Wraps in UNARY_EXPR. `+`/`-` are matched
+                    -- by token kind (PLUS/MINUS), not the keyword
+                    -- table. The operand parses at prec 6 — one above
+                    -- the tightest infix (multiplicative, 5) — so the
+                    -- sign binds tighter than every binary operator:
+                    -- `-a * b` is `(-a) * b`, `-a + b` is `(-a) + b`,
+                    -- `2 - -3` is `2 - (-3)`; postfix still binds
+                    -- tighter, so `-a.b` is `-(a.b)`. A binary `a - b`
+                    -- is consumed by the infix loop, not here.
 <paren-expr>    ::= '(' <expr-prec> ')' ;                       -- PAREN_EXPR
                     -- Transparent grouping; AST view unwraps to
                     -- the inner expression so the typechecker /
@@ -1132,10 +1145,12 @@ is explicit, not implied:
   Relation literals `Relation { … }` landed in Phase 19. Boolean
   literals `true` / `false` and infix `=`, `<>`, `<`, `>`, `<=`,
   `>=`, `and`, `or`, `where` landed in Phase 20.)
-- **`mod`** (`Integer × Integer → Integer`, multiplicative precedence) and
-  **unary minus** / negative literals. Still deferred. (Binary arithmetic
-  `+`, `-`, `*`, `/` on `Integer` and concatenation `||` on `Text`/`Character`
-  landed — they parse at prec 4/5 above comparison, see `<infix-op>`.)
+- **`mod`** (`Integer × Integer → Integer`, multiplicative precedence). Still
+  deferred. (Binary arithmetic `+`, `-`, `*`, `/` on `Integer`/`Rational` and
+  concatenation `||` on `Text`/`Character` landed — they parse at prec 4/5
+  above comparison, see `<infix-op>`. Unary `+`/`-` on `Integer`/`Rational`
+  landed as `<sign-expr>`; unary minus on `Approximate` stays deferred until
+  float arithmetic lands — it is T0109.)
 - **Pattern matching**, **`if`/`else`**, **anonymous opers**.
 
 

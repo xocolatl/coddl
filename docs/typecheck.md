@@ -594,9 +594,13 @@ each `parse_<x>` has a corresponding `check_<x>`.
   - **Logical (`and`, `or`)**: both operands must be Boolean.
     Result is `Boolean`. T0021 otherwise. (Prefix `not` is the unary
     sibling — see `check_unary_expr` below, same T0021.)
-  - **Arithmetic (`+`, `-`, `*`, `/`)**: both operands must be
-    Integer (integer division truncates toward zero). Result is
-    `Integer`. T0043 otherwise.
+  - **Arithmetic (`+`, `-`, `*`, `/`)**: both operands must be two
+    Integers or two Rationals (no mixing). For Integer operands `+`,
+    `-`, `*` yield Integer and exact `/` yields Rational; `div`
+    truncates toward zero (Integer only). T0043 otherwise. The unary
+    sign operators (`+`/`-`) are the prefix siblings — see
+    `check_unary_expr` below: operand Integer or Rational, result the
+    operand type, T0109 otherwise (Approximate not yet supported).
   - **Concatenation (`||`)**: each operand must be Text or
     Character (any mix). Result is always `Text` (two Characters
     can't be one Character). T0044 otherwise.
@@ -917,7 +921,7 @@ check script enforces that.
 | T0040 | `compose` operands have identical headings (every attribute removed, result always nullary) — suggest `intersect` |
 | T0041 | `tclose` operand must be a relation of exactly two attributes of the same type (binary graph relation) |
 | T0042 | `replace` value references no attribute, so it removes nothing — use `extend` to add without removing |
-| T0043 | arithmetic operator (`+`, `-`, `*`, `/`) requires Integer operands |
+| T0043 | binary arithmetic operator (`+`, `-`, `*`, `/`, `div`) requires two Integer or two Rational operands (no mixing; `div` is Integer-only) |
 | T0044 | `||` requires Text or Character operands |
 | T0045 | `extend` attribute already exists / duplicate `extend` target |
 | T0046 | computed `extend` / `replace` value must be Integer or Text (v1 relation-cell support) |
@@ -983,3 +987,4 @@ check script enforces that.
 | T0106 | a `.cddb` INIT relation's heading does not match the relvar heading (attributes missing and/or unexpected) |
 | T0107 | a `.cddb` INIT value is not a constant expression — it reads a relvar, uses a `transaction`, or calls a side-effecting operator (an unresolved bare name is the plain T0001, not this) |
 | T0108 | a `.cddb` INIT attribute value's type is not assignable to the declared attribute type (an `Integer` value is accepted where a `Rational` is declared) |
+| T0109 | unary `+`/`-` requires an Integer or Rational operand (Approximate is not yet supported — it needs a float-arithmetic path) |
