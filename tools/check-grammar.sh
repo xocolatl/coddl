@@ -4,7 +4,7 @@
 # Verify the docs/ tree is in lockstep with the syntax, types, and
 # procir crates.
 #
-# Two invariants:
+# Three invariants:
 #   1. Every `fn parse_<name>` in any parser*.rs (outside #[cfg(test)]
 #      code) has a `<name>` rule (kebab-case) defined in some
 #      docs/*-grammar.md or docs/grammar.md file. Which doc file owns
@@ -19,8 +19,16 @@
 #      file owns which code prefix is documentation discipline; the
 #      script only enforces that every emitted code is documented
 #      somewhere.
+#   3. The keyword inventory syncs BIDIRECTIONALLY: every keyword or
+#      glyph in crates/coddl-syntax/src/keywords.rs (outside tests)
+#      appears backticked in grammar.md's "Reserved words" section, and
+#      every backticked word/glyph on that section's inventory lines
+#      (table rows and the bold Tier-3 list lines) exists in
+#      keywords.rs. Which tier/table a word belongs to remains
+#      documentation discipline, like the per-file scoping of checks
+#      1-2.
 #
-# Exits 0 if both invariants hold, 1 with a summary of what's missing
+# Exits 0 if all invariants hold, 1 with a summary of what's missing
 # otherwise. POSIX shell only — no Python, no Rust.
 
 set -eu
@@ -96,6 +104,77 @@ for code in $codes; do
         failed=1
     fi
 done
+
+# 3. Keyword inventory.
+#
+# keywords.rs is the single source of truth for every contextually
+# recognized identifier; grammar.md's "Reserved words" section publishes
+# it as the keyword taxonomy. Diff the two bidirectionally. The source
+# harvest relies on the keywords.rs invariant that every string literal
+# outside the test module is a keyword or glyph (stated in that file's
+# module docs).
+
+keywords_rs="$ROOT/crates/coddl-syntax/src/keywords.rs"
+grammar_main="$ROOT/docs/grammar.md"
+
+src_words=$(
+    sed '/^#\[cfg(test)\]/,$d' "$keywords_rs" \
+        | grep -v '^[[:space:]]*//' \
+        | grep -oE '"[^"]+"' \
+        | tr -d '"' \
+        | sort -u
+)
+if [ -z "$src_words" ]; then
+    echo "check-grammar: no keywords harvested from keywords.rs" >&2
+    exit 1
+fi
+
+# The "Reserved words" section body (heading and next ## heading dropped).
+section=$(
+    sed -n '/^## Reserved words$/,/^## /p' "$grammar_main" | sed '1d;$d'
+)
+if [ -z "$section" ]; then
+    echo "check-grammar: no \"Reserved words\" section found in grammar.md" >&2
+    exit 1
+fi
+
+# 3a. Source -> doc: every keyword/glyph appears backticked somewhere in
+# the section (multi-word entries like "not matching" included).
+old_ifs=$IFS
+IFS='
+'
+for w in $src_words; do
+    if ! printf '%s\n' "$section" | grep -qF "\`$w\`"; then
+        echo "check-grammar: keyword \`$w\` (keywords.rs) is missing from grammar.md \"Reserved words\"" >&2
+        failed=1
+    fi
+done
+
+# 3b. Doc -> source: every backticked word/glyph on the section's
+# inventory lines (table rows `|...` and the bold `**...` list lines)
+# exists in keywords.rs. Compound examples (tokens with spaces),
+# punctuation-bearing code fragments (`:=`, `<assign-stmt>`, `[asc]`),
+# parser fn names, and diagnostic codes are prose, not inventory.
+doc_words=$(
+    printf '%s\n' "$section" \
+        | grep -E '^(\||\*\*)' \
+        | grep -oE '`[^`]+`' \
+        | tr -d '`' \
+        | sort -u
+)
+for w in $doc_words; do
+    case $w in
+        *' '*) continue ;;
+        parse_*) continue ;;
+        [EPTL][0-9][0-9][0-9][0-9] | P[BMSL][0-9][0-9][0-9][0-9]) continue ;;
+        *[\<\>\[\]\{\}\(\)\;\:\=\.\,\*\/\+\|\"\'\?\!]*) continue ;;
+    esac
+    if ! printf '%s\n' "$src_words" | grep -qxF "$w"; then
+        echo "check-grammar: \`$w\` in a grammar.md \"Reserved words\" table is not in keywords.rs" >&2
+        failed=1
+    fi
+done
+IFS=$old_ifs
 
 if [ "$failed" -eq 0 ]; then
     echo "check-grammar: docs/ is in sync with crates/coddl-syntax + crates/coddl-types + crates/coddl-procir + crates/coddl-plan"

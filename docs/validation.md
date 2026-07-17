@@ -114,7 +114,11 @@ codegen runs and the test never reaches the per-backend assertion.
 
 The five-part hygiene gate (fmt, build, clippy, tests,
 check-grammar) gates every commit; nothing about validation
-shortcuts it.
+shortcuts it. Two of the five run mechanically from the pre-commit
+hook (`tools/git-hooks/pre-commit`): the formatting checks and
+`tools/check-grammar.sh` (grammar rules, diagnostic codes, and the
+bidirectional keyword-inventory sync). Build, clippy, and tests
+remain run-before-committing convention.
 
 
 ## Running the suite fast (macOS)

@@ -7,8 +7,12 @@
 //! (`peek_infix_prec`) and the AST's operator allow-lists
 //! (`BinaryExpr::op_token`/`op_kind`, `UnaryExpr`, `BoolLit`, `SortItem`,
 //! `ProjectExpr`) consume the same consts, and `docs/grammar.md`
-//! §"Reserved words" publishes this module as a table (mechanical sync is
-//! tracked; today the doc table is maintained by hand against this file).
+//! §"Reserved words" publishes this module as a table —
+//! `tools/check-grammar.sh` (Check 3) diffs the two bidirectionally and
+//! runs from the pre-commit hook. That check harvests every string
+//! literal in this module outside the test block, so keep the invariant:
+//! **every non-test string literal here is a keyword or glyph** — nothing
+//! else (no message strings, no quoted prose in code).
 //!
 //! Two kinds of groups live here:
 //!

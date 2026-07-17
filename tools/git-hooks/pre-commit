@@ -1,5 +1,5 @@
 #!/bin/sh
-# Pre-commit formatting gate.
+# Pre-commit gate: formatting + doc/source sync.
 #
 # Rust: rustfmt's fixed defaults over the whole workspace (`cargo fmt --all
 # --check`) — the baseline is kept clean, so any drift fails fast.
@@ -9,6 +9,10 @@
 # maturing, so pre-existing `.cd` files are left as-is until a deliberate
 # `coddl fmt --write` sweep — you only reformat what you touch. When the
 # formatter's rules change, that sweep is the "expected churn".
+#
+# Docs: tools/check-grammar.sh — every parser fn has a grammar rule, every
+# emitted diagnostic code is documented, and the keyword inventory
+# (keywords.rs <-> grammar.md "Reserved words") syncs bidirectionally.
 #
 # Installed by tools/git-hooks/install.sh as a shim in .git/hooks/pre-commit,
 # so local hooks (e.g. ctags) keep working. Bypass with `git commit --no-verify`.
@@ -46,9 +50,15 @@ if [ -n "$staged_cd" ]; then
     fi
 fi
 
+# ── Docs (grammar rules, diagnostic codes, keyword inventory) ────────────
+if ! "$repo/tools/check-grammar.sh" >/dev/null; then
+    echo "✗ docs out of sync (see check-grammar output above)." >&2
+    fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "" >&2
-    echo "pre-commit: formatting check failed; commit aborted." >&2
+    echo "pre-commit: check failed; commit aborted." >&2
     echo "bypass with 'git commit --no-verify' if intentional." >&2
     exit 1
 fi
