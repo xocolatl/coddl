@@ -828,6 +828,45 @@ and transaction rule (**T0025**):
   `check_replace_expr`'s, minus those two surface lints).
 
 
+## `.cddb` base-relvar INIT values
+
+A `.cddb` catalog may give a base relvar an **initial value** —
+`S := Relation { … };` — the TTM base-relvar INIT applied once when the
+database is materialized by `coddl provision` (the analogue of Tutorial D's
+`VAR … REAL … INIT (…)`). `check_relvar_init` validates each INIT item in a
+**second pass** over the catalog, after every `base`/`virtual` relvar is in the
+table, so an INIT may name a relvar declared anywhere in the file and a
+duplicate INIT for one relvar is caught (`initialized` set).
+
+The rules:
+
+- **The LHS resolves to a base relvar of this catalog.** An unknown name is
+  **T0102**; a `virtual relvar` target is **T0103** (only base relvars hold a
+  value). One INIT per relvar — a second is **T0104**.
+- **The RHS is a relation whose heading matches the relvar's.** It is typed
+  bidirectionally against the declared `Relation H` (reusing the relation- and
+  tuple-literal typers, so a non-tuple selector element is **T0096**, a
+  heading-inconsistent tuple is **T0019**, a duplicate field is **T0015**). A
+  non-relation RHS is **T0105**; a heading with missing/unexpected attributes is
+  **T0106**; an attribute whose value type is not assignable to the declared
+  type is **T0108**, with one widening — an `Integer` value seeds a `Rational`
+  column (an INIT `12` for `weight: Rational`).
+- **The RHS is a constant expression.** A cell value is any expression typed by
+  `check_expr` — a literal, arithmetic, or a call to a **pure** operator (a
+  `.cddb` declares no `oper`s and takes no imports, so every callee is a
+  built-in whose purity is known). What a provision-time evaluation cannot do is
+  rejected as **T0107**: reading a relvar, a `transaction`, or a call to a
+  side-effecting operator. An unresolved bare name stays the plain **T0001**
+  (the same discipline as module-level `let` constant initializers), not a
+  constant-ness error.
+
+Because the derived heading comes from the RHS's *first* tuple, a column whose
+value literal-form varies across tuples (a `Rational` written `12.0` in one
+tuple and `12` in another) surfaces as **T0019** — keep a column's literal form
+consistent. Value-level key-uniqueness of the INIT rows is checked later, at
+provision fold time, not here.
+
+
 ## Typecheck diagnostics
 
 Every diagnostic the typechecker emits has a stable `T####` code.
@@ -937,3 +976,10 @@ check script enforces that.
 | T0099 | `when` condition discipline: the condition must be `Boolean` (a relation-typed condition suggests `times`), and an unresolved name in it that is an attribute of the left operand hints at `where` — attributes are deliberately not in scope in a `when` condition |
 | T0100 | `ungroup` target is not a relation-valued attribute (the RVA analogue of T0048) |
 | T0101 | a storage-backed relvar (`public`/`base`) declares a relation- or tuple-valued attribute — no SQL column form yet; decompose into a side relvar (see [storage.md](storage.md) "Nested attributes") |
+| T0102 | a `.cddb` base-relvar INIT value (`X := …`) names a relvar not declared as a `base relvar` in this catalog |
+| T0103 | a `.cddb` INIT target is a `virtual relvar` — only base relvars have an INIT value |
+| T0104 | duplicate INIT value for the same base relvar (a relvar's INIT is applied once, at `coddl provision`) |
+| T0105 | a `.cddb` INIT value is not a relation (its heading cannot match the relvar's) |
+| T0106 | a `.cddb` INIT relation's heading does not match the relvar heading (attributes missing and/or unexpected) |
+| T0107 | a `.cddb` INIT value is not a constant expression — it reads a relvar, uses a `transaction`, or calls a side-effecting operator (an unresolved bare name is the plain T0001, not this) |
+| T0108 | a `.cddb` INIT attribute value's type is not assignable to the declared attribute type (an `Integer` value is accepted where a `Rational` is declared) |

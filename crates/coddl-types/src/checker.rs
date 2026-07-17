@@ -22,7 +22,7 @@ use coddl_syntax::ast::{
     TupleLit, TypeDecl, TypeRef, UnaryExpr, UnaryOp, UngroupExpr, UnwrapExpr, UpdateStmt, VarStmt,
     WhileStmt, WrapExpr,
 };
-use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, VirtualRelvarDecl};
+use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, RelvarInit, VirtualRelvarDecl};
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
 use coddl_syntax::{parse, parse_format_template, FileKind, SyntaxKind, TemplateChunk};
 
@@ -1134,10 +1134,10 @@ impl TypeChecker {
             match item {
                 CddbItem::BaseRelvar(d) => self.check_base_relvar_decl(&d),
                 CddbItem::VirtualRelvar(d) => self.check_virtual_relvar_decl(&d),
-                // Base-relvar INIT values (`S := Relation { … };`) parse
-                // here but are not yet validated — resolving the LHS to a
-                // base relvar and checking the RHS is a ground relation
-                // literal lands in the provision roadmap's typecheck chunk.
+                // Base-relvar INIT values (`S := Relation { … };`) are
+                // validated in a second pass below, once every base/virtual
+                // relvar is in `self.relvars` — so an INIT may reference a
+                // relvar declared anywhere in the file.
                 CddbItem::RelvarInit(_) => {}
             }
         }
@@ -1159,6 +1159,220 @@ impl TypeChecker {
                     }
                 }
                 _ => {}
+            }
+        }
+        // Second pass — base-relvar INIT values. Deferred until here so an
+        // INIT may name a relvar declared anywhere in the file, and so a
+        // duplicate INIT for one relvar is caught via `initialized`.
+        let mut initialized: HashSet<String> = HashSet::new();
+        for item in root.items() {
+            if let CddbItem::RelvarInit(init) = item {
+                self.check_relvar_init(&init, &mut initialized);
+            }
+        }
+    }
+
+    /// Validate a base-relvar INIT value (`S := <expr>;`) — the TTM initial
+    /// value applied at `coddl provision`. The LHS must resolve to a `base
+    /// relvar` in this catalog; the RHS must be a **constant** relation
+    /// expression (no relvar reads, no `transaction`, no side-effecting
+    /// operator calls) whose heading matches the relvar's. Cell values are
+    /// ordinary constant expressions typed by [`Self::check_expr`], so
+    /// arithmetic (`2 * 3 + 1`), unary minus, and pure built-in calls all
+    /// work; evaluating them to rows is provision's job, not the checker's.
+    fn check_relvar_init(&mut self, init: &RelvarInit, initialized: &mut HashSet<String>) {
+        let Some(name_tok) = init.name() else {
+            return;
+        };
+        let name = name_tok.text().to_string();
+
+        // 1. Resolve the LHS to a base relvar of this catalog. Copy the kind
+        // and heading out so the immutable `self.relvars` borrow ends before
+        // any `self.error(...)` below.
+        let declared = match self.relvars.get(&name).map(|i| (i.kind, i.heading.clone())) {
+            None => {
+                self.error(
+                    self.token_span(&name_tok),
+                    "T0102",
+                    format!("no base relvar `{name}` is declared in this catalog to initialize"),
+                );
+                return;
+            }
+            Some((kind, _)) if kind != RelvarKind::Base => {
+                self.error(
+                    self.token_span(&name_tok),
+                    "T0103",
+                    format!("`{name}` is a virtual relvar — only base relvars have an INIT value"),
+                );
+                return;
+            }
+            Some((_, heading)) => heading,
+        };
+
+        // 2. One INIT per relvar.
+        if !initialized.insert(name.clone()) {
+            self.error(
+                self.token_span(&name_tok),
+                "T0104",
+                format!("duplicate INIT value for base relvar `{name}`"),
+            );
+            return;
+        }
+
+        // 3. The RHS. A missing one already drew PB0013 from the parser.
+        let Some(rhs) = init.rhs() else {
+            return;
+        };
+
+        // 4. Type it against the declared relation type (bidirectional, so an
+        // empty `Relation {}` INIT takes the declared heading). This reuses
+        // the relation-/tuple-literal typers, so malformed tuples (T0096),
+        // heading-inconsistent tuples (T0019), duplicate fields (T0015) and
+        // per-cell type errors (arithmetic, unknown names → T0001) all surface
+        // here for free.
+        let mut scope = Scope::default();
+        let ty = self.check_expr_expected(&rhs, &mut scope, &Type::Relation(declared.clone()));
+
+        // 5. The RHS must be constant (evaluable at provision time with no
+        // database and no effects).
+        self.check_init_value_constness(&rhs);
+
+        // 6. Heading conformance against the declared relvar.
+        match ty {
+            Type::Relation(actual) => {
+                self.check_init_heading(&name, &actual, &declared, rhs.syntax())
+            }
+            // Recovery: a cell already reported; don't pile on.
+            Type::Unknown => {}
+            other => {
+                self.error(
+                    self.node_span(rhs.syntax()),
+                    "T0105",
+                    format!("INIT value for `{name}` must be a relation, but is {other}"),
+                );
+            }
+        }
+    }
+
+    /// Compare an INIT relation's derived heading against the relvar's
+    /// declared heading: any missing or unexpected attribute is T0106 (one
+    /// diagnostic naming them), and each attribute present on both sides whose
+    /// value type isn't assignable to the declared type is T0108. An `Integer`
+    /// value is accepted where a `Rational` is declared (an INIT `12` seeds a
+    /// `Rational` column).
+    fn check_init_heading(
+        &mut self,
+        name: &str,
+        actual: &Heading,
+        declared: &Heading,
+        span_node: &SyntaxNode,
+    ) {
+        let missing: Vec<&str> = declared
+            .attrs()
+            .iter()
+            .filter(|(dn, _)| actual.lookup(dn).is_none())
+            .map(|(dn, _)| dn.as_str())
+            .collect();
+        let unexpected: Vec<&str> = actual
+            .attrs()
+            .iter()
+            .filter(|(an, _)| declared.lookup(an).is_none())
+            .map(|(an, _)| an.as_str())
+            .collect();
+        if !missing.is_empty() || !unexpected.is_empty() {
+            let mut parts: Vec<String> = Vec::new();
+            if !missing.is_empty() {
+                parts.push(format!("missing {}", quote_join(&missing)));
+            }
+            if !unexpected.is_empty() {
+                parts.push(format!("unexpected {}", quote_join(&unexpected)));
+            }
+            self.error(
+                self.node_span(span_node),
+                "T0106",
+                format!(
+                    "INIT value for `{name}` does not match the relvar heading ({})",
+                    parts.join("; ")
+                ),
+            );
+        }
+        for (an, at) in actual.attrs() {
+            if let Some(dt) = declared.lookup(an) {
+                if !init_type_assignable(at, dt) {
+                    self.error(
+                        self.node_span(span_node),
+                        "T0108",
+                        format!(
+                            "INIT value for `{name}`: attribute `{an}` has type {at}, but the relvar declares {dt}"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The INIT constant-expression walk — the analogue of
+    /// [`Self::check_module_let_purity`], but with the `.cddb` policy: a
+    /// **pure** operator call is allowed (a `.cddb` has no `oper`s or imports,
+    /// so every callee is a built-in whose purity is known), and so are `if` /
+    /// field-access / indexing over constants. What is rejected (T0107) is
+    /// what a provision-time evaluation cannot do without a database or would
+    /// make non-constant: reading a relvar, a `transaction`, or a call to a
+    /// side-effecting operator. An unknown bare name is left to
+    /// [`Self::check_expr`]'s T0001, not double-reported here. (The two walks
+    /// are points on one "constant expression" spectrum; unify them once
+    /// user-operator purity derivation lands.)
+    fn check_init_value_constness(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Transaction(_) => {
+                self.error(
+                    self.node_span(expr.syntax()),
+                    "T0107",
+                    "an INIT value must be a constant expression — a `transaction` is not constant",
+                );
+                return;
+            }
+            Expr::Call(c) => {
+                if let Some(callee) = call_callee_name(c) {
+                    let side_effecting = self
+                        .builtins
+                        .candidates(&callee)
+                        .iter()
+                        .any(|s| matches!(s.purity, Purity::SideEffecting));
+                    if side_effecting {
+                        self.error(
+                            self.node_span(expr.syntax()),
+                            "T0107",
+                            format!(
+                                "an INIT value must be a constant expression — it calls the side-effecting operator `{callee}`"
+                            ),
+                        );
+                        return;
+                    }
+                }
+                // A pure (or as-yet-unresolved) call: recurse into its
+                // arguments below.
+            }
+            Expr::NameRef(n) => {
+                if let Some(ident) = n.ident() {
+                    if self.relvars.get(ident.text()).is_some() {
+                        self.error(
+                            self.node_span(expr.syntax()),
+                            "T0107",
+                            format!(
+                                "an INIT value must be a constant expression — it reads relvar `{}`",
+                                ident.text()
+                            ),
+                        );
+                        return;
+                    }
+                }
+            }
+            _ => {}
+        }
+        for child in expr.syntax().children() {
+            if let Some(e) = Expr::cast(child) {
+                self.check_init_value_constness(&e);
             }
         }
     }
@@ -6049,6 +6263,34 @@ fn call_has_named_arg(call: &CallExpr, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The operator name a call selects — the bare-`NameRef` callee of a prefix
+/// call `m { … }`, or the method token of a UFCS call `x.m { … }`. Used to
+/// look a call's purity up in the builtins registry.
+fn call_callee_name(call: &CallExpr) -> Option<String> {
+    match call.callee()? {
+        Expr::NameRef(n) => n.ident().map(|t| t.text().to_string()),
+        Expr::FieldAccess(fa) => fa.field().map(|t| t.text().to_string()),
+        _ => None,
+    }
+}
+
+/// Whether an INIT cell value of type `actual` may seed a column declared
+/// `declared`: ordinary assignability, plus the one widening a constant seed
+/// needs — an `Integer` value into a `Rational` column (an INIT `12` for a
+/// `Rational` attribute).
+fn init_type_assignable(actual: &Type, declared: &Type) -> bool {
+    actual.assignable_to(declared) || matches!((actual, declared), (Type::Integer, Type::Rational))
+}
+
+/// Render a name list as `` `a`, `b` `` for a heading-mismatch diagnostic.
+fn quote_join(names: &[&str]) -> String {
+    names
+        .iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn param_kind_accepts(kind: &crate::builtins::ParamKind, ty: &Type) -> bool {
     match kind {
         crate::builtins::ParamKind::Concrete(expected) => ty.assignable_to(expected),
@@ -7837,6 +8079,147 @@ mod tests {
         let info = out.relvars.get("V").expect("virtual registered");
         assert_eq!(info.kind, RelvarKind::Virtual);
         assert!(info.heading.is_empty());
+    }
+
+    // ── `.cddb` base-relvar INIT values (`S := Relation { … };`) ──────
+
+    #[test]
+    fn init_matching_heading_typechecks_cleanly() {
+        let src = "database d;\n\
+                   base relvar X { a: Integer, b: Text } key { a };\n\
+                   X := Relation { { a: 1, b: \"x\" }, { a: 2, b: \"y\" } };\n";
+        assert!(
+            diagnostics_cddb(src).is_empty(),
+            "unexpected: {:?}",
+            diagnostics_cddb(src)
+        );
+    }
+
+    #[test]
+    fn init_rational_and_composite_key_clean() {
+        // The suppliers-and-parts shape: a Rational column and a composite key.
+        let src = "database d;\n\
+                   base relvar P { pno: Text, weight: Rational } key { pno };\n\
+                   P := Relation { { pno: \"P1\", weight: 12.0 } };\n\
+                   base relvar SP { sno: Text, pno: Text, qty: Integer } key { sno, pno };\n\
+                   SP := Relation { { sno: \"S1\", pno: \"P1\", qty: 300 } };\n";
+        assert!(
+            diagnostics_cddb(src).is_empty(),
+            "unexpected: {:?}",
+            diagnostics_cddb(src)
+        );
+    }
+
+    #[test]
+    fn init_empty_relation_seeds_clean() {
+        let src = "database d;\nbase relvar X { a: Integer } key { a };\nX := Relation {};\n";
+        assert!(
+            diagnostics_cddb(src).is_empty(),
+            "unexpected: {:?}",
+            diagnostics_cddb(src)
+        );
+    }
+
+    #[test]
+    fn init_cell_may_be_a_constant_expression() {
+        // A cell is any constant expression, not just a literal.
+        let src = "database d;\nbase relvar X { a: Integer } key { a };\n\
+                   X := Relation { { a: 2 * 3 + 1 } };\n";
+        assert!(
+            diagnostics_cddb(src).is_empty(),
+            "unexpected: {:?}",
+            diagnostics_cddb(src)
+        );
+    }
+
+    #[test]
+    fn init_integer_seeds_rational_column_clean() {
+        // Integer→Rational widening for a constant seed (`12` into a Rational).
+        let src = "database d;\nbase relvar P { pno: Text, weight: Rational } key { pno };\n\
+                   P := Relation { { pno: \"P1\", weight: 12 } };\n";
+        assert!(
+            diagnostics_cddb(src).is_empty(),
+            "unexpected: {:?}",
+            diagnostics_cddb(src)
+        );
+    }
+
+    #[test]
+    fn init_unknown_relvar_diagnoses_t0102() {
+        let src = "database d;\nbase relvar X { a: Integer } key { a };\n\
+                   Y := Relation { { a: 1 } };\n";
+        assert!(codes_cddb(src).contains(&"T0102"), "{:?}", codes_cddb(src));
+    }
+
+    #[test]
+    fn init_on_virtual_relvar_diagnoses_t0103() {
+        let src = "database d;\nbase relvar X { a: Integer } key { a };\n\
+                   virtual relvar V = X;\n\
+                   V := Relation { { a: 1 } };\n";
+        assert!(codes_cddb(src).contains(&"T0103"), "{:?}", codes_cddb(src));
+    }
+
+    #[test]
+    fn duplicate_init_diagnoses_t0104() {
+        let src = "database d;\nbase relvar X { a: Integer } key { a };\n\
+                   X := Relation { { a: 1 } };\n\
+                   X := Relation { { a: 2 } };\n";
+        assert!(codes_cddb(src).contains(&"T0104"), "{:?}", codes_cddb(src));
+    }
+
+    #[test]
+    fn init_non_relation_rhs_diagnoses_t0105() {
+        let src = "database d;\nbase relvar X { a: Integer } key { a };\nX := 42;\n";
+        assert!(codes_cddb(src).contains(&"T0105"), "{:?}", codes_cddb(src));
+    }
+
+    #[test]
+    fn init_missing_attribute_diagnoses_t0106() {
+        let src = "database d;\nbase relvar X { a: Integer, b: Text } key { a };\n\
+                   X := Relation { { a: 1 } };\n";
+        assert!(codes_cddb(src).contains(&"T0106"), "{:?}", codes_cddb(src));
+    }
+
+    #[test]
+    fn init_extra_attribute_diagnoses_t0106() {
+        let src = "database d;\nbase relvar X { a: Integer } key { a };\n\
+                   X := Relation { { a: 1, c: 2 } };\n";
+        assert!(codes_cddb(src).contains(&"T0106"), "{:?}", codes_cddb(src));
+    }
+
+    #[test]
+    fn init_type_mismatch_diagnoses_t0108() {
+        let src = "database d;\nbase relvar X { a: Text } key { a };\n\
+                   X := Relation { { a: 5 } };\n";
+        assert!(codes_cddb(src).contains(&"T0108"), "{:?}", codes_cddb(src));
+    }
+
+    #[test]
+    fn init_relvar_read_diagnoses_t0107() {
+        let src = "database d;\n\
+                   base relvar X { a: Integer } key { a };\n\
+                   base relvar Y { a: Integer } key { a };\n\
+                   X := Y;\n";
+        assert!(codes_cddb(src).contains(&"T0107"), "{:?}", codes_cddb(src));
+    }
+
+    #[test]
+    fn init_side_effecting_call_diagnoses_t0107() {
+        // `write_relation` is a side-effecting built-in — not a constant value.
+        let src = "database d;\nbase relvar X { a: Integer } key { a };\n\
+                   X := write_relation { rel: Relation {} };\n";
+        assert!(codes_cddb(src).contains(&"T0107"), "{:?}", codes_cddb(src));
+    }
+
+    #[test]
+    fn init_unknown_name_is_t0001_not_t0107() {
+        // A bare name that resolves to nothing is a plain unresolved-name
+        // error, not a constant-ness error (matches the module-let discipline).
+        let src = "database d;\nbase relvar X { a: Integer } key { a };\n\
+                   X := Relation { { a: foo } };\n";
+        let cs = codes_cddb(src);
+        assert!(cs.contains(&"T0001"), "{cs:?}");
+        assert!(!cs.contains(&"T0107"), "{cs:?}");
     }
 
     #[test]
