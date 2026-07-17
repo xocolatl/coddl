@@ -15,7 +15,7 @@ module core;
 // bindings (constants), defined here in Coddl rather than as compiler
 // intrinsics. Stdlib lets are annotated by convention — the annotation is
 // their signature, the way a `builtin oper` carries its full heading. A user
-// binding of the same name shadows core's (no reserved words).
+// binding of the same name shadows core's (library vocabulary, not keywords).
 //
 // Deliberately NOT declared here (stay compiler-registered, cannot be spelled
 // in Coddl yet):

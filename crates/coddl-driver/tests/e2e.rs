@@ -8739,7 +8739,8 @@ oper main {} [
     run_both_backends_expect(src, "core-truth.cd", b"{b: 5}\n{}\n1 1 true false\n");
 }
 
-/// A user binding named `reltrue` shadows core's (no reserved words) —
+/// A user binding named `reltrue` shadows core's (library vocabulary, not
+/// a keyword) —
 /// locals and user module lets both win over the stdlib vocabulary.
 #[test]
 fn user_binding_shadows_core_reltrue_on_both_backends() {

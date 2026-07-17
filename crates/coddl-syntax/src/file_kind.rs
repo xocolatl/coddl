@@ -8,7 +8,8 @@
 //! - `.cdmap`   — external → conceptual adapter
 //! - `.cdstore` — conceptual → physical binding
 //!
-//! All four share the same lexer (no reserved words) and CST
+//! All four share the same lexer (no keyword token type — every word
+//! lexes as `IDENT`) and CST
 //! infrastructure; only the parser dispatch differs. The driver and the
 //! LSP analyzer resolve a path or URI to a [`FileKind`] once and pass it
 //! through every analysis call.

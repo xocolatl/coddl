@@ -42,7 +42,7 @@ Builtins were a hand-written Rust table (`Builtins::new()` registering `OperSig`
 (`builtin oper write_line { message: Text };`). Leading mirrors Coddl's existing declaration qualifiers —
 `public` / `private` / `base` / `virtual` relvars — so `builtin` slots into the parser's item dispatch as one
 more leading qualifier rather than a special body form, and both parser and reader learn "no body coming"
-from the first token. Per "no reserved words" ([grammar.md](grammar.md)), `builtin` carries meaning only as a
+from the first token. Per the contextual-keyword rule ([grammar.md](grammar.md)), `builtin` carries meaning only as a
 leading item qualifier; it stays an ordinary identifier everywhere else.
 
 **One surface marker, two lowering strategies underneath.** Some builtins are runtime FFI calls
@@ -131,7 +131,7 @@ Live opt-in modules today:
 `coddl::` is a closed, compiler-owned, embedded root; module sources live in `coddl-stdlib`
 ([workspace.md](workspace.md)). Opt-in names are registered **lazily** — only in a file that `use`s their
 module — so an un-imported stdlib name (`Request`) stays a free identifier the user may define
-themselves (no reserved words, [grammar.md](grammar.md)). Referencing one without the import is not a plain
+themselves (module vocabulary is not reserved, [grammar.md](grammar.md)). Referencing one without the import is not a plain
 unknown-name error but an actionable **T0087** (operator) / **T0088** (type) pointing at the missing
 `use module`; an unknown module path is **T0089**. Imports are **bring-bare-names**: `::` is a module-path
 separator only, never used in expression or type position, so after `use module coddl::web;` you write

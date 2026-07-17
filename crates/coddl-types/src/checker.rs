@@ -6974,7 +6974,7 @@ mod tests {
 
     #[test]
     fn unimported_module_name_is_a_free_identifier() {
-        // No reserved words: without importing `coddl::web`, a user may define
+        // Module vocabulary is not reserved: without importing `coddl::web`, a user may define
         // their own `Request` type (the opt-in web name) freely.
         let src = "program p; \
                    type Request = Integer; \
@@ -7034,7 +7034,7 @@ mod tests {
 
     #[test]
     fn user_may_name_a_relvar_environment_without_import() {
-        // No reserved words: without importing `coddl::env`, `Environment` is a
+        // Module vocabulary is not reserved: without importing `coddl::env`, `Environment` is a
         // free name a user may claim for their own relvar.
         let src = "program p; \
                    private relvar Environment { name: Text } key { name }; \
@@ -10073,7 +10073,7 @@ mod tests {
 
     #[test]
     fn user_binding_shadows_core_let() {
-        // No reserved words: a user module let (or local) named `reltrue`
+        // Library vocabulary is shadowable: a user module let (or local) named `reltrue`
         // shadows core's — no T0060, and the user's type wins.
         let src = "program p;\n\
                    let reltrue = 1;\n\
