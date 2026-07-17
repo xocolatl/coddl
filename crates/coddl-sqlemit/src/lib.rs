@@ -1971,7 +1971,12 @@ pub trait Conn {
     /// cursor isn't worth the borrow gymnastics yet.)
     fn bind_and_step(&mut self, id: StmtId, params: &[Value]) -> Result<Vec<Row>>;
 
-    /// Shipping in-memory relations into a backend temp table is not yet wired.
+    /// Ship an in-memory relation into a backend temp table the next query
+    /// references like a relvar-shaped leaf. The portable seam for trait-path
+    /// backends (Postgres: `UNNEST`/`COPY`); the bundled-SQLite realization
+    /// lives at the runtime force point instead (`fire_escalated`,
+    /// `coddl-runtime/src/sqlite.rs` — stable per-(plan, slot) temp tables
+    /// past the read bind ceiling), which does not go through this trait.
     fn materialize_temp(&mut self, _heading: &Heading, _rows: &[Tuple]) -> Result<TempRelRef> {
         unimplemented!("materialize_temp is not implemented yet")
     }

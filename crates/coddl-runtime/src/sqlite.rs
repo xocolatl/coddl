@@ -144,9 +144,11 @@ pub struct CoddlParam {
 /// descriptor (the same `(src, desc)` pair [`coddl_exec_insert`] takes). The
 /// runtime expands the plan's matching `__CODDL_REL_<slot>__` marker with the
 /// relation's rows — a `(VALUES …)` table primary whose cells bind numbered
-/// after the plan's scalar parameters, or a typed zero-row `SELECT` when the
-/// relation is empty. `#[repr(C)]`: two pointers, no padding; codegen mirrors
-/// this layout when it builds the array.
+/// after the plan's scalar parameters, a typed zero-row `SELECT` when the
+/// relation is empty, or a stable per-(plan, slot) session temp table when
+/// the projected binds pass the ceiling ([`fire_escalated`]). `#[repr(C)]`:
+/// two pointers, no padding; codegen mirrors this layout when it builds the
+/// array.
 #[repr(C)]
 pub struct CoddlRelParam {
     pub src: *const u8,
@@ -925,8 +927,11 @@ pub unsafe extern "C" fn coddl_register_plan(
 /// the relation is empty — and its cells bind after the scalar params
 /// (scalars are `?1..?param_count`; slot cells number onward, in slot order),
 /// so the bind vector is scalars ++ slot cells regardless of where each
-/// marker sits in the text. A read never batch-splits; a statement whose
-/// total binds exceed [`QUERY_BIND_CEILING`] aborts loud.
+/// marker sits in the text. A read never batch-splits; past
+/// [`QUERY_BIND_CEILING`] projected binds the shipped slots escalate into
+/// stable per-(plan, slot) session temp tables instead ([`fire_escalated`])
+/// and the statement binds scalars only. Scalar binds alone past the ceiling
+/// abort loud — there is nothing to escalate.
 ///
 /// Runs on a connection minted by [`ensure_connection`], so the audit `trace`
 /// hook captures the (expanded) statement. Aborts on any hard error (unknown
@@ -1140,6 +1145,32 @@ pub unsafe extern "C" fn coddl_query(
         }
     }
 
+    // Past the ceiling, the general form escalates: every slot ships into its
+    // stable temp table and the statement binds scalars only. The projection
+    // is exact — `rel_table_primary` decodes `count × arity` cells per slot
+    // (0 for an empty relation) — so under-ceiling plans take the VALUES path
+    // bit-for-bit as before. Only scalars alone past the ceiling still abort:
+    // there is nothing left to escalate.
+    let shipped_cells: usize = rel_specs
+        .iter()
+        .zip(&row_counts)
+        .map(|(spec, &count)| count * spec.arity as usize)
+        .sum();
+    if bindings.len() + shipped_cells > QUERY_BIND_CEILING {
+        if bindings.len() > QUERY_BIND_CEILING {
+            eprintln!(
+                "coddl: query: plan {}: {} scalar bind(s) alone exceed the \
+                 {QUERY_BIND_CEILING} ceiling; nothing to escalate",
+                plan_id.0,
+                bindings.len()
+            );
+            std::process::abort();
+        }
+        return fire_escalated(
+            &path, &sql, &bindings, rel_slice, &rel_specs, desc, plan_id.0, &ctx,
+        );
+    }
+
     // General form: substitute each slot's marker with the table primary
     // built from its rows and append its cells to the bind vector (scalars
     // first, then slot cells in slot order — matching the numbered
@@ -1158,25 +1189,58 @@ pub unsafe extern "C" fn coddl_query(
         sql = sql.replacen(&marker, &primary, 1);
         bindings.extend(cells);
     }
-    if bindings.len() > QUERY_BIND_CEILING {
-        eprintln!(
-            "coddl: query: plan {}: {} bind values exceed the {QUERY_BIND_CEILING} ceiling \
-             ({param_count} scalar param(s) + shipped relation rows); a read query is never \
-             batch-split — ship fewer rows or wait for the temp-table escalation",
-            plan_id.0,
-            bindings.len()
-        );
-        std::process::abort();
-    }
+    // The escalation check above projected this exactly; drift means
+    // `rel_table_primary` learned to decode a different cell count than
+    // `count × arity` and the projection must move with it.
+    debug_assert!(
+        bindings.len() <= QUERY_BIND_CEILING,
+        "VALUES expansion diverged from the projected bind count"
+    );
 
     fire_and_marshal(&path, &sql, &bindings, desc, plan_id.0, &ctx)
 }
 
+/// Prepare (cached), execute, and marshal one read statement's rows on an
+/// already-held connection — the statement core shared by
+/// [`fire_and_marshal`] (which takes the pool guard itself) and
+/// [`fire_escalated`] (which holds one guard across populate + select +
+/// cleanup). `prepare_cached` keys by SQL text per connection, so repeat
+/// queries of the same text reuse the compiled statement; the audit `trace`
+/// hook captures the (expanded) statement on execution.
+///
+/// # Safety
+/// As [`marshal_rows`]: the statement's SELECT list must line up positionally
+/// with `attrs` (heading-canonical order), each record exactly `record_size`
+/// bytes.
+unsafe fn query_rows_on(
+    conn: &Connection,
+    sql: &str,
+    bindings: &[rusqlite::types::Value],
+    attrs: &[CoddlAttrDesc],
+    record_size: usize,
+    plan_id: u32,
+    ctx: &MarshalCtx,
+) -> Vec<Vec<u8>> {
+    let mut stmt = match conn.prepare_cached(sql) {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("coddl: query: prepare failed for plan {plan_id}: {err}");
+            std::process::abort();
+        }
+    };
+    let mut rows = match stmt.query(params_from_iter(bindings.iter())) {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("coddl: query: execution failed for plan {plan_id}: {err}");
+            std::process::abort();
+        }
+    };
+    marshal_rows(&mut rows, attrs, record_size, ctx)
+}
+
 /// Prepare, execute, and marshal one read statement into a fresh RC
 /// `Relation` — the shared tail of [`coddl_query`]'s general and
-/// cardinality-1 paths. `prepare_cached` keys by SQL text per connection, so
-/// repeat queries of the same plan reuse the compiled statement; the audit
-/// `trace` hook captures the (expanded) statement on execution.
+/// cardinality-1 paths (the escalated path is [`fire_escalated`]).
 ///
 /// # Safety
 /// `desc` must be a valid heading descriptor outliving the returned relation;
@@ -1199,21 +1263,69 @@ unsafe fn fire_and_marshal(
         let conn = conn_guard
             .get(path)
             .expect("connection inserted by ensure_connection");
-        let mut stmt = match conn.prepare_cached(sql) {
-            Ok(s) => s,
-            Err(err) => {
-                eprintln!("coddl: query: prepare failed for plan {plan_id}: {err}");
-                std::process::abort();
-            }
-        };
-        let mut rows = match stmt.query(params_from_iter(bindings.iter())) {
-            Ok(r) => r,
-            Err(err) => {
-                eprintln!("coddl: query: execution failed for plan {plan_id}: {err}");
-                std::process::abort();
-            }
-        };
-        marshal_rows(&mut rows, attrs, record_size, ctx)
+        query_rows_on(conn, sql, bindings, attrs, record_size, plan_id, ctx)
+    };
+
+    finalize_relation(&row_buffers, record_size, desc, ctx)
+}
+
+/// Temp-table escalation — the general form's stand-in past the bind ceiling
+/// (a read never batch-splits, so an over-ceiling `(VALUES …)` expansion is
+/// not an option). Every slot's marker substitutes to its stable
+/// per-(plan, slot) session temp table ([`temp_rel_table`] — stable name ⇒
+/// stable statement text ⇒ one `prepare_cached` entry across every escalated
+/// fire of the plan), every slot is populated (clear + batched INSERT; an
+/// empty slot stays a cleared table — the escalated stand-in for the typed
+/// zero-row SELECT, still no NULL token, RM Pro 4), the SELECT fires with
+/// scalar binds only (guaranteed under the ceiling by the caller), and every
+/// table is cleared after the read so the shipped rows don't outlive it.
+///
+/// ONE pool-guard acquisition spans populate + select + cleanup: connections
+/// are opened `NO_MUTEX`, the pool guard *is* their serialization, so nothing
+/// may interleave with the populated tables mid-read.
+///
+/// # Safety
+/// As [`fire_and_marshal`], plus: `rel_slice`/`rel_specs` must be the plan's
+/// validated relation parameters (arity checked against each descriptor).
+#[allow(clippy::too_many_arguments)]
+unsafe fn fire_escalated(
+    path: &str,
+    plan_sql: &str,
+    scalars: &[rusqlite::types::Value],
+    rel_slice: &[CoddlRelParam],
+    rel_specs: &[RelSpec],
+    desc: *const CoddlHeadingDesc,
+    plan_id: u32,
+    ctx: &MarshalCtx,
+) -> *mut u8 {
+    let mut sql = plan_sql.to_string();
+    let mut tables: Vec<String> = Vec::with_capacity(rel_slice.len());
+    for slot in 0..rel_slice.len() {
+        let marker = coddl_sqlemit::rel_param_marker(slot);
+        if !sql.contains(&marker) {
+            eprintln!("coddl: query: plan {plan_id}: marker `{marker}` missing from plan SQL");
+            std::process::abort();
+        }
+        let table = temp_rel_table(plan_id, slot);
+        sql = sql.replacen(&marker, &table, 1);
+        tables.push(table);
+    }
+
+    let attrs = std::slice::from_raw_parts((*desc).attrs, (*desc).attr_count as usize);
+    let record_size = (*desc).record_size as usize;
+    let row_buffers = {
+        let conn_guard = db_connections().lock().expect("conn map poisoned");
+        let conn = conn_guard
+            .get(path)
+            .expect("connection inserted by ensure_connection");
+        for ((table, rel), spec) in tables.iter().zip(rel_slice).zip(rel_specs) {
+            populate_temp_rel(conn, table, rel, spec.arity as usize, plan_id);
+        }
+        let buffers = query_rows_on(conn, &sql, scalars, attrs, record_size, plan_id, ctx);
+        for table in &tables {
+            exec_stmt_on(conn, &format!("DELETE FROM {table}"), plan_id);
+        }
+        buffers
     };
 
     finalize_relation(&row_buffers, record_size, desc, ctx)
@@ -1319,12 +1431,14 @@ pub unsafe extern "C" fn coddl_exec(
 /// are sized so `rows × arity` stays below it.
 const INSERT_PARAM_BUDGET: usize = 900;
 
-/// Hard ceiling on a read query's total bind variables (scalars + every
-/// shipped relation's cells). A read is **never batch-split** — splitting a
-/// `(VALUES …)` operand changes the query's meaning for any non-distributive
-/// surrounding shape — so a shipped relation that doesn't fit under SQLite's
-/// historical bind floor fails loud instead (the temp-table escalation is
-/// future work; see docs/sqlemit.md "Relation-valued parameters").
+/// Ceiling on a read query's total bind variables (scalars + every shipped
+/// relation's cells), under SQLite's historical `SQLITE_MAX_VARIABLE_NUMBER`
+/// floor. A read is **never batch-split** — splitting a `(VALUES …)` operand
+/// changes the query's meaning for any non-distributive surrounding shape —
+/// so past the ceiling the shipped slots escalate into stable per-(plan,
+/// slot) session temp tables ([`fire_escalated`]) and the statement binds
+/// scalars only. Scalar binds alone past the ceiling fail loud: nothing to
+/// escalate. See docs/sqlemit.md "Sending in-memory relations back into SQL".
 const QUERY_BIND_CEILING: usize = 999;
 
 /// Decode every row of an in-memory relation payload into owned rusqlite bind
@@ -1458,6 +1572,88 @@ fn values_groups(arity: usize, n_groups: usize, base: usize) -> String {
         groups.push(format!("({})", cells.join(", ")));
     }
     groups.join(", ")
+}
+
+/// Session temp table backing plan `plan_id`'s slot `slot` in the escalated
+/// (past-the-bind-ceiling) form. Stable per (plan, slot) so the escalated
+/// SELECT's text is stable — one `prepare_cached` entry across repeat
+/// escalated fires. A plain unquoted identifier in the `coddl_l` /
+/// `coddl_v0` / `coddl_ow_p` alias convention; SQLite resolves unqualified
+/// names temp-schema-first, so a same-named user table is shadowed, never
+/// hit.
+fn temp_rel_table(plan_id: u32, slot: usize) -> String {
+    format!("coddl_rp_{plan_id}_{slot}")
+}
+
+/// `prepare_cached` + `execute` one no-result statement on a held connection,
+/// aborting on failure — the read path's loud-failure discipline, for the
+/// escalation's DDL/DML around the read itself.
+fn exec_stmt_on(conn: &Connection, sql: &str, plan_id: u32) {
+    let mut stmt = match conn.prepare_cached(sql) {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("coddl: query: prepare failed for plan {plan_id}: {err}");
+            std::process::abort();
+        }
+    };
+    if let Err(err) = stmt.execute([]) {
+        eprintln!("coddl: query: execution failed for plan {plan_id}: {err}");
+        std::process::abort();
+    }
+}
+
+/// Create-if-absent, clear, and batch-fill one escalated slot's temp table.
+/// Columns are bare `column1…columnN` — the exact names a `(VALUES …)` table
+/// exposes (which is what the emitted SELECT aliases from), and **no type
+/// keyword**, so BLOB affinity and no insert coercion: the table behaves
+/// exactly like the VALUES row source it replaces. Population batches mirror
+/// [`coddl_exec_insert`] (`INSERT_PARAM_BUDGET / arity` rows per statement —
+/// splitting is safe here because population is cumulative, unlike the read
+/// itself). An empty relation leaves the table cleared. Runs inside any open
+/// user transaction; a ROLLBACK may resurrect rows, harmlessly — every use
+/// clears first.
+///
+/// # Safety
+/// `rel` must carry a valid (or null-empty) relation payload + descriptor of
+/// the given `arity` (≥ 1, validated against the plan's spec by the caller).
+unsafe fn populate_temp_rel(
+    conn: &Connection,
+    table: &str,
+    rel: &CoddlRelParam,
+    arity: usize,
+    plan_id: u32,
+) {
+    let cols: Vec<String> = (1..=arity).map(|i| format!("column{i}")).collect();
+    exec_stmt_on(
+        conn,
+        &format!(
+            "CREATE TEMP TABLE IF NOT EXISTS {table} ({})",
+            cols.join(", ")
+        ),
+        plan_id,
+    );
+    exec_stmt_on(conn, &format!("DELETE FROM {table}"), plan_id);
+
+    let cells = decode_relation_cells(rel.src, rel.desc, "query");
+    let batch_rows = (INSERT_PARAM_BUDGET / arity).max(1);
+    for batch in cells.chunks(batch_rows * arity) {
+        let n_groups = batch.len() / arity;
+        let sql = format!(
+            "INSERT INTO {table} VALUES {}",
+            values_groups(arity, n_groups, 0)
+        );
+        let mut stmt = match conn.prepare_cached(&sql) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("coddl: query: prepare failed for plan {plan_id}: {err}");
+                std::process::abort();
+            }
+        };
+        if let Err(err) = stmt.execute(params_from_iter(batch.iter())) {
+            eprintln!("coddl: query: execution failed for plan {plan_id}: {err}");
+            std::process::abort();
+        }
+    }
 }
 
 /// The SQL **table primary** substituted for one relation-parameter marker,

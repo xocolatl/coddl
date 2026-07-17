@@ -31,7 +31,7 @@ trait Conn {
 
 Crates: `coddl-backend-sqlite`, `coddl-backend-postgres`. Selection is a Cargo feature on the runtime crate; the LLVM-emitted binary links against exactly one runtime that wraps the chosen `Conn`. If passing backends around as values gets clumsy with the associated-type trait, switch to a `dyn`-friendly `BackendOps` record-of-fn-pointers — the per-call dispatch cost is negligible against query latency. Decide once the second backend lands. Cargo features also gate SQL backends out of `wasm32-*` builds where the C dependencies of `rusqlite` / `postgres` don't link (see [workspace.md](workspace.md), [runtime.md](runtime.md) "Portability").
 
-`materialize_temp` is the boundary primitive for sending in-memory relations back into SQL — see [sqlemit.md](sqlemit.md) "Sending in-memory relations back into SQL" for the per-backend strategy.
+`materialize_temp` is the boundary primitive for sending in-memory relations back into SQL — the portable seam for trait-path backends. The bundled-SQLite realization lives directly at the runtime force point instead (`fire_escalated`, `coddl-runtime/src/sqlite.rs`, which wraps rusqlite without going through `Conn`); see [sqlemit.md](sqlemit.md) "Sending in-memory relations back into SQL" for the mechanism and per-backend strategy.
 
 ## The `database` declaration
 

@@ -344,12 +344,15 @@ spelling is free.
 
 Bounds and declines: a read query **never batch-splits** (splitting a `VALUES`
 operand changes the query's meaning for non-distributive shapes), so scalars +
-shipped cells must fit under the historical SQLite bind floor (999) — a bigger
-local relation aborts loud; the escalation for large relations is the
-temp-table path below. A local heading with a Tuple-valued attribute (no
-scalar SQL cell) or a nullary local (no zero-column `VALUES` form) declines
-the push and falls to the in-process path. Deferred by choice: eliding the
-nested no-op wrappers (SQLite's subquery flattener collapses them).
+shipped cells must fit under the historical SQLite bind floor (999) — past it
+the force point **escalates every shipped slot into its session temp table**
+and fires the same statement with scalar binds only (see "Sending in-memory
+relations back into SQL" below); only scalar binds *alone* past the ceiling
+abort loud (nothing to escalate). A local heading with a Tuple-valued
+attribute (no scalar SQL cell) or a nullary local (no zero-column `VALUES`
+form) declines the push and falls to the in-process path. Deferred by choice:
+eliding the nested no-op wrappers (SQLite's subquery flattener collapses
+them).
 
 ### Statement-verb sugar
 
@@ -424,9 +427,11 @@ Per-backend golden-file tests live in `tests/golden/`: `RelIR plan → expected 
 
 A relation value built or filtered in procedural code may be the input to a subsequent query. **The built v1 mechanism is the relation-valued parameter** (see "Relation-valued parameters" above): the rows ride the statement itself as a bound `VALUES` derived table — no temp table, no catalog churn, one round trip — on both the read side (`RelExpr::RelParam` → `coddl_query`) and the write side (`emit_insert_template` → `coddl_exec_insert`, which batches because an insert is cumulative).
 
-The **temp-table escalation** remains the designed path for relations too large for a bound `VALUES` list (a read never batch-splits, so past the bind-variable ceiling it fails loud today). The `Conn::materialize_temp(heading, rows) -> TempRelRef` trait method (see [storage.md](storage.md)) ships an in-memory relation to a temp table the next query references as if it were a relvar:
+The **temp-table escalation** is the built path for relations too large for a bound `VALUES` list (a read never batch-splits). For the bundled SQLite backend it lives at the **runtime force point** (`fire_escalated`, `coddl-runtime/src/sqlite.rs`), which holds every shipped relation and therefore the projected bind count for free: when scalars + `rows × arity` over the slots would pass the read bind ceiling, **every** slot's `__CODDL_REL_<slot>__` marker substitutes to a stable per-(plan, slot) session temp table `coddl_rp_<plan>_<slot>` instead of a `(VALUES …)` primary — all slots together, so the plan has exactly two statement texts (the row-count-varying `VALUES` form and the fully stable escalated form, one cached prepared statement). Each table is created `IF NOT EXISTS` with **bare `column1…N` columns** (no type keyword — BLOB affinity, no insert coercion, so it behaves exactly like the `VALUES` row source it replaces, and emission's `column1…N` aliasing applies unchanged — no emission change at all), cleared, populated in insert-budget-sized batches (population is cumulative, so batching is legal there), and cleared again after the read; an empty slot stays a cleared table — the escalated stand-in for the typed zero-row SELECT, still no `NULL` token. One connection-pool guard spans populate + select + cleanup (the connection is `NO_MUTEX`; the guard *is* its serialization). Only scalar binds alone past the ceiling still abort — there is nothing to escalate.
 
-- **SQLite**: temp tables / `carray`.
+Per-backend strategy:
+
+- **SQLite**: session temp tables (built, above); `carray` noted as an alternative.
 - **Postgres**: `UNNEST` over arrays for small relations; `COPY` into a temp table for larger ones; table-valued parameters via temp tables are the portable bet.
 
-SQL emission can reference a `TempRelRef` the same way it references a base table — `coddl-sqlemit` doesn't need a special path for boundary materialization; it just sees another relvar-shaped leaf. When this lands, the cut (or the eventual cost model) picks `VALUES` vs. temp table by row count; the ship-up *direction* stays settled either way.
+The `Conn::materialize_temp(heading, rows) -> TempRelRef` trait method (see [storage.md](storage.md)) remains the **portable seam for trait-path backends** (the runtime's bundled-SQLite path does not go through the `Conn` trait); SQL emission can reference a `TempRelRef` the same way it references a base table — just another relvar-shaped leaf. The force point (or the eventual cost model) picks `VALUES` vs. temp table by projected bind count; the ship-up *direction* stays settled either way.

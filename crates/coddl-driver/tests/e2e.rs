@@ -4437,6 +4437,312 @@ fn mixed_origin_field_access_cranelift() {
     assert_mixed_origin_field_access("cranelift");
 }
 
+// ── temp-table escalation past the read bind ceiling ──────────────────
+
+/// Render a `Relation { { sno: <lo> }, …, { sno: <hi> } }` literal big enough
+/// to push a shipped slot past the read bind ceiling (999). Generated here —
+/// the suite owns its source.
+fn big_sno_literal(lo: i64, hi: i64) -> String {
+    let rows: Vec<String> = (lo..=hi).map(|i| format!("{{ sno: {i} }}")).collect();
+    format!("Relation {{ {} }}", rows.join(", "))
+}
+
+/// Temp-table escalation: a shipped slot whose cells would push the read past
+/// the bind ceiling (999) no longer aborts — the force point materializes the
+/// local into a stable per-(plan, slot) session temp table
+/// (`coddl_rp_<plan>_<slot>`, bare `column1…N` columns — VALUES-identical
+/// affinity) and fires the SELECT with scalar binds only. The read still
+/// never batch-splits: the escalated read is ONE statement; only the table
+/// *population* batches (insert-style, cumulative). The under-ceiling control
+/// on the same plan keeps the `(VALUES …)` path. (The scalars-alone-past-the-
+/// ceiling abort has no e2e — authoring >999 scalar binds would take a
+/// ~1000-conjunct WHERE; it stays a defensive guard.)
+fn assert_bind_ceiling_escalates_semijoin(backend: &str) {
+    let program = format!(
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers {{ sno: Integer, sname: Text }} key {{ sno }};\n\
+         public relvar Shipments {{ pno: Integer, sno: Integer }} key {{ pno, sno }};\n\
+         oper main {{}} [\n\
+             let big = {big};\n\
+             let escalated = transaction [ Suppliers matching big ];\n\
+             write_relation {{ rel: escalated }};\n\
+             let small = Relation {{ {{ sno: 1 }}, {{ sno: 3 }} }};\n\
+             let control = transaction [ Suppliers matching small ];\n\
+             write_relation {{ rel: control }};\n\
+         ];\n",
+        big = big_sno_literal(1, 1000)
+    );
+    let (stdout, audit) = run_parts_program(backend, &program, true);
+    assert_eq!(
+        tuple_lines(&stdout),
+        sorted_tuples(&[
+            // Suppliers matching big — sno 1..=1000 covers all three
+            "{sname: \"Smith\", sno: 1}",
+            "{sname: \"Jones\", sno: 2}",
+            "{sname: \"Blake\", sno: 3}",
+            // Suppliers matching small
+            "{sname: \"Smith\", sno: 1}",
+            "{sname: \"Blake\", sno: 3}",
+        ]),
+        "backend={backend}"
+    );
+    // One table created (single escalated slot), bare column1 (no type
+    // keyword — VALUES-identical affinity), populated in two batches
+    // (1000 single-cell rows against the 900-bind insert budget), cleared
+    // before population and after the read.
+    let creates: Vec<&str> = audit
+        .lines()
+        .filter(|l| l.contains("CREATE TEMP TABLE"))
+        .collect();
+    assert!(
+        creates.len() == 1
+            && creates[0].contains("IF NOT EXISTS coddl_rp_")
+            && creates[0].trim_end().ends_with("(column1)"),
+        "expected one bare-column temp table; audit:\n{audit}"
+    );
+    assert_eq!(
+        audit
+            .lines()
+            .filter(|l| l.contains("INSERT INTO coddl_rp_"))
+            .count(),
+        2,
+        "expected the 1000-row population split into 900+100; audit:\n{audit}"
+    );
+    assert_eq!(
+        audit
+            .lines()
+            .filter(|l| l.contains("DELETE FROM coddl_rp_"))
+            .count(),
+        2,
+        "expected the pre-population clear + post-read cleanup; audit:\n{audit}"
+    );
+    // The escalated read is ONE statement referencing the temp table — no
+    // VALUES operand, no scalar-cell binds, and the bare root semijoin still
+    // needs no DISTINCT.
+    let escalated: Vec<&str> = audit
+        .lines()
+        .filter(|l| l.contains("SELECT") && l.contains("FROM coddl_rp_"))
+        .collect();
+    assert!(
+        escalated.len() == 1
+            && escalated[0].contains("EXISTS")
+            && !escalated[0].contains("VALUES")
+            && !escalated[0].contains("DISTINCT"),
+        "expected one escalated EXISTS statement with no VALUES/DISTINCT; audit:\n{audit}"
+    );
+    // The under-ceiling control keeps the VALUES path on the same plan text.
+    assert!(
+        audit.contains("(VALUES (1), (3))") || audit.contains("(VALUES (3), (1))"),
+        "expected the 2-row control to ship as VALUES; audit:\n{audit}"
+    );
+    for line in audit.lines() {
+        assert!(
+            !line.trim_end().ends_with(r#"FROM "suppliers""#),
+            "a statement pulled the whole relvar bare: {line}"
+        );
+    }
+}
+
+#[test]
+fn bind_ceiling_escalates_semijoin_llvm() {
+    assert_bind_ceiling_escalates_semijoin("llvm");
+}
+
+#[test]
+fn bind_ceiling_escalates_semijoin_cranelift() {
+    assert_bind_ceiling_escalates_semijoin("cranelift");
+}
+
+/// Repeat escalation on ONE plan: the three `matching` spellings dedup to the
+/// same statement text (one plan id, one temp table), so the escalated form's
+/// text is stable — one `prepare_cached` entry, proven by the two escalated
+/// SELECT lines being string-equal — and each escalated fire repopulates
+/// (clear + INSERT): the second result *lacking Smith* proves no stale sno=1
+/// row leaked from the first. The final small local drops the same plan back
+/// to the VALUES path.
+fn assert_bind_ceiling_escalation_repopulates(backend: &str) {
+    let program = format!(
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers {{ sno: Integer, sname: Text }} key {{ sno }};\n\
+         public relvar Shipments {{ pno: Integer, sno: Integer }} key {{ pno, sno }};\n\
+         oper main {{}} [\n\
+             let big1 = {big1};\n\
+             let all = transaction [ Suppliers matching big1 ];\n\
+             write_relation {{ rel: all }};\n\
+             let big2 = {big2};\n\
+             let tail = transaction [ Suppliers matching big2 ];\n\
+             write_relation {{ rel: tail }};\n\
+             let small = Relation {{ {{ sno: 2 }}, {{ sno: 3 }} }};\n\
+             let back = transaction [ Suppliers matching small ];\n\
+             write_relation {{ rel: back }};\n\
+         ];\n",
+        big1 = big_sno_literal(1, 1000),
+        big2 = big_sno_literal(2, 1001),
+    );
+    let (stdout, audit) = run_parts_program(backend, &program, true);
+    assert_eq!(
+        tuple_lines(&stdout),
+        sorted_tuples(&[
+            // Suppliers matching big1 (sno 1..=1000)
+            "{sname: \"Smith\", sno: 1}",
+            "{sname: \"Jones\", sno: 2}",
+            "{sname: \"Blake\", sno: 3}",
+            // Suppliers matching big2 (sno 2..=1001) — no Smith: repopulated
+            "{sname: \"Jones\", sno: 2}",
+            "{sname: \"Blake\", sno: 3}",
+            // Suppliers matching small — back on the VALUES path
+            "{sname: \"Jones\", sno: 2}",
+            "{sname: \"Blake\", sno: 3}",
+        ]),
+        "backend={backend}"
+    );
+    assert_eq!(
+        audit
+            .lines()
+            .filter(|l| l.contains("CREATE TEMP TABLE IF NOT EXISTS coddl_rp_"))
+            .count(),
+        2,
+        "expected IF NOT EXISTS to re-run per escalated fire; audit:\n{audit}"
+    );
+    assert_eq!(
+        audit
+            .lines()
+            .filter(|l| l.contains("INSERT INTO coddl_rp_"))
+            .count(),
+        4,
+        "expected two population batches per escalated fire; audit:\n{audit}"
+    );
+    assert_eq!(
+        audit
+            .lines()
+            .filter(|l| l.contains("DELETE FROM coddl_rp_"))
+            .count(),
+        4,
+        "expected clear + cleanup per escalated fire; audit:\n{audit}"
+    );
+    // Stable escalated text: the two escalated fires ran the byte-identical
+    // statement (no binds beyond scalars here, so even trace expansion
+    // matches) — one prepare_cached entry serves both. Compare the SQL, not
+    // the raw lines (the audit prefix carries a timestamp).
+    let escalated: Vec<&str> = audit
+        .lines()
+        .filter(|l| l.contains("SELECT") && l.contains("FROM coddl_rp_"))
+        .map(|l| audit_sql(l).expect("audit line format"))
+        .collect();
+    assert!(
+        escalated.len() == 2 && escalated[0] == escalated[1],
+        "expected two string-equal escalated SELECTs; audit:\n{audit}"
+    );
+    assert!(
+        audit.contains("(VALUES (2), (3))") || audit.contains("(VALUES (3), (2))"),
+        "expected the small local to drop back to VALUES; audit:\n{audit}"
+    );
+}
+
+#[test]
+fn bind_ceiling_escalation_repopulates_llvm() {
+    assert_bind_ceiling_escalation_repopulates("llvm");
+}
+
+#[test]
+fn bind_ceiling_escalation_repopulates_cranelift() {
+    assert_bind_ceiling_escalation_repopulates("cranelift");
+}
+
+/// All-slots escalation: past the ceiling EVERY shipped slot goes to its temp
+/// table — one stable escalated text, not per-subset combinatorics — including
+/// an **empty** slot, which stays a cleared table (the escalated stand-in for
+/// the typed zero-row SELECT; no `WHERE 0`, no NULL token). The empty local
+/// sits at a NON-absorbing antijoin rhs, so no A2 short-circuit fires and
+/// everything the semijoin kept survives.
+fn assert_bind_ceiling_escalation_two_slots(backend: &str) {
+    let program = format!(
+        "program parts;\n\
+         database parts;\n\
+         public relvar Suppliers {{ sno: Integer, sname: Text }} key {{ sno }};\n\
+         public relvar Shipments {{ pno: Integer, sno: Integer }} key {{ pno, sno }};\n\
+         oper main {{}} [\n\
+             let big = {big};\n\
+             let none = Relation {{ {{ sno: 1 }} }} where sno = 99;\n\
+             let survivors = transaction [ (Suppliers matching big) not matching none ];\n\
+             write_relation {{ rel: survivors }};\n\
+         ];\n",
+        big = big_sno_literal(1, 1000)
+    );
+    let (stdout, audit) = run_parts_program(backend, &program, true);
+    assert_eq!(
+        tuple_lines(&stdout),
+        sorted_tuples(&[
+            "{sname: \"Smith\", sno: 1}",
+            "{sname: \"Jones\", sno: 2}",
+            "{sname: \"Blake\", sno: 3}",
+        ]),
+        "backend={backend}"
+    );
+    // Two tables (slots 0 and 1); population only for the non-empty slot
+    // (1000 cells → two batches); clear + cleanup for both.
+    assert_eq!(
+        audit
+            .lines()
+            .filter(|l| l.contains("CREATE TEMP TABLE IF NOT EXISTS coddl_rp_"))
+            .count(),
+        2,
+        "expected a temp table per shipped slot; audit:\n{audit}"
+    );
+    assert_eq!(
+        audit
+            .lines()
+            .filter(|l| l.contains("INSERT INTO coddl_rp_"))
+            .count(),
+        2,
+        "expected population batches only for the non-empty slot; audit:\n{audit}"
+    );
+    assert_eq!(
+        audit
+            .lines()
+            .filter(|l| l.contains("DELETE FROM coddl_rp_"))
+            .count(),
+        4,
+        "expected clear + cleanup for both slots; audit:\n{audit}"
+    );
+    let escalated: Vec<&str> = audit
+        .lines()
+        .filter(|l| l.contains("SELECT") && l.contains("FROM coddl_rp_"))
+        .collect();
+    assert!(
+        escalated.len() == 1,
+        "expected one escalated statement; audit:\n{audit}"
+    );
+    let sel = escalated[0];
+    assert!(
+        sel.contains("EXISTS") && sel.contains("NOT EXISTS"),
+        "expected both existence tests in one statement: {sel}"
+    );
+    assert!(
+        sel.matches("FROM coddl_rp_").count() == 2
+            && sel.contains("AS coddl_v0")
+            && sel.contains("AS coddl_v1"),
+        "expected both slots to reference their own temp tables: {sel}"
+    );
+    assert!(
+        !sel.contains("(VALUES") && !sel.contains("WHERE 0"),
+        "the escalated statement ships nothing inline and retires the \
+         zero-row SELECT form: {sel}"
+    );
+}
+
+#[test]
+fn bind_ceiling_escalation_two_slots_llvm() {
+    assert_bind_ceiling_escalation_two_slots("llvm");
+}
+
+#[test]
+fn bind_ceiling_escalation_two_slots_cranelift() {
+    assert_bind_ceiling_escalation_two_slots("cranelift");
+}
+
 // ── `when` (gate) and `otherwise` (relational COALESCE) ───────────────
 
 /// In-process gating: `R when c` keeps R when the condition holds and
