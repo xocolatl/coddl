@@ -920,7 +920,7 @@ check script enforces that.
 | T0082 | a `load … order [ … ]` sort key names a **relation- or tuple-valued** attribute — only scalars have an order (tuples/relations carry `=`/`<>` only, RM Pro 1) |
 | T0083 | an `order` clause on the reverse `load <relvar> from <sequence>` form — a relation is unordered (RM Pro 1), so ordering a seal-into-relvar is meaningless |
 | T0084 | the reverse `load` target is a **public** (SQL-backed) relvar — sealing a sequence into a public relvar (a DML replace) is not yet wired; use a private relvar |
-| T0085 | a `type Name = …;` declaration shadows a built-in type name (`Integer`, `Text`, …) |
+| T0085 | a `type` declaration (alias or possrep scalar) shadows a built-in type name (`Integer`, `Text`, …) or a type generator (`Tuple`, `Relation`, `Sequence`) — a same-named type would be unreachable behind the generator's type-position claim |
 | T0086 | a `type Name …;` declaration (alias or possrep scalar) re-declares a name already given a type |
 | T0087 | an operator that belongs to an opt-in stdlib module is called without importing it — add `use module <path>;` (e.g. `environment` needs `use module coddl::env;`) |
 | T0088 | a type that belongs to an opt-in stdlib module is named without importing it — add `use module <path>;` (e.g. `RawRequest` needs `use module coddl::web;`) |

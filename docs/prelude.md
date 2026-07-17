@@ -90,7 +90,7 @@ type Pair = Tuple { a: Integer, b: Integer };
 ```
 
 The prelude itself declares no types today; this is the mechanism a future standard library (or user code)
-uses to name composite types. Shadowing a built-in type name is rejected (T0085), as is a duplicate
+uses to name composite types. Shadowing a built-in type or type-generator name is rejected (T0085), as is a duplicate
 declaration (T0086). The exact scope of type declarations — alias-only, or a future home for
 scalar-type/possrep declarations — is an open design question.
 

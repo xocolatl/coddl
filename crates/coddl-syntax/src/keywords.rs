@@ -13,13 +13,14 @@
 //! Two kinds of groups live here:
 //!
 //! - **Consumed** groups are mechanically matched in code ([`INFIX_OPS`],
-//!   [`UNARY_OPS`], [`BOOL_WORDS`], [`EXPR_HEAD_NARROWED`], the
-//!   single-word consts) — changing an entry changes the parser (and, for
-//!   the operator tables, the AST) with it.
+//!   [`UNARY_OPS`], [`BOOL_WORDS`], [`EXPR_HEAD_NARROWED`],
+//!   [`TYPE_GENERATORS`], the single-word consts) — changing an entry
+//!   changes the parser (and, where noted, the AST or the typechecker)
+//!   with it.
 //! - **Inventory** groups ([`STMT_HEADS`], [`POSTFIX_SUFFIXES`],
-//!   [`CLAUSE_WORDS`], [`ITEM_HEADS`], [`TYPE_GENERATORS`], the dialect
-//!   sets) each have exactly one hand-written match site in the parser
-//!   today; they are published for the grammar.md keyword table.
+//!   [`CLAUSE_WORDS`], [`ITEM_HEADS`], the dialect sets) each have exactly
+//!   one hand-written match site in the parser today; they are published
+//!   for the grammar.md keyword table.
 //!
 //! Symbolic operators (`= <> < > <= >= + - * / ||`) and the comparison
 //! glyphs (`≤ ≥ ≠ ⊂ ⊃ ⊆ ⊇`) are lexer token kinds, not identifiers — they
@@ -246,7 +247,10 @@ pub const ITEM_HEADS: &[&str] = &[
 
 /// Type-position generators (`parse_type_ref`). `Tuple` is claimed nowhere
 /// else — it never claims expression space; `Relation`/`Sequence` also have
-/// the expression-head claims listed in [`EXPR_HEAD_NARROWED`].
+/// the expression-head claims listed in [`EXPR_HEAD_NARROWED`]. The
+/// typechecker consumes this set as part of T0085's cannot-redefine list:
+/// a `type` named after a generator would be unreachable, so declaring one
+/// is rejected like a builtin.
 pub const TYPE_GENERATORS: &[&str] = &["Tuple", "Relation", "Sequence"];
 
 /// `.cddb` dialect keywords (`parser_cddb`).

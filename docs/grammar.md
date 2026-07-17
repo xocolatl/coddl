@@ -152,7 +152,7 @@ There is **no `mod`** — `div` (truncating integer division) is the only textua
 
 **Item heads** (top level; no expression can start there): `program` `library` `module` `database` `public` `private` `base` `virtual` `builtin` `oper` `type` `use` `let` `var`. `builtin` is two-token narrowed (`builtin relvar` vs `builtin oper`); `relvar` and `key` are decl-interior words, not item heads.
 
-**Type position** (`parse_type_ref`): `Relation` and `Sequence` as generators (their expression-head claims are the Tier-2 rows above). **`Tuple` is type-position only — it never claims expression space**; a variable, attribute, or oper named `Tuple` is fully usable.
+**Type position** (`parse_type_ref`): `Relation` and `Sequence` as generators (their expression-head claims are the Tier-2 rows above). **`Tuple` is type-position only — it never claims expression space**; a variable, attribute, or oper named `Tuple` is fully usable. A *type* named after a generator is the one thing the claim forecloses — `type Relation { … }` would be unreachable — so the typechecker rejects it (T0085, same as the builtins).
 
 **Sidecar dialects** (separate parsers, separate diagnostic namespaces): `.cddb` — `database` `base` `virtual` `public` `private` `relvar` `key`; `.cdstore` — `store` `for` `backend` `relvar` `table` `columns` `env` `default`; `.cdmap` — `map` `to`.
 
@@ -526,8 +526,8 @@ function that implements it.
                     -- Dispatched on the leading contextual `type` keyword.
                     -- Missing name is P0080; a name followed by neither `{` nor
                     -- `=` is P0081; missing `;` is P0082. The checker rejects
-                    -- shadowing a built-in type name (T0085) and a duplicate
-                    -- declaration (T0086).
+                    -- shadowing a built-in type or type-generator name
+                    -- (T0085) and a duplicate declaration (T0086).
 
 <use-decl>      ::= 'use' 'module' <module-path> ';' ;         -- parse_use_decl
                     -- A module import. `module` is the only category today;

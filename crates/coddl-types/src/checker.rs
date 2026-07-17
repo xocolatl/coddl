@@ -1546,10 +1546,10 @@ impl TypeChecker {
     /// names a builtin or an earlier user op is rejected with T0060 and the
     /// first definition wins.
     /// Register a `type Name = <type-ref>;` alias. Rejects shadowing a
-    /// built-in type name (T0085) and a duplicate declaration (T0086); a bad
-    /// component of the aliased type surfaces T0005 once, here. The aliased
-    /// type resolves loudly, so it may name an alias registered earlier in
-    /// source order.
+    /// built-in type or type-generator name (T0085) and a duplicate
+    /// declaration (T0086); a bad component of the aliased type surfaces
+    /// T0005 once, here. The aliased type resolves loudly, so it may name an
+    /// alias registered earlier in source order.
     /// Register a `type` declaration in its pre-pass. Two forms (chosen by the
     /// parser, surfaced as `possrep_heading()` vs `aliased_type()`):
     /// - `type Name { component: T };` — a distinct nominal **possrep scalar**
@@ -1565,6 +1565,18 @@ impl TypeChecker {
                 self.token_span(&name_tok),
                 "T0085",
                 format!("cannot redefine built-in type `{name}`"),
+            );
+            return;
+        }
+        // The generators are not resolvable as bare type names
+        // (`from_builtin_name` is "resolves to a scalar type"), but a `type`
+        // named after one would be unreachable — `parse_type_ref` intercepts
+        // the word as the generator — so it is rejected the same way.
+        if coddl_syntax::keywords::TYPE_GENERATORS.contains(&name.as_str()) {
+            self.error(
+                self.token_span(&name_tok),
+                "T0085",
+                format!("cannot redefine built-in type generator `{name}`"),
             );
             return;
         }
@@ -7093,6 +7105,27 @@ mod tests {
     fn type_alias_cannot_shadow_builtin() {
         let src = "program p; type Integer = Text;";
         assert!(codes(src).contains(&"T0085"), "{:?}", codes(src));
+    }
+
+    #[test]
+    fn type_decl_cannot_shadow_a_generator() {
+        // A `type` named after a generator would register and then be
+        // unreachable (`parse_type_ref` intercepts the word as the
+        // generator), so both declaration forms reject it like a builtin.
+        for gen in coddl_syntax::keywords::TYPE_GENERATORS {
+            let possrep = format!("program p; type {gen} {{ c: Integer }};");
+            assert!(
+                codes(&possrep).contains(&"T0085"),
+                "`type {gen} {{ … }}`: {:?}",
+                codes(&possrep)
+            );
+            let alias = format!("program p; type {gen} = Integer;");
+            assert!(
+                codes(&alias).contains(&"T0085"),
+                "`type {gen} = …`: {:?}",
+                codes(&alias)
+            );
+        }
     }
 
     #[test]
