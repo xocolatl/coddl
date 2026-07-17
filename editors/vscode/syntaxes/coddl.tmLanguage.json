@@ -118,29 +118,31 @@
         "keywords": {
             "patterns": [
                 {
+                    "comment": "Item-head declaration verbs (keywords.rs ITEM_HEADS) plus the decl-interior `relvar` and the `key` clause. tools/check-grammar.sh Check 3 cross-checks every group in this repository block against keywords.rs, bidirectionally — a word here that the parser doesn't know fails the hygiene gate, and vice versa.",
                     "name": "keyword.declaration.coddl",
-                    "match": "\\b(program|database|oper|relvar|type|possrep|constraint|var|key)\\b"
+                    "match": "\\b(program|library|module|database|oper|type|use|relvar|key)\\b"
                 },
                 {
                     "name": "keyword.declaration.binding.coddl",
-                    "match": "\\b(let|mut)\\b"
+                    "match": "\\b(let|var)\\b"
                 },
                 {
                     "name": "storage.modifier.coddl",
-                    "match": "\\b(real|base|virtual|private|public)\\b"
+                    "match": "\\b(public|private|base|virtual|builtin)\\b"
                 },
                 {
+                    "comment": "Statement heads and their clause words (keywords.rs STMT_HEADS + CLAUSE_WORDS).",
                     "name": "keyword.control.coddl",
-                    "match": "\\b(if|then|else|end|do|to|return)\\b"
+                    "match": "\\b(if|then|else|for|while|do|in|to|return)\\b"
                 },
                 {
                     "name": "keyword.other.iteration.coddl",
-                    "match": "\\b(load|array|from|order|asc|desc|by)\\b"
+                    "match": "\\b(load|from|order|asc|desc)\\b"
                 },
                 {
-                    "comment": "Infix relational operators (join/times/compose/intersect/union/minus/matching/where/when/otherwise — `not matching` gets `not` from the logical group), the postfix pipeline suffixes (project/replace/extend/rename/wrap/unwrap/group/ungroup/tclose), prefix `extract`, and the designed-but-unbuilt sugar (summarize).",
+                    "comment": "Infix relational operators (keywords.rs INFIX_OPS — `not matching` gets `not` from the logical group), the postfix pipeline suffixes (POSTFIX_SUFFIXES), and prefix `extract` (UNARY_OPS).",
                     "name": "keyword.other.relational.coddl",
-                    "match": "\\b(join|times|compose|union|intersect|minus|matching|where|when|otherwise|extract|extend|summarize|replace|rename|project|group|ungroup|wrap|unwrap|tclose)\\b"
+                    "match": "\\b(join|times|compose|union|intersect|minus|matching|where|when|otherwise|extract|extend|replace|rename|project|group|ungroup|wrap|unwrap|tclose)\\b"
                 },
                 {
                     "comment": "Unicode operator glyph synonyms (grammar.md § Unicode operator glyphs): ⋈ join, ∪ union, ∩ intersect, ∖ minus, ⋉ matching, ▷ not-matching, ¬ not. Lexed as IDENTs, so no \\b anchors (word boundaries misfire next to symbols).",
@@ -162,17 +164,13 @@
                     "match": "\\b(and|or|not)\\b"
                 },
                 {
-                    "comment": "Textual arithmetic: `div` (truncating integer division) and the designed `mod`.",
+                    "comment": "`div` (truncating integer division) is the only textual arithmetic keyword — there is no `mod`.",
                     "name": "keyword.operator.arithmetic.coddl",
-                    "match": "\\b(div|mod)\\b"
+                    "match": "\\b(div)\\b"
                 },
                 {
                     "name": "keyword.other.transaction.coddl",
-                    "match": "\\b(begin|commit|rollback|transaction|savepoint)\\b"
-                },
-                {
-                    "name": "keyword.other.coddl",
-                    "match": "\\b(with|as|add|the)\\b"
+                    "match": "\\b(transaction)\\b"
                 }
             ]
         },

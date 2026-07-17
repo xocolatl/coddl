@@ -162,7 +162,7 @@ There is **no `mod`** — `div` (truncating integer division) is the only textua
 
 The ergonomic goal stands: users model real domains with attribute names like `name`, `type`, `from`, `to`, `order`, `value`, `with`, `by`, `and` — every one of those is Tier 3 or entirely unclaimed, and hard-reserving them remains a tax Coddl refuses to pay. The cost is the prefix-only constraint on textual operators noted above, plus the five Tier-1 words whose expression-head grammar genuinely cannot share.
 
-The TextMate grammar still pattern-highlights keywords at the lexical level (highlighting is a UX hint, not a lex check); the [LSP](lsp.md)'s semantic tokens correct mis-highlightings later where a user has used such a word as an identifier.
+The TextMate grammar still pattern-highlights keywords at the lexical level (highlighting is a UX hint, not a lex check); the [LSP](lsp.md)'s semantic tokens correct mis-highlightings later where a user has used such a word as an identifier. Its keyword inventory is held to the taxonomy by the same Check 3 (bidirectionally: no fictional words highlighted, no `.cd` keyword unhighlighted); `reltrue`/`relfalse` and the builtin scalar type names are highlighted as *vocabulary*, outside the keyword cross-check.
 
 ## Unicode operator glyphs
 

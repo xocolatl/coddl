@@ -12,7 +12,10 @@
 //! runs from the pre-commit hook. That check harvests every string
 //! literal in this module outside the test block, so keep the invariant:
 //! **every non-test string literal here is a keyword or glyph** — nothing
-//! else (no message strings, no quoted prose in code).
+//! else (no message strings, no quoted prose in code). Check 3 also
+//! cross-checks the VSCode TextMate grammar against this module, treating
+//! everything above [`CDDB_WORDS`] as the `.cd` keyword set — so **the
+//! dialect groups stay last in this file**.
 //!
 //! Two kinds of groups live here:
 //!

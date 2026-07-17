@@ -26,7 +26,10 @@
 #      (table rows and the bold Tier-3 list lines) exists in
 #      keywords.rs. Which tier/table a word belongs to remains
 #      documentation discipline, like the per-file scoping of checks
-#      1-2.
+#      1-2. The VSCode TextMate grammar is held to the same standard,
+#      both directions: every word its keyword patterns highlight
+#      exists in keywords.rs, and every .cd keyword (the dialect sets
+#      excluded) is highlighted.
 #
 # Exits 0 if all invariants hold, 1 with a summary of what's missing
 # otherwise. POSIX shell only — no Python, no Rust.
@@ -171,6 +174,64 @@ for w in $doc_words; do
     esac
     if ! printf '%s\n' "$src_words" | grep -qxF "$w"; then
         echo "check-grammar: \`$w\` in a grammar.md \"Reserved words\" table is not in keywords.rs" >&2
+        failed=1
+    fi
+done
+
+# 3c/3d. TextMate grammar cross-check — the third keyword copy. Harvest
+# every alternation from a "match" that directly follows a keyword.* /
+# constant.language.boolean / support.type.generator scope name
+# (stripping `\b` anchors, parens, and the `\s+` of the `all but` pair);
+# symbol patterns from the operator scopes fall out via the punctuation
+# filter. reltrue/relfalse (library constants) and the builtin scalar
+# type names are deliberately outside the harvest — they are not
+# keywords and are highlighted as vocabulary.
+tm_json="$ROOT/editors/vscode/syntaxes/coddl.tmLanguage.json"
+if [ ! -f "$tm_json" ]; then
+    echo "check-grammar: editors/vscode/syntaxes/coddl.tmLanguage.json not found" >&2
+    exit 1
+fi
+tm_words=$(
+    grep -A1 -E '"name": "(keyword\.|storage\.|constant\.language\.boolean|support\.type\.generator)' "$tm_json" \
+        | grep '"match"' \
+        | sed 's/.*"match": "//; s/".*//' \
+        | sed 's/\\\\b//g; s/[()]//g; s/\\\\s+/|/g' \
+        | tr '|' '\n' \
+        | sort -u
+)
+
+# The .cd keyword set: everything in keywords.rs above the dialect
+# groups (CDDB/CDSTORE/CDMAP stay last in that file — a stated layout
+# invariant there). The grammar's fileTypes is .cd only, so
+# dialect-only words are not expected to be highlighted.
+cd_words=$(
+    sed '/^pub const CDDB_WORDS/,$d' "$keywords_rs" \
+        | grep -v '^[[:space:]]*//' \
+        | grep -oE '"[^"]+"' \
+        | tr -d '"' \
+        | sort -u
+)
+
+# tm -> source: no fictional keywords highlighted.
+for w in $tm_words; do
+    case $w in
+        *' '*) continue ;;
+        *[-\\\<\>\[\]\{\}\(\)\;\:\=\.\,\*\/\+\|\"\'\?\!]*) continue ;;
+    esac
+    if ! printf '%s\n' "$src_words" | grep -qxF "$w"; then
+        echo "check-grammar: \`$w\` is highlighted by coddl.tmLanguage.json but is not in keywords.rs" >&2
+        failed=1
+    fi
+done
+
+# source -> tm: every .cd keyword is highlighted. Multi-word entries
+# ("not matching") are covered by their component words.
+for w in $cd_words; do
+    case $w in
+        *' '*) continue ;;
+    esac
+    if ! printf '%s\n' "$tm_words" | grep -qxF "$w"; then
+        echo "check-grammar: .cd keyword \`$w\` (keywords.rs) is not highlighted by coddl.tmLanguage.json" >&2
         failed=1
     fi
 done
