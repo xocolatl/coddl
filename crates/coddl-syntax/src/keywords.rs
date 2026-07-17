@@ -19,8 +19,9 @@
 //!   [`CLAUSE_WORDS`], [`ITEM_HEADS`], [`TYPE_GENERATORS`],
 //!   [`EXPR_HEAD_NARROWED`], the dialect sets) each have exactly one match
 //!   site in the parser today; they are published for the grammar.md
-//!   keyword table and for the planned decl-site and lookahead work
-//!   (`.local/active/reserved-words.md`), which will consume them.
+//!   keyword table and for the remaining lookahead work — the
+//!   expression-head narrowing, which will consume
+//!   [`EXPR_HEAD_NARROWED`].
 //!
 //! Symbolic operators (`= <> < > <= >= + - * / ||`) and the comparison
 //! glyphs (`≤ ≥ ≠ ⊂ ⊃ ⊆ ⊇`) are lexer token kinds, not identifiers — they
@@ -213,9 +214,10 @@ pub const EXPR_HEAD_NARROWED: &[(&str, SyntaxKind)] = &[
     ("transaction", SyntaxKind::L_BRACKET),
 ];
 
-/// Statement-head words (`parse_stmt` dispatch). Claimed unconditionally
-/// today, so `delete := 2;` misparses into the DELETE statement; the
-/// planned narrowing claims each only when the next token is not `:=`.
+/// Statement-head words (`parse_stmt` dispatch, via `Parser::at_stmt_head`).
+/// Each is claimed only when the next token is not `:=`, so an assignment
+/// to a same-named variable (`delete := 2;`) falls through to the
+/// ASSIGN_STMT fallback and the bare word stays an ordinary identifier.
 pub const STMT_HEADS: &[&str] = &[
     "let", "var", "truncate", "delete", "insert", "update", "for", "while", "do", "load", "return",
 ];

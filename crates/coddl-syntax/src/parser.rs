@@ -182,6 +182,14 @@ impl<'a> Parser<'a> {
         false
     }
 
+    /// Statement-head guard: `word` at statement position, narrowed by one
+    /// token of lookahead — never claimed when the next token is `:=`, so an
+    /// assignment to a same-named variable (`delete := 2;`) falls through to
+    /// the ASSIGN_STMT fallback instead of misparsing into the statement.
+    fn at_stmt_head(&self, word: &str) -> bool {
+        self.at_keyword(word) && self.nth_kind(1) != SyntaxKind::ASSIGN
+    }
+
     /// Emit every trivia token at the cursor into the current node.
     pub(crate) fn bump_trivia(&mut self) {
         while self.pos < self.tokens.len() && self.tokens[self.pos].kind.is_trivia() {
@@ -818,9 +826,9 @@ impl<'a> Parser<'a> {
     /// Counted has an **inclusive** upper bound (`i <= hi`); element iterates a
     /// `Sequence` (RM Pro 7 forbids tuple-at-a-time over a relation, so a
     /// relation operand is a type error). `in`/`to`/`do` are contextual
-    /// keywords recognized only in this statement position (Coddl has no
-    /// reserved words); each `<expr>` stops at the next keyword because none of
-    /// them is an infix operator or a postfix trigger. The loop variable is
+    /// keywords recognized only in this statement position; each `<expr>`
+    /// stops at the next keyword because none of them is an infix operator
+    /// or a postfix trigger. The loop variable is
     /// loop-scoped and immutable (assigning it is T0072). A trailing `;` is
     /// required (P0013). Both forms build one `FOR_STMT`; the AST distinguishes
     /// them by the presence of the `:=` token.
@@ -1150,55 +1158,59 @@ impl<'a> Parser<'a> {
     }
 
     /// One statement, *or* the block's trailing tail expression. The
-    /// `let` form is recognized first; otherwise an expression is
-    /// parsed and either wrapped in `EXPR_STMT` (terminated by `;`)
-    /// or left as a bare child under `BLOCK` (the tail expression,
-    /// immediately followed by `]`).
+    /// statement-head keywords are tried first, each narrowed via
+    /// [`at_stmt_head`](Self::at_stmt_head) (claimed only when the next
+    /// token is not `:=`, so `delete := 2;` assigns to a variable named
+    /// `delete` instead of dispatching into the DELETE statement);
+    /// otherwise an expression is parsed and either wrapped in
+    /// `EXPR_STMT` (terminated by `;`), retro-wrapped in `ASSIGN_STMT`
+    /// (followed by `:=`), or left as a bare child under `BLOCK` (the
+    /// tail expression, immediately followed by `]`).
     fn parse_stmt(&mut self) {
         if matches!(self.current(), SyntaxKind::R_BRACKET | SyntaxKind::EOF) {
             return;
         }
-        if self.at_keyword("let") {
+        if self.at_stmt_head("let") {
             self.parse_let_stmt();
             return;
         }
-        if self.at_keyword("var") {
+        if self.at_stmt_head("var") {
             self.parse_var_stmt();
             return;
         }
-        if self.at_keyword("truncate") {
+        if self.at_stmt_head("truncate") {
             self.parse_truncate_stmt();
             return;
         }
-        if self.at_keyword("delete") {
+        if self.at_stmt_head("delete") {
             self.parse_delete_stmt();
             return;
         }
-        if self.at_keyword("insert") {
+        if self.at_stmt_head("insert") {
             self.parse_insert_stmt();
             return;
         }
-        if self.at_keyword("update") {
+        if self.at_stmt_head("update") {
             self.parse_update_stmt();
             return;
         }
-        if self.at_keyword("for") {
+        if self.at_stmt_head("for") {
             self.parse_for_stmt();
             return;
         }
-        if self.at_keyword("while") {
+        if self.at_stmt_head("while") {
             self.parse_while_stmt();
             return;
         }
-        if self.at_keyword("do") {
+        if self.at_stmt_head("do") {
             self.parse_do_while_stmt();
             return;
         }
-        if self.at_keyword("load") {
+        if self.at_stmt_head("load") {
             self.parse_load_stmt();
             return;
         }
-        if self.at_keyword("return") {
+        if self.at_stmt_head("return") {
             self.parse_return_stmt();
             return;
         }
@@ -3191,6 +3203,58 @@ mod tests {
     }
 
     #[test]
+    fn stmt_head_named_var_is_assignable() {
+        // The canonical statement-head trap, fixed: `delete` declares a
+        // local and `delete := 2;` assigns to it — the head is not claimed
+        // when the next token is `:=`.
+        let src = "oper main {} [ var delete := 1; delete := 2; ];";
+        let out = parse_str(src);
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        assert_eq!(out.tree.text(), src);
+        assert!(
+            out.tree
+                .descendants()
+                .all(|n| n.kind() != SyntaxKind::DELETE_STMT),
+            "`delete := 2;` must not parse as DELETE_STMT"
+        );
+        let assign = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::ASSIGN_STMT)
+            .expect("ASSIGN_STMT in tree");
+        let target = assign
+            .children()
+            .find(|n| n.kind() == SyntaxKind::NAME_REF)
+            .expect("assignment target NAME_REF");
+        assert_eq!(target.text(), "delete");
+    }
+
+    #[test]
+    fn every_stmt_head_named_var_is_assignable() {
+        // The `:=` narrowing holds for all eleven statement heads: each
+        // declares a same-named local and assigns to it, parsing to exactly
+        // one VAR_STMT and one ASSIGN_STMT.
+        for head in crate::keywords::STMT_HEADS {
+            let src = format!("oper main {{}} [ var {head} := 1; {head} := 2; ];");
+            let out = parse_str(&src);
+            assert!(
+                out.diagnostics.is_empty(),
+                "`{head}`: {:?}",
+                out.diagnostics
+            );
+            assert_eq!(out.tree.text(), src.as_str(), "`{head}` round-trips");
+            let count =
+                |kind: SyntaxKind| out.tree.descendants().filter(|n| n.kind() == kind).count();
+            assert_eq!(count(SyntaxKind::VAR_STMT), 1, "`{head}`: one VAR_STMT");
+            assert_eq!(
+                count(SyntaxKind::ASSIGN_STMT),
+                1,
+                "`{head}`: one ASSIGN_STMT"
+            );
+        }
+    }
+
+    #[test]
     fn assign_stmt_rhs_relation_literal_parses() {
         let out = parse_str("oper main {} [ R := Relation { {a: 1} }; ];");
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
@@ -4410,12 +4474,41 @@ mod tests {
 
     #[test]
     fn for_stmt_missing_name_diagnoses_p0062() {
-        let out = parse_str("oper f {} [ for := 0 to 2 do [ i; ]; ];");
+        let out = parse_str("oper f {} [ for 0 to 2 do [ i; ]; ];");
         assert!(
             out.diagnostics.iter().any(|d| d.code == "P0062"),
             "expected P0062, got {:?}",
             out.diagnostics
         );
+    }
+
+    #[test]
+    fn for_assign_parses_as_assignment_not_p0062() {
+        // `for` immediately followed by `:=` is not claimed as a statement
+        // head — it parses as an assignment to a variable named `for`. The
+        // missing-loop-variable typo therefore diagnoses at the assignment
+        // tail (P0013 at `to`), not P0062.
+        let out = parse_str("oper f {} [ for := 0 to 2 do [ i; ]; ];");
+        assert!(
+            out.diagnostics.iter().all(|d| d.code != "P0062"),
+            "no P0062 expected, got {:?}",
+            out.diagnostics
+        );
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == "P0013"),
+            "expected P0013, got {:?}",
+            out.diagnostics
+        );
+        let assign = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::ASSIGN_STMT)
+            .expect("ASSIGN_STMT in tree");
+        let target = assign
+            .children()
+            .find(|n| n.kind() == SyntaxKind::NAME_REF)
+            .expect("assignment target NAME_REF");
+        assert_eq!(target.text(), "for");
     }
 
     #[test]

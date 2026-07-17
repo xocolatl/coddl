@@ -101,7 +101,7 @@ User code is not *required* to follow PascalCase for types and relvars — that'
 At the lexer level there is no `KEYWORD` token type — every alphanumeric/underscore/`#` token is an `IDENT` — and the parser recognizes specific identifiers as keywords in specific syntactic positions. That much is unchanged. The honest statement of what it buys is a **taxonomy**, published in full below (the tables render `crates/coddl-syntax/src/keywords.rs`, the single source of truth both the parser's operator table and the AST's operator resolution consume; mechanical doc↔source sync is planned):
 
 - **Tier 1 — reserved (five words + the operator glyphs).** `true`, `false`, `if`, `not`, `extract` are claimed at an expression head with nothing to narrow on: `true`/`false` are the bare word, and `if`/`not`/`extract` are followed by an arbitrary expression, so no lookahead can ever free them — a binding under one of these names would be silently unreachable (`let true = 1; let x = true;` binds `x` to the Boolean literal) or misparse at every bare reference, and there is no quoting escape hatch (no Coddl analogue of SQL's `"order"`). So a declaration naming one is **rejected at the declaration site with P0096** — softly, on the E0007 model: the diagnostic is emitted, the name still binds, and parsing continues (LSP discipline; the trap is loud, not fatal). The check fires at every `.cd` name-declaring position — bindings, params and every heading attribute, oper/type/relvar names, loop and `load` binders, module-path segments, the file header, `database` bindings — and at every attribute-*creating* position: tuple/relation literal fields, `extend`/`replace`/`rename` new names, `wrap`/`group` new names. Reference positions (call-argument names, `update` clauses, `project` lists, dot access) are deliberately unchecked: a reference either resolves against an already-checked declaration or fails in the typechecker. The seven word-operator glyphs (`¬ ⋈ ∪ ∩ ∖ ⋉ ▷`) lex as `IDENT` and are rejected the same way. The `.cddb` parser's own decl sites (database and relvar names) emit its namespace sibling **PB0012**; `.cddb` relvar *attributes* funnel through the shared heading parser and emit P0096.
-- **Tier 2 — positional claims with known traps (narrowing planned).** `Relation` / `Sequence` / `transaction` are claimed unconditionally at an expression head, so a bare reference to a same-named binding errs at the *use site* (P0031/P0055/P0019); the eleven statement heads are claimed unconditionally at a statement boundary, so assigning to a same-named variable misparses (`delete := 2;` dispatches into the DELETE statement). Each needs only one token of lookahead to free the bare word (the word's delimiter; next-token-isn't-`:=` for statement heads) — the narrowing pattern already proven in-tree by `asc`/`desc` (recognized only when followed by another IDENT) and `builtin` (two-token `builtin relvar` vs `builtin oper`).
+- **Tier 2 — positional claims narrowed by lookahead (three still pending).** The eleven statement heads are **narrowed**: a head is claimed at a statement boundary only when the next token is not `:=`, so a variable named after any head stays assignable — `var delete := 1; delete := 2;` parses as a declaration and an ordinary assignment. The same pattern already frees `asc`/`desc` (recognized only when followed by another IDENT) and `builtin` (two-token `builtin relvar` vs `builtin oper`). `Relation` / `Sequence` / `transaction` are still claimed unconditionally at an expression head, so a bare reference to a same-named binding errs at the *use site* (P0031/P0055/P0019); each needs only its delimiter token of lookahead — narrowing planned.
 - **Tier 3 — vacuous claims (genuinely free).** Everything else is recognized in a position where a bare identifier is never a legal continuation — infix/postfix operator position, clause position after an introducing construct, item-head position, type position — so the claim shadows nothing. These are the words that keep the identifier space unfettered for real domains (`name`, `type`, `from`, `to`, `order`, `value`, `key`, `and` as attribute names all work).
 - **Tier 4 — not keywords at all.** `reltrue` / `relfalse` are **not** parser-recognized: they are module-level `let`s in `coddl::core` (always in scope, resolved *after* everything else, deliberately user-shadowable — tests pin it). This is the model: vocabulary lives in the registry/stdlib and stays shadowable; the parser claims a word only when its *grammar* is special. The reserved set grows with syntax, never with library.
 
@@ -117,16 +117,23 @@ At the lexer level there is no `KEYWORD` token type — every alphanumeric/under
 
 The glyphs `⋈ ∪ ∩ ∖ ⋉ ▷` (operator rows below) and `¬` belong to this tier: they lex as `IDENT` with the glyph text, so declaring one is rejected exactly like the five words. The symbolic glyphs `≤ ≥ ≠ ⊂ ⊃ ⊆ ⊇` lex as operator *tokens*, never as identifiers — no declaration-site exposure.
 
-### Tier 2 — claimed unconditionally today, lookahead narrowing planned
+### Tier 2 — positional claims, narrowed by lookahead
+
+Narrowed — the bare word is an ordinary identifier:
+
+| Word | Position | Lookahead rule | What it frees |
+|---|---|---|---|
+| `let` `var` `truncate` `delete` `insert` `update` `for` `while` `do` `load` `return` | statement head | claimed only when the next token ≠ `:=` | assignment to a same-named variable — `delete := 2;` reaches `<assign-stmt>` |
+
+Still claimed unconditionally — narrowing planned:
 
 | Word | Position | Delimiter that would narrow it | Trap today |
 |---|---|---|---|
 | `Relation` | expression head (relation literal); also a type generator | `{` | bare reference → P0031; a relvar named `Relation` is declarable but unusable |
 | `Sequence` | expression head (sequence literal); also a type generator | `[` | bare reference → P0055 (bioinformatics wants relvar `Sequence`) |
 | `transaction` | expression head | `[` | bare reference → P0019 (finance wants attribute `transaction`) |
-| `let` `var` `truncate` `delete` `insert` `update` `for` `while` `do` `load` `return` | statement head | next token ≠ `:=` | `X := e;` for a variable named after any head misparses into that statement |
 
-Residual traps that survive even the planned narrowing (documented, accepted): indexing a `Sequence`-typed variable named `transaction` (`transaction [i]` is the transaction-expression claim); a *bare-reference* expression statement of a statement-head-named variable (`while;` — useless anyway); prefix-calling an oper named after a narrowed word (`Relation { … }` is claimed — UFCS `x.Relation { … }` is the escape hatch).
+Residual traps that survive the narrowing, done or planned (documented, accepted): indexing a `Sequence`-typed variable named `transaction` (`transaction [i]` is the transaction-expression claim); a *bare-reference* expression statement of a statement-head-named variable (`while;` — useless anyway); prefix-calling an oper named after a narrowed word (`Relation { … }` is claimed — UFCS `x.Relation { … }` is the escape hatch). One diagnostic trade came with the statement-head narrowing: the missing-loop-variable typo `for := 0 to 2 do [ … ];` now parses as an assignment to a variable named `for` and diagnoses generically at the assignment tail (P0013 at `to`) rather than with the targeted P0062.
 
 ### Tier 3 — vacuous claims
 
@@ -592,6 +599,11 @@ function that implements it.
                   | <return-stmt>
                   | <assign-stmt>
                   | <expr> ';' ;                               -- parse_stmt (LET_STMT, VAR_STMT, TRUNCATE_STMT, DELETE_STMT, INSERT_STMT, UPDATE_STMT, ASSIGN_STMT, or EXPR_STMT)
+                    -- A statement-head keyword is claimed only when the
+                    -- next token is not `:=` (Parser::at_stmt_head), so a
+                    -- variable named after any head stays assignable:
+                    -- `delete := 2;` parses as an <assign-stmt>, not a
+                    -- <delete-stmt>.
 <return-stmt>   ::= 'return' [ <expr> ] ';' ;                   -- parse_return_stmt (RETURN_STMT)
                     -- Early return from the enclosing operator body. The value
                     -- is optional (`return;` yields Unit); a present value is
@@ -608,9 +620,12 @@ function that implements it.
                     -- Relational assignment. The parser accepts any
                     -- expression as the target (LHS); the typechecker
                     -- restricts it to a name bound to an assignable relvar
-                    -- (public or private; T0033 otherwise). A public target
-                    -- is a write to its SQL table — the RHS shape is recognized
-                    -- and emitted as surgical DML at lowering.
+                    -- (public or private; T0033 otherwise) or a mutable
+                    -- local. A public target is a write to its SQL table —
+                    -- the RHS shape is recognized and emitted as surgical
+                    -- DML at lowering. Statement-head-named targets reach
+                    -- this production via the `:=` lookahead on the heads
+                    -- (see <stmt> above).
 <truncate-stmt> ::= 'truncate' <expr> ';' ;                    -- parse_truncate_stmt
                     -- Clear every tuple from a relvar — sugar for the
                     -- relational assignment `R := R minus R` (the surgical
