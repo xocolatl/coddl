@@ -200,6 +200,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "coddl-consteval"
+version = "0.0.0"
+dependencies = [
+ "coddl-relir",
+ "coddl-syntax",
+]
+
+[[package]]
 name = "coddl-diagnostics"
 version = "0.0.0"
 
@@ -268,6 +276,7 @@ dependencies = [
 name = "coddl-procir"
 version = "0.0.0"
 dependencies = [
+ "coddl-consteval",
  "coddl-diagnostics",
  "coddl-plan",
  "coddl-relir",
@@ -275,6 +284,22 @@ dependencies = [
  "coddl-stdlib",
  "coddl-syntax",
  "coddl-types",
+]
+
+[[package]]
+name = "coddl-provision"
+version = "0.0.0"
+dependencies = [
+ "coddl-backend-sqlite",
+ "coddl-consteval",
+ "coddl-diagnostics",
+ "coddl-plan",
+ "coddl-relir",
+ "coddl-sqlemit",
+ "coddl-syntax",
+ "coddl-types",
+ "rusqlite",
+ "tempfile",
 ]
 
 [[package]]

@@ -241,7 +241,12 @@ pub struct Tuple;
 /// result cell. The storage layer owns this type rather than reusing the
 /// relational IR's `Literal`, so the backend crates never depend on
 /// `coddl-relir` (see `docs/principles.md` "Toward self-hosting").
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Hash` lets a whole cell (and a projected key tuple) key a set/map — the
+/// provision fold uses it to dedup INIT rows and detect key collisions. Every
+/// variant's payload is already `Hash` (the `Approximate`/`Rational` canonical
+/// encodings keep it consistent with `Eq`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Value {
     Integer(i64),
     Text(String),

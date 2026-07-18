@@ -7,11 +7,13 @@ members = [
     "crates/coddl-types",
     "crates/coddl-plan",
     "crates/coddl-relir",
+    "crates/coddl-consteval",
     "crates/coddl-procir",
     "crates/coddl-sqlemit",
     "crates/coddl-execlocal",
     "crates/coddl-backend-sqlite",
     "crates/coddl-backend-postgres",
+    "crates/coddl-provision",
     "crates/coddl-codegen-llvm",
     "crates/coddl-codegen-cranelift",
     "crates/coddl-codegen-wasm",
@@ -55,11 +57,13 @@ coddl-stdlib = { path = "crates/coddl-stdlib" }
 coddl-types = { path = "crates/coddl-types" }
 coddl-plan = { path = "crates/coddl-plan" }
 coddl-relir = { path = "crates/coddl-relir" }
+coddl-consteval = { path = "crates/coddl-consteval" }
 coddl-procir = { path = "crates/coddl-procir" }
 coddl-sqlemit = { path = "crates/coddl-sqlemit" }
 coddl-execlocal = { path = "crates/coddl-execlocal" }
 coddl-backend-sqlite = { path = "crates/coddl-backend-sqlite" }
 coddl-backend-postgres = { path = "crates/coddl-backend-postgres" }
+coddl-provision = { path = "crates/coddl-provision" }
 coddl-codegen-llvm = { path = "crates/coddl-codegen-llvm" }
 coddl-codegen-cranelift = { path = "crates/coddl-codegen-cranelift" }
 coddl-codegen-wasm = { path = "crates/coddl-codegen-wasm" }

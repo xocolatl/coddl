@@ -24,7 +24,7 @@ use coddl_syntax::ast::{
 };
 use coddl_syntax::literal_decode::{
     decode_approximate_literal, decode_char_literal, decode_rational_literal,
-    decode_string_literal, gcd_i128, parse_integer_literal, reduce_rational,
+    decode_string_literal, parse_integer_literal,
 };
 use coddl_syntax::{parse, parse_format_template, SyntaxKind, TemplateChunk};
 use coddl_types::{
@@ -1093,58 +1093,12 @@ impl Lowerer {
     /// value doesn't exist (overflow, division by zero): a compile error,
     /// never a silent wrap.
     fn fold_const_expr(&self, expr: &Expr) -> Result<Option<RelLiteral>, String> {
-        if let Some(lit) = self.literal_value(expr) {
-            return Ok(Some(lit));
-        }
-        match expr {
-            Expr::NameRef(n) => Ok(n
-                .ident()
-                .and_then(|t| self.module_let_consts.get(t.text()).cloned())),
-            Expr::Unary(u) if u.op_kind() == Some(UnaryOp::Not) => {
-                let Some(operand) = u.operand() else {
-                    return Ok(None);
-                };
-                match self.fold_const_expr(&operand)? {
-                    Some(RelLiteral::Boolean(b)) => Ok(Some(RelLiteral::Boolean(!b))),
-                    _ => Ok(None),
-                }
-            }
-            Expr::Unary(u) if matches!(u.op_kind(), Some(UnaryOp::Pos | UnaryOp::Neg)) => {
-                let Some(operand) = u.operand() else {
-                    return Ok(None);
-                };
-                let Some(lit) = self.fold_const_expr(&operand)? else {
-                    return Ok(None);
-                };
-                // `+x` is the identity; `-x` folds as `0 - x` — the same
-                // overflow/reduce semantics as the runtime and the lowering
-                // desugar (Rational stays canonical: den > 0, sign on numerator).
-                match (u.op_kind(), lit) {
-                    (
-                        Some(UnaryOp::Pos),
-                        l @ (RelLiteral::Integer(_) | RelLiteral::Rational(..)),
-                    ) => Ok(Some(l)),
-                    (Some(UnaryOp::Neg), l @ RelLiteral::Integer(_)) => {
-                        fold_binary_const(Some(BinaryOp::Sub), RelLiteral::Integer(0), l)
-                    }
-                    (Some(UnaryOp::Neg), l @ RelLiteral::Rational(..)) => {
-                        fold_binary_const(Some(BinaryOp::Sub), RelLiteral::Rational(0, 1), l)
-                    }
-                    _ => Ok(None),
-                }
-            }
-            Expr::Binary(b) => {
-                let (Some(le), Some(re)) = (b.lhs(), b.rhs()) else {
-                    return Ok(None);
-                };
-                let (Some(l), Some(r)) = (self.fold_const_expr(&le)?, self.fold_const_expr(&re)?)
-                else {
-                    return Ok(None);
-                };
-                fold_binary_const(b.op_kind(), l, r)
-            }
-            _ => Ok(None),
-        }
+        // Shadow-unaware name resolution: a module-level `let` constant. This
+        // reproduces the pre-extraction net behavior — the old inline fold tried
+        // a shadow-aware `literal_value` first, then fell back to a
+        // shadow-unaware name arm, so a name resolved to its module constant
+        // regardless of a same-named local.
+        coddl_consteval::fold_const_scalar(expr, &|name| self.module_let_consts.get(name).cloned())
     }
 
     /// Absorb `builtin` relvars from the typechecker's relvar table: intern each
@@ -5762,63 +5716,19 @@ impl Lowerer {
     /// Convert a literal AST node to a RelIR `Literal`, or `None` for forms
     /// the pushdown doesn't bind yet (rationals, non-UTF-8 text).
     fn literal_value(&self, expr: &Expr) -> Option<RelLiteral> {
-        match expr {
-            Expr::Literal(lit) => {
-                let token = lit.token()?;
-                match token.kind() {
-                    SyntaxKind::INTEGER_LIT => {
-                        Some(RelLiteral::Integer(parse_integer_literal(token.text())))
-                    }
-                    SyntaxKind::STRING_LIT => {
-                        let bytes = decode_string_literal(token.text());
-                        String::from_utf8(bytes).ok().map(RelLiteral::Text)
-                    }
-                    SyntaxKind::CHAR_LIT => {
-                        Some(RelLiteral::Character(decode_char_literal(token.text())))
-                    }
-                    SyntaxKind::APPROXIMATE_LIT => Some(RelLiteral::Approximate(
-                        decode_approximate_literal(token.text()),
-                    )),
-                    SyntaxKind::RATIONAL_LIT => {
-                        let (n, d) = decode_rational_literal(token.text());
-                        Some(RelLiteral::Rational(n, d))
-                    }
-                    _ => None,
-                }
-            }
-            Expr::BoolLit(b) => b.value().map(RelLiteral::Boolean),
-            // A scalar module-level `let` is a compile-time constant — look
-            // through the name to its folded literal, so `where col = CONST`
-            // pushes with the value bound (never inlined into the text). A
-            // same-named local shadows it (that name binds as a `Param`); a
-            // heading attribute never reaches here (`build_predicate`
-            // classifies the attribute side before consulting values).
-            Expr::NameRef(n) => {
-                let name = n.ident()?;
-                let name = name.text();
-                if self.lookup_local(name).is_some() {
-                    return None;
-                }
+        // Shadow-aware name resolution: a scalar module-level `let` is a
+        // compile-time constant (so `where col = CONST` pushes with the value
+        // bound, never inlined), unless a same-named local shadows it — then it
+        // binds as a `Param`. A heading attribute never reaches here
+        // (`build_predicate` classifies the attribute side before consulting
+        // values).
+        coddl_consteval::literal_value(expr, &|name| {
+            if self.lookup_local(name).is_some() {
+                None
+            } else {
                 self.module_let_consts.get(name).cloned()
             }
-            // Exact `/` of two Integer literals is a compile-time Rational
-            // constant. Fold it locally so a `where a = 2/3` predicate can push
-            // (bound as `'2/3'` TEXT) — the division can never be a SQL op (the
-            // column is `TEXT "n/d"`; SQL `/` would be integer division). This
-            // is the idiomatic way to write a rational constant (there is no
-            // `2/3` literal token), so folding it is what makes such predicates
-            // pushable instead of hitting the in-process pushdown gap.
-            Expr::Binary(b) if b.op_kind() == Some(BinaryOp::Div) => {
-                let n = int_literal_i64(&b.lhs()?)?;
-                let d = int_literal_i64(&b.rhs()?)?;
-                if d == 0 {
-                    return None; // `2/0` is not a rational — decline the fold
-                }
-                let (n, d) = reduce_rational(n as i128, d as i128);
-                Some(RelLiteral::Rational(n, d))
-            }
-            _ => None,
-        }
+        })
     }
 
     /// Lower a baked `SqlQuery` to an `Inst::Query`: dedup the plan by its
@@ -8809,18 +8719,6 @@ fn scalar_result_type(e: &ScalarExpr, heading: &Heading) -> Type {
     }
 }
 
-/// If `expr` is an integer literal, its `i64` value; else `None`.
-/// Used to constant-fold `<int> / <int>` rational constants in the pushdown path.
-fn int_literal_i64(expr: &Expr) -> Option<i64> {
-    if let Expr::Literal(lit) = expr {
-        let tok = lit.token()?;
-        if tok.kind() == SyntaxKind::INTEGER_LIT {
-            return Some(parse_integer_literal(tok.text()) as i64);
-        }
-    }
-    None
-}
-
 /// A folded scalar constant as an `Inst::Const` payload (one per use site).
 fn const_of_literal(lit: &RelLiteral) -> (Const, ProcType) {
     match lit {
@@ -8844,143 +8742,6 @@ fn literal_type(lit: &RelLiteral) -> Type {
         RelLiteral::Rational(..) => Type::Rational,
         RelLiteral::Boolean(_) => Type::Boolean,
     }
-}
-
-/// `reduce_rational` with a graceful narrow: `Err` when the reduced
-/// component exceeds `i64` — the compile-time mirror of the runtime's
-/// narrowing trap, surfaced as a diagnostic instead of a panic.
-fn try_reduce_rational(n: i128, d: i128) -> Result<(i64, i64), String> {
-    if d == 0 {
-        return Err("divides by zero".to_string());
-    }
-    if n == 0 {
-        return Ok((0, 1));
-    }
-    let g = gcd_i128(n, d);
-    let (mut n, mut d) = (n / g, d / g);
-    if d < 0 {
-        n = -n;
-        d = -d;
-    }
-    let narrow =
-        |v: i128| i64::try_from(v).map_err(|_| "overflows Rational (i64 component)".to_string());
-    Ok((narrow(n)?, narrow(d)?))
-}
-
-/// Evaluate one built-in binary operator over two folded scalar constants —
-/// the compile-time mirror of the runtime `ScalarOp` semantics (checked
-/// Integer arithmetic; exact `/` to Rational; i128-intermediate Rational
-/// arithmetic with the runtime's reduce/narrow rules; cross-multiply
-/// Rational ordering; content Text equality; canonical-bit Approximate
-/// equality; `||` over Text/Character). `Ok(None)` for a shape the folder
-/// doesn't cover (relational operators, `where`, mixed kinds the checker
-/// would have rejected); `Err` when the value doesn't exist (overflow,
-/// division by zero) — a compile error, never a silent wrap.
-fn fold_binary_const(
-    op: Option<BinaryOp>,
-    l: RelLiteral,
-    r: RelLiteral,
-) -> Result<Option<RelLiteral>, String> {
-    use RelLiteral as L;
-    let out = match (op, l, r) {
-        (Some(BinaryOp::Add), L::Integer(a), L::Integer(b)) => {
-            L::Integer(a.checked_add(b).ok_or("`+` overflows Integer")?)
-        }
-        (Some(BinaryOp::Sub), L::Integer(a), L::Integer(b)) => {
-            L::Integer(a.checked_sub(b).ok_or("`-` overflows Integer")?)
-        }
-        (Some(BinaryOp::Mul), L::Integer(a), L::Integer(b)) => {
-            L::Integer(a.checked_mul(b).ok_or("`*` overflows Integer")?)
-        }
-        (Some(BinaryOp::IntDiv), L::Integer(a), L::Integer(b)) => {
-            if b == 0 {
-                return Err("`div` divides by zero".to_string());
-            }
-            L::Integer(a.checked_div(b).ok_or("`div` overflows Integer")?)
-        }
-        // Exact `/`: Integer × Integer → Rational.
-        (Some(BinaryOp::Div), L::Integer(a), L::Integer(b)) => {
-            let (n, d) =
-                try_reduce_rational(a as i128, b as i128).map_err(|e| format!("`/` {e}"))?;
-            L::Rational(n, d)
-        }
-        // Rational arithmetic: i128 intermediates never wrap before the
-        // reduce; the narrow mirrors the runtime trap.
-        (Some(BinaryOp::Add), L::Rational(an, ad), L::Rational(bn, bd)) => {
-            let n = an as i128 * bd as i128 + bn as i128 * ad as i128;
-            let (n, d) =
-                try_reduce_rational(n, ad as i128 * bd as i128).map_err(|e| format!("`+` {e}"))?;
-            L::Rational(n, d)
-        }
-        (Some(BinaryOp::Sub), L::Rational(an, ad), L::Rational(bn, bd)) => {
-            let n = an as i128 * bd as i128 - bn as i128 * ad as i128;
-            let (n, d) =
-                try_reduce_rational(n, ad as i128 * bd as i128).map_err(|e| format!("`-` {e}"))?;
-            L::Rational(n, d)
-        }
-        (Some(BinaryOp::Mul), L::Rational(an, ad), L::Rational(bn, bd)) => {
-            let (n, d) = try_reduce_rational(an as i128 * bn as i128, ad as i128 * bd as i128)
-                .map_err(|e| format!("`*` {e}"))?;
-            L::Rational(n, d)
-        }
-        (Some(BinaryOp::Div), L::Rational(an, ad), L::Rational(bn, bd)) => {
-            if bn == 0 {
-                return Err("`/` divides by zero".to_string());
-            }
-            let (n, d) = try_reduce_rational(an as i128 * bd as i128, ad as i128 * bn as i128)
-                .map_err(|e| format!("`/` {e}"))?;
-            L::Rational(n, d)
-        }
-        (Some(BinaryOp::And), L::Boolean(a), L::Boolean(b)) => L::Boolean(a && b),
-        (Some(BinaryOp::Or), L::Boolean(a), L::Boolean(b)) => L::Boolean(a || b),
-        (Some(op @ (BinaryOp::Eq | BinaryOp::NotEq)), l, r) => {
-            // Same-kind operands (typechecked). Reduced Rational pairs and
-            // canonical Approximate bits make structural equality
-            // value-equality — the same rule the runtime cells follow.
-            let eq = match (&l, &r) {
-                (L::Integer(a), L::Integer(b)) => a == b,
-                (L::Text(a), L::Text(b)) => a == b,
-                (L::Character(a), L::Character(b)) => a == b,
-                (L::Approximate(a), L::Approximate(b)) => a == b,
-                (L::Rational(an, ad), L::Rational(bn, bd)) => an == bn && ad == bd,
-                (L::Boolean(a), L::Boolean(b)) => a == b,
-                _ => return Ok(None),
-            };
-            L::Boolean(if op == BinaryOp::Eq { eq } else { !eq })
-        }
-        (Some(op @ (BinaryOp::Lt | BinaryOp::Gt | BinaryOp::LtEq | BinaryOp::GtEq)), l, r) => {
-            // Ordering is Integer/Rational only (typechecked); Rational
-            // compares by cross-multiplication (denominators positive).
-            let ord = match (&l, &r) {
-                (L::Integer(a), L::Integer(b)) => a.cmp(b),
-                (L::Rational(an, ad), L::Rational(bn, bd)) => {
-                    (*an as i128 * *bd as i128).cmp(&(*bn as i128 * *ad as i128))
-                }
-                _ => return Ok(None),
-            };
-            L::Boolean(match op {
-                BinaryOp::Lt => ord.is_lt(),
-                BinaryOp::Gt => ord.is_gt(),
-                BinaryOp::LtEq => ord.is_le(),
-                _ => ord.is_ge(),
-            })
-        }
-        (Some(BinaryOp::Concat), l, r) => {
-            let text_of = |v: &L| -> Option<String> {
-                match v {
-                    L::Text(s) => Some(s.clone()),
-                    L::Character(cp) => char::from_u32(*cp).map(String::from),
-                    _ => None,
-                }
-            };
-            match (text_of(&l), text_of(&r)) {
-                (Some(a), Some(b)) => L::Text(a + &b),
-                _ => return Ok(None),
-            }
-        }
-        _ => return Ok(None),
-    };
-    Ok(Some(out))
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ coddl/
     coddl-stdlib/                  # embedded standard-library module sources (coddl::core, …) + path→source resolver
     coddl-types/                   # type checker, type representation
     coddl-relir/                   # relational IR + optimizer (see relir.md)
+    coddl-consteval/               # compile-time constant folding of scalar exprs (Expr → Literal); shared by procir + provision
     coddl-procir/                  # procedural IR — backend-agnostic SSA (see procir.md)
     coddl-sqlemit/                 # RelIR → SQL — dialect-agnostic core; used by compiler AND runtime
     coddl-execlocal/               # RelIR → ProcIR lowering for in-process subtrees (compile-time)
@@ -20,6 +21,7 @@ coddl/
     coddl-codegen-cranelift/       # ProcIR → Cranelift (planned; REPL JIT + toolchain-free AOT)
     coddl-codegen-wasm/            # ProcIR → wasm-encoder (optional; revisit when needed)
     coddl-runtime/                 # extern "C" staticlib linked into compiled binaries (see runtime.md)
+    coddl-provision/               # coddl provision: catalog → schema+rows fold + one-transaction reconcile (see storage.md)
     coddl-driver/                  # CLI: compile, run, repl, fmt (see driver.md)
     coddl-web/                     # web host: TcpListener calling compiled handlers over the C ABI (see webhost.md)
     coddl-lsp/                     # tower-lsp language server; thin adapter over the frontend crates (see lsp.md)

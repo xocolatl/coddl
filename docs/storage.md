@@ -235,6 +235,66 @@ deferred to `migrate`. There is likewise no FK-ordering hazard in v1 (the
 all-tables `DELETE` pass (child→parent) before any `INSERT` pass (parent→child),
 since the per-table truncate+fill above would trip a cross-table constraint.
 
+## Provision fold and diagnostics (`coddl-provision`)
+
+The executor above is deliberately blind to the relational middle. The crate that
+bridges the two is `coddl-provision` — the orchestration layer that sees *both*
+sides of the self-hosting seam, exactly as `coddl-runtime` does. Its entry point
+is `provision_catalog(cddb_path) -> ProvisionOutcome { report: Option<Report>,
+diagnostics: Vec<Diagnostic> }`: it resolves the catalog
+(`coddl_plan::resolve_catalog`), folds each base relvar into a `ProvisionTable`,
+resolves the target file the way the runtime does, and drives the executor. The
+database is touched only if resolution **and** every fold succeed; a catalog that
+doesn't typecheck never reaches SQL.
+
+Two folds turn the resolved catalog into neutral shapes:
+
+- **`Heading → Schema`.** Each attribute's `coddl_types::Type` maps to a neutral
+  `ColKind` (the six spellable scalars — `Integer`/`Text`/`Boolean`/`Rational`/
+  `Approximate`/`Character`); `Binary`/`Byte` (literal-less) and the non-scalars
+  are **rejected** (PV0001), never mapped. Columns keep the heading-canonical
+  (attribute-name-sorted) order; the first candidate key's attributes translate
+  to their physical columns and name-sort into the `PRIMARY KEY`.
+- **INIT `Expr → Row`s.** A `.cddb` INIT cell is a *constant expression*, not
+  merely a literal (Chunk 3 widened it), so provision **evaluates** it through the
+  shared constant-folder `coddl_consteval::fold_const_scalar` — the very folder
+  `coddl-procir` uses for module `let`s and pushdown-predicate constants, extracted
+  down into `coddl-consteval` (deps `coddl-syntax` + `coddl-relir`) so both
+  consumers depend downward on one source of truth rather than sideways on each
+  other. Each folded `Literal` becomes a storage `Value`, widening an `Integer`
+  literal to `n/1` in a `Rational` column (the Chunk-3 INIT tolerance). Cells are
+  placed positionally in `schema.columns` order.
+
+Fold-time validation is all pre-SQL: exact-duplicate tuples coalesce (a relation
+is a set — RM Pro 2), two tuples that share a key but differ in a non-key
+attribute are a clean error (PV0005), and any failure aborts before the database
+is opened. The target file is resolved by replicating the runtime's rule exactly —
+the `CODDL_<DBNAME>_FILE` env override (DBNAME = the uppercased `database` header),
+else the `.cdstore` baked default — so `provision` and `run` always agree on which
+file to open.
+
+**Diagnostics (`PV####`).**
+
+| Code | Meaning |
+|---|---|
+| PV0001 | attribute (or key attribute) has no provisionable column type |
+| PV0002 | INIT value is not a relation literal (only `Relation { … }` is seedable in v1) |
+| PV0003 | an INIT cell is not a constant scalar (or doesn't match its column type) |
+| PV0004 | evaluating an INIT cell failed (overflow, division by zero) |
+| PV0005 | two INIT tuples share a key but differ in a non-key attribute |
+| PV0006 | cannot resolve a target database file (no env override, no baked default) |
+| PV0007 | backend is not SQLite (v1 supports SQLite only) |
+| PV0008 | a table exists but does not match the catalog (rollback — provision never migrates) |
+| PV0009 | a managed name resolves to a non-table object (view/index — never dropped) |
+| PV0010 | database open or SQL failure during provisioning |
+
+**Graceful declines (documented v1 limits).** The constant-folder covers scalar
+expressions only, so an INIT that uses a pure built-in *call*, or a non-literal
+constant *relation* form (`Relation { … } union Relation { … }`), is declined with
+a diagnostic rather than evaluated — no example needs them. `Approximate`
+arithmetic (`-2e0`) is likewise gated upstream (no float path; T0109) and inherited
+here.
+
 ## Nested attributes: the decomposition endpoint (designed, not built)
 
 TTM requires relation-valued attributes in database relvars (RM Pre 7;

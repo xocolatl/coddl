@@ -1,11 +1,11 @@
 [package]
-name = "coddl-procir"
+name = "coddl-provision"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "Procedural SSA IR — backend-agnostic. See docs/procir.md."
+description = "Provision a database from its .cddb catalog: fold + orchestrate over the executor."
 
 [dependencies]
 coddl-diagnostics.workspace = true
@@ -15,4 +15,8 @@ coddl-plan.workspace = true
 coddl-relir.workspace = true
 coddl-consteval.workspace = true
 coddl-sqlemit.workspace = true
-coddl-stdlib.workspace = true
+coddl-backend-sqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rusqlite.workspace = true

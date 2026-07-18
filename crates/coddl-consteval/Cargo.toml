@@ -1,0 +1,12 @@
+[package]
+name = "coddl-consteval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Compile-time constant folding of scalar expressions (Expr → Literal)."
+
+[dependencies]
+coddl-syntax.workspace = true
+coddl-relir.workspace = true
