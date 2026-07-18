@@ -74,5 +74,6 @@ When citing design context in a discussion, the relevant topic doc lives at:
 
 ## Operational notes
 
+- **Article: write "an SQL" and "an SQLite" — never "a SQL" / "a SQLite".** Both are read with a leading vowel sound ("ess-cue-ell", "ess-cue-ell-ite"), so the indefinite article is *an*. Applies everywhere — prose, code comments, docs, commit messages, diagnostics. Same rule for any other initialism read letter-by-letter that opens on a vowel sound.
 - The `tags` file is a ctags index seeded by the user — no code is indexed yet.
 - The default branch is `main`. There is currently one commit; the working tree generally has staged design-doc edits.
