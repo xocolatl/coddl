@@ -17,6 +17,11 @@ use coddl_sqlemit::{
 };
 use rusqlite::{params_from_iter, Connection, OpenFlags};
 
+mod provision;
+pub use provision::{
+    diff_table, provision, ProvisionError, ProvisionTable, Report, SchemaDiff, TableReport,
+};
+
 /// The SQLite `Type ↔ SQL` keyword map: what `PRAGMA table_info` reports for
 /// each column kind. The structural quirks a keyword can't carry — the Boolean
 /// `CHECK (col IN (0, 1))` and the `Approximate` NaN-channel nullability — are

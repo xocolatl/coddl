@@ -179,6 +179,62 @@ through `quote_ident`. Postgres, which stores NaN natively, will make its
 Approximate columns `NOT NULL` — which is exactly why `emit_ddl` is a
 per-backend method rather than a shared emitter.
 
+## Provision executor and schema diff (v1)
+
+`coddl provision` (`docs/plan.md`) reconciles a SQLite database to the state a
+catalog declares. The executor is `coddl_backend_sqlite::provision(db_path,
+tables) -> Result<Report, ProvisionError>`, taking one `ProvisionTable {
+schema: Schema, rows: Vec<Row> }` per base relvar — the neutral vocabulary
+above, never a `Heading`/`CatalogPlan`, so it stays on the permanent-Rust side
+of the self-hosting seam (`docs/principles.md`). The `Type → ColKind` and
+`RelationLit → Vec<Row>` folds that build those inputs live up in
+`coddl-provision`; the row cells are positional in the schema's heading-sorted
+column order (cell `i` binds column `i`).
+
+The reconcile is **one transaction** — SQLite's DDL + DML are transactional and
+`sqlite_master`/`PRAGMA` reads don't force an implicit commit, so create +
+delete + insert are atomic under a single `BEGIN`:
+
+```
+open db_path  READ_WRITE | CREATE | NO_MUTEX          (provision creates the file; the read path is READ_ONLY)
+BEGIN
+  # Pass 1 — reconcile schema (tables processed in the caller-supplied, name-sorted order)
+  for t in tables:
+      match sqlite_master.type WHERE name = t.table:
+          absent   => emit_ddl(t.schema) → CREATE TABLE          (created = true)
+          "table"  => if !diff_table(conn, t.schema).is_empty():  Err(SchemaMismatch) → ROLLBACK
+          other    => Err(NotATable)  # view / index / trigger — never dropped
+  # Pass 2 — truncate + replenish to INIT rows
+  for t in tables:
+      DELETE FROM t.table
+      if t.rows: batched INSERT (cols name-sorted; ≤ INSERT_PARAM_BUDGET binds/batch, values bound never interpolated)
+COMMIT            # any error ⇒ ROLLBACK, leaving the database byte-identical
+```
+
+It is **not** a migrator: a table that exists but doesn't match its declared
+schema is a rollback + error, never a drop-recreate. That is what keeps
+`provision` non-destructive — the invariant test provisions against a
+deliberately-mismatched table and asserts the file is byte-identical afterward.
+
+`diff_table(conn, schema) -> Result<SchemaDiff, ProvisionError>` is **policy-free**
+— it returns a neutral `SchemaDiff` (empty ⇔ the table matches) and never
+decides what to do about a difference. `provision`'s policy is "non-empty diff ⇒
+`SchemaMismatch` ⇒ rollback"; the future `migrate` will consume the same
+`SchemaDiff` to emit `ALTER`s. One seam, two commands. The diff compares the
+`PRAGMA table_info` projection (column name-set, declared type string, NOT NULL
+flag, and PK column *set*) against the exact oracle `emit_ddl` used: the
+`type_map().sql_type` keyword, the "every total column `NOT NULL` except
+`Approximate`" rule, and the name-sorted key columns.
+
+**v1 blind spot:** `PRAGMA table_info` cannot see a `CHECK` constraint, so a
+`Boolean` column (`INTEGER CHECK (c IN (0,1))`) is introspection-indistinguishable
+from an `Integer` column — both report declared type `INTEGER`, `notnull = 1`,
+and diff clean. Accepted for v1; a robust `sqlite_master.sql` comparison is
+deferred to `migrate`. There is likewise no FK-ordering hazard in v1 (the
+`.cddb` declares no foreign keys); when FKs land, Pass 2 must split into an
+all-tables `DELETE` pass (child→parent) before any `INSERT` pass (parent→child),
+since the per-table truncate+fill above would trip a cross-table constraint.
+
 ## Nested attributes: the decomposition endpoint (designed, not built)
 
 TTM requires relation-valued attributes in database relvars (RM Pre 7;
