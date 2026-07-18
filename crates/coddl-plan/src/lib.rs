@@ -23,8 +23,10 @@ use coddl_syntax::ast_cdstore::{
 use coddl_syntax::{parse, FileKind};
 use coddl_types::{check, check_program, CheckUnit, Heading, RelvarKind, RelvarTable};
 
+mod catalog;
 mod modules;
 mod plan;
+pub use catalog::{resolve_catalog, CatalogPlan, CatalogPlanOutput, ResolvedCatalogRelvar};
 pub use modules::{ModuleGraph, ResolvedModule};
 pub use plan::{BackendKind, FileHeaderKind, Plan, PlanOutput, ResolvedPublicRelvar, WritePolicy};
 
@@ -263,7 +265,7 @@ pub fn discover_and_validate_with_overrides(
     let backend_kind = cdstore_root
         .as_ref()
         .and_then(|r| r.backend())
-        .map(|b| classify_backend(&b, &mut diags))
+        .map(|b| classify_backend(&b, FileId(2), &mut diags))
         .unwrap_or(BackendKind::Unknown);
     let db_file_default = if matches!(backend_kind, BackendKind::Sqlite) {
         cdstore_root
@@ -325,7 +327,7 @@ pub fn discover_and_validate_with_overrides(
             .unwrap_or_default();
 
         // PL0009 / PL0010: column coverage.
-        let columns = collect_columns(&binding, &catalog.heading, &mut diags);
+        let columns = collect_columns(&binding, &catalog.heading, FileId(2), &mut diags);
 
         resolved.push(ResolvedPublicRelvar {
             app_name: app_name.to_string(),
@@ -365,7 +367,7 @@ pub fn discover_and_validate_with_overrides(
 /// Pull the `file: "..."` directive out of a `BackendDecl`. Returns the
 /// raw (still-relative) lexeme; the caller canonicalizes against the
 /// `.cdstore`'s parent directory.
-fn extract_file_directive(decl: &BackendDecl) -> Option<String> {
+pub(crate) fn extract_file_directive(decl: &BackendDecl) -> Option<String> {
     for field in decl.fields() {
         let name = field
             .name()
@@ -387,7 +389,7 @@ fn extract_file_directive(decl: &BackendDecl) -> Option<String> {
 /// fails (e.g., the file doesn't exist yet — the user may seed the DB
 /// after build but before run). Always returns an absolute lexical
 /// path so the binary is relocatable via `CODDL_<DB>_FILE` override.
-fn canonicalize_against(cdstore_path: &Path, raw: &str) -> String {
+pub(crate) fn canonicalize_against(cdstore_path: &Path, raw: &str) -> String {
     let raw_path = Path::new(raw);
     let absolute = if raw_path.is_absolute() {
         raw_path.to_path_buf()
@@ -404,7 +406,15 @@ fn canonicalize_against(cdstore_path: &Path, raw: &str) -> String {
     }
 }
 
-fn classify_backend(decl: &BackendDecl, diags: &mut Vec<Diagnostic>) -> BackendKind {
+/// Classify the `.cdstore`'s `backend <kind>;` declaration. `file` is
+/// the `.cdstore`'s [`FileId`] so PL0011 anchors to the right file in
+/// both the `.cd`-rooted flow (FileId(2)) and the catalog-rooted flow
+/// (FileId(1)).
+pub(crate) fn classify_backend(
+    decl: &BackendDecl,
+    file: FileId,
+    diags: &mut Vec<Diagnostic>,
+) -> BackendKind {
     let Some(tok) = decl.kind() else {
         return BackendKind::Unknown;
     };
@@ -413,7 +423,7 @@ fn classify_backend(decl: &BackendDecl, diags: &mut Vec<Diagnostic>) -> BackendK
         BackendKind::Sqlite
     } else {
         diags.push(Diagnostic::error(
-            token_span(FileId(2), &tok),
+            token_span(file, &tok),
             "PL0011",
             format!("backend `{kind}` is not supported (v1 supports `sqlite` only)"),
         ));
@@ -421,14 +431,20 @@ fn classify_backend(decl: &BackendDecl, diags: &mut Vec<Diagnostic>) -> BackendK
     }
 }
 
-fn find_binding(root: &CdstoreRoot, name: &str) -> Option<RelvarBinding> {
+pub(crate) fn find_binding(root: &CdstoreRoot, name: &str) -> Option<RelvarBinding> {
     root.bindings()
         .find(|b| b.name().map(|t| t.text() == name).unwrap_or(false))
 }
 
-fn collect_columns(
+/// Collect the `(heading_attr, sql_column)` map from a `.cdstore`
+/// binding, emitting PL0009 (uncovered heading attribute) and PL0010
+/// (column entry not in the heading). `file` is the `.cdstore`'s
+/// [`FileId`] — FileId(2) for the `.cd`-rooted flow, FileId(1) for the
+/// catalog-rooted flow.
+pub(crate) fn collect_columns(
     binding: &RelvarBinding,
     heading: &Heading,
+    file: FileId,
     diags: &mut Vec<Diagnostic>,
 ) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
@@ -454,7 +470,7 @@ fn collect_columns(
 
             if heading.lookup(&attr_name).is_none() {
                 diags.push(Diagnostic::error(
-                    token_span(FileId(2), &name_tok),
+                    token_span(file, &name_tok),
                     "PL0010",
                     format!(
                         "column entry `{attr_name}` is not in the catalog heading {}",
@@ -477,8 +493,8 @@ fn collect_columns(
         if !seen_attrs.iter().any(|a| a == attr) {
             let span = binding
                 .name()
-                .map(|t| token_span(FileId(2), &t))
-                .unwrap_or_else(|| Span::new(FileId(2), 0, 0));
+                .map(|t| token_span(file, &t))
+                .unwrap_or_else(|| Span::new(file, 0, 0));
             diags.push(Diagnostic::error(
                 span,
                 "PL0009",
@@ -627,14 +643,14 @@ fn first_public_relvar_span(table: &RelvarTable) -> Span {
         .unwrap_or_else(|| Span::new(FileId(0), 0, 0))
 }
 
-fn token_span(file: FileId, token: &coddl_syntax::cst::SyntaxToken) -> Span {
+pub(crate) fn token_span(file: FileId, token: &coddl_syntax::cst::SyntaxToken) -> Span {
     let r = token.text_range();
     Span::new(file, r.start().into(), r.end().into())
 }
 
 /// Strip surrounding double-quotes from a raw string-literal lexeme.
 /// The lexer guarantees the token form: opening `"`, body, closing `"`.
-fn unquote(s: &str) -> String {
+pub(crate) fn unquote(s: &str) -> String {
     let trimmed = s
         .strip_prefix('"')
         .and_then(|s| s.strip_suffix('"'))
@@ -652,7 +668,7 @@ pub(crate) fn plain_error(code: &'static str, message: String) -> Diagnostic {
 /// Read `path`'s source: from `overrides` if present (in-memory
 /// buffer wins), else from disk. The override map keys must match
 /// the paths the plan layer constructs verbatim.
-fn read_source_or_override(
+pub(crate) fn read_source_or_override(
     path: &Path,
     overrides: &HashMap<PathBuf, String>,
 ) -> std::io::Result<String> {

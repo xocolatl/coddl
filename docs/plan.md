@@ -40,7 +40,7 @@ A `.cd` source with **no** public relvars doesn't need a `database` binding — 
 
 The rest of this doc pins what `coddl-plan` enforces today.
 
-**Last sync:** userspace module resolution (PL0016–PL0019, `ModuleGraph` on `PlanOutput`). Every commit that adds, removes, or changes a PL-code or validation invariant in `crates/coddl-plan/` updates this file in the same commit; `tools/check-grammar.sh` enforces the diagnostic table from the hygiene gate.
+**Last sync:** catalog-rooted resolution (`resolve_catalog` / `CatalogPlan`, PL0020) for `coddl provision`. Every commit that adds, removes, or changes a PL-code or validation invariant in `crates/coddl-plan/` updates this file in the same commit; `tools/check-grammar.sh` enforces the diagnostic table from the hygiene gate.
 
 
 ## Discovery
@@ -189,6 +189,77 @@ pub enum BackendKind {
 ```
 
 
+## Catalog-rooted resolution (`resolve_catalog`)
+
+`coddl provision` seeds a database from its catalog, so it resolves
+**from a `.cddb`**, not from a `.cd` program.
+`coddl_plan::resolve_catalog(cddb_path) -> CatalogPlanOutput` is the
+parallel entry point (`crates/coddl-plan/src/catalog.rs`). It reads +
+typechecks the `.cddb`, walks to the sibling `<db>.cdstore` — located
+by the catalog's own `database <name>;` header, not the file stem —
+and resolves every **base** relvar to its physical form.
+
+Because there is no `.cd`, the FileId numbering differs: the `.cddb`
+is `FileId(0)` and the `.cdstore` is `FileId(1)` (the program flow
+uses `0`/`1`/`2` for `.cd`/`.cddb`/`.cdstore`). The two shared helpers
+`classify_backend` and `collect_columns` take the `.cdstore`'s FileId
+as a parameter so diagnostics anchor to the right file in both flows.
+
+```rust
+pub struct CatalogPlanOutput {
+    pub plan: Option<CatalogPlan>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+pub struct CatalogPlan {
+    pub database_name: String,               // from `.cddb` `database <name>;`
+    pub backend_kind: BackendKind,
+    pub db_file_default: Option<String>,     // canonicalized `file:`, SQLite only
+    pub relvars: Vec<ResolvedCatalogRelvar>, // base only, name-sorted
+}
+
+pub struct ResolvedCatalogRelvar {
+    pub name: String,
+    pub heading: Heading,
+    pub keys: Vec<Vec<String>>,
+    pub table_name: String,
+    pub columns: Vec<(String, String)>,        // (heading_attr, sql_column), name-sorted
+    pub init: Option<coddl_syntax::ast::Expr>, // RHS of `Name := <expr>;`; the seed value
+}
+```
+
+`init` carries the INIT relation **expression** node (the RHS of
+`<Name> := <expr>;`), not folded rows: an INIT cell is any constant
+expression, so `coddl-provision` — not the plan layer — evaluates it
+to seed rows, above the neutral backend seam. That node is an
+`Rc`-backed rowan handle, so `CatalogPlan` is `!Send` (provision is a
+synchronous CLI pass; the program flow's `Plan` is a separate `Send`
+type).
+
+Env-var resolution (`CODDL_<DBNAME>_FILE`) is **not** applied here:
+`resolve_catalog` carries `database_name` + `db_file_default`, and
+`coddl-provision` applies the override to replicate the runtime
+resolver, so `provision` and `run` open the same file.
+
+Behavior:
+- **Hard failures** (plan `None`): the `.cddb` is unreadable (PL0100),
+  or it has no `database <name>;` header so its store can't be located
+  (PL0020).
+- Otherwise a plan is returned best-effort; per-relvar failures are
+  diagnostics. Virtual relvars are omitted (no physical table). When
+  the `.cdstore` is absent (PL0003) the per-relvar loop is skipped
+  entirely — PL0003 is the single root cause, so there is no
+  PL0008-per-relvar cascade.
+
+The program-flow codes PL0005 / PL0008 / PL0009 / PL0010 / PL0011 /
+PL0100 are **re-homed** to the catalog context (PL0005 compares the
+store header against the catalog's `database <name>;`, not a `.cd`
+binding). The program-only codes PL0001 / PL0002 / PL0004 / PL0006 /
+PL0007 and the `.cd` header/module codes PL0012–PL0019 do not apply.
+The `.cddb`'s own typecheck diagnostics (T-codes) flow through the
+merged output.
+
+
 ## Driver integration
 
 `coddl plan <cd-file>` runs the plan pass and dumps the resolved
@@ -233,4 +304,5 @@ hygiene-check script enforces that.
 | PL0017 | An imported module's header name doesn't match its file name exactly (case-fold guard) |
 | PL0018 | A `use module` import targets a `program`/`library` (or a headerless file), not a `module` |
 | PL0019 | Import cycle among userspace modules                                                 |
-| PL0100 | I/O error reading the `.cd` entry point                                              |
+| PL0020 | A `.cddb` catalog has no `database <name>;` header, so its `.cdstore` can't be located |
+| PL0100 | I/O error reading the entry point (`.cd` program or `.cddb` catalog)                 |
