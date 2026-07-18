@@ -1435,6 +1435,7 @@ impl TypeChecker {
             kind: RelvarKind::Virtual,
             heading: Heading::empty(),
             keys: Vec::new(),
+            module: None,
             span: self.token_span(&name_tok),
         };
         if let Err(prior) = self.relvars.try_insert(name.clone(), info) {
@@ -1516,6 +1517,7 @@ impl TypeChecker {
             kind,
             heading,
             keys: key_lists,
+            module: None,
             span: self.token_span(&name_tok),
         };
         if let Err(prior) = self.relvars.try_insert(name.clone(), info) {
@@ -1742,6 +1744,7 @@ impl TypeChecker {
                                     kind: RelvarKind::Builtin,
                                     heading,
                                     keys,
+                                    module: Some(module.path.clone()),
                                     span: self.token_span(&n),
                                 };
                                 let _ = self.relvars.try_insert(name, info);
@@ -2757,9 +2760,13 @@ impl TypeChecker {
             _ => {}
         }
 
-        // … bound to an assignable relvar (public or private).
+        // … bound to an assignable relvar (public, private, or builtin).
         let lookup = self.relvars.get(name).and_then(|i| {
-            matches!(i.kind, RelvarKind::Public | RelvarKind::Private).then(|| i.heading.clone())
+            matches!(
+                i.kind,
+                RelvarKind::Public | RelvarKind::Private | RelvarKind::Builtin
+            )
+            .then(|| i.heading.clone())
         });
         let Some(heading) = lookup else {
             self.error(
@@ -2818,11 +2825,13 @@ impl TypeChecker {
         let Some(ident) = target.ident() else { return };
         let name = ident.text();
 
-        // … bound to an assignable relvar (public or private).
-        let assignable = self
-            .relvars
-            .get(name)
-            .is_some_and(|i| matches!(i.kind, RelvarKind::Public | RelvarKind::Private));
+        // … bound to an assignable relvar (public, private, or builtin).
+        let assignable = self.relvars.get(name).is_some_and(|i| {
+            matches!(
+                i.kind,
+                RelvarKind::Public | RelvarKind::Private | RelvarKind::Builtin
+            )
+        });
         if !assignable {
             self.error(
                 self.token_span(&ident),
@@ -7356,12 +7365,15 @@ mod tests {
     }
 
     #[test]
-    fn env_builtin_relvar_general_assign_is_rejected_t0033() {
-        // The general `R := …` surgical form on a builtin relvar is deferred —
-        // use insert/update/delete instead.
-        let src = "program p; use module coddl::env; \
-                   oper main {} [ Environment := Environment; ];";
-        assert!(codes(src).contains(&"T0033"), "{:?}", codes(src));
+    fn env_builtin_relvar_general_assign_and_truncate_are_allowed() {
+        // `R := V` and `truncate R` on a builtin relvar are now allowed, uniform
+        // with insert/update/delete: the builtin write path reconciles the whole
+        // value. A genuine reassignment (not `R := R`, which warns T0051) and a
+        // truncate draw no error and no T0033.
+        let src = "program p; use module coddl::env; oper main {} [ \
+                   Environment := Environment where name = \"X\"; \
+                   truncate Environment; ];";
+        assert!(diagnostics(src).is_empty(), "{:?}", diagnostics(src));
     }
 
     #[test]

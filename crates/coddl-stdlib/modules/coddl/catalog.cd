@@ -1,0 +1,89 @@
+// catalog.cd  —  coddl::catalog, Coddl's LOGICAL catalog.
+//
+// The sibling of coddl::storage. Where storage describes how databases are
+// physically stored/reached, this describes WHAT they are: which databases
+// exist, their relvars, headings, and keys — the conceptual schema, RM Pre 14
+// database-side. These are `builtin relvar`s (compiler-provided, like
+// coddl::env's `Environment`); `.cddb` files populate them by DML
+// (`insert Attributes …`), the way `.cdstore` files populate coddl::storage's,
+// and a program reads them via `use module coddl::catalog`.
+//
+// Together, coddl::catalog + coddl::storage are Coddl's system catalog. Both
+// are compiler truth (reference today; consumed as the meta-catalog schema
+// once the loader goes relational). Self-describing: this module declares the
+// relations that describe every database, including the system catalog itself.
+//
+// SCOPE — database-side, logical, schema only. Deliberately OUT of scope,
+// each its own concern:
+//   • The TYPE catalog (built-in + user `type` decls + possrep components).
+//     `Attributes.type` references it by name; modeling it (Coddl's pg_type)
+//     is a sibling not written here. Structured/generic types (RVA/TVA/
+//     Sequence, user generics) need that richer representation.
+//   • The APPLICATION-side external schema (`.cd` public/private relvars and
+//     `.cdmap` adapters) — RM Pre 14 application-side, a separate layer.
+//   • INIT values. A base relvar's initializer is DATA (its own seed tuples,
+//     in its own heading), not schema — so it has no fixed-heading relvar
+//     here; it is the relvar's contents, handled apart from the catalog.
+//
+// Vertically decomposed (RM Pro 4): base-vs-virtual is a partition modeled as
+// a subset relvar (VirtualRelvars) plus derivation, not a nullable `kind`
+// column — a relvar is base iff `Relvars not matching VirtualRelvars`.
+
+module catalog;
+
+// Which databases exist — the root every other relvar hangs off.
+builtin relvar Databases {
+    database: Text,
+} key { database };
+
+// Every database-side relvar (base OR virtual).
+builtin relvar Relvars {
+    database: Text,
+    relvar: Text,
+} key { database, relvar };
+
+// The virtual ones, each with its defining expression. A relvar in Relvars
+// but NOT here is base. (`definition` is the view expression; really a
+// structured RelExpr, Text in this sketch.)
+builtin relvar VirtualRelvars {
+    database: Text,
+    relvar: Text,
+    definition: Text,
+} key { database, relvar };
+
+// The heading of each relvar: one tuple per attribute. No ordinal position
+// (RM Pro 1) — attributes are a set. `type` names a type in the (separate)
+// type catalog.
+builtin relvar Attributes {
+    database: Text,
+    relvar: Text,
+    attribute: Text,
+    type: Text,
+} key { database, relvar, attribute };
+
+// Candidate keys. A key has no NAME — its identity IS its set of
+// attributes (RM Pre 8: two keys with equal attribute-sets are the same
+// key). So: one tuple per key, whose value is that set, held as a
+// relation-valued attribute and participating in the key itself. No
+// surrogate id — the earlier `key: Text` invented a name the language
+// doesn't have.
+//
+// And it checks clean here: T0101 — which forbids a persisted RVA until the
+// .cdstore child-table decomposition lands — applies to STORAGE-BACKED
+// relvars, and a `builtin relvar` is not one; its materialization is the
+// compiler's own. (The very same RVA in a user `base relvar` still trips
+// T0101 today.) Any physical decomposition is the compiler's concern and
+// never surfaces a key name.
+builtin relvar Keys {
+    database: Text,
+    relvar: Text,
+    attributes: Relation { attribute: Text },
+} key { database, relvar, attributes };
+
+// Database-wide constraints: a named predicate over the database. The
+// expression is really a structured Boolean RelExpr; Text in this sketch.
+builtin relvar Constraints {
+    database: Text,
+    constraint: Text,
+    expression: Text,
+} key { database, constraint };

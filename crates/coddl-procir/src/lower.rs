@@ -96,27 +96,15 @@ struct BuiltinExtern {
     return_type: ProcType,
 }
 
-/// Compiler-side metadata for a `builtin relvar` — the runtime symbols its
-/// read (and, in a later phase, write) lowering targets. The relvar analogue of
-/// [`BUILTIN_EXTERNS`]: the surface name is spelled in the stdlib `.cd`, the
-/// symbols are compiler-side (keyed by name, like a `builtin oper`'s linkage).
-struct BuiltinRelvar {
-    surface: &'static str,
-    /// Returns the relvar's current value as a fresh RC `Relation` payload.
-    read: &'static str,
-}
-
-const BUILTIN_RELVARS: &[BuiltinRelvar] = &[BuiltinRelvar {
-    surface: "Environment",
-    read: "coddl_env_snapshot",
-}];
-
-/// The runtime symbol a read of `builtin relvar` `name` lowers to a call of.
-fn builtin_relvar_read_symbol(name: &str) -> Option<&'static str> {
-    BUILTIN_RELVARS
-        .iter()
-        .find(|r| r.surface == name)
-        .map(|r| r.read)
+/// A `builtin` relvar in lowering scope: its interned heading and the
+/// qualified-name `handle` (`<module>::<name>`) the runtime dispatches its
+/// generic read/assign FFI on. Every `builtin relvar` — `coddl::env`'s
+/// `Environment` and the system-catalog relvars alike — goes through the one
+/// generic path (`coddl_builtin_read`/`coddl_builtin_assign`); there is no
+/// per-relvar symbol table.
+struct AbsorbedBuiltin {
+    heading_id: HeadingId,
+    handle: String,
 }
 
 /// A user-defined operator's lowered signature, collected in a pre-pass over
@@ -667,11 +655,12 @@ struct Lowerer {
     /// lowered into `__coddl_module_lets_init` once every unit is absorbed
     /// (each under its defining unit's name tables).
     module_let_inits: Vec<ModuleLetInit>,
-    /// `builtin` relvars in scope: surface name → interned heading id. Absorbed
-    /// from an imported stdlib module's relvar table. Unlike private relvars,
-    /// they have no in-memory slot — a read calls the module's runtime snapshot
-    /// symbol ([`builtin_relvar_read_symbol`]) and never touches SQL.
-    builtin_relvars: HashMap<String, HeadingId>,
+    /// `builtin` relvars in scope: surface name → its interned heading + the
+    /// qualified-name handle. Absorbed from an imported stdlib module's relvar
+    /// table. Unlike private relvars they have no in-memory slot — a read/assign
+    /// lowers to the generic `coddl_builtin_read`/`coddl_builtin_assign` FFI,
+    /// dispatched on the handle (never SQL).
+    builtin_relvars: HashMap<String, AbsorbedBuiltin>,
     /// SSA values that are *owned* heap `Text` payloads — produced by `||`
     /// (`Concat`/`CharToText`), `read_line`, or a retained `Text` alias. Only
     /// these are auto-released (at scope exit, or as consumed temporaries):
@@ -1102,8 +1091,9 @@ impl Lowerer {
     }
 
     /// Absorb `builtin` relvars from the typechecker's relvar table: intern each
-    /// heading so a read lowers to a call of the relvar's runtime snapshot
-    /// symbol returning that heading. No slot, no plan — an FFI read, never SQL.
+    /// heading and record the qualified-name handle so a read/assign lowers to
+    /// the generic `coddl_builtin_read`/`coddl_builtin_assign` FFI. No slot, no
+    /// plan — an FFI read/assign, never SQL.
     fn absorb_builtin_relvars(&mut self, relvars: &RelvarTable) {
         let mut builtins: Vec<_> = relvars
             .iter()
@@ -1112,7 +1102,15 @@ impl Lowerer {
         builtins.sort_by(|a, b| a.0.cmp(b.0));
         for (name, info) in builtins {
             let heading_id = self.intern_heading(&info.heading);
-            self.builtin_relvars.insert(name.to_string(), heading_id);
+            // The handle is the relvar's qualified name. A `Builtin` relvar is
+            // always registered from a stdlib module, so `module` is present;
+            // fall back to the bare name defensively.
+            let handle = match &info.module {
+                Some(m) => format!("{m}::{name}"),
+                None => name.to_string(),
+            };
+            self.builtin_relvars
+                .insert(name.to_string(), AbsorbedBuiltin { heading_id, handle });
         }
     }
 
@@ -2594,10 +2592,9 @@ impl Lowerer {
             return;
         }
 
-        // Private target → in-memory slot store.
+        // Private or builtin target → compute the whole value and store it.
         let value = self.lower_expr(&value_expr);
-        self.used_private_relvars.insert(name.clone());
-        self.insts.push(Inst::RelvarSlotStore { name, value });
+        self.store_relvar_value(&name, value);
     }
 
     /// Lower `truncate R;` — clear every tuple. It desugars to `R := R minus R`:
@@ -2636,13 +2633,19 @@ impl Lowerer {
             return;
         }
 
-        // Private target → `R minus R` is the empty relation; store it into the
-        // slot (the two reads lower exactly as the literal `R minus R` would).
+        // Private or builtin target → `R minus R` is the empty relation; store
+        // it (the two reads lower exactly as the literal `R minus R` would).
         let lhs = self.lower_expr(&operand);
         let rhs = self.lower_expr(&operand);
         let value = self.emit_minus(lhs, rhs);
-        self.used_private_relvars.insert(name.clone());
-        self.insts.push(Inst::RelvarSlotStore { name, value });
+        let is_builtin = self.builtin_relvars.contains_key(&name);
+        self.store_relvar_value(&name, value);
+        if is_builtin {
+            // `minus` borrowed both operands; for a builtin both are fresh
+            // `BuiltinRead` temps, so release them.
+            self.release_fresh_relation(lhs);
+            self.release_fresh_relation(rhs);
+        }
     }
 
     /// Lower `delete R where p;` — remove the matching tuples. It desugars to
@@ -2664,15 +2667,6 @@ impl Lowerer {
             return;
         };
         let name = name_tok.text().to_string();
-
-        // Builtin (FFI-backed) target → unset each matched variable. The rows to
-        // remove are `Environment where p` (the operand); the runtime walks them
-        // and calls `unsetenv`.
-        if self.builtin_relvars.contains_key(&name) {
-            let rel = self.lower_expr(&operand);
-            self.emit_env_write("coddl_env_unset", rel);
-            return;
-        }
 
         // Public target → surgical `DELETE FROM t WHERE p` via the
         // `R := R minus (R where p)` shape.
@@ -2714,13 +2708,19 @@ impl Lowerer {
             return;
         }
 
-        // Private target → the kept rows `R minus (R where p)` stored back (the
-        // operands lower exactly as the literal `R minus (R where p)` would).
+        // Private or builtin target → the kept rows `R minus (R where p)` stored
+        // back (the operands lower exactly as the literal would).
         let lhs_val = self.lower_expr(&lhs_expr);
         let rhs_val = self.lower_expr(&operand);
         let value = self.emit_minus(lhs_val, rhs_val);
-        self.used_private_relvars.insert(name.clone());
-        self.insts.push(Inst::RelvarSlotStore { name, value });
+        let is_builtin = self.builtin_relvars.contains_key(&name);
+        self.store_relvar_value(&name, value);
+        if is_builtin {
+            // `minus` borrowed both operands; for a builtin the lhs is a fresh
+            // `BuiltinRead` and the rhs a fresh `where`-result — release both.
+            self.release_fresh_relation(lhs_val);
+            self.release_fresh_relation(rhs_val);
+        }
     }
 
     /// Lower `insert R <source>;` — add tuples. It desugars to `R := R union
@@ -2742,14 +2742,6 @@ impl Lowerer {
         let Some(source_expr) = stmt.source() else {
             return;
         };
-
-        // Builtin (FFI-backed) target → set each source tuple's variable. The
-        // runtime walks the source relation and calls `setenv`.
-        if self.builtin_relvars.contains_key(&name) {
-            let src = self.lower_expr(&source_expr);
-            self.emit_env_write("coddl_env_insert", src);
-            return;
-        }
 
         // Public target → idempotent INSERT via the `R := R union source` shape.
         if self.public_relvars.contains_key(&name) {
@@ -2789,12 +2781,19 @@ impl Lowerer {
             return;
         }
 
-        // Private target → the in-process union `R union source` stored back.
+        // Private or builtin target → the in-process union `R union source`
+        // stored back.
         let lhs_val = self.lower_expr(&target_expr);
         let rhs_val = self.lower_expr(&source_expr);
         let value = self.emit_union(lhs_val, rhs_val);
-        self.used_private_relvars.insert(name.clone());
-        self.insts.push(Inst::RelvarSlotStore { name, value });
+        let is_builtin = self.builtin_relvars.contains_key(&name);
+        self.store_relvar_value(&name, value);
+        if is_builtin {
+            // `union` borrowed both operands; for a builtin target both are
+            // fresh temps (a `BuiltinRead` and the source), so release them.
+            self.release_fresh_relation(lhs_val);
+            self.release_fresh_relation(rhs_val);
+        }
     }
 
     /// Ship an in-memory relation's rows into a public base relvar as an
@@ -2837,32 +2836,45 @@ impl Lowerer {
         true
     }
 
-    /// Emit a `coddl::env` write: call `symbol` (`coddl_env_insert` /
-    /// `coddl_env_unset`) with the `{name,value}` relation `rel`, which the
-    /// runtime walks record-by-record (`setenv` / `unsetenv`). The runtime only
-    /// reads the relation, so `rel` — a temporary from a literal / restriction /
-    /// substitute — is released here (the fresh-source discipline).
-    fn emit_env_write(&mut self, symbol: &'static str, rel: ValueId) {
-        let ProcType::Relation(hid) = self.value_type(rel) else {
-            return;
-        };
-        self.ensure_runtime_extern(
-            symbol,
-            vec![("rel".to_string(), ProcType::Relation(hid))],
-            ProcType::Unit,
-        );
-        self.insts.push(Inst::Call {
-            dst: None,
-            callee: symbol.to_string(),
-            args: vec![rel],
-            return_type: ProcType::Unit,
-        });
+    /// Store a computed whole-relation `value` back into relvar `name`. A
+    /// `builtin` relvar assigns via the generic FFI — the runtime reconciles
+    /// its store to `value` (`coddl::env`: `setenv` present, `unset` absent). A
+    /// private relvar stores `value` into its in-memory slot. The runtime only
+    /// *reads* `value` on the builtin path, so a fresh temporary is released
+    /// here (fresh-source discipline); the private slot takes ownership.
+    fn store_relvar_value(&mut self, name: &str, value: ValueId) {
+        if let Some(b) = self.builtin_relvars.get(name) {
+            let handle = b.handle.clone();
+            let heading_id = b.heading_id;
+            self.insts.push(Inst::BuiltinAssign {
+                handle,
+                heading_id,
+                rel: value,
+            });
+            self.release_fresh_relation(value);
+        } else {
+            self.used_private_relvars.insert(name.to_string());
+            self.insts.push(Inst::RelvarSlotStore {
+                name: name.to_string(),
+                value,
+            });
+        }
+    }
+
+    /// Release a relation `v` if it is a fresh temporary (not owned by a local,
+    /// which would free it at its own scope exit). Used for the builtin-relvar
+    /// write path: `union`/`minus` and the FFI `assign` all *borrow* their
+    /// relation operands (each retains the cells it keeps but frees no
+    /// container), so a fresh `BuiltinRead` / literal / `where`-result operand
+    /// or the assigned value must be released here or its container (and any
+    /// cells only it holds) leak.
+    fn release_fresh_relation(&mut self, v: ValueId) {
         let is_owned = self
             .locals
             .iter()
-            .any(|layer| layer.values().any(|(vid, _)| *vid == rel));
+            .any(|layer| layer.values().any(|(vid, _)| *vid == v));
         if !is_owned {
-            self.insts.push(Inst::Release { src: rel });
+            self.insts.push(Inst::Release { src: v });
         }
     }
 
@@ -2904,21 +2916,6 @@ impl Lowerer {
         // what the values read), unlike `replace` which drops the read attrs.
         let removed: HashSet<String> = pairs.iter().map(|(n, _)| n.clone()).collect();
 
-        // Builtin (FFI-backed) target → set each matched variable to its new
-        // value. Compute the changed rows (matching rows with the substitute
-        // applied) and `setenv` them; unchanged rows keep their values, so only
-        // the changed set is written.
-        if self.builtin_relvars.contains_key(&name) {
-            let matching = if has_where {
-                self.lower_expr(&operand)
-            } else {
-                self.lower_expr(&root_expr)
-            };
-            let changed = self.emit_substitute(matching, pairs, removed);
-            self.emit_env_write("coddl_env_insert", changed);
-            return;
-        }
-
         // Public target → surgical UPDATE via the substitute-union shape.
         if self.public_relvars.contains_key(&name) {
             self.lower_public_update(&name, &root_expr, &operand, has_where, &pairs, &removed);
@@ -2927,26 +2924,33 @@ impl Lowerer {
 
         // Private target → compute the result in process. The substitute runs
         // over the matching rows `R where p` (or all rows `R` for update-all).
+        let is_builtin = self.builtin_relvars.contains_key(&name);
         let matching = if has_where {
             self.lower_expr(&operand)
         } else {
             self.lower_expr(&root_expr)
         };
+        // `emit_substitute` consumes (releases) `matching`.
         let changed = self.emit_substitute(matching, pairs, removed);
         let result = if has_where {
             // unchanged = R minus (R where p) ≡ R where ¬p (no AST-level negation).
             let r = self.lower_expr(&root_expr);
             let matching_again = self.lower_expr(&operand);
             let unchanged = self.emit_minus(r, matching_again);
-            self.emit_union(unchanged, changed)
+            let result = self.emit_union(unchanged, changed);
+            if is_builtin {
+                // `minus`/`union` borrowed these fresh temps; release them
+                // (`matching` was already consumed by `emit_substitute`).
+                self.release_fresh_relation(r);
+                self.release_fresh_relation(matching_again);
+                self.release_fresh_relation(unchanged);
+                self.release_fresh_relation(changed);
+            }
+            result
         } else {
             changed
         };
-        self.used_private_relvars.insert(name.clone());
-        self.insts.push(Inst::RelvarSlotStore {
-            name,
-            value: result,
-        });
+        self.store_relvar_value(&name, result);
     }
 
     /// Lower the public (SQL-backed) `update`: build `Or{ Restrict(t, ¬p),
@@ -6124,17 +6128,15 @@ impl Lowerer {
             // intercepted before the private/public paths (the cut already
             // declines it: `build_rel_expr` returns `None` for a non-private,
             // non-public name).
-            if let Some(&heading_id) = self.builtin_relvars.get(name) {
-                let read = builtin_relvar_read_symbol(name)
-                    .expect("an absorbed builtin relvar has a read symbol");
-                self.ensure_runtime_extern(read, vec![], ProcType::Relation(heading_id));
+            if let Some(b) = self.builtin_relvars.get(name) {
+                let heading_id = b.heading_id;
+                let handle = b.handle.clone();
                 let dst = self.fresh_value();
                 self.record_type(dst, ProcType::Relation(heading_id));
-                self.insts.push(Inst::Call {
-                    dst: Some(dst),
-                    callee: read.to_string(),
-                    args: vec![],
-                    return_type: ProcType::Relation(heading_id),
+                self.insts.push(Inst::BuiltinRead {
+                    dst,
+                    handle,
+                    heading_id,
                 });
                 return dst;
             }

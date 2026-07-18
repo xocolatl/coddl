@@ -290,11 +290,11 @@ impl Emitter {
     }
 
     /// Declare the runtime symbols that `Inst::RelationLit`,
-    /// `Inst::Retain`, `Inst::Release`, and `Inst::WriteRelation`
-    /// call directly. The compiler injects these regardless of
-    /// whether the user wrote `write_relation` — the relation
-    /// machinery (alloc/seal) is always needed once a `RELATION_LIT`
-    /// is present.
+    /// `Inst::Retain`, `Inst::Release`, `Inst::WriteRelation`, and the
+    /// `Inst::BuiltinRead`/`Inst::BuiltinAssign` builtin-relvar FFI call
+    /// directly. The compiler injects these regardless of whether the user
+    /// wrote `write_relation` — the relation machinery (alloc/seal) is always
+    /// needed once a `RELATION_LIT` is present.
     fn emit_runtime_rc_externs(&mut self) {
         writeln!(self.body, "declare ptr @coddl_rc_alloc(i64, i32, i32, ptr)").unwrap();
         // `coddl_rc_retain`/`coddl_rc_release` are declared unconditionally in
@@ -302,6 +302,14 @@ impl Emitter {
         // relations), so they are intentionally not repeated here.
         writeln!(self.body, "declare void @coddl_relation_seal(ptr, ptr)").unwrap();
         writeln!(self.body, "declare void @coddl_write_relation(ptr, ptr)").unwrap();
+        // Builtin-relvar (env / system-catalog) generic read+assign FFI:
+        // read(handle_ptr, handle_len, desc) -> relation; assign(…, rel) -> void.
+        writeln!(self.body, "declare ptr @coddl_builtin_read(ptr, i64, ptr)").unwrap();
+        writeln!(
+            self.body,
+            "declare void @coddl_builtin_assign(ptr, i64, ptr, ptr)"
+        )
+        .unwrap();
         // Private-relvar in-memory slots: empty-init a slot, and store (move)
         // a relation into a slot.
         writeln!(
@@ -1148,6 +1156,43 @@ impl Emitter {
                 writeln!(
                     self.body,
                     "    call void @coddl_write_relation(ptr {op}, ptr @.heading.{})",
+                    heading_id.0,
+                )
+                .unwrap();
+                Ok(())
+            }
+            Inst::BuiltinRead {
+                dst,
+                handle,
+                heading_id,
+            } => {
+                let (hptr, hlen) = self.emit_handle_const(handle);
+                let name = format!("%v{}", dst.0);
+                writeln!(
+                    self.body,
+                    "    {name} = call ptr @coddl_builtin_read(ptr {hptr}, i64 {hlen}, ptr @.heading.{})",
+                    heading_id.0,
+                )
+                .unwrap();
+                self.values.insert(
+                    *dst,
+                    ValueRepr::Scalar {
+                        ty: "ptr".to_string(),
+                        op: name,
+                    },
+                );
+                Ok(())
+            }
+            Inst::BuiltinAssign {
+                handle,
+                heading_id,
+                rel,
+            } => {
+                let (hptr, hlen) = self.emit_handle_const(handle);
+                let op = self.scalar_op(rel)?;
+                writeln!(
+                    self.body,
+                    "    call void @coddl_builtin_assign(ptr {hptr}, i64 {hlen}, ptr @.heading.{}, ptr {op})",
                     heading_id.0,
                 )
                 .unwrap();
@@ -3345,6 +3390,24 @@ impl Emitter {
                 len_op: format!("{len}"),
             },
         );
+    }
+
+    /// Emit a private byte-array global for a builtin-relvar `handle`
+    /// (`coddl::storage::Backends`), returning its pointer operand and byte
+    /// length. The runtime reads it as a `&str` (ptr + len); no RC header — it
+    /// is never retained or released.
+    fn emit_handle_const(&mut self, handle: &str) -> (String, usize) {
+        let name = format!("@.handle.{}", self.next_str);
+        self.next_str += 1;
+        let bytes = handle.as_bytes();
+        let len = bytes.len();
+        writeln!(
+            self.globals,
+            "{name} = private unnamed_addr constant [{len} x i8] c\"{}\"",
+            escape_ir_bytes(bytes),
+        )
+        .unwrap();
+        (name, len)
     }
 
     fn lower_call(

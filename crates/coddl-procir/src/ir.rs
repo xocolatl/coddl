@@ -308,6 +308,28 @@ pub enum Inst {
     /// of a generic `Inst::Call` so the backend doesn't have to
     /// special-case the descriptor lookup in its `Inst::Call` path.
     WriteRelation { rel: ValueId, heading_id: HeadingId },
+    /// Read a `builtin` relvar's current value. `handle` is the relvar's
+    /// interned qualified name (e.g. `coddl::storage::Backends`), which the
+    /// runtime dispatches on to the right store; `heading_id` carries the
+    /// descriptor. Backends lower to `call coddl_builtin_read(handle_ptr,
+    /// handle_len, &heading_descriptor) -> relation`. Generalizes the old
+    /// per-relvar snapshot symbol (env's `coddl_env_snapshot`) into one
+    /// heading-passing call.
+    BuiltinRead {
+        dst: ValueId,
+        handle: String,
+        heading_id: HeadingId,
+    },
+    /// Assign a whole relation value to a `builtin` relvar — the runtime
+    /// reconciles that relvar's store to `rel` (env: `setenv` present, `unset`
+    /// absent). `handle`/`heading_id` as in [`Inst::BuiltinRead`]. Backends
+    /// lower to `call coddl_builtin_assign(handle_ptr, handle_len,
+    /// &heading_descriptor, rel_ptr)`. The runtime only borrows `rel`.
+    BuiltinAssign {
+        handle: String,
+        heading_id: HeadingId,
+        rel: ValueId,
+    },
     /// Scalar binary operator. The result type depends on `op`: comparison /
     /// Boolean ops yield `ProcType::Boolean`, arithmetic ops yield
     /// `ProcType::Integer`, and `Concat` yields `ProcType::Text`.
@@ -957,6 +979,24 @@ impl fmt::Display for Inst {
             Inst::WriteRelation { rel, heading_id } => {
                 write!(f, "write_relation {rel} heading_{}", heading_id.0)
             }
+            Inst::BuiltinRead {
+                dst,
+                handle,
+                heading_id,
+            } => write!(
+                f,
+                "{dst} = builtin_read {handle:?} heading_{}",
+                heading_id.0
+            ),
+            Inst::BuiltinAssign {
+                handle,
+                heading_id,
+                rel,
+            } => write!(
+                f,
+                "builtin_assign {handle:?} heading_{} {rel}",
+                heading_id.0
+            ),
             Inst::ScalarOp {
                 dst,
                 op,

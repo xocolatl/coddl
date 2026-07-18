@@ -229,8 +229,8 @@ unsafe fn write_text_cell(cell: *mut u8, bytes: &[u8]) {
 /// Build an owned `OrderedNameValues` relation from `pairs`, in order — one
 /// 40 B record per pair (`name@0`, `ordinality@16` = the index, `value@24`),
 /// each `Text` cell a fresh `rc_text` (rc=1, **moved in**). Mirrors
-/// `coddl_env_snapshot`; the caller's single release frees every cell via the
-/// drop walker. `build_headers(&[])` is the empty relation.
+/// `coddl::env`'s `env_read`; the caller's single release frees every cell via
+/// the drop walker. `build_headers(&[])` is the empty relation.
 unsafe fn build_headers(pairs: &[(Vec<u8>, Vec<u8>)]) -> *mut u8 {
     let n = pairs.len();
     let rel = coddl_rc_alloc(n * 40, n as u32, CoddlKind::Relation as u32, headers_desc());

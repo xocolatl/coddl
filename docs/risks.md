@@ -56,7 +56,7 @@ ProcIR's tuple/value layout, the Rust runtime's `#[repr(C)]` types, and the LLVM
 
 Build a single layout description (a Rust type with derives that generates both the LLVM struct emission and the matching `#[repr(C)]` declaration) before the second value type lands. Same for the tagged-union row representation. This is a long-term-planning bill we pay now or pay tenfold later.
 
-New drift site (`coddl::env`): the runtime `coddl_env_snapshot` hand-writes a `CoddlHeadingDesc` for `{ name: Text, value: Text }` (`crates/coddl-runtime/src/env.rs`) — the first descriptor built *inside* the runtime rather than emitted by codegen from `layout.rs`. It must match the `{name, value}` layout codegen interns for that heading (name @ 0, value @ 16, record_size 32). Once a second `builtin relvar` (or the generalized descriptor-passing path) arrives, fold this into the single-source-of-truth layout so the runtime stops re-deriving it by hand.
+~~New drift site (`coddl::env`): the runtime `coddl_env_snapshot` hand-writes a `CoddlHeadingDesc`…~~ **Resolved.** The generalized builtin-relvar path landed: `builtin relvar` read/write lower to `coddl_builtin_read(handle, heading_desc)` / `coddl_builtin_assign(handle, heading_desc, rel)` (`crates/coddl-runtime/src/builtin_relvar.rs`), and codegen passes the `@.heading.<id>` descriptor from `layout.rs` as an argument. `env_heading_desc()` is deleted; the runtime no longer derives any `CoddlHeadingDesc` by hand. The broader single-source-of-truth layout goal (first paragraph) still stands for the `#[repr(C)]`/LLVM-struct/ProcIR triple.
 
 ## 9. `Integer` precision and arithmetic cost
 

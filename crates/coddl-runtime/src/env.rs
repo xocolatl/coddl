@@ -1,54 +1,18 @@
 //! `coddl::env` runtime backing — the process environment as a relation.
 //!
-//! `coddl_env_snapshot` is the read symbol a `coddl::env` `Environment`
-//! reference lowers to a call of (see `coddl-procir`'s `BUILTIN_RELVARS`). It
-//! returns the current environment as a fresh RC `Relation { name: Text, value:
-//! Text }` payload, built with the same `coddl_rc_alloc` + cell layout the SQL
-//! path uses. Writes (`coddl_env_set` / `coddl_env_unset`) land with env DML in
-//! a later phase.
+//! `coddl::env`'s `Environment` is a `builtin relvar`; its read and assign go
+//! through the generic [`crate::builtin_relvar`] FFI, which dispatches this
+//! relvar's handle here. [`env_read`] returns the current environment as a fresh
+//! RC `Relation { name, value }` of the **passed** heading descriptor (no
+//! hand-written descriptor — codegen supplies it, resolving the drift site under
+//! [docs/risks.md] §8). [`env_assign`] reconciles the process environment to a
+//! whole relation value (`setenv` each record, `unsetenv` every variable the
+//! value omits).
 
-use std::sync::OnceLock;
+use std::collections::HashSet;
 
 use crate::rc::{coddl_rc_alloc, CoddlKind, CoddlRcHeader, HEADER_SIZE};
-use crate::relation::{CoddlAttrDesc, CoddlAttrKind, CoddlHeadingDesc};
-
-/// Two `Text` cells, name-sorted (`name` @ 0, `value` @ 16); each is 16 bytes
-/// (`ptr` @ 0, `len` @ 8), so `record_size` is 32.
-const RECORD_SIZE: usize = 32;
-
-/// The fixed `{ name: Text, value: Text }` heading descriptor, built once and
-/// leaked so the pointer stays valid for the program's lifetime — the returned
-/// relation's RC header holds it, and consumers read it after this call
-/// returns. Hand-written here: one more site under "FFI struct-layout single
-/// source of truth" ([docs/risks.md]); it must match what codegen emits for
-/// this heading.
-fn env_heading_desc() -> *const CoddlHeadingDesc {
-    static DESC: OnceLock<usize> = OnceLock::new();
-    *DESC.get_or_init(|| {
-        let attrs: &'static [CoddlAttrDesc; 2] = Box::leak(Box::new([
-            CoddlAttrDesc {
-                name: b"name".as_ptr(),
-                name_len: 4,
-                kind: CoddlAttrKind::Text as u32,
-                offset: 0,
-                sub: std::ptr::null(),
-            },
-            CoddlAttrDesc {
-                name: b"value".as_ptr(),
-                name_len: 5,
-                kind: CoddlAttrKind::Text as u32,
-                offset: 16,
-                sub: std::ptr::null(),
-            },
-        ]));
-        let desc: &'static CoddlHeadingDesc = Box::leak(Box::new(CoddlHeadingDesc {
-            attr_count: 2,
-            record_size: RECORD_SIZE as u32,
-            attrs: attrs.as_ptr(),
-        }));
-        desc as *const CoddlHeadingDesc as usize
-    }) as *const CoddlHeadingDesc
-}
+use crate::relation::CoddlHeadingDesc;
 
 /// Allocate an owned RC `Text` cell holding `bytes`.
 unsafe fn alloc_text(bytes: &[u8]) -> *mut u8 {
@@ -64,50 +28,8 @@ unsafe fn alloc_text(bytes: &[u8]) -> *mut u8 {
     p
 }
 
-/// Read the process environment as a fresh RC `Relation { name, value }`. A
-/// read of the `coddl::env` `Environment` relvar lowers to a call of this.
-///
-/// # Safety
-/// FFI entry point. The returned pointer is an owned RC relation payload the
-/// caller must eventually `coddl_rc_release`.
-#[no_mangle]
-pub unsafe extern "C" fn coddl_env_snapshot() -> *mut u8 {
-    // Skip non-UTF-8 entries: Coddl `Text` is UTF-8, and `std::env::vars()`
-    // would panic on them. Env var names are unique, so no dedup/seal is needed.
-    let vars: Vec<(String, String)> = std::env::vars_os()
-        .filter_map(|(k, v)| match (k.into_string(), v.into_string()) {
-            (Ok(k), Ok(v)) => Some((k, v)),
-            _ => None,
-        })
-        .collect();
-
-    let count = vars.len();
-    let desc = env_heading_desc();
-    let payload = coddl_rc_alloc(
-        count * RECORD_SIZE,
-        count as u32,
-        CoddlKind::Relation as u32,
-        desc,
-    );
-    if payload.is_null() {
-        return payload;
-    }
-    for (i, (name, value)) in vars.iter().enumerate() {
-        let rec = payload.add(i * RECORD_SIZE);
-        // name cell @ 0
-        let np = alloc_text(name.as_bytes());
-        std::ptr::write(rec as *mut usize, np as usize);
-        std::ptr::write(rec.add(8) as *mut usize, name.len());
-        // value cell @ 16
-        let vp = alloc_text(value.as_bytes());
-        std::ptr::write(rec.add(16) as *mut usize, vp as usize);
-        std::ptr::write(rec.add(24) as *mut usize, value.len());
-    }
-    payload
-}
-
-/// Read a `Text` cell `(ptr @ 0, len @ 8)` as a `&str`. The bytes are UTF-8:
-/// they came from a Coddl `Text` literal or a value this module wrote.
+/// Read a `Text` cell `(ptr @ 0, len @ 8)` as a `&str`. UTF-8 by construction:
+/// the bytes came from a Coddl `Text` literal or a value this module wrote.
 unsafe fn text_cell(cell: *const u8) -> &'static str {
     let ptr = std::ptr::read(cell as *const usize) as *const u8;
     let len = std::ptr::read(cell.add(8) as *const usize);
@@ -119,34 +41,97 @@ unsafe fn record_count(rel: *const u8) -> usize {
     (*(rel.sub(HEADER_SIZE) as *const CoddlRcHeader)).length as usize
 }
 
-/// Apply an `insert`/`update` write to the environment: set each
-/// `{ name, value }` record's variable (`setenv`; overwrites, so `update` and
-/// `insert` share this path). The relation is borrowed, not consumed.
-///
-/// # Safety
-/// `rel` must be null or a valid `Relation { name: Text, value: Text }` payload.
-#[no_mangle]
-pub unsafe extern "C" fn coddl_env_insert(rel: *const u8) {
-    if rel.is_null() {
-        return;
+/// Byte offset of the attribute named `want` within a record of heading `desc`.
+/// The compiler-emitted descriptor always carries the env relvar's `{ name,
+/// value }` attributes, so a lookup never fails in practice.
+unsafe fn attr_offset(desc: *const CoddlHeadingDesc, want: &str) -> usize {
+    let d = &*desc;
+    let attrs = std::slice::from_raw_parts(d.attrs, d.attr_count as usize);
+    for a in attrs {
+        let name =
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(a.name, a.name_len as usize));
+        if name == want {
+            return a.offset as usize;
+        }
     }
-    for i in 0..record_count(rel) {
-        let rec = rel.add(i * RECORD_SIZE);
-        std::env::set_var(text_cell(rec), text_cell(rec.add(16)));
-    }
+    0
 }
 
-/// Apply a `delete` write: unset each record's variable (`unsetenv`). Only the
-/// `name` column is read.
+/// Read the process environment as a fresh owned RC `Relation { name, value }`
+/// of heading `desc`. Called from [`crate::builtin_relvar::coddl_builtin_read`]
+/// for the `coddl::env::Environment` handle.
 ///
 /// # Safety
-/// `rel` must be null or a valid `Relation { name: Text, value: Text }` payload.
-#[no_mangle]
-pub unsafe extern "C" fn coddl_env_unset(rel: *const u8) {
-    if rel.is_null() {
-        return;
+/// `desc` is a valid `{ name: Text, value: Text }` heading descriptor. The
+/// returned payload is owned — the caller `coddl_rc_release`s it.
+pub(crate) unsafe fn env_read(desc: *const CoddlHeadingDesc) -> *mut u8 {
+    // Skip non-UTF-8 entries: Coddl `Text` is UTF-8, and `into_string` fails
+    // otherwise. Env var names are unique, so no dedup/seal is needed.
+    let vars: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(k, v)| match (k.into_string(), v.into_string()) {
+            (Ok(k), Ok(v)) => Some((k, v)),
+            _ => None,
+        })
+        .collect();
+
+    let record_size = (*desc).record_size as usize;
+    let name_off = attr_offset(desc, "name");
+    let value_off = attr_offset(desc, "value");
+    let count = vars.len();
+    let payload = coddl_rc_alloc(
+        count * record_size,
+        count as u32,
+        CoddlKind::Relation as u32,
+        desc,
+    );
+    if payload.is_null() {
+        return payload;
     }
-    for i in 0..record_count(rel) {
-        std::env::remove_var(text_cell(rel.add(i * RECORD_SIZE)));
+    for (i, (name, value)) in vars.iter().enumerate() {
+        let rec = payload.add(i * record_size);
+        let np = alloc_text(name.as_bytes());
+        std::ptr::write(rec.add(name_off) as *mut usize, np as usize);
+        std::ptr::write(rec.add(name_off + 8) as *mut usize, name.len());
+        let vp = alloc_text(value.as_bytes());
+        std::ptr::write(rec.add(value_off) as *mut usize, vp as usize);
+        std::ptr::write(rec.add(value_off + 8) as *mut usize, value.len());
+    }
+    payload
+}
+
+/// Reconcile the process environment to the whole relation value `rel`: `setenv`
+/// each `{ name, value }` record, then `unsetenv` every current variable the
+/// value omits. Called from [`crate::builtin_relvar::coddl_builtin_assign`] for
+/// the `coddl::env::Environment` handle. `rel` is borrowed.
+///
+/// # Safety
+/// `desc` is a valid `{ name, value }` descriptor; `rel` is null or a valid
+/// relation payload of that heading.
+pub(crate) unsafe fn env_assign(desc: *const CoddlHeadingDesc, rel: *const u8) {
+    let record_size = (*desc).record_size as usize;
+    let name_off = attr_offset(desc, "name");
+    let value_off = attr_offset(desc, "value");
+
+    // Set every variable the new value carries; remember which names it holds.
+    let mut wanted: HashSet<String> = HashSet::new();
+    if !rel.is_null() {
+        for i in 0..record_count(rel) {
+            let rec = rel.add(i * record_size);
+            let name = text_cell(rec.add(name_off));
+            let value = text_cell(rec.add(value_off));
+            std::env::set_var(name, value);
+            wanted.insert(name.to_string());
+        }
+    }
+
+    // Unset every current variable the new value omits. Collect the names first
+    // so the environment isn't mutated while it is being iterated.
+    let current: Vec<String> = std::env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .collect();
+    for name in current {
+        if !wanted.contains(&name) {
+            std::env::remove_var(name);
+        }
     }
 }

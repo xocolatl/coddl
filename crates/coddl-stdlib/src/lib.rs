@@ -141,6 +141,14 @@ const EMBEDDED: &[Embedded] = &[
         path: "coddl::env",
         source: include_str!("../modules/coddl/env.cd"),
     },
+    Embedded {
+        path: "coddl::storage",
+        source: include_str!("../modules/coddl/storage.cd"),
+    },
+    Embedded {
+        path: "coddl::catalog",
+        source: include_str!("../modules/coddl/catalog.cd"),
+    },
 ];
 
 /// Resolve a module path against the embedded `coddl::` root, or `None`.

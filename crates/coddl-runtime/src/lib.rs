@@ -22,6 +22,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 mod audit;
+pub mod builtin_relvar;
 pub mod env;
 pub mod rational;
 pub mod rc;
@@ -103,6 +104,10 @@ pub unsafe extern "C" fn coddl_runtime_shutdown() -> CoddlStatus {
     // connection. Connections are dropped here, closing every open
     // handle.
     sqlite::shutdown_storage();
+    // Release every relation the builtin-relvar catalog store still holds (a
+    // program's final `coddl::storage` / `coddl::catalog` values) before the
+    // leak check, so they don't register as leaks.
+    builtin_relvar::clear_store();
     // Opt-in refcount-balance check: in a correct program every
     // `coddl_rc_alloc` is matched by a release before we get here (relvar
     // slots and heap locals are released earlier in `main`), so

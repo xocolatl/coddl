@@ -1,0 +1,100 @@
+// storage.cd  —  coddl::storage, Coddl's storage meta-catalog.
+//
+// The compiler-provided system relations describing how every USER database
+// is physically stored and reached. These are `builtin relvar`s — like
+// coddl::env's `Environment`, the compiler owns the implementation and this
+// file is the SIGNATURE. `.cdstore` / `.cdconn` config files populate them by
+// DML (`insert Backends …`); a program reads (or writes) them via
+// `use module coddl::storage` — the storage reflection API.
+//
+// STATUS: reference today. The compiler is meant to consume it as the baked
+// meta-catalog schema once storage goes relational (the "make the compiler
+// act relationally" work). Self-describing: a module whose relations describe
+// every database, including the system catalog itself. Core-owned, NOT
+// extended by backends — a backend adds DATA (its `Backends` rows, its
+// `Conn*` defaults) and BEHAVIOR (emit/connect), never a new relvar.
+//
+// HOME: crates/coddl-stdlib/modules/coddl/ — the built-in surface, beside
+// coddl::env (the first builtin relvar) and coddl::core (operator signatures).
+//
+// SCOPE: physical/storage only. The LOGICAL catalog — which databases and
+// relvars exist (Databases, Relvars, Attributes, Keys, i.e. what `.cddb`
+// files populate) — is the sibling coddl::catalog (catalog.cd). Together they
+// are the system catalog. Here `database` is a Text handle referencing
+// those logical relations.
+//
+// DESIGN NOTES:
+//   • Vertically decomposed (RM Pro 4): an absent channel is an absent
+//     TUPLE, never a null — so each connection channel is its own relvar.
+//   • NO realization relvar. Coddl owns and provisions every schema, so a
+//     relvar `S` is table `"S"` (quoted, verbatim), an attribute is its
+//     same-named column — pure identity, nothing to store, no foreign-DB
+//     name-remap (foreign databases are out of scope by design). Holds for
+//     document backends too (collection = relvar, field = attribute); a
+//     paradigm's own shape — e.g. Mongo's nesting — lives in how a backend
+//     STORES nested attributes (RVAs/TVAs), never in a name map.
+//   • This version has no `source`/precedence layer (no `.cdconn`, no
+//     overrides): the catalog holds one value per key directly.
+//
+// NAMING: `storage` / `coddl::storage` may end up under a reserved system
+// namespace once the real system catalog lands; kept plain here.
+
+module storage;
+
+// Which backends a database is offered on — the anchor for everything else.
+builtin relvar Backends {
+    database: Text,
+    backend: Text,
+} key { database, backend };
+
+// ── Connection sourcing: how each backend field is supplied. One relvar
+//    per channel; a field may appear in any subset (hence separate relvars,
+//    not nullable columns on one wide row). ─────────────────────────────
+
+// Read the field from this environment variable.
+builtin relvar ConnEnv {
+    database: Text,
+    backend: Text,
+    field: Text,
+    env_var: Text,
+} key { database, backend, field };
+
+// Expose the field as a long CLI flag, e.g. --host.
+builtin relvar ConnArgLong {
+    database: Text,
+    backend: Text,
+    field: Text,
+    long: Text,
+} key { database, backend, field };
+
+// Expose the field as a short CLI flag, e.g. -h. Exactly one character.
+builtin relvar ConnArgShort {
+    database: Text,
+    backend: Text,
+    field: Text,
+    short: Character,
+} key { database, backend, field };
+
+// A baked default value, used when no flag or env var supplied one. Always
+// Text — a backend parses it (a port "5432" is text here, an Integer there).
+builtin relvar ConnDefault {
+    database: Text,
+    backend: Text,
+    field: Text,
+    value: Text,
+} key { database, backend, field };
+
+// Mark a field secret. Seeded by the backend descriptor (the backend knows
+// `password` is secret; it is not an app/DBA choice). Its purpose is an
+// integrity constraint — these semijoins must all be EMPTY:
+//     ConnDefault  matching ConnSecret
+//     ConnArgLong  matching ConnSecret
+//     ConnArgShort matching ConnSecret
+// i.e. a secret field may carry only a ConnEnv name (or the backend's own
+// secret store), never a baked default or a CLI flag. Expressed as prose
+// here; it becomes a real database constraint when this file goes live.
+builtin relvar ConnSecret {
+    database: Text,
+    backend: Text,
+    field: Text,
+} key { database, backend, field };

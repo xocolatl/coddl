@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use coddl_diagnostics::Span;
+use coddl_stdlib::ModulePath;
 
 use crate::ty::Heading;
 
@@ -56,6 +57,10 @@ pub struct RelvarInfo {
     /// declarations parse; v1 typechecks only the first key. Stored
     /// in source order; attribute names within a key are unsorted.
     pub keys: Vec<Vec<String>>,
+    /// For a `RelvarKind::Builtin` relvar, the stdlib module that declared it.
+    /// The relvar's qualified name (`<module>::<name>`) is the runtime handle
+    /// its read/assign lowering dispatches on. `None` for every other kind.
+    pub module: Option<ModulePath>,
     /// Source range of the declaration's name token, for downstream
     /// "declared here" notes.
     pub span: Span,
@@ -117,6 +122,7 @@ mod tests {
             kind,
             heading: Heading::new(vec![("id".into(), Type::Integer)]),
             keys: vec![vec!["id".into()]],
+            module: None,
             span: span(),
         }
     }

@@ -326,6 +326,31 @@ fn declare_runtime_rc_externs(
             .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
         funcs.insert(name.into(), id);
     }
+    // Builtin-relvar (env / system-catalog) generic FFI.
+    // coddl_builtin_read(handle_ptr: ptr, handle_len: i64, desc: ptr) -> ptr
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.returns.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_builtin_read", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_builtin_read".into(), id);
+    }
+    // coddl_builtin_assign(handle_ptr: ptr, handle_len: i64, desc: ptr, rel: ptr) -> ()
+    {
+        let mut sig = obj.make_signature();
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(ptr_ty));
+        let id = obj
+            .declare_function("coddl_builtin_assign", Linkage::Import, &sig)
+            .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
+        funcs.insert("coddl_builtin_assign".into(), id);
+    }
     // coddl_relation_where(src: ptr, desc: ptr, pred_fn: ptr) -> ptr
     // coddl_relation_project(src: ptr, src_desc: ptr, result_desc: ptr) -> ptr
     // coddl_relation_restructure(src: ptr, src_desc: ptr, result_desc: ptr) -> ptr
@@ -982,6 +1007,26 @@ fn declare_byte_constant(
     obj.define_data(id, &dd)
         .map_err(|e| CraneliftEmitError::ModuleError(e.to_string()))?;
     Ok(id)
+}
+
+/// Emit a Local byte-array data symbol for a builtin-relvar `handle`
+/// (`coddl::storage::Backends`) and return its pointer + byte-length as
+/// Cranelift values. Plain bytes, no RC header — the runtime reads it as a
+/// `&str` and never retains it. `next_data` keeps the symbol name unique.
+fn builtin_handle_value(
+    obj: &mut ObjectModule,
+    builder: &mut FunctionBuilder<'_>,
+    next_data: &mut u32,
+    handle: &str,
+) -> Result<(CrValue, CrValue), CraneliftEmitError> {
+    let name = format!(".handle.{}", *next_data);
+    *next_data += 1;
+    let id = declare_byte_constant(obj, &name, handle.as_bytes())?;
+    let local = obj.declare_data_in_func(id, builder.func);
+    let ptr_ty = obj.target_config().pointer_type();
+    let ptr = builder.ins().symbol_value(ptr_ty, local);
+    let len = builder.ins().iconst(types::I64, handle.len() as i64);
+    Ok((ptr, len))
 }
 
 /// Declare + define an anonymous read-only `u32` array (little-endian) — the
@@ -2052,6 +2097,37 @@ fn emit_inst(
             let id = funcs["coddl_write_relation"];
             let local = obj.declare_func_in_func(id, builder.func);
             builder.ins().call(local, &[v, desc_val]);
+            Ok(())
+        }
+        Inst::BuiltinRead {
+            dst,
+            handle,
+            heading_id,
+        } => {
+            let ptr_ty = obj.target_config().pointer_type();
+            let (hptr, hlen) = builtin_handle_value(obj, builder, next_data, handle)?;
+            let desc_id = heading_desc_ids[heading_id.0 as usize];
+            let desc_gv = obj.declare_data_in_func(desc_id, builder.func);
+            let desc_val = builder.ins().symbol_value(ptr_ty, desc_gv);
+            let local = obj.declare_func_in_func(funcs["coddl_builtin_read"], builder.func);
+            let call = builder.ins().call(local, &[hptr, hlen, desc_val]);
+            let result = builder.inst_results(call)[0];
+            values.insert(*dst, ValueRepr::Scalar(result));
+            Ok(())
+        }
+        Inst::BuiltinAssign {
+            handle,
+            heading_id,
+            rel,
+        } => {
+            let ptr_ty = obj.target_config().pointer_type();
+            let v = scalar_value(values, rel)?;
+            let (hptr, hlen) = builtin_handle_value(obj, builder, next_data, handle)?;
+            let desc_id = heading_desc_ids[heading_id.0 as usize];
+            let desc_gv = obj.declare_data_in_func(desc_id, builder.func);
+            let desc_val = builder.ins().symbol_value(ptr_ty, desc_gv);
+            let local = obj.declare_func_in_func(funcs["coddl_builtin_assign"], builder.func);
+            builder.ins().call(local, &[hptr, hlen, desc_val, v]);
             Ok(())
         }
         Inst::ScalarOp {
