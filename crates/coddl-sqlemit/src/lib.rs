@@ -157,10 +157,84 @@ pub struct StmtId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TempRelRef(pub u32);
 
-/// Opaque shapes still used only by the not-yet-implemented DDL / temp-table
-/// paths; they gain real definitions when those land.
-pub struct Schema;
-pub struct TypeMap;
+/// A neutral SQL column kind — the backend-agnostic scalar set `emit_ddl`
+/// renders. Distinct from `coddl_types::Type` so the backend crates (which
+/// implement `emit_ddl`) never depend on the relational middle; the
+/// `Type → ColKind` fold lives up in `coddl-provision`. Covers the six
+/// spellable-with-a-literal scalars; `Binary`/`Byte` are literal-less (no INIT
+/// value possible) and rejected by that fold rather than mapped here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColKind {
+    Integer,
+    Text,
+    Boolean,
+    Rational,
+    Approximate,
+    Character,
+}
+
+/// One column of a [`Schema`]: its physical name, its scalar kind, and whether
+/// the attribute is conceptually total.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Column {
+    pub name: String,
+    pub kind: ColKind,
+    /// Conceptual totality (RM Pro 4) — true for every real relvar column. A
+    /// backend may still emit a *physically* nullable column (SQLite's
+    /// `Approximate` NaN channel, where SQL `NULL` encodes the `NaN` value);
+    /// that is the backend's `emit_ddl` decision, not this flag.
+    pub not_null: bool,
+}
+
+/// The physical schema of one base relvar's table — everything `emit_ddl` needs
+/// to render a `CREATE TABLE`. Backend-neutral (no `coddl-types`/`coddl-relir`
+/// surface), so the permanent-Rust backend can consume it across the
+/// self-hosting seam (`docs/principles.md`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Schema {
+    pub table: String,
+    /// The columns in heading-canonical (name-sorted) order — the fold that
+    /// builds a `Schema` supplies them sorted; `emit_ddl` renders them as given.
+    pub columns: Vec<Column>,
+    /// The candidate-key column names, name-sorted (a key is a set — RM Pro 1 —
+    /// so its SQL column order is arbitrary; name-sorting is the deterministic
+    /// choice). Non-empty for a base relvar (RM Pre 15).
+    pub pk: Vec<String>,
+}
+
+/// The CoddlType ↔ SQL base-type-keyword map (`docs/storage.md`) — the declared
+/// type string `PRAGMA table_info` reports (`INTEGER`/`TEXT`/`REAL`), which the
+/// schema-diff compares. A backend-neutral struct; each backend authors its own
+/// values (SQLite's live in `coddl-backend-sqlite`), so this stays free of any
+/// one dialect. The structural quirks a bare keyword can't carry — the Boolean
+/// `CHECK`, the Approximate NaN-channel nullability — are the backend
+/// `emit_ddl`'s job, not part of this keyword map.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeMap {
+    pub integer: &'static str,
+    pub text: &'static str,
+    pub boolean: &'static str,
+    pub rational: &'static str,
+    pub approximate: &'static str,
+    pub character: &'static str,
+}
+
+impl TypeMap {
+    /// The base SQL type keyword for a column kind.
+    pub fn sql_type(&self, kind: ColKind) -> &'static str {
+        match kind {
+            ColKind::Integer => self.integer,
+            ColKind::Text => self.text,
+            ColKind::Boolean => self.boolean,
+            ColKind::Rational => self.rational,
+            ColKind::Approximate => self.approximate,
+            ColKind::Character => self.character,
+        }
+    }
+}
+
+/// Opaque shape still used only by the not-yet-implemented temp-table path
+/// (`materialize_temp`); it gains a real definition when that lands.
 pub struct Tuple;
 
 /// A scalar value crossing the storage boundary — a bind parameter or a
@@ -1906,8 +1980,10 @@ fn push_qualified_leaf_cols(alias: &str, attr: &str, ty: &Type, out: &mut Vec<St
     }
 }
 
-/// Double-quote a SQL identifier, doubling any embedded quote.
-fn quote_ident(name: &str) -> String {
+/// Double-quote a SQL identifier, doubling any embedded quote. `pub` so the
+/// backend crates' DDL emission (`emit_ddl`) quote identifiers the same way the
+/// shared read/write emitters do.
+pub fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
@@ -4311,5 +4387,29 @@ mod tests {
             q.sql.text,
             r#"SELECT "id" AS "identifier", "message" FROM "greetings" WHERE "id" = ?1"#
         );
+    }
+
+    #[test]
+    fn type_map_sql_type_dispatches_each_kind_to_its_field() {
+        let tm = TypeMap {
+            integer: "INT",
+            text: "TXT",
+            boolean: "BOOL",
+            rational: "RAT",
+            approximate: "APX",
+            character: "CHR",
+        };
+        assert_eq!(tm.sql_type(ColKind::Integer), "INT");
+        assert_eq!(tm.sql_type(ColKind::Text), "TXT");
+        assert_eq!(tm.sql_type(ColKind::Boolean), "BOOL");
+        assert_eq!(tm.sql_type(ColKind::Rational), "RAT");
+        assert_eq!(tm.sql_type(ColKind::Approximate), "APX");
+        assert_eq!(tm.sql_type(ColKind::Character), "CHR");
+    }
+
+    #[test]
+    fn quote_ident_doubles_embedded_quotes() {
+        assert_eq!(quote_ident("sno"), r#""sno""#);
+        assert_eq!(quote_ident(r#"we"ird"#), r#""we""ird""#);
     }
 }

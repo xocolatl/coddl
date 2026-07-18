@@ -115,13 +115,21 @@ startup makes them relocatable today.
 
 ## Supported attribute types (v1)
 
-Public relvar attributes can be Integer, Boolean, or Text. The
-runtime's materialization marshals each cell via
-`record_layout::cell_kind` into the canonical byte layout
+Public relvar attributes can be Integer, Boolean, or Text at the
+runtime *read* path: the runtime's materialization marshals each cell
+via `record_layout::cell_kind` into the canonical byte layout
 (`docs/runtime.md`).
 
-Rational, Approximate, Character defer until the runtime adds per-cell
-codec entries. Nested **Tuple** and **Relation** cells are fully
+The DDL *write* path is wider. `coddl provision` (`docs/plan.md`)
+creates + seeds base tables through `emit_ddl`, which covers the full
+spellable-with-a-literal scalar set — Integer, Text,
+Boolean, Rational, Approximate, Character — so a `.cddb` INIT value can
+seed a Rational or Approximate column even though a compiled v1 program
+cannot yet *read* one back. That read/write asymmetry is the same
+per-cell-codec gap below, not a DDL limit.
+
+Rational, Approximate, Character defer (for reads) until the runtime adds
+per-cell codec entries. Nested **Tuple** and **Relation** cells are fully
 representable in relation *values* (query results / intermediates — the
 inline sub-region and the RC-pointer cell respectively, see
 `docs/runtime.md`), but neither is a legal *storage-backed column*: the
@@ -129,6 +137,47 @@ typechecker rejects a relation- or tuple-valued attribute in a `public`
 (`.cd`) or `base` (`.cddb`) relvar heading with **T0101** at check time
 (a `private` relvar is in-process state and takes any heading). The
 designed endpoint for persisting them is decomposition, below.
+
+## Schema vocabulary and DDL emission (v1)
+
+`Backend::emit_ddl(schema: &Schema) -> Vec<SqlString>` and
+`Backend::type_map() -> &TypeMap` render a base relvar's physical schema.
+Their inputs are the **neutral** column vocabulary in `coddl-sqlemit`
+(`Schema` / `Column` / `ColKind` / `TypeMap`) — deliberately free of any
+`coddl-types`/`coddl-relir` surface, so the permanent-Rust backend
+(`coddl-backend-sqlite`) consumes them across the self-hosting seam
+(`docs/principles.md`). The `coddl_types::Type → ColKind` fold lives up in
+`coddl-provision`, the crate that sees both the relational middle and the
+storage bottom; the backend only ever sees the neutral `Schema`.
+
+- `ColKind` covers the six spellable-with-a-literal scalars — Integer,
+  Text, Boolean, Rational, Approximate, Character. `Binary`/`Byte` are
+  literal-less (no INIT value is expressible) and are rejected by the
+  fold rather than mapped.
+- `Schema { table, columns: Vec<Column>, pk: Vec<String> }`. Columns
+  arrive **heading-sorted** (the fold supplies the order; `emit_ddl` is a
+  pure renderer and does not re-sort). `pk` is **name-sorted** and
+  non-empty — a candidate key is a set (RM Pro 1), so its SQL column order
+  is arbitrary and name-sorting is the deterministic canonical choice.
+- `Column.not_null` is **conceptual** totality (RM Pro 4) — true for every
+  real relvar column. Physical nullability is the backend's call.
+- `TypeMap` is just the `ColKind → base-SQL-keyword` map (what
+  `PRAGMA table_info` reports: `INTEGER`/`TEXT`/`REAL`). Each backend
+  authors its own values (SQLite's live in `coddl-backend-sqlite`); the
+  schema-diff (`coddl provision`) compares against it. Structural quirks a
+  bare keyword can't carry stay in `emit_ddl`.
+
+The SQLite `emit_ddl` renders one `CREATE TABLE` per relvar following the
+`docs/sqlemit.md` rules: every total column `NOT NULL` **except** an
+`Approximate` (`REAL`), which stays nullable so SQLite can encode the
+`NaN` value as `NULL` (the sanctioned NaN channel — a `NOT NULL` `REAL`
+column would reject a legitimate NaN store; see `value_to_sqlite`); a
+`Boolean` `INTEGER` gets `CHECK (col IN (0, 1))`; the key is a
+**table-level** `PRIMARY KEY(…)`, never an inline `INTEGER PRIMARY KEY`
+(whose rowid-alias would accept NULL); and every identifier is routed
+through `quote_ident`. Postgres, which stores NaN natively, will make its
+Approximate columns `NOT NULL` — which is exactly why `emit_ddl` is a
+per-backend method rather than a shared emitter.
 
 ## Nested attributes: the decomposition endpoint (designed, not built)
 
