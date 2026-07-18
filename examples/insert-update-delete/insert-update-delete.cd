@@ -13,7 +13,7 @@ private relvar Greetings { id: Integer, message: Text } key { id };
 private relvar Stale { id: Integer, message: Text } key { id };
 private relvar NewArrivals { id: Integer, message: Text } key { id };
 
-oper main {} [
+oper main{} [
     Greetings := Relation {
         { id: 1, message: "hello world" },
         { id: 2, message: "goodbye" },
@@ -30,7 +30,7 @@ oper main {} [
         { id: 4, message: "so long" },
         { id: 5, message: "howdy" },
     };
-    write_relation { rel: Greetings };
+    write_relation{ rel: Greetings };
 
     // Remove one tuple by predicate. `delete Greetings where id = 1` is sugar
     // for `Greetings := Greetings minus (Greetings where id = 1)` — the rows
@@ -54,20 +54,20 @@ oper main {} [
     // `Greetings := (Greetings where id <> 5) union ((Greetings where id = 5)
     // replace { message: … })`.
     update Greetings where id = 5 { message: message || " (seen)" };
-    write_relation { rel: Greetings };
+    write_relation{ rel: Greetings };
 
     // Keep only the rows that don't match a predicate — `Greetings where id <> 5`
     // drops id 5. Greetings is on both sides, so it's an incremental change.
     Greetings := Greetings where id <> 5;
-    write_relation { rel: Greetings };
+    write_relation{ rel: Greetings };
 
     // Replace the whole relvar. The right-hand side doesn't mention Greetings, so
     // it's a reset, not an incremental change.
     Greetings := Relation { { id: 1, message: "fresh start" } };
-    write_relation { rel: Greetings };
+    write_relation{ rel: Greetings };
 
     // Clear the relvar entirely. `truncate Greetings` is sugar for
     // `Greetings := Greetings minus Greetings` — the whole-relvar delete.
     truncate Greetings;
-    write_relation { rel: Greetings };
+    write_relation{ rel: Greetings };
 ];

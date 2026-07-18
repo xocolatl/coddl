@@ -9,9 +9,10 @@
 //
 // The .cd-family (storage stays out of D):
 //   tclose-db.cd   — this program: the external schema + closures
-//   tclose.cddb    — database catalog (conceptual schema)
+//   tclose.cddb    — database catalog (conceptual schema) + INIT values
 //   tclose.cdstore — conceptual -> physical (SQLite) binding
-//   seed-db.sh     — recreates tclose.sqlite with the demo data
+//
+// Seed the store from the catalog: `coddl provision tclose.cddb`.
 //
 // `public` relvars are read-only, so there is no `:=` — the data lives in the
 // seeded database. A public-relvar read must sit inside a `transaction [...]`.
@@ -34,19 +35,19 @@ public relvar Contains {
     qty: Integer,
 } key { major, minor };
 
-oper main {} [
+oper main{} [
     // Baseline: the direct edges — pushes a plain `SELECT "from", "to" FROM ...`.
     let direct = transaction [
         Edges
     ];
-    write_relation { rel: direct };
+    write_relation{ rel: direct };
 
     // Bare form: `Edges tclose` pushes one `WITH RECURSIVE` over the edge set.
     // Reachability adds 1->3, 2->4, 1->4 on top of the direct 1->2, 2->3, 3->4.
     let reachable = transaction [
         Edges tclose
     ];
-    write_relation { rel: reachable };
+    write_relation{ rel: reachable };
 
     // Brace form: pick { major, minor } out of the ternary `Contains` (dropping
     // qty), then close — the operand SELECT narrows inside the recursive CTE.
@@ -54,5 +55,5 @@ oper main {} [
     let all_parts = transaction [
         Contains tclose { major, minor }
     ];
-    write_relation { rel: all_parts };
+    write_relation{ rel: all_parts };
 ];

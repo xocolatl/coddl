@@ -26,7 +26,7 @@ private relvar Sales {
     qty: Integer,
 } key { id };
 
-oper main {} [
+oper main{} [
     Sales := Relation {
         { id: 1, customer: "ada", item: "widget", unit_cents: 500, qty: 3 },
         { id: 2, customer: "bo", item: "gadget", unit_cents: 800, qty: 2 },
@@ -35,28 +35,28 @@ oper main {} [
     // extend: add a computed `line_cents = unit_cents * qty`, KEEPING the
     // inputs. The per-tuple multiply runs in-process.
     let priced = Sales extend { line_cents: unit_cents * qty };
-    write_relation { rel: priced };
+    write_relation{ rel: priced };
 
     // replace COLLAPSE: the SAME `unit_cents * qty`, but `replace` CONSUMES the
     // attributes the value reads — `unit_cents` and `qty` are gone, `line_cents`
     // takes their place. This is the heart of the example: extend keeps, replace
     // consumes.
     let collapsed = Sales replace { line_cents: unit_cents * qty };
-    write_relation { rel: collapsed };
+    write_relation{ rel: collapsed };
 
     // replace IN-PLACE: the new name `qty` is also read by the value, so the old
     // `qty` is consumed and the updated one re-added — a heading-preserving
     // update ("bump the quantity").
     let bumped = Sales replace { qty: qty + 1 };
-    write_relation { rel: bumped };
+    write_relation{ rel: bumped };
 
     // replace COLLAPSE via concatenation: a '-' Character separator. `customer`
     // and `item` are consumed into `handle`.
     let handled = Sales replace { handle: customer || '-' || item };
-    write_relation { rel: handled };
+    write_relation{ rel: handled };
 
     // rename: id -> ref. The strict relabel-only operator — the value must be a
     // bare attribute reference; a computed value here would be a `replace`.
     let reffed = Sales rename { ref: id };
-    write_relation { rel: reffed };
+    write_relation{ rel: reffed };
 ];

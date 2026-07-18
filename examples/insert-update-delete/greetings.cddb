@@ -6,6 +6,15 @@ base relvar Greetings {
 }
 key { id };
 
+// INIT values (TTM base-relvar initializers): `coddl provision` seeds each
+// relvar once, at creation time, through the type map in greetings.cdstore.
+Greetings := Relation {
+    { id: 1, message: "hello world" },
+    { id: 2, message: "goodbye" },
+    { id: 3, message: "farewell" },
+    { id: 4, message: "so long" },
+};
+
 // Tuples slated for removal — same heading as Greetings, so it can be
 // subtracted from it.
 base relvar Stale {
@@ -14,9 +23,22 @@ base relvar Stale {
 }
 key { id };
 
+// Exact tuples to purge from Greetings (matched on id AND message).
+Stale := Relation {
+    { id: 2, message: "goodbye" },
+    { id: 3, message: "farewell" },
+};
+
 // Tuples to add — same heading again, so it can be unioned into Greetings.
 base relvar NewArrivals {
     id: Integer,
     message: Text,
 }
 key { id };
+
+// Tuples to add. (4, "so long") is already present in Greetings, so the
+// union is a no-op for it (idempotent); (5, "howdy") is genuinely new.
+NewArrivals := Relation {
+    { id: 4, message: "so long" },
+    { id: 5, message: "howdy" },
+};

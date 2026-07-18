@@ -14,18 +14,43 @@ base relvar Employees {
 }
 key { emp_id };
 
+// INIT values (TTM base-relvar initializers): `coddl provision` seeds each
+// relvar once, at creation time, through the type map in staffing.cdstore.
+Employees := Relation {
+    { emp_id: 1, emp_name: "Ada", dept_id: 10 },
+    { emp_id: 2, emp_name: "Grace", dept_id: 10 },
+    { emp_id: 3, emp_name: "Alan", dept_id: 20 },
+    { emp_id: 4, emp_name: "Edsger", dept_id: 30 },
+};
+
 base relvar Departments {
     dept_id: Integer,
     dept_name: Text,
 }
 key { dept_id };
 
+Departments := Relation {
+    { dept_id: 10, dept_name: "Engineering" },
+    { dept_id: 20, dept_name: "Sales" },
+    { dept_id: 30, dept_name: "Marketing" },
+};
+
 base relvar JobTitles {
     title: Text,
 }
 key { title };
 
+JobTitles := Relation {
+    { title: "Engineer" },
+    { title: "Manager" },
+};
+
 base relvar Locations {
     location: Text,
 }
 key { location };
+
+Locations := Relation {
+    { location: "London" },
+    { location: "Paris" },
+};

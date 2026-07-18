@@ -15,9 +15,10 @@
 //
 // The .cd-family (storage stays out of D):
 //   extend-replace-rename-db.cd  — this program: the external schema + queries
-//   sales.cddb                   — database catalog (conceptual schema)
+//   sales.cddb                   — database catalog (conceptual schema) + INIT values
 //   sales.cdstore                — conceptual -> physical (SQLite) binding
-//   seed-db.sh                   — recreates sales.sqlite with the demo data
+//
+// Seed the store from the catalog: `coddl provision sales.cddb`.
 //
 // `public` relvars are read-only, so there is no `:=` — the data lives in the
 // seeded database. A public-relvar read must sit inside a `transaction [...]`.
@@ -35,13 +36,13 @@ public relvar Sales {
     qty: Integer,
 } key { id };
 
-oper main {} [
+oper main{} [
     // extend: add a computed `line_cents = unit_cents * qty`, KEEPING the
     // inputs. Pushes one `SELECT …, ("unit_cents" * "qty") AS "line_cents" …`.
     let priced = transaction [
         Sales extend { line_cents: unit_cents * qty }
     ];
-    write_relation { rel: priced };
+    write_relation{ rel: priced };
 
     // replace COLLAPSE: the SAME `unit_cents * qty`, but `replace` CONSUMES the
     // inputs — pushes `SELECT …, ("unit_cents" * "qty") AS "line_cents" …` with
@@ -49,26 +50,26 @@ oper main {} [
     let collapsed = transaction [
         Sales replace { line_cents: unit_cents * qty }
     ];
-    write_relation { rel: collapsed };
+    write_relation{ rel: collapsed };
 
     // replace IN-PLACE: pushes `SELECT …, ("qty" + 1) AS "qty", … FROM "sales"`
     // — the value reads `qty`, so the column is updated in place.
     let bumped = transaction [
         Sales replace { qty: qty + 1 }
     ];
-    write_relation { rel: bumped };
+    write_relation{ rel: bumped };
 
     // replace COLLAPSE via concatenation ('-' Character separator): pushes
     // `SELECT …, (("customer" || '-') || "item") AS "handle" …`.
     let handled = transaction [
         Sales replace { handle: customer || '-' || item }
     ];
-    write_relation { rel: handled };
+    write_relation{ rel: handled };
 
     // rename: id -> ref. The strict relabel-only operator (value is a bare
     // attribute reference) pushes `SELECT "id" AS "ref", … FROM "sales"`.
     let reffed = transaction [
         Sales rename { ref: id }
     ];
-    write_relation { rel: reffed };
+    write_relation{ rel: reffed };
 ];

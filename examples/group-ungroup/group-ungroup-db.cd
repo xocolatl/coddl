@@ -12,9 +12,10 @@
 //
 // The .cd-family (storage stays out of D):
 //   group-ungroup-db.cd  — this program: the external schema + queries
-//   shipments.cddb       — database catalog (conceptual schema)
+//   shipments.cddb       — database catalog (conceptual schema) + INIT values
 //   shipments.cdstore    — conceptual -> physical (SQLite) binding
-//   seed-db.sh           — recreates shipments.sqlite with the demo data
+//
+// Seed the store from the catalog: `coddl provision shipments.cddb`.
 //
 // `public` relvars are read-only, so each read sits inside a `transaction [...]`.
 

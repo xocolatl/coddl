@@ -8,9 +8,10 @@
 //
 // The .cd-family (storage stays out of D):
 //   union-intersect-minus-db.cd  — this program: the external schema + queries
-//   shifts.cddb                  — database catalog (conceptual schema)
+//   shifts.cddb                  — database catalog (conceptual schema) + INIT values
 //   shifts.cdstore               — conceptual -> physical (SQLite) binding
-//   seed-db.sh                   — recreates shifts.sqlite with the demo data
+//
+// Seed the store from the catalog: `coddl provision shifts.cddb`.
 //
 // `public` relvars are read-only, so there is no `:=` — the data lives in the seeded
 // database. A public-relvar read must sit inside a `transaction [...]` block.
@@ -28,33 +29,33 @@ public relvar Evening {
     name: Text,
 } key { id };
 
-oper main {} [
+oper main{} [
     // Baseline: dump each raw relvar — pushes one `SELECT "id", "name" FROM ...`.
     let m = transaction [
         Morning
     ];
-    write_relation { rel: m };
+    write_relation{ rel: m };
 
     let e = transaction [
         Evening
     ];
-    write_relation { rel: e };
+    write_relation{ rel: e };
 
     // intersect: pushes one `INNER JOIN "evening" USING ("id", "name")`.
     let both = transaction [
         Morning intersect Evening
     ];
-    write_relation { rel: both };
+    write_relation{ rel: both };
 
     // union: pushes one `SELECT ... FROM "morning" UNION SELECT ... FROM "evening"`.
     let either = transaction [
         Morning union Evening
     ];
-    write_relation { rel: either };
+    write_relation{ rel: either };
 
     // minus: pushes one `SELECT ... FROM "morning" EXCEPT SELECT ... FROM "evening"`.
     let morning_only = transaction [
         Morning minus Evening
     ];
-    write_relation { rel: morning_only };
+    write_relation{ rel: morning_only };
 ];

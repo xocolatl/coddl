@@ -31,3 +31,11 @@ base relvar Greetings {
     message: Text,
 }
 key { id };
+
+// The base relvar's INIT value (TTM base-relvar initializer): the single
+// greeting the database holds when first provisioned. `coddl provision`
+// applies it once, at creation time, through the type map in
+// greetings.cdstore — replacing the old hand-written seed-db.sh.
+Greetings := Relation {
+    { id: 1, message: "hello world" },
+};

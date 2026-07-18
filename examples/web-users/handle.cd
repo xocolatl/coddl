@@ -17,14 +17,13 @@ library web_users;
 //
 // The .cd-family (storage stays out of D — RM Pro 6):
 //   handle.cd       — this program: the external schema + the handler
-//   users.cddb      — database catalog (conceptual schema)
+//   users.cddb      — database catalog (conceptual schema) + INIT values
 //   users.cdstore   — conceptual -> physical (SQLite) binding
-//   seed-db.sh      — recreates users.sqlite with the demo data
 //
 // There is no `main`: a handler module is compiled *mainless* and linked into
 // the `coddl-web` host that owns the socket loop. Run it end-to-end:
 //
-//   sh examples/web-users/seed-db.sh
+//   coddl provision examples/web-users/users.cddb
 //   coddl emit-obj examples/web-users/handle.cd -o /tmp/handle.o
 //   CODDL_APP_OBJ=/tmp/handle.o \
 //     CODDL_USERS_FILE=$PWD/examples/web-users/users.sqlite \

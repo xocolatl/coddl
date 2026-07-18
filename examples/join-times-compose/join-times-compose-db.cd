@@ -8,9 +8,10 @@
 //
 // The .cd-family (storage stays out of D):
 //   join-times-compose-db.cd  — this program: the external schema + queries
-//   staffing.cddb             — database catalog (conceptual schema)
+//   staffing.cddb             — database catalog (conceptual schema) + INIT values
 //   staffing.cdstore          — conceptual -> physical (SQLite) binding
-//   seed-db.sh                — recreates staffing.sqlite with the demo data
+//
+// Seed the store from the catalog: `coddl provision staffing.cddb`.
 //
 // `public` relvars are read-only, so there is no `:=` — the data lives in the seeded
 // database. A public-relvar read must sit inside a `transaction [...]` block, which each
@@ -38,30 +39,30 @@ public relvar Locations {
     location: Text,
 } key { location };
 
-oper main {} [
+oper main{} [
     // join: pushes one `INNER JOIN ... USING (dept_id)`.
     let staffed = transaction [
         Employees join Departments
     ];
-    write_relation { rel: staffed };
+    write_relation{ rel: staffed };
 
     // times: disjoint headings, so it pushes one `CROSS JOIN`.
     let grid = transaction [
         JobTitles times Locations
     ];
-    write_relation { rel: grid };
+    write_relation{ rel: grid };
 
     // compose: join on `dept_id`, then drop it — pushes the join with `dept_id`
     // removed from the SELECT.
     let dept_names = transaction [
         Employees compose Departments
     ];
-    write_relation { rel: dept_names };
+    write_relation{ rel: dept_names };
 
     // a join feeding `where` and `project`: pushes as one
     // `... INNER JOIN ... WHERE "dept_name" = ?` selecting { dept_name, emp_name }.
     let eng = transaction [
         (Employees join Departments) where dept_name = "Engineering" project { emp_name, dept_name }
     ];
-    write_relation { rel: eng };
+    write_relation{ rel: eng };
 ];

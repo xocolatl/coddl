@@ -12,3 +12,11 @@ base relvar Shipments {
     qty: Integer,
 }
 key { supplier, part };
+
+// INIT value (TTM base-relvar initializer): `coddl provision` seeds these
+// rows once, at creation time, through the type map in shipments.cdstore.
+Shipments := Relation {
+    { supplier: "S1", part: "P1", qty: 300 },
+    { supplier: "S1", part: "P2", qty: 200 },
+    { supplier: "S2", part: "P1", qty: 100 },
+};

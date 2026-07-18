@@ -12,3 +12,10 @@ base relvar Points {
     y: Integer,
 }
 key { id };
+
+// INIT value (TTM base-relvar initializer): `coddl provision` seeds these
+// rows once, at creation time, through the type map in points.cdstore.
+Points := Relation {
+    { id: 1, x: 10, y: 20 },
+    { id: 2, x: 30, y: 40 },
+};

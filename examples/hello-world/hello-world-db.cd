@@ -42,12 +42,12 @@ public relvar Greetings {
     message: Text,
 } key { id };
 
-oper main {} [
+oper main{} [
     let greeting = transaction [
         extract (Greetings where id = 1 project { message })
     ];
 
     let message = greeting.message;
 
-    write_line { message };
+    write_line{ message };
 ];

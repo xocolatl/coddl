@@ -30,7 +30,7 @@ private relvar Contains {
     qty: Integer,
 } key { major, minor };
 
-oper main {} [
+oper main{} [
     Edges := Relation {
         { from: 1, to: 2 },
         { from: 2, to: 3 },
@@ -45,16 +45,16 @@ oper main {} [
     };
 
     // Baseline: the direct edges.
-    write_relation { rel: Edges };
+    write_relation{ rel: Edges };
 
     // Bare form: the operand is already binary, so `Edges tclose` closes it.
     // Reachability adds 1->3, 2->4, 1->4 on top of the direct 1->2, 2->3, 3->4.
     let reachable = Edges tclose;
-    write_relation { rel: reachable };
+    write_relation{ rel: reachable };
 
     // Brace form: pick { major, minor } out of the ternary `Contains` (dropping
     // qty), then close. The transitive containment adds 1->4 (bicycle->spoke,
     // via the wheel) and 1->5 (bicycle->tube, via the frame).
     let all_parts = Contains tclose { major, minor };
-    write_relation { rel: all_parts };
+    write_relation{ rel: all_parts };
 ];

@@ -1,0 +1,100 @@
+// suppliersandparts.cddb
+//
+// The database catalog (conceptual schema) for the `suppliersandparts`
+// database — Date & Darwen's canonical suppliers-and-parts example, the
+// running example throughout *Databases, Types, and the Relational
+// Model: The Third Manifesto*.
+//
+// File naming: keyed on the *database* name. The `database <name>;`
+// header below is `suppliersandparts` (a Coddl identifier — no hyphens,
+// since `-` is not an identifier character), so the catalog is
+// `suppliersandparts.cddb` and its physical binding is
+// `suppliersandparts.cdstore`. The directory (`suppliers-and-parts/`) is
+// just the example's display name and need not match.
+//
+// What lives here (RM Pro 6 — no internal-level constructs in source):
+//   - The conceptual schema: each `base relvar` names its heading
+//     (attributes + types) and its candidate `key`. No file paths, no
+//     SQL column types, no connection strings — those are the physical
+//     concern of `suppliersandparts.cdstore`.
+//   - An initial value per relvar (`S := Relation { … };`). This is the
+//     TTM base-relvar INIT value: the value the relvar holds when the
+//     database is first *provisioned*. It is applied once, at creation
+//     time (`coddl provision`), not on every program run — the same
+//     semantics as Tutorial D's `VAR … REAL … INIT (…)`. Because a
+//     relvar's definition lives in the catalog, its initial value
+//     legitimately lives here too. The RHS is a ground relation literal
+//     (constant tuples only).
+//
+// To materialize this catalog into its physical store:
+//
+//     coddl provision examples/suppliers-and-parts/suppliersandparts.cddb
+//
+// which creates each table (via the type map in the `.cdstore`) and
+// seeds it with the INIT value below. This replaces the old
+// `seed-db.sh`, which hand-wrote CREATE TABLE + INSERT in raw SQLite.
+
+database suppliersandparts;
+
+// ── Suppliers ────────────────────────────────────────────────────────
+// sno is the supplier number (the key); status and city carry the
+// classic Date sample data.
+base relvar S {
+    sno: Text,
+    sname: Text,
+    status: Integer,
+    city: Text,
+} key { sno };
+
+S := Relation {
+    { sno: "S1", sname: "Smith", status: 20, city: "London" },
+    { sno: "S2", sname: "Jones", status: 10, city: "Paris" },
+    { sno: "S3", sname: "Blake", status: 30, city: "Paris" },
+    { sno: "S4", sname: "Clark", status: 20, city: "London" },
+    { sno: "S5", sname: "Adams", status: 30, city: "Athens" },
+};
+
+// ── Parts ────────────────────────────────────────────────────────────
+// weight is a Rational (12.0, 17.0, …) — the physical binding stores it
+// as TEXT "n/d"; note that reading Rational columns back at runtime is
+// still gated by the storage read-codec (docs/storage.md). pno is the key.
+base relvar P {
+    pno: Text,
+    pname: Text,
+    color: Text,
+    weight: Rational,
+    city: Text,
+} key { pno };
+
+P := Relation {
+    { pno: "P1", pname: "Nut", color: "Red", weight: 12.0, city: "London" },
+    { pno: "P2", pname: "Bolt", color: "Green", weight: 17.0, city: "Paris" },
+    { pno: "P3", pname: "Screw", color: "Blue", weight: 17.0, city: "Oslo" },
+    { pno: "P4", pname: "Screw", color: "Red", weight: 14.0, city: "London" },
+    { pno: "P5", pname: "Cam", color: "Blue", weight: 12.0, city: "Paris" },
+    { pno: "P6", pname: "Cog", color: "Red", weight: 19.0, city: "London" },
+};
+
+// ── Shipments ────────────────────────────────────────────────────────
+// The many-to-many relationship: which supplier ships which part, and
+// how much. The key is the composite { sno, pno }.
+base relvar SP {
+    sno: Text,
+    pno: Text,
+    qty: Integer,
+} key { sno, pno };
+
+SP := Relation {
+    { sno: "S1", pno: "P1", qty: 300 },
+    { sno: "S1", pno: "P2", qty: 200 },
+    { sno: "S1", pno: "P3", qty: 400 },
+    { sno: "S1", pno: "P4", qty: 200 },
+    { sno: "S1", pno: "P5", qty: 100 },
+    { sno: "S1", pno: "P6", qty: 100 },
+    { sno: "S2", pno: "P1", qty: 300 },
+    { sno: "S2", pno: "P2", qty: 400 },
+    { sno: "S3", pno: "P2", qty: 200 },
+    { sno: "S4", pno: "P2", qty: 200 },
+    { sno: "S4", pno: "P4", qty: 300 },
+    { sno: "S4", pno: "P5", qty: 400 },
+};

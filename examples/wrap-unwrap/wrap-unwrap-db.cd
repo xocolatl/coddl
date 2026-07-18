@@ -11,9 +11,10 @@
 //
 // The .cd-family (storage stays out of D):
 //   wrap-unwrap-db.cd  — this program: the external schema + queries
-//   points.cddb        — database catalog (conceptual schema)
+//   points.cddb        — database catalog (conceptual schema) + INIT values
 //   points.cdstore     — conceptual -> physical (SQLite) binding
-//   seed-db.sh         — recreates points.sqlite with the demo data
+//
+// Seed the store from the catalog: `coddl provision points.cddb`.
 //
 // `public` relvars are read-only, so each read sits inside a `transaction [...]`.
 
@@ -26,17 +27,17 @@ public relvar Points {
     y: Integer,
 } key { id };
 
-oper main {} [
+oper main{} [
     // wrap: group `x` and `y` into a tuple-valued attribute `pt`. Pushes to SQL
     // as a flat leaf-column SELECT; the result materializes nested.
     let wrapped = transaction [
         Points wrap { pt: { x, y } }
     ];
-    write_relation { rel: wrapped };
+    write_relation{ rel: wrapped };
 
     // round-trip: `unwrap` recovers the original heading.
     let back = transaction [
         Points wrap { pt: { x, y } } unwrap { pt }
     ];
-    write_relation { rel: back };
+    write_relation{ rel: back };
 ];

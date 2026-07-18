@@ -22,7 +22,7 @@ private relvar Points {
     y: Integer,
 } key { id };
 
-oper main {} [
+oper main{} [
     Points := Relation {
         { id: 1, x: 10, y: 20 },
         { id: 2, x: 30, y: 40 },
@@ -31,15 +31,15 @@ oper main {} [
     // wrap: group `x` and `y` into a tuple-valued attribute `pt`. `id` survives;
     // `x`/`y` are consumed into `pt`, which prints nested as `pt: {x: .., y: ..}`.
     let wrapped = Points wrap { pt: { x, y } };
-    write_relation { rel: wrapped };
+    write_relation{ rel: wrapped };
 
     // round-trip: `unwrap` recovers the original heading — `wrap` then `unwrap`
     // of the same attribute is the identity.
     let back = Points wrap { pt: { x, y } } unwrap { pt };
-    write_relation { rel: back };
+    write_relation{ rel: back };
 
     // the tuple-valued attribute flows through `project` intact (the whole tuple
     // cell is kept, not truncated).
     let just_pt = Points wrap { pt: { x, y } } project { pt };
-    write_relation { rel: just_pt };
+    write_relation{ rel: just_pt };
 ];

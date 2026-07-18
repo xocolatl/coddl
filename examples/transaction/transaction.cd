@@ -13,9 +13,9 @@
 
 program transaction_demo;
 
-oper main {} [
+oper main{} [
     let ok = transaction [
         "ok"
     ];
-    write_line { message: ok };
+    write_line{ message: ok };
 ];

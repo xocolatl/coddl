@@ -12,3 +12,15 @@ base relvar Users {
     active: Boolean,
 }
 key { id };
+
+// INIT value (TTM base-relvar initializer): `coddl provision` seeds these
+// rows once, at creation time, through the type map in users.cdstore. The
+// Boolean `active` stores as an INTEGER (0/1) via that type map — the
+// catalog stays conceptual (`true`/`false`), the physical encoding is the
+// store's concern.
+Users := Relation {
+    { id: 1, name: "Alice", email: "alice@example.com", active: true },
+    { id: 2, name: "Bob", email: "bob@example.com", active: false },
+    { id: 3, name: "Carol", email: "carol@example.com", active: true },
+    { id: 4, name: "Dave", email: "dave@example.com", active: false },
+};

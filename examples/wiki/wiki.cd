@@ -67,14 +67,13 @@ library wiki;
 //
 // The .cd-family (storage stays out of D — RM Pro 6):
 //   wiki.cd       — this library: the external schema + the router
-//   wiki.cddb     — database catalog (conceptual schema)
+//   wiki.cddb     — database catalog (conceptual schema) + INIT values
 //   wiki.cdstore  — conceptual -> physical (SQLite) binding
-//   seed-db.sh    — recreates wiki.sqlite with the demo pages
 //
 // Run it end-to-end (once the pieces above land; there is no `main` — a
 // handler library is compiled mainless):
 //
-//   sh examples/wiki/seed-db.sh
+//   coddl provision examples/wiki/wiki.cddb
 //   coddl emit-obj examples/wiki/wiki.cd -o /tmp/wiki.o
 //   CODDL_APP_OBJ=/tmp/wiki.o \
 //     CODDL_WIKI_FILE=$PWD/examples/wiki/wiki.sqlite \

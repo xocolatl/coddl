@@ -12,8 +12,22 @@ base relvar Morning {
 }
 key { id };
 
+// INIT values (TTM base-relvar initializers): `coddl provision` seeds each
+// relvar once, at creation time, through the type map in shifts.cdstore.
+Morning := Relation {
+    { id: 1, name: "Ada" },
+    { id: 2, name: "Grace" },
+    { id: 3, name: "Alan" },
+};
+
 base relvar Evening {
     id: Integer,
     name: Text,
 }
 key { id };
+
+Evening := Relation {
+    { id: 2, name: "Grace" },
+    { id: 3, name: "Alan" },
+    { id: 4, name: "Edsger" },
+};

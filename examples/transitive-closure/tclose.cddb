@@ -12,9 +12,26 @@ base relvar Edges {
 }
 key { from, to };
 
+// INIT values (TTM base-relvar initializers): `coddl provision` seeds each
+// relvar once, at creation time, through the type map in tclose.cdstore.
+// `from`/`to` are ordinary Coddl attribute names (not reserved words); the
+// SQLite emitter quotes them because they are reserved in SQL.
+Edges := Relation {
+    { from: 1, to: 2 },
+    { from: 2, to: 3 },
+    { from: 3, to: 4 },
+};
+
 base relvar Contains {
     major: Integer,
     minor: Integer,
     qty: Integer,
 }
 key { major, minor };
+
+Contains := Relation {
+    { major: 1, minor: 2, qty: 2 },
+    { major: 1, minor: 3, qty: 1 },
+    { major: 2, minor: 4, qty: 32 },
+    { major: 3, minor: 5, qty: 1 },
+};

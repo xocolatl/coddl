@@ -11,3 +11,10 @@ base relvar Pages {
     body: Text,
 }
 key { slug };
+
+// INIT value (TTM base-relvar initializer): `coddl provision` seeds these
+// pages once, at creation time, through the type map in wiki.cdstore.
+Pages := Relation {
+    { slug: "home", title: "Home", body: "Welcome to the wiki." },
+    { slug: "about", title: "About", body: "This wiki is built in Coddl." },
+};

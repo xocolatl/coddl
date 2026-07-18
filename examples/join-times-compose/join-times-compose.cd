@@ -48,7 +48,7 @@ private relvar Locations {
 
 // main: populate the relvars by relational assignment (`R := <relation literal>`),
 // then dump each query. A relation is a set, so the printed tuple order is unspecified.
-oper main {} [
+oper main{} [
     Departments := Relation {
         { dept_id: 10, dept_name: "Engineering" },
         { dept_id: 20, dept_name: "Sales" },
@@ -76,20 +76,20 @@ oper main {} [
     // Result heading { dept_id, dept_name, emp_id, emp_name }. Private relvars are
     // plain in-memory values, so no `transaction` is needed (unlike the SQL twin).
     let staffed = Employees join Departments;
-    write_relation { rel: staffed };
+    write_relation{ rel: staffed };
 
     // times: the Cartesian product of the two disjoint relvars — every
     // (title, location) pairing. Result heading { location, title }.
     let grid = JobTitles times Locations;
-    write_relation { rel: grid };
+    write_relation{ rel: grid };
 
     // compose: join on `dept_id`, then remove it — each employee paired with its
     // department's name. Result heading { dept_name, emp_id, emp_name }.
     let dept_names = Employees compose Departments;
-    write_relation { rel: dept_names };
+    write_relation{ rel: dept_names };
 
     // a join feeding `where` and `project`: restrict the join to the Engineering
     // department, then keep only { emp_name, dept_name }. Result: Ada and Grace.
     let eng = (Employees join Departments) where dept_name = "Engineering" project { emp_name, dept_name };
-    write_relation { rel: eng };
+    write_relation{ rel: eng };
 ];

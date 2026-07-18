@@ -5,10 +5,10 @@
 // recognizes the right-hand-side shape and emits the surgical SQL.
 //
 //   greetings.cddb    declares the base relvars (Greetings, Stale, NewArrivals)
+//                     and their INIT values (Greetings 1..4, Stale 2,3, NewArrivals 4,5)
 //   greetings.cdstore binds them to SQLite tables
-//   seed-db.sh        creates greetings.sqlite (Greetings 1..4, Stale 2,3, NewArrivals 4,5)
 //
-// Run:  ./seed-db.sh && coddl run insert-update-delete-db.cd
+// Run:  coddl provision greetings.cddb && coddl run insert-update-delete-db.cd
 
 program insert_update_delete_db;
 database greetings;
@@ -17,12 +17,12 @@ public relvar Greetings { id: Integer, message: Text } key { id };
 public relvar Stale { id: Integer, message: Text } key { id };
 public relvar NewArrivals { id: Integer, message: Text } key { id };
 
-oper main {} [
+oper main{} [
     // Every database access sits inside a transaction.
     let before = transaction [
         Greetings
     ];
-    write_relation { rel: before };
+    write_relation{ rel: before };
 
     // Remove one tuple by predicate. `delete Greetings where id = 1` is sugar
     // for `Greetings := Greetings minus (Greetings where id = 1)` — the same
@@ -66,7 +66,7 @@ oper main {} [
     let after = transaction [
         Greetings
     ];
-    write_relation { rel: after };
+    write_relation{ rel: after };
 
     // Keep only the rows that *don't* match a predicate by deleting their
     // complement. `Greetings where id <> 5` keeps every row but id 5 — assigning
@@ -79,7 +79,7 @@ oper main {} [
     let kept = transaction [
         Greetings
     ];
-    write_relation { rel: kept };
+    write_relation{ rel: kept };
 
     // Replace the whole relvar. The right-hand side doesn't mention Greetings, so
     // this isn't an incremental change — it's a reset: `DELETE FROM greetings`
@@ -91,7 +91,7 @@ oper main {} [
     let reset = transaction [
         Greetings
     ];
-    write_relation { rel: reset };
+    write_relation{ rel: reset };
 
     // Clear the relvar entirely. `truncate Greetings` is sugar for
     // `Greetings := Greetings minus Greetings`, recognized as a whole-table
@@ -102,5 +102,5 @@ oper main {} [
     let cleared = transaction [
         Greetings
     ];
-    write_relation { rel: cleared };
+    write_relation{ rel: cleared };
 ];
