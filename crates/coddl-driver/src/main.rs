@@ -27,6 +27,7 @@ fn main() -> ExitCode {
         Some("emit-obj") => cmd_emit_obj(&args[2..]),
         Some("compile") => cmd_compile(&args[2..]),
         Some("run") => cmd_run(&args[2..]),
+        Some("provision") => cmd_provision(&args[2..]),
         Some("fmt") => cmd_fmt(&args[2..]),
         _ => {
             eprintln!("usage: coddl <subcommand> [args]");
@@ -50,6 +51,8 @@ fn main() -> ExitCode {
             eprintln!("                       [-o <path>] (default <basename> in CWD)");
             eprintln!("  run <file>           compile + run <file>, propagating exit code");
             eprintln!("                       [--backend=llvm|cranelift] (default cranelift)");
+            eprintln!("  provision <file>     reconcile a database to its <file>.cddb catalog:");
+            eprintln!("                       create-or-verify each base table, then re-seed INIT");
             eprintln!("  fmt <file>           run the formatter on <file> (or stdin if -)");
             eprintln!("                       [--check] verify formatting (exit 1 if not),");
             eprintln!("                       [--write] reformat the file in place");
@@ -945,6 +948,82 @@ fn cmd_run(args: &[String]) -> ExitCode {
     match status.code() {
         Some(code) => ExitCode::from(code as u8),
         None => ExitCode::from(128), // killed by signal
+    }
+}
+
+/// `coddl provision <file>.cddb` — reconcile the database the catalog declares
+/// to its state: create-or-verify each base table, then truncate + re-seed it to
+/// its INIT value, all in one transaction. The input must be a `.cddb` catalog
+/// (stdin has no sibling `.cdstore` to resolve, so it is rejected). The target
+/// file is resolved exactly as the compiled runtime will (`CODDL_<DBNAME>_FILE`,
+/// else the `.cdstore` default) — `provision` and `run` hit the same database.
+fn cmd_provision(args: &[String]) -> ExitCode {
+    let path = match args.first().map(String::as_str) {
+        Some("-") | None => {
+            eprintln!("coddl provision: requires a `.cddb` file path (stdin is unsupported)");
+            return ExitCode::from(2);
+        }
+        Some(p) => PathBuf::from(p),
+    };
+
+    // provision reconciles from a catalog, so the input must be a `.cddb`; a
+    // `.cd`/`.cdstore`/extensionless path is a usage error.
+    if FileKind::from_path(&path) != Some(FileKind::Cddb) {
+        eprintln!(
+            "coddl provision: expected a `.cddb` catalog file, got `{}`",
+            path.display()
+        );
+        return ExitCode::from(2);
+    }
+
+    let out = coddl_provision::provision_catalog(&path);
+
+    // The report is `Some` only when the whole reconcile committed; print a
+    // per-table summary to stdout.
+    if let Some(report) = &out.report {
+        let stdout = io::stdout();
+        let mut w = stdout.lock();
+        let _ = writeln!(w, "provisioned {} table(s):", report.tables.len());
+        for t in &report.tables {
+            let action = if t.created { "created" } else { "verified" };
+            let _ = writeln!(w, "  {}: {}, {} row(s)", t.table, action, t.rows_inserted);
+        }
+    }
+
+    // Every provision diagnostic anchors in the `.cddb` (`FileId(0)`); a
+    // resolve-time diagnostic in the sibling `.cdstore` (`FileId(1)`) has no path
+    // to hand here, so it prints with bare offsets. Related notes (a schema
+    // mismatch's per-column detail) print as indented follow-ups.
+    for d in &out.diagnostics {
+        if d.span.file == FileId(0) {
+            eprintln!(
+                "{}: {} [{}] at {}:{}..{}",
+                d.severity,
+                d.message,
+                d.code,
+                path.display(),
+                d.span.start,
+                d.span.end
+            );
+        } else {
+            eprintln!(
+                "{}: {} [{}] at {}..{}",
+                d.severity, d.message, d.code, d.span.start, d.span.end
+            );
+        }
+        for (_, note) in &d.related {
+            eprintln!("  note: {note}");
+        }
+    }
+
+    let has_error = out
+        .diagnostics
+        .iter()
+        .any(|d| d.severity == Severity::Error);
+    if out.report.is_none() || has_error {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 

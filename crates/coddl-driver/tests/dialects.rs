@@ -132,6 +132,87 @@ fn coddl_check_accepts_cddb_file() {
 }
 
 #[test]
+fn coddl_provision_seeds_from_catalog() {
+    // `coddl provision <db>.cddb` reconciles the SQLite database its catalog
+    // declares: create-or-verify each base table, then re-seed it to its INIT
+    // value. This test authors a catalog *with* an INIT value plus its store
+    // binding, points the target file at a tempdir via the env override, and
+    // asserts the seeded rows land.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cddb = tmp.path().join("greetings.cddb");
+    std::fs::write(
+        &cddb,
+        "database greetings;\n\
+         base relvar Greetings { id: Integer, message: Text } key { id };\n\
+         Greetings := Relation { { id: 1, message: \"hi\" }, { id: 2, message: \"yo\" } };\n",
+    )
+    .expect("write greetings.cddb");
+    write_cdstore(&tmp);
+
+    // Resolve the same file the runtime would, but steered into the tempdir so
+    // no `greetings.sqlite` is left in the test's working directory.
+    let db = tmp.path().join("greetings.sqlite");
+    let out = coddl()
+        .args(["provision"])
+        .arg(&cddb)
+        .env("CODDL_GREETINGS_FILE", &db)
+        .output()
+        .expect("spawn coddl");
+    assert!(
+        out.status.success(),
+        "coddl provision <.cddb> failed: stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("greetings: created, 2 row(s)"),
+        "expected a create-and-seed summary line, got:\n{stdout}"
+    );
+
+    // The rows are actually in the database.
+    let conn = rusqlite::Connection::open(&db).expect("open seeded db");
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM greetings", [], |r| r.get(0))
+        .expect("count seeded rows");
+    assert_eq!(n, 2, "expected 2 seeded rows");
+
+    // Re-provisioning is idempotent: the matching table is verified, not
+    // recreated, and the row count is unchanged.
+    let out2 = coddl()
+        .args(["provision"])
+        .arg(&cddb)
+        .env("CODDL_GREETINGS_FILE", &db)
+        .output()
+        .expect("spawn coddl");
+    assert!(out2.status.success(), "re-provision failed");
+    assert!(
+        String::from_utf8_lossy(&out2.stdout).contains("greetings: verified, 2 row(s)"),
+        "expected a verify summary on re-provision, got:\n{}",
+        String::from_utf8_lossy(&out2.stdout)
+    );
+}
+
+#[test]
+fn coddl_provision_rejects_non_cddb() {
+    // provision reconciles from a catalog; a `.cd` (or any non-`.cddb`) input is
+    // a usage error (exit 2), never touched.
+    use std::io::Write;
+    let mut tmp = tempfile::NamedTempFile::with_suffix(".cd").expect("tempfile");
+    writeln!(tmp, "program p;\noper main {{}}").expect("write");
+    let out = coddl()
+        .args(["provision"])
+        .arg(tmp.path())
+        .output()
+        .expect("spawn coddl");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected exit 2 for a non-`.cddb` provision target, stderr=\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn coddl_lex_works_on_any_dialect() {
     // The lexer is dialect-agnostic; `coddl lex` should succeed on a
     // `.cddb` file even though its grammar is different.

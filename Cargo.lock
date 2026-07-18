@@ -222,6 +222,7 @@ dependencies = [
  "coddl-fmt",
  "coddl-plan",
  "coddl-procir",
+ "coddl-provision",
  "coddl-relir",
  "coddl-runtime",
  "coddl-sqlemit",

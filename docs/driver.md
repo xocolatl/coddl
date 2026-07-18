@@ -4,7 +4,7 @@ The authoritative spec for the `coddl` command-line driver: every subcommand, ev
 
 The driver is the user's first contact with Coddl. It calls into the frontend crates ([grammar.md](grammar.md), [typecheck.md](typecheck.md)) for `lex` / `parse` / `check`, into the plan layer ([plan.md](plan.md)) when a `.cd` declares public relvars, into [codegen.md](codegen.md) for emission, and links against the runtime [staticlib](runtime.md). Frontend diagnostics are routed through `coddl-diagnostics` (see [lsp.md](lsp.md)) so terminal output and LSP output share one source.
 
-**Last sync:** `a2c3fd3`. Every commit that adds, removes, or changes a subcommand, a flag, an exit code, or the runtime-discovery rule updates this file in the same commit.
+**Last sync:** `27b20da`. Every commit that adds, removes, or changes a subcommand, a flag, an exit code, or the runtime-discovery rule updates this file in the same commit.
 
 
 ## Subcommand reference
@@ -20,6 +20,7 @@ The driver is the user's first contact with Coddl. It calls into the frontend cr
 | `emit-obj <file>`   | file or `-`   | Cranelift object bytes → stdout (or `-o`)  | `-o <path>` optional           |
 | `compile <file>`    | file (or `-` with `-o`) | native binary at `<output>`     | `--backend=llvm`, `-o <basename>` |
 | `run <file>`        | file or `-`   | compiled binary's stdout/stderr            | `--backend=cranelift`          |
+| `provision <file>`  | `.cddb` path  | per-table reconcile summary → stdout       | —                              |
 | `fmt <file>`        | file or `-`   | formatted source → stdout                  | `--check`, `--write`           |
 
 Every subcommand exits `0` on success, `1` on I/O / compile failure,
@@ -116,6 +117,54 @@ flags.
 `coddl compile`.
 
 
+## `provision`
+
+`provision` reconciles a database to the state its `.cddb` catalog declares, in
+**one transaction**: for each base relvar, create-or-verify its table, then
+truncate and re-seed it to the relvar's INIT value (`R := Relation { … };`). The
+backend is whatever the catalog's `.cdstore` binds — `provision` is
+backend-agnostic and drives the store abstraction the runtime uses, so it never
+hand-maps types or speaks a backend dialect itself. See [storage.md](storage.md)
+for the fold-and-reconcile pipeline and the `PV####` diagnostics.
+
+> **v1 backend coverage.** Only the SQLite backend is implemented today; a
+> catalog bound to any other backend is declined (`PV0007`). Postgres and
+> MariaDB are planned and reuse this command unchanged — everything below is
+> backend-independent.
+
+It is **not** a migrator. A table that already exists but doesn't match the
+catalog is a rollback + error (`PV0008`), never a drop-recreate; a managed name
+that resolves to a view or other non-table object is likewise an error
+(`PV0009`), never altered. The rollback leaves the database byte-identical — the
+invariant that keeps `provision` from becoming a destructive `migrate`.
+
+**Input.** A `.cddb` catalog **path** only. Stdin (`-`) is rejected (exit `2`):
+there is no sibling `.cdstore` to resolve the connection target from. A
+non-`.cddb` extension is a usage error (exit `2`).
+
+**Connection target.** Resolved exactly as the compiled runtime resolves it, so
+`provision` and `run` act on the same database. For the SQLite backend that
+target is a file path: the `CODDL_<DBNAME>_FILE` environment variable (DBNAME =
+uppercase of the `database <name>;` header) if set, else the `.cdstore`'s baked
+`file:` default. Other backends resolve their own target (connection string /
+DSN) by the same override-then-default rule — see [storage.md](storage.md).
+
+**Output.** A per-table summary to stdout — one line per relvar reporting
+whether the table was `created` or `verified` and how many rows were re-seeded.
+Diagnostics (resolution, fold-time value errors, execution) print to stderr; a
+schema mismatch's per-column detail prints as indented `note:` lines. Exit `0`
+on a committed reconcile, `1` on any error (resolution, folding, or a mismatch
+rollback), `2` on a usage error.
+
+```console
+$ coddl provision examples/suppliers-and-parts/suppliersandparts.cddb
+provisioned 3 table(s):
+  p: created, 6 row(s)
+  s: created, 5 row(s)
+  sp: created, 12 row(s)
+```
+
+
 ## Runtime staticlib discovery
 
 `compile` and `run` need `libcoddl_runtime.a` to link. Lookup order:
@@ -143,7 +192,7 @@ side-by-side placement is the discipline.
 | Code | Cause                                                                  |
 |------|------------------------------------------------------------------------|
 | 0    | Success.                                                               |
-| 1    | I/O failure, compile error, link error, or missing runtime staticlib.  |
+| 1    | I/O failure, compile error, link error, missing runtime staticlib, or a `provision` reconcile failure (resolution/fold error or schema-mismatch rollback). |
 | 2    | Usage error — unknown flag, missing required argument, invalid backend.|
 | _N_  | For `run`, the compiled binary's exit code (forwarded unchanged).      |
 | 128  | For `run`, the compiled binary was killed by a signal (no exit code).  |
