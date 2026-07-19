@@ -193,7 +193,7 @@ pub fn lower(source: &str, file: FileId) -> LowerOutput {
 /// into one `Module::public_relvars` slot, emits `RelvarSlotInit` /
 /// `RelvarSlotRelease` in `main`'s prologue/epilogue, and resolves
 /// bare-name references against the relvar set. When `plan` is `None`,
-/// behavior matches the legacy `lower()` path: no relvar slots, no
+/// behavior matches the baseline `lower()` path: no relvar slots, no
 /// SQLite, no transaction externs.
 pub fn lower_with_plan(source: &str, file: FileId, plan: Option<&Plan>) -> LowerOutput {
     lower_impl(source, file, plan, false)
@@ -604,7 +604,7 @@ struct Lowerer {
     /// SQL dialect to bake pushed queries for, derived from the plan's
     /// backend. `Some` only when the backend is one the cut can push to
     /// (SQLite today); `None` disables pushdown so every relvar read takes
-    /// the legacy in-process materialize path.
+    /// the in-process materialize path.
     dialect: Option<Dialect>,
     /// Baked query plans, in assignment order. Drained onto `Module::plans`.
     plans: Vec<PlanEntry>,
@@ -614,10 +614,10 @@ struct Lowerer {
     plan_ids: HashMap<u64, u32>,
     /// Next dense plan id to hand out.
     next_plan_id: u32,
-    /// Public relvars referenced via the legacy `RelvarRead` path (i.e. not
+    /// Public relvars referenced via the in-process `RelvarRead` path (i.e. not
     /// pushed to SQL). Slot init/release in `main` is emitted only for these;
     /// fully-pushed (or unreferenced) relvars get no startup materialization.
-    legacy_used_relvars: HashSet<String>,
+    in_process_relvars: HashSet<String>,
     /// In-memory `private` relvars: surface name → interned heading id.
     /// Resolved type aliases (user `type Name = …;` + active-module aliases like
     /// `coddl::web`'s `Request`/`Response`), absorbed from the typechecker. A
@@ -782,7 +782,7 @@ impl Lowerer {
             plans: Vec::new(),
             plan_ids: HashMap::new(),
             next_plan_id: 0,
-            legacy_used_relvars: HashSet::new(),
+            in_process_relvars: HashSet::new(),
             private_relvars: HashMap::new(),
             module_let_consts: HashMap::new(),
             module_let_slots: HashMap::new(),
@@ -810,7 +810,7 @@ impl Lowerer {
         self.db_name = plan.database_name.clone();
         self.db_path_default = plan.db_file_default.clone();
         // Only backends the cut can emit SQL for enable pushdown; others
-        // leave `dialect` `None` and fall through to the legacy path.
+        // leave `dialect` `None` and fall through to the in-process path.
         self.dialect = match plan.backend_kind {
             coddl_plan::BackendKind::Sqlite => Some(Dialect::SQLite),
             coddl_plan::BackendKind::Other(_) | coddl_plan::BackendKind::Unknown => None,
@@ -1966,7 +1966,7 @@ impl Lowerer {
         // synthesized function, now that every unit's bindings are absorbed.
         self.build_module_lets_init();
         // Now that every function is lowered (so `plans` and
-        // `legacy_used_relvars` are final), patch `main`'s prologue:
+        // `in_process_relvars` are final), patch `main`'s prologue:
         // register the database + pushed plans, and emit slot init/release
         // only for relvars still read in-process.
         self.finalize_main_prologue();
@@ -2001,7 +2001,7 @@ impl Lowerer {
     /// Insert `main`'s prologue registration and slot init/release after
     /// the body is fully lowered. Runs once in `lower_root`. The database
     /// and plan registrations go right after `coddl_runtime_init`; slot
-    /// init/release cover only relvars referenced via the legacy path.
+    /// init/release cover only relvars referenced via the in-process path.
     fn finalize_main_prologue(&mut self) {
         // Build the insts from immutable reads of `self` before taking the
         // mutable borrow on `self.functions`.
@@ -2013,7 +2013,7 @@ impl Lowerer {
             }
         }
         for name in &self.public_relvar_order {
-            if self.legacy_used_relvars.contains(name) {
+            if self.in_process_relvars.contains(name) {
                 let heading_id = self.public_relvars[name].heading_id;
                 prologue.push(Inst::RelvarSlotInit {
                     name: name.clone(),
@@ -2051,7 +2051,7 @@ impl Lowerer {
         let mut releases: Vec<Inst> = self
             .public_relvar_order
             .iter()
-            .filter(|n| self.legacy_used_relvars.contains(*n))
+            .filter(|n| self.in_process_relvars.contains(*n))
             .map(|n| Inst::RelvarSlotRelease { name: n.clone() })
             .collect();
         for name in &self.private_relvar_order {
@@ -3351,7 +3351,7 @@ impl Lowerer {
         // Try the SQL pushdown cut first: a relvar-rooted relational subtree
         // becomes one `Inst::Query` fired lazily at this force point. On a
         // miss (not pushable, or no pushable backend) fall through to the
-        // legacy in-process lowering below.
+        // in-process lowering below.
         if let Some(v) = self.try_lower_pushed(expr) {
             return v;
         }
@@ -5164,7 +5164,7 @@ impl Lowerer {
     /// If `expr` is a relvar-rooted relational subtree the cut can push,
     /// bake its SQL into `Module::plans` and emit an `Inst::Query`, returning
     /// its result value. Otherwise return `None` so the caller lowers `expr`
-    /// via the legacy in-process path. No-op when pushdown is disabled
+    /// via the in-process path. No-op when pushdown is disabled
     /// (`dialect` is `None`).
     fn try_lower_pushed(&mut self, expr: &Expr) -> Option<ValueId> {
         self.try_lower_pushed_ordered(expr, &[])
@@ -6149,7 +6149,7 @@ impl Lowerer {
             if let Some(binding) = self.public_relvars.get(name).cloned() {
                 // Reaching here means the cut didn't push this relvar read, so
                 // it stays in-process — mark it so `main` materializes its slot.
-                self.legacy_used_relvars.insert(binding.name.clone());
+                self.in_process_relvars.insert(binding.name.clone());
                 let dst = self.fresh_value();
                 self.record_type(dst, ProcType::Relation(binding.heading_id));
                 self.insts.push(Inst::RelvarRead {
@@ -9433,7 +9433,7 @@ oper main {}\n\
             .count();
         assert_eq!(queries, 1, "expected exactly one Inst::Query in:\n{m}");
 
-        // The pushed subtree replaces the legacy materialize + filter path.
+        // The pushed subtree replaces the in-process materialize + filter path.
         assert!(
             !insts
                 .iter()

@@ -1,79 +1,18 @@
-// greetings.cdstore
-//
-// The conceptual → physical binding for the `greetings` database:
-// which backend, where to connect, and how each base catalog relvar
-// maps to a physical table and column set.
-//
-// File naming: keyed on the *database* name (`greetings.cdstore`).
-// One `.cdstore` per (database, environment): the checked-in version
-// here is the dev default; prod typically ships its own (often
-// ops-owned), with secrets like DSNs supplied by env vars at deploy.
-//
-// Lifetime split — what's baked vs late-bound:
-//   - Structural (backend kind, table/column names): consumed by
-//     codegen, baked into the compiled binary. They appear in every
-//     emitted SQL statement; changing them means recompiling.
-//   - Operational (file path, DSN, pool size): late-bound from env
-//     vars at startup. The literal values in this file are the
-//     defaults; env-var overrides take precedence.
-//
-// v1 expedient: the literal `file:` here is canonicalised at
-// compile time and baked into the binary as the operational default.
-// That's fine for `coddl run` and dev workflows but wrong long-term
-// — production binaries shouldn't carry hard-coded data paths. The
-// end state is to drop the baked default entirely, requiring the
-// env var (or some other discovery mechanism) at startup. v1 keeps
-// the baked default so SQLite integration lands without designing
-// the no-default deployment story first.
-//
-// Env-var convention (runtime, implicit):
-//
-//     CODDL_<DBNAME>_<FIELD>
-//
-// derived deterministically from the `.cdstore`'s `store for <db>;`
-// header and each operational field name. For this file:
-//
-//     CODDL_GREETINGS_FILE   overrides `file:` at startup
-//
-// Postgres would use `CODDL_<DB>_DSN` similarly. Capital-snake-case
-// for env-var hygiene; the rule is stable and documented in
-// `docs/storage.md` (lands with Phase 19).
-//
-// OPEN syntax questions:
-//   - `store for <database>;` header — required, first non-comment.
-//   - `backend <kind> { ... };` — one declaration per file. The kind
-//     selects the runtime engine; the body's named-args carry the
-//     connection-target defaults for this environment.
-//   - Explicit env-var spelling, sketched but not used in v1:
-//
-//         file: env("CUSTOM_NAME", default: "greetings.sqlite"),
-//         dsn:  env("CUSTOM_NAME"),    // required at runtime; no default
-//
-//     Overrides the implicit `CODDL_<DBNAME>_<FIELD>` convention when
-//     ops wants a particular name. Resolved at startup, not at
-//     compile time. The compiler accepts `env(...)` only in
-//     operational-field positions (not in table names or column
-//     names — those are structural).
-//   - `relvar <Name>: table "<sql_name>" { columns: { <attr>: "<col>", ... } };`
-//     binds a base catalog relvar's heading to a physical table and
-//     column set. Every attribute in the catalog heading must have a
-//     column entry; every column entry must name an attribute.
-//   - Column shorthand: when the attribute name and the SQL column name
-//     match, write the bare attribute name — `columns: { id, message }`
-//     is sugar for `columns: { id: "id", message: "message" }`. Mix with
-//     the explicit `attr: "col"` form for the columns that genuinely
-//     differ. Shorthand is columns-only; `backend` fields always carry a
-//     value.
+// greetings.cdstore — plain inserts into coddl::storage. No sugar; this is
+// the raw relational model. `coddl::storage` is implicit for a `.cdstore`, so
+// there is no `use module` line — the file is bare DML into its relvars.
 
-store for greetings;
-
-backend sqlite {
-    file: "greetings.sqlite",
+// greetings runs on SQLite.
+insert Backends Relation {
+    { database: "greetings", backend: "sqlite" },
 };
 
-// The table is named `greetings` and both columns match their attribute
-// names, so the columns block uses the bare-name shorthand. The explicit
-// form `columns: { id: "id", message: "message" }` is equivalent.
-relvar Greetings: table "greetings" {
-    columns: { id, message }
+// SQLite's `file` field: read env HELLO_WORLD_SQLITE_PATH, else the default
+// path "greetings.sqlite".
+insert ConnEnv Relation {
+    { database: "greetings", backend: "sqlite", field: "file", env_var: "HELLO_WORLD_SQLITE_PATH" },
+};
+
+ConnDefault := ConnDefault union Relation {
+    { database: "greetings", backend: "sqlite", field: "file", value: "greetings.sqlite" },
 };

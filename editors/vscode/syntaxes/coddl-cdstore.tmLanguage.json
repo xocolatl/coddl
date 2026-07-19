@@ -3,73 +3,8 @@
     "name": "Coddl Store",
     "scopeName": "source.coddl.cdstore",
     "fileTypes": ["cdstore"],
+    "//": "A .cdstore is DML into coddl::storage — a bare sequence of .cd statements (insert, :=, union, Relation { … }). It is a syntactic subset of .cd, so it reuses the .cd grammar wholesale rather than maintaining a parallel keyword list that would drift.",
     "patterns": [
-        { "include": "#comments" },
-        { "include": "#strings" },
-        { "include": "#keywords" },
-        { "include": "#operators" },
-        { "include": "#identifiers" }
-    ],
-    "repository": {
-        "comments": {
-            "patterns": [
-                { "name": "comment.line.double-slash.coddl", "match": "//.*$" },
-                { "include": "#block_comment" }
-            ]
-        },
-        "block_comment": {
-            "name": "comment.block.coddl",
-            "begin": "/\\*",
-            "end": "\\*/",
-            "patterns": [{ "include": "#block_comment" }]
-        },
-        "strings": {
-            "patterns": [
-                {
-                    "name": "string.quoted.double.coddl",
-                    "begin": "\"",
-                    "end": "\"",
-                    "patterns": [
-                        { "name": "constant.character.escape.coddl", "match": "\\\\." }
-                    ]
-                }
-            ]
-        },
-        "keywords": {
-            "patterns": [
-                {
-                    "name": "keyword.declaration.coddl",
-                    "match": "\\b(store|backend|relvar)\\b"
-                },
-                {
-                    "name": "keyword.other.coddl",
-                    "match": "\\b(for|table|columns|default|env)\\b"
-                }
-            ]
-        },
-        "operators": {
-            "patterns": [
-                {
-                    "name": "punctuation.separator.coddl",
-                    "match": "[,;:]"
-                }
-            ]
-        },
-        "identifiers": {
-            "patterns": [
-                {
-                    "name": "variable.parameter.named-arg.coddl",
-                    "match": "(?<=[\\{,]\\s*)([A-Za-z_][A-Za-z0-9_#]*)\\s*(?=:)"
-                },
-                {
-                    "name": "entity.name.type.coddl",
-                    "match": "\\b[A-Z][A-Za-z0-9_]*[#]?\\b"
-                },
-                {
-                    "name": "variable.other.coddl",
-                    "match": "\\b[a-z_][A-Za-z0-9_#]*\\b"
-                }
-            ]
-        }
-    }
+        { "include": "source.coddl" }
+    ]
 }

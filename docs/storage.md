@@ -6,6 +6,16 @@ This doc covers the **abstraction** (the traits, the design rationale, the `data
 
 ## Why an abstraction at all
 
+> **Status note.** The `.cdstore` grammar is being rebuilt from scratch: a
+> `.cdstore` is now **DML into `coddl::storage`** (the storage meta-catalog — see
+> [cdstore-grammar.md](cdstore-grammar.md)), not the old `store for` / `backend` /
+> `relvar … : table …` config. The plan layer no longer reads a `.cdstore`; it
+> uses **identity** mapping (table = relvar name, column = attribute) with default
+> backend/file until the storage-catalog **loader** lands. The old-grammar
+> descriptions below (the `file:` directive, `db_file_default`, the RVA
+> child-table `.cdstore` clause) predate that change and will be revised with the
+> loader.
+
 RM Pro 6 forbids internal-level constructs in `D` source. A Coddl program does not name a `.sqlite` file, a `pg_hba.conf`, a `JDBC URL`, or a column type. The mapping from a `public relvar` in source to a physical table in some database lives in companion files (`.cddb` for the catalog, `.cdstore` for the physical binding — see [plan.md](plan.md)). The source code names the **database** (a logical handle) by binding `database <name>;`; everything else is the plan layer's job.
 
 The `Backend` / `Conn` split exists for the same reason the IR split exists (see [principles.md](principles.md) "Long-term planning"): the boundary is *semantic* (pure dialect emission vs. effectful connection) rather than expedient. Adding Postgres later doesn't require touching the compiler — only adding a second `impl Backend`.

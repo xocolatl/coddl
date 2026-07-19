@@ -1178,7 +1178,11 @@ impl<'a> Parser<'a> {
     /// `EXPR_STMT` (terminated by `;`), retro-wrapped in `ASSIGN_STMT`
     /// (followed by `:=`), or left as a bare child under `BLOCK` (the
     /// tail expression, immediately followed by `]`).
-    fn parse_stmt(&mut self) {
+    ///
+    /// `pub(crate)` so the `.cdstore` root ([`crate::parser_cdstore`]) can drive
+    /// the same statement grammar at file top level — a `.cdstore` document is a
+    /// bare sequence of these statements (DML into `coddl::storage`).
+    pub(crate) fn parse_stmt(&mut self) {
         if matches!(self.current(), SyntaxKind::R_BRACKET | SyntaxKind::EOF) {
             return;
         }

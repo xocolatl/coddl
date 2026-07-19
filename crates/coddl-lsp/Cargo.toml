@@ -16,6 +16,7 @@ coddl-diagnostics.workspace = true
 coddl-syntax.workspace = true
 coddl-types.workspace = true
 coddl-plan.workspace = true
+coddl-store.workspace = true
 coddl-fmt.workspace = true
 tower-lsp.workspace = true
 tokio.workspace = true

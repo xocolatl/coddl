@@ -226,6 +226,7 @@ dependencies = [
  "coddl-relir",
  "coddl-runtime",
  "coddl-sqlemit",
+ "coddl-store",
  "coddl-syntax",
  "coddl-types",
  "rusqlite",
@@ -255,6 +256,7 @@ dependencies = [
  "coddl-diagnostics",
  "coddl-fmt",
  "coddl-plan",
+ "coddl-store",
  "coddl-syntax",
  "coddl-types",
  "tempfile",
@@ -336,6 +338,17 @@ dependencies = [
 [[package]]
 name = "coddl-stdlib"
 version = "0.0.0"
+
+[[package]]
+name = "coddl-store"
+version = "0.0.0"
+dependencies = [
+ "coddl-consteval",
+ "coddl-diagnostics",
+ "coddl-relir",
+ "coddl-syntax",
+ "coddl-types",
+]
 
 [[package]]
 name = "coddl-syntax"

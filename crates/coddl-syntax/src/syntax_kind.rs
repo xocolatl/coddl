@@ -179,22 +179,10 @@ pub enum SyntaxKind {
     /// Reserved for Phase 16; parsed as an unknown body today.
     CDMAP_RENAME_CLAUSE,
 
-    // ── `.cdstore` dialect — conceptual → physical binding ───────────
-    /// Root of a parsed `.cdstore` document.
+    // ── `.cdstore` dialect — DML into `coddl::storage` ───────────────
+    /// Root of a parsed `.cdstore` document: a bare sequence of statements
+    /// (DML into `coddl::storage`), reusing the shared statement nodes.
     CDSTORE_ROOT,
-    /// `store for <database>;` — required first item.
-    CDSTORE_HEADER,
-    /// `backend <kind> { <field>, … };` — exactly one per file.
-    BACKEND_DECL,
-    /// `relvar <Name>: table "<sql>" { columns: { … } };` — binds a
-    /// base catalog relvar to a physical table and column set.
-    RELVAR_BINDING,
-    /// `<name>: <value>` field inside a backend block, columns block,
-    /// or relvar-binding body. Value grammar is narrow: a string
-    /// literal, an identifier, or an `env(...)` call.
-    CDSTORE_FIELD,
-    /// `columns: { <name>: "<col>", … }` block inside a relvar binding.
-    COLUMNS_BLOCK,
 
     /// `<relExpr> project { a, b, … }` — relational projection. A postfix
     /// expression node wrapping its relation operand; the brace-list of
@@ -464,11 +452,6 @@ mod tests {
             SyntaxKind::CDMAP_PROJECT_CLAUSE,
             SyntaxKind::CDMAP_RENAME_CLAUSE,
             SyntaxKind::CDSTORE_ROOT,
-            SyntaxKind::CDSTORE_HEADER,
-            SyntaxKind::BACKEND_DECL,
-            SyntaxKind::RELVAR_BINDING,
-            SyntaxKind::CDSTORE_FIELD,
-            SyntaxKind::COLUMNS_BLOCK,
             SyntaxKind::PROJECT_EXPR,
             SyntaxKind::REPLACE_EXPR,
             SyntaxKind::TCLOSE_EXPR,

@@ -1,29 +1,4 @@
-// staffing.cdstore
-//
-// Conceptual -> physical binding for `staffing`: the SQLite backend plus the
-// table/column map for each base relvar. The .sqlite file is created by
-// `coddl provision` and gitignored. CODDL_STAFFING_FILE overrides `file:` at startup.
-
-store for staffing;
-
-backend sqlite {
-    file: "staffing.sqlite",
-};
-
-// Every attribute maps to a same-named column, so the columns blocks use the
-// bare-name shorthand (`columns: { a, b }` ≡ `columns: { a: "a", b: "b" }`).
-relvar Employees: table "employees" {
-    columns: { emp_id, emp_name, dept_id }
-};
-
-relvar Departments: table "departments" {
-    columns: { dept_id, dept_name }
-};
-
-relvar JobTitles: table "job_titles" {
-    columns: { title }
-};
-
-relvar Locations: table "locations" {
-    columns: { location }
+// staffing.cdstore — DML into coddl::storage. `staffing` runs on SQLite.
+insert Backends Relation {
+    { database: "staffing", backend: "sqlite" },
 };

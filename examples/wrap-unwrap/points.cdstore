@@ -1,17 +1,4 @@
-// points.cdstore
-//
-// Conceptual -> physical binding for `points`: the SQLite backend plus the
-// table/column map for the base relvar. The .sqlite file is created by
-// `coddl provision` and gitignored. CODDL_POINTS_FILE overrides `file:` at startup.
-
-store for points;
-
-backend sqlite {
-    file: "points.sqlite",
-};
-
-// Every attribute maps to a same-named column, so the columns block uses the
-// bare-name shorthand (`columns: { a, b }` ≡ `columns: { a: "a", b: "b" }`).
-relvar Points: table "points" {
-    columns: { id, x, y }
+// points.cdstore — DML into coddl::storage. `points` runs on SQLite.
+insert Backends Relation {
+    { database: "points", backend: "sqlite" },
 };

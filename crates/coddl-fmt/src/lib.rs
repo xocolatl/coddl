@@ -267,4 +267,22 @@ mod tests {
             got
         );
     }
+
+    #[test]
+    fn formats_cdstore_dml() {
+        // A `.cdstore` is a bare sequence of `.cd` statements (DML into
+        // coddl::storage), so the same re-spacer formats it — messy spacing
+        // canonicalizes and the result is a fixpoint.
+        let messy = "insert Backends Relation{{database:\"g\",backend:\"sqlite\"},};\n";
+        let got = format(messy, &FormatOptions::default(), FileKind::Cdstore).text;
+        assert!(
+            got.contains("{ database: \"g\", backend: \"sqlite\" }"),
+            "got:\n{got}"
+        );
+        assert_eq!(
+            format(&got, &FormatOptions::default(), FileKind::Cdstore).text,
+            got,
+            "formatting must be a fixpoint"
+        );
+    }
 }

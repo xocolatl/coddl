@@ -1,25 +1,4 @@
-// greetings.cdstore
-//
-// Conceptual -> physical binding for `greetings`: the SQLite backend plus the
-// table/column map. The .sqlite file is created by `coddl provision` and gitignored.
-// CODDL_GREETINGS_FILE overrides `file:` at startup.
-
-store for greetings;
-
-backend sqlite {
-    file: "greetings.sqlite",
-};
-
-// Each attribute maps to a same-named column, so the columns block uses the
-// bare-name shorthand (`columns: { a, b }` ≡ `columns: { a: "a", b: "b" }`).
-relvar Greetings: table "greetings" {
-    columns: { id, message }
-};
-
-relvar Stale: table "stale" {
-    columns: { id, message }
-};
-
-relvar NewArrivals: table "new_arrivals" {
-    columns: { id, message }
+// greetings.cdstore — DML into coddl::storage. `greetings` runs on SQLite.
+insert Backends Relation {
+    { database: "greetings", backend: "sqlite" },
 };

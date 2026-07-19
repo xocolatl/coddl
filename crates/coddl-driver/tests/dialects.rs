@@ -21,14 +21,13 @@ fn write_cddb(tmp: &tempfile::TempDir) -> PathBuf {
     path
 }
 
-/// Author a `greetings.cdstore` binding in `tmp` and return its path.
+/// Author a `greetings.cdstore` — DML into `coddl::storage` — in `tmp` and
+/// return its path.
 fn write_cdstore(tmp: &tempfile::TempDir) -> PathBuf {
     let path = tmp.path().join("greetings.cdstore");
     std::fs::write(
         &path,
-        "store for greetings;\n\
-         backend sqlite { file: \"greetings.sqlite\" };\n\
-         relvar Greetings: table \"greetings\" { columns: { id: \"id\", message: \"message\" } };\n",
+        "insert Backends Relation { { database: \"greetings\", backend: \"sqlite\" }, };\n",
     )
     .expect("write greetings.cdstore");
     path
@@ -165,7 +164,7 @@ fn coddl_provision_seeds_from_catalog() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("greetings: created, 2 row(s)"),
+        stdout.contains("Greetings: created, 2 row(s)"),
         "expected a create-and-seed summary line, got:\n{stdout}"
     );
 
@@ -186,7 +185,7 @@ fn coddl_provision_seeds_from_catalog() {
         .expect("spawn coddl");
     assert!(out2.status.success(), "re-provision failed");
     assert!(
-        String::from_utf8_lossy(&out2.stdout).contains("greetings: verified, 2 row(s)"),
+        String::from_utf8_lossy(&out2.stdout).contains("Greetings: verified, 2 row(s)"),
         "expected a verify summary on re-provision, got:\n{}",
         String::from_utf8_lossy(&out2.stdout)
     );

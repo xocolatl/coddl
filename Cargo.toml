@@ -8,6 +8,7 @@ members = [
     "crates/coddl-plan",
     "crates/coddl-relir",
     "crates/coddl-consteval",
+    "crates/coddl-store",
     "crates/coddl-procir",
     "crates/coddl-sqlemit",
     "crates/coddl-execlocal",
@@ -58,6 +59,7 @@ coddl-types = { path = "crates/coddl-types" }
 coddl-plan = { path = "crates/coddl-plan" }
 coddl-relir = { path = "crates/coddl-relir" }
 coddl-consteval = { path = "crates/coddl-consteval" }
+coddl-store = { path = "crates/coddl-store" }
 coddl-procir = { path = "crates/coddl-procir" }
 coddl-sqlemit = { path = "crates/coddl-sqlemit" }
 coddl-execlocal = { path = "crates/coddl-execlocal" }

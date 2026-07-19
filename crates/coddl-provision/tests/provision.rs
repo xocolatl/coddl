@@ -1,33 +1,20 @@
-//! End-to-end tests for `provision_catalog`: self-authored `.cddb` + `.cdstore`
-//! fixtures in a temp dir, driven through the fold and the SQLite executor, with
-//! the resulting database reopened to check what actually landed. No fixture is
-//! read from `examples/` — every test authors its own catalog.
+//! End-to-end tests for `provision_catalog`: self-authored `.cddb` fixtures in a
+//! temp dir, driven through the fold and the SQLite executor, with the resulting
+//! database reopened to check what actually landed. No fixture is read from
+//! `examples/` — every test authors its own catalog. There is no `.cdstore`:
+//! provision uses identity mapping (table = relvar name, column = attribute) and
+//! a default SQLite file (`<db>.sqlite`).
 
 use std::path::{Path, PathBuf};
 
 use coddl_provision::provision_catalog;
 use rusqlite::Connection;
 
-/// Write `<db>.cddb` and `<db>.cdstore` into `dir`; return the `.cddb` path.
-fn write_catalog(dir: &Path, db: &str, cddb: &str, cdstore: &str) -> PathBuf {
+/// Write `<db>.cddb` into `dir`; return the `.cddb` path.
+fn write_catalog(dir: &Path, db: &str, cddb: &str) -> PathBuf {
     let cddb_path = dir.join(format!("{db}.cddb"));
     std::fs::write(&cddb_path, cddb).unwrap();
-    std::fs::write(dir.join(format!("{db}.cdstore")), cdstore).unwrap();
     cddb_path
-}
-
-/// A minimal `.cdstore` binding each relvar to a same-named lowercase table with
-/// bare-name columns; the SQLite file lands beside the `.cdstore` (the temp dir).
-fn cdstore(db: &str, relvars: &[(&str, &str, &[&str])]) -> String {
-    let mut s =
-        format!("store for {db};\n\nbackend sqlite {{\n    file: \"{db}.sqlite\",\n}};\n\n");
-    for (name, table, cols) in relvars {
-        s.push_str(&format!(
-            "relvar {name}: table \"{table}\" {{\n    columns: {{ {} }}\n}};\n\n",
-            cols.join(", ")
-        ));
-    }
-    s
 }
 
 fn error_codes(diags: &[coddl_diagnostics::Diagnostic]) -> Vec<&str> {
@@ -66,15 +53,7 @@ SP := Relation {
     { sno: "S1", pno: "P2", qty: 200 },
 };
 "#;
-    let store = cdstore(
-        "sphappy",
-        &[
-            ("S", "s", &["sno", "status"]),
-            ("P", "p", &["pno", "weight"]),
-            ("SP", "sp", &["sno", "pno", "qty"]),
-        ],
-    );
-    let cddb_path = write_catalog(dir.path(), "sphappy", cddb, &store);
+    let cddb_path = write_catalog(dir.path(), "sphappy", cddb);
 
     let out = provision_catalog(&cddb_path);
     assert!(
@@ -83,25 +62,26 @@ SP := Relation {
         out.diagnostics
     );
     let report = out.report.expect("a report on success");
-    // Every table is freshly created; counts match the (deduped) INIT.
+    // Every table is freshly created; counts match the (deduped) INIT. Tables
+    // take the relvar name (identity mapping).
     assert!(report.tables.iter().all(|t| t.created));
     let counts: std::collections::HashMap<&str, usize> = report
         .tables
         .iter()
         .map(|t| (t.table.as_str(), t.rows_inserted))
         .collect();
-    assert_eq!(counts["s"], 3);
-    assert_eq!(counts["p"], 2);
-    assert_eq!(counts["sp"], 2);
+    assert_eq!(counts["S"], 3);
+    assert_eq!(counts["P"], 2);
+    assert_eq!(counts["SP"], 2);
 
     // Reopen the real database: the Rational weight is stored as canonical TEXT.
     let conn = Connection::open(dir.path().join("sphappy.sqlite")).unwrap();
     let weight: String = conn
-        .query_row("SELECT weight FROM p WHERE pno = 'P1'", [], |r| r.get(0))
+        .query_row("SELECT weight FROM P WHERE pno = 'P1'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(weight, "12/1");
     let status: i64 = conn
-        .query_row("SELECT status FROM s WHERE sno = 'S2'", [], |r| r.get(0))
+        .query_row("SELECT status FROM S WHERE sno = 'S2'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(status, 10);
 }
@@ -129,11 +109,7 @@ F := Relation {
     { id: "b", w: 17.0 },
 };
 "#;
-    let store = cdstore(
-        "speval",
-        &[("E", "e", &["id", "n", "r"]), ("F", "f", &["id", "w"])],
-    );
-    let cddb_path = write_catalog(dir.path(), "speval", cddb, &store);
+    let cddb_path = write_catalog(dir.path(), "speval", cddb);
 
     let out = provision_catalog(&cddb_path);
     assert!(
@@ -144,24 +120,24 @@ F := Relation {
 
     let conn = Connection::open(dir.path().join("speval.sqlite")).unwrap();
     let (n_a, r_a): (i64, String) = conn
-        .query_row("SELECT n, r FROM e WHERE id = 'a'", [], |row| {
+        .query_row("SELECT n, r FROM E WHERE id = 'a'", [], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })
         .unwrap();
     assert_eq!(n_a, 36); // 6 * 6
     assert_eq!(r_a, "3/1"); // Integer 3 widened into the Rational column
     let n_b: i64 = conn
-        .query_row("SELECT n FROM e WHERE id = 'b'", [], |r| r.get(0))
+        .query_row("SELECT n FROM E WHERE id = 'b'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(n_b, -5); // unary minus on an Integer
 
     // Unary minus and a bare literal in a Rational column.
     let w_a: String = conn
-        .query_row("SELECT w FROM f WHERE id = 'a'", [], |r| r.get(0))
+        .query_row("SELECT w FROM F WHERE id = 'a'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(w_a, "-12/1");
     let w_b: String = conn
-        .query_row("SELECT w FROM f WHERE id = 'b'", [], |r| r.get(0))
+        .query_row("SELECT w FROM F WHERE id = 'b'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(w_b, "17/1");
 }
@@ -179,8 +155,7 @@ T := Relation {
     { k: "y", v: 2 },
 };
 "#;
-    let store = cdstore("spdup", &[("T", "t", &["k", "v"])]);
-    let cddb_path = write_catalog(dir.path(), "spdup", cddb, &store);
+    let cddb_path = write_catalog(dir.path(), "spdup", cddb);
 
     let out = provision_catalog(&cddb_path);
     assert!(error_codes(&out.diagnostics).is_empty());
@@ -201,8 +176,7 @@ T := Relation {
     { k: "x", v: 2 },
 };
 "#;
-    let store = cdstore("spcol", &[("T", "t", &["k", "v"])]);
-    let cddb_path = write_catalog(dir.path(), "spcol", cddb, &store);
+    let cddb_path = write_catalog(dir.path(), "spcol", cddb);
 
     let out = provision_catalog(&cddb_path);
     assert!(out.report.is_none());
@@ -220,8 +194,7 @@ database spbin;
 
 base relvar B { id: Text, blob: Binary, } key { id };
 "#;
-    let store = cdstore("spbin", &[("B", "b", &["id", "blob"])]);
-    let cddb_path = write_catalog(dir.path(), "spbin", cddb, &store);
+    let cddb_path = write_catalog(dir.path(), "spbin", cddb);
 
     let out = provision_catalog(&cddb_path);
     assert!(out.report.is_none());
@@ -234,9 +207,11 @@ fn schema_mismatch_rolls_back_byte_identical() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("spmis.sqlite");
     // Pre-create a table that does NOT match the catalog (an extra column).
+    // The table takes the relvar name (identity), and provision's
+    // `sqlite_master` lookup is case-sensitive, so it must be `T`.
     {
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch("CREATE TABLE t (k TEXT, v INTEGER, extra TEXT);")
+        conn.execute_batch("CREATE TABLE T (k TEXT, v INTEGER, extra TEXT);")
             .unwrap();
     }
     let before = std::fs::read(&db_path).unwrap();
@@ -247,8 +222,7 @@ database spmis;
 base relvar T { k: Text, v: Integer, } key { k };
 T := Relation { { k: "x", v: 1 }, };
 "#;
-    let store = cdstore("spmis", &[("T", "t", &["k", "v"])]);
-    let cddb_path = write_catalog(dir.path(), "spmis", cddb, &store);
+    let cddb_path = write_catalog(dir.path(), "spmis", cddb);
 
     let out = provision_catalog(&cddb_path);
     assert!(out.report.is_none());
@@ -263,7 +237,8 @@ fn view_named_like_a_table_errors() {
     let db_path = dir.path().join("spview.sqlite");
     {
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch("CREATE VIEW t AS SELECT 1 AS k;")
+        // Identity table name = relvar name `T` (case-sensitive lookup).
+        conn.execute_batch("CREATE VIEW T AS SELECT 1 AS k;")
             .unwrap();
     }
     let cddb = r#"
@@ -272,8 +247,7 @@ database spview;
 base relvar T { k: Integer, } key { k };
 T := Relation { { k: 1 }, };
 "#;
-    let store = cdstore("spview", &[("T", "t", &["k"])]);
-    let cddb_path = write_catalog(dir.path(), "spview", cddb, &store);
+    let cddb_path = write_catalog(dir.path(), "spview", cddb);
 
     let out = provision_catalog(&cddb_path);
     assert!(out.report.is_none());
@@ -289,8 +263,7 @@ database spidem;
 base relvar T { k: Text, v: Integer, } key { k };
 T := Relation { { k: "x", v: 1 }, { k: "y", v: 2 }, };
 "#;
-    let store = cdstore("spidem", &[("T", "t", &["k", "v"])]);
-    let cddb_path = write_catalog(dir.path(), "spidem", cddb, &store);
+    let cddb_path = write_catalog(dir.path(), "spidem", cddb);
 
     let first = provision_catalog(&cddb_path);
     assert!(error_codes(&first.diagnostics).is_empty());
@@ -317,8 +290,7 @@ database spenv;
 base relvar T { k: Text, } key { k };
 T := Relation { { k: "x" }, };
 "#;
-    let store = cdstore("spenv", &[("T", "t", &["k"])]);
-    let cddb_path = write_catalog(dir.path(), "spenv", cddb, &store);
+    let cddb_path = write_catalog(dir.path(), "spenv", cddb);
 
     let out = provision_catalog(&cddb_path);
     std::env::remove_var("CODDL_SPENV_FILE");

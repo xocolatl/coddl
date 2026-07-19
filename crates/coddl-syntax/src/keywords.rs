@@ -265,10 +265,12 @@ pub const CDDB_WORDS: &[&str] = &[
     "database", "base", "virtual", "public", "private", "relvar", "key",
 ];
 
-/// `.cdstore` dialect keywords (`parser_cdstore`).
-pub const CDSTORE_WORDS: &[&str] = &[
-    "store", "for", "backend", "relvar", "table", "columns", "env", "default",
-];
+/// `.cdstore` dialect keywords (`parser_cdstore`). Empty: a `.cdstore` document
+/// is a bare sequence of `.cd` statements (DML into `coddl::storage`), so it
+/// introduces no dialect-specific keywords — every word it recognizes already
+/// lives in the `.cd` sets above (`insert`/`update`/… in [`STMT_HEADS`],
+/// `union`/`minus` in [`INFIX_OPS`], …).
+pub const CDSTORE_WORDS: &[&str] = &[];
 
 /// `.cdmap` dialect keywords (`parser_cdmap`).
 pub const CDMAP_WORDS: &[&str] = &["map", "to"];

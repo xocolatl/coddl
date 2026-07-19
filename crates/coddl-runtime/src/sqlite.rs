@@ -61,7 +61,7 @@ fn relvar_slots() -> &'static Mutex<HashMap<String, usize>> {
 /// credentials slot in here when a second backend or write-through lands.
 /// Long-term the live `Connection` folds into this entry; today the entry
 /// resolves a name to a path and the existing path-keyed [`db_connections`]
-/// pool still owns the connection, so the legacy materialization path is
+/// pool still owns the connection, so the in-process materialization path is
 /// untouched.
 struct DbEntry {
     path: String,
@@ -321,7 +321,7 @@ pub unsafe extern "C" fn coddl_sqlite_relvar_init(
 }
 
 /// Abort-message context for [`marshal_rows`] / [`finalize_relation`]. Lets
-/// the shared marshalling name its source differently per caller: the legacy
+/// the shared marshalling name its source differently per caller: the in-process
 /// relvar path keeps its byte-identical "relvar `X`" diagnostics, while the
 /// query path names the plan.
 struct MarshalCtx {
@@ -665,7 +665,7 @@ fn ensure_connection(path: &str) -> () {
     };
     // Audit every statement executed on this connection. Installed here — on
     // every connection the runtime mints, before it's cached — so one hook
-    // captures every query path with no per-call-site plumbing. The legacy
+    // captures every query path with no per-call-site plumbing. The value-expanding
     // `trace` callback delivers the *expanded* SQL (bound values inlined):
     // handy for self-audit, but it can leak PII/secrets from filter values.
     conn.trace(Some(audit_sqlite_trace));

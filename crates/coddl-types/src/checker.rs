@@ -23,6 +23,7 @@ use coddl_syntax::ast::{
     WhileStmt, WrapExpr,
 };
 use coddl_syntax::ast_cddb::{BaseRelvarDecl, CddbItem, CddbRoot, RelvarInit, VirtualRelvarDecl};
+use coddl_syntax::ast_cdstore::CdstoreRoot;
 use coddl_syntax::cst::{SyntaxNode, SyntaxToken};
 use coddl_syntax::{parse, parse_format_template, FileKind, SyntaxKind, TemplateChunk};
 
@@ -314,10 +315,11 @@ pub struct CheckOutput {
     /// rust-analyzer-style mutability marking); no symbol table or tree walk
     /// is needed downstream.
     pub mutable_spans: Vec<Span>,
-    /// All relvars declared in this file. For `.cd`: public + private
+    /// All relvars in scope for this file. For `.cd`: public + private
     /// (and any base/virtual the user mistakenly placed in `.cd`,
-    /// which T0014 flags). For `.cddb`: base + virtual (similarly).
-    /// Empty for `.cdmap` / `.cdstore` — those don't declare relvars.
+    /// which T0014 flags). For `.cddb`: base + virtual (similarly). For
+    /// `.cdstore`: the `coddl::storage` builtin relvars, brought in implicitly
+    /// (a `.cdstore` is DML over that meta-catalog). Empty for `.cdmap`.
     pub relvars: RelvarTable,
     /// Every resolved type alias in scope — user `type Name = …;` declarations
     /// and the type aliases of active (`use module`) stdlib modules (e.g.
@@ -404,9 +406,14 @@ fn check_inner(
                 tc.check_cddb_root(&root);
             }
         }
-        FileKind::Cdmap | FileKind::Cdstore => {
+        FileKind::Cdstore => {
+            if let Some(root) = CdstoreRoot::cast(parse_out.tree) {
+                tc.check_cdstore_root(&root);
+            }
+        }
+        FileKind::Cdmap => {
             // Parse-only today; semantic validation lands with Phase 16
-            // (the plan layer) and Phase 21 (storage materialization).
+            // (the plan layer).
         }
     }
     let exports = tc.user_opers.clone();
@@ -1125,6 +1132,38 @@ impl TypeChecker {
         }
     }
 
+    /// `.cdstore` root walk. A `.cdstore` is DML into `coddl::storage` — a bare
+    /// sequence of statements over that meta-catalog's builtin relvars. The
+    /// module is **implicit** (no `use module` line), so we seed it as active and
+    /// register its relvars, then check each statement against them with a fresh
+    /// (empty) scope — a `.cdstore` has no operator params or locals, only the
+    /// storage relvars. The DML checkers already accept `RelvarKind::Builtin`
+    /// targets (T0033/T0034); the T0025 transaction guard fires only for
+    /// `Public`, so builtin writes need no `transaction [...]`.
+    fn check_cdstore_root(&mut self, root: &CdstoreRoot) {
+        self.active_modules
+            .insert(ModulePath::parse("coddl::storage"));
+        self.load_active_modules();
+
+        let mut scope = Scope::default();
+        scope.push();
+        // Seed the scope with the storage relvars so a bare `ConnDefault` in
+        // expression position (e.g. the RHS of `ConnDefault := ConnDefault union
+        // …`) resolves to `Type::Relation(H)` — the same seeding
+        // `check_oper_decl` does for a `.cd` body. Every storage relvar is
+        // `Builtin`, so none carries the T0025 transaction gate.
+        for (name, info) in self.relvars.iter() {
+            if matches!(info.kind, RelvarKind::Builtin) {
+                let ty = Type::Relation(info.heading.clone());
+                scope.insert(name.to_string(), ty, Span::default(), BindingOrigin::Relvar);
+            }
+        }
+
+        for stmt in root.stmts() {
+            self.check_stmt(&stmt, &mut scope);
+        }
+    }
+
     /// `.cddb` root walk. There are no operator bodies in `.cddb`, so
     /// this is a one-pass collection of every relvar declaration into
     /// the table. T0014 fires here if `public` / `private` appears
@@ -1623,8 +1662,6 @@ impl TypeChecker {
     ///      (into `type_aliases`) registered — lazily, so an un-imported module's
     ///      names never enter this file's namespace.
     fn resolve_modules(&mut self, root: &Root) {
-        let core = ModulePath::parse("coddl::core");
-
         // (1) Collect the imports.
         for item in root.items() {
             let Item::UseDecl(u) = item else { continue };
@@ -1654,7 +1691,21 @@ impl TypeChecker {
             self.active_modules.insert(path);
         }
 
-        // (2) Build the hint catalogs, and load the active modules' contents.
+        // (2) Register the active modules' contents (operators, aliases,
+        //     builtin relvars) and build the hint catalogs.
+        self.load_active_modules();
+    }
+
+    /// Step (2) of module resolution: scan every embedded stdlib module to build
+    /// the hint catalogs ([`Self::stdlib_oper_owner`] / [`Self::stdlib_type_owner`]
+    /// / [`Self::stdlib_relvar_owner`]), and for the **active** ones (those in
+    /// [`Self::active_modules`]) register their `builtin oper`s, type aliases /
+    /// possrep scalars, and `builtin relvar`s into scope. Split out from
+    /// [`Self::resolve_modules`] so the `.cdstore` check path can reuse it after
+    /// seeding `active_modules` with the implicit `coddl::storage` (a `.cdstore`
+    /// has no `use module` decls to collect in step (1)).
+    fn load_active_modules(&mut self) {
+        let core = ModulePath::parse("coddl::core");
         for module in coddl_stdlib::stdlib_modules() {
             if module.path == core {
                 continue; // core is always loaded (Builtins::new) and always in scope
@@ -6433,6 +6484,51 @@ mod tests {
 
     fn codes_cddb(src: &str) -> Vec<&'static str> {
         diagnostics_cddb(src).into_iter().map(|d| d.code).collect()
+    }
+
+    fn diagnostics_cdstore(src: &str) -> Vec<Diagnostic> {
+        check(src, FileId(0), FileKind::Cdstore).diagnostics
+    }
+
+    fn codes_cdstore(src: &str) -> Vec<&'static str> {
+        diagnostics_cdstore(src)
+            .into_iter()
+            .map(|d| d.code)
+            .collect()
+    }
+
+    #[test]
+    fn cdstore_dml_against_storage_relvars_checks_clean() {
+        // The greetings.cdstore shape: `coddl::storage` is implicit, so the two
+        // inserts and the `:=` resolve `Backends`/`ConnEnv`/`ConnDefault` and
+        // typecheck with no `use module` line and no diagnostics.
+        let src = "insert Backends Relation { { database: \"greetings\", backend: \"sqlite\" }, };\n\
+                   insert ConnEnv Relation { { database: \"greetings\", backend: \"sqlite\", field: \"file\", env_var: \"HELLO_WORLD_SQLITE_PATH\" }, };\n\
+                   ConnDefault := ConnDefault union Relation { { database: \"greetings\", backend: \"sqlite\", field: \"file\", value: \"greetings.sqlite\" }, };\n";
+        let diags = diagnostics_cdstore(src);
+        assert!(diags.is_empty(), "expected clean, got: {diags:?}");
+    }
+
+    #[test]
+    fn cdstore_insert_heading_mismatch_is_t0034() {
+        // `Backends` is `{ database, backend }`; an extra attribute mismatches
+        // the target heading.
+        let src = "insert Backends Relation { { database: \"g\", backend: \"sqlite\", bogus: \"x\" }, };\n";
+        assert!(
+            codes_cdstore(src).contains(&"T0034"),
+            "{:?}",
+            codes_cdstore(src)
+        );
+    }
+
+    #[test]
+    fn cdstore_write_to_unknown_relvar_is_t0033() {
+        let src = "insert Nope Relation { { a: \"x\" }, };\n";
+        assert!(
+            codes_cdstore(src).contains(&"T0033"),
+            "{:?}",
+            codes_cdstore(src)
+        );
     }
 
     const HELLO_WORLD: &str = "program hello_world;\n\

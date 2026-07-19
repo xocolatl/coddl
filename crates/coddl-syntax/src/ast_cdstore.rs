@@ -1,174 +1,29 @@
 //! Typed AST view over a parsed `.cdstore` document.
 //!
-//! Mirrors the productions in [`parser_cdstore`](crate::parser_cdstore):
-//! [`CdstoreRoot`] wraps the document; [`CdstoreHeader`] is the
-//! `store for <db>;` header; [`BackendDecl`] declares the backend kind
-//! and its operational fields; [`RelvarBinding`] binds a catalog base
-//! relvar to a physical table; [`ColumnsBlock`] holds the column
-//! mappings.
+//! A `.cdstore` is DML into `coddl::storage` — a bare sequence of statements
+//! (see [`parser_cdstore`](crate::parser_cdstore)). [`CdstoreRoot`] wraps the
+//! document; its statements are the shared [`Stmt`] grammar `.cd` operator
+//! bodies use.
 
-use crate::ast::{self, AstNode};
+use crate::ast::Stmt;
 use crate::ast_node;
-use crate::cst::SyntaxToken;
-use crate::syntax_kind::SyntaxKind;
 
 ast_node!(pub CdstoreRoot, CDSTORE_ROOT);
 
 impl CdstoreRoot {
-    /// The `store for <database>;` header.
-    pub fn header(&self) -> Option<CdstoreHeader> {
-        ast::child(&self.syntax)
-    }
-
-    /// The single `backend <kind> { … };` declaration (v1: exactly
-    /// one). Returns `None` if missing or malformed.
-    pub fn backend(&self) -> Option<BackendDecl> {
-        ast::child(&self.syntax)
-    }
-
-    /// Iterate the per-relvar bindings in source order.
-    pub fn bindings(&self) -> impl Iterator<Item = RelvarBinding> + '_ {
-        ast::children(&self.syntax)
-    }
-}
-
-ast_node!(pub CdstoreHeader, CDSTORE_HEADER);
-
-impl CdstoreHeader {
-    /// The declared database name. Token order in the header is
-    /// `store`, `for`, IDENT — the database name is the third IDENT.
-    pub fn database_name(&self) -> Option<SyntaxToken> {
-        ast::nth_token(&self.syntax, SyntaxKind::IDENT, 2)
-    }
-}
-
-ast_node!(pub BackendDecl, BACKEND_DECL);
-
-impl BackendDecl {
-    /// The backend kind token (e.g. `sqlite`, `postgres`). Token order:
-    /// `backend` keyword, then the kind IDENT.
-    pub fn kind(&self) -> Option<SyntaxToken> {
-        ast::nth_token(&self.syntax, SyntaxKind::IDENT, 1)
-    }
-
-    /// Iterate the named-field children (`file: …`, `dsn: …`, etc.).
-    pub fn fields(&self) -> impl Iterator<Item = CdstoreField> + '_ {
-        ast::children(&self.syntax)
-    }
-}
-
-ast_node!(pub RelvarBinding, RELVAR_BINDING);
-
-impl RelvarBinding {
-    /// The catalog-side relvar name (the LHS of the `:`). Token order:
-    /// `relvar` keyword, name IDENT, `:`, `table` keyword, …
-    pub fn name(&self) -> Option<SyntaxToken> {
-        ast::nth_token(&self.syntax, SyntaxKind::IDENT, 1)
-    }
-
-    /// The physical table name (the string literal after `table`).
-    pub fn table_name(&self) -> Option<SyntaxToken> {
-        ast::first_token_of_kind(&self.syntax, SyntaxKind::STRING_LIT)
-    }
-
-    /// The `columns: { … }` block, if present.
-    pub fn columns_block(&self) -> Option<ColumnsBlock> {
-        ast::child(&self.syntax)
-    }
-}
-
-ast_node!(pub ColumnsBlock, COLUMNS_BLOCK);
-
-impl ColumnsBlock {
-    /// Iterate the `<attr>: "<col>"` field children.
-    pub fn fields(&self) -> impl Iterator<Item = CdstoreField> + '_ {
-        ast::children(&self.syntax)
-    }
-}
-
-ast_node!(pub CdstoreField, CDSTORE_FIELD);
-
-impl CdstoreField {
-    /// The field name (LHS of `:`, or the whole field in shorthand form).
-    pub fn name(&self) -> Option<SyntaxToken> {
-        ast::first_token_of_kind(&self.syntax, SyntaxKind::IDENT)
-    }
-
-    /// True when this is the columns-block shorthand `<name>` (no `:` value):
-    /// the column name equals the attribute name. Detected by the absence of a
-    /// `:` token, so it's distinct from a colon-present field whose value the
-    /// parser recovered past.
-    pub fn is_shorthand(&self) -> bool {
-        !self
-            .syntax
-            .children_with_tokens()
-            .any(|el| el.kind() == SyntaxKind::COLON)
-    }
-
-    /// The field value.
-    pub fn value(&self) -> Option<CdstoreValue> {
-        // The value is the first non-name, non-trivia element after
-        // the `:`. Walk the children-with-tokens stream, skipping the
-        // field name and the colon.
-        let mut seen_name = false;
-        let mut seen_colon = false;
-        for el in self.syntax.children_with_tokens() {
-            if el.kind().is_trivia() {
-                continue;
-            }
-            if !seen_name {
-                seen_name = true;
-                continue;
-            }
-            if !seen_colon {
-                seen_colon = true;
-                continue;
-            }
-            return match el.kind() {
-                SyntaxKind::STRING_LIT => el.into_token().map(CdstoreValue::String),
-                SyntaxKind::IDENT => el.into_token().map(CdstoreValue::Ident),
-                SyntaxKind::CALL_EXPR => el
-                    .into_node()
-                    .and_then(EnvCall::cast)
-                    .map(CdstoreValue::Env),
-                _ => None,
-            };
-        }
-        None
-    }
-}
-
-/// The right-hand side of a `.cdstore` field. Narrow on purpose —
-/// `.cdstore` is declarative configuration, not a programming surface.
-#[derive(Debug, Clone)]
-pub enum CdstoreValue {
-    /// A literal string (e.g. `"greetings.sqlite"`, `"id"`).
-    String(SyntaxToken),
-    /// A bare identifier (e.g. `sqlite`, `pooled`).
-    Ident(SyntaxToken),
-    /// An `env("NAME" [, default: "fallback"])` call — operational
-    /// late-bind to an environment variable at runtime startup.
-    Env(EnvCall),
-}
-
-ast_node!(pub EnvCall, CALL_EXPR);
-
-impl EnvCall {
-    /// The env-var name string literal (the first argument).
-    pub fn name(&self) -> Option<SyntaxToken> {
-        ast::first_token_of_kind(&self.syntax, SyntaxKind::STRING_LIT)
-    }
-
-    /// The optional default-value string literal, if the `default:` arg
-    /// is present. Returns the second STRING_LIT under the call node.
-    pub fn default(&self) -> Option<SyntaxToken> {
-        ast::nth_token(&self.syntax, SyntaxKind::STRING_LIT, 1)
+    /// The document's statements, in source order. A `.cdstore` is a bare
+    /// sequence of DML statements (`insert …;`, `R := …;`) over the implicit
+    /// `coddl::storage` module — the same [`Stmt`] grammar `.cd` operator bodies
+    /// use, just at file top level.
+    pub fn stmts(&self) -> impl Iterator<Item = Stmt> + '_ {
+        self.syntax.children().filter_map(Stmt::cast)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{self, AstNode};
     use crate::file_kind::FileKind;
     use crate::parse;
     use coddl_diagnostics::FileId;
@@ -184,96 +39,26 @@ mod tests {
     }
 
     #[test]
-    fn header_name_resolves() {
-        let root = ast("store for greetings;");
-        assert_eq!(
-            root.header().unwrap().database_name().unwrap().text(),
-            "greetings"
-        );
+    fn stmts_are_dml_in_source_order() {
+        let src = "insert Backends Relation { { database: \"g\", backend: \"sqlite\" }, };\n\
+                   ConnDefault := ConnDefault union Relation { { database: \"g\", backend: \"sqlite\", field: \"file\", value: \"g.sqlite\" }, };\n";
+        let root = ast(src);
+        let stmts: Vec<_> = root.stmts().collect();
+        assert_eq!(stmts.len(), 2);
+        assert!(matches!(stmts[0], Stmt::Insert(_)));
+        assert!(matches!(stmts[1], Stmt::Assign(_)));
     }
 
     #[test]
-    fn backend_kind_and_string_field() {
-        let src = "store for d;\nbackend sqlite { file: \"x.sqlite\" };\n";
-        let root = ast(src);
-        let backend = root.backend().expect("backend");
-        assert_eq!(backend.kind().unwrap().text(), "sqlite");
-        let field = backend.fields().next().unwrap();
-        assert_eq!(field.name().unwrap().text(), "file");
-        match field.value().unwrap() {
-            CdstoreValue::String(s) => assert_eq!(s.text(), "\"x.sqlite\""),
-            other => panic!("expected string value, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn backend_env_value_with_default() {
-        let src =
-            "store for d;\nbackend sqlite { file: env(\"CODDL_DB\", default: \"x.sqlite\") };\n";
-        let root = ast(src);
-        let field = root.backend().unwrap().fields().next().unwrap();
-        let CdstoreValue::Env(env) = field.value().unwrap() else {
-            panic!("expected env() value");
+    fn insert_stmt_exposes_target_and_source() {
+        let root = ast("insert Backends Relation { { database: \"g\", backend: \"sqlite\" }, };\n");
+        let Some(Stmt::Insert(ins)) = root.stmts().next() else {
+            panic!("expected an insert statement");
         };
-        assert_eq!(env.name().unwrap().text(), "\"CODDL_DB\"");
-        assert_eq!(env.default().unwrap().text(), "\"x.sqlite\"");
-    }
-
-    #[test]
-    fn ident_value_recognized() {
-        let src = "store for d;\nbackend postgres { mode: pooled };\n";
-        let root = ast(src);
-        let field = root.backend().unwrap().fields().next().unwrap();
-        match field.value().unwrap() {
-            CdstoreValue::Ident(t) => assert_eq!(t.text(), "pooled"),
-            other => panic!("expected ident value, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn relvar_binding_walks_to_columns() {
-        let src = "store for d;\n\
-                   relvar Greetings: table \"greetings\" {\n\
-                       columns: { id: \"id\", message: \"message\" }\n\
-                   };\n";
-        let root = ast(src);
-        let binding = root.bindings().next().expect("binding");
-        assert_eq!(binding.name().unwrap().text(), "Greetings");
-        assert_eq!(binding.table_name().unwrap().text(), "\"greetings\"");
-        let cols = binding.columns_block().expect("columns");
-        let fields: Vec<_> = cols.fields().collect();
-        assert_eq!(fields.len(), 2);
-        assert_eq!(fields[0].name().unwrap().text(), "id");
-        assert!(!fields[0].is_shorthand(), "explicit `id: \"id\"` field");
-    }
-
-    #[test]
-    fn shorthand_field_has_name_and_no_value() {
-        // `columns: { id, body: "message" }` — `id` is shorthand (name only,
-        // no value); `body` is explicit.
-        let src = "store for d;\n\
-                   relvar Greetings: table \"greetings\" {\n\
-                       columns: { id, body: \"message\" }\n\
-                   };\n";
-        let root = ast(src);
-        let cols = root
-            .bindings()
-            .next()
-            .unwrap()
-            .columns_block()
-            .expect("columns");
-        let fields: Vec<_> = cols.fields().collect();
-        assert_eq!(fields.len(), 2);
-
-        assert_eq!(fields[0].name().unwrap().text(), "id");
-        assert!(fields[0].is_shorthand());
-        assert!(fields[0].value().is_none());
-
-        assert_eq!(fields[1].name().unwrap().text(), "body");
-        assert!(!fields[1].is_shorthand());
-        match fields[1].value().unwrap() {
-            CdstoreValue::String(s) => assert_eq!(s.text(), "\"message\""),
-            other => panic!("expected string value, got {other:?}"),
-        }
+        // The target is the bare relvar name reference `Backends`.
+        let Some(ast::Expr::NameRef(target)) = ins.target() else {
+            panic!("expected a name-ref target");
+        };
+        assert_eq!(target.ident().unwrap().text(), "Backends");
     }
 }

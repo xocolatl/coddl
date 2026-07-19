@@ -1,21 +1,4 @@
-// shifts.cdstore
-//
-// Conceptual -> physical binding for `shifts`: the SQLite backend plus the
-// table/column map for each base relvar. The .sqlite file is created by
-// `coddl provision` and gitignored. CODDL_SHIFTS_FILE overrides `file:` at startup.
-
-store for shifts;
-
-backend sqlite {
-    file: "shifts.sqlite",
-};
-
-// Every attribute maps to a same-named column, so the columns blocks use the
-// bare-name shorthand (`columns: { a, b }` ≡ `columns: { a: "a", b: "b" }`).
-relvar Morning: table "morning" {
-    columns: { id, name }
-};
-
-relvar Evening: table "evening" {
-    columns: { id, name }
+// shifts.cdstore — DML into coddl::storage. `shifts` runs on SQLite.
+insert Backends Relation {
+    { database: "shifts", backend: "sqlite" },
 };

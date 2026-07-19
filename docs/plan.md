@@ -75,11 +75,11 @@ public entry point. It:
 4. **Public relvars present, no binding** → PL0001 at the first
    public relvar's span.
 5. **Public relvars present, binding present** → looks for
-   `<db>.cddb` and `<db>.cdstore` in `cd_path`'s parent directory.
-   Missing → PL0002 / PL0003.
-6. Parses + typechecks each companion via `coddl_types::check`.
-   `.cddb` populates a relvar table; `.cdstore` is consumed via the
-   `ast_cdstore` AST view.
+   `<db>.cddb` in `cd_path`'s parent directory. Missing → PL0002.
+6. Parses + typechecks the `.cddb` via `coddl_types::check`, which
+   populates a relvar table. Physical binding is identity (table =
+   relvar name, column = attribute); the plan layer does not read a
+   `.cdstore` (that is the future storage-catalog loader's job).
 
 `.cdmap` discovery is **out of scope for Phase 16** — any `.cdmap`
 file in the directory is left alone. Non-identity adapters (project /
@@ -135,15 +135,17 @@ the offending span.
 |------------------------------------------------------------------------|------------|
 | `.cd` binds a database when public relvars are declared                | PL0001     |
 | `<db>.cddb` exists in the same directory                               | PL0002     |
-| `<db>.cdstore` exists in the same directory                            | PL0003     |
 | `<db>.cddb`'s `database <name>;` equals the `.cd` binding              | PL0004     |
-| `<db>.cdstore`'s `store for <name>;` equals the `.cd` binding          | PL0005     |
 | Each public relvar in `.cd` has a same-named base relvar in `.cddb`    | PL0006     |
 | Public-relvar heading equals catalog-relvar heading (set equality)     | PL0007     |
-| Each resolved catalog relvar has exactly one `.cdstore` binding        | PL0008     |
-| Each heading attribute appears in the `.cdstore` columns block         | PL0009     |
-| `.cdstore` column entries name only attributes in the catalog heading  | PL0010     |
-| The `backend <kind> { ... };` declaration is supported (v1: `sqlite`)  | PL0011     |
+
+The physical binding is **identity** — table = relvar name, column =
+attribute (the mapping `coddl::storage`'s design mandates) — and the backend +
+connection file are transitional defaults (SQLite, `<db>.sqlite`). The plan
+layer no longer reads a `.cdstore`; a `.cdstore` is now DML into `coddl::storage`
+(see `docs/cdstore-grammar.md`) that the future storage-catalog **loader** will
+consume. Until it lands, PL0003 / PL0005 / PL0008 / PL0009 / PL0010 / PL0011
+(the retired `.cdstore`-binding invariants) are not emitted.
 
 Heading equivalence reuses `coddl_types::Heading::assignable_to`, so
 `Unknown` attribute types (the typechecker's error-recovery sentinel)
@@ -195,15 +197,11 @@ pub enum BackendKind {
 **from a `.cddb`**, not from a `.cd` program.
 `coddl_plan::resolve_catalog(cddb_path) -> CatalogPlanOutput` is the
 parallel entry point (`crates/coddl-plan/src/catalog.rs`). It reads +
-typechecks the `.cddb`, walks to the sibling `<db>.cdstore` — located
-by the catalog's own `database <name>;` header, not the file stem —
-and resolves every **base** relvar to its physical form.
-
-Because there is no `.cd`, the FileId numbering differs: the `.cddb`
-is `FileId(0)` and the `.cdstore` is `FileId(1)` (the program flow
-uses `0`/`1`/`2` for `.cd`/`.cddb`/`.cdstore`). The two shared helpers
-`classify_backend` and `collect_columns` take the `.cdstore`'s FileId
-as a parameter so diagnostics anchor to the right file in both flows.
+typechecks the `.cddb` and resolves every **base** relvar to its
+physical form by **identity**: table = relvar name, column = attribute.
+The backend + connection file are transitional defaults (SQLite,
+`<db>.sqlite`) — TODO(cdstore-loader): resolve them by querying the
+loaded `coddl::storage` relations. The `.cddb` is `FileId(0)`.
 
 ```rust
 pub struct CatalogPlanOutput {
@@ -213,8 +211,8 @@ pub struct CatalogPlanOutput {
 
 pub struct CatalogPlan {
     pub database_name: String,               // from `.cddb` `database <name>;`
-    pub backend_kind: BackendKind,
-    pub db_file_default: Option<String>,     // canonicalized `file:`, SQLite only
+    pub backend_kind: BackendKind,           // default: SQLite (TODO loader)
+    pub db_file_default: Option<String>,     // default: `<db>.sqlite` (TODO loader)
     pub relvars: Vec<ResolvedCatalogRelvar>, // base only, name-sorted
 }
 
@@ -222,8 +220,8 @@ pub struct ResolvedCatalogRelvar {
     pub name: String,
     pub heading: Heading,
     pub keys: Vec<Vec<String>>,
-    pub table_name: String,
-    pub columns: Vec<(String, String)>,        // (heading_attr, sql_column), name-sorted
+    pub table_name: String,                    // identity: = name
+    pub columns: Vec<(String, String)>,        // identity: (attr, attr), name-sorted
     pub init: Option<coddl_syntax::ast::Expr>, // RHS of `Name := <expr>;`; the seed value
 }
 ```
@@ -243,21 +241,14 @@ resolver, so `provision` and `run` open the same file.
 
 Behavior:
 - **Hard failures** (plan `None`): the `.cddb` is unreadable (PL0100),
-  or it has no `database <name>;` header so its store can't be located
-  (PL0020).
-- Otherwise a plan is returned best-effort; per-relvar failures are
-  diagnostics. Virtual relvars are omitted (no physical table). When
-  the `.cdstore` is absent (PL0003) the per-relvar loop is skipped
-  entirely — PL0003 is the single root cause, so there is no
-  PL0008-per-relvar cascade.
+  or it has no `database <name>;` header (PL0020).
+- Otherwise a plan is returned; every base relvar resolves by identity.
+  Virtual relvars are omitted (no physical table).
 
-The program-flow codes PL0005 / PL0008 / PL0009 / PL0010 / PL0011 /
-PL0100 are **re-homed** to the catalog context (PL0005 compares the
-store header against the catalog's `database <name>;`, not a `.cd`
-binding). The program-only codes PL0001 / PL0002 / PL0004 / PL0006 /
-PL0007 and the `.cd` header/module codes PL0012–PL0019 do not apply.
-The `.cddb`'s own typecheck diagnostics (T-codes) flow through the
-merged output.
+Only PL0100 / PL0020 apply to the catalog flow; the `.cddb`'s own
+typecheck diagnostics (T-codes) flow through the merged output. The
+retired `.cdstore`-binding codes (PL0003 / PL0005 / PL0008–PL0011) are
+no longer emitted by either flow.
 
 
 ## Driver integration

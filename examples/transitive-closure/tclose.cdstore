@@ -1,23 +1,4 @@
-// tclose.cdstore
-//
-// Conceptual -> physical binding for `tclose`: the SQLite backend plus the
-// table/column map for each base relvar. The .sqlite file is created by
-// `coddl provision` and gitignored. CODDL_TCLOSE_FILE overrides `file:` at startup.
-
-store for tclose;
-
-backend sqlite {
-    file: "tclose.sqlite",
-};
-
-// Every attribute maps to a same-named column, so the columns blocks use the
-// bare-name shorthand (`columns: { a, b }` ≡ `columns: { a: "a", b: "b" }`).
-// `from`/`to` are reserved SQL keywords used as attribute names; the emitter
-// quotes every identifier, so they bind cleanly.
-relvar Edges: table "edges" {
-    columns: { from, to }
-};
-
-relvar Contains: table "contains" {
-    columns: { major, minor, qty }
+// tclose.cdstore — DML into coddl::storage. `tclose` runs on SQLite.
+insert Backends Relation {
+    { database: "tclose", backend: "sqlite" },
 };

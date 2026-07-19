@@ -1,0 +1,15 @@
+[package]
+name = "coddl-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Evaluate a .cdstore document's DML into the coddl::storage meta-catalog relation values, at compile time."
+
+[dependencies]
+coddl-diagnostics.workspace = true
+coddl-syntax.workspace = true
+coddl-types.workspace = true
+coddl-relir.workspace = true
+coddl-consteval.workspace = true

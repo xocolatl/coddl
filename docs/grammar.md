@@ -154,7 +154,7 @@ There is **no `mod`** — `div` (truncating integer division) is the only textua
 
 **Type position** (`parse_type_ref`): `Relation` and `Sequence` as generators (their expression-head claims are the Tier-2 rows above). **`Tuple` is type-position only — it never claims expression space**; a variable, attribute, or oper named `Tuple` is fully usable. A *type* named after a generator is the one thing the claim forecloses — `type Relation { … }` would be unreachable — so the typechecker rejects it (T0085, same as the builtins).
 
-**Sidecar dialects** (separate parsers, separate diagnostic namespaces): `.cddb` — `database` `base` `virtual` `public` `private` `relvar` `key`; `.cdstore` — `store` `for` `backend` `relvar` `table` `columns` `env` `default`; `.cdmap` — `map` `to`.
+**Sidecar dialects** (separate parsers, separate diagnostic namespaces): `.cddb` — `database` `base` `virtual` `public` `private` `relvar` `key`; `.cdmap` — `map` `to`. `.cdstore` introduces no dialect keywords of its own — it is a bare sequence of `.cd` statements (DML into `coddl::storage`), so it reuses the `.cd` keyword set above.
 
 ### Tier 4 — library vocabulary, not keywords
 

@@ -17,11 +17,8 @@ use std::path::{Path, PathBuf};
 use coddl_diagnostics::{Diagnostic, FileId, Span};
 use coddl_syntax::ast::{AstNode, DatabaseBinding, Root};
 use coddl_syntax::ast_cddb::CddbRoot;
-use coddl_syntax::ast_cdstore::{
-    BackendDecl, CdstoreRoot, CdstoreValue, ColumnsBlock, RelvarBinding,
-};
 use coddl_syntax::{parse, FileKind};
-use coddl_types::{check, check_program, CheckUnit, Heading, RelvarKind, RelvarTable};
+use coddl_types::{check, check_program, CheckUnit, RelvarKind, RelvarTable};
 
 mod catalog;
 mod modules;
@@ -178,7 +175,6 @@ pub fn discover_and_validate_with_overrides(
     };
 
     let cddb_path = base.join(format!("{database_name}.cddb"));
-    let cdstore_path = base.join(format!("{database_name}.cdstore"));
 
     let cddb_source = match read_source_or_override(&cddb_path, overrides) {
         Ok(s) => Some(s),
@@ -190,27 +186,11 @@ pub fn discover_and_validate_with_overrides(
             None
         }
     };
-    let cdstore_source = match read_source_or_override(&cdstore_path, overrides) {
-        Ok(s) => Some(s),
-        Err(_) => {
-            diags.push(plain_error(
-                "PL0003",
-                format!("missing companion store: {}", cdstore_path.display()),
-            ));
-            None
-        }
-    };
 
     let cddb_check = cddb_source
         .as_ref()
         .map(|s| check(s, FileId(1), FileKind::Cddb));
     if let Some(c) = &cddb_check {
-        diags.extend(c.diagnostics.iter().cloned());
-    }
-    let cdstore_check = cdstore_source
-        .as_ref()
-        .map(|s| check(s, FileId(2), FileKind::Cdstore));
-    if let Some(c) = &cdstore_check {
         diags.extend(c.diagnostics.iter().cloned());
     }
 
@@ -236,46 +216,20 @@ pub fn discover_and_validate_with_overrides(
         }
     }
 
-    let cdstore_root = cdstore_check
-        .as_ref()
-        .and_then(|c| CdstoreRoot::cast(c.tree.clone()));
-    if let Some(root) = &cdstore_root {
-        if let Some(header) = root.header() {
-            if let Some(tok) = header.database_name() {
-                let cdstore_db_name = tok.text();
-                if cdstore_db_name != database_name {
-                    diags.push(Diagnostic::error(
-                        token_span(FileId(2), &tok),
-                        "PL0005",
-                        format!(
-                            "`{}` declares `store for {cdstore_db_name};` but `{}` binds `database {database_name};`",
-                            cdstore_path.display(),
-                            cd_path.display(),
-                        ),
-                    ));
-                }
-            }
-        }
-    }
-
     let cddb_relvars = cddb_check
         .as_ref()
         .map(|c| c.relvars.clone())
         .unwrap_or_default();
-    let backend_kind = cdstore_root
-        .as_ref()
-        .and_then(|r| r.backend())
-        .map(|b| classify_backend(&b, FileId(2), &mut diags))
-        .unwrap_or(BackendKind::Unknown);
-    let db_file_default = if matches!(backend_kind, BackendKind::Sqlite) {
-        cdstore_root
-            .as_ref()
-            .and_then(|r| r.backend())
-            .and_then(|b| extract_file_directive(&b))
-            .map(|raw| canonicalize_against(&cdstore_path, &raw))
-    } else {
-        None
-    };
+    // The physical binding no longer comes from a `.cdstore`: table = relvar
+    // name and column = attribute (identity — the mapping `coddl::storage`'s
+    // design mandates), and backend + file are transitional defaults.
+    // TODO(cdstore-loader): resolve backend + connection by querying the loaded
+    // `coddl::storage` relations instead of defaulting.
+    let backend_kind = BackendKind::Sqlite;
+    let db_file_default = Some(canonicalize_against(
+        &cddb_path,
+        &format!("{database_name}.sqlite"),
+    ));
 
     // Per-public-relvar resolution: identity match, heading
     // equivalence, store-binding lookup, column coverage.
@@ -308,26 +262,16 @@ pub fn discover_and_validate_with_overrides(
             continue;
         }
 
-        // PL0008: catalog relvar must have a store binding.
-        let binding = cdstore_root
-            .as_ref()
-            .and_then(|root| find_binding(root, app_name));
-        let Some(binding) = binding else {
-            diags.push(Diagnostic::error(
-                info.span,
-                "PL0008",
-                format!("catalog relvar `{app_name}` has no `.cdstore` binding"),
-            ));
-            continue;
-        };
-
-        let table_name = binding
-            .table_name()
-            .map(|t| unquote(t.text()))
-            .unwrap_or_default();
-
-        // PL0009 / PL0010: column coverage.
-        let columns = collect_columns(&binding, &catalog.heading, FileId(2), &mut diags);
+        // Identity physical mapping: table = relvar name, column = attribute
+        // (heading-canonical, name-sorted for determinism).
+        let table_name = app_name.to_string();
+        let mut columns: Vec<(String, String)> = catalog
+            .heading
+            .attrs()
+            .iter()
+            .map(|(a, _)| (a.clone(), a.clone()))
+            .collect();
+        columns.sort_by(|a, b| a.0.cmp(&b.0));
 
         resolved.push(ResolvedPublicRelvar {
             app_name: app_name.to_string(),
@@ -364,37 +308,17 @@ pub fn discover_and_validate_with_overrides(
     }
 }
 
-/// Pull the `file: "..."` directive out of a `BackendDecl`. Returns the
-/// raw (still-relative) lexeme; the caller canonicalizes against the
-/// `.cdstore`'s parent directory.
-pub(crate) fn extract_file_directive(decl: &BackendDecl) -> Option<String> {
-    for field in decl.fields() {
-        let name = field
-            .name()
-            .map(|t| t.text().to_string())
-            .unwrap_or_default();
-        if name != "file" {
-            continue;
-        }
-        return match field.value() {
-            Some(CdstoreValue::String(t)) => Some(unquote(t.text())),
-            _ => None,
-        };
-    }
-    None
-}
-
-/// Resolve `raw` against the `.cdstore`'s parent directory and try to
+/// Resolve `raw` against `base_path`'s parent directory and try to
 /// canonicalize. Falls back to the path-joined form when canonicalize
 /// fails (e.g., the file doesn't exist yet — the user may seed the DB
 /// after build but before run). Always returns an absolute lexical
 /// path so the binary is relocatable via `CODDL_<DB>_FILE` override.
-pub(crate) fn canonicalize_against(cdstore_path: &Path, raw: &str) -> String {
+pub(crate) fn canonicalize_against(base_path: &Path, raw: &str) -> String {
     let raw_path = Path::new(raw);
     let absolute = if raw_path.is_absolute() {
         raw_path.to_path_buf()
     } else {
-        let parent = cdstore_path
+        let parent = base_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
@@ -404,105 +328,6 @@ pub(crate) fn canonicalize_against(cdstore_path: &Path, raw: &str) -> String {
         Ok(p) => p.display().to_string(),
         Err(_) => absolute.display().to_string(),
     }
-}
-
-/// Classify the `.cdstore`'s `backend <kind>;` declaration. `file` is
-/// the `.cdstore`'s [`FileId`] so PL0011 anchors to the right file in
-/// both the `.cd`-rooted flow (FileId(2)) and the catalog-rooted flow
-/// (FileId(1)).
-pub(crate) fn classify_backend(
-    decl: &BackendDecl,
-    file: FileId,
-    diags: &mut Vec<Diagnostic>,
-) -> BackendKind {
-    let Some(tok) = decl.kind() else {
-        return BackendKind::Unknown;
-    };
-    let kind = tok.text();
-    if kind == "sqlite" {
-        BackendKind::Sqlite
-    } else {
-        diags.push(Diagnostic::error(
-            token_span(file, &tok),
-            "PL0011",
-            format!("backend `{kind}` is not supported (v1 supports `sqlite` only)"),
-        ));
-        BackendKind::Other(kind.to_string())
-    }
-}
-
-pub(crate) fn find_binding(root: &CdstoreRoot, name: &str) -> Option<RelvarBinding> {
-    root.bindings()
-        .find(|b| b.name().map(|t| t.text() == name).unwrap_or(false))
-}
-
-/// Collect the `(heading_attr, sql_column)` map from a `.cdstore`
-/// binding, emitting PL0009 (uncovered heading attribute) and PL0010
-/// (column entry not in the heading). `file` is the `.cdstore`'s
-/// [`FileId`] — FileId(2) for the `.cd`-rooted flow, FileId(1) for the
-/// catalog-rooted flow.
-pub(crate) fn collect_columns(
-    binding: &RelvarBinding,
-    heading: &Heading,
-    file: FileId,
-    diags: &mut Vec<Diagnostic>,
-) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    let block: Option<ColumnsBlock> = binding.columns_block();
-
-    let mut seen_attrs: Vec<String> = Vec::new();
-    if let Some(block) = &block {
-        for field in block.fields() {
-            let Some(name_tok) = field.name() else {
-                continue;
-            };
-            let attr_name = name_tok.text().to_string();
-            // Shorthand `id` ≡ `id: "id"` — the column name is the attribute
-            // name. An explicit `attr: "col"` uses the quoted column string.
-            let column_name = if field.is_shorthand() {
-                attr_name.clone()
-            } else {
-                match field.value() {
-                    Some(CdstoreValue::String(t)) => unquote(t.text()),
-                    _ => String::new(),
-                }
-            };
-
-            if heading.lookup(&attr_name).is_none() {
-                diags.push(Diagnostic::error(
-                    token_span(file, &name_tok),
-                    "PL0010",
-                    format!(
-                        "column entry `{attr_name}` is not in the catalog heading {}",
-                        heading,
-                    ),
-                ));
-                continue;
-            }
-            seen_attrs.push(attr_name.clone());
-            out.push((attr_name, column_name));
-        }
-    }
-
-    // PL0009: every heading attribute must appear in the columns block.
-    let binding_name = binding
-        .name()
-        .map(|t| t.text().to_string())
-        .unwrap_or_default();
-    for (attr, _) in heading.attrs() {
-        if !seen_attrs.iter().any(|a| a == attr) {
-            let span = binding
-                .name()
-                .map(|t| token_span(file, &t))
-                .unwrap_or_else(|| Span::new(file, 0, 0));
-            diags.push(Diagnostic::error(
-                span,
-                "PL0009",
-                format!("binding for `{binding_name}` doesn't cover heading attribute `{attr}`",),
-            ));
-        }
-    }
-    out
 }
 
 /// Validate the `.cd`'s mandatory file header and return its kind.
@@ -648,19 +473,6 @@ pub(crate) fn token_span(file: FileId, token: &coddl_syntax::cst::SyntaxToken) -
     Span::new(file, r.start().into(), r.end().into())
 }
 
-/// Strip surrounding double-quotes from a raw string-literal lexeme.
-/// The lexer guarantees the token form: opening `"`, body, closing `"`.
-pub(crate) fn unquote(s: &str) -> String {
-    let trimmed = s
-        .strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .unwrap_or(s);
-    // The string-literal token preserves escapes verbatim today; the
-    // caller (SQL emitter, runtime) decodes them on use. Phase 21's
-    // SQLite layer should run the decoder before passing to sqlite3.
-    trimmed.to_string()
-}
-
 pub(crate) fn plain_error(code: &'static str, message: String) -> Diagnostic {
     Diagnostic::error(Span::new(FileId(0), 0, 0), code, message)
 }
@@ -685,18 +497,15 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
-    /// Write a triple of files into a fresh tempdir and return its
-    /// path plus the path to the `.cd`. `db` is the database name
-    /// used to construct the companion file names.
-    fn write_project(cd: &str, cddb: Option<&str>, cdstore: Option<&str>) -> (TempDir, PathBuf) {
+    /// Write a `.cd` plus its `greetings.cddb` companion into a fresh tempdir
+    /// and return the tempdir plus the `.cd` path. There is no `.cdstore` — the
+    /// plan layer no longer reads one (identity mapping + defaults).
+    fn write_project(cd: &str, cddb: Option<&str>) -> (TempDir, PathBuf) {
         let dir = TempDir::new().expect("tempdir");
         let cd_path = dir.path().join("app.cd");
         fs::write(&cd_path, cd).unwrap();
         if let Some(s) = cddb {
             fs::write(dir.path().join("greetings.cddb"), s).unwrap();
-        }
-        if let Some(s) = cdstore {
-            fs::write(dir.path().join("greetings.cdstore"), s).unwrap();
         }
         (dir, cd_path)
     }
@@ -713,21 +522,13 @@ database greetings;
 base relvar Greetings { id: Integer, message: Text } key { id };
 ";
 
-    const CDSTORE_GREETINGS: &str = "\
-store for greetings;
-backend sqlite { file: \"greetings.sqlite\" };
-relvar Greetings: table \"greetings\" {
-    columns: { id: \"id\", message: \"message\" }
-};
-";
-
     fn codes(diags: &[Diagnostic]) -> Vec<&'static str> {
         diags.iter().map(|d| d.code).collect()
     }
 
     #[test]
     fn hello_world_db_resolves_cleanly() {
-        let (_dir, cd) = write_project(CD_HELLO, Some(CDDB_GREETINGS), Some(CDSTORE_GREETINGS));
+        let (_dir, cd) = write_project(CD_HELLO, Some(CDDB_GREETINGS));
         let out = discover_and_validate(&cd);
         let pl: Vec<_> = out
             .diagnostics
@@ -740,59 +541,28 @@ relvar Greetings: table \"greetings\" {
         let plan = out.plan.expect("plan");
         assert_eq!(plan.program_name, "hello");
         assert_eq!(plan.database_name.as_deref(), Some("greetings"));
+        // Backend + file are transitional defaults (TODO cdstore-loader).
         assert_eq!(plan.backend_kind, BackendKind::Sqlite);
         assert_eq!(plan.resolved.len(), 1);
         let r = &plan.resolved[0];
         assert_eq!(r.app_name, "Greetings");
         assert_eq!(r.catalog_name, "Greetings");
-        assert_eq!(r.table_name, "greetings");
+        // Identity mapping: table = relvar name, column = same-named attribute.
+        assert_eq!(r.table_name, "Greetings");
         // A base catalog relvar is directly writable.
         assert_eq!(r.write_policy, WritePolicy::ReadWrite);
-        // Heading-canonical (sorted) order: id, message.
         let col_attrs: Vec<&str> = r.columns.iter().map(|(a, _)| a.as_str()).collect();
         assert!(col_attrs.contains(&"id"));
         assert!(col_attrs.contains(&"message"));
-    }
-
-    #[test]
-    fn columns_shorthand_maps_each_attr_to_its_own_name() {
-        // `columns: { id, message }` — the shorthand binds each attribute to a
-        // column of the same name, exactly like the explicit `id: "id"` form.
-        const CDSTORE_SHORTHAND: &str = "\
-store for greetings;
-backend sqlite { file: \"greetings.sqlite\" };
-relvar Greetings: table \"greetings\" {
-    columns: { id, message }
-};
-";
-        let (_dir, cd) = write_project(CD_HELLO, Some(CDDB_GREETINGS), Some(CDSTORE_SHORTHAND));
-        let out = discover_and_validate(&cd);
-        let pl: Vec<_> = out
-            .diagnostics
-            .iter()
-            .filter(|d| d.code.starts_with("PL"))
-            .map(|d| d.code)
-            .collect();
-        assert!(pl.is_empty(), "unexpected PL diagnostics: {pl:?}");
-
-        let plan = out.plan.expect("plan");
-        let r = &plan.resolved[0];
-        let mut cols = r.columns.clone();
-        cols.sort();
-        assert_eq!(
-            cols,
-            vec![
-                ("id".to_string(), "id".to_string()),
-                ("message".to_string(), "message".to_string()),
-            ],
-            "shorthand maps each attribute to a same-named column"
-        );
+        for (a, c) in &r.columns {
+            assert_eq!(a, c, "column is the same-named attribute");
+        }
     }
 
     #[test]
     fn no_public_relvars_empty_plan() {
         let cd = "program p;\noper main {} [];\n";
-        let (_dir, cd_path) = write_project(cd, None, None);
+        let (_dir, cd_path) = write_project(cd, None);
         let out = discover_and_validate(&cd_path);
         let pl: Vec<_> = codes(&out.diagnostics)
             .into_iter()
@@ -810,23 +580,16 @@ relvar Greetings: table \"greetings\" {
 program p;
 public relvar X { a: Integer } key { a };
 ";
-        let (_dir, cd_path) = write_project(cd, None, None);
+        let (_dir, cd_path) = write_project(cd, None);
         let out = discover_and_validate(&cd_path);
         assert!(codes(&out.diagnostics).contains(&"PL0001"));
     }
 
     #[test]
     fn missing_cddb_emits_pl0002() {
-        let (_dir, cd) = write_project(CD_HELLO, None, Some(CDSTORE_GREETINGS));
+        let (_dir, cd) = write_project(CD_HELLO, None);
         let out = discover_and_validate(&cd);
         assert!(codes(&out.diagnostics).contains(&"PL0002"));
-    }
-
-    #[test]
-    fn missing_cdstore_emits_pl0003() {
-        let (_dir, cd) = write_project(CD_HELLO, Some(CDDB_GREETINGS), None);
-        let out = discover_and_validate(&cd);
-        assert!(codes(&out.diagnostics).contains(&"PL0003"));
     }
 
     #[test]
@@ -835,29 +598,15 @@ public relvar X { a: Integer } key { a };
 database other;
 base relvar Greetings { id: Integer, message: Text } key { id };
 ";
-        let (_dir, cd) = write_project(CD_HELLO, Some(bad_cddb), Some(CDSTORE_GREETINGS));
+        let (_dir, cd) = write_project(CD_HELLO, Some(bad_cddb));
         let out = discover_and_validate(&cd);
         assert!(codes(&out.diagnostics).contains(&"PL0004"));
     }
 
     #[test]
-    fn cdstore_header_mismatch_emits_pl0005() {
-        let bad_cdstore = "\
-store for other;
-backend sqlite { file: \"x.sqlite\" };
-relvar Greetings: table \"greetings\" {
-    columns: { id: \"id\", message: \"message\" }
-};
-";
-        let (_dir, cd) = write_project(CD_HELLO, Some(CDDB_GREETINGS), Some(bad_cdstore));
-        let out = discover_and_validate(&cd);
-        assert!(codes(&out.diagnostics).contains(&"PL0005"));
-    }
-
-    #[test]
     fn missing_catalog_relvar_emits_pl0006() {
         let empty_cddb = "database greetings;\n";
-        let (_dir, cd) = write_project(CD_HELLO, Some(empty_cddb), Some(CDSTORE_GREETINGS));
+        let (_dir, cd) = write_project(CD_HELLO, Some(empty_cddb));
         let out = discover_and_validate(&cd);
         assert!(codes(&out.diagnostics).contains(&"PL0006"));
     }
@@ -868,72 +617,14 @@ relvar Greetings: table \"greetings\" {
 database greetings;
 base relvar Greetings { id: Integer, message: Boolean } key { id };
 ";
-        let (_dir, cd) = write_project(CD_HELLO, Some(mismatched_cddb), Some(CDSTORE_GREETINGS));
+        let (_dir, cd) = write_project(CD_HELLO, Some(mismatched_cddb));
         let out = discover_and_validate(&cd);
         assert!(codes(&out.diagnostics).contains(&"PL0007"));
     }
 
     #[test]
-    fn missing_store_binding_emits_pl0008() {
-        let empty_cdstore = "\
-store for greetings;
-backend sqlite { file: \"x.sqlite\" };
-";
-        let (_dir, cd) = write_project(CD_HELLO, Some(CDDB_GREETINGS), Some(empty_cdstore));
-        let out = discover_and_validate(&cd);
-        assert!(codes(&out.diagnostics).contains(&"PL0008"));
-    }
-
-    #[test]
-    fn missing_column_emits_pl0009() {
-        let bad_cdstore = "\
-store for greetings;
-backend sqlite { file: \"x.sqlite\" };
-relvar Greetings: table \"greetings\" {
-    columns: { id: \"id\" }
-};
-";
-        let (_dir, cd) = write_project(CD_HELLO, Some(CDDB_GREETINGS), Some(bad_cdstore));
-        let out = discover_and_validate(&cd);
-        assert!(codes(&out.diagnostics).contains(&"PL0009"));
-    }
-
-    #[test]
-    fn extra_column_emits_pl0010() {
-        let bad_cdstore = "\
-store for greetings;
-backend sqlite { file: \"x.sqlite\" };
-relvar Greetings: table \"greetings\" {
-    columns: { id: \"id\", message: \"message\", extra: \"foo\" }
-};
-";
-        let (_dir, cd) = write_project(CD_HELLO, Some(CDDB_GREETINGS), Some(bad_cdstore));
-        let out = discover_and_validate(&cd);
-        assert!(codes(&out.diagnostics).contains(&"PL0010"));
-    }
-
-    #[test]
-    fn unsupported_backend_emits_pl0011() {
-        let pg_cdstore = "\
-store for greetings;
-backend postgres { dsn: \"postgres://x\" };
-relvar Greetings: table \"greetings\" {
-    columns: { id: \"id\", message: \"message\" }
-};
-";
-        let (_dir, cd) = write_project(CD_HELLO, Some(CDDB_GREETINGS), Some(pg_cdstore));
-        let out = discover_and_validate(&cd);
-        assert!(codes(&out.diagnostics).contains(&"PL0011"));
-        let plan = out.plan.unwrap();
-        assert_eq!(
-            plan.backend_kind,
-            BackendKind::Other("postgres".to_string())
-        );
-    }
-
-    #[test]
     fn overrides_with_empty_map_matches_disk_only_behavior() {
-        let (dir, cd) = write_project(CD_HELLO, Some(CDDB_GREETINGS), Some(CDSTORE_GREETINGS));
+        let (dir, cd) = write_project(CD_HELLO, Some(CDDB_GREETINGS));
         let baseline = discover_and_validate(&cd);
         let with_empty = discover_and_validate_with_overrides(&cd, &HashMap::new());
         // Same PL-code set (the per-file T-code diagnostics carry
@@ -947,7 +638,7 @@ relvar Greetings: table \"greetings\" {
 
     #[test]
     fn override_for_cddb_wins_over_disk() {
-        let (dir, cd) = write_project(CD_HELLO, Some(CDDB_GREETINGS), Some(CDSTORE_GREETINGS));
+        let (dir, cd) = write_project(CD_HELLO, Some(CDDB_GREETINGS));
 
         // First confirm the disk version validates clean.
         let clean = discover_and_validate(&cd);
@@ -973,9 +664,9 @@ base relvar Greetings { id: Integer, message: Boolean } key { id };
 
     #[test]
     fn sqlite_backed_cd_family_resolves_cleanly() {
-        // Owns its source: author a `.cd` plus its `greetings.cddb` /
-        // `greetings.cdstore` companions in a tempdir, then discover + validate
-        // the family. No on-disk fixture dependency.
+        // Owns its source: author a `.cd` plus its `greetings.cddb` companion in
+        // a tempdir, then discover + validate the family. No on-disk fixture
+        // dependency and no `.cdstore` (identity mapping + defaults).
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             tmp.path().join("app.cd"),
@@ -994,13 +685,6 @@ base relvar Greetings { id: Integer, message: Boolean } key { id };
              base relvar Greetings { id: Integer, message: Text } key { id };\n",
         )
         .expect("write greetings.cddb");
-        std::fs::write(
-            tmp.path().join("greetings.cdstore"),
-            "store for greetings;\n\
-             backend sqlite { file: \"greetings.sqlite\" };\n\
-             relvar Greetings: table \"greetings\" { columns: { id: \"id\", message: \"message\" } };\n",
-        )
-        .expect("write greetings.cdstore");
 
         let out = discover_and_validate(&tmp.path().join("app.cd"));
         let pl: Vec<_> = out
@@ -1022,7 +706,7 @@ base relvar Greetings { id: Integer, message: Boolean } key { id };
 
     /// PL-codes only, from a standalone `.cd` (no companions needed).
     fn pl_codes(cd: &str) -> Vec<&'static str> {
-        let (_dir, cd_path) = write_project(cd, None, None);
+        let (_dir, cd_path) = write_project(cd, None);
         discover_and_validate(&cd_path)
             .diagnostics
             .into_iter()
@@ -1038,7 +722,7 @@ base relvar Greetings { id: Integer, message: Boolean } key { id };
             ("library l;\noper handle {} [ ]\n", FileHeaderKind::Library),
             ("module m;\noper helper {} [ ]\n", FileHeaderKind::Module),
         ] {
-            let (_dir, cd_path) = write_project(cd, None, None);
+            let (_dir, cd_path) = write_project(cd, None);
             let out = discover_and_validate(&cd_path);
             let pl: Vec<_> = out
                 .diagnostics

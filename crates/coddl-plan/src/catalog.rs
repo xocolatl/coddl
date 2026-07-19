@@ -4,19 +4,16 @@
 //! point. Provision has no program — it starts from a `.cddb` catalog
 //! and reconciles a physical store to it. [`resolve_catalog`] is the
 //! parallel entry point: given a `.cddb` path it reads + typechecks the
-//! catalog, walks to the sibling `<db>.cdstore` (by the catalog's
-//! `database <name>;` header, not the file stem), and resolves every
-//! **base** relvar to its physical table, column map, candidate keys,
-//! and INIT value.
+//! catalog and resolves every **base** relvar to its physical table,
+//! column map, candidate keys, and INIT value.
 //!
-//! It reuses the crate's validation helpers in-crate. There is no
-//! `.cd`, so the [`FileId`] numbering differs from the program flow's
-//! 0/1/2: the `.cddb` is [`CDDB_FILE`] and the `.cdstore` is
-//! [`CDSTORE_FILE`].
+//! The physical binding is identity — table = relvar name, column =
+//! attribute — and the backend + connection are transitional defaults
+//! (SQLite, `<db>.sqlite`). TODO(cdstore-loader): resolve them by
+//! querying the loaded `coddl::storage` relations instead of defaulting.
 //!
-//! Diagnostic reuse: PL0003 / PL0005 / PL0008 / PL0009 / PL0010 /
-//! PL0011 / PL0100 are re-homed from the program flow. PL0020 is new —
-//! a `.cddb` with no `database <name>;` header can't name its store.
+//! Diagnostic reuse: PL0100 (unreadable catalog) and PL0020 (a `.cddb`
+//! with no `database <name>;` header) are the only cross-file codes here.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,20 +21,14 @@ use std::path::Path;
 use coddl_diagnostics::{Diagnostic, FileId};
 use coddl_syntax::ast::{AstNode, Expr};
 use coddl_syntax::ast_cddb::{CddbItem, CddbRoot};
-use coddl_syntax::ast_cdstore::CdstoreRoot;
 use coddl_syntax::FileKind;
 use coddl_types::{check, Heading, RelvarKind};
 
 use crate::plan::BackendKind;
-use crate::{
-    canonicalize_against, classify_backend, collect_columns, extract_file_directive, find_binding,
-    plain_error, token_span, unquote,
-};
+use crate::{canonicalize_against, plain_error};
 
 /// FileId assigned to the `.cddb` catalog in the catalog-rooted flow.
 const CDDB_FILE: FileId = FileId(0);
-/// FileId assigned to the sibling `.cdstore` in the catalog-rooted flow.
-const CDSTORE_FILE: FileId = FileId(1);
 
 /// The output of one catalog resolution: the [`CatalogPlan`] (when the
 /// catalog was readable and named a database) plus every diagnostic
@@ -142,60 +133,16 @@ pub fn resolve_catalog(cddb_path: &Path) -> CatalogPlanOutput {
         };
     };
 
-    // Sibling `.cdstore`, keyed on the catalog's db-header name (not the
-    // file stem). Missing → PL0003; resolution continues without store
-    // info (backend Unknown, no relvars) — PL0003 is the root cause.
-    let base = cddb_path.parent().unwrap_or_else(|| Path::new("."));
-    let cdstore_path = base.join(format!("{database_name}.cdstore"));
-    let cdstore_root = match std::fs::read_to_string(&cdstore_path) {
-        Ok(src) => {
-            let cdstore_check = check(&src, CDSTORE_FILE, FileKind::Cdstore);
-            diags.extend(cdstore_check.diagnostics.iter().cloned());
-            CdstoreRoot::cast(cdstore_check.tree.clone())
-        }
-        Err(_) => {
-            diags.push(plain_error(
-                "PL0003",
-                format!("missing companion store: {}", cdstore_path.display()),
-            ));
-            None
-        }
-    };
-
-    // PL0005: the store's `store for <name>;` must match the catalog's
-    // own `database <name>;`.
-    if let Some(root) = &cdstore_root {
-        if let Some(tok) = root.header().and_then(|h| h.database_name()) {
-            let store_name = tok.text();
-            if store_name != database_name {
-                diags.push(Diagnostic::error(
-                    token_span(CDSTORE_FILE, &tok),
-                    "PL0005",
-                    format!(
-                        "`{}` declares `store for {store_name};` but catalog `{}` declares `database {database_name};`",
-                        cdstore_path.display(),
-                        cddb_path.display(),
-                    ),
-                ));
-            }
-        }
-    }
-
-    // Backend classification (PL0011) + baked SQLite file default.
-    let backend_kind = cdstore_root
-        .as_ref()
-        .and_then(|r| r.backend())
-        .map(|b| classify_backend(&b, CDSTORE_FILE, &mut diags))
-        .unwrap_or(BackendKind::Unknown);
-    let db_file_default = if matches!(backend_kind, BackendKind::Sqlite) {
-        cdstore_root
-            .as_ref()
-            .and_then(|r| r.backend())
-            .and_then(|b| extract_file_directive(&b))
-            .map(|raw| canonicalize_against(&cdstore_path, &raw))
-    } else {
-        None
-    };
+    // Physical binding no longer comes from a `.cdstore`: table = relvar name
+    // and column = attribute (identity — the mapping `coddl::storage`'s design
+    // mandates), and backend + file are transitional defaults.
+    // TODO(cdstore-loader): resolve backend + connection by querying the loaded
+    // `coddl::storage` relations instead of defaulting.
+    let backend_kind = BackendKind::Sqlite;
+    let db_file_default = Some(canonicalize_against(
+        cddb_path,
+        &format!("{database_name}.sqlite"),
+    ));
 
     // INIT values live in the `.cddb` as `<Name> := <expr>;` items. The
     // typechecker validated them (Chunk 3) but doesn't retain the RHS,
@@ -213,46 +160,32 @@ pub fn resolve_catalog(cddb_path: &Path) -> CatalogPlanOutput {
     }
 
     // Resolve each base relvar to its physical form, name-sorted for
-    // deterministic output. Only when a store loaded — otherwise PL0003
-    // stands alone and a PL0008-per-relvar cascade would be pure noise.
+    // deterministic output. Identity mapping: table = relvar name, column =
+    // attribute (heading-canonical, name-sorted).
     let mut relvars: Vec<ResolvedCatalogRelvar> = Vec::new();
-    if let Some(cdstore_root) = &cdstore_root {
-        let mut base_relvars: Vec<_> = cddb_check
-            .relvars
-            .iter()
-            .filter(|(_, info)| info.kind == RelvarKind::Base)
-            .collect();
-        base_relvars.sort_by(|a, b| a.0.cmp(b.0));
+    let mut base_relvars: Vec<_> = cddb_check
+        .relvars
+        .iter()
+        .filter(|(_, info)| info.kind == RelvarKind::Base)
+        .collect();
+    base_relvars.sort_by(|a, b| a.0.cmp(b.0));
 
-        for (name, info) in base_relvars {
-            // PL0008: every base relvar needs a store binding.
-            let Some(binding) = find_binding(cdstore_root, name) else {
-                diags.push(Diagnostic::error(
-                    info.span,
-                    "PL0008",
-                    format!("catalog relvar `{name}` has no `.cdstore` binding"),
-                ));
-                continue;
-            };
-            let table_name = binding
-                .table_name()
-                .map(|t| unquote(t.text()))
-                .unwrap_or_default();
-            // PL0009 / PL0010: column coverage. `collect_columns` returns
-            // entries in `.cdstore` declaration order; sort by attribute
-            // name so the map is deterministic (heading-canonical),
-            // independent of how the store author ordered the block.
-            let mut columns = collect_columns(&binding, &info.heading, CDSTORE_FILE, &mut diags);
-            columns.sort_by(|a, b| a.0.cmp(&b.0));
-            relvars.push(ResolvedCatalogRelvar {
-                name: name.to_string(),
-                heading: info.heading.clone(),
-                keys: info.keys.clone(),
-                table_name,
-                columns,
-                init: init_map.get(name).cloned(),
-            });
-        }
+    for (name, info) in base_relvars {
+        let mut columns: Vec<(String, String)> = info
+            .heading
+            .attrs()
+            .iter()
+            .map(|(a, _)| (a.clone(), a.clone()))
+            .collect();
+        columns.sort_by(|a, b| a.0.cmp(&b.0));
+        relvars.push(ResolvedCatalogRelvar {
+            name: name.to_string(),
+            heading: info.heading.clone(),
+            keys: info.keys.clone(),
+            table_name: name.to_string(),
+            columns,
+            init: init_map.get(name).cloned(),
+        });
     }
 
     CatalogPlanOutput {
@@ -273,17 +206,13 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
-    /// Write a `<db>.cddb` (+ optional `<db>.cdstore`) into a fresh
-    /// tempdir and return its path plus the `.cddb` path. `resolve_catalog`
-    /// locates the store by the catalog's `database <name>;` header, so
-    /// the companion must be named `<db>.cdstore`.
-    fn write_catalog(db: &str, cddb: &str, cdstore: Option<&str>) -> (TempDir, PathBuf) {
+    /// Write a `<db>.cddb` into a fresh tempdir and return its path plus the
+    /// `.cddb` path. `resolve_catalog` no longer reads a `.cdstore` — the
+    /// physical binding is identity and backend/file are defaults.
+    fn write_catalog(db: &str, cddb: &str) -> (TempDir, PathBuf) {
         let dir = TempDir::new().expect("tempdir");
         let cddb_path = dir.path().join(format!("{db}.cddb"));
         fs::write(&cddb_path, cddb).unwrap();
-        if let Some(s) = cdstore {
-            fs::write(dir.path().join(format!("{db}.cdstore")), s).unwrap();
-        }
         (dir, cddb_path)
     }
 
@@ -304,14 +233,6 @@ P := Relation {
 };
 ";
 
-    const CDSTORE_SP: &str = "\
-store for sp;
-backend sqlite { file: \"sp.sqlite\" };
-relvar S: table \"s\" { columns: { sno, sname, status, city } };
-relvar P: table \"p\" { columns: { pno, weight } };
-relvar SP: table \"sp\" { columns: { sno, pno, qty } };
-";
-
     fn has(diags: &[Diagnostic], code: &str) -> bool {
         diags.iter().any(|d| d.code == code)
     }
@@ -326,7 +247,7 @@ relvar SP: table \"sp\" { columns: { sno, pno, qty } };
 
     #[test]
     fn clean_catalog_resolves() {
-        let (_dir, cddb) = write_catalog("sp", CDDB_SP, Some(CDSTORE_SP));
+        let (_dir, cddb) = write_catalog("sp", CDDB_SP);
         let out = resolve_catalog(&cddb);
 
         let pl = pl_codes(&out.diagnostics);
@@ -334,6 +255,7 @@ relvar SP: table \"sp\" { columns: { sno, pno, qty } };
 
         let plan = out.plan.expect("plan");
         assert_eq!(plan.database_name, "sp");
+        // Backend + file are transitional defaults (TODO cdstore-loader).
         assert_eq!(plan.backend_kind, BackendKind::Sqlite);
         assert!(
             plan.db_file_default
@@ -348,15 +270,27 @@ relvar SP: table \"sp\" { columns: { sno, pno, qty } };
         assert_eq!(names, vec!["P", "S", "SP"]);
 
         let s = plan.relvars.iter().find(|r| r.name == "S").unwrap();
-        assert_eq!(s.table_name, "s");
+        // Identity mapping: table = relvar name, column = attribute.
+        assert_eq!(s.table_name, "S");
         assert_eq!(s.keys, vec![vec!["sno".to_string()]]);
-        // Column map covers the whole heading (order is heading-canonical).
-        let s_attrs: Vec<&str> = s.columns.iter().map(|(a, _)| a.as_str()).collect();
-        assert_eq!(s_attrs, vec!["city", "sname", "sno", "status"]);
+        let s_cols: Vec<(&str, &str)> = s
+            .columns
+            .iter()
+            .map(|(a, c)| (a.as_str(), c.as_str()))
+            .collect();
+        assert_eq!(
+            s_cols,
+            vec![
+                ("city", "city"),
+                ("sname", "sname"),
+                ("sno", "sno"),
+                ("status", "status"),
+            ]
+        );
         assert!(s.init.is_some(), "S has an INIT value");
 
         let sp = plan.relvars.iter().find(|r| r.name == "SP").unwrap();
-        assert_eq!(sp.table_name, "sp");
+        assert_eq!(sp.table_name, "SP");
         assert_eq!(sp.keys, vec![vec!["sno".to_string(), "pno".to_string()]]);
         assert!(sp.init.is_none(), "SP declares no INIT");
 
@@ -368,7 +302,7 @@ relvar SP: table \"sp\" { columns: { sno, pno, qty } };
     #[test]
     fn missing_database_header_is_pl0020_no_plan() {
         let cddb = "base relvar S { sno: Text } key { sno };\n";
-        let (_dir, path) = write_catalog("sp", cddb, Some(CDSTORE_SP));
+        let (_dir, path) = write_catalog("sp", cddb);
         let out = resolve_catalog(&path);
         assert!(has(&out.diagnostics, "PL0020"));
         assert!(out.plan.is_none());
@@ -381,74 +315,5 @@ relvar SP: table \"sp\" { columns: { sno, pno, qty } };
         let out = resolve_catalog(&missing);
         assert!(has(&out.diagnostics, "PL0100"));
         assert!(out.plan.is_none());
-    }
-
-    #[test]
-    fn missing_store_file_is_pl0003() {
-        let (_dir, cddb) = write_catalog("sp", CDDB_SP, None);
-        let out = resolve_catalog(&cddb);
-        assert!(has(&out.diagnostics, "PL0003"));
-        // A plan is still returned, but with no resolved relvars (the
-        // store is the root cause; no PL0008-per-relvar cascade).
-        let plan = out.plan.expect("plan");
-        assert!(plan.relvars.is_empty());
-        assert!(!has(&out.diagnostics, "PL0008"));
-    }
-
-    #[test]
-    fn store_header_mismatch_is_pl0005() {
-        let cdstore = CDSTORE_SP.replace("store for sp;", "store for wrong;");
-        let (_dir, cddb) = write_catalog("sp", CDDB_SP, Some(&cdstore));
-        let out = resolve_catalog(&cddb);
-        assert!(has(&out.diagnostics, "PL0005"));
-    }
-
-    #[test]
-    fn non_sqlite_backend_is_pl0011() {
-        let cdstore = CDSTORE_SP.replace("backend sqlite", "backend postgres");
-        let (_dir, cddb) = write_catalog("sp", CDDB_SP, Some(&cdstore));
-        let out = resolve_catalog(&cddb);
-        assert!(has(&out.diagnostics, "PL0011"));
-    }
-
-    #[test]
-    fn base_relvar_without_binding_is_pl0008() {
-        // Drop the SP binding; S and P still resolve.
-        let cdstore = "\
-store for sp;
-backend sqlite { file: \"sp.sqlite\" };
-relvar S: table \"s\" { columns: { sno, sname, status, city } };
-relvar P: table \"p\" { columns: { pno, weight } };
-";
-        let (_dir, cddb) = write_catalog("sp", CDDB_SP, Some(cdstore));
-        let out = resolve_catalog(&cddb);
-        assert!(has(&out.diagnostics, "PL0008"));
-        let plan = out.plan.expect("plan");
-        let names: Vec<&str> = plan.relvars.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["P", "S"]); // SP omitted (no binding)
-    }
-
-    #[test]
-    fn uncovered_heading_attribute_is_pl0009() {
-        // S binding omits `city`.
-        let cdstore = CDSTORE_SP.replace(
-            "relvar S: table \"s\" { columns: { sno, sname, status, city } };",
-            "relvar S: table \"s\" { columns: { sno, sname, status } };",
-        );
-        let (_dir, cddb) = write_catalog("sp", CDDB_SP, Some(&cdstore));
-        let out = resolve_catalog(&cddb);
-        assert!(has(&out.diagnostics, "PL0009"));
-    }
-
-    #[test]
-    fn extra_column_not_in_heading_is_pl0010() {
-        // S binding names a `bogus` attribute the heading lacks.
-        let cdstore = CDSTORE_SP.replace(
-            "relvar S: table \"s\" { columns: { sno, sname, status, city } };",
-            "relvar S: table \"s\" { columns: { sno, sname, status, city, bogus } };",
-        );
-        let (_dir, cddb) = write_catalog("sp", CDDB_SP, Some(&cdstore));
-        let out = resolve_catalog(&cddb);
-        assert!(has(&out.diagnostics, "PL0010"));
     }
 }

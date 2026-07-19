@@ -3367,8 +3367,8 @@ fn is_audit_timestamp(ts: &str) -> bool {
 /// projects to `{message}`, so the SELECT list narrows to that one column.
 /// No `DISTINCT`: `where id = 1` pins the key, bounding cardinality to ≤ 1, so
 /// the projection is provably duplicate-free. The literal `1` is inlined by
-/// the legacy `trace` callback.
-const EXPECTED_PUSHED_SQL: &str = r#"SELECT "message" FROM "greetings" WHERE "id" = 1"#;
+/// the value-expanding `trace` callback.
+const EXPECTED_PUSHED_SQL: &str = r#"SELECT "message" FROM "Greetings" WHERE "id" = 1"#;
 
 /// Author a self-contained relvar-rooted pushdown program — `.cd` plus its
 /// `greetings.cddb` / `greetings.cdstore` companions — into `dir`, and seed a
@@ -3448,8 +3448,8 @@ fn explain_dumps_relir_tree_paired_with_its_sql() {
     for needle in [
         "Project { keep: message }",
         "Restrict { id = 1 }",
-        "RelvarRef Greetings { db: greetings, table: greetings }",
-        r#"SELECT "message" FROM "greetings" WHERE "id" = ?1"#,
+        "RelvarRef Greetings { db: greetings, table: Greetings }",
+        r#"SELECT "message" FROM "Greetings" WHERE "id" = ?1"#,
     ] {
         assert!(
             stdout.contains(needle),
@@ -3651,7 +3651,7 @@ fn explain_dumps_mixed_semijoin_with_rel_param() {
         r#"coddl_l."sno" = coddl_r."sno""#,
         // The cardinality-1 sibling is baked alongside the general plan.
         "SQL (card-1 dispatch, plan ",
-        r#"SELECT "sname" FROM "suppliers" WHERE "sno" = ?1"#,
+        r#"SELECT "sname" FROM "Suppliers" WHERE "sno" = ?1"#,
     ] {
         assert!(
             stdout.contains(needle),
@@ -3663,7 +3663,7 @@ fn explain_dumps_mixed_semijoin_with_rel_param() {
 /// Compile + run a self-owned relvar-rooted pushdown program on `backend`,
 /// pointing `CODDL_AUDIT_LOG` at a fresh per-run temp file, then assert the
 /// audit log proves the pushdown path ran: the program printed `hello world`,
-/// every logged line is well-formed, **no** statement is a `FROM "greetings"`
+/// every logged line is well-formed, **no** statement is a `FROM "Greetings"`
 /// full-table scan (no `WHERE`), and **exactly one** statement is the
 /// parameterized filter — byte-for-byte `EXPECTED_PUSHED_SQL`.
 ///
@@ -3714,7 +3714,7 @@ fn assert_pushdown_audit(backend: &str) {
     // No startup full-table scan: nothing reads `greetings` without a filter.
     let scans: Vec<&&str> = sqls
         .iter()
-        .filter(|s| s.contains("greetings") && !s.contains("WHERE"))
+        .filter(|s| s.contains("Greetings") && !s.contains("WHERE"))
         .collect();
     assert!(
         scans.is_empty(),
@@ -3724,7 +3724,7 @@ fn assert_pushdown_audit(backend: &str) {
     // Exactly one filtered read of `greetings`, and it is the pushed query.
     let filtered: Vec<&&str> = sqls
         .iter()
-        .filter(|s| s.contains("greetings") && s.contains("WHERE"))
+        .filter(|s| s.contains("Greetings") && s.contains("WHERE"))
         .collect();
     assert_eq!(
         filtered.len(),
@@ -4091,7 +4091,7 @@ fn assert_mixed_origin_pushdown(backend: &str) {
     );
     for line in audit.lines() {
         assert!(
-            !line.trim_end().ends_with(r#"FROM "suppliers""#),
+            !line.trim_end().ends_with(r#"FROM "Suppliers""#),
             "a statement pulled the whole relvar bare: {line}"
         );
     }
@@ -4301,7 +4301,7 @@ fn assert_mixed_origin_two_semijoins(backend: &str) {
     // projected rhs stays DISTINCT-free.
     let nested = audit
         .lines()
-        .find(|l| l.contains(r#"FROM "shipments""#))
+        .find(|l| l.contains(r#"FROM "Shipments""#))
         .unwrap_or_else(|| panic!("no nested relvar-semijoin statement; audit:\n{audit}"));
     assert_eq!(
         nested.matches("WHERE EXISTS").count(),
@@ -4538,7 +4538,7 @@ fn assert_bind_ceiling_escalates_semijoin(backend: &str) {
     );
     for line in audit.lines() {
         assert!(
-            !line.trim_end().ends_with(r#"FROM "suppliers""#),
+            !line.trim_end().ends_with(r#"FROM "Suppliers""#),
             "a statement pulled the whole relvar bare: {line}"
         );
     }
@@ -5869,21 +5869,14 @@ fn run_union_dml(backend: &str, program: &str) -> Vec<String> {
          base relvar NewArrivals { id: Integer, message: Text } key { id };\n",
     )
     .expect("write greetings.cddb");
-    std::fs::write(
-        dir.join("greetings.cdstore"),
-        "store for greetings;\n\
-         backend sqlite { file: \"greetings.sqlite\" };\n\
-         relvar Greetings: table \"greetings\" { columns: { id: \"id\", message: \"message\" } };\n\
-         relvar NewArrivals: table \"new_arrivals\" { columns: { id: \"id\", message: \"message\" } };\n",
-    )
-    .expect("write greetings.cdstore");
     let db = dir.join("greetings.sqlite");
+    // Tables take the relvar name (identity mapping); the seed matches.
     seed_db(
         &db,
-        "CREATE TABLE greetings (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
-         CREATE TABLE new_arrivals (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
-         INSERT INTO greetings (id, message) VALUES (1, 'hello world'), (2, 'goodbye'); \
-         INSERT INTO new_arrivals (id, message) VALUES (2, 'goodbye'), (3, 'farewell');",
+        "CREATE TABLE Greetings (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
+         CREATE TABLE NewArrivals (id INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (id)); \
+         INSERT INTO Greetings (id, message) VALUES (1, 'hello world'), (2, 'goodbye'); \
+         INSERT INTO NewArrivals (id, message) VALUES (2, 'goodbye'), (3, 'farewell');",
     );
 
     let cd = dir.join("dml.cd");
@@ -6049,13 +6042,13 @@ fn assert_comparison_pushes(backend: &str, pred: &str, expect_msg: &str, expect_
     assert!(
         !sqls
             .iter()
-            .any(|s| s.contains("greetings") && !s.contains("WHERE")),
+            .any(|s| s.contains("Greetings") && !s.contains("WHERE")),
         "unexpected full scan (pred {pred}, {backend}): {sqls:?}"
     );
     // Exactly one pushed query, carrying the comparison operator.
     let pushed: Vec<&&str> = sqls
         .iter()
-        .filter(|s| s.contains("greetings") && s.contains(expect_op))
+        .filter(|s| s.contains("Greetings") && s.contains(expect_op))
         .collect();
     assert_eq!(
         pushed.len(),
@@ -6553,10 +6546,10 @@ fn general_replace_pushdown_cranelift() {
 
 #[test]
 fn audit_sql_strips_prefix_and_validates_format() {
-    let line = r#"2026-06-19 07:12:36.948 - sqlite - SELECT DISTINCT "id" FROM "greetings" WHERE "id" = 1"#;
+    let line = r#"2026-06-19 07:12:36.948 - sqlite - SELECT DISTINCT "id" FROM "Greetings" WHERE "id" = 1"#;
     assert_eq!(
         audit_sql(line),
-        Some(r#"SELECT DISTINCT "id" FROM "greetings" WHERE "id" = 1"#)
+        Some(r#"SELECT DISTINCT "id" FROM "Greetings" WHERE "id" = 1"#)
     );
     // Malformed timestamp prefixes are rejected (None), so the integration
     // test panics rather than silently skipping a non-conforming line.
@@ -6573,11 +6566,11 @@ fn audit_sql_strips_prefix_and_validates_format() {
 
 #[test]
 fn scan_classifier_catches_the_pre_pushdown_full_scan() {
-    // The legacy startup read (no WHERE) is exactly what the acceptance test must reject.
-    let legacy = "SELECT id, message FROM greetings";
-    assert!(legacy.contains("greetings") && !legacy.contains("WHERE"));
+    // A full-table startup read (no WHERE) is exactly what the acceptance test must reject.
+    let full_scan = "SELECT id, message FROM greetings";
+    assert!(full_scan.contains("greetings") && !full_scan.contains("WHERE"));
     // The pushed read is classified as filtered, not a scan.
-    assert!(EXPECTED_PUSHED_SQL.contains("greetings") && EXPECTED_PUSHED_SQL.contains("WHERE"));
+    assert!(EXPECTED_PUSHED_SQL.contains("Greetings") && EXPECTED_PUSHED_SQL.contains("WHERE"));
 }
 
 // ── in-process projection (Inst::Project → coddl_relation_project) ────
@@ -6671,7 +6664,7 @@ fn project_all_but_inprocess_keeps_complement() {
 #[test]
 fn project_all_but_pushed_keeps_complement() {
     // `Greetings where id = 1 project all but {id}` keeps {message}; pushes to
-    // `SELECT "message" FROM "greetings" WHERE "id" = 1` (key-filtered → no
+    // `SELECT "message" FROM "Greetings" WHERE "id" = 1` (key-filtered → no
     // DISTINCT), the same query `project {message}` produces.
     for backend in ["llvm", "cranelift"] {
         ensure_runtime_built();
@@ -6702,7 +6695,7 @@ fn project_all_but_pushed_keeps_complement() {
         assert_eq!(out.stdout, b"hello world\n", "on {backend}");
         let log_txt = std::fs::read_to_string(&log).expect("read audit log");
         assert!(
-            log_txt.contains(r#"SELECT "message" FROM "greetings" WHERE "id" = 1"#),
+            log_txt.contains(r#"SELECT "message" FROM "Greetings" WHERE "id" = 1"#),
             "expected message-only no-DISTINCT pushed SQL on {backend}, got:\n{log_txt}"
         );
     }
@@ -6831,7 +6824,7 @@ fn pushed_rename_aliases_columns() {
         let log_txt = std::fs::read_to_string(&log).expect("read audit log");
         assert!(
             log_txt.contains(
-                r#"SELECT "id" AS "identifier", "message" AS "msg" FROM "greetings" WHERE "id" = 1"#
+                r#"SELECT "id" AS "identifier", "message" AS "msg" FROM "Greetings" WHERE "id" = 1"#
             ),
             "expected the rename pushed via AS on {backend}, got:\n{log_txt}"
         );
@@ -8364,8 +8357,8 @@ const TCLOSE_DB_TUPLES: &[&str] = &[
 
 /// The exact `WITH RECURSIVE` query each closure pushes — the golden text the
 /// audit log must contain. Pins the recursive-CTE emission end-to-end.
-const TCLOSE_EDGES_SQL: &str = r#"WITH RECURSIVE coddl_tc_op("from", "to") AS (SELECT "from", "to" FROM "edges"), coddl_tc("from", "to") AS (SELECT "from", "to" FROM coddl_tc_op UNION SELECT coddl_tc."from", coddl_tc_op."to" FROM coddl_tc JOIN coddl_tc_op ON coddl_tc."to" = coddl_tc_op."from") SELECT DISTINCT "from", "to" FROM coddl_tc"#;
-const TCLOSE_CONTAINS_SQL: &str = r#"WITH RECURSIVE coddl_tc_op("major", "minor") AS (SELECT "major", "minor" FROM "contains"), coddl_tc("major", "minor") AS (SELECT "major", "minor" FROM coddl_tc_op UNION SELECT coddl_tc."major", coddl_tc_op."minor" FROM coddl_tc JOIN coddl_tc_op ON coddl_tc."minor" = coddl_tc_op."major") SELECT DISTINCT "major", "minor" FROM coddl_tc"#;
+const TCLOSE_EDGES_SQL: &str = r#"WITH RECURSIVE coddl_tc_op("from", "to") AS (SELECT "from", "to" FROM "Edges"), coddl_tc("from", "to") AS (SELECT "from", "to" FROM coddl_tc_op UNION SELECT coddl_tc."from", coddl_tc_op."to" FROM coddl_tc JOIN coddl_tc_op ON coddl_tc."to" = coddl_tc_op."from") SELECT DISTINCT "from", "to" FROM coddl_tc"#;
+const TCLOSE_CONTAINS_SQL: &str = r#"WITH RECURSIVE coddl_tc_op("major", "minor") AS (SELECT "major", "minor" FROM "Contains"), coddl_tc("major", "minor") AS (SELECT "major", "minor" FROM coddl_tc_op UNION SELECT coddl_tc."major", coddl_tc_op."minor" FROM coddl_tc JOIN coddl_tc_op ON coddl_tc."minor" = coddl_tc_op."major") SELECT DISTINCT "major", "minor" FROM coddl_tc"#;
 
 /// Compile + run a self-owned relvar-rooted `tclose` program on `backend`: each
 /// closure must push to SQL as a `WITH RECURSIVE` query (asserted via the audit
@@ -8616,7 +8609,7 @@ fn assert_wrap_pushdown(backend: &str) {
     );
 }
 
-const EXPECTED_PUSHED_WRAP_SQL: &str = r#"SELECT DISTINCT "id", "message" FROM "greetings""#;
+const EXPECTED_PUSHED_WRAP_SQL: &str = r#"SELECT DISTINCT "id", "message" FROM "Greetings""#;
 
 #[test]
 fn wrap_pushdown_llvm() {
@@ -8759,7 +8752,7 @@ fn assert_group_operand_pushdown(backend: &str) {
         .collect();
     assert!(
         sqls.iter()
-            .any(|s| *s == r#"SELECT "id", "message" FROM "greetings""#),
+            .any(|s| *s == r#"SELECT "id", "message" FROM "Greetings""#),
         "audit log on {backend} missing the pushed operand fetch; got:\n{sqls:#?}",
     );
 }

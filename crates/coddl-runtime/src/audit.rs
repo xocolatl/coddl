@@ -10,7 +10,7 @@
 //! UTC, millisecond precision. The line carries the **expanded** SQL (bound
 //! parameter values inlined), which is what a human self-audit wants — but it
 //! can therefore contain PII/secrets from filter values. There is no
-//! template-only (`?`) mode: the legacy `rusqlite` `trace` callback only ever
+//! template-only (`?`) mode: the `rusqlite` `trace` callback only ever
 //! delivers the expanded statement.
 //!
 //! This is the single observability chokepoint. Each backend installs one

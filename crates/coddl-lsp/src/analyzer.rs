@@ -174,6 +174,15 @@ impl Analyzer {
                     let check = coddl_types::check(&source_for_blocking, FileId(0), kind);
                     (check.diagnostics, check.hints, check.mutable_spans)
                 }
+                FileKind::Cdstore => {
+                    // A `.cdstore` is DML into `coddl::storage`, evaluated at
+                    // compile time. The evaluator runs the typecheck internally,
+                    // so its diagnostics carry both type errors and any `SE####`
+                    // evaluation error. Config DML has no inferred-type hints and
+                    // no mutable `var`s, so those stay empty (but plumbed).
+                    let eval = coddl_store::evaluate_cdstore(&source_for_blocking, FileId(0));
+                    (eval.diagnostics, Vec::new(), Vec::new())
+                }
                 other => {
                     let parse_out = coddl_syntax::parse(&source_for_blocking, FileId(0), other);
                     (parse_out.diagnostics, Vec::new(), Vec::new())

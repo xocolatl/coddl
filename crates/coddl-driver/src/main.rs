@@ -279,6 +279,16 @@ fn cmd_check(args: &[String]) -> ExitCode {
                 let map = build_source_map(Path::new(path), &out.module_graph);
                 (out.diagnostics, map)
             }
+            (FileKind::Cdstore, _) => {
+                // A `.cdstore` is DML into `coddl::storage`, evaluated at compile
+                // time — checking it means parse + typecheck + evaluate. The
+                // evaluator runs the check internally, so its diagnostics carry
+                // both the type errors and any `SE####` evaluation error.
+                (
+                    coddl_store::evaluate_cdstore(&source, FileId(0)).diagnostics,
+                    Vec::new(),
+                )
+            }
             _ => (
                 coddl_types::check(&source, FileId(0), kind).diagnostics,
                 Vec::new(),
@@ -734,7 +744,7 @@ fn discover_plan_for_input(positional: &[String]) -> Option<coddl_plan::Plan> {
 /// same channel; on success, the resolved `Plan` is passed to
 /// `lower_with_plan` so public-relvar references resolve and `main`
 /// gets per-relvar init/release wrapping. Stdin and standalone (no
-/// public relvars) inputs go through the legacy plan-less path.
+/// public relvars) inputs go through the plan-less path.
 fn lower_or_bail(source: &str, cd_path: Option<&Path>) -> Option<coddl_procir::Module> {
     // The `.cd` is typechecked in both the plan pass (`discover_and_validate`)
     // and lowering (`lower_with_plan`), so its diagnostics surface in both.
@@ -1050,8 +1060,16 @@ fn cmd_fmt(args: &[String]) -> ExitCode {
     let Some((source, kind)) = read_input(&positional, "fmt") else {
         return ExitCode::from(1);
     };
-    if let Err(code) = require_cd(kind, "fmt") {
-        return code;
+    // The re-spacer works over any CST it can parse; today that is `.cd` and
+    // `.cdstore` (a `.cdstore` is a bare sequence of `.cd` statements). Other
+    // dialects aren't wired into `fmt` yet.
+    if !matches!(kind, FileKind::Cd | FileKind::Cdstore) {
+        eprintln!(
+            "coddl fmt: only accepts .cd and .cdstore files today; \
+             .{ext} pipeline support lands in later phases",
+            ext = kind.extension(),
+        );
+        return ExitCode::from(2);
     }
 
     let opts = coddl_fmt::FormatOptions::default();
