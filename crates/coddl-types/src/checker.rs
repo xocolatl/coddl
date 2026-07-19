@@ -3686,6 +3686,10 @@ impl TypeChecker {
             Type::Relation(h) => h.clone(),
             Type::Unknown => return Type::Unknown,
             other => {
+                let hint = pe
+                    .input()
+                    .map(|e| self.extract_paren_hint(&e))
+                    .unwrap_or("");
                 let span = pe
                     .input()
                     .map(|e| self.node_span(e.syntax()))
@@ -3693,7 +3697,7 @@ impl TypeChecker {
                 self.error(
                     span,
                     "T0023",
-                    format!("`project` expects a Relation on the left, got {other}"),
+                    format!("`project` expects a Relation on the left, got {other}{hint}"),
                 );
                 return Type::Unknown;
             }
@@ -3752,6 +3756,10 @@ impl TypeChecker {
             Type::Relation(h) => h.clone(),
             Type::Unknown => return Type::Unknown,
             other => {
+                let hint = we
+                    .input()
+                    .map(|e| self.extract_paren_hint(&e))
+                    .unwrap_or("");
                 let span = we
                     .input()
                     .map(|e| self.node_span(e.syntax()))
@@ -3759,7 +3767,7 @@ impl TypeChecker {
                 self.error(
                     span,
                     "T0023",
-                    format!("`wrap` expects a Relation on the left, got {other}"),
+                    format!("`wrap` expects a Relation on the left, got {other}{hint}"),
                 );
                 return Type::Unknown;
             }
@@ -3833,6 +3841,10 @@ impl TypeChecker {
             Type::Relation(h) => h.clone(),
             Type::Unknown => return Type::Unknown,
             other => {
+                let hint = ue
+                    .input()
+                    .map(|e| self.extract_paren_hint(&e))
+                    .unwrap_or("");
                 let span = ue
                     .input()
                     .map(|e| self.node_span(e.syntax()))
@@ -3840,7 +3852,7 @@ impl TypeChecker {
                 self.error(
                     span,
                     "T0023",
-                    format!("`unwrap` expects a Relation on the left, got {other}"),
+                    format!("`unwrap` expects a Relation on the left, got {other}{hint}"),
                 );
                 return Type::Unknown;
             }
@@ -3926,6 +3938,10 @@ impl TypeChecker {
             Type::Relation(h) => h.clone(),
             Type::Unknown => return Type::Unknown,
             other => {
+                let hint = ge
+                    .input()
+                    .map(|e| self.extract_paren_hint(&e))
+                    .unwrap_or("");
                 let span = ge
                     .input()
                     .map(|e| self.node_span(e.syntax()))
@@ -3933,7 +3949,7 @@ impl TypeChecker {
                 self.error(
                     span,
                     "T0023",
-                    format!("`group` expects a Relation on the left, got {other}"),
+                    format!("`group` expects a Relation on the left, got {other}{hint}"),
                 );
                 return Type::Unknown;
             }
@@ -4010,6 +4026,10 @@ impl TypeChecker {
             Type::Relation(h) => h.clone(),
             Type::Unknown => return Type::Unknown,
             other => {
+                let hint = ue
+                    .input()
+                    .map(|e| self.extract_paren_hint(&e))
+                    .unwrap_or("");
                 let span = ue
                     .input()
                     .map(|e| self.node_span(e.syntax()))
@@ -4017,7 +4037,7 @@ impl TypeChecker {
                 self.error(
                     span,
                     "T0023",
-                    format!("`ungroup` expects a Relation on the left, got {other}"),
+                    format!("`ungroup` expects a Relation on the left, got {other}{hint}"),
                 );
                 return Type::Unknown;
             }
@@ -4111,6 +4131,10 @@ impl TypeChecker {
             Type::Relation(h) => h.clone(),
             Type::Unknown => return Type::Unknown,
             other => {
+                let hint = re
+                    .input()
+                    .map(|e| self.extract_paren_hint(&e))
+                    .unwrap_or("");
                 let span = re
                     .input()
                     .map(|e| self.node_span(e.syntax()))
@@ -4118,7 +4142,7 @@ impl TypeChecker {
                 self.error(
                     span,
                     "T0023",
-                    format!("`replace` expects a Relation on the left, got {other}"),
+                    format!("`replace` expects a Relation on the left, got {other}{hint}"),
                 );
                 return Type::Unknown;
             }
@@ -4244,6 +4268,10 @@ impl TypeChecker {
             Type::Relation(h) => h.clone(),
             Type::Unknown => return Type::Unknown,
             other => {
+                let hint = re
+                    .input()
+                    .map(|e| self.extract_paren_hint(&e))
+                    .unwrap_or("");
                 let span = re
                     .input()
                     .map(|e| self.node_span(e.syntax()))
@@ -4251,7 +4279,7 @@ impl TypeChecker {
                 self.error(
                     span,
                     "T0023",
-                    format!("`rename` expects a Relation on the left, got {other}"),
+                    format!("`rename` expects a Relation on the left, got {other}{hint}"),
                 );
                 return Type::Unknown;
             }
@@ -4344,6 +4372,10 @@ impl TypeChecker {
             Type::Relation(h) => h.clone(),
             Type::Unknown => return Type::Unknown,
             other => {
+                let hint = ee
+                    .input()
+                    .map(|e| self.extract_paren_hint(&e))
+                    .unwrap_or("");
                 let span = ee
                     .input()
                     .map(|e| self.node_span(e.syntax()))
@@ -4351,7 +4383,7 @@ impl TypeChecker {
                 self.error(
                     span,
                     "T0023",
-                    format!("`extend` expects a Relation on the left, got {other}"),
+                    format!("`extend` expects a Relation on the left, got {other}{hint}"),
                 );
                 return Type::Unknown;
             }
@@ -4428,6 +4460,10 @@ impl TypeChecker {
             Type::Relation(h) => h.clone(),
             Type::Unknown => return Type::Unknown,
             other => {
+                let hint = te
+                    .input()
+                    .map(|e| self.extract_paren_hint(&e))
+                    .unwrap_or("");
                 let span = te
                     .input()
                     .map(|e| self.node_span(e.syntax()))
@@ -4435,7 +4471,7 @@ impl TypeChecker {
                 self.error(
                     span,
                     "T0023",
-                    format!("`tclose` expects a Relation on the left, got {other}"),
+                    format!("`tclose` expects a Relation on the left, got {other}{hint}"),
                 );
                 return Type::Unknown;
             }
@@ -4519,10 +4555,11 @@ impl TypeChecker {
                         .operand()
                         .map(|e| self.node_span(e.syntax()))
                         .unwrap_or_else(|| self.node_span(ue.syntax()));
+                    let hint = self.not_comparison_hint(ue);
                     self.error(
                         span,
                         "T0021",
-                        format!("`not` expects Boolean, got {operand_ty}"),
+                        format!("`not` expects Boolean, got {operand_ty}{hint}"),
                     );
                 }
                 // `not` is always Boolean-valued; return `Boolean` even on a
@@ -4899,6 +4936,67 @@ impl TypeChecker {
         }
     }
 
+    /// Diagnostic hint for the tight-binding `extract` trap. Every prefix
+    /// operator binds tightly, so `extract R where p` groups as
+    /// `(extract R) where p` — a tuple handed to a relational operator, which
+    /// is the T0023 the caller is about to report. When the rejected operand
+    /// is a bare (unparenthesized) `extract`, point the user at the
+    /// parenthesized form. A `(extract R)` the user grouped themselves (parent
+    /// is a PAREN_EXPR) is left alone. Returns "" otherwise, so callers append
+    /// it unconditionally.
+    fn extract_paren_hint(&self, operand: &Expr) -> &'static str {
+        let Expr::Unary(ue) = operand else {
+            return "";
+        };
+        if !matches!(ue.op_kind(), Some(UnaryOp::Extract)) {
+            return "";
+        }
+        if ue.syntax().parent().map(|p| p.kind()) == Some(SyntaxKind::PAREN_EXPR) {
+            return "";
+        }
+        " — `extract` binds tightly, so it grouped with the left operand alone; \
+         parenthesize to extract a query result: `extract (...)`"
+    }
+
+    /// Diagnostic hint for the tight-binding `not` trap. `not` binds tightly,
+    /// so `not a = b` groups as `(not a) = b`; when a `not` with a non-Boolean
+    /// operand is the *left* side of a comparison, the whole comparison was
+    /// likely meant to be negated. A comparison is Boolean-valued, so
+    /// `not (a = b)` typechecks where `(not a) = b` did not. Suppressed when the
+    /// `not` was parenthesized by the user.
+    fn not_comparison_hint(&self, ue: &UnaryExpr) -> &'static str {
+        let Some(parent) = ue.syntax().parent() else {
+            return "";
+        };
+        if parent.kind() == SyntaxKind::PAREN_EXPR {
+            return "";
+        }
+        let Some(bin) = BinaryExpr::cast(parent) else {
+            return "";
+        };
+        let is_comparison = matches!(
+            bin.op_kind(),
+            Some(
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::Gt
+                    | BinaryOp::LtEq
+                    | BinaryOp::GtEq
+            )
+        );
+        let is_lhs = bin
+            .lhs()
+            .map(|e| e.syntax().text_range() == ue.syntax().text_range())
+            .unwrap_or(false);
+        if is_comparison && is_lhs {
+            " — `not` binds tightly, so `not a = b` groups as `(not a) = b`; \
+             parenthesize to negate the comparison: `not (...)`"
+        } else {
+            ""
+        }
+    }
+
     /// `R where pred` — restriction. Lhs must be relational; rhs
     /// typechecks with the operand's heading attributes injected
     /// into a fresh scope layer.
@@ -4911,6 +5009,7 @@ impl TypeChecker {
             Type::Relation(h) => h.clone(),
             Type::Unknown => return Type::Unknown,
             other => {
+                let hint = bin.lhs().map(|e| self.extract_paren_hint(&e)).unwrap_or("");
                 let span = bin
                     .lhs()
                     .map(|e| self.node_span(e.syntax()))
@@ -4918,7 +5017,7 @@ impl TypeChecker {
                 self.error(
                     span,
                     "T0023",
-                    format!("`where` expects a Relation on the left, got {other}"),
+                    format!("`where` expects a Relation on the left, got {other}{hint}"),
                 );
                 return Type::Unknown;
             }
@@ -7200,6 +7299,92 @@ mod tests {
         let diags = diagnostics(src);
         let hint = diags.iter().find(|d| d.code == "T0099").expect("T0099");
         assert!(hint.message.contains("where"), "{}", hint.message);
+    }
+
+    #[test]
+    fn extract_before_pipeline_hints_parens() {
+        // Tight binding: `extract R where p` = `(extract R) where p` — a tuple
+        // fed to `where`. The T0023 carries the parenthesization hint.
+        let src = "program p; \
+                   private relvar R { a: Integer } key { a }; \
+                   oper main {} [ R := Relation { { a: 1 } }; \
+                                  let _t = extract R where a = 1; ];";
+        let d = diagnostics(src)
+            .into_iter()
+            .find(|d| d.code == "T0023")
+            .expect("T0023");
+        assert!(d.message.contains("binds tightly"), "{}", d.message);
+        assert!(d.message.contains("extract (...)"), "{}", d.message);
+    }
+
+    #[test]
+    fn extract_before_project_hints_parens() {
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Integer } key { a }; \
+                   oper main {} [ R := Relation { { a: 1, b: 2 } }; \
+                                  let _t = extract R project { a }; ];";
+        let d = diagnostics(src)
+            .into_iter()
+            .find(|d| d.code == "T0023")
+            .expect("T0023");
+        assert!(d.message.contains("binds tightly"), "{}", d.message);
+    }
+
+    #[test]
+    fn extract_before_group_hints_parens() {
+        // The hint reaches every relational suffix, not just where/project.
+        let src = "program p; \
+                   private relvar R { a: Integer, b: Integer } key { a }; \
+                   oper main {} [ R := Relation { { a: 1, b: 2 } }; \
+                                  let _t = extract R group { pq: { b } }; ];";
+        let d = diagnostics(src)
+            .into_iter()
+            .find(|d| d.code == "T0023")
+            .expect("T0023");
+        assert!(d.message.contains("binds tightly"), "{}", d.message);
+    }
+
+    #[test]
+    fn parenthesized_extract_before_where_no_hint() {
+        // The user grouped `(extract R)` deliberately — the hint (which would
+        // advise parenthesizing) is suppressed; the bare T0023 stands.
+        let src = "program p; \
+                   private relvar R { a: Integer } key { a }; \
+                   oper main {} [ R := Relation { { a: 1 } }; \
+                                  let _t = (extract R) where a = 1; ];";
+        let d = diagnostics(src)
+            .into_iter()
+            .find(|d| d.code == "T0023")
+            .expect("T0023");
+        assert!(!d.message.contains("binds tightly"), "{}", d.message);
+    }
+
+    #[test]
+    fn not_before_comparison_hints_parens() {
+        // Tight binding: `not 1 = 2` = `(not 1) = 2` — `not` of a non-Boolean.
+        // The T0021 on the operand carries the "negate the comparison" hint.
+        let src = "program p; oper main {} [ let _b = not 1 = 2; ];";
+        let d = diagnostics(src)
+            .into_iter()
+            .find(|d| d.code == "T0021" && d.message.contains("expects Boolean"))
+            .expect("T0021 `not expects Boolean`");
+        assert!(d.message.contains("negate the comparison"), "{}", d.message);
+    }
+
+    #[test]
+    fn not_before_non_comparison_no_hint() {
+        // `not 1 and true` = `(not 1) and true` — the parent is `and`, not a
+        // comparison, so `not (…)` would not typecheck either: no hint.
+        let src = "program p; oper main {} [ let _b = not 1 and true; ];";
+        let d = diagnostics(src)
+            .into_iter()
+            .find(|d| d.code == "T0021" && d.message.contains("expects Boolean"))
+            .expect("T0021 `not expects Boolean`");
+        assert!(
+            !d.message.contains("negate the comparison"),
+            "{}",
+            d.message
+        );
     }
 
     #[test]
