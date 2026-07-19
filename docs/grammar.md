@@ -34,7 +34,7 @@ Three operator-shape categories, with deliberate exceptions:
 
 - **Symbolic**: `=`, `<>`, `<`, `>`, `<=`, `>=`, `+`, `-`, `*`, `/`. The comparison operators `<=` and `>=` are polymorphic: scalar comparison on scalars (as ever); **subset** and **superset** on relations (`R <= S` iff every tuple in `R` appears in `S`; `S >= R` iff `R <= S`). `<` and `>` give strict subset / superset analogously. Identical headings are required for the relation overload — checked at compile time. There's no separate `subset` keyword; `<=` covers it.
 - **Textual relational**: `join`, `times`, `intersect`, `compose`, `union`, `minus`, `matching`, `not matching`, `where`, `when`, `otherwise`.
-- **Textual logical**: `and`, `or` (infix, both `Boolean × Boolean → Boolean`) and `not` (prefix, `Boolean → Boolean`). Precedence ladder `or` (1) < `and` (2) < `not` < comparison (3): `not` is a prefix operator whose operand parses at comparison level, so `not a and b` reads as `(not a) and b` and `not a = b` as `not (a = b)`. `not` also has the Unicode glyph `¬` (see "Unicode operator glyphs").
+- **Textual logical**: `and`, `or` (infix, both `Boolean × Boolean → Boolean`) and `not` (prefix, `Boolean → Boolean`). Like every prefix operator, `not` binds *tightly* — its operand is a primary, so no infix binds inside it: `not a and b` reads as `(not a) and b` and `not a = b` as `(not a) = b`. A negated comparison is `not (a = b)` (parenthesized). `not` also has the Unicode glyph `¬` (see "Unicode operator glyphs").
 - **Textual arithmetic**: `div` (truncating integer division, toward zero), and the planned `mod` (remainder). `div` is `Integer × Integer → Integer` and binds at multiplicative precedence, alongside `*` and `/`. **The symbolic `/` is *exact* division**: `Integer × Integer → Rational` — `7 / 2` is the rational `7/2`, whereas `7 div 2` is the integer `3`. (`div` is the recognized keyword; `mod` is documented here but not yet wired.)
 
 Reason: the named-prefix form is clumsy for ubiquitous dyadic ops on identifier-unfriendly names, and the textual binary ops all have natural infix readings from math and SQL. No-reserved-words still holds — `join` is recognized contextually in expression position; it remains a valid identifier elsewhere.
@@ -100,7 +100,7 @@ User code is not *required* to follow PascalCase for types and relvars — that'
 
 At the lexer level there is no `KEYWORD` token type — every alphanumeric/underscore/`#` token is an `IDENT` — and the parser recognizes specific identifiers as keywords in specific syntactic positions. That much is unchanged. The honest statement of what it buys is a **taxonomy**, published in full below (the tables render `crates/coddl-syntax/src/keywords.rs`, the single source of truth both the parser's operator table and the AST's operator resolution consume; `tools/check-grammar.sh` Check 3 diffs this section against that file **bidirectionally**, and the pre-commit hook runs it):
 
-- **Tier 1 — reserved (five words + the operator glyphs).** `true`, `false`, `if`, `not`, `extract` are claimed at an expression head with nothing to narrow on: `true`/`false` are the bare word, and `if`/`not`/`extract` are followed by an arbitrary expression, so no lookahead can ever free them — a binding under one of these names would be silently unreachable (`let true = 1; let x = true;` binds `x` to the Boolean literal) or misparse at every bare reference, and there is no quoting escape hatch (no Coddl analogue of SQL's `"order"`). So a declaration naming one is **rejected at the declaration site with P0096** — softly, on the E0007 model: the diagnostic is emitted, the name still binds, and parsing continues (LSP discipline; the trap is loud, not fatal). The check fires at every `.cd` name-declaring position — bindings, params and every heading attribute, oper/type/relvar names, loop and `load` binders, module-path segments, the file header, `database` bindings — and at every attribute-*creating* position: tuple/relation literal fields, `extend`/`replace`/`rename` new names, `wrap`/`group` new names. Reference positions (call-argument names, `update` clauses, `project` lists, dot access) are deliberately unchecked: a reference either resolves against an already-checked declaration or fails in the typechecker. The seven word-operator glyphs (`¬ ⋈ ∪ ∩ ∖ ⋉ ▷`) lex as `IDENT` and are rejected the same way. The `.cddb` parser's own decl sites (database and relvar names) emit its namespace sibling **PB0012**; `.cddb` relvar *attributes* funnel through the shared heading parser and emit P0096.
+- **Tier 1 — reserved (five words + the operator glyphs).** `true`, `false`, `if`, `not`, `extract` are claimed at an expression head with nothing to narrow on: `true`/`false` are the bare word, and `if`/`not`/`extract` are followed by an operand (`if` by a condition, `not`/`extract` by a tight primary operand), so no lookahead can ever free them — a binding under one of these names would be silently unreachable (`let true = 1; let x = true;` binds `x` to the Boolean literal) or misparse at every bare reference, and there is no quoting escape hatch (no Coddl analogue of SQL's `"order"`). So a declaration naming one is **rejected at the declaration site with P0096** — softly, on the E0007 model: the diagnostic is emitted, the name still binds, and parsing continues (LSP discipline; the trap is loud, not fatal). The check fires at every `.cd` name-declaring position — bindings, params and every heading attribute, oper/type/relvar names, loop and `load` binders, module-path segments, the file header, `database` bindings — and at every attribute-*creating* position: tuple/relation literal fields, `extend`/`replace`/`rename` new names, `wrap`/`group` new names. Reference positions (call-argument names, `update` clauses, `project` lists, dot access) are deliberately unchecked: a reference either resolves against an already-checked declaration or fails in the typechecker. The seven word-operator glyphs (`¬ ⋈ ∪ ∩ ∖ ⋉ ▷`) lex as `IDENT` and are rejected the same way. The `.cddb` parser's own decl sites (database and relvar names) emit its namespace sibling **PB0012**; `.cddb` relvar *attributes* funnel through the shared heading parser and emit P0096.
 - **Tier 2 — positional claims narrowed by lookahead.** Every Tier-2 word is claimed only together with one token of lookahead, so the bare word is an ordinary identifier. The eleven statement heads are claimed at a statement boundary only when the next token is not `:=` — a variable named after any head stays assignable (`var delete := 1; delete := 2;` parses as a declaration and an ordinary assignment). The three expression heads `Relation` / `Sequence` / `transaction` are claimed only together with their delimiter (`{` / `[` / `[`) — a bare reference to a same-named binding is a NAME_REF, so a relvar named `Sequence` is queryable and an attribute named `transaction` usable. The same pattern frees `asc`/`desc` (recognized only when followed by another IDENT) and `builtin` (two-token `builtin relvar` vs `builtin oper`).
 - **Tier 3 — vacuous claims (genuinely free).** Everything else is recognized in a position where a bare identifier is never a legal continuation — infix/postfix operator position, clause position after an introducing construct, item-head position, type position — so the claim shadows nothing. These are the words that keep the identifier space unfettered for real domains (`name`, `type`, `from`, `to`, `order`, `value`, `key`, `and` as attribute names all work).
 - **Tier 4 — not keywords at all.** `reltrue` / `relfalse` are **not** parser-recognized: they are module-level `let`s in `coddl::core` (always in scope, resolved *after* everything else, deliberately user-shadowable — tests pin it). This is the model: vocabulary lives in the registry/stdlib and stays shadowable; the parser claims a word only when its *grammar* is special. The reserved set grows with syntax, never with library.
@@ -887,35 +887,45 @@ function that implements it.
                   | <sign-expr>
                   | <paren-expr> ;                             -- parse_primary_expr
 <bool-lit>      ::= 'true' | 'false' ;                         -- BOOL_LITERAL
-<extract-expr>  ::= 'extract' <expr-prec> ;                    -- parse_extract_expr
+<extract-expr>  ::= 'extract' <unary-operand> ;                 -- parse_extract_expr
                     -- TTM RM Pre 10 cardinality-checked
                     -- relation-to-tuple primitive. Wraps in
-                    -- UNARY_EXPR. The operand parses at the
-                    -- lowest precedence so `extract R where p`
-                    -- reads as `extract (R where p)` without
-                    -- parens.
-<not-expr>      ::= ( 'not' | '¬' ) <expr-prec> ;               -- parse_not_expr
+                    -- UNARY_EXPR. The operand binds tightly (see
+                    -- <unary-operand>), so `extract R where p` reads
+                    -- as `(extract R) where p` — ill-typed (`extract`
+                    -- yields a tuple, `where` needs a relation). To
+                    -- extract a query result, parenthesize:
+                    -- `extract (R where p)`.
+<not-expr>      ::= ( 'not' | '¬' ) <unary-operand> ;           -- parse_not_expr
                     -- Boolean prefix negation (`Boolean →
                     -- Boolean`). Wraps in UNARY_EXPR. The operand
-                    -- parses at prec 3 (comparison level), so
-                    -- comparison/arithmetic bind inside but
-                    -- `and`/`or` stay outside: `not a and b` is
-                    -- `(not a) and b`, `not a = b` is `not (a = b)`.
-                    -- `¬` is the glyph synonym (lexed as an IDENT,
-                    -- matched at the same recognition site). T0021
-                    -- if the operand isn't Boolean.
-<sign-expr>     ::= ( '+' | '-' ) <expr-prec> ;                 -- parse_sign_expr
+                    -- binds tightly, so no infix binds inside:
+                    -- `not a and b` is `(not a) and b`, `not a = b`
+                    -- is `(not a) = b`. A negated comparison is
+                    -- `not (a = b)`. `¬` is the glyph synonym (lexed
+                    -- as an IDENT, matched at the same recognition
+                    -- site). T0021 if the operand isn't Boolean.
+<sign-expr>     ::= ( '+' | '-' ) <unary-operand> ;             -- parse_sign_expr
                     -- Unary sign: `+` identity, `-` negation
                     -- (Integer / Rational; Approximate is T0109 for
                     -- now). Wraps in UNARY_EXPR. `+`/`-` are matched
                     -- by token kind (PLUS/MINUS), not the keyword
-                    -- table. The operand parses at prec 6 — one above
-                    -- the tightest infix (multiplicative, 5) — so the
-                    -- sign binds tighter than every binary operator:
+                    -- table. The operand binds tightly, so the sign
+                    -- binds tighter than every binary operator:
                     -- `-a * b` is `(-a) * b`, `-a + b` is `(-a) + b`,
-                    -- `2 - -3` is `2 - (-3)`; postfix still binds
-                    -- tighter, so `-a.b` is `-(a.b)`. A binary `a - b`
-                    -- is consumed by the infix loop, not here.
+                    -- `2 - -3` is `2 - (-3)`. A binary `a - b` is
+                    -- consumed by the infix loop, not here.
+<unary-operand> ::= <primary-expr> { <postfix> } ;             -- the tight operand shared
+                    -- by every prefix operator (extract / not / ¬ /
+                    -- sign). Parsed at UNARY_OPERAND_PREC — one above
+                    -- the tightest infix (multiplicative, 5) — so it
+                    -- is a primary plus its postfix tail (`.name`,
+                    -- `{…}`, `[i]`) with no infix or pipeline inside
+                    -- (same shape as <expr-prec> minus the infix loop).
+                    -- Postfix still binds tighter, so `-a.b` is
+                    -- `-(a.b)` and `not is_empty{…}` is
+                    -- `not (is_empty{…})`. Parenthesize to feed a
+                    -- prefix operator a wider expression.
 <paren-expr>    ::= '(' <expr-prec> ')' ;                       -- PAREN_EXPR
                     -- Transparent grouping; AST view unwraps to
                     -- the inner expression so the typechecker /

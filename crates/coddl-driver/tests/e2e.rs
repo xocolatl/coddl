@@ -5315,13 +5315,15 @@ fn otherwise_local_fallback_keeps_primary_only_plan_cranelift() {
 
 // ── Boolean `not` (prefix negation) ───────────────────────────────────
 
-/// `not` lowers to `ScalarOp::Not` in ProcIR and evaluates on both backends,
-/// with the settled precedence `or < and < not < comparison`. Each `if` prints
-/// its marker only when the guarded condition is true under the *correct* parse:
+/// `not` lowers to `ScalarOp::Not` in ProcIR and evaluates on both backends.
+/// Like every prefix operator it binds *tightly* — its operand is a primary, so
+/// every infix stays outside it. Each `if` prints its marker only when the
+/// guarded condition is true under the *correct* parse:
 ///   - `not f and f` ⇒ `(not f) and f` = false — a `not (f and f)` misparse
 ///     would be true and leak "and-BUG" into the (exact-matched) output.
-///   - `not 1 = 2` ⇒ `not (1 = 2)` = true — a `(not 1) = 2` misparse is a type
-///     error and wouldn't compile, so a clean run proves `not < comparison`.
+///   - `not (1 = 2)` ⇒ `not false` = true; the parens are required now that
+///     `not` binds tighter than comparison (`not 1 = 2` = `(not 1) = 2`, a type
+///     error), so a clean run proves the parenthesized negated comparison works.
 ///   - `not not t` ⇒ true (nested prefix).
 ///   - `¬ f` ⇒ true (the glyph is a synonym for `not`).
 ///   - `not t or t` ⇒ `(not t) or t` = true — a `not (t or t)` misparse = false.
@@ -5335,7 +5337,7 @@ fn assert_not_precedence_and_glyph(backend: &str) {
              let t = true;\n\
              let f = false;\n\
              if not f and f then [ write_line { message: \"and-BUG\" }; ];\n\
-             if not 1 = 2 then [ write_line { message: \"cmp-ok\" }; ];\n\
+             if not (1 = 2) then [ write_line { message: \"cmp-ok\" }; ];\n\
              if not not t then [ write_line { message: \"dneg-ok\" }; ];\n\
              if ¬ f then [ write_line { message: \"glyph-ok\" }; ];\n\
              if not t or t then [ write_line { message: \"or-ok\" }; ];\n\

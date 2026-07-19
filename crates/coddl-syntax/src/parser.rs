@@ -1282,9 +1282,22 @@ impl<'a> Parser<'a> {
     /// ladder from lowest to highest is `where`(0) < `or`(1) < `and`(2)
     /// < comparison(3) < additive `+`/`-`/`||`(4) < multiplicative
     /// `*`/`/`(5). All infix operators are left-associative.
+    ///
+    /// Every prefix/unary operator (`extract`, `not`/`¬`, unary `+`/`-`)
+    /// parses its operand at `UNARY_OPERAND_PREC` — one above the tightest
+    /// infix level — so the family binds uniformly tightly: the operand is a
+    /// primary plus its postfix tail, with no infix or pipeline. Parenthesize
+    /// to feed a prefix operator a wider expression.
     pub(crate) fn parse_expr(&mut self) {
         self.parse_expr_prec(0, true);
     }
+
+    /// Precedence at which every prefix/unary operator parses its operand.
+    /// One above the tightest infix level (multiplicative, 5), so the operand
+    /// is a primary plus its postfix tail (`.name`, `{…}`, `[i]`) and no infix
+    /// or pipeline binds inside it. Shared by `extract`, `not`/`¬`, and unary
+    /// `+`/`-` so the family stays uniform.
+    const UNARY_OPERAND_PREC: u8 = 6;
 
     /// Parse an expression, only consuming operators whose precedence
     /// is `>= min_prec`. The caller picks `min_prec` to control how
@@ -1498,9 +1511,9 @@ impl<'a> Parser<'a> {
         }
         // `extract <expr>` — prefix-position unary form. Recognized
         // before the generic IDENT branch so the AST gets a
-        // distinct `UNARY_EXPR` node. The operand parses at full
-        // expression precedence so `extract R where p` reads as
-        // `extract (R where p)` without parens.
+        // distinct `UNARY_EXPR` node. The operand binds tightly (a
+        // primary), so `extract R where p` reads as `(extract R) where p`;
+        // parenthesize as `extract (R where p)` to extract a query result.
         if self.at_keyword("extract") {
             self.parse_extract_expr();
             return true;
@@ -1712,53 +1725,51 @@ impl<'a> Parser<'a> {
 
     /// `extract <expr>` — the TTM RM Pre 10 primitive: collapse a
     /// single-row relation to a tuple. Parsed as a `UNARY_EXPR`
-    /// containing one operand (typechecked to be a relation). The
-    /// operand parses at full expression precedence so `extract R
-    /// where p` reads as `extract (R where p)` — the canonical
-    /// idiom.
+    /// containing one operand (typechecked to be a relation). The operand
+    /// binds tightly at `UNARY_OPERAND_PREC` (a primary), so `extract R
+    /// where p` reads as `(extract R) where p` — which is ill-typed
+    /// (`extract` yields a tuple, `where` needs a relation). To extract a
+    /// query result, parenthesize: `extract (R where p)`.
     fn parse_extract_expr(&mut self) {
         debug_assert!(self.at_keyword("extract"));
         self.bump_trivia();
         self.start_node(SyntaxKind::UNARY_EXPR);
         self.bump(); // `extract`
-                     // Operand parses at the lowest precedence so `where`, `and`,
-                     // `or`, comparisons all bind inside. Missing operand surfaces
-                     // as P0014 from the inner `parse_primary_expr`.
-        self.parse_expr_prec(0, true);
+                     // Tight operand: no `where`/`and`/`or`/comparison binds inside.
+                     // Missing operand surfaces as P0014 from `parse_primary_expr`.
+        self.parse_expr_prec(Self::UNARY_OPERAND_PREC, true);
         self.finish_node();
     }
 
     /// `not <expr>` / `¬ <expr>` — Boolean prefix negation. Parsed as a
     /// `UNARY_EXPR` containing one operand (typechecked to be Boolean). The
-    /// operand parses at precedence 3 (comparison level): since
-    /// `parse_expr_prec` continues while `prec >= min_prec`, comparison and
-    /// arithmetic (prec 3–5) bind inside the operand while `and` (2) / `or`
-    /// (1) stay outside — so `not a and b` reads as `(not a) and b` and
-    /// `not a = b` as `not (a = b)`, matching the `and < not < comparison`
-    /// ladder. Nested `not not p` falls out naturally.
+    /// operand binds tightly at `UNARY_OPERAND_PREC` (a primary), so no infix
+    /// binds inside: `not a and b` reads as `(not a) and b` and `not a = b`
+    /// as `(not a) = b`. A negated comparison is `not (a = b)` (parenthesized).
+    /// Nested `not not p` falls out naturally.
     fn parse_not_expr(&mut self) {
         debug_assert!(self.at_keyword("not") || self.at_keyword("¬"));
         self.bump_trivia();
         self.start_node(SyntaxKind::UNARY_EXPR);
         self.bump(); // `not` / `¬`
-        self.parse_expr_prec(3, true);
+        self.parse_expr_prec(Self::UNARY_OPERAND_PREC, true);
         self.finish_node();
     }
 
     /// `- <expr>` / `+ <expr>` — unary sign negation / identity. Parsed as a
     /// `UNARY_EXPR` with one operand (typechecked to be Integer or Rational).
-    /// The operand parses at precedence 6 — one above the tightest infix
-    /// level (multiplicative, 5) — so the sign binds tighter than every
-    /// binary operator: `-a * b` reads as `(-a) * b`, `-a + b` as `(-a) + b`,
-    /// and `2 - -3` as `2 - (-3)`. Postfix suffixes (`.name`, `{…}`, `[i]`)
-    /// still bind tighter, so `-a.b` is `-(a.b)`; nested `- -3` falls out
-    /// naturally.
+    /// The operand binds tightly at `UNARY_OPERAND_PREC` — one above the
+    /// tightest infix level (multiplicative, 5) — so the sign binds tighter
+    /// than every binary operator: `-a * b` reads as `(-a) * b`, `-a + b` as
+    /// `(-a) + b`, and `2 - -3` as `2 - (-3)`. Postfix suffixes (`.name`,
+    /// `{…}`, `[i]`) still bind tighter, so `-a.b` is `-(a.b)`; nested `- -3`
+    /// falls out naturally.
     fn parse_sign_expr(&mut self) {
         debug_assert!(self.at(SyntaxKind::PLUS) || self.at(SyntaxKind::MINUS));
         self.bump_trivia();
         self.start_node(SyntaxKind::UNARY_EXPR);
         self.bump(); // `+` / `-`
-        self.parse_expr_prec(6, true);
+        self.parse_expr_prec(Self::UNARY_OPERAND_PREC, true);
         self.finish_node();
     }
 
@@ -5563,9 +5574,10 @@ mod tests {
     }
 
     #[test]
-    fn extract_binds_loosely_so_where_lives_inside() {
-        // `extract R where a = 1` should parse as
-        //   UNARY_EXPR(extract, BINARY_EXPR(R, where, BINARY_EXPR(a, =, 1)))
+    fn extract_binds_tightly_so_where_lives_outside() {
+        // `extract R where a = 1` parses tightly as
+        //   BINARY_EXPR(UNARY_EXPR(extract, R), where, BINARY_EXPR(a, =, 1))
+        // — extract's operand is just `R`; the `where` sits outside.
         let out = parse_str("oper f {} [ let t = extract R where a = 1; ];");
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
         let ue = out
@@ -5573,15 +5585,48 @@ mod tests {
             .descendants()
             .find(|n| n.kind() == SyntaxKind::UNARY_EXPR)
             .expect("UNARY_EXPR in tree");
-        // The unary's operand is a BINARY_EXPR (the `where`).
-        let inner = ue
+        // The unary's operand is the bare NAME_REF `R` — no `where` inside.
+        let operand = ue
             .children()
-            .find(|n| n.kind() == SyntaxKind::BINARY_EXPR)
-            .expect("operand BINARY_EXPR (the where)");
-        let inner_text = inner.text().to_string();
+            .find(|n| n.kind() == SyntaxKind::NAME_REF)
+            .expect("operand NAME_REF");
+        assert_eq!(operand.text(), "R");
         assert!(
-            inner_text.contains(" where "),
-            "expected `where` inside extract's operand: {inner_text}"
+            !ue.text().to_string().contains(" where "),
+            "the `where` must live outside extract's operand: {}",
+            ue.text()
+        );
+        // The `where` is the outer BINARY_EXPR.
+        assert!(
+            out.tree
+                .descendants()
+                .any(|n| n.kind() == SyntaxKind::BINARY_EXPR
+                    && n.text().to_string().contains(" where ")),
+            "expected an outer `where` BINARY_EXPR"
+        );
+    }
+
+    #[test]
+    fn not_binds_tightly_so_comparison_lives_outside() {
+        // `not p = q` parses tightly as BINARY_EXPR(UNARY_EXPR(not, p), =, q)
+        // — the operand is just `p`; the comparison sits outside.
+        let out = parse_str("oper f {} [ let b = not p = q; ];");
+        assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+        let ue = out
+            .tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::UNARY_EXPR)
+            .expect("UNARY_EXPR in tree");
+        let operand = ue
+            .children()
+            .find(|n| n.kind() == SyntaxKind::NAME_REF)
+            .expect("operand NAME_REF");
+        assert_eq!(operand.text(), "p");
+        // The `=` is outside the `not` operand.
+        assert!(
+            !ue.text().to_string().contains('='),
+            "the comparison must live outside not's operand: {}",
+            ue.text()
         );
     }
 
